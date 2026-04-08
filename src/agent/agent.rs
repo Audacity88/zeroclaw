@@ -71,6 +71,9 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Hook runner for tool-call auditing and lifecycle side effects.
+    /// See issue #5462.
+    hook_runner: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 pub struct AgentBuilder {
@@ -99,6 +102,7 @@ pub struct AgentBuilder {
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    hook_runner: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 impl AgentBuilder {
@@ -129,6 +133,7 @@ impl AgentBuilder {
             security_summary: None,
             autonomy_level: None,
             activated_tools: None,
+            hook_runner: None,
         }
     }
 
@@ -269,6 +274,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn hook_runner(mut self, runner: Option<Arc<crate::hooks::HookRunner>>) -> Self {
+        self.hook_runner = runner;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -325,6 +335,7 @@ impl AgentBuilder {
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            hook_runner: self.hook_runner,
         })
     }
 }
@@ -556,6 +567,20 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
             .activated_tools(activated_tools)
+            .hook_runner(if config.hooks.enabled {
+                let mut runner = crate::hooks::HookRunner::new();
+                if config.hooks.builtin.command_logger {
+                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+                }
+                if config.hooks.builtin.webhook_audit.enabled {
+                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                        config.hooks.builtin.webhook_audit.clone(),
+                    )));
+                }
+                Some(Arc::new(runner))
+            } else {
+                None
+            })
             .build()
     }
 
@@ -623,67 +648,110 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        // First try to find tool in static registry, then in activated MCP tools.
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
+        // ── Hook: before_tool_call (modifying) ──────────────────
+        // Mirrors the hook pipeline in run_tool_call_loop (loop_.rs) so that
+        // library-integrated runs honour the same hook chain.  See #5462.
+        let mut tool_name = call.name.clone();
+        let mut tool_args = call.arguments.clone();
+        if let Some(ref hooks) = self.hook_runner {
+            match hooks
+                .run_before_tool_call(tool_name.clone(), tool_args.clone())
+                .await
+            {
+                crate::hooks::HookResult::Continue((n, a)) => {
+                    tool_name = n;
+                    tool_args = a;
                 }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
+                crate::hooks::HookResult::Cancel(reason) => {
+                    tracing::info!(
+                        tool = %call.name, %reason,
+                        "tool call cancelled by hook"
+                    );
+                    return ToolExecutionResult {
+                        name: call.name.clone(),
+                        output: format!("Cancelled by hook: {reason}"),
                         success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
+                        tool_call_id: call.tool_call_id.clone(),
+                    };
                 }
             }
-        } else if let Some(activated_arc) = self.activated_tools.as_ref() {
-            // Try to find in activated MCP tools.
-            let activated_opt = activated_arc.lock().unwrap().get_resolved(&call.name);
-            if let Some(tool) = activated_opt {
-                match tool.execute(call.arguments.clone()).await {
+        }
+
+        // First try to find tool in static registry, then in activated MCP tools.
+        let (result, success) =
+            if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
+                match tool.execute(tool_args.clone()).await {
                     Ok(r) => {
                         self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
+                            tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: r.success,
                         });
                         if r.success {
-                            r.output
+                            (r.output, true)
                         } else {
-                            format!("Error: {}", r.error.unwrap_or(r.output))
+                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
                         }
                     }
                     Err(e) => {
                         self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
+                            tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: false,
                         });
-                        format!("Error executing {}: {e}", call.name)
+                        (format!("Error executing {}: {e}", tool_name), false)
                     }
                 }
+            } else if let Some(activated_arc) = self.activated_tools.as_ref() {
+                let activated_opt = activated_arc.lock().unwrap().get_resolved(&tool_name);
+                if let Some(tool) = activated_opt {
+                    match tool.execute(tool_args.clone()).await {
+                        Ok(r) => {
+                            self.observer.record_event(&ObserverEvent::ToolCall {
+                                tool: tool_name.clone(),
+                                duration: start.elapsed(),
+                                success: r.success,
+                            });
+                            if r.success {
+                                (r.output, true)
+                            } else {
+                                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                            }
+                        }
+                        Err(e) => {
+                            self.observer.record_event(&ObserverEvent::ToolCall {
+                                tool: tool_name.clone(),
+                                duration: start.elapsed(),
+                                success: false,
+                            });
+                            (format!("Error executing {}: {e}", tool_name), false)
+                        }
+                    }
+                } else {
+                    (format!("Unknown tool: {}", tool_name), false)
+                }
             } else {
-                format!("Unknown tool: {}", call.name)
-            }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
+                (format!("Unknown tool: {}", tool_name), false)
+            };
+
+        let duration = start.elapsed();
+
+        // ── Hook: after_tool_call (void) ─────────────────────────
+        if let Some(ref hooks) = self.hook_runner {
+            let tool_result_obj = crate::tools::ToolResult {
+                success,
+                output: result.clone(),
+                error: None,
+            };
+            hooks
+                .fire_after_tool_call(&tool_name, &tool_result_obj, duration)
+                .await;
+        }
 
         ToolExecutionResult {
-            name: call.name.clone(),
+            name: tool_name,
             output: result,
-            success: true,
+            success,
             tool_call_id: call.tool_call_id.clone(),
         }
     }
