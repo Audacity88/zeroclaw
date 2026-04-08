@@ -650,6 +650,8 @@ enum PropsCommands {
         /// Section prefix (e.g. channels.matrix). Omit to init all.
         section: Option<String>,
     },
+    /// Migrate config.toml to the current schema version on disk (preserves comments)
+    Migrate,
     /// Print matching property paths for shell completion (hidden)
     #[command(hide = true)]
     Complete {
@@ -1806,6 +1808,25 @@ async fn main() -> Result<()> {
                     }
                     config.save().await?;
                     println!("\nRun `zeroclaw props list` to review, then set required fields.");
+                }
+                Ok(())
+            }
+            PropsCommands::Migrate => {
+                let raw = tokio::fs::read_to_string(&config.config_path)
+                    .await
+                    .context("Failed to read config file")?;
+                match crate::config::migration::migrate_file(&raw)? {
+                    Some(migrated) => {
+                        tokio::fs::write(&config.config_path, &migrated).await?;
+                        let to = crate::config::migration::CURRENT_SCHEMA_VERSION;
+                        println!(
+                            "Migrated {} to schema version {to}.",
+                            config.config_path.display()
+                        );
+                    }
+                    None => {
+                        println!("Config already at current schema version.");
+                    }
                 }
                 Ok(())
             }

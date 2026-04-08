@@ -10652,8 +10652,26 @@ impl Config {
         // Encrypt all #[secret]-annotated fields via Configurable derive
         config_to_save.encrypt_secrets(&store)?;
 
-        let toml_str =
+        let new_toml =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
+
+        // If an existing config file is present, sync the new values onto it
+        // to preserve comments and formatting. Otherwise, use the fresh serialization.
+        let toml_str = if config_path.exists() {
+            let existing = fs::read_to_string(&config_path).await.unwrap_or_default();
+            if existing.is_empty() {
+                new_toml
+            } else {
+                let new_table: toml::Table = toml::from_str(&new_toml)
+                    .context("Failed to round-trip serialized config")?;
+                let mut doc: toml_edit::DocumentMut = existing.parse()
+                    .context("Failed to parse existing config for comment preservation")?;
+                crate::config::migration::sync_table(doc.as_table_mut(), &new_table);
+                doc.to_string()
+            }
+        } else {
+            new_toml
+        };
 
         let parent_dir = config_path
             .parent()

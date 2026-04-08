@@ -3,7 +3,7 @@
 //! Validates that V1 (old top-level layout) configs are correctly migrated
 //! to V2 (providers.models) layout via V1Compat deserialization.
 
-use zeroclaw::config::migration::{V1Compat, CURRENT_SCHEMA_VERSION};
+use zeroclaw::config::migration::{self, V1Compat, CURRENT_SCHEMA_VERSION};
 
 fn migrate(toml_str: &str) -> zeroclaw::config::Config {
     let compat: V1Compat = toml::from_str(toml_str).expect("failed to deserialize");
@@ -219,6 +219,61 @@ model_provider = "ollama"
 "#);
 
     assert_eq!(config.providers.fallback.as_deref(), Some("ollama"));
+}
+
+#[test]
+fn migrate_file_preserves_comments() {
+    let raw = r#"
+# Global settings
+schema_version = 0
+
+api_key = "sk-test"          # my API key
+default_provider = "openrouter"
+
+# Agent tuning
+[agent]
+max_tool_iterations = 5  # keep it tight
+
+# Matrix channel
+[channels_config.matrix]
+homeserver = "https://matrix.org"  # production server
+access_token = "tok"
+room_id = "!abc:matrix.org"
+allowed_users = ["@user:matrix.org"]
+"#;
+    let migrated = migration::migrate_file(raw).unwrap().expect("should migrate");
+
+    // Comments on unchanged sections are preserved.
+    assert!(migrated.contains("# Agent tuning"), "section comment preserved");
+    assert!(migrated.contains("# keep it tight"), "inline comment preserved");
+    assert!(migrated.contains("# production server"), "matrix inline comment preserved");
+
+    // Old top-level keys are gone, new structure is present.
+    // (api_key now lives inside [providers.models.*], not at the top level)
+    let lines: Vec<&str> = migrated.lines().collect();
+    let top_level_keys: Vec<&str> = lines.iter()
+        .take_while(|l| !l.starts_with('['))
+        .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+        .copied()
+        .collect();
+    assert!(!top_level_keys.iter().any(|l| l.starts_with("api_key")), "old api_key removed from top level");
+    assert!(!top_level_keys.iter().any(|l| l.starts_with("default_provider")), "old default_provider removed from top level");
+    assert!(migrated.contains("[providers"), "providers section added");
+    assert!(!migrated.contains("room_id"), "room_id removed");
+}
+
+#[test]
+fn migrate_file_returns_none_when_current() {
+    let raw = r#"
+schema_version = 2
+
+[providers]
+fallback = "openrouter"
+
+[providers.models.openrouter]
+api_key = "sk-test"
+"#;
+    assert!(migration::migrate_file(raw).unwrap().is_none());
 }
 
 #[test]
