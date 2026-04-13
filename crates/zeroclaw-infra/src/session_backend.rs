@@ -44,6 +44,20 @@ pub trait SessionBackend: Send + Sync {
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 
+    /// Update the content of the last message in a session. Used for incremental
+    /// persistence of streaming responses — append a placeholder first, then
+    /// update_last periodically as more content arrives. Returns `false` if
+    /// the session is empty. Default implementation is remove_last + append
+    /// (backends can override for efficiency).
+    fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        if self.remove_last(session_key)? {
+            self.append(session_key, message)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// List all session keys.
     fn list_sessions(&self) -> Vec<String>;
 

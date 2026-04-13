@@ -239,6 +239,44 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    /// Efficiently update the last message in-place (single UPDATE instead of
+    /// DELETE + INSERT). Used for incremental persistence during streaming.
+    fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+
+        let last_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let Some(id) = last_id else {
+            return Ok(false);
+        };
+
+        conn.execute(
+            "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
+            params![message.role, message.content, id],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // NOTE: FTS index becomes stale here (no UPDATE trigger, only
+        // INSERT/DELETE triggers). This is acceptable — update_last is
+        // used for transient streaming snapshots. The final content will
+        // be correct in the sessions table for load().
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = ?2",
+            params![now, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        Ok(true)
+    }
+
     fn list_sessions(&self) -> Vec<String> {
         let conn = self.conn.lock();
         let mut stmt = match conn
