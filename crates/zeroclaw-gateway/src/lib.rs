@@ -52,7 +52,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, ChatMessage, Provider};
+use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
@@ -1328,52 +1328,7 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
-/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(
-    state: &AppState,
-    message: &str,
-) -> anyhow::Result<zeroclaw_api::provider::ChatResponse> {
-    let user_messages = vec![ChatMessage::user(message)];
-
-    // Keep webhook/gateway prompts aligned with channel behavior by injecting
-    // workspace-aware system context before model invocation.
-    let system_prompt = {
-        let config_guard = state.config.lock();
-        zeroclaw_runtime::agent::system_prompt::build_system_prompt(
-            &config_guard.workspace_dir,
-            &state.model,
-            &[], // tools - empty for simple chat
-            &[], // skills
-            Some(&config_guard.identity),
-            None, // bootstrap_max_chars - use default
-        )
-    };
-
-    let mut messages = Vec::with_capacity(1 + user_messages.len());
-    messages.push(ChatMessage::system(system_prompt));
-    messages.extend(user_messages);
-
-    let multimodal_config = state.config.lock().multimodal.clone();
-    let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
-        &messages,
-        &multimodal_config,
-    )
-    .await?;
-
-    state
-        .provider
-        .chat(
-            zeroclaw_api::provider::ChatRequest {
-                messages: &prepared.messages,
-                tools: None,
-            },
-            &state.model,
-            state.temperature,
-        )
-        .await
-}
-
-/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+/// Full-featured chat with tools for channel and webhook handlers.
 async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
@@ -1522,16 +1477,9 @@ async fn handle_webhook(
         },
     );
 
-    match run_gateway_chat_simple(&state, message).await {
-        Ok(chat_response) => {
+    match run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await {
+        Ok(response) => {
             let duration = started_at.elapsed();
-            let input_tokens = chat_response.usage.as_ref().and_then(|u| u.input_tokens);
-            let output_tokens = chat_response.usage.as_ref().and_then(|u| u.output_tokens);
-            let tokens_used = input_tokens
-                .zip(output_tokens)
-                .map(|(i, o)| i + o)
-                .or(input_tokens)
-                .or(output_tokens);
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     provider: provider_label.clone(),
@@ -1539,8 +1487,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens,
-                    output_tokens,
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             );
             state.observer.record_metric(
@@ -1551,12 +1499,11 @@ async fn handle_webhook(
                     provider: provider_label,
                     model: model_label,
                     duration,
-                    tokens_used,
+                    tokens_used: None,
                     cost_usd: None,
                 },
             );
 
-            let response = chat_response.text.unwrap_or_default();
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
