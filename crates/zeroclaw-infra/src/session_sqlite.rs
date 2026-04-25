@@ -63,6 +63,13 @@ impl SqliteSessionBackend {
                 INSERT INTO sessions_fts(rowid, session_key, content)
                 VALUES (new.id, new.session_key, new.content);
              END;
+             CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions
+             WHEN old.content != new.content BEGIN
+                INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
+                VALUES ('delete', old.id, old.session_key, old.content);
+                INSERT INTO sessions_fts(rowid, session_key, content)
+                VALUES (new.id, new.session_key, new.content);
+             END;
              CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
                 INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
                 VALUES ('delete', old.id, old.session_key, old.content);
@@ -261,11 +268,6 @@ impl SessionBackend for SqliteSessionBackend {
             params![message.role, message.content, id],
         )
         .map_err(std::io::Error::other)?;
-
-        // NOTE: FTS index becomes stale here (no UPDATE trigger, only
-        // INSERT/DELETE triggers). This is acceptable — update_last is
-        // used for transient streaming snapshots. The final content will
-        // be correct in the sessions table for load().
 
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
@@ -732,6 +734,39 @@ mod tests {
         });
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "code_chat");
+    }
+
+    #[test]
+    fn fts5_update_trigger_reflects_modified_content() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("s1", &ChatMessage::assistant("draft response about cats"))
+            .unwrap();
+
+        let before = backend.search(&SessionQuery {
+            keyword: Some("cats".into()),
+            limit: Some(10),
+        });
+        assert_eq!(before.len(), 1);
+
+        backend
+            .update_last("s1", &ChatMessage::assistant("final response about dogs"))
+            .unwrap();
+
+        let cats = backend.search(&SessionQuery {
+            keyword: Some("cats".into()),
+            limit: Some(10),
+        });
+        assert!(cats.is_empty(), "stale content should not match after update");
+
+        let dogs = backend.search(&SessionQuery {
+            keyword: Some("dogs".into()),
+            limit: Some(10),
+        });
+        assert_eq!(dogs.len(), 1, "updated content should be searchable");
+        assert_eq!(dogs[0].key, "s1");
     }
 
     #[test]
