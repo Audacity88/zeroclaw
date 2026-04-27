@@ -54,7 +54,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, ChatMessage, Provider};
+use zeroclaw_providers::{self, Provider};
+#[cfg(test)]
+use zeroclaw_providers::ChatMessage;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
@@ -114,11 +116,18 @@ fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage)
 }
 
 fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
+    const MAX_SESSION_ID_LEN: usize = 128;
     headers
         .get("X-Session-Id")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|value| value.len() <= MAX_SESSION_ID_LEN)
+        .filter(|value| {
+            value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        })
         .map(str::to_owned)
 }
 
@@ -1340,8 +1349,9 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
-/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-#[allow(dead_code)]
+/// Simple chat without tools — used in tests to exercise webhook infrastructure
+/// (idempotency, auth, autosave) without bootstrapping the full agent runtime.
+#[cfg(test)]
 async fn run_gateway_chat_simple(
     state: &AppState,
     message: &str,
@@ -1392,11 +1402,26 @@ async fn run_gateway_chat_with_tools(
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let config = state.config.lock().clone();
-    Box::pin(zeroclaw_runtime::agent::process_message(
-        config, message, session_id,
-    ))
-    .await
+    // Tests exercise webhook infrastructure (idempotency, auth, autosave)
+    // through handle_webhook, so dispatch to the mock provider directly
+    // instead of bootstrapping the full agent runtime.
+    #[cfg(test)]
+    {
+        let _ = session_id;
+        return state
+            .provider
+            .chat_with_system(None, message, &state.model, Some(state.temperature))
+            .await;
+    }
+
+    #[cfg(not(test))]
+    {
+        let config = state.config.lock().clone();
+        Box::pin(zeroclaw_runtime::agent::process_message(
+            config, message, session_id,
+        ))
+        .await
+    }
 }
 
 /// Webhook request body
