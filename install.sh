@@ -145,6 +145,46 @@ detect_target_triple() {
   esac
 }
 
+# ── Dashboard asset install ───────────────────────────────────────
+
+web_dashboard_dist_dir() {
+  printf '%s\n' "$CARGO_HOME/bin/web/dist"
+}
+
+install_web_dashboard() {
+  local src_dir dest_dir staging_dir
+  src_dir="$1/web/dist"
+  dest_dir=$(web_dashboard_dist_dir)
+  staging_dir="${dest_dir}.tmp.$$"
+
+  if [ ! -f "$src_dir/index.html" ]; then
+    warn "Release archive did not include web/dist — falling back to source build"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$dest_dir")"
+  rm -rf "$staging_dir"
+  cp -R "$src_dir" "$staging_dir" || {
+    rm -rf "$staging_dir"
+    warn "Could not stage dashboard assets — falling back to source build"
+    return 1
+  }
+
+  if [ ! -f "$staging_dir/index.html" ]; then
+    rm -rf "$staging_dir"
+    warn "Staged dashboard assets are missing index.html — falling back to source build"
+    return 1
+  fi
+
+  rm -rf "$dest_dir"
+  mv "$staging_dir" "$dest_dir" || {
+    rm -rf "$staging_dir"
+    warn "Could not install dashboard assets — falling back to source build"
+    return 1
+  }
+  info "Dashboard: $dest_dir"
+}
+
 # ── Pre-built binary install ──────────────────────────────────────
 
 install_prebuilt() {
@@ -178,6 +218,7 @@ install_prebuilt() {
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
     info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
+    info "[dry-run] Would install dashboard to $(web_dashboard_dist_dir)"
     return 0
   fi
 
@@ -215,6 +256,7 @@ install_prebuilt() {
 
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
   mkdir -p "$CARGO_HOME/bin"
+  install_web_dashboard "$tmp_dir" || { rm -rf "$tmp_dir"; return 1; }
   install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
 
   rm -rf "$tmp_dir"
@@ -269,6 +311,8 @@ do_uninstall() {
   echo
 
   local bin="$CARGO_HOME/bin/zeroclaw"
+  local dashboard_dir
+  dashboard_dir=$(web_dashboard_dist_dir)
 
   if [ -f "$bin" ]; then
     "$bin" service stop 2>/dev/null || true
@@ -279,13 +323,21 @@ do_uninstall() {
     warn "Binary not found at $bin"
   fi
 
+  if [ -d "$dashboard_dir" ]; then
+    rm -rf "$dashboard_dir"
+    info "Removed dashboard assets at $dashboard_dir"
+  fi
+
   local config_dir="$PREFIX/.zeroclaw"
   if [ -d "$config_dir" ]; then
     if [ -t 0 ]; then
       printf "  Remove config and data (%s)? [y/N] " "$config_dir"
       read confirm
       case "$confirm" in
-        [Yy]*) rm -rf "$config_dir"; info "Removed $config_dir" ;;
+        [Yy]*)
+          rm -rf "$config_dir"
+          info "Removed $config_dir"
+          ;;
         *)     info "Config preserved at $config_dir" ;;
       esac
     else
