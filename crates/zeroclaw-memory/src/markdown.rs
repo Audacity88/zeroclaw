@@ -179,8 +179,18 @@ impl Memory for MarkdownMemory {
         }
 
         let all = self.read_all_entries().await?;
-        let query_lower = query.to_lowercase();
-        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+        let trimmed_query = query.trim();
+        let is_recent_query = trimmed_query.is_empty() || trimmed_query == "*";
+        let query_lower = (!is_recent_query).then(|| query.to_lowercase());
+        let keywords: Vec<&str> = if is_recent_query {
+            Vec::new()
+        } else {
+            query_lower
+                .as_deref()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect()
+        };
 
         let mut scored: Vec<MemoryEntry> = all
             .into_iter()
@@ -342,6 +352,30 @@ mod tests {
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn markdown_recall_star_query_returns_recent_entries() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("a", "first memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "second memory", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let results = mem.recall("*", 10, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.content.contains("first memory"))
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.content.contains("second memory"))
+        );
     }
 
     #[tokio::test]
