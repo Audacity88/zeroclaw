@@ -59,6 +59,9 @@ Medium/high-risk PRs must fill:
 
 **Labels** live in the GitHub label UI, not in the body. Set `risk:*`, `size:*`, and scope labels via the sidebar. Auto-label corrections: add `risk: manual` and the intended label.
 
-**Commit trailers** capture AI-assisted collaboration (`Co-Authored-By: Claude ...`) — no separate section needed.
+**Do not add bot/AI attribution footers** such as `Co-authored-by: Claude ...`
+or `Created with Claude Code` to the PR body or commit-message tail. Human
+co-author trailers for incorporated contributors are still appropriate when the
+supersede-attribution section applies.
 
 **Privacy contract** (`docs/book/src/contributing/privacy.md`) is a merge gate. Never commit real identities, secrets, personal emails, or PII in diff, tests, fixtures, or docs.
