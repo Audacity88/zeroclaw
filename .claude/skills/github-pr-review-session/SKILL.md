@@ -23,15 +23,13 @@ Read these files at the start of every session. They are authoritative.
 
 - `AGENTS.md` — risk tiers, high-risk paths, anti-patterns, commands
 - `docs/book/src/contributing/pr-review-protocol.md` — **the full review protocol**;
-  follow it exactly for every PR
+  follow it exactly for every PR, including the review-body Markdown format
 - `.github/pull_request_template.md` — required PR body sections; used to
   check template completeness
 - `docs/book/src/foundations/fnd-003-governance.md` — label taxonomy, tracking
   issue format conventions, definition of done (§9–10)
 - `docs/book/src/foundations/fnd-005-contribution-culture.md` — review voice,
   feedback taxonomy, and the norms every review must follow
-- `docs/book/src/contributing/pr-review-protocol.md` — review body Markdown
-  format, including H3 taxonomy headings and draft-delivery preference
 - `tmp/handoff.md` — session state; tells you which PRs are already reviewed,
   what's still open, and what's next in the queue
 
@@ -108,8 +106,12 @@ fetches sequentially wastes time and the results are independent.
 ### Phase 3 — Write and post
 
 1. Write the review body to `tmp/review-<number>.md`.
-2. Apply the required Markdown style guidance from `docs/book/src/contributing/pr-review-protocol.md` before showing or posting the draft. Confirm the context intro is present, each formal finding heading is an H3 that starts with the required taxonomy emoji, prose is not accidentally hard-wrapped, and the review has had a plain-language pass.
-3. Show the draft to the active reviewer before posting. Prefer a link to `tmp/review-<number>.md` plus a short summary; if the full draft needs to be inline, paste it as regular text rather than wrapping the whole review in a fenced Markdown block.
+2. Before showing or posting, confirm the context intro is present, formal
+   finding headings are H3 headings that start with taxonomy emoji, prose is not
+   accidentally hard-wrapped, and the review has had a plain-language pass.
+3. Show the draft to the active reviewer before posting. Prefer a link to
+   `tmp/review-<number>.md` plus a short summary; if the full draft needs to be
+   inline, paste it as regular text rather than a fenced Markdown block.
 4. Post using the verdict flag from the decision tree:
    ```bash
    gh pr review <number> --repo zeroclaw-labs/zeroclaw \
@@ -239,12 +241,10 @@ These norms are documented in
 4. **Always write to `tmp/review-<number>.md` before posting.** The tmp file
    is the source of truth for what was posted. It also lets you inspect before
    posting if the user asks.
-5. **Always apply the Markdown style guide before showing or posting public text.**
-   Use `docs/book/src/contributing/pr-review-protocol.md` for reviews, comments,
-   PR bodies, checklist notes, and handoff notes. This is a required drafting
-   step, not optional cleanup. Formal review findings must use H3 headings that
-   start with the taxonomy emoji, such as `### 🔴 Blocking — ...`; headings such
-   as `### Blocking — ...` or numbered findings do not satisfy the protocol.
+5. **Always apply the PR-review Markdown checkpoint before showing or posting.**
+   Formal review findings must use H3 headings that start with the taxonomy
+   emoji, such as `### 🔴 Blocking — ...`; headings such as
+   `### Blocking — ...` or numbered findings do not satisfy the protocol.
 6. **Always show drafts to the active reviewer as a file link or regular text by default.**
    Do not wrap an entire public review/comment/PR draft in a fenced Markdown
    block unless the active reviewer explicitly asks for that format.

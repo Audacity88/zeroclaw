@@ -150,7 +150,9 @@ If the client never replies (crash, network drop, user closes IDE), the request 
 
 ### `session/cancel` _(ZeroClaw extension)_
 
-Abort an in-flight `session/prompt` turn. `session/cancel` is a ZeroClaw-specific extension, not part of the base ACP spec. If a future ACP spec revision adds `session/cancel` with different semantics, ZeroClaw will move this extension to `_meta/session/cancel` rather than changing the method's meaning in place.
+Abort an in-flight `session/prompt` turn. This method is a ZeroClaw extension,
+not part of the base ACP spec. If ACP later standardizes a conflicting
+`session/cancel`, ZeroClaw will move its extension to `_meta/session/cancel`.
 
 **Cancel vs. stop:** `session/cancel` aborts an in-flight prompt turn and returns `stopReason: "cancelled"` with any streamed text accumulated up to the interrupt point. `session/stop` gracefully ends the session after the current turn completes — it waits for the turn to finish rather than interrupting it.
 

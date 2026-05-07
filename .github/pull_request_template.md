@@ -4,7 +4,9 @@
 - **What changed and why:** (2–5 bullets — the diff shows *what*, you explain *why*)
 - **Scope boundary:** (what this PR explicitly does NOT change)
 - **Blast radius:** (what other subsystems or consumers could be affected)
-- **Linked issue(s):** Use plain text outside backticks. Write `Closes`, `Related`, `Depends on`, or `Supersedes` followed by the real issue or PR number.
+- **Linked issue(s):** Use plain text outside backticks. Use `Closes #`,
+  `Fixes #`, or `Resolves #` only for issues this PR fully resolves. Use
+  `Related #`, `Depends on #`, or `Supersedes #` for non-closing relationships.
 
 ## Validation Evidence (required)
 
@@ -61,7 +63,7 @@ Medium/high-risk PRs must fill:
 
 **Do not add bot/AI attribution footers** such as `Co-authored-by: Claude ...`
 or `Created with Claude Code` to the PR body or commit-message tail. Human
-co-author trailers for incorporated contributors are still appropriate when the
-supersede-attribution section applies.
+co-author trailers are appropriate only for incorporated contributor work under
+the supersede-attribution section and privacy contract.
 
 **Privacy contract** (`docs/book/src/contributing/privacy.md`) is a merge gate. Never commit real identities, secrets, personal emails, or PII in diff, tests, fixtures, or docs.

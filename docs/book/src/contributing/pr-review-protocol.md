@@ -79,7 +79,7 @@ The take-stock pass is what stops you from re-raising settled points and what su
 | Your review is approving and no other reviewer holds an active block | `--approve` |
 | Your review is rejecting on substantive grounds you'd block on personally | `--request-changes` |
 | You have nothing new to block on but other reviewers hold active blocks | `--comment` |
-| You have specific findings but they're all `[suggestion]` / non-blocking clarification questions | `--comment` |
+| You have specific findings but they're all 🔵 suggestions or non-blocking clarification questions | `--comment` |
 | You're a maintainer override-approving over another reviewer's `CHANGES_REQUESTED` | **Don't.** Get the other reviewer to dismiss or convert their review first. |
 
 ## Feedback taxonomy
@@ -113,12 +113,15 @@ Write as a thoughtful senior contributor who has read everything and cares about
 - **Be specific.** Vague feedback creates anxiety without direction. Explain the principle behind every finding, not just the verdict.
 - **Name what is good.** Specific praise (`✅ The merge order is correct because…`) builds shared judgment over time.
 - **Separate work from person.** "This approach has a problem" not "you made a mistake."
-- **Don't re-raise settled points.** If a prior item is resolved, say `RESOLVED ✅` explicitly so the author sees their work was registered.
+- **Don't re-raise settled points.** If a prior item is resolved, use
+  `### ✅ Resolved — ...` so the author sees their work was registered.
 - **Reference RFCs by section** when they're the basis for a finding. "Per FND-006 §4.3" is more useful than "per our standards."
 
 ## Inline vs body
 
-- **Inline diff comments** for every `[blocking]` / `[suggestion]` finding tied to a specific line. Anchor the feedback to the code so the author can resolve it inline.
+- **Inline diff comments** for every 🔴 blocking, 🟡 warning, or 🔵 suggestion
+  finding tied to a specific line. Anchor the feedback to the code so the
+  author can resolve it inline.
 - **Review body** for overall verdict, comprehension summary, cross-references to other PRs, and template-level issues that aren't tied to a specific line.
 - **Bare commit hashes** (never wrap in backticks — GitHub auto-links bare hashes; backticks block the auto-link).
 - **`@`-prefixed usernames** in all review content (chat, body, inline). `@WareWolf-MoonWall`, not `WareWolf-MoonWall`.

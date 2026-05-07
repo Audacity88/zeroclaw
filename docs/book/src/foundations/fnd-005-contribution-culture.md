@@ -526,11 +526,11 @@ Every review comment on this project carries an explicit weight. Using those wei
 consistently means reviewers communicate clearly and authors know exactly what requires
 action.
 
-The categories below describe the project's review intent. The operational PR review
-protocol maps that intent into the canonical GitHub review categories and heading format:
-🔴 blocking, 🟡 warning, 🔵 suggestion, 🟢 praise, and ✅ resolved. When writing PR
-reviews, use `docs/book/src/contributing/pr-review-protocol.md` for the exact category
-names, emoji, and Markdown heading format.
+The categories below describe the project's review intent. PR reviews render
+that intent through the review protocol's emoji headings: 🔴 blocking,
+🟡 warning, 🔵 suggestion, 🟢 praise, and ✅ resolved. Use
+`docs/book/src/contributing/pr-review-protocol.md` for the exact PR-review
+format.
 
 ---
 
