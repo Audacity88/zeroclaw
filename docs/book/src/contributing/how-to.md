@@ -24,7 +24,7 @@ The key checkpoints:
 
 - **PR template** — `.github/pull_request_template.md`. Fill it out. The summary, validation evidence, and compatibility sections are non-negotiable.
 - **CI** — runs on every PR. `ci.yml` is the composite gate; all legs must pass.
-- **Labels** — scope (`scope:providers`, `scope:channels`, etc.) and risk (`risk:low` / `risk:medium` / `risk:high`) are auto-applied by path-labeler. Double-check they match your change; if not, flag in a comment.
+- **Labels** — scope (`scope:providers`, `scope:channels`, etc.) and risk (`risk:low` / `risk:medium` / `risk:high`) are auto-applied by path-labeler. Double-check they match your change. If they look wrong and you cannot edit labels, flag the mismatch in a comment; maintainers or reviewers with label permissions can correct obvious mismatches directly.
 - **Review** — maintainers review. Findings use the PR review taxonomy: 🔴 blocking, 🟡 warning, 🔵 suggestion, 🟢 praise, and ✅ resolved. Address blockers; warnings should get a response; suggestions are optional.
 
 ## Code style

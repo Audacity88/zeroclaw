@@ -93,6 +93,9 @@ The protocol specifies:
   `docs/book/src/foundations/fnd-005-contribution-culture.md`
 - **How to cross-check** the diff against local source files
 - **The take-stock checkpoint** before writing anything
+- **Label hygiene** — fix obvious label mismatches yourself when the active
+  reviewer has label permissions, after approval for the public-state mutation;
+  do not ask authors to update labels they may not be allowed to edit
 - **The verdict decision tree** — which flag to use based on review state
 - **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
   H3 review-body heading format that starts each formal finding with the

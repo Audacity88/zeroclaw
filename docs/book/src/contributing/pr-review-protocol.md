@@ -72,6 +72,12 @@ Before you write a single line of review, name out loud:
 
 The take-stock pass is what stops you from re-raising settled points and what surfaces who's actually waiting on what.
 
+## Label hygiene
+
+Labels are maintainer metadata, not a contributor blocker. If the right label is obvious and you have permission, fix it yourself before finalizing the review. If you are acting through an assistant, draft the exact label change and get the human reviewer's approval before mutating GitHub.
+
+Ask the author about labels only when the right label choice is ambiguous or nobody with label permissions is available. Do not request changes or hold merge solely because an author cannot edit labels.
+
 ## Verdict decision tree
 
 | Situation | Verdict flag |
