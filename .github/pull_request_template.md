@@ -7,6 +7,8 @@
 - **Linked issue(s):** Use plain text outside backticks. Use `Closes #`,
   `Fixes #`, or `Resolves #` only for issues this PR fully resolves. Use
   `Related #`, `Depends on #`, or `Supersedes #` for non-closing relationships.
+- **Labels:** Snapshot the current GitHub labels after labels are applied, for
+  example `type: docs`, `risk: low`, `size: S`, `docs`.
 
 ## Validation Evidence (required)
 
