@@ -1,4 +1,4 @@
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 
 /// CLI channel factory, injected by the binary. Returns a `Box<dyn Channel>` for interactive mode.
 pub static CLI_CHANNEL_FN: std::sync::OnceLock<
@@ -1593,9 +1593,14 @@ pub async fn run_tool_call_loop(
                 channel_reply_target,
             );
 
+            super::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+
             // ── Approval hook ────────────────────────────────
+            let mut approval_requirement = approval
+                .map(|mgr| mgr.approval_requirement(&tool_name))
+                .unwrap_or(ApprovalRequirement::NotRequired);
             if let Some(mgr) = approval
-                && mgr.needs_approval(&tool_name)
+                && approval_requirement == ApprovalRequirement::Prompt
             {
                 let request = ApprovalRequest {
                     tool_name: tool_name.clone(),
@@ -1680,7 +1685,16 @@ pub async fn run_tool_call_loop(
                     ));
                     continue;
                 }
+
+                if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+                    approval_requirement = ApprovalRequirement::Approved;
+                }
             }
+            super::set_runtime_approved_arg(
+                &tool_name,
+                &mut tool_args,
+                approval_requirement == ApprovalRequirement::Approved,
+            );
 
             let signature = {
                 let canonical_args = canonicalize_json_for_tool_signature(&tool_args);
