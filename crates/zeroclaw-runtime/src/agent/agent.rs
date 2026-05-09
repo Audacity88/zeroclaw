@@ -19,6 +19,7 @@ use std::time::Instant;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
+use zeroclaw_tool_call_parser::strip_think_tags;
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
@@ -419,6 +420,24 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+
+    fn should_send_tool_specs(&self) -> bool {
+        self.tool_dispatcher.should_send_tool_specs() && !self.tool_specs.is_empty()
+    }
+
+    fn parse_response_for_effective_tools(
+        &self,
+        response: &zeroclaw_providers::ChatResponse,
+    ) -> (String, Vec<ParsedToolCall>) {
+        if self.tool_specs.is_empty() {
+            return (
+                strip_think_tags(&response.text.clone().unwrap_or_default()),
+                Vec::new(),
+            );
+        }
+
+        self.tool_dispatcher.parse_response(response)
     }
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
@@ -1168,7 +1187,7 @@ impl Agent {
                 .chat(
                     ChatRequest {
                         messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
+                        tools: if self.should_send_tool_specs() {
                             Some(&self.tool_specs)
                         } else {
                             None
@@ -1183,9 +1202,9 @@ impl Agent {
                 Err(err) => return Err(err),
             };
 
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            let (text, calls) = self.parse_response_for_effective_tools(&response);
             if calls.is_empty() {
-                let final_text = if text.is_empty() {
+                let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
                     response.text.unwrap_or_default()
                 } else {
                     text
@@ -1353,7 +1372,7 @@ impl Agent {
             let mut stream = self.provider.stream_chat(
                 zeroclaw_providers::ChatRequest {
                     messages: &messages,
-                    tools: if self.tool_dispatcher.should_send_tool_specs() {
+                    tools: if self.should_send_tool_specs() {
                         Some(&self.tool_specs)
                     } else {
                         None
@@ -1491,7 +1510,7 @@ impl Agent {
                 let chat_fut = self.provider.chat(
                     ChatRequest {
                         messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
+                        tools: if self.should_send_tool_specs() {
                             Some(&self.tool_specs)
                         } else {
                             None
@@ -1531,9 +1550,9 @@ impl Agent {
                     .await;
             }
 
-            let (text, mut calls) = self.tool_dispatcher.parse_response(&response);
+            let (text, mut calls) = self.parse_response_for_effective_tools(&response);
             if calls.is_empty() {
-                let final_text = if text.is_empty() {
+                let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
                     response.text.unwrap_or_default()
                 } else {
                     text
