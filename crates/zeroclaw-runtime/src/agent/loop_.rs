@@ -6885,20 +6885,20 @@ Let me check the result."#;
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
-    /// the output must contain ZERO XML protocol artifacts. In the native path
-    /// `build_tool_instructions` is never called, so the system prompt alone
-    /// must be clean of XML tool-call protocol.
+    /// the output must contain ZERO XML protocol artifacts and must not inject
+    /// the duplicate non-native tools summary.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::agent::system_prompt::build_system_prompt_with_mode;
 
+        let workspace = tempdir().unwrap();
         let tool_summaries: Vec<(&str, &str)> = vec![
             ("shell", "Execute shell commands"),
             ("file_read", "Read files"),
         ];
 
         let system_prompt = build_system_prompt_with_mode(
-            std::path::Path::new("/tmp"),
+            workspace.path(),
             "test-model",
             &tool_summaries,
             &[],  // no skills
@@ -6931,10 +6931,10 @@ Let me check the result."#;
             "Native prompt must not contain XML protocol header"
         );
 
-        // Positive: native prompt should still list tools and contain task instructions
+        // Positive: native prompt should still contain native-task framing.
         assert!(
-            system_prompt.contains("shell"),
-            "Native prompt must list tool names"
+            !system_prompt.contains("## Tools"),
+            "Native prompt should skip the duplicate tools summary"
         );
         assert!(
             system_prompt.contains("## Your Task"),

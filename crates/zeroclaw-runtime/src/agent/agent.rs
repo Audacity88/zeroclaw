@@ -799,6 +799,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
+            sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
@@ -1913,6 +1914,51 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "hello");
+    }
+
+    #[test]
+    fn native_agent_prompt_omits_duplicate_tools_section() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let native_agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(Arc::clone(&mem))
+            .observer(Arc::clone(&observer))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed with valid config");
+        let native_prompt = native_agent.build_system_prompt().unwrap();
+        assert!(!native_prompt.contains("## Tools"));
+        assert!(!native_prompt.contains("echo"));
+
+        let xml_agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed with valid config");
+        let xml_prompt = xml_agent.build_system_prompt().unwrap();
+        assert!(xml_prompt.contains("## Tools"));
+        assert!(xml_prompt.contains("echo"));
+        assert!(xml_prompt.contains("## Tool Use Protocol"));
     }
 
     #[tokio::test]

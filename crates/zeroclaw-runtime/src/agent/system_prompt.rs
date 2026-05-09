@@ -139,7 +139,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     );
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
+    if !tools.is_empty() && !native_tools {
         prompt.push_str("## Tools\n\n");
         if compact_context {
             // Compact mode: tool names only, no descriptions/schemas
