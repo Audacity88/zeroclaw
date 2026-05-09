@@ -97,6 +97,8 @@ use zeroclaw_runtime::agent::loop_::{
     is_model_switch_requested, run_tool_call_loop, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
+#[cfg(not(feature = "whatsapp-web"))]
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
 use zeroclaw_runtime::observability::{self, Observer, runtime_trace};
 use zeroclaw_runtime::platform;
@@ -4919,12 +4921,26 @@ fn collect_configured_channels(
                     #[cfg(not(feature = "whatsapp-web"))]
                     {
                         tracing::warn!(
-                            "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
+                            "WhatsApp Web backend requires 'whatsapp-web' feature. Build/run with --features whatsapp-web"
                         );
                         eprintln!(
-                            "  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in."
+                            "{}",
+                            i18n::get_required_cli_string(
+                                "channel-whatsapp-web-feature-missing-warning"
+                            )
                         );
-                        eprintln!("    Rebuild with: cargo build --features whatsapp-web");
+                        eprintln!(
+                            "{}",
+                            i18n::get_required_cli_string(
+                                "channel-whatsapp-web-feature-missing-build"
+                            )
+                        );
+                        eprintln!(
+                            "{}",
+                            i18n::get_required_cli_string(
+                                "channel-whatsapp-web-feature-missing-install"
+                            )
+                        );
                     }
                 }
                 _ => {
