@@ -93,9 +93,8 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
-    build_tool_instructions, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    clear_model_switch_request, get_model_switch_state, is_model_switch_requested,
+    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 #[cfg(not(feature = "whatsapp-web"))]
@@ -5727,7 +5726,9 @@ pub async fn start_channels(
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+        system_prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(
+            tools_registry.as_ref(),
+        ));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -9935,7 +9936,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[]));
+        prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(&[]));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),
