@@ -93,8 +93,9 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
-    clear_model_switch_request, get_model_switch_state, is_model_switch_requested,
-    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
+    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
+    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
+    scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 #[cfg(not(feature = "whatsapp-web"))]
@@ -5745,6 +5746,15 @@ pub async fn start_channels(
     if !excluded.is_empty() && config.autonomy.level != AutonomyLevel::Full {
         tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
     }
+    let effective_tool_names: HashSet<&str> = tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| {
+            config.autonomy.level == AutonomyLevel::Full
+                || !excluded.iter().any(|excluded| excluded.as_str() == *name)
+        })
+        .collect();
+    tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -5766,8 +5776,9 @@ pub async fn start_channels(
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(
+        system_prompt.push_str(&build_tool_instructions_for_names(
             tools_registry.as_ref(),
+            &effective_tool_names,
         ));
     }
 
@@ -6244,6 +6255,7 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, Provider};
+    use zeroclaw_runtime::agent::loop_::build_tool_instructions;
     use zeroclaw_runtime::observability::NoopObserver;
     use zeroclaw_runtime::tools::{Tool, ToolResult};
 
@@ -10104,7 +10116,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(&[]));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        prompt.push_str(&build_tool_instructions(&tools_registry));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),
