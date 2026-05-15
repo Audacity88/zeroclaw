@@ -69,17 +69,53 @@ api_key = "..."
 
 **macOS-only** and requires either Linq as a third-party relay, or direct AppleScript automation (experimental, requires Full Disk Access and Accessibility grants).
 
-## WeCom (企业微信)
+## WeCom Bot Webhook (企业微信群机器人)
 
 ```toml
 [channels.wecom]
 enabled = true
-corp_id = "..."
-corp_secret = "..."
-agent_id = 1000001
+webhook_key = "..."                 # key from the group bot webhook URL
+allowed_users = ["*"]
 ```
 
-Chinese enterprise WeChat. Custom app required in the corp admin panel.
+WeCom Bot Webhook is send-only through the group bot webhook API. Use it for simple outbound delivery into a WeCom group when ZeroClaw does not need to receive messages from WeCom.
+
+## WeCom AI Bot WebSocket (企业微信智能机器人长连接)
+
+```toml
+[channels.wecom_ws]
+enabled = true
+bot_id = "..."
+secret = "..."
+allowed_users = ["zeroclaw_user"]    # empty denies all users
+allowed_groups = ["zeroclaw_group"]  # empty denies all groups
+bot_name = "danya"                   # optional group mention alias
+stream_mode = "partial"
+file_retention_days = 7
+max_file_size_mb = 20
+# proxy_url = "http://127.0.0.1:7890"  # optional per-channel override
+```
+
+WeCom AI Bot WebSocket uses the long-connection API for inbound chat handling and replies through the active WebSocket session. It is separate from `channels.wecom`; enabling `wecom_ws` does not change webhook behavior.
+
+Access control is explicit. If both `allowed_users` and `allowed_groups` are empty, inbound messages are denied. Use `"*"` only for controlled test deployments.
+
+Set `bot_name` to the visible WeCom robot name when using the channel in groups. This lets ZeroClaw recognize messages such as `@danya say hi` as addressed to the bot during reply-intent prechecks.
+
+Attachments sent by WeCom can be downloaded into the workspace cache and represented to the model as local markers such as `[IMAGE:/absolute/path.png]` or `[Document: /absolute/path.bin]`.
+
+Outbound image payloads are not supported yet. `stream_mode` supports `"partial"` for progressive draft updates or `"off"` for final replies only.
+
+## WeChat personal iLink Bot (微信个人号 iLink)
+
+```toml
+[channels.wechat]
+enabled = true
+allowed_users = ["*"]
+# api_base_url, cdn_base_url, and state_dir are optional overrides.
+```
+
+WeChat personal iLink Bot is a different channel from WeCom. It uses QR-code login against the iLink Bot API for personal WeChat conversations and should not be used for WeCom enterprise bot traffic.
 
 ## DingTalk
 
