@@ -687,7 +687,9 @@ description = \"test heredoc\"
 name = \"write-file\"
 description = \"write a config file\"
 kind = \"shell\"
-command = \"cat <<'EOF'\nsome content\nEOF\"
+command = \"\"\"cat <<'EOF'
+some content
+EOF\"\"\"
 ",
         )
         .unwrap();
