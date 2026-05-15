@@ -89,6 +89,8 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
+    /// Inherited parser policy for agentic sub-agent loops.
+    strict_tool_parsing: bool,
 }
 
 impl DelegateTool {
@@ -123,6 +125,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            strict_tool_parsing: false,
         }
     }
 
@@ -163,6 +166,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            strict_tool_parsing: false,
         }
     }
 
@@ -214,6 +218,12 @@ impl DelegateTool {
     /// Attach memory for namespace isolation on delegate agents.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Inherit the parent agent's strict parser policy for agentic sub-agent loops.
+    pub fn with_strict_tool_parsing(mut self, strict_tool_parsing: bool) -> Self {
+        self.strict_tool_parsing = strict_tool_parsing;
         self
     }
 
@@ -500,7 +510,7 @@ impl DelegateTool {
 
         // Build enriched system prompt for non-agentic sub-agent.
         let enriched_system_prompt =
-            self.build_enriched_system_prompt(agent_config, &[], &self.workspace_dir);
+            self.build_enriched_system_prompt(agent_config, &[], &self.workspace_dir, false);
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
@@ -655,6 +665,7 @@ impl DelegateTool {
         let delegate_config = self.delegate_config.clone();
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
+        let strict_tool_parsing = self.strict_tool_parsing;
         let task_id_clone = task_id.clone();
         let parent_session_key = current_tool_loop_session_key();
 
@@ -673,6 +684,7 @@ impl DelegateTool {
                     workspace_dir: workspace_dir.clone(),
                     cancellation_token: child_token.clone(),
                     memory: None,
+                    strict_tool_parsing,
                 };
 
                 let args_inner = json!({
@@ -834,6 +846,7 @@ impl DelegateTool {
             let args_clone = args.clone();
             let receipt_scope = parent_receipt_scope.clone();
             let session_key = parent_session_key.clone();
+            let strict_tool_parsing = self.strict_tool_parsing;
 
             handles.push(tokio::spawn(async move {
                 let inner = DelegateTool {
@@ -848,6 +861,7 @@ impl DelegateTool {
                     workspace_dir,
                     cancellation_token,
                     memory: None,
+                    strict_tool_parsing,
                 };
                 let agent_name_for_return = agent_name.clone();
                 let result = scope_delegate_session_key(session_key, async move {
@@ -1064,6 +1078,7 @@ impl DelegateTool {
         agent_config: &DelegateAgentConfig,
         sub_tools: &[Box<dyn Tool>],
         workspace_dir: &Path,
+        sends_native_tool_specs: bool,
     ) -> Option<String> {
         // Resolve skills directory: scoped if configured, otherwise workspace default.
         let skills_dir = agent_config
@@ -1076,7 +1091,10 @@ impl DelegateTool {
 
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.
-        let has_shell = sub_tools.iter().any(|t| t.name() == "shell");
+        let empty_tools: &[Box<dyn Tool>] = &[];
+        let expose_tools = sends_native_tool_specs || !self.strict_tool_parsing;
+        let prompt_tools = if expose_tools { sub_tools } else { empty_tools };
+        let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
         let shell_policy = if has_shell {
             "## Shell Policy\n\n\
              - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
@@ -1092,12 +1110,12 @@ impl DelegateTool {
         let ctx = PromptContext {
             workspace_dir,
             model_name: &agent_config.model,
-            tools: sub_tools,
+            tools: prompt_tools,
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            sends_native_tool_specs: false,
+            sends_native_tool_specs,
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
@@ -1178,8 +1196,12 @@ impl DelegateTool {
         }
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
-        let enriched_system_prompt =
-            self.build_enriched_system_prompt(agent_config, &sub_tools, &self.workspace_dir);
+        let enriched_system_prompt = self.build_enriched_system_prompt(
+            agent_config,
+            &sub_tools,
+            &self.workspace_dir,
+            provider.supports_native_tools(),
+        );
 
         let mut history = Vec::new();
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
@@ -1227,6 +1249,7 @@ impl DelegateTool {
                 None,
                 None,
                 &zeroclaw_config::schema::PacingConfig::default(),
+                self.strict_tool_parsing,
                 0,    // max_tool_result_chars: inherit from parent config in future
                 0,    // context_token_budget: 0 = disabled for subagents
                 None, // shared_budget: TODO thread from parent in future
@@ -1903,6 +1926,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_agentic_strict_tool_parsing_inherits_parent_policy() {
+        struct TextFallbackToolProvider;
+
+        #[async_trait]
+        impl Provider for TextFallbackToolProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("unused".to_string())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some(
+                        r#"<tool_call>{"name":"echo_tool","arguments":{"value":"ignored"}}</tool_call>"#
+                            .to_string(),
+                    ),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let config = agentic_config(vec!["echo_tool".to_string()], 10);
+        let prompt_tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])))
+            .with_strict_tool_parsing(true);
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &prompt_tools, Path::new("/tmp"), false)
+            .expect("prompt should render");
+        assert!(
+            !prompt.contains("## Tools"),
+            "strict delegate prompt should not advertise text tool instructions"
+        );
+        assert!(
+            !prompt.contains("echo_tool"),
+            "strict delegate prompt should hide text-only tool schema"
+        );
+
+        let provider = TextFallbackToolProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run", 0.2)
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("<tool_call>"),
+            "strict subagent should return fallback-looking text unchanged"
+        );
+        assert!(
+            !result.output.contains("echo:ignored"),
+            "strict subagent must not execute text fallback tool calls"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_config(vec!["delegate".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
@@ -2193,7 +2285,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, &tools, &workspace, false)
             .unwrap();
 
         assert!(prompt.contains("## Tools"), "should contain tools section");
@@ -2264,7 +2356,7 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2343,7 +2435,7 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2601,7 +2693,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, &tools, &workspace, false)
             .unwrap();
 
         assert!(
@@ -2648,7 +2740,7 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .build_enriched_system_prompt(&config, &tools, &workspace, false)
             .unwrap();
 
         assert!(

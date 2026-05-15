@@ -3430,6 +3430,7 @@ async fn process_channel_message(
                         ctx.activated_tools.as_ref(),
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
+                        ctx.prompt_config.agent.strict_tool_parsing,
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget

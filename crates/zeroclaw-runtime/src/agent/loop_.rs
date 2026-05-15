@@ -585,6 +585,7 @@ async fn consume_provider_streaming_response(
     temperature: f64,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    strict_tool_parsing: bool,
 ) -> Result<StreamedChatOutcome> {
     let mut provider_stream = provider.stream_chat(
         ChatRequest {
@@ -661,7 +662,7 @@ async fn consume_provider_streaming_response(
                     marker_window.drain(..boundary);
                 }
 
-                if !suppress_forwarding && {
+                if !strict_tool_parsing && !suppress_forwarding && {
                     let lowered = marker_window.to_ascii_lowercase();
                     lowered.contains("<tool_call")
                         || lowered.contains("<toolcall")
@@ -733,9 +734,10 @@ pub async fn agent_turn(
         activated_tools,
         model_switch_callback,
         &zeroclaw_config::schema::PacingConfig::default(),
-        0,    // max_tool_result_chars: 0 = disabled (legacy callers)
-        0,    // context_token_budget: 0 = disabled (legacy callers)
-        None, // shared_budget: no shared budget for legacy callers
+        false, // strict_tool_parsing
+        0,     // max_tool_result_chars: 0 = disabled (legacy callers)
+        0,     // context_token_budget: 0 = disabled (legacy callers)
+        None,  // shared_budget: no shared budget for legacy callers
         channel,
         None, // receipt_generator
         None, // collected_receipts
@@ -875,6 +877,7 @@ pub async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &zeroclaw_config::schema::PacingConfig,
+    strict_tool_parsing: bool,
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -1139,6 +1142,7 @@ pub async fn run_tool_call_loop(
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
+                strict_tool_parsing,
             )
             .await
             {
@@ -1303,7 +1307,7 @@ pub async fn run_tool_call_loop(
                 };
                 let mut parsed_text = String::new();
 
-                if calls.is_empty() && !tool_specs.is_empty() {
+                if calls.is_empty() && !tool_specs.is_empty() && !strict_tool_parsing {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
@@ -1311,7 +1315,7 @@ pub async fn run_tool_call_loop(
                     calls = fallback_calls;
                 }
 
-                let parse_issue = if tool_specs.is_empty() {
+                let parse_issue = if tool_specs.is_empty() || strict_tool_parsing {
                     None
                 } else {
                     detect_tool_call_parse_issue(&response_text, &calls)
@@ -2521,6 +2525,11 @@ pub async fn run(
         None
     };
     let native_tools = provider.supports_native_tools();
+    let expose_text_tool_protocol = !native_tools && !config.agent.strict_tool_parsing;
+    if !native_tools && config.agent.strict_tool_parsing {
+        tool_descs.clear();
+        deferred_section.clear();
+    }
     let mut system_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
@@ -2536,7 +2545,7 @@ pub async fn run(
     );
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
-    if !native_tools {
+    if expose_text_tool_protocol {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
@@ -2695,6 +2704,7 @@ pub async fn run(
                         activated_handle.as_ref(),
                         Some(model_switch_callback.clone()),
                         &config.pacing,
+                        config.agent.strict_tool_parsing,
                         config.agent.max_tool_result_chars,
                         config.agent.max_context_tokens,
                         None, // shared_budget
@@ -3010,6 +3020,7 @@ pub async fn run(
                             activated_handle.as_ref(),
                             Some(model_switch_callback.clone()),
                             &config.pacing,
+                            config.agent.strict_tool_parsing,
                             config.agent.max_tool_result_chars,
                             config.agent.max_context_tokens,
                             None, // shared_budget
@@ -3463,6 +3474,11 @@ pub async fn process_message(
         None
     };
     let native_tools = provider.supports_native_tools();
+    let expose_text_tool_protocol = !native_tools && !config.agent.strict_tool_parsing;
+    if !native_tools && config.agent.strict_tool_parsing {
+        tool_descs.clear();
+        deferred_section.clear();
+    }
     let mut system_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
@@ -3476,7 +3492,7 @@ pub async fn process_message(
         config.agent.compact_context,
         config.agent.max_system_prompt_chars,
     );
-    if !native_tools {
+    if expose_text_tool_protocol {
         system_prompt.push_str(&build_tool_instructions_for_names(
             &tools_registry,
             &effective_tool_names,
@@ -4832,6 +4848,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -4890,6 +4907,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -4942,6 +4960,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -4993,6 +5012,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5051,6 +5071,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5109,6 +5130,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5168,6 +5190,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5225,6 +5248,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5282,6 +5306,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5422,6 +5447,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5502,6 +5528,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5574,6 +5601,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5641,6 +5669,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5721,6 +5750,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5791,6 +5821,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5881,6 +5912,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5945,6 +5977,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -5971,6 +6004,65 @@ mod tests {
                 .iter()
                 .all(|msg| !(msg.role == "user" && msg.content.starts_with("[Tool results]"))),
             "native mode should use role=tool history instead of prompt fallback wrapper"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_strict_tool_parsing_ignores_text_fallback_calls() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"{"content":"Need to call tool","tool_calls":[{"id":"call_abc","name":"count_tool","arguments":"{\"value\":\"X\"}"}]}"#,
+        ])
+        .with_native_tool_support();
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("do not infer tool calls from text"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            true,
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("strict parser should treat textual fallback payload as final text");
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(
+            result.contains("\"tool_calls\""),
+            "strict parser should preserve fallback-looking text, got: {result}"
         );
     }
 
@@ -6037,6 +6129,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6105,6 +6198,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6176,6 +6270,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6255,6 +6350,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6342,6 +6438,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7376,6 +7473,7 @@ Let me check the result."#;
             0.2,
             None,
             None,
+            false,
         )
         .await
         .expect("streaming should succeed");
@@ -7456,12 +7554,100 @@ Let me check the result."#;
             0.2,
             None,
             None,
+            false,
         )
         .await
         .expect("streaming should succeed");
 
         assert_eq!(outcome.response_text, "Hello there.");
         assert_eq!(outcome.reasoning_content, "Step 1: consider options.");
+    }
+
+    #[tokio::test]
+    async fn consume_provider_streaming_response_strict_tool_parsing_forwards_literal_tool_text() {
+        struct LiteralToolTextProvider;
+
+        #[async_trait]
+        impl Provider for LiteralToolTextProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("not used in this test")
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                anyhow::bail!("not used in this test")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<StreamEvent>,
+            > {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("Literal "))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        r#"<tool_call>{"name":"echo_tool","arguments":{"value":"ignored"}}</tool_call>"#,
+                    ))),
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(" done."))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = LiteralToolTextProvider;
+        let messages = vec![ChatMessage::user("quote a tool-shaped payload")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &messages,
+            None,
+            "mock-streaming-model",
+            0.2,
+            None,
+            Some(&tx),
+            true,
+        )
+        .await
+        .expect("streaming should succeed");
+        drop(tx);
+
+        let mut forwarded = String::new();
+        while let Some(delta) = rx.recv().await {
+            match delta {
+                StreamDelta::Text(text) => forwarded.push_str(&text),
+                StreamDelta::Status(_) => {}
+            }
+        }
+
+        assert_eq!(outcome.response_text, forwarded);
+        assert!(
+            forwarded.contains("<tool_call>"),
+            "strict streaming should forward literal tool-looking text"
+        );
+        assert!(
+            outcome.tool_calls.is_empty(),
+            "literal text should not be converted into tool calls"
+        );
     }
 
     // ── glob_match tests ──────────────────────────────────────────────────────
@@ -7657,6 +7843,7 @@ Let me check the result."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7819,6 +8006,7 @@ Let me check the result."#;
                     None,
                     None,
                     &zeroclaw_config::schema::PacingConfig::default(),
+                    false,
                     0,
                     0,
                     None,
@@ -7875,6 +8063,7 @@ Let me check the result."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7971,6 +8160,7 @@ Let me check the result."#;
                     None,
                     None,
                     &zeroclaw_config::schema::PacingConfig::default(),
+                    false,
                     0,
                     0,
                     None,
@@ -8032,6 +8222,7 @@ Let me check the result."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,

@@ -963,7 +963,8 @@ pub fn all_tools_with_runtime(
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
-        .with_memory(memory.clone());
+        .with_memory(memory.clone())
+        .with_strict_tool_parsing(root_config.agent.strict_tool_parsing);
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
