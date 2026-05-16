@@ -17,13 +17,12 @@ ZeroClaw emits structured logs, Prometheus metrics, and OpenTelemetry traces. Al
 
 ### Levels
 
-Set via the `RUST_LOG` env var. Examples:
+Set via the `RUST_LOG` env var. Leave it unset for ZeroClaw's built-in default (`info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn`). Examples:
 
 ```bash
-RUST_LOG=zeroclaw=info                       # default — high-signal events
-RUST_LOG=zeroclaw=debug                      # verbose — per tool call, per provider call
-RUST_LOG=zeroclaw::agent=trace               # very verbose — just the agent loop
-RUST_LOG=warn,zeroclaw::security=debug       # quiet except security subsystem
+RUST_LOG=debug                                       # verbose — per tool call, per provider call
+RUST_LOG=zeroclaw_runtime::agent=trace               # very verbose — just the agent loop
+RUST_LOG=warn,zeroclaw_runtime::security=debug       # quiet except security subsystem
 ```
 
 For persistent changes, put the value in your service unit:
@@ -31,7 +30,7 @@ For persistent changes, put the value in your service unit:
 ```ini
 # ~/.config/systemd/user/zeroclaw.service.d/override.conf
 [Service]
-Environment=RUST_LOG=zeroclaw=info,zeroclaw::security=debug
+Environment=RUST_LOG=info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn,zeroclaw_runtime::security=debug
 ```
 
 ### Format

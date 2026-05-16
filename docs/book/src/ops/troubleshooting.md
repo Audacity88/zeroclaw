@@ -158,7 +158,7 @@ Enable debug logging and catch the next failure:
 
 ```bash
 zeroclaw service stop
-RUST_LOG=zeroclaw=debug zeroclaw daemon
+RUST_LOG=debug zeroclaw daemon
 ```
 
 ### Gateway unreachable
