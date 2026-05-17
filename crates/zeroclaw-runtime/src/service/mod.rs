@@ -653,9 +653,27 @@ fn install_macos(config: &Config) -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
+    let plist =
+        render_macos_launch_agent_plist(&exe, &stdout, &stderr, homebrew_var_dir.as_deref());
+
+    fs::write(&file, plist)?;
+    println!("✅ Installed launchd service: {}", file.display());
+    if let Some(ref var_dir) = homebrew_var_dir {
+        println!("   Homebrew var: {}", var_dir.display());
+    }
+    println!("   Start with: zeroclaw service start");
+    Ok(())
+}
+
+fn render_macos_launch_agent_plist(
+    exe: &Path,
+    stdout: &Path,
+    stderr: &Path,
+    homebrew_var_dir: Option<&Path>,
+) -> String {
     // When running under Homebrew, inject ZEROCLAW_CONFIG_DIR and
     // WorkingDirectory so the daemon finds its data in the Homebrew prefix.
-    let env_section = if let Some(ref var_dir) = homebrew_var_dir {
+    let env_section = if let Some(var_dir) = homebrew_var_dir {
         format!(
             r#"  <key>EnvironmentVariables</key>
   <dict>
@@ -672,10 +690,10 @@ fn install_macos(config: &Config) -> Result<()> {
         String::new()
     };
 
-    let plist = format!(
-        r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
   <key>Label</key>
   <string>{label}</string>
@@ -700,15 +718,7 @@ fn install_macos(config: &Config) -> Result<()> {
         env_section = env_section,
         stdout = xml_escape(&stdout.display().to_string()),
         stderr = xml_escape(&stderr.display().to_string())
-    );
-
-    fs::write(&file, plist)?;
-    println!("✅ Installed launchd service: {}", file.display());
-    if let Some(ref var_dir) = homebrew_var_dir {
-        println!("   Homebrew var: {}", var_dir.display());
-    }
-    println!("   Start with: zeroclaw service start");
-    Ok(())
+    )
 }
 
 fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
@@ -1383,6 +1393,29 @@ pub fn xml_escape(raw: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod macos_plist_tests {
+    use super::*;
+
+    #[test]
+    fn macos_plist_renderer_uses_plain_xml_quotes() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/opt/homebrew/bin/zeroclaw"),
+            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stdout.log"),
+            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stderr.log"),
+            Some(Path::new("/opt/homebrew/var/zeroclaw")),
+        );
+
+        assert!(!plist.contains(r#"\""#));
+        assert!(plist.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
+        assert!(plist.contains(
+            r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#
+        ));
+        assert!(plist.contains(r#"<plist version="1.0">"#));
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+    }
 }
 
 #[cfg(all(test, zeroclaw_root_crate))]
