@@ -249,8 +249,9 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
-    /// Print raw LLM message payloads for local debugging; may include prompts,
-    /// history, and tool output.
+    /// Emit raw LLM message payload trace events for local debugging; default
+    /// logging writes them to stderr, but custom subscribers may route them
+    /// elsewhere. May include prompts, history, and tool output.
     #[arg(long, global = true)]
     log_llm: bool,
 
@@ -3949,8 +3950,10 @@ mod tests {
         let help = String::from_utf8(help).expect("help should be utf8");
 
         assert!(help.contains("--log-llm"));
-        assert!(help.contains("Print raw LLM message payloads"));
-        assert!(help.contains("may include prompts, history, and tool output"));
+        assert!(help.contains("Emit raw LLM message payload trace events"));
+        assert!(help.contains("default logging writes them to stderr"));
+        assert!(help.contains("custom subscribers may route them elsewhere"));
+        assert!(help.contains("May include prompts, history, and tool output"));
     }
 
     #[test]
