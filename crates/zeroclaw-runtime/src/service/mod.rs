@@ -1416,6 +1416,53 @@ mod macos_plist_tests {
         assert!(plist.contains(r#"<plist version="1.0">"#));
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
     }
+
+    #[test]
+    fn macos_plist_renderer_escapes_paths_and_omits_homebrew_section_when_absent() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            None,
+        );
+
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/bin/zeroclaw"));
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stdout.log"));
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stderr.log"));
+        assert!(!plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(!plist.contains("<key>WorkingDirectory</key>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plist_renderer_emits_plutil_parseable_xml() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            Some(Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw")),
+        );
+
+        let file = std::env::temp_dir().join(format!(
+            "zeroclaw-launch-agent-plist-{}.plist",
+            std::process::id()
+        ));
+        fs::write(&file, plist).expect("write plist fixture");
+
+        let output = Command::new("plutil")
+            .arg("-lint")
+            .arg(&file)
+            .output()
+            .expect("run plutil");
+        let _ = fs::remove_file(&file);
+
+        assert!(
+            output.status.success(),
+            "plutil failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[cfg(all(test, zeroclaw_root_crate))]
