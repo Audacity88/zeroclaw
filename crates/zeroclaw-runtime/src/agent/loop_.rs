@@ -1187,7 +1187,7 @@ pub async fn run(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
-        let eff_max_history_messages = agent.resolved.max_history_messages;
+        let eff_max_history_turns = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_model_context_window = agent.resolved.model_context_window;
@@ -2725,8 +2725,8 @@ pub async fn run(
                     }
                 }
 
-                // Hard cap as a safety net.
-                trim_history(&mut history, eff_max_history_messages);
+                // Whole-turn retention limit as a safety net.
+                trim_history(&mut history, eff_max_history_turns);
 
                 // Restore base system prompt after the per-turn tool framing
                 // and optional thinking prefix have been applied.
@@ -12552,39 +12552,30 @@ Let me check the result."#;
             ChatMessage::user("msg 1"),
             ChatMessage::assistant("reply 1"),
         ];
-        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
+        trim_history(&mut history, 1);
         assert_eq!(history.len(), 3, "should not trim when exactly at limit");
     }
 
     #[test]
-    fn trim_history_keeps_first_user_anchor_and_recent_tail() {
-        // The framing anchor (first user message) must survive trim so the
-        // model doesn't start a turn thinking "Continue" is the first thing
-        // it ever saw. Middle messages are the ones that get dropped.
+    fn trim_history_keeps_latest_complete_turns() {
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user("anchor: what's the task"),
-            ChatMessage::assistant("middle reply 1"),
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old reply"),
             ChatMessage::user("middle user 1"),
             ChatMessage::assistant("middle reply 2"),
             ChatMessage::user("recent user"),
             ChatMessage::assistant("recent reply"),
         ];
-        // max_history = 3 → keep anchor + 2 most recent (=3 non-system).
-        trim_history(&mut history, 3);
+        trim_history(&mut history, 2);
         assert_eq!(history[0].role, "system");
-        assert_eq!(
-            history[1].content, "anchor: what's the task",
-            "first user message (framing anchor) must survive"
-        );
+        assert_eq!(history[1].content, "middle user 1");
         let last = history.last().expect("history not empty");
         assert_eq!(last.content, "recent reply", "tail must be preserved");
     }
 
     #[test]
-    fn trim_history_falls_back_to_tail_when_max_history_is_one() {
-        // With max_history=1 there's no room for both anchor and tail; fall
-        // back to plain head-drop so we don't produce a degenerate window.
+    fn trim_history_keeps_newest_incomplete_turn_when_limit_is_one() {
         let mut history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("anchor"),
@@ -12595,6 +12586,31 @@ Let me check the result."#;
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "recent");
+    }
+
+    #[test]
+    fn trim_history_does_not_count_tool_rows_as_turns() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run tools"),
+        ];
+        for index in 0..60 {
+            history.push(ChatMessage::assistant(format!("tool call {index}")));
+            history.push(ChatMessage::user(format!("[Tool results]\nresult {index}")));
+        }
+        history.push(ChatMessage::assistant("done"));
+        let original: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+
+        trim_history(&mut history, 1);
+
+        let retained: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+        assert_eq!(retained, original, "tool rows must remain part of one turn");
     }
 
     #[test]
