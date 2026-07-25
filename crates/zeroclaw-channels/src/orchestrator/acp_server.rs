@@ -2409,6 +2409,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         TurnEvent::ApprovalRequest { .. } => return None,
         TurnEvent::HistoryTrimmed {
             dropped_messages,
+            dropped_turns,
             kept_turns,
             reason,
         } => JsonRpcNotification {
@@ -2419,6 +2420,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             params: serde_json::json!({
                 "sessionId": session_id,
                 "droppedMessages": dropped_messages,
+                "droppedTurns": dropped_turns,
                 "keptTurns": kept_turns,
                 "reason": reason,
             }),
@@ -4051,6 +4053,7 @@ mod tests {
             "restored-session",
             &TurnEvent::HistoryTrimmed {
                 dropped_messages: 12,
+                dropped_turns: 4,
                 kept_turns: 3,
                 reason: "message limit".to_string(),
             },
@@ -4064,6 +4067,7 @@ mod tests {
             serde_json::json!({
                 "sessionId": "restored-session",
                 "droppedMessages": 12,
+                "droppedTurns": 4,
                 "keptTurns": 3,
                 "reason": "message limit",
             })

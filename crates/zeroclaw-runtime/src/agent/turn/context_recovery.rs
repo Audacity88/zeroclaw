@@ -114,6 +114,7 @@ pub(crate) async fn try_recover_context_overflow(
                 let _ = tx
                     .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
                         dropped_messages,
+                        dropped_turns,
                         kept_turns,
                         reason: reason.clone(),
                     })
@@ -198,10 +199,12 @@ mod tests {
         match event {
             zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
             } => {
                 assert!(dropped_messages > 0, "must report dropped messages");
+                assert!(dropped_turns > 0, "must report dropped turns");
                 assert!(kept_turns >= 1, "must keep at least the current turn");
                 assert_eq!(
                     reason,

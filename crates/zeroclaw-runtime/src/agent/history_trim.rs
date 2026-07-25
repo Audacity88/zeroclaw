@@ -215,7 +215,10 @@ pub(crate) fn trim_to_recent_turn_count(
         };
     }
 
-    let leading_system = history.iter().take_while(|message| is_system(message)).count();
+    let leading_system = history
+        .iter()
+        .take_while(|message| is_system(message))
+        .count();
     let system = history[..leading_system].to_vec();
     let body = &history[leading_system..];
     let boundaries: Vec<usize> = body

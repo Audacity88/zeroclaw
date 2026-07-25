@@ -249,6 +249,7 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
 #[derive(Debug)]
 struct HistoryTrimNotice {
     dropped_messages: usize,
+    dropped_turns: usize,
     kept_turns: usize,
     reason: String,
 }
@@ -257,6 +258,7 @@ impl HistoryTrimNotice {
     fn into_turn_event(self) -> TurnEvent {
         TurnEvent::HistoryTrimmed {
             dropped_messages: self.dropped_messages,
+            dropped_turns: self.dropped_turns,
             kept_turns: self.kept_turns,
             reason: self.reason,
         }
@@ -845,8 +847,7 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_turn_limit_resolver: self
-                .structured_history_turn_limit_resolver,
+            structured_history_turn_limit_resolver: self.structured_history_turn_limit_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             model_provider_name: self
@@ -1784,6 +1785,7 @@ impl Agent {
 
         Some(HistoryTrimNotice {
             dropped_messages: result.dropped_messages,
+            dropped_turns: result.dropped_turns,
             kept_turns: result.kept_turns,
             reason,
         })
@@ -6664,18 +6666,20 @@ mod tests {
         while let Ok(event) = event_rx.try_recv() {
             if let TurnEvent::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
             } = event
             {
-                trim_events.push((dropped_messages, kept_turns, reason));
+                trim_events.push((dropped_messages, dropped_turns, kept_turns, reason));
             }
         }
         assert_eq!(trim_events.len(), 1, "one streamed trim event is required");
         assert_eq!(trim_events[0].0, 2);
         assert_eq!(trim_events[0].1, 1);
+        assert_eq!(trim_events[0].2, 1);
         assert_eq!(
-            trim_events[0].2,
+            trim_events[0].3,
             crate::i18n::get_required_cli_string("history-trim-reason-message-cap")
         );
         assert!(capturing.events.lock().iter().any(|event| matches!(

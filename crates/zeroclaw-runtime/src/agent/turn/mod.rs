@@ -156,6 +156,7 @@ async fn enforce_reported_budget(
             let _ = tx
                 .send(TurnEvent::HistoryTrimmed {
                     dropped_messages: result.dropped_messages,
+                    dropped_turns: result.dropped_turns,
                     kept_turns: result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                 })
@@ -481,6 +482,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     let _ = tx
                         .send(TurnEvent::HistoryTrimmed {
                             dropped_messages: result.dropped_messages,
+                            dropped_turns: result.dropped_turns,
                             kept_turns: result.kept_turns,
                             reason: crate::i18n::get_required_cli_string(
                                 "history-trim-reason-budget",
