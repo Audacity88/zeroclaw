@@ -15,9 +15,12 @@ impl DockerRuntime {
     }
 
     fn workspace_mount_path(&self, workspace_dir: &Path) -> Result<PathBuf> {
-        let resolved = workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_dir.to_path_buf());
+        let resolved = workspace_dir.canonicalize().with_context(|| {
+            format!(
+                "Failed to canonicalize Docker workspace path {}",
+                workspace_dir.display()
+            )
+        })?;
 
         if !resolved.is_absolute() {
             anyhow::bail!(
@@ -34,12 +37,17 @@ impl DockerRuntime {
             return Ok(resolved);
         }
 
-        let allowed = self.config.allowed_workspace_roots.iter().any(|root| {
-            let root_path = Path::new(root)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(root));
-            resolved.starts_with(root_path)
-        });
+        let allowed_roots = self
+            .config
+            .allowed_workspace_roots
+            .iter()
+            .map(|root| {
+                Path::new(root)
+                    .canonicalize()
+                    .with_context(|| format!("Failed to canonicalize Docker workspace root {root}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let allowed = allowed_roots.iter().any(|root| resolved.starts_with(root));
 
         if !allowed {
             anyhow::bail!(
@@ -187,16 +195,95 @@ mod tests {
 
     #[test]
     fn docker_workspace_allowlist_blocks_outside_paths() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
         let cfg = DockerRuntimeConfig {
-            allowed_workspace_roots: vec!["/tmp/allowed".into()],
+            allowed_workspace_roots: vec![allowed.path().to_string_lossy().into_owned()],
             ..DockerRuntimeConfig::default()
         };
         let runtime = DockerRuntime::new(cfg);
 
-        let outside = PathBuf::from("/tmp/blocked_workspace");
-        let result = runtime.build_shell_command("echo test", &outside);
+        let err = runtime
+            .build_shell_command("echo test", outside.path())
+            .unwrap_err();
+        let message = format!("{err:#}");
 
-        assert!(result.is_err());
+        assert!(
+            message.contains("is not in runtime.docker.allowed_workspace_roots"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn docker_workspace_allowlist_rejects_missing_traversal_path() {
+        let allowed = tempfile::tempdir().unwrap();
+        let workspace = allowed
+            .path()
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("escape");
+        let cfg = DockerRuntimeConfig {
+            allowed_workspace_roots: vec![allowed.path().to_string_lossy().into_owned()],
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+
+        let err = runtime
+            .build_shell_command("echo test", &workspace)
+            .unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("Failed to canonicalize Docker workspace path"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn docker_workspace_allowlist_rejects_missing_configured_root() {
+        let allowed = tempfile::tempdir().unwrap();
+        let workspace = allowed.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let missing_root = allowed.path().join("missing-root");
+        let cfg = DockerRuntimeConfig {
+            allowed_workspace_roots: vec![
+                allowed.path().to_string_lossy().into_owned(),
+                missing_root.to_string_lossy().into_owned(),
+            ],
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+
+        let err = runtime
+            .build_shell_command("echo test", &workspace)
+            .unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains("Failed to canonicalize Docker workspace root"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn docker_workspace_allowlist_accepts_existing_path_under_root() {
+        let allowed = tempfile::tempdir().unwrap();
+        let workspace = allowed.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let cfg = DockerRuntimeConfig {
+            allowed_workspace_roots: vec![allowed.path().to_string_lossy().into_owned()],
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+
+        let command = runtime
+            .build_shell_command("echo test", &workspace)
+            .unwrap();
+        let debug = format!("{command:?}");
+        let canonical_workspace = workspace.canonicalize().unwrap();
+
+        assert!(debug.contains(canonical_workspace.to_string_lossy().as_ref()));
     }
 
     // ── §3.3 / §3.4 Docker mount & network isolation tests ──
