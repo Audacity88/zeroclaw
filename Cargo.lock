@@ -12865,6 +12865,7 @@ dependencies = [
  "cargo_metadata 0.18.1",
  "clap",
  "fluent-syntax",
+ "pulldown-cmark",
  "reqwest 0.12.28",
  "schemars 1.2.1",
  "serde",
