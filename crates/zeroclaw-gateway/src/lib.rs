@@ -1128,7 +1128,18 @@ pub async fn run_gateway(
                     // One canonical bot secret: an explicit `bot_token`
                     // wins, else fall back to `webhook_secret` (Nextcloud
                     // issues one secret per bot for both directions).
-                    nc.bot_token.clone().or_else(|| nc.webhook_secret.clone()),
+                    nc.resolve_bot_secret().unwrap_or_else(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            &e.to_string()
+                        );
+                        None
+                    }),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias.clone(),
                     peer_resolver,
@@ -1144,12 +1155,23 @@ pub async fn run_gateway(
         .nextcloud_talk
         .iter()
         .filter_map(|(alias, nc)| {
-            let secret = nc
-                .webhook_secret
-                .as_deref()
-                .map(str::trim)
-                .filter(|secret| !secret.is_empty())
-                .map(ToOwned::to_owned)?;
+            // Same resolver as the outbound signing path: Nextcloud installs one
+            // secret per bot, so inbound verification and outbound signing must
+            // agree. A conflict or an unresolved secret yields no entry, and the
+            // handler rejects rather than skipping verification.
+            let secret = match nc.resolve_bot_secret() {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return None,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &e.to_string()
+                    );
+                    return None;
+                }
+            };
             Some((alias.clone(), Arc::from(secret)))
         })
         .collect();
@@ -3456,8 +3478,20 @@ async fn process_nextcloud_talk_webhook(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(webhook_secret) = webhook_secret {
+    // ── Security: Nextcloud Talk webhooks MUST be signature-verified ──
+    // Fail closed: with no resolved bot secret we cannot verify the signature, so the
+    // request is rejected. Previously an unresolved secret skipped verification
+    // entirely, which left a bot_token-only configuration accepting unverified inbound
+    // webhooks while still signing outbound replies.
+    let Some(webhook_secret) = webhook_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "nextcloud_talk: no bot secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let random = headers
             .get("X-Nextcloud-Talk-Random")
             .and_then(|v| v.to_str().ok())
