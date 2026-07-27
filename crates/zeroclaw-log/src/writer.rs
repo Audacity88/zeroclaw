@@ -90,6 +90,9 @@ enum WriterJob {
     /// Block until the worker has drained all previously-queued jobs and
     /// completed a `sync_all`. Acks via a rendezvous channel.
     Flush(SyncSender<()>),
+    /// Drain all earlier jobs, sync the active file, and exit. Re-init uses
+    /// the acknowledgement to establish a quiescent migration boundary.
+    Shutdown(SyncSender<()>),
 }
 
 /// Set when the worker thread has exited (panic or normal). Used by
@@ -114,6 +117,8 @@ struct WriterState {
 }
 
 static WRITER: OnceLock<parking_lot::RwLock<Option<Arc<WriterState>>>> = OnceLock::new();
+static REINIT_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static HANDOFF_BUFFER: OnceLock<parking_lot::Mutex<Option<Vec<Value>>>> = OnceLock::new();
 
 fn slot() -> &'static parking_lot::RwLock<Option<Arc<WriterState>>> {
     WRITER.get_or_init(|| parking_lot::RwLock::new(None))
@@ -124,11 +129,31 @@ fn current_state() -> Option<Arc<WriterState>> {
 }
 
 pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
+    init_from_config_with_migration(
+        config,
+        workspace_dir,
+        migrate::migrate_legacy_jsonl_in_place,
+    );
+}
+
+fn init_from_config_with_migration<F>(config: &LogConfig, workspace_dir: &Path, migrate_file: F)
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let _reinit_guard = REINIT_LOCK.lock();
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
-    if policy.storage.is_enabled()
+    // Route writes emitted during reload into a temporary buffer. Taking this
+    // lock before removing the old writer closes the race with producers that
+    // are about to clone its sender.
+    *handoff_buffer().lock() = Some(Vec::new());
+
+    let previous_stopped = shutdown_current_writer();
+
+    if previous_stopped
+        && policy.storage.is_enabled()
         && policy.path.exists()
-        && let Err(err) = migrate::migrate_legacy_jsonl_in_place(&policy.path)
+        && let Err(err) = migrate_file(&policy.path)
     {
         tracing::warn!(
             target: "zeroclaw_log",
@@ -137,11 +162,13 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
             "log: legacy JSONL migration failed; daemon continuing with mixed-shape file"
         );
     }
-
-    // Tear down any previous writer before installing the new one. Taking
-    // the slot first stops new producers from cloning the old Arc; dropping
-    // the Arc drops its SyncSender and disconnects the old worker.
-    shutdown_current_writer();
+    if !previous_stopped && policy.storage.is_enabled() && policy.path.exists() {
+        tracing::warn!(
+            target: "zeroclaw_log",
+            path = %policy.path.display(),
+            "log: skipping legacy JSONL migration because the previous writer is still stopping"
+        );
+    }
 
     let (tx, rx) = sync_channel::<WriterJob>(QUEUE_CAPACITY);
     let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
@@ -164,35 +191,67 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
         tx,
         worker_dead,
     });
-    *slot().write() = Some(state);
+    *slot().write() = Some(Arc::clone(&state));
+
+    // Keep the handoff lock while replaying so no later producer can overtake
+    // an event accepted during reload.
+    let mut handoff = handoff_buffer().lock();
+    let buffered = handoff.take().unwrap_or_default();
+    for value in buffered {
+        try_persist(&state, value);
+    }
 }
 
-/// Remove the currently installed writer (if any) and wait for its worker
-/// thread to exit. Best-effort: if another thread still holds an
-/// `Arc<WriterState>` clone the channel stays open until that clone drops,
-/// and we only wait up to [`SHUTDOWN_WAIT`] before proceeding.
-fn shutdown_current_writer() {
+fn handoff_buffer() -> &'static parking_lot::Mutex<Option<Vec<Value>>> {
+    HANDOFF_BUFFER.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// Remove the currently installed writer (if any), drain its queue, and wait
+/// for the worker to sync and exit. The explicit shutdown job does not depend
+/// on temporary `Arc<WriterState>` clones releasing their senders.
+fn shutdown_current_writer() -> bool {
     let previous = slot().write().take();
     let Some(prev) = previous else {
-        return;
+        return true;
     };
-    let dead = Arc::clone(&prev.worker_dead);
-    // Dropping `prev` drops the last slot-owned SyncSender. Any in-flight
-    // `record_event` that already cloned the Arc may keep the channel open
-    // briefly; the wait below covers the common case.
+    if prev.worker_dead.load(Ordering::Acquire) {
+        return true;
+    }
+
+    let (ack_tx, ack_rx) = sync_channel(0);
+    let start = Instant::now();
+    let mut shutdown = WriterJob::Shutdown(ack_tx);
+    loop {
+        match prev.tx.try_send(shutdown) {
+            Ok(()) => break,
+            Err(TrySendError::Full(job)) if start.elapsed() < SHUTDOWN_WAIT => {
+                shutdown = job;
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(
+                    target: "zeroclaw_log",
+                    "log: previous writer queue did not drain within {:?}; continuing with re-init",
+                    SHUTDOWN_WAIT
+                );
+                return false;
+            }
+            Err(TrySendError::Disconnected(_)) => return true,
+        }
+    }
     drop(prev);
 
-    let start = Instant::now();
-    while !dead.load(Ordering::Acquire) && start.elapsed() < SHUTDOWN_WAIT {
-        thread::sleep(Duration::from_millis(1));
+    let remaining = SHUTDOWN_WAIT.saturating_sub(start.elapsed());
+    if ack_rx.recv_timeout(remaining).is_ok() {
+        return true;
     }
-    if !dead.load(Ordering::Acquire) {
-        tracing::warn!(
-            target: "zeroclaw_log",
-            "log: previous writer worker did not exit within {:?}; continuing with re-init",
-            SHUTDOWN_WAIT
-        );
-    }
+
+    tracing::warn!(
+        target: "zeroclaw_log",
+        "log: previous writer worker did not exit within {:?}; continuing with re-init",
+        SHUTDOWN_WAIT
+    );
+    false
 }
 
 /// Spawn the disk-persistence worker thread. The worker owns the active
@@ -215,6 +274,7 @@ fn spawn_worker(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
 fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
     let mut writes_since_sync: u64 = 0;
     let mut last_sync = Instant::now();
+    let mut shutdown_ack = None;
 
     loop {
         let job = match rx.recv_timeout(IDLE_TICK) {
@@ -249,6 +309,10 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
                     last_sync = Instant::now();
                     let _ = ack.send(());
                 }
+                WriterJob::Shutdown(ack) => {
+                    shutdown_ack = Some(ack);
+                    break;
+                }
             }
         }
 
@@ -267,11 +331,13 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
         }
     }
 
-    // Channel closed (all senders dropped). Final sync so any pending
-    // writes that the worker pulled off the queue land on disk before
-    // we exit.
+    // Channel closed or an ordered shutdown was requested. Final sync so any
+    // writes pulled from the queue land on disk before exit is acknowledged.
     let _ = sync_active_file(&state);
     state.worker_dead.store(true, Ordering::Release);
+    if let Some(ack) = shutdown_ack {
+        let _ = ack.send(());
+    }
 }
 
 /// Serialize + write one event. Opens the active file fresh, runs the
@@ -420,9 +486,30 @@ pub fn record_event(event: LogEvent) {
         let _ = hook.send(broadcast_value);
     }
 
+    // Serialize persistence handoff with re-init. Once reload begins, events
+    // are buffered until the old worker has drained and the replacement is
+    // installed, so migration cannot replace a file that is still receiving
+    // accepted writes.
+    let mut handoff = handoff_buffer().lock();
+    if let Some(buffer) = handoff.as_mut() {
+        if buffer.len() < QUEUE_CAPACITY {
+            buffer.push(value);
+        } else {
+            tracing::warn!(
+                target: "zeroclaw_log_internal",
+                queue_capacity = QUEUE_CAPACITY,
+                "log: reload handoff buffer full; dropping event"
+            );
+        }
+        return;
+    }
     let Some(state) = current_state() else {
         return;
     };
+    try_persist(&state, value);
+}
+
+fn try_persist(state: &WriterState, value: Value) {
     if !state.policy.storage.is_enabled() {
         return;
     }
@@ -1065,12 +1152,9 @@ mod tests {
             !first_dead.load(Ordering::Acquire),
             "fresh worker should be alive"
         );
-        // Drop our Arc clone so shutdown can close the channel. Holding it
-        // would keep the SyncSender alive and prevent the worker from exiting.
-        drop(first);
-
         // Re-init with a different policy must tear down the first worker
-        // (channel disconnect → worker_dead) before installing the second.
+        // before installing the second, even while this test holds a state
+        // clone (and therefore another sender) across the handoff.
         install_rotating(tmp.path(), 0, false, 0, 0);
 
         assert!(
@@ -1087,6 +1171,67 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first_dead, &second.worker_dead),
             "re-init must install a fresh WriterState, not mutate the old one"
+        );
+    }
+
+    #[test]
+    fn reinit_preserves_event_accepted_while_migrating() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 100);
+        emit("before-reload");
+
+        let path = runtime_trace_path().unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"id":"legacy-id","timestamp":"2026-05-15T19:00:00Z","event_type":"legacy-test","message":"legacy-row"}}"#
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+
+        let cfg = LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 100,
+            ..LogConfig::default()
+        };
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let mut event = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            event.message = Some("accepted-during-migration".to_string());
+            record_event(event);
+            accepted_tx.send(()).unwrap();
+        });
+
+        init_from_config_with_migration(&cfg, tmp.path(), |migration_path| {
+            start_tx.send(()).unwrap();
+            accepted_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("concurrent event should be accepted into the handoff buffer");
+            migrate::migrate_legacy_jsonl_in_place(migration_path)
+        });
+        producer.join().unwrap();
+        flush_for_test().unwrap();
+
+        let events: Vec<Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            events.iter().any(|event| {
+                event.get("message").and_then(Value::as_str) == Some("accepted-during-migration")
+            }),
+            "an event accepted during migration must be replayed to the replacement writer"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.get("id").and_then(Value::as_str) == Some("legacy-id")
+                    && event.get("schema_version").and_then(Value::as_u64) == Some(2)
+            }),
+            "the legacy row should still be migrated during the quiescent handoff"
         );
     }
 
