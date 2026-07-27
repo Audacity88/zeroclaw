@@ -15,11 +15,31 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 ## Prerequisites
 
 - **Nextcloud server** with the Talk app enabled (v17 or later recommended)
-- **Bot registered** in Talk's bot admin settings, give it a display name (e.g. `zeroclaw-bot`)
-- **Bot secret** from that registration. Nextcloud issues one shared secret per bot, used both to verify inbound webhook signatures and to sign outbound bot-API replies. Set it as `webhook_secret` (canonical); `bot_token` exists only if your deployment genuinely needs a different secret for outbound sends
+- **Bot installed** with `occ talk:bot:install`, which is how Nextcloud documents
+  registering a webhook bot. Give it a display name (e.g. `zeroclaw-bot`).
+- **Bot secret** from that installation. Nextcloud issues **one** shared secret per
+  bot, used both to verify inbound webhook signatures and to sign outbound bot-API
+  replies. Set it as `webhook_secret`, which is canonical. `bot_token` is a
+  **deprecated alias for the same value**: if both are set they must be identical.
+  It cannot hold a different outbound secret. Conflicting non-empty values are
+  **not** silently resolved in favour of one; the conflict is logged and the alias
+  resolves to no secret, so the channel then behaves exactly as if unconfigured —
+  inbound `401`, no outbound send.
 - **Publicly-reachable gateway**: see [Setup → Container](../setup/container.md) for tunnel options if self-hosted
 
-Sending fails closed (no request is sent) if neither `bot_token` nor `webhook_secret` is configured; misconfiguration never produces an unsigned or invalid-signature request on the wire.
+Both directions fail closed on a missing secret, and there is no unauthenticated
+mode:
+
+- **Inbound**: signature verification is **mandatory**. With no resolved secret the
+  webhook endpoint returns `401` and never reaches the agent. There is no
+  "public" mode that accepts unverified webhooks.
+- **Outbound**: no request is sent at all, so misconfiguration never puts an
+  unsigned or wrongly-signed request on the wire.
+
+> **Upgrading is a breaking change.** A deployment that previously ran without a
+> secret accepted webhooks; it now rejects every one of them with `401`. Install
+> the bot with `occ talk:bot:install`, then set that secret as `webhook_secret`
+> before upgrading, or inbound messages stop being processed.
 
 ## Configuration
 
