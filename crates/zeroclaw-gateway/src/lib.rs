@@ -6676,15 +6676,22 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        // Obviously-fake placeholder, never a real credential.
+        let secret = "fake-nextcloud-webhook-secret-not-real";
+        let random = "0123456789abcdef0123456789abcdef";
+
+        // The same secret governs both directions now, so the channel gets it
+        // too rather than the empty string this test used to pass.
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             None,
-            String::new(),
+            secret.to_string(),
             "default",
             Arc::new(|| vec!["*".to_string()]),
         ));
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let signature = compute_nextcloud_signature_hex(secret, random, body);
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
@@ -6713,7 +6720,16 @@ mod tests {
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([("default".to_string(), channel)]),
-            nextcloud_talk_webhook_secret: HashMap::new(),
+            // A resolved secret, not an empty map. Inbound verification is now
+            // mandatory and fail-closed, so an unsigned request is rejected with
+            // 401 before the handler ever spawns the LLM task — which would make
+            // this test pass for the wrong reason (no provider call because the
+            // request was refused, not because the ack raced ahead of a slow
+            // provider). Signing the request keeps it exercising #6156.
+            nextcloud_talk_webhook_secret: HashMap::from([(
+                "default".to_string(),
+                std::sync::Arc::<str>::from(secret),
+            )]),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             #[cfg(feature = "channel-wati")]
@@ -6746,12 +6762,22 @@ mod tests {
             webauthn: None,
         };
 
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+
         let start = std::time::Instant::now();
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             Box::pin(handle_nextcloud_talk_webhook(
                 State(state),
-                HeaderMap::new(),
+                headers,
                 Bytes::from(body),
             )),
         )
