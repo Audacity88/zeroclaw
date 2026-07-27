@@ -35,45 +35,16 @@ Read the [Philosophy](docs/book/src/philosophy/index.md) for the four opinions t
 
 ### Unix (recommended)
 
+<!-- >>> generated:readme-unix-fast by `cargo generate installers` - do not edit <<< -->
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
-"$HOME/.cargo/bin/zeroclaw" quickstart
+"${CARGO_HOME:-$HOME/.cargo}/bin/zeroclaw" quickstart
 ```
+<!-- >>> end generated:readme-unix-fast <<< -->
 
 ### Windows (recommended)
 
-Run this idempotent prebuilt install from PowerShell:
-
-```powershell
-# Idempotent: re-running this block is a no-op when zeroclaw is already
-# installed at the latest release and on the user PATH. After a release
-# bumps, the version check fails and the install side runs again.
-$ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
-$dst = "$env:USERPROFILE\.zeroclaw\bin"
-$exe = "$dst\zeroclaw.exe"
-
-$current = if (Test-Path $exe) {
-    ((& $exe --version 2>$null) | Select-String -Pattern '\d+\.\d+\.\d+').Matches.Value
-} else { '' }
-
-if ($current -ne $ver) {
-    $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
-    New-Item -ItemType Directory -Force -Path $dst | Out-Null
-    Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
-    Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
-}
-
-$environment = [Environment]
-$userPath = $environment::GetEnvironmentVariable('Path', 'User')
-if (($userPath -split ';') -notcontains $dst) {
-    $environment::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
-}
-if (($env:Path -split ';') -notcontains $dst) {
-    $env:Path = "$dst;$env:Path"
-}
-
-& $exe quickstart
-```
+Use the Rust-free [prebuilt PowerShell path](docs/book/src/setup/windows.md#option-1-prebuilt-binary-recommended) in the Windows setup guide. It installs the current release, updates PATH, and runs Quickstart.
 
 For the guided Unix installer, source builds, app and feature selection, and PATH behavior, compare the [installation paths](docs/book/src/getting-started/quickstart.md#install).
 

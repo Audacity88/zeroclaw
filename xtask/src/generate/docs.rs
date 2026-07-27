@@ -4,13 +4,6 @@ use super::spec::{
 };
 use std::path::Path;
 
-const EXPECTED_ROUTE_IDS: [RouteId; 4] = [
-    RouteId::UnixFast,
-    RouteId::UnixGuided,
-    RouteId::WindowsPrebuilt,
-    RouteId::AdvancedSource,
-];
-
 fn route_title(id: RouteId) -> &'static str {
     match id {
         RouteId::UnixFast => "Unix fast path",
@@ -38,7 +31,7 @@ fn route_command(variant: &InstallVariant) -> anyhow::Result<String> {
             variant.invocation.command().unwrap_or_default()
         )),
         (Platform::Windows, Invocation::ManualPrebuilt) => Ok(
-            "Use the idempotent PowerShell block in the [Windows setup guide](../setup/windows.md)."
+            "Use the PowerShell block in the [Windows setup guide](../setup/windows.md). Installation and PATH setup are idempotent; Quickstart still runs."
                 .to_owned(),
         ),
         (Platform::Windows, Invocation::CargoInstall) => Ok(format!(
@@ -183,11 +176,7 @@ fn render_route(route: &InstallRoute) -> anyhow::Result<String> {
 }
 
 fn render_routes(routes: &[InstallRoute]) -> anyhow::Result<String> {
-    let actual: Vec<_> = routes.iter().map(|route| route.id).collect();
-    anyhow::ensure!(
-        actual.as_slice() == EXPECTED_ROUTE_IDS.as_slice(),
-        "canonical install routes must contain each supported route exactly once in presentation order"
-    );
+    spec::validate_install_routes(routes)?;
     anyhow::ensure!(
         routes == spec::install_routes()?.as_slice(),
         "documented install routes must match every canonical platform contract"
@@ -218,15 +207,85 @@ pub fn render_markdown() -> anyhow::Result<String> {
 }
 
 const WINDOWS_PREBUILT_ZONE: &str = "windows-prebuilt-powershell";
+const UNIX_FAST_COMMAND_ZONE: &str = "unix-fast-command";
+const README_UNIX_FAST_ZONE: &str = "readme-unix-fast";
 
-fn windows_begin() -> String {
-    format!(
-        "<!-- >>> generated:{WINDOWS_PREBUILT_ZONE} by `cargo generate installers` - do not edit <<< -->"
-    )
+fn markdown_begin(zone: &str) -> String {
+    format!("<!-- >>> generated:{zone} by `cargo generate installers` - do not edit <<< -->")
 }
 
-fn windows_end() -> String {
-    format!("<!-- >>> end generated:{WINDOWS_PREBUILT_ZONE} <<< -->")
+fn markdown_end(zone: &str) -> String {
+    format!("<!-- >>> end generated:{zone} <<< -->")
+}
+
+fn splice_markdown(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
+    let begin = markdown_begin(zone);
+    let end = markdown_end(zone);
+    let begin_count = current.match_indices(&begin).count();
+    let end_count = current.match_indices(&end).count();
+    anyhow::ensure!(
+        begin_count == 1 && end_count == 1,
+        "{zone} must contain exactly one generated sentinel pair"
+    );
+    let begin_at = current
+        .find(&begin)
+        .ok_or_else(|| anyhow::Error::msg(format!("missing {zone} begin sentinel")))?;
+    let after_begin = begin_at + begin.len();
+    let end_at = current
+        .find(&end)
+        .ok_or_else(|| anyhow::Error::msg(format!("missing {zone} end sentinel")))?;
+    anyhow::ensure!(after_begin < end_at, "{zone} sentinels are out of order");
+
+    let mut rendered = String::new();
+    rendered.push_str(&current[..after_begin]);
+    rendered.push('\n');
+    rendered.push_str(body);
+    rendered.push('\n');
+    rendered.push_str(&current[end_at..]);
+    Ok(rendered)
+}
+
+fn unix_fast_variant(routes: &[InstallRoute]) -> anyhow::Result<&InstallVariant> {
+    routes
+        .iter()
+        .find(|route| route.id == RouteId::UnixFast)
+        .ok_or_else(|| anyhow::Error::msg("missing canonical Unix fast route"))?
+        .variant(Platform::Unix)
+}
+
+fn render_unix_fast_command_block(routes: &[InstallRoute]) -> anyhow::Result<String> {
+    let variant = unix_fast_variant(routes)?;
+    let command = variant
+        .invocation
+        .command()
+        .ok_or_else(|| anyhow::Error::msg("Unix fast route must define an entry command"))?;
+    Ok(format!("```sh\n{command}\n```"))
+}
+
+fn render_readme_unix_fast_block(routes: &[InstallRoute]) -> anyhow::Result<String> {
+    let variant = unix_fast_variant(routes)?;
+    let command = variant
+        .invocation
+        .command()
+        .ok_or_else(|| anyhow::Error::msg("Unix fast route must define an entry command"))?;
+    let quickstart_subcommand = variant
+        .quickstart_command
+        .strip_prefix("zeroclaw ")
+        .filter(|subcommand| !subcommand.is_empty() && !subcommand.contains(char::is_whitespace))
+        .ok_or_else(|| anyhow::Error::msg("Unix Quickstart command must be one subcommand"))?;
+    Ok(format!(
+        "```sh\n{command}\n\"${{CARGO_HOME:-$HOME/.cargo}}/bin/zeroclaw\" {quickstart_subcommand}\n```"
+    ))
+}
+
+pub fn render_unix_fast_command_zone(_root: &Path, current: &str) -> anyhow::Result<String> {
+    let body = render_unix_fast_command_block(&spec::install_routes()?)?;
+    splice_markdown(current, UNIX_FAST_COMMAND_ZONE, &body)
+}
+
+pub fn render_readme_unix_fast_zone(_root: &Path, current: &str) -> anyhow::Result<String> {
+    let body = render_readme_unix_fast_block(&spec::install_routes()?)?;
+    splice_markdown(current, README_UNIX_FAST_ZONE, &body)
 }
 
 fn render_windows_prebuilt_block(routes: &[InstallRoute]) -> anyhow::Result<String> {
@@ -254,9 +313,9 @@ fn render_windows_prebuilt_block(routes: &[InstallRoute]) -> anyhow::Result<Stri
         .ok_or_else(|| anyhow::Error::msg("Windows Quickstart command must be one subcommand"))?;
 
     Ok(r#"```powershell
-# Idempotent: re-running this block is a no-op when zeroclaw is already
-# installed at the latest release and on the user PATH. After a release
-# bumps, the version check fails and the install side runs again.
+# Installation and PATH setup are idempotent. If zeroclaw is already at the
+# latest release and on the user PATH, those steps are skipped; Quickstart
+# still runs at the end.
 $ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
 $dst = "$env:USERPROFILE\.zeroclaw\bin"
 $exe = "$dst\zeroclaw.exe"
@@ -287,33 +346,8 @@ if (($env:Path -split ';') -notcontains $dst) {
 }
 
 pub fn render_windows_guide(_root: &Path, current: &str) -> anyhow::Result<String> {
-    let begin = windows_begin();
-    let end = windows_end();
-    let begin_count = current.match_indices(&begin).count();
-    let end_count = current.match_indices(&end).count();
-    anyhow::ensure!(
-        begin_count == 1 && end_count == 1,
-        "Windows prebuilt guide must contain exactly one generated sentinel pair"
-    );
-    let begin_at = current
-        .find(&begin)
-        .ok_or_else(|| anyhow::Error::msg("missing Windows prebuilt begin sentinel"))?;
-    let after_begin = begin_at + begin.len();
-    let end_at = current
-        .find(&end)
-        .ok_or_else(|| anyhow::Error::msg("missing Windows prebuilt end sentinel"))?;
-    anyhow::ensure!(
-        after_begin < end_at,
-        "Windows prebuilt sentinels are out of order"
-    );
-
-    let mut rendered = String::new();
-    rendered.push_str(&current[..after_begin]);
-    rendered.push('\n');
-    rendered.push_str(&render_windows_prebuilt_block(&spec::install_routes()?)?);
-    rendered.push('\n');
-    rendered.push_str(&current[end_at..]);
-    Ok(rendered)
+    let body = render_windows_prebuilt_block(&spec::install_routes()?)?;
+    splice_markdown(current, WINDOWS_PREBUILT_ZONE, &body)
 }
 
 pub fn render_file(_root: &Path, _current: &str) -> anyhow::Result<String> {
@@ -464,10 +498,41 @@ mod tests {
     }
 
     #[test]
+    fn windows_prebuilt_idempotency_claim_excludes_quickstart() {
+        let block = render_windows_prebuilt_block(&spec::install_routes().unwrap()).unwrap();
+        let markdown = render_markdown().unwrap();
+        assert!(block.contains("Installation and PATH setup are idempotent"));
+        assert!(!block.contains("re-running this block is a no-op"));
+        assert!(block.contains("& $exe quickstart"));
+        assert!(
+            markdown.contains("Installation and PATH setup are idempotent; Quickstart still runs")
+        );
+        assert!(!markdown.contains("Use the idempotent PowerShell block"));
+    }
+
+    #[test]
     fn windows_prebuilt_guide_rejects_duplicate_sentinels() {
         let guide = std::fs::read_to_string(root().join("docs/book/src/setup/windows.md")).unwrap();
-        let duplicate = format!("{guide}\n{}\n{}", windows_begin(), windows_end());
+        let duplicate = format!(
+            "{guide}\n{}\n{}",
+            markdown_begin(WINDOWS_PREBUILT_ZONE),
+            markdown_end(WINDOWS_PREBUILT_ZONE)
+        );
         assert!(render_windows_guide(&root(), &duplicate).is_err());
+    }
+
+    #[test]
+    fn unix_fast_command_zones_come_from_the_route_contract() {
+        let routes = spec::install_routes().unwrap();
+        let command = Invocation::PipedScript.command().unwrap();
+        assert!(
+            render_unix_fast_command_block(&routes)
+                .unwrap()
+                .contains(command)
+        );
+        let readme = render_readme_unix_fast_block(&routes).unwrap();
+        assert!(readme.contains(command));
+        assert!(readme.contains("/bin/zeroclaw\" quickstart"));
     }
 
     fn mutate_variant(

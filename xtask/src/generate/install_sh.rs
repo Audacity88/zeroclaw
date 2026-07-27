@@ -20,24 +20,81 @@ const ZONE_ROUTE_FLAGS: &str = "route-flags";
 const ZONE_ROUTE_DECISION: &str = "route-decision";
 const ZONE_SOURCE_DISPATCH_OPEN: &str = "source-dispatch-open";
 const ZONE_RUST_BOOTSTRAP: &str = "rust-bootstrap";
+const ZONE_FEATURE_PICKER_HELPER: &str = "feature-picker-helper";
 const ZONE_FEATURE_PICKER: &str = "feature-picker";
 const ZONE_APP_SELECTION: &str = "app-selection";
 const ZONE_CARGO_INSTALL: &str = "source-cargo-install";
 const ZONE_SOURCE_DISPATCH_CLOSE: &str = "source-dispatch-close";
 const ZONE_PATH_HANDOFF: &str = "path-handoff";
 const ZONE_QUICKSTART_HANDOFF: &str = "quickstart-handoff";
-const ORDERED_ZONES: [&str; 11] = [
-    ZONE_ROUTE_CONTRACT,
-    ZONE_ROUTE_FLAGS,
-    ZONE_ROUTE_DECISION,
-    ZONE_SOURCE_DISPATCH_OPEN,
-    ZONE_RUST_BOOTSTRAP,
-    ZONE_FEATURE_PICKER,
-    ZONE_CARGO_INSTALL,
-    ZONE_APP_SELECTION,
-    ZONE_SOURCE_DISPATCH_CLOSE,
-    ZONE_PATH_HANDOFF,
-    ZONE_QUICKSTART_HANDOFF,
+#[derive(Clone, Copy)]
+struct ZoneLayout {
+    zone: &'static str,
+    range_start: &'static str,
+    range_end: &'static str,
+}
+
+const ZONE_LAYOUTS: [ZoneLayout; 12] = [
+    ZoneLayout {
+        zone: ZONE_ROUTE_CONTRACT,
+        range_start: "bold() { printf \"${BOLD}%s${RESET}\" \"$*\"; }",
+        range_end: "# ── Parse Cargo.toml (source of truth) ────────────────────────────",
+    },
+    ZoneLayout {
+        zone: ZONE_FEATURE_PICKER_HELPER,
+        range_start: "# ── Interactive feature picker ───────────────────────────────────",
+        range_end: "# Resolve the platform data directory the gateway auto-detects for the",
+    },
+    ZoneLayout {
+        zone: ZONE_ROUTE_FLAGS,
+        range_start: "  --skip-quickstart) SKIP_QUICKSTART=true ;;",
+        range_end: "  --uninstall) UNINSTALL=true ;;",
+    },
+    ZoneLayout {
+        zone: ZONE_ROUTE_DECISION,
+        range_start: "# ── Decide: pre-built or source ───────────────────────────────────",
+        range_end: "[ \"${PREBUILT_OK:-false}\" = true ] && [ \"$DRY_RUN\" != true ] && {",
+    },
+    ZoneLayout {
+        zone: ZONE_SOURCE_DISPATCH_OPEN,
+        range_start: "# ── Locate source ─────────────────────────────────────────────────",
+        range_end: "  printf \"%s\\n\" \"$(bold \"ZeroClaw — source install\")\"",
+    },
+    ZoneLayout {
+        zone: ZONE_RUST_BOOTSTRAP,
+        range_start: "  # ── Preflight: Rust ───────────────────────────────────────────────",
+        range_end: "  # ── Preflight: 32-bit ARM ────────────────────────────────────────",
+    },
+    ZoneLayout {
+        zone: ZONE_FEATURE_PICKER,
+        range_start: "  # Interactive picker — only when the operator did not pin features or",
+        range_end: "  # ── Detect existing installs ──────────────────────────────────────",
+    },
+    ZoneLayout {
+        zone: ZONE_CARGO_INSTALL,
+        range_start: "      build_web_dashboard \"$INSTALL_DIR\" true\n    fi\n  fi",
+        range_end: "  # ── Web dashboard (gateway feature only) ──────────────────────────",
+    },
+    ZoneLayout {
+        zone: ZONE_APP_SELECTION,
+        range_start: "  # ── Apps (standalone binaries under apps/<dir>) ──────────────────",
+        range_end: "  # ── Summary ───────────────────────────────────────────────────────",
+    },
+    ZoneLayout {
+        zone: ZONE_SOURCE_DISPATCH_CLOSE,
+        range_start: "  # ── Summary ───────────────────────────────────────────────────────",
+        range_end: "BIN=\"$CARGO_HOME/bin/zeroclaw\"\n\n# ── PATH setup",
+    },
+    ZoneLayout {
+        zone: ZONE_PATH_HANDOFF,
+        range_start: "# ── PATH setup ────────────────────────────────────────────────────",
+        range_end: "# ── Quickstart prompt ─────────────────────────────────────────────",
+    },
+    ZoneLayout {
+        zone: ZONE_QUICKSTART_HANDOFF,
+        range_start: "# ── Quickstart prompt ─────────────────────────────────────────────",
+        range_end: "# Next-step hint",
+    },
 ];
 
 fn route_by_id(routes: &[InstallRoute], id: RouteId) -> anyhow::Result<&InstallRoute> {
@@ -235,6 +292,115 @@ fn render_rust_bootstrap() -> &'static str {
     fi
     info "Rust $RUST_VERSION (>= $MSRV)"
   fi"#
+}
+
+fn render_feature_picker_helper() -> &'static str {
+    r#"# Offers every non-aggregate feature and installable app. Defaults start
+# checked and can be toggled off. Prompts are written to stderr; the selected
+# values are returned through PICKED_FEATURES and PICKED_APPS. The caller only
+# invokes this helper for an interactive TTY, never for a piped `curl | sh` run.
+interactive_feature_picker() {
+  toml="$1"
+  parse_cargo_toml "$toml"
+  discover_apps
+
+  # Split features into channels (channel-*) and everything else. Skip
+  # aggregate/meta features (see $NON_ROW_FEATURES) — they are internal
+  # groupings, not individual toggles. Defaults are pre-checked below.
+  channel_features=""
+  other_features=""
+  for feat in $ALL_FEATURES; do
+    if is_aggregate "$feat"; then continue; fi
+    case "$feat" in
+    channel-*)
+      channel_features="${channel_features:+$channel_features }$feat"
+      ;;
+    *)
+      other_features="${other_features:+$other_features }$feat"
+      ;;
+    esac
+  done
+
+  # Apps default-on set (zerocode); features pre-checked from the crate's
+  # `default = [...]` list, expanded transitively so aggregate defaults like
+  # `default-channels` pre-check their leaf channel-* rows.
+  selected_apps="$DEFAULT_APPS"
+  selected_features=$(expand_default_features "$toml")
+
+  # Flat entry list, in display order: apps, then features, then channels.
+  # Each entry is tagged "app:" or "feat:" so toggling routes to the right
+  # selection set.
+  entries=""
+  for a in $APPS; do entries="${entries:+$entries }app:$a"; done
+  for f in $other_features; do entries="${entries:+$entries }feat:$f"; done
+  for c in $channel_features; do entries="${entries:+$entries }feat:$c"; done
+
+  # Prompt-side output goes to stderr; the result is returned via globals.
+  echo >&2
+  printf "  %s\n" "$(bold "Select apps and optional features:")" >&2
+  printf "  %s\n" "Type the numbers to toggle, blank line to confirm." >&2
+  printf "  %s\n" "Checked (✓) items are on by default — uncheck to drop them." >&2
+  echo >&2
+
+  while :; do
+    i=1
+    last_section=""
+    for entry in $entries; do
+      kind=${entry%%:*}
+      name=${entry#*:}
+      # Section header when the group changes.
+      section=""
+      case "$kind" in
+      app) section="Apps (--apps)" ;;
+      feat) case "$name" in channel-*) section="Channels (--features)" ;; *) section="Features (--features)" ;; esac ;;
+      esac
+      if [ "$section" != "$last_section" ]; then
+        [ -n "$last_section" ] && echo >&2
+        printf "  %s\n" "$(bold "$section:")" >&2
+        last_section="$section"
+      fi
+      mark=" "
+      case "$kind" in
+      app) case " $selected_apps " in *" $name "*) mark="✓" ;; esac ;;
+      feat) case " $selected_features " in *" $name "*) mark="✓" ;; esac ;;
+      esac
+      printf "    [%2d] %s %s\n" "$i" "$mark" "$name" >&2
+      i=$((i + 1))
+    done
+    echo >&2
+    printf "  toggle (e.g. \"1 3 5\"), %s confirm: " "$(bold "Enter to")" >&2
+    read -r choices
+    [ -z "$choices" ] && break
+    for n in $choices; do
+      case "$n" in
+      '' | *[!0-9]*) continue ;;
+      esac
+      idx=1
+      for entry in $entries; do
+        if [ "$idx" -eq "$n" ]; then
+          kind=${entry%%:*}
+          name=${entry#*:}
+          if [ "$kind" = app ]; then
+            case " $selected_apps " in
+            *" $name "*) selected_apps=$(printf '%s' "$selected_apps" | tr ' ' '\n' | grep -vx "$name" | paste -sd' ' -) ;;
+            *) selected_apps="${selected_apps:+$selected_apps }$name" ;;
+            esac
+          else
+            case " $selected_features " in
+            *" $name "*) selected_features=$(printf '%s' "$selected_features" | tr ' ' '\n' | grep -vx "$name" | paste -sd' ' -) ;;
+            *) selected_features="${selected_features:+$selected_features }$name" ;;
+            esac
+          fi
+          break
+        fi
+        idx=$((idx + 1))
+      done
+    done
+  done
+
+  PICKED_FEATURES=$(printf '%s' "$selected_features" | tr ' ' ',')
+  PICKED_APPS=$(printf '%s' "$selected_apps" | tr ' ' ',')
+}"#
 }
 
 fn render_feature_picker() -> &'static str {
@@ -454,6 +620,7 @@ pub fn render_file(root: &Path, current: &str) -> anyhow::Result<String> {
     let route_contract = render_route_contract(&routes)?;
     let mut rendered = splice(current, ZONE_ROUTE_CONTRACT, &route_contract)?;
     for (zone, body) in [
+        (ZONE_FEATURE_PICKER_HELPER, render_feature_picker_helper()),
         (ZONE_ROUTE_FLAGS, render_route_flags()),
         (ZONE_ROUTE_DECISION, render_route_decision()),
         (ZONE_SOURCE_DISPATCH_OPEN, render_source_dispatch_open()),
@@ -471,11 +638,29 @@ pub fn render_file(root: &Path, current: &str) -> anyhow::Result<String> {
 
 fn validate_zone_order(current: &str) -> anyhow::Result<()> {
     let mut previous_end = 0;
-    for zone in ORDERED_ZONES {
+    for layout in ZONE_LAYOUTS {
+        let zone = layout.zone;
         let b = begin(zone);
         let e = end(zone);
         ensure_once(current, &b, &format!("generated:{zone} begin sentinel"))?;
         ensure_once(current, &e, &format!("generated:{zone} end sentinel"))?;
+        ensure_once(
+            current,
+            layout.range_start,
+            &format!("generated:{zone} range start"),
+        )?;
+        ensure_once(
+            current,
+            layout.range_end,
+            &format!("generated:{zone} range end"),
+        )?;
+        let range_start = current
+            .find(layout.range_start)
+            .ok_or_else(|| anyhow::Error::msg(format!("missing generated:{zone} range start")))?
+            + layout.range_start.len();
+        let range_end = current
+            .find(layout.range_end)
+            .ok_or_else(|| anyhow::Error::msg(format!("missing generated:{zone} range end")))?;
         let begin_at = current.find(&b).ok_or_else(|| {
             anyhow::Error::msg(format!("missing generated:{zone} begin sentinel"))
         })?;
@@ -485,6 +670,10 @@ fn validate_zone_order(current: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
             begin_at >= previous_end && begin_at < end_at,
             "generated installer zones are out of canonical order at {zone}"
+        );
+        anyhow::ensure!(
+            range_start <= begin_at && end_at + e.len() <= range_end,
+            "generated:{zone} must remain inside its canonical structural range"
         );
         previous_end = end_at + e.len();
     }
@@ -731,6 +920,22 @@ mod tests {
     }
 
     #[test]
+    fn installer_contract_restores_picker_helper_drift() {
+        let script = std::fs::read_to_string(root().join("install.sh")).unwrap();
+        let mismatch = script.replacen(
+            "  selected_features=$(expand_default_features \"$toml\")",
+            "  selected_features=\"\"",
+            1,
+        );
+        assert_ne!(script, mismatch, "fixture must modify the picker helper");
+        assert_eq!(
+            script,
+            render_file(&root(), &mismatch).unwrap(),
+            "installer generation must restore picker helper drift"
+        );
+    }
+
+    #[test]
     fn installer_contract_rejects_generated_zone_relocation() {
         let script = std::fs::read_to_string(root().join("install.sh")).unwrap();
         let path_begin = begin(ZONE_PATH_HANDOFF);
@@ -750,6 +955,40 @@ mod tests {
         );
         assert_ne!(script, relocated);
         assert!(render_file(&root(), &relocated).is_err());
+    }
+
+    #[test]
+    fn installer_contract_rejects_same_order_zone_relocation() {
+        let script = std::fs::read_to_string(root().join("install.sh")).unwrap();
+        let picker_begin = begin(ZONE_FEATURE_PICKER);
+        let picker_end = end(ZONE_FEATURE_PICKER);
+        let start = script.find(&picker_begin).unwrap();
+        let finish = script.find(&picker_end).unwrap() + picker_end.len();
+        let picker_zone = &script[start..finish];
+        let without_picker = format!("{}{}", &script[..start], &script[finish..]);
+        let insertion = without_picker
+            .find("  # ── Build and install")
+            .expect("build section anchor");
+        let relocated = format!(
+            "{}{}\n{}",
+            &without_picker[..insertion],
+            picker_zone,
+            &without_picker[insertion..]
+        );
+        assert_ne!(script, relocated);
+        assert!(
+            render_file(&root(), &relocated).is_err(),
+            "zone placement must be structural, not only relative"
+        );
+    }
+
+    #[test]
+    fn installer_contract_allows_adjacent_handwritten_edits() {
+        let script = std::fs::read_to_string(root().join("install.sh")).unwrap();
+        let marker = begin(ZONE_ROUTE_CONTRACT);
+        let customized = script.replacen(&marker, &format!("# local note\n{marker}"), 1);
+        let rendered = render_file(&root(), &customized).unwrap();
+        assert!(rendered.contains("# local note\n"));
     }
 
     #[test]

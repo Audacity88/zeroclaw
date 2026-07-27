@@ -525,15 +525,11 @@ quickstart_needed() {
 }
 
 # ── Interactive feature picker ───────────────────────────────────
-#
-# POSIX-sh number-toggle picker over the OPTIONAL feature set (channel-*,
-# observability-*, hardware/peripheral/sandbox/browser flavours). Default
-# features are always on; this only surfaces the opt-in extras. The output
-# is a comma-separated list of selected features written to stdout.
-#
-# Invoked from the interactive flow when the operator runs install.sh in a
-# TTY without `--minimal`, `--preset`, or `--features`. Skipped in
-# non-interactive runs (curl | bash) and in CI.
+  # >>> generated:feature-picker-helper by `cargo generate installers` - do not edit <<<
+# Offers every non-aggregate feature and installable app. Defaults start
+# checked and can be toggled off. Prompts are written to stderr; the selected
+# values are returned through PICKED_FEATURES and PICKED_APPS. The caller only
+# invokes this helper for an interactive TTY, never for a piped `curl | sh` run.
 interactive_feature_picker() {
   toml="$1"
   parse_cargo_toml "$toml"
@@ -636,6 +632,7 @@ interactive_feature_picker() {
   PICKED_FEATURES=$(printf '%s' "$selected_features" | tr ' ' ',')
   PICKED_APPS=$(printf '%s' "$selected_apps" | tr ' ' ',')
 }
+  # >>> end generated:feature-picker-helper <<<
 
 # Resolve the platform data directory the gateway auto-detects for the
 # dashboard bundle. Single source of truth so the prebuilt and source
@@ -1059,7 +1056,7 @@ See all available features:
   # Interactive picker — only when the operator did not pin features or
   # apps via the CLI and is running under a TTY. Skipped on `--minimal`,
   # `--preset`, `--features`, `--apps`, `--with-gateway` /
-  # `--without-gateway`, and any non-interactive run (curl | bash).
+  # `--without-gateway`, and any non-interactive run (curl | sh).
   # >>> generated:feature-picker by `cargo generate installers` - do not edit <<<
   if [ -t 0 ] &&
     [ "$MINIMAL" != true ] &&

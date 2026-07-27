@@ -14,9 +14,11 @@ That is the whole install. Run it from a clone, or pipe it from `curl`:
 
 #### sh
 
+<!-- >>> generated:unix-fast-command by `cargo generate installers` - do not edit <<< -->
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 ```
+<!-- >>> end generated:unix-fast-command <<< -->
 
 </div>
 
@@ -113,7 +115,7 @@ Re-run the installer, it detects the existing install and upgrades in place:
 #### sh
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh -s -- --skip-quickstart
 zeroclaw service restart
 ```
 

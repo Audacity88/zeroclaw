@@ -48,6 +48,26 @@ fn registry() -> Vec<Surface> {
             render: docs::render_file,
         },
         Surface {
+            name: "readme-unix-fast",
+            file: "README.md",
+            render: docs::render_readme_unix_fast_zone,
+        },
+        Surface {
+            name: "linux-unix-fast",
+            file: "docs/book/src/setup/linux.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "macos-unix-fast",
+            file: "docs/book/src/setup/macos.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "hardware-unix-fast",
+            file: "docs/book/src/hardware/subsystem.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
             name: "windows-prebuilt-guide",
             file: "docs/book/src/setup/windows.md",
             render: docs::render_windows_guide,

@@ -51,7 +51,7 @@ For an unconfigured install, it offers `zeroclaw quickstart` or browser-based Qu
 <!-- ANCHOR: windows-prebuilt -->
 ### Windows prebuilt path
 
-Use the idempotent PowerShell block in the [Windows setup guide](../setup/windows.md).
+Use the PowerShell block in the [Windows setup guide](../setup/windows.md). Installation and PATH setup are idempotent; Quickstart still runs.
 
 This route is noninteractive and does not open a picker.
 

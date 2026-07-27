@@ -147,10 +147,10 @@ echo.
 set /p "CHOICE=  Select [1-5] (default: 1): "
 if "%CHOICE%"=="" set "CHOICE=1"
 if "%CHOICE%"=="1" goto :install_prebuilt
-if "%CHOICE%"=="2" goto :build_minimal
-if "%CHOICE%"=="3" goto :build_dist
-if "%CHOICE%"=="4" goto :build_default
-if "%CHOICE%"=="5" goto :build_all
+if "%CHOICE%"=="2" (set "MODE=minimal" & goto :build_minimal)
+if "%CHOICE%"=="3" (set "MODE=dist" & goto :build_dist)
+if "%CHOICE%"=="4" (set "MODE=default" & goto :build_default)
+if "%CHOICE%"=="5" (set "MODE=all" & goto :build_all)
 echo   %RED%Invalid choice. Please enter 1-5.%RESET%
 goto :choose_mode
 :: >>> end generated:menu <<<

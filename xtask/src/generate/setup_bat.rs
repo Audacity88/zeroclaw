@@ -55,7 +55,7 @@ fn render_menu(_manifest_dir: &Path) -> String {
     out.push_str("if \"%CHOICE%\"==\"1\" goto :install_prebuilt\n");
     for (i, sel) in menu.iter().enumerate() {
         out.push_str(&format!(
-            "if \"%CHOICE%\"==\"{n}\" goto :build_{id}\n",
+            "if \"%CHOICE%\"==\"{n}\" (set \"MODE={id}\" & goto :build_{id})\n",
             n = i + 2,
             id = sel.id()
         ));
@@ -197,6 +197,22 @@ mod tests {
         assert!(m.contains("if \"%MODE%\"==\"prebuilt\" goto :install_prebuilt"));
         for sel in Selection::menu() {
             assert!(m.contains(&format!("goto :build_{}", sel.id())));
+        }
+    }
+
+    #[test]
+    fn interactive_menu_records_the_selected_source_mode() {
+        let menu = render_menu(&root());
+        for (index, selection) in Selection::menu().iter().enumerate() {
+            let choice = index + 2;
+            assert!(
+                menu.contains(&format!(
+                    "if \"%CHOICE%\"==\"{choice}\" (set \"MODE={id}\" & goto :build_{id})",
+                    id = selection.id()
+                )),
+                "interactive choice {choice} must preserve MODE={} before routing",
+                selection.id()
+            );
         }
     }
 

@@ -63,7 +63,9 @@ This updates README badges, the Tauri config, and workflow description
 examples, then regenerates every spec-driven install surface via
 `cargo generate installers`: install.sh, setup.bat, `dist/aur/PKGBUILD`,
 `dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
-sets, `dev/ci/docker-tags.toml`, and `docs/book/src/_snippets/install.md`.
+sets, `dev/ci/docker-tags.toml`, `docs/book/src/_snippets/install.md`, the Unix
+fast-path blocks in README/platform docs, and the Windows prebuilt block in
+`docs/book/src/setup/windows.md`.
 Version, feature, and application-packaging values come from `Cargo.toml` and
 `[package.metadata.zeroclaw]`; the four stable installation routes come from
 typed contracts in `xtask/src/generate/spec.rs`. The bump keeps these surfaces
