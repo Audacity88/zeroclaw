@@ -511,8 +511,8 @@ jobs:
         run: ./scripts/ci/firmware_protocol_gate.sh
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Install mold linker
-        run: bash scripts/ci/apt_install.sh mold
+      - name: Install test system dependencies
+        run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
