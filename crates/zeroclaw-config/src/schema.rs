@@ -14805,7 +14805,7 @@ impl ChannelConfig for WatiConfig {
     }
 }
 
-/// Nextcloud Talk bot configuration (webhook receive + OCS send API).
+/// Nextcloud Talk bot configuration (webhook receive + signed bot send API).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nextcloud_talk"]
@@ -14821,7 +14821,7 @@ pub struct NextcloudTalkConfig {
     #[tab(Connection)]
     pub base_url: String,
     /// Deprecated, unused. Nextcloud Talk sends do not authenticate via
-    /// OCS bearer auth (see `bot_token`); this field is only accepted so
+    /// OCS bearer auth (see `webhook_secret`); this field is only accepted so
     /// existing configs that set it don't fail to parse. Safe to remove
     /// from your config.
     #[serde(default)]
@@ -14833,7 +14833,8 @@ pub struct NextcloudTalkConfig {
     ///
     /// Nextcloud issues ONE secret per installed bot and uses it for both
     /// directions, so this cannot hold a different outbound secret. When both
-    /// are set to different non-empty values the configuration is rejected.
+    /// are set to different non-empty values the channel logs the conflict and
+    /// fails closed as unconfigured: inbound `401` and no outbound send.
     /// Prefer `webhook_secret`; this alias will be removed.
     ///
     /// Upgrade from a `bot_token`-only configuration: copy the installed bot
@@ -14871,16 +14872,15 @@ pub struct NextcloudTalkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-    /// Controls whether and how streaming draft updates are delivered.
-    ///
-    /// - `"off"` (default): responses are sent as a single final message.
-    /// - `"partial"`: a placeholder is posted first and edited incrementally
-    ///   as tokens arrive, making long responses visible in real time.
+    /// Retained for configuration compatibility. Nextcloud Talk's bot API does
+    /// not provide message IDs or edit/delete operations, so draft updates are
+    /// disabled and responses are currently sent as one final message for every
+    /// value.
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
-    /// Minimum interval in milliseconds between consecutive OCS edit calls per
-    /// room when `stream_mode = "partial"`. Default: 1000 ms.
+    /// Retained for configuration compatibility. Currently inert while draft
+    /// updates are disabled for this channel. Default: 1000 ms.
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,

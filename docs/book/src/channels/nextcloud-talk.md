@@ -9,21 +9,28 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 ## What this integration does
 
 - Receives inbound Talk events via `POST /nextcloud-talk/<alias>` on the gateway (bare `/nextcloud-talk` still works as a deprecated fallback)
-- Verifies webhook signatures (HMAC-SHA256) when a secret is configured
+- Requires and verifies webhook signatures (HMAC-SHA256) with the installed bot secret
 - Sends replies back to Talk rooms via the signed Nextcloud Talk Bot API
 
 ## Prerequisites
 
 - **Nextcloud server** with the Talk app enabled (v17 or later recommended)
-- **Bot installed** with `occ talk:bot:install`, which is how Nextcloud documents
-  registering a webhook bot. Give it a display name (e.g. `zeroclaw-bot`).
+- **Bot installed** with both the `webhook` and `response` features, which let
+  Nextcloud deliver room messages to ZeroClaw and let ZeroClaw send replies:
+
+  ```sh
+  sudo -u www-data php occ talk:bot:install \
+    -f webhook -f response \
+    zeroclaw-bot '<shared-secret>' \
+    'https://<your-public-url>/nextcloud-talk/<alias>'
+  ```
 - **Bot secret** from that installation. Nextcloud issues **one** shared secret per
   bot, used both to verify inbound webhook signatures and to sign outbound bot-API
   replies. Set it as `webhook_secret`, which is canonical. `bot_token` is a
   **deprecated alias for the same value**: if both are set they must be identical.
   It cannot hold a different outbound secret. Conflicting non-empty values are
   **not** silently resolved in favour of one; the conflict is logged and the alias
-  resolves to no secret, so the channel then behaves exactly as if unconfigured —
+  resolves to no secret, so the channel then behaves exactly as if unconfigured:
   inbound `401`, no outbound send.
 - **Publicly-reachable gateway**: see [Setup → Container](../setup/container.md) for tunnel options if self-hosted
 
@@ -83,7 +90,7 @@ Local development? Configure `[tunnel]` in your config (ngrok, Cloudflare, or Ta
 
 ## Signature verification
 
-When `webhook_secret` is set, inbound requests must carry:
+Inbound requests must carry:
 
 - `X-Nextcloud-Talk-Random` header
 - `X-Nextcloud-Talk-Signature` header
@@ -96,7 +103,8 @@ if X-Nextcloud-Talk-Signature != expected_sig:
     return 401
 ```
 
-Without a secret, no verification: don't expose this endpoint publicly in that mode.
+Without a resolved secret, ZeroClaw returns `401` before parsing or dispatching
+the webhook. There is no mode that accepts an unverified request.
 
 ## Message routing
 

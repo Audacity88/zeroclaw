@@ -1131,9 +1131,9 @@ pub async fn run_gateway(
                 alias.clone(),
                 Arc::new(NextcloudTalkChannel::new(
                     nc.base_url.clone(),
-                    // One canonical bot secret: an explicit `bot_token`
-                    // wins, else fall back to `webhook_secret` (Nextcloud
-                    // issues one secret per bot for both directions).
+                    // Resolve the same installed-bot secret used by inbound
+                    // verification. `webhook_secret` is canonical and
+                    // `bot_token` is a deprecated alias for the same value.
                     nc.resolve_bot_secret().unwrap_or_else(|e| {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -6725,7 +6725,7 @@ mod tests {
             // 401 before the handler ever spawns the LLM task — which would make
             // this test pass for the wrong reason (no provider call because the
             // request was refused, not because the ack raced ahead of a slow
-            // provider). Signing the request keeps it exercising #6156.
+            // provider). Signing the request keeps it on the fast-ack path.
             nextcloud_talk_webhook_secret: HashMap::from([(
                 "default".to_string(),
                 std::sync::Arc::<str>::from(secret),
