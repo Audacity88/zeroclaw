@@ -1072,6 +1072,9 @@ mod tests {
         ));
         assert!(manual.contains("echo \"BUILD_CMD=cargo build\""));
         assert!(manual.contains(
+            "prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n          cache-targets: false\n          save-if: ${{ github.ref == 'refs/heads/master' }}"
+        ));
+        assert!(manual.contains(
             "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
         ));
         assert!(manual.contains(
