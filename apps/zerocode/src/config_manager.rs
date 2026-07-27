@@ -3134,7 +3134,8 @@ impl App {
         let previous =
             crate::text_navigation::previous_grapheme_boundary(&self.edit_buf, self.edit_cursor);
         self.edit_buf.replace_range(previous..self.edit_cursor, "");
-        self.edit_cursor = previous;
+        self.edit_cursor =
+            crate::text_navigation::normalize_grapheme_cursor(&self.edit_buf, previous);
     }
 
     fn move_scalar_edit_cursor(&mut self, action: crate::keymap::ConfigEditorAction) {
@@ -4360,7 +4361,9 @@ impl App {
     }
 
     pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
-        self.is_scalar_field_edit()
+        self.section == ConfigSection::Zeroclaw
+            && self.zeroclaw_pane == ZeroclawPane::Detail
+            && self.is_scalar_field_edit()
             && matches!(
                 crate::keymap::ConfigEditorAction::from_chord(key),
                 Some(
@@ -4888,10 +4891,19 @@ mod tests {
             breadcrumb: vec!["example".into()],
             field_idx: 0,
         };
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
         let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
 
         assert!(manager.claims_pane_navigation(&word_left));
 
+        manager.section = ConfigSection::Zerocode;
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.section = ConfigSection::Zeroclaw;
+        manager.zeroclaw_pane = ZeroclawPane::Sections;
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
         manager.select_items = vec!["first".into(), "second".into()];
         assert!(!manager.claims_pane_navigation(&word_left));
 
@@ -4932,6 +4944,18 @@ mod tests {
         manager.backspace_scalar_edit();
         assert_eq!(manager.edit_buf, "");
         assert_eq!(manager.edit_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn scalar_field_backspace_normalizes_a_joined_grapheme() {
+        let mut manager = test_manager();
+        manager.edit_buf = "🇺x🇸".into();
+        manager.edit_cursor = "🇺x".len();
+
+        manager.backspace_scalar_edit();
+
+        assert_eq!(manager.edit_buf, "🇺🇸");
+        assert_eq!(manager.edit_cursor, manager.edit_buf.len());
     }
 
     #[test]
