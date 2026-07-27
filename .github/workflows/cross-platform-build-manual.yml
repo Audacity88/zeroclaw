@@ -22,6 +22,7 @@ jobs:
         with:
           context: .
           file: Containerfile
+          target: web-build
           push: false
           load: false
           platforms: linux/amd64
