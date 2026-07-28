@@ -2,6 +2,7 @@ use crate::agent::history_pruner::remove_orphaned_tool_messages;
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
@@ -10,6 +11,43 @@ use zeroclaw_providers::ChatMessage;
 /// value via `run_tool_call_loop`; this constant is only used when callers omit
 /// the parameter. The name is retained for config compatibility.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
+
+const PROMPT_TOOL_RESULTS_ROLE: &str = "zeroclaw_prompt_tool_results";
+
+pub(crate) fn prompt_tool_results_message(content: impl Into<String>) -> ChatMessage {
+    ChatMessage {
+        role: PROMPT_TOOL_RESULTS_ROLE.to_string(),
+        content: content.into(),
+    }
+}
+
+pub(crate) fn is_prompt_tool_results_message(message: &ChatMessage) -> bool {
+    message.role == PROMPT_TOOL_RESULTS_ROLE
+}
+
+pub(crate) fn normalize_prompt_tool_results_for_provider(
+    messages: &[ChatMessage],
+) -> Cow<'_, [ChatMessage]> {
+    if !messages
+        .iter()
+        .any(|message| message.role == PROMPT_TOOL_RESULTS_ROLE)
+    {
+        return Cow::Borrowed(messages);
+    }
+
+    Cow::Owned(
+        messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                if message.role == PROMPT_TOOL_RESULTS_ROLE {
+                    message.role = "user".to_string();
+                }
+                message
+            })
+            .collect(),
+    )
+}
 
 static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -307,10 +345,15 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
     normalize_system_messages(history);
 }
 
-pub fn trim_history(history: &mut Vec<ChatMessage>, max_history_turns: usize) {
+pub fn trim_history(
+    history: &mut Vec<ChatMessage>,
+    max_history_turns: usize,
+    history_has_trim_breadcrumb: &mut bool,
+) {
     let result = crate::agent::history_trim::trim_to_recent_turn_count(
         std::mem::take(history),
         max_history_turns,
+        *history_has_trim_breadcrumb,
     );
     let crate::agent::history_trim::TurnCountTrimResult {
         history: trimmed_history,
@@ -345,13 +388,16 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history_turns: usize) {
 pub struct InteractiveSessionState {
     pub version: u32,
     pub history: Vec<ChatMessage>,
+    #[serde(default)]
+    pub history_has_trim_breadcrumb: bool,
 }
 
 impl InteractiveSessionState {
-    fn from_history(history: &[ChatMessage]) -> Self {
+    fn from_history(history: &[ChatMessage], history_has_trim_breadcrumb: bool) -> Self {
         Self {
             version: 1,
             history: history.to_vec(),
+            history_has_trim_breadcrumb,
         }
     }
 }
@@ -360,8 +406,16 @@ pub fn load_interactive_session_history(
     path: &Path,
     system_prompt: &str,
 ) -> Result<Vec<ChatMessage>> {
+    load_interactive_session_history_with_provenance(path, system_prompt)
+        .map(|(history, _)| history)
+}
+
+pub fn load_interactive_session_history_with_provenance(
+    path: &Path,
+    system_prompt: &str,
+) -> Result<(Vec<ChatMessage>, bool)> {
     if !path.exists() {
-        return Ok(vec![ChatMessage::system(system_prompt)]);
+        return Ok((vec![ChatMessage::system(system_prompt)], false));
     }
 
     let raw = std::fs::read_to_string(path)?;
@@ -378,15 +432,26 @@ pub fn load_interactive_session_history(
 
     remove_orphaned_tool_messages(&mut state.history);
 
-    Ok(state.history)
+    Ok((state.history, state.history_has_trim_breadcrumb))
 }
 
 pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+    save_interactive_session_history_with_provenance(path, history, false)
+}
+
+pub fn save_interactive_session_history_with_provenance(
+    path: &Path,
+    history: &[ChatMessage],
+    history_has_trim_breadcrumb: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
+    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(
+        history,
+        history_has_trim_breadcrumb,
+    ))?;
     std::fs::write(path, payload)?;
     Ok(())
 }
@@ -394,6 +459,20 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_trim_prompt_tool_results_normalize_only_at_provider_boundary() {
+        let internal = prompt_tool_results_message("[Tool results]\noutput");
+        let messages = vec![internal.clone(), ChatMessage::user("real user")];
+
+        let normalized = normalize_prompt_tool_results_for_provider(&messages);
+
+        assert!(is_prompt_tool_results_message(&internal));
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[0].content, internal.content);
+        assert_eq!(normalized[1].role, "user");
+        assert!(is_prompt_tool_results_message(&messages[0]));
+    }
 
     #[test]
     fn estimate_system_floor_counts_only_system_messages() {

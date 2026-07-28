@@ -56,6 +56,7 @@ pub(crate) fn record_llm_failure(
 
 pub(crate) async fn try_recover_context_overflow(
     history: &mut Vec<ChatMessage>,
+    history_has_trim_breadcrumb: &mut bool,
     e: &anyhow::Error,
     iteration: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
@@ -77,7 +78,7 @@ pub(crate) async fn try_recover_context_overflow(
         let tokens_now = estimate_history_tokens(history);
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
-        let result = trim_to_recent_turns(owned, budget);
+        let result = trim_to_recent_turns(owned, budget, *history_has_trim_breadcrumb);
         let trimmed = result.trimmed;
         let dropped_turns = result.dropped_turns;
         let dropped_messages = result.dropped_messages;
@@ -89,11 +90,10 @@ pub(crate) async fn try_recover_context_overflow(
             // uses, after the leading system messages, so the retried provider
             // call tells the model earlier turns were dropped (never silent to
             // the model, not just to clients).
-            let system_count = recovered_history
-                .iter()
-                .take_while(|m| m.role == "system")
-                .count();
-            recovered_history.insert(system_count, crate::agent::history_trim::breadcrumb());
+            crate::agent::history_trim::insert_breadcrumb_deduped(
+                &mut recovered_history,
+                history_has_trim_breadcrumb,
+            );
         }
         *history = recovered_history;
         if trimmed {
@@ -183,9 +183,18 @@ mod tests {
         let err = anyhow::Error::msg("maximum context length exceeded");
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
+        let mut has_breadcrumb = false;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &mut has_breadcrumb,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            32_000,
+        )
+        .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -230,9 +239,18 @@ mod tests {
         let err = anyhow::Error::msg("maximum context length exceeded");
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
+        let mut has_breadcrumb = false;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100).await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &mut has_breadcrumb,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            100,
+        )
+        .await;
 
         assert!(
             !recovered,
@@ -257,9 +275,18 @@ mod tests {
         let err = anyhow::Error::msg("some unrelated provider error");
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
+        let mut has_breadcrumb = false;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &mut has_breadcrumb,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            32_000,
+        )
+        .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -286,12 +313,21 @@ mod tests {
         let err = anyhow::Error::msg("maximum context length exceeded");
         let observer = NoopObserver;
         let budget = 100usize;
+        let mut has_breadcrumb = false;
 
         // Drain any pre-existing broadcast traffic from parallel tests.
         while rx.try_recv().is_ok() {}
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, &observer, budget).await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &mut has_breadcrumb,
+            &err,
+            1,
+            None,
+            &observer,
+            budget,
+        )
+        .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s

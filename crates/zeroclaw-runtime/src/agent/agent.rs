@@ -2287,6 +2287,7 @@ impl Agent {
 
         let mut loop_history = provider_messages;
         let mut loop_new_messages: Vec<ChatMessage> = Vec::new();
+        let mut loop_history_has_trim_breadcrumb = self.history_has_trim_breadcrumb;
 
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -2315,6 +2316,7 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        history_has_trim_breadcrumb: Some(&mut loop_history_has_trim_breadcrumb),
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
@@ -2640,6 +2642,7 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let mut loop_history_has_trim_breadcrumb = self.history_has_trim_breadcrumb;
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
@@ -2687,6 +2690,7 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        history_has_trim_breadcrumb: Some(&mut loop_history_has_trim_breadcrumb),
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
