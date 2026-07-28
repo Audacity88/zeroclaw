@@ -13,6 +13,7 @@ pub mod file_read;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
+mod runtime_command_error;
 pub mod schedule;
 pub mod scoped;
 pub mod security_ops;

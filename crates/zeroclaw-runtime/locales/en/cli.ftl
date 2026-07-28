@@ -1078,3 +1078,8 @@ sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
+
+# ── Runtime command construction — shell and skill shell tools ──
+tool-runtime-command-build-failed = Failed to build runtime command: {$error}
+tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
+tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}

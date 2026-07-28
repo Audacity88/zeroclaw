@@ -3,6 +3,25 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 
+/// Canonicalization failures that the runtime layer can present through
+/// localized tool diagnostics without parsing an English error chain.
+#[derive(Debug, thiserror::Error)]
+pub enum DockerWorkspaceMountError {
+    #[error("Failed to canonicalize Docker workspace path {path}")]
+    WorkspacePath {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to canonicalize Docker workspace root {path}")]
+    AllowedRoot {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Docker runtime with lightweight container isolation.
 #[derive(Debug, Clone)]
 pub struct DockerRuntime {
@@ -15,11 +34,11 @@ impl DockerRuntime {
     }
 
     fn workspace_mount_path(&self, workspace_dir: &Path) -> Result<PathBuf> {
-        let resolved = workspace_dir.canonicalize().with_context(|| {
-            format!(
-                "Failed to canonicalize Docker workspace path {}",
-                workspace_dir.display()
-            )
+        let resolved = workspace_dir.canonicalize().map_err(|source| {
+            DockerWorkspaceMountError::WorkspacePath {
+                path: workspace_dir.display().to_string(),
+                source,
+            }
         })?;
 
         if !resolved.is_absolute() {
@@ -42,11 +61,14 @@ impl DockerRuntime {
             .allowed_workspace_roots
             .iter()
             .map(|root| {
-                Path::new(root)
-                    .canonicalize()
-                    .with_context(|| format!("Failed to canonicalize Docker workspace root {root}"))
+                Path::new(root).canonicalize().map_err(|source| {
+                    DockerWorkspaceMountError::AllowedRoot {
+                        path: root.clone(),
+                        source,
+                    }
+                })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         let allowed = allowed_roots.iter().any(|root| resolved.starts_with(root));
 
         if !allowed {

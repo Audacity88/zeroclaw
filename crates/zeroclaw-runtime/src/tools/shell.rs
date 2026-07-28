@@ -306,7 +306,9 @@ impl Tool for ShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to build runtime command: {e:#}")),
+                    error: Some(super::runtime_command_error::format_runtime_command_error(
+                        &e,
+                    )),
                 });
             }
         };
