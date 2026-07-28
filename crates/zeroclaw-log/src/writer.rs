@@ -243,7 +243,6 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
                         tracing::warn!(
                             target: "zeroclaw_log_internal",
                             error = ?err,
-                            path = %state.policy.path.display(),
                             "log: worker flush sync_all failed"
                         );
                     }
@@ -301,8 +300,8 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Open the active file just long enough to call `sync_all`. Used for
-/// Flush and the periodic sync cadence.
+/// Open or create the active file, then call `sync_all`. Used by explicit
+/// flush, periodic sync after successful writes, and best-effort shutdown sync.
 fn sync_active_file(state: &Arc<WorkerState>) -> Result<()> {
     let file = open_active_file(state)?;
     file.sync_all()
@@ -864,6 +863,39 @@ mod tests {
             tx,
             worker_dead,
         }));
+    }
+
+    #[test]
+    fn flush_without_writer_is_noop() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        shutdown_current_writer();
+
+        flush_for_test().unwrap();
+    }
+
+    #[test]
+    fn flush_with_disabled_storage_is_noop() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+
+        flush_for_test().unwrap();
+    }
+
+    #[test]
+    fn flush_before_first_write_creates_empty_active_file() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        flush_for_test().unwrap();
+
+        let path = runtime_trace_path().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "");
     }
 
     #[test]
