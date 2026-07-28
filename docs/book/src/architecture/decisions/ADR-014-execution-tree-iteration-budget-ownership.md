@@ -19,7 +19,7 @@ ZeroClaw limits each agent loop with `max_tool_iterations` from that agent's eff
 
 The runtime contains a dormant optional `shared_budget` handle. Production roots currently pass `None`, child construction does not establish a shared owner consistently, and the existing surface has no configured lifecycle contract. [#9201](https://github.com/zeroclaw-labs/zeroclaw/pull/9201) hardens the atomic reservation primitive but intentionally does not select an owner or change production behavior.
 
-Accepted RFC [#9323](https://github.com/zeroclaw-labs/zeroclaw/issues/9323) separates the per-loop limit from an aggregate execution-tree limit. This record defines who owns that aggregate limit, which descendants participate, and how exhaustion reaches the root without conflating iterations with delegation depth or child concurrency.
+RFC [#9323](https://github.com/zeroclaw-labs/zeroclaw/issues/9323) proposes separating the per-loop limit from an aggregate execution-tree limit. This record defines who would own that aggregate limit, which descendants would participate, and how exhaustion would reach the root without conflating iterations with delegation depth or child concurrency.
 
 ## Decision
 
