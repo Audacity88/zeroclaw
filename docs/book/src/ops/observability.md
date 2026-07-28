@@ -232,8 +232,7 @@ curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 
 </div>
 
-Log pagination walks backward with a byte-offset cursor. When `next_cursor_line_offset` is non-null, pass it back as `until_line_offset` to load older events without re-reading newer bytes. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; using its timestamp/ID pair as `until_ts` and `until_id` for pagination is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
-`at_end: true` means the reader scanned the whole file for the current filter.
+Log pagination walks backward with a byte-offset cursor. While `at_end` is false, pass a non-null `next_cursor_line_offset` back as `until_line_offset` with the same non-cursor filters to load older events without re-reading newer bytes. Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that pagination walk. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; using its timestamp/ID pair as `until_ts` and `until_id` for pagination is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
 
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an
