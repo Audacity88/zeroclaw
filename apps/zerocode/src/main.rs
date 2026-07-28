@@ -322,6 +322,9 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     // Initial connection (before the terminal is initialized).
     // `owns_ephemeral` records whether THIS process spawned the daemon
     // (initial connect failed → we started one). Only an owned ephemeral
@@ -329,16 +332,37 @@ async fn run() -> anyhow::Result<()> {
     let mut owns_ephemeral = false;
     let rpc = match &target {
         ConnectTarget::LocalSocket(socket) => {
-            match client::RpcClient::connect(socket, None, None).await {
+            #[cfg(unix)]
+            let initial_connection = tokio::select! {
+                result = client::RpcClient::connect(socket, None, None) => result,
+                _ = sigterm.recv() => return Ok(()),
+            };
+            #[cfg(not(unix))]
+            let initial_connection = client::RpcClient::connect(socket, None, None).await;
+
+            match initial_connection {
                 Ok(c) => c,
                 Err(e) if is_terminal_connection_error(&e) => return Err(e),
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
                     let mut daemon = spawn_owned_ephemeral_daemon(&config_dir, socket)?;
-                    match await_spawned_daemon_ready(socket, &mut daemon).await {
+                    #[cfg(unix)]
+                    let readiness = tokio::select! {
+                        result = await_spawned_daemon_ready(socket, &mut daemon) => result,
+                        _ = sigterm.recv() => {
+                            return cleanup_spawned_daemon_after_signal(&mut daemon);
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let readiness = await_spawned_daemon_ready(socket, &mut daemon).await;
+
+                    match readiness {
                         Ok(client) => {
-                            daemon.detach();
-                            owns_ephemeral = true;
+                            owns_ephemeral =
+                                reconcile_spawned_daemon_identity(client.server_pid, &mut daemon)?;
+                            if owns_ephemeral {
+                                daemon.detach();
+                            }
                             client
                         }
                         Err(startup_error) => {
@@ -360,7 +384,17 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            client::RpcClient::connect_wss(url, None, None, *skip_verify).await?
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    result = client::RpcClient::connect_wss(url, None, None, *skip_verify) => result?,
+                    _ = sigterm.recv() => return Ok(()),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                client::RpcClient::connect_wss(url, None, None, *skip_verify).await?
+            }
         }
     };
 
@@ -373,6 +407,8 @@ async fn run() -> anyhow::Result<()> {
         &target,
         &local_config_dir,
         owns_ephemeral,
+        #[cfg(unix)]
+        &mut sigterm,
     )
     .await;
 
@@ -391,6 +427,7 @@ async fn run_until_exit(
     target: &ConnectTarget,
     config_dir: &std::path::Path,
     owns_ephemeral: bool,
+    #[cfg(unix)] sigterm: &mut tokio::signal::unix::Signal,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
     // the new agent's alias here so the recovering `app::run` loop drops
@@ -403,8 +440,6 @@ async fn run_until_exit(
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral) => r.map(|_| ()),
             _ = sigterm.recv() => Ok(()),
@@ -575,6 +610,10 @@ impl SpawnedDaemon {
         self.child.try_wait()
     }
 
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     fn poll_exit(&mut self) -> anyhow::Result<Option<SpawnedDaemonExit>> {
         let Some(status) = self.child.try_wait()? else {
             return Ok(None);
@@ -646,9 +685,16 @@ fn terminate_child(child: &mut std::process::Child) -> anyhow::Result<ExitStatus
 
 fn sanitize_daemon_stderr(bytes: &[u8]) -> String {
     let mut rendered = String::new();
-    for character in String::from_utf8_lossy(bytes).chars() {
+    let decoded = String::from_utf8_lossy(bytes);
+    let mut characters = decoded.chars().peekable();
+    while let Some(character) = characters.next() {
         match character {
-            '\n' | '\r' | '\t' => rendered.push(character),
+            '\r' if characters.peek() == Some(&'\n') => {
+                characters.next();
+                rendered.push('\n');
+            }
+            '\r' => rendered.push('\u{fffd}'),
+            '\n' | '\t' => rendered.push(character),
             character if character.is_control() => rendered.push('\u{fffd}'),
             character => rendered.push(character),
         }
@@ -662,6 +708,42 @@ fn sanitize_daemon_stderr(bytes: &[u8]) -> String {
         start += 1;
     }
     rendered[start..].to_owned()
+}
+
+fn reconcile_spawned_daemon_identity(
+    server_pid: Option<u32>,
+    daemon: &mut SpawnedDaemon,
+) -> anyhow::Result<bool> {
+    if server_pid == Some(daemon.id()) {
+        return Ok(true);
+    }
+
+    let spawned_pid = daemon.id();
+    daemon.terminate_and_wait().map_err(|cleanup_error| {
+        anyhow::Error::msg(format!(
+            "connected to daemon pid {}, but failed to clean up spawned daemon pid {}: {cleanup_error:#}",
+            server_pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+            spawned_pid,
+        ))
+    })?;
+
+    if server_pid.is_none() {
+        anyhow::bail!(
+            "spawned daemon did not report its process id during initialization; cleaned up pid {spawned_pid}"
+        );
+    }
+    Ok(false)
+}
+
+fn cleanup_spawned_daemon_after_signal(daemon: &mut SpawnedDaemon) -> anyhow::Result<()> {
+    daemon
+        .terminate_and_wait()
+        .map(|_| ())
+        .map_err(|cleanup_error| {
+            anyhow::Error::msg(format!(
+                "received SIGTERM while starting daemon; cleanup failed: {cleanup_error:#}"
+            ))
+        })
 }
 
 #[derive(Debug)]
@@ -871,7 +953,105 @@ mod connection_tests {
         assert!(exit.stderr().len() <= DAEMON_STDERR_LIMIT);
         assert!(!exit.stderr().contains('\u{1b}'));
         assert!(!exit.stderr().contains('\0'));
+        assert!(!exit.stderr().contains('\r'));
         assert!(exit.stderr().contains("unsafe-stderr-tail"));
+    }
+
+    #[test]
+    fn spawned_daemon_stderr_normalizes_crlf_and_replaces_bare_carriage_returns() {
+        assert_eq!(
+            sanitize_daemon_stderr(b"first\r\nsecond\roverwrite"),
+            "first\nsecond\u{fffd}overwrite"
+        );
+    }
+
+    #[test]
+    fn spawned_daemon_mismatched_identity_terminates_and_reaps_child() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+        let spawned_pid = daemon.id();
+
+        let owns_ephemeral =
+            reconcile_spawned_daemon_identity(Some(spawned_pid.wrapping_add(1)), &mut daemon)
+                .expect("clean up mismatched child");
+
+        assert!(!owns_ephemeral);
+        assert!(daemon.try_wait().expect("poll reaped helper").is_some());
+    }
+
+    #[test]
+    fn spawned_daemon_missing_identity_fails_closed_after_reaping_child() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+
+        let error = reconcile_spawned_daemon_identity(None, &mut daemon)
+            .expect_err("missing identity must not transfer ownership");
+
+        assert!(error.to_string().contains("did not report its process id"));
+        assert!(daemon.try_wait().expect("poll reaped helper").is_some());
+    }
+
+    #[test]
+    fn spawned_daemon_matching_identity_retains_child() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+
+        let owns_ephemeral = reconcile_spawned_daemon_identity(Some(daemon.id()), &mut daemon)
+            .expect("accept matching child");
+
+        assert!(owns_ephemeral);
+        assert!(daemon.try_wait().expect("poll helper").is_none());
+    }
+
+    #[test]
+    fn spawned_daemon_startup_signal_cleanup_terminates_and_reaps_child() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+
+        cleanup_spawned_daemon_after_signal(&mut daemon).expect("clean up signalled child");
+
+        assert!(daemon.try_wait().expect("poll reaped helper").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_daemon_parent_only_sigterm_cleans_up_child() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let pid_path = temp.path().join("daemon.pid");
+        let mut owner = spawned_daemon_helper_command("signal-owner");
+        owner.env("ZEROCODE_SIGNAL_OWNER_PID_PATH", &pid_path);
+        let mut owner = owner.spawn().expect("spawn signal owner");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let daemon_pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+                break pid.trim().parse::<u32>().expect("parse daemon pid");
+            }
+            assert!(
+                owner.try_wait().expect("poll signal owner").is_none(),
+                "signal owner exited before publishing daemon pid"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "signal owner did not publish daemon pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGTERM) };
+        assert_eq!(
+            signal_result,
+            0,
+            "send SIGTERM: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(owner.wait().expect("wait signal owner").success());
+
+        let child_probe = unsafe { libc::kill(daemon_pid as libc::pid_t, 0) };
+        assert_eq!(child_probe, -1, "spawned daemon pid {daemon_pid} survived");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]
@@ -898,7 +1078,7 @@ mod connection_tests {
                     .write_all(&vec![0xff; DAEMON_STDERR_LIMIT * 2])
                     .expect("write invalid stderr");
                 stderr
-                    .write_all(b"\x1b[2J\0unsafe-stderr-tail\n")
+                    .write_all(b"\x1b[2J\0\runsafe-stderr-tail\r\n")
                     .expect("write control stderr");
                 std::process::exit(23);
             }
@@ -928,6 +1108,27 @@ mod connection_tests {
                     );
                     std::thread::sleep(Duration::from_millis(10));
                 }
+            }
+            #[cfg(unix)]
+            Ok("signal-owner") => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build signal runtime");
+                runtime.block_on(async {
+                    let mut sigterm =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .expect("install SIGTERM handler");
+                    let mut daemon = SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep"))
+                        .expect("spawn owned daemon helper");
+                    let pid_path = std::env::var_os("ZEROCODE_SIGNAL_OWNER_PID_PATH")
+                        .expect("signal owner pid path");
+                    std::fs::write(pid_path, daemon.id().to_string())
+                        .expect("publish owned daemon pid");
+                    sigterm.recv().await;
+                    cleanup_spawned_daemon_after_signal(&mut daemon)
+                        .expect("clean up signalled daemon");
+                });
             }
             other => panic!("unexpected helper mode: {other:?}"),
         }
