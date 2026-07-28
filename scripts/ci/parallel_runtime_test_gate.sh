@@ -22,10 +22,10 @@ esac
 
 case "$scope" in
     all)
-        package_args=(-p zeroclaw-runtime -p zeroclaw-channels)
+        crates=(zeroclaw-runtime zeroclaw-channels)
         ;;
     channels)
-        package_args=(-p zeroclaw-channels)
+        crates=(zeroclaw-channels)
         ;;
     *)
         echo "ZEROCLAW_PARALLEL_TEST_SCOPE must be 'channels' or 'all' (got: $scope)."
@@ -33,7 +33,9 @@ case "$scope" in
         ;;
 esac
 
-for ((run = 1; run <= runs; run++)); do
-    echo "==> parallel runtime regression: $scope run $run/$runs ($threads threads)"
-    cargo test --locked --quiet "${package_args[@]}" --lib -- --test-threads="$threads"
+for crate in "${crates[@]}"; do
+    for ((run = 1; run <= runs; run++)); do
+        echo "==> parallel runtime regression: $crate run $run/$runs ($threads threads)"
+        cargo test --locked --quiet -p "$crate" --lib -- --test-threads="$threads"
+    done
 done

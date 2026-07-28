@@ -80,16 +80,29 @@ printf '%s\n' "$*" >> "$ZEROCLAW_PARALLEL_TEST_CARGO_LOG"
 EOF
 chmod +x "${mock_dir}/cargo"
 
+expect_cargo_log() {
+    local name="$1"
+    local actual
+    local expected
+    shift
+
+    actual="$(cat "$cargo_log")"
+    expected="$(printf '%s\n' "$@")"
+    if [ "$actual" != "$expected" ]; then
+        echo "FAIL: unexpected Cargo calls for $name" >&2
+        printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+        exit 1
+    fi
+}
+
 PATH="${mock_dir}:$PATH" \
     ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
     ZEROCLAW_PARALLEL_TEST_RUNS=1 \
     ZEROCLAW_PARALLEL_TEST_SCOPE=channels \
     bash "$gate" >/dev/null
 
-if ! grep -Fxq 'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16' "$cargo_log"; then
-    echo "FAIL: channels scope did not invoke only zeroclaw-channels" >&2
-    exit 1
-fi
+expect_cargo_log "channels scope" \
+    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16'
 
 : > "$cargo_log"
 PATH="${mock_dir}:$PATH" \
@@ -97,10 +110,9 @@ PATH="${mock_dir}:$PATH" \
     ZEROCLAW_PARALLEL_TEST_RUNS=1 \
     bash "$gate" >/dev/null
 
-if ! grep -Fxq 'test --locked --quiet -p zeroclaw-runtime -p zeroclaw-channels --lib -- --test-threads=16' "$cargo_log"; then
-    echo "FAIL: default scope did not invoke the dependency-closed crate set" >&2
-    exit 1
-fi
+expect_cargo_log "default scope" \
+    'test --locked --quiet -p zeroclaw-runtime --lib -- --test-threads=16' \
+    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16'
 
 : > "$cargo_log"
 PATH="${mock_dir}:$PATH" \
@@ -109,10 +121,9 @@ PATH="${mock_dir}:$PATH" \
     ZEROCLAW_PARALLEL_TEST_SCOPE='' \
     bash "$gate" >/dev/null
 
-if ! grep -Fxq 'test --locked --quiet -p zeroclaw-runtime -p zeroclaw-channels --lib -- --test-threads=16' "$cargo_log"; then
-    echo "FAIL: empty scope did not invoke the dependency-closed crate set" >&2
-    exit 1
-fi
+expect_cargo_log "empty scope" \
+    'test --locked --quiet -p zeroclaw-runtime --lib -- --test-threads=16' \
+    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16'
 
 : > "$cargo_log"
 set +e
