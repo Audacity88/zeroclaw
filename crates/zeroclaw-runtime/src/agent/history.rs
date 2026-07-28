@@ -21,6 +21,7 @@ pub(crate) fn prompt_tool_results_message(content: impl Into<String>) -> ChatMes
     }
 }
 
+#[cfg(test)]
 pub(crate) fn is_prompt_tool_results_message(message: &ChatMessage) -> bool {
     message.role == PROMPT_TOOL_RESULTS_ROLE
 }

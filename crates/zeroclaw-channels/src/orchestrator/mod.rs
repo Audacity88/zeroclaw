@@ -5385,6 +5385,7 @@ async fn process_channel_message_body(
                     },
                 ),
                 history: &mut history,
+                history_has_trim_breadcrumb: None,
                 channel_name: msg.channel.as_str(),
                 channel_reply_target: Some(msg.reply_target.as_str()),
                 cancellation_token: Some(cancellation_token.clone()),
