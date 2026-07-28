@@ -4,13 +4,27 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 classifier="${script_dir}/parallel_runtime_test_scope.sh"
+gate="${script_dir}/parallel_runtime_test_gate.sh"
 
 expect_run() {
     local name="$1"
-    shift
+    local expected="$2"
+    local actual
+    local status
+    shift 2
 
-    if ! printf '%s\n' "$@" | bash "$classifier" >/dev/null; then
+    set +e
+    actual="$(printf '%s\n' "$@" | bash "$classifier")"
+    status=$?
+    set -e
+
+    if [ "$status" -ne 0 ]; then
         echo "FAIL: expected parallel runtime tests for $name" >&2
+        exit 1
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        echo "FAIL: expected '$expected' for $name, got '$actual'" >&2
         exit 1
     fi
 }
@@ -20,7 +34,7 @@ expect_skip() {
     shift
 
     set +e
-    printf '%s\n' "$@" | bash "$classifier" >/dev/null
+    printf '%s\n' "$@" | bash "$classifier" >/dev/null 2>&1
     status=$?
     set -e
 
@@ -30,19 +44,65 @@ expect_skip() {
     fi
 }
 
-expect_run "runtime source" "crates/zeroclaw-runtime/src/agent/loop_.rs"
-expect_run "channel source" "crates/zeroclaw-channels/src/orchestrator/mod.rs"
-expect_run "workspace manifest" "Cargo.toml"
-expect_run "workspace lockfile" "Cargo.lock"
-expect_run "quality workflow" ".github/workflows/ci.yml"
-expect_run "parallel gate" "scripts/ci/parallel_runtime_test_gate.sh"
-expect_run "scope classifier" "scripts/ci/parallel_runtime_test_scope.sh"
-expect_run "mixed paths" "apps/zerocode/src/app.rs" "crates/zeroclaw-runtime/src/lib.rs"
+expect_run "runtime source" "all" \
+    "crates/zeroclaw-runtime/src/agent/loop_.rs"
+expect_run "channel source" "channels" \
+    "crates/zeroclaw-channels/src/orchestrator/mod.rs"
+expect_run "workspace manifest" "all" "Cargo.toml"
+expect_run "workspace lockfile" "all" "Cargo.lock"
+expect_run "quality workflow" "all" ".github/workflows/ci.yml"
+expect_run "parallel gate" "all" \
+    "scripts/ci/parallel_runtime_test_gate.sh"
+expect_run "scope classifier" "all" \
+    "scripts/ci/parallel_runtime_test_scope.sh"
+expect_run "mixed paths" "all" \
+    "apps/zerocode/src/app.rs" "crates/zeroclaw-runtime/src/lib.rs"
 
 expect_skip "ZeroCode-only changes" "apps/zerocode/src/app.rs"
 expect_skip "web-only changes" "web/src/pages/AgentChat.tsx"
 expect_skip "docs-only changes" "docs/book/src/contributing/testing.md"
 expect_skip "unrelated crate changes" "crates/zeroclaw-providers/src/openai.rs"
 expect_skip "empty input"
+
+mock_dir="$(mktemp -d)"
+cargo_log="${mock_dir}/cargo.log"
+trap 'rm -rf "$mock_dir"' EXIT
+
+cat > "${mock_dir}/cargo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$ZEROCLAW_PARALLEL_TEST_CARGO_LOG"
+EOF
+chmod +x "${mock_dir}/cargo"
+
+PATH="${mock_dir}:$PATH" \
+    ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
+    ZEROCLAW_PARALLEL_TEST_RUNS=1 \
+    ZEROCLAW_PARALLEL_TEST_SCOPE=channels \
+    bash "$gate" >/dev/null
+
+if ! grep -Fxq 'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16' "$cargo_log"; then
+    echo "FAIL: channels scope did not invoke only zeroclaw-channels" >&2
+    exit 1
+fi
+
+: > "$cargo_log"
+PATH="${mock_dir}:$PATH" \
+    ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
+    ZEROCLAW_PARALLEL_TEST_RUNS=1 \
+    bash "$gate" >/dev/null
+
+if ! grep -Fxq 'test --locked --quiet -p zeroclaw-runtime -p zeroclaw-channels --lib -- --test-threads=16' "$cargo_log"; then
+    echo "FAIL: default scope did not invoke the dependency-closed crate set" >&2
+    exit 1
+fi
+
+set +e
+ZEROCLAW_PARALLEL_TEST_SCOPE=unsupported bash "$gate" >/dev/null 2>&1
+status=$?
+set -e
+if [ "$status" -ne 2 ]; then
+    echo "FAIL: unsupported scope should exit 2, got $status" >&2
+    exit 1
+fi
 
 echo "parallel runtime test scope tests: pass"
