@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn generic_runtime_error_preserves_the_full_chain() {
-        let error = anyhow::anyhow!("inner runtime cause").context("outer runtime context");
+        let error = anyhow::Error::msg("inner runtime cause").context("outer runtime context");
 
         let message = format_runtime_command_error(&error);
 
