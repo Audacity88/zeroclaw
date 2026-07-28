@@ -55,6 +55,8 @@ expect_run "parallel gate" "all" \
     "scripts/ci/parallel_runtime_test_gate.sh"
 expect_run "scope classifier" "all" \
     "scripts/ci/parallel_runtime_test_scope.sh"
+expect_run "scope fixture" "all" \
+    "scripts/ci/parallel_runtime_test_scope.test.sh"
 expect_run "channel then runtime" "all" \
     "crates/zeroclaw-channels/src/orchestrator/mod.rs" \
     "crates/zeroclaw-runtime/src/lib.rs"
@@ -97,6 +99,18 @@ PATH="${mock_dir}:$PATH" \
 
 if ! grep -Fxq 'test --locked --quiet -p zeroclaw-runtime -p zeroclaw-channels --lib -- --test-threads=16' "$cargo_log"; then
     echo "FAIL: default scope did not invoke the dependency-closed crate set" >&2
+    exit 1
+fi
+
+: > "$cargo_log"
+PATH="${mock_dir}:$PATH" \
+    ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
+    ZEROCLAW_PARALLEL_TEST_RUNS=1 \
+    ZEROCLAW_PARALLEL_TEST_SCOPE='' \
+    bash "$gate" >/dev/null
+
+if ! grep -Fxq 'test --locked --quiet -p zeroclaw-runtime -p zeroclaw-channels --lib -- --test-threads=16' "$cargo_log"; then
+    echo "FAIL: empty scope did not invoke the dependency-closed crate set" >&2
     exit 1
 fi
 
