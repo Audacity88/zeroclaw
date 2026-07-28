@@ -55,8 +55,12 @@ expect_run "parallel gate" "all" \
     "scripts/ci/parallel_runtime_test_gate.sh"
 expect_run "scope classifier" "all" \
     "scripts/ci/parallel_runtime_test_scope.sh"
-expect_run "mixed paths" "all" \
-    "apps/zerocode/src/app.rs" "crates/zeroclaw-runtime/src/lib.rs"
+expect_run "channel then runtime" "all" \
+    "crates/zeroclaw-channels/src/orchestrator/mod.rs" \
+    "crates/zeroclaw-runtime/src/lib.rs"
+expect_run "runtime then channel" "all" \
+    "crates/zeroclaw-runtime/src/lib.rs" \
+    "crates/zeroclaw-channels/src/orchestrator/mod.rs"
 
 expect_skip "ZeroCode-only changes" "apps/zerocode/src/app.rs"
 expect_skip "web-only changes" "web/src/pages/AgentChat.tsx"
@@ -96,12 +100,21 @@ if ! grep -Fxq 'test --locked --quiet -p zeroclaw-runtime -p zeroclaw-channels -
     exit 1
 fi
 
+: > "$cargo_log"
 set +e
-ZEROCLAW_PARALLEL_TEST_SCOPE=unsupported bash "$gate" >/dev/null 2>&1
+PATH="${mock_dir}:$PATH" \
+    ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
+    ZEROCLAW_PARALLEL_TEST_RUNS=1 \
+    ZEROCLAW_PARALLEL_TEST_SCOPE=unsupported \
+    bash "$gate" >/dev/null 2>&1
 status=$?
 set -e
 if [ "$status" -ne 2 ]; then
     echo "FAIL: unsupported scope should exit 2, got $status" >&2
+    exit 1
+fi
+if [ -s "$cargo_log" ]; then
+    echo "FAIL: unsupported scope invoked Cargo" >&2
     exit 1
 fi
 
