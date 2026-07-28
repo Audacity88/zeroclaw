@@ -2829,17 +2829,13 @@ impl RpcDispatcher {
     }
 
     async fn refresh_live_sessions_for_agent(ctx: Arc<RpcContext>, agent_alias: &str) {
-        let provider_ref = {
-            let config = ctx.config.read();
+        Self::refresh_live_sessions_matching(ctx, |config, session_agent, overrides| {
+            if !agent_scoped_refresh_selects(agent_alias, session_agent, overrides) {
+                return None;
+            }
             config
                 .agent(agent_alias)
                 .map(|agent| agent.model_provider.to_string())
-        };
-        let Some(provider_ref) = provider_ref else {
-            return;
-        };
-        Self::refresh_live_sessions_matching(ctx, &provider_ref, |session_agent, overrides| {
-            agent_scoped_refresh_selects(agent_alias, session_agent, overrides)
         })
         .await;
     }
@@ -2849,18 +2845,23 @@ impl RpcDispatcher {
         model_provider_ref: &str,
     ) {
         let target_ref = model_provider_ref.to_string();
-        Self::refresh_live_sessions_matching(ctx, model_provider_ref, move |_agent, overrides| {
-            provider_scoped_refresh_selects(&target_ref, overrides)
+        Self::refresh_live_sessions_matching(ctx, move |config, session_agent, overrides| {
+            if !provider_scoped_refresh_selects(&target_ref, overrides) {
+                return None;
+            }
+            let effective_ref = overrides.model_provider.as_deref().or_else(|| {
+                config
+                    .agent(session_agent)
+                    .map(|agent| agent.model_provider.as_str())
+            });
+            (effective_ref == Some(target_ref.as_str())).then(|| target_ref.clone())
         })
         .await;
     }
 
-    async fn refresh_live_sessions_matching<F>(
-        ctx: Arc<RpcContext>,
-        model_provider_ref: &str,
-        select: F,
-    ) where
-        F: Fn(&str, &SessionOverrides) -> bool,
+    async fn refresh_live_sessions_matching<F>(ctx: Arc<RpcContext>, resolve_provider_ref: F)
+    where
+        F: Fn(&Config, &str, &SessionOverrides) -> Option<String>,
     {
         let session_ids = ctx.sessions.list_ids().await;
         for session_id in session_ids {
@@ -2875,24 +2876,13 @@ impl RpcDispatcher {
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
-            if !select(&agent_alias, &overrides) {
-                continue;
-            }
-            let resolves_provider = {
-                let config = ctx.config.read();
-                let effective_ref = overrides.model_provider.as_deref().or_else(|| {
-                    config
-                        .agent(&agent_alias)
-                        .map(|agent| agent.model_provider.as_str())
-                });
-                effective_ref == Some(model_provider_ref)
-            };
-            if !resolves_provider {
-                continue;
-            }
-
             let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
                 let config = ctx.config.read();
+                let Some(model_provider_ref) =
+                    resolve_provider_ref(&config, &agent_alias, &overrides)
+                else {
+                    continue;
+                };
                 let provider_temperature = model_provider_ref.split_once('.').and_then(
                     |(provider_type, provider_alias)| {
                         config
@@ -2921,7 +2911,7 @@ impl RpcDispatcher {
                 };
                 match crate::agent::agent::build_session_model_provider(
                     &config,
-                    model_provider_ref,
+                    &model_provider_ref,
                     overrides.model.as_deref(),
                 ) {
                     Ok((model_provider, model_provider_name, model_name)) => {
@@ -8873,31 +8863,54 @@ mod tests {
             .await
             .expect("session update lock exists");
 
-        let mut refreshes = Vec::new();
-        for provider in ["openai.other-provider", "openai.latest-provider"] {
-            dispatcher
-                .ctx
-                .config
-                .write()
-                .agents
-                .get_mut("test-agent")
-                .expect("test agent exists")
-                .model_provider = provider.into();
-            let refresh_ctx = Arc::clone(&dispatcher.ctx);
-            let refresh_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
-            let refresh_wait = refresh_waiting.notified();
-            refreshes.push(zeroclaw_spawn::spawn!(async move {
-                RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent").await;
-            }));
-            tokio::time::timeout(std::time::Duration::from_secs(1), refresh_wait)
-                .await
-                .expect("agent refresh must reach the provider update boundary");
-        }
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+        let release_older_refresh = Arc::new(tokio::sync::Notify::new());
+        let older_release = Arc::clone(&release_older_refresh);
+        let older_ctx = Arc::clone(&dispatcher.ctx);
+        let older_refresh = zeroclaw_spawn::spawn!(async move {
+            older_release.notified().await;
+            RpcDispatcher::refresh_live_sessions_for_agent(older_ctx, "test-agent").await;
+        });
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.latest-provider".into();
+        let latest_ctx = Arc::clone(&dispatcher.ctx);
+        let latest_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let latest_wait = latest_waiting.notified();
+        let latest_refresh = zeroclaw_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(latest_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), latest_wait)
+            .await
+            .expect("latest agent refresh must reach the provider update boundary");
+
+        let older_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let older_wait = older_waiting.notified();
+        release_older_refresh.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), older_wait)
+            .await
+            .expect("older agent refresh must queue after the latest refresh");
         drop(update_guard);
 
-        for refresh in refreshes {
-            refresh.await.expect("agent refresh task must complete");
-        }
+        latest_refresh
+            .await
+            .expect("latest agent refresh task must complete");
+        older_refresh
+            .await
+            .expect("older agent refresh task must complete");
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
             "latest-model",
