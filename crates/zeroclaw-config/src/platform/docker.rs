@@ -280,10 +280,15 @@ mod tests {
         let command = runtime
             .build_shell_command("echo test", &workspace)
             .unwrap();
-        let debug = format!("{command:?}");
         let canonical_workspace = workspace.canonicalize().unwrap();
+        let expected_mount = format!("{}:/workspace:rw", canonical_workspace.display());
 
-        assert!(debug.contains(canonical_workspace.to_string_lossy().as_ref()));
+        assert!(
+            command
+                .as_std()
+                .get_args()
+                .any(|arg| arg == std::ffi::OsStr::new(&expected_mount))
+        );
     }
 
     // ── §3.3 / §3.4 Docker mount & network isolation tests ──

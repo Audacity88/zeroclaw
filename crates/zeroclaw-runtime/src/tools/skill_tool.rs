@@ -221,7 +221,7 @@ impl Tool for SkillShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to build runtime command: {e}")),
+                    error: Some(format!("Failed to build runtime command: {e:#}")),
                 });
             }
         };
