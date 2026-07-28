@@ -4757,8 +4757,6 @@ fn notification_for_turn_event(
         },
         TurnEvent::Usage {
             input_tokens,
-            cached_input_tokens: _,
-            output_tokens: _,
             ..
         } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
