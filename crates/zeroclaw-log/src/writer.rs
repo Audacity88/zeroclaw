@@ -75,11 +75,10 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 /// honoured even when no events are flowing.
 const IDLE_TICK: Duration = Duration::from_millis(50);
 
-/// Upper bound on how long re-init waits for a previous worker thread to
-/// observe channel disconnect and exit. Sized well above `IDLE_TICK` so a
-/// healthy worker always exits before the deadline; a stuck worker is
-/// logged and abandoned rather than blocking config reload forever.
-const SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
+/// How long re-init waits before warning that the previous writer is slow to
+/// stop. The warning is not permission to install a second writer for the same
+/// path: reload continues waiting to preserve exclusive ownership.
+const SHUTDOWN_WARN_AFTER: Duration = Duration::from_millis(500);
 
 /// A unit of work sent from the async runtime to the disk-persistence
 /// worker. The `Value` payload is unavoidable because we serialize once
@@ -93,6 +92,11 @@ enum WriterJob {
     /// Drain all earlier jobs, sync the active file, and exit. Re-init uses
     /// the acknowledgement to establish a quiescent migration boundary.
     Shutdown(SyncSender<()>),
+    #[cfg(test)]
+    Pause {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    },
 }
 
 /// Set when the worker thread has exited (panic or normal). Used by
@@ -140,6 +144,22 @@ fn init_from_config_with_migration<F>(config: &LogConfig, workspace_dir: &Path, 
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    init_from_config_with_migration_and_shutdown_warning(
+        config,
+        workspace_dir,
+        migrate_file,
+        SHUTDOWN_WARN_AFTER,
+    );
+}
+
+fn init_from_config_with_migration_and_shutdown_warning<F>(
+    config: &LogConfig,
+    workspace_dir: &Path,
+    migrate_file: F,
+    shutdown_warn_after: Duration,
+) where
+    F: FnOnce(&Path) -> Result<()>,
+{
     let _reinit_guard = REINIT_LOCK.lock();
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
@@ -148,10 +168,9 @@ where
     // are about to clone its sender.
     *handoff_buffer().lock() = Some(Vec::new());
 
-    let previous_stopped = shutdown_current_writer();
+    shutdown_current_writer(shutdown_warn_after);
 
-    if previous_stopped
-        && policy.storage.is_enabled()
+    if policy.storage.is_enabled()
         && policy.path.exists()
         && let Err(err) = migrate_file(&policy.path)
     {
@@ -162,14 +181,6 @@ where
             "log: legacy JSONL migration failed; daemon continuing with mixed-shape file"
         );
     }
-    if !previous_stopped && policy.storage.is_enabled() && policy.path.exists() {
-        tracing::warn!(
-            target: "zeroclaw_log",
-            path = %policy.path.display(),
-            "log: skipping legacy JSONL migration because the previous writer is still stopping"
-        );
-    }
-
     let (tx, rx) = sync_channel::<WriterJob>(QUEUE_CAPACITY);
     let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
 
@@ -209,49 +220,59 @@ fn handoff_buffer() -> &'static parking_lot::Mutex<Option<Vec<Value>>> {
 /// Remove the currently installed writer (if any), drain its queue, and wait
 /// for the worker to sync and exit. The explicit shutdown job does not depend
 /// on temporary `Arc<WriterState>` clones releasing their senders.
-fn shutdown_current_writer() -> bool {
+fn shutdown_current_writer(warn_after: Duration) {
     let previous = slot().write().take();
     let Some(prev) = previous else {
-        return true;
+        return;
     };
     if prev.worker_dead.load(Ordering::Acquire) {
-        return true;
+        return;
     }
 
     let (ack_tx, ack_rx) = sync_channel(0);
     let start = Instant::now();
     let mut shutdown = WriterJob::Shutdown(ack_tx);
+    let mut warned_while_queued = false;
     loop {
         match prev.tx.try_send(shutdown) {
             Ok(()) => break,
-            Err(TrySendError::Full(job)) if start.elapsed() < SHUTDOWN_WAIT => {
+            Err(TrySendError::Full(job)) if start.elapsed() < warn_after => {
                 shutdown = job;
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(TrySendError::Full(_)) => {
+            Err(TrySendError::Full(job)) => {
                 tracing::warn!(
                     target: "zeroclaw_log",
-                    "log: previous writer queue did not drain within {:?}; continuing with re-init",
-                    SHUTDOWN_WAIT
+                    "log: previous writer queue did not drain within {:?}; waiting to preserve exclusive ownership",
+                    warn_after
                 );
-                return false;
+                warned_while_queued = true;
+                if prev.tx.send(job).is_err() {
+                    return;
+                }
+                break;
             }
-            Err(TrySendError::Disconnected(_)) => return true,
+            Err(TrySendError::Disconnected(_)) => return,
         }
     }
     drop(prev);
 
-    let remaining = SHUTDOWN_WAIT.saturating_sub(start.elapsed());
+    if warned_while_queued {
+        let _ = ack_rx.recv();
+        return;
+    }
+
+    let remaining = warn_after.saturating_sub(start.elapsed());
     if ack_rx.recv_timeout(remaining).is_ok() {
-        return true;
+        return;
     }
 
     tracing::warn!(
         target: "zeroclaw_log",
-        "log: previous writer worker did not exit within {:?}; continuing with re-init",
-        SHUTDOWN_WAIT
+        "log: previous writer worker did not exit within {:?}; waiting to preserve exclusive ownership",
+        warn_after
     );
-    false
+    let _ = ack_rx.recv();
 }
 
 /// Spawn the disk-persistence worker thread. The worker owns the active
@@ -312,6 +333,11 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
                 WriterJob::Shutdown(ack) => {
                     shutdown_ack = Some(ack);
                     break;
+                }
+                #[cfg(test)]
+                WriterJob::Pause { entered, release } => {
+                    let _ = entered.send(());
+                    let _ = release.recv();
                 }
             }
         }
@@ -1171,6 +1197,99 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first_dead, &second.worker_dead),
             "re-init must install a fresh WriterState, not mutate the old one"
+        );
+    }
+
+    #[test]
+    fn reinit_waits_past_shutdown_warning_before_replacing_writer() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 100);
+
+        let first = current_state().expect("writer installed");
+        let (entered_tx, entered_rx) = sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        first
+            .tx
+            .send(WriterJob::Pause {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old worker should enter the deterministic pause");
+
+        let mut late_old = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        late_old.message = Some("old-worker-after-warning".to_string());
+        first
+            .tx
+            .send(WriterJob::Write(serde_json::to_value(late_old).unwrap()))
+            .unwrap();
+        drop(first);
+
+        let cfg = LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 100,
+            ..LogConfig::default()
+        };
+        let dir = tmp.path().to_path_buf();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reinit = thread::spawn(move || {
+            init_from_config_with_migration_and_shutdown_warning(
+                &cfg,
+                &dir,
+                |_| Ok(()),
+                Duration::from_millis(20),
+            );
+            done_tx.send(()).unwrap();
+        });
+
+        let handoff_start = Instant::now();
+        while handoff_buffer().lock().is_none() {
+            assert!(
+                handoff_start.elapsed() < Duration::from_secs(1),
+                "re-init should activate the handoff buffer"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(60)).is_err(),
+            "re-init must not install a replacement after only reaching the warning threshold"
+        );
+        let mut accepted = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        accepted.message = Some("accepted-during-timeout-handoff".to_string());
+        record_event(accepted);
+
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("re-init should finish after the old worker resumes and exits");
+        reinit.join().unwrap();
+        flush_for_test().unwrap();
+
+        let path = runtime_trace_path().unwrap();
+        let messages: Vec<String> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter_map(|event| {
+                event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "old-worker-after-warning")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "accepted-during-timeout-handoff"),
+            "an event accepted past the shutdown warning must survive after exclusive ownership transfers"
         );
     }
 
