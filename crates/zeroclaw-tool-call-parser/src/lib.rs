@@ -2770,19 +2770,42 @@ Done."#;
 
         let secret_name = "sk_live_SECRET_IDENTIFIER";
         let secret_body = "api_key=sk_live_SECRET_BODY";
-        let response = format!("```tool {secret_name}\n{secret_body}\n```");
+        let malformed_payload = format!("{secret_body}\n");
+        let expected_payload_len = malformed_payload.len() as u64;
+        let response = format!("```tool {secret_name}\n{malformed_payload}```");
 
         let (_, calls) = parse_tool_calls(&response);
         assert!(calls.is_empty());
 
-        let event = rx
-            .try_recv()
-            .expect("malformed tool block should emit a canonical log event");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let event = 'search: loop {
+            while let Ok(event) = rx.try_recv() {
+                let matches_message = event.get("message").and_then(|value| value.as_str())
+                    == Some("Found ```tool <name> block but could not parse JSON arguments");
+                let matches_source = event
+                    .get("attributes")
+                    .and_then(|attributes| attributes.get("_file"))
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|file| file.ends_with("zeroclaw-tool-call-parser/src/lib.rs"));
+                if matches_message && matches_source {
+                    break 'search event;
+                }
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "malformed tool block should emit the expected canonical log event"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         let serialized = event.to_string();
         assert!(!serialized.contains(secret_name));
         assert!(!serialized.contains(secret_body));
         assert!(event["attributes"].get("tool_name").is_none());
-        assert!(event["attributes"]["payload_len"].as_u64().is_some());
+        assert_eq!(
+            event["attributes"]["payload_len"].as_u64(),
+            Some(expected_payload_len)
+        );
     }
 
     #[test]
