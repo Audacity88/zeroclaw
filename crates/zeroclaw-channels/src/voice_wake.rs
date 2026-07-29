@@ -568,23 +568,23 @@ mod tests {
 
     #[test]
     fn all_pcm_formats_are_classified() {
-        let formats = [
-            cpal::SampleFormat::F32,
-            cpal::SampleFormat::F64,
-            cpal::SampleFormat::I8,
-            cpal::SampleFormat::I16,
-            cpal::SampleFormat::I24,
-            cpal::SampleFormat::I32,
-            cpal::SampleFormat::I64,
-            cpal::SampleFormat::U8,
-            cpal::SampleFormat::U16,
-            cpal::SampleFormat::U24,
-            cpal::SampleFormat::U32,
-            cpal::SampleFormat::U64,
+        let cases = [
+            (cpal::SampleFormat::F32, PcmSampleFormat::F32),
+            (cpal::SampleFormat::F64, PcmSampleFormat::F64),
+            (cpal::SampleFormat::I8, PcmSampleFormat::I8),
+            (cpal::SampleFormat::I16, PcmSampleFormat::I16),
+            (cpal::SampleFormat::I24, PcmSampleFormat::I24),
+            (cpal::SampleFormat::I32, PcmSampleFormat::I32),
+            (cpal::SampleFormat::I64, PcmSampleFormat::I64),
+            (cpal::SampleFormat::U8, PcmSampleFormat::U8),
+            (cpal::SampleFormat::U16, PcmSampleFormat::U16),
+            (cpal::SampleFormat::U24, PcmSampleFormat::U24),
+            (cpal::SampleFormat::U32, PcmSampleFormat::U32),
+            (cpal::SampleFormat::U64, PcmSampleFormat::U64),
         ];
 
-        for format in formats {
-            assert!(PcmSampleFormat::try_from(format).is_ok());
+        for (format, expected) in cases {
+            assert_eq!(PcmSampleFormat::try_from(format).unwrap(), expected);
         }
         assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU8).is_err());
         assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU16).is_err());
