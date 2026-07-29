@@ -20,6 +20,31 @@ const ZONE_MENU: &str = "menu";
 const ZONE_PRESETS: &str = "presets";
 const ZONE_POST_INSTALL: &str = "post-install";
 
+#[derive(Clone, Copy)]
+struct ZoneLayout {
+    zone: &'static str,
+    range_start: &'static str,
+    range_end: &'static str,
+}
+
+const ZONE_LAYOUTS: [ZoneLayout; 3] = [
+    ZoneLayout {
+        zone: ZONE_MENU,
+        range_start: ":: ---- Choose build mode ----",
+        range_end: ":: ---- Prebuilt binary ----",
+    },
+    ZoneLayout {
+        zone: ZONE_PRESETS,
+        range_start: ":: ---- Source build presets ----",
+        range_end: ":: ---- Build from source ----",
+    },
+    ZoneLayout {
+        zone: ZONE_POST_INSTALL,
+        range_start: "echo %BOLD%%GREEN%  ZeroClaw setup complete!%RESET%",
+        range_end: "echo   Alternative install via Scoop:",
+    },
+];
+
 /// Render the menu/routing zone body: non-interactive MODE routing plus the
 /// interactive numbered menu, walked from `Selection::menu()`. Option 1 is the
 /// hand-written prebuilt path; generated options start at 2.
@@ -124,9 +149,74 @@ pub fn fallback_build_id() -> &'static str {
 /// Splice all three generated zones into the current setup.bat, leaving all
 /// hand-written glue untouched. Errors if any zone's sentinels are missing.
 pub fn render_file(manifest_dir: &Path, current: &str) -> anyhow::Result<String> {
+    validate_zone_layouts(current)?;
     let with_menu = splice(current, ZONE_MENU, &render_menu(manifest_dir))?;
     let with_presets = splice(&with_menu, ZONE_PRESETS, &render_presets(manifest_dir)?)?;
     splice(&with_presets, ZONE_POST_INSTALL, &render_post_install())
+}
+
+fn unique_index(current: &str, needle: &str, label: &str) -> anyhow::Result<usize> {
+    let mut matches = current.match_indices(needle);
+    let first = matches
+        .next()
+        .ok_or_else(|| anyhow::Error::msg(format!("setup.bat missing {label}")))?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "setup.bat {label} must appear exactly once"
+    );
+    Ok(first.0)
+}
+
+fn validate_zone_layouts(current: &str) -> anyhow::Result<()> {
+    let mut previous_end = 0;
+    for layout in ZONE_LAYOUTS {
+        let range_start = unique_index(
+            current,
+            layout.range_start,
+            &format!("{} range start", layout.zone),
+        )?;
+        let range_end = unique_index(
+            current,
+            layout.range_end,
+            &format!("{} range end", layout.zone),
+        )?;
+        anyhow::ensure!(
+            range_start < range_end,
+            "setup.bat generated:{} structural range is reversed",
+            layout.zone
+        );
+
+        let begin_marker = begin(layout.zone);
+        let end_marker = end(layout.zone);
+        let begin_at = unique_index(
+            current,
+            &begin_marker,
+            &format!("generated:{} BEGIN sentinel", layout.zone),
+        )?;
+        let end_at = unique_index(
+            current,
+            &end_marker,
+            &format!("generated:{} END sentinel", layout.zone),
+        )?;
+
+        anyhow::ensure!(
+            begin_at < end_at,
+            "setup.bat generated:{} sentinels are reversed",
+            layout.zone
+        );
+        anyhow::ensure!(
+            begin_at > range_start && end_at + end_marker.len() < range_end,
+            "setup.bat generated:{} zone is outside its structural range",
+            layout.zone
+        );
+        anyhow::ensure!(
+            begin_at >= previous_end,
+            "setup.bat generated:{} zone is out of order",
+            layout.zone
+        );
+        previous_end = end_at + end_marker.len();
+    }
+    Ok(())
 }
 
 fn splice(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
@@ -233,6 +323,56 @@ mod tests {
     #[test]
     fn splice_errors_without_zone() {
         assert!(splice("nothing", ZONE_MENU, "x").is_err());
+    }
+
+    fn zone_span(current: &str, zone: &str) -> (usize, usize) {
+        let begin_marker = begin(zone);
+        let end_marker = end(zone);
+        let start = current.find(&begin_marker).unwrap();
+        let finish = current.find(&end_marker).unwrap() + end_marker.len();
+        (start, finish)
+    }
+
+    #[test]
+    fn real_setup_bat_rejects_duplicate_zone_sentinels() {
+        let current = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        for zone in [ZONE_MENU, ZONE_PRESETS, ZONE_POST_INSTALL] {
+            let duplicate = format!("{}\n{}\nDUPLICATE\n{}\n", current, begin(zone), end(zone));
+            assert!(
+                render_file(&root(), &duplicate).is_err(),
+                "duplicate generated:{zone} sentinels must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn real_setup_bat_rejects_zone_relocation() {
+        let current = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        for zone in [ZONE_MENU, ZONE_PRESETS, ZONE_POST_INSTALL] {
+            let (start, finish) = zone_span(&current, zone);
+            let zone_text = &current[start..finish];
+            let without_zone = format!("{}{}", &current[..start], &current[finish..]);
+            let insertion = without_zone.find('\n').unwrap() + 1;
+            let relocated = format!(
+                "{}{}\n{}",
+                &without_zone[..insertion],
+                zone_text,
+                &without_zone[insertion..]
+            );
+            assert_ne!(current, relocated);
+            assert!(
+                render_file(&root(), &relocated).is_err(),
+                "relocated generated:{zone} zone must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn real_setup_bat_allows_adjacent_handwritten_edits() {
+        let current = std::fs::read_to_string(root().join("setup.bat")).unwrap();
+        let marker = begin(ZONE_MENU);
+        let customized = current.replacen(&marker, &format!(":: local note\n{marker}"), 1);
+        assert!(render_file(&root(), &customized).is_ok());
     }
 
     #[test]
