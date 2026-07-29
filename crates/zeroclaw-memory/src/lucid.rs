@@ -641,7 +641,8 @@ mod platform_tests {
         );
         assert_eq!(
             memory.store_timeout,
-            Duration::from_millis(LucidMemory::DEFAULT_STORE_TIMEOUT_MS)
+            Duration::from_secs(3),
+            "the production store timeout must retain the documented cold-start allowance"
         );
     }
 }
@@ -770,17 +771,15 @@ exit 1
         script_path.display().to_string()
     }
 
-    fn write_timeout_lucid_script(dir: &Path, pid_path: &Path, marker_path: &Path) -> String {
+    fn write_timeout_lucid_script(dir: &Path, pid_path: &Path) -> String {
         let script_path = dir.join("timeout-lucid.sh");
         let script = format!(
             r#"#!/bin/sh
 set -eu
 printf '%s\n' "$$" > "{}"
-sleep 1
-printf 'completed\n' > "{}"
+exec sleep 10
 "#,
-            pid_path.display(),
-            marker_path.display()
+            pid_path.display()
         );
 
         fs::write(&script_path, script).unwrap();
@@ -929,13 +928,22 @@ exit 1
     }
 
     #[tokio::test]
-    async fn store_handles_lucid_cold_start_delay_with_default_timeout() {
+    async fn store_waits_for_delayed_lucid_process_with_test_timeout() {
         let tmp = TempDir::new().unwrap();
         let marker_path = tmp.path().join("store-completed.marker");
         let delayed_cmd = write_delayed_store_lucid_script(tmp.path(), &marker_path);
         let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let memory =
-            LucidMemory::with_overrides("test", tmp.path(), sqlite, Some(delayed_cmd), None, None);
+        let memory = LucidMemory::with_options(
+            "test",
+            tmp.path(),
+            sqlite,
+            delayed_cmd,
+            200,
+            3,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        );
 
         memory
             .store(
@@ -949,7 +957,7 @@ exit 1
 
         assert!(
             marker_path.exists(),
-            "the default store timeout must allow the simulated 1.5s cold start"
+            "the store path must wait for a healthy delayed Lucid process"
         );
     }
 
@@ -957,13 +965,17 @@ exit 1
     async fn timeout_terminates_and_reaps_lucid_child() {
         let tmp = TempDir::new().unwrap();
         let pid_path = tmp.path().join("child.pid");
-        let marker_path = tmp.path().join("completed.marker");
-        let cmd = write_timeout_lucid_script(tmp.path(), &pid_path, &marker_path);
+        let cmd = write_timeout_lucid_script(tmp.path(), &pid_path);
+        let timeout = Duration::from_secs(2);
 
-        let error = LucidMemory::run_lucid_command_raw(&cmd, &[], Duration::from_millis(200))
+        let error = LucidMemory::run_lucid_command_raw(&cmd, &[], timeout)
             .await
             .expect_err("delayed command must time out");
-        assert!(error.to_string().contains("timed out after 200ms"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("timed out after {}ms", timeout.as_millis()))
+        );
 
         let pid = fs::read_to_string(&pid_path)
             .expect("fake command must record its PID before the deadline")
@@ -979,12 +991,6 @@ exit 1
         assert!(
             !still_running,
             "timed-out Lucid child PID {pid} still exists"
-        );
-
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        assert!(
-            !marker_path.exists(),
-            "timed-out Lucid child continued running and wrote its late marker"
         );
     }
 
