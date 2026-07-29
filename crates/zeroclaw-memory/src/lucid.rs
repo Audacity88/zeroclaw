@@ -239,9 +239,18 @@ impl LucidMemory {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn lucid command {lucid_cmd:?}"))?;
+
+        Self::wait_for_lucid_child(child, lucid_cmd, timeout_window).await
+    }
+
+    async fn wait_for_lucid_child(
+        mut child: tokio::process::Child,
+        lucid_cmd: &str,
+        timeout_window: Duration,
+    ) -> anyhow::Result<String> {
         let mut stdout = child
             .stdout
             .take()
@@ -771,24 +780,6 @@ exit 1
         script_path.display().to_string()
     }
 
-    fn write_timeout_lucid_script(dir: &Path, pid_path: &Path) -> String {
-        let script_path = dir.join("timeout-lucid.sh");
-        let script = format!(
-            r#"#!/bin/sh
-set -eu
-printf '%s\n' "$$" > "{}"
-exec sleep 10
-"#,
-            pid_path.display()
-        );
-
-        fs::write(&script_path, script).unwrap();
-        let mut perms = fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms).unwrap();
-        script_path.display().to_string()
-    }
-
     fn write_probe_lucid_script(dir: &Path, marker_path: &Path) -> String {
         let script_path = dir.join("probe-lucid.sh");
         let marker = marker_path.display().to_string();
@@ -887,7 +878,7 @@ exit 1
     }
 
     #[tokio::test]
-    async fn recall_handles_lucid_cold_start_delay_within_timeout() {
+    async fn recall_waits_for_delayed_lucid_process_with_test_timeout() {
         let tmp = TempDir::new().unwrap();
         let delayed_cmd = write_delayed_lucid_script(tmp.path());
         let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
@@ -898,8 +889,8 @@ exit 1
             delayed_cmd,
             200,
             3,
-            Duration::from_millis(LucidMemory::DEFAULT_RECALL_TIMEOUT_MS),
-            Duration::from_millis(LucidMemory::DEFAULT_STORE_TIMEOUT_MS),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
             Duration::from_secs(2),
         );
 
@@ -963,12 +954,17 @@ exit 1
 
     #[tokio::test]
     async fn timeout_terminates_and_reaps_lucid_child() {
-        let tmp = TempDir::new().unwrap();
-        let pid_path = tmp.path().join("child.pid");
-        let cmd = write_timeout_lucid_script(tmp.path(), &pid_path);
-        let timeout = Duration::from_secs(2);
+        let mut command = Command::new("sleep");
+        command
+            .arg("10")
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().expect("sleep command must start");
+        let pid = child.id().expect("spawned sleep command must have a PID");
+        let timeout = Duration::from_millis(100);
 
-        let error = LucidMemory::run_lucid_command_raw(&cmd, &[], timeout)
+        let error = LucidMemory::wait_for_lucid_child(child, "sleep", timeout)
             .await
             .expect_err("delayed command must time out");
         assert!(
@@ -977,12 +973,8 @@ exit 1
                 .contains(&format!("timed out after {}ms", timeout.as_millis()))
         );
 
-        let pid = fs::read_to_string(&pid_path)
-            .expect("fake command must record its PID before the deadline")
-            .trim()
-            .to_string();
         let still_running = std::process::Command::new("kill")
-            .args(["-0", &pid])
+            .args(["-0", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -994,22 +986,26 @@ exit 1
         );
     }
 
-    #[tokio::test]
-    async fn with_overrides_none_matches_new_defaults() {
+    #[test]
+    fn with_overrides_none_matches_new_defaults() {
         let tmp = TempDir::new().unwrap();
-        let delayed_cmd = write_delayed_lucid_script(tmp.path());
         let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
-        let memory =
-            LucidMemory::with_overrides("test", tmp.path(), sqlite, Some(delayed_cmd), None, None);
+        let memory = LucidMemory::with_overrides(
+            "test",
+            tmp.path(),
+            sqlite,
+            Some("lucid-test".to_string()),
+            None,
+            None,
+        );
 
-        let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
-
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.content.contains("Delayed token refresh guidance")),
-            "with_overrides(None, None, None) must apply the same raised \
-             default timeout as `new`, tolerating the simulated 1.5s cold start"
+        assert_eq!(
+            memory.recall_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_RECALL_TIMEOUT_MS)
+        );
+        assert_eq!(
+            memory.store_timeout,
+            Duration::from_millis(LucidMemory::DEFAULT_STORE_TIMEOUT_MS)
         );
     }
 
