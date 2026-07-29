@@ -6,7 +6,9 @@ on:
     paths:
       - Dockerfile
       - Dockerfile.debian
+      - Dockerfile.alpine
       - Dockerfile.ci
+      - docker-compose.alpine.yml
       - .dockerignore
       - dev/config.template.toml
       - .github/workflows/docker-image-pr.yml
@@ -67,12 +69,12 @@ jobs:
           severity: HIGH,CRITICAL
 
   # Compiles the real source Dockerfiles (not the pre-built-binary `*.ci`
-  # variants above). The default `Dockerfile` is built for both published
-  # platforms, proving the arm64 cross-compilation path before a tag triggers
-  # docker-publish.yml; `Dockerfile.debian` stays amd64-only until the same
-  # cross-build support lands there. `push: false` and `contents: read` only —
-  # this never publishes. Split per matrix entry so the slow arm64 cross-build
-  # does not serialize behind the others.
+  # variants above). The default and Alpine Dockerfiles are built for both
+  # supported platforms, proving the arm64 cross-compilation paths before a tag
+  # triggers docker-publish.yml; `Dockerfile.debian` stays amd64-only until the
+  # same cross-build support lands there. `push: false` and `contents: read`
+  # only — this never publishes. Split per matrix entry so the slow arm64
+  # cross-builds do not serialize behind the others.
   source-images:
     name: Dockerfile Source Build (no push)
     runs-on: ubuntu-latest
@@ -93,6 +95,14 @@ jobs:
             platform: linux/amd64
             tag: zeroclaw-pr-source-debian:build
             cache-scope: docker-source-debian
+          - dockerfile: Dockerfile.alpine
+            platform: linux/amd64
+            tag: zeroclaw-pr-source-alpine:build
+            cache-scope: docker-source-alpine-amd64
+          - dockerfile: Dockerfile.alpine
+            platform: linux/arm64
+            tag: zeroclaw-pr-source-alpine:build
+            cache-scope: docker-source-alpine-arm64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -105,8 +115,14 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
-          load: false
+          load: ${{ matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' }}
           platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max
+
+      - name: Smoke Alpine binaries
+        if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64'
+        run: |
+          docker run --rm --entrypoint zeroclaw "${{ matrix.tag }}" --version
+          docker run --rm --entrypoint zerocode "${{ matrix.tag }}" --version
