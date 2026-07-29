@@ -1354,6 +1354,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn migration_makes_unterminated_tail_safe_for_first_writer_append() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "full".into(),
+            ..LogConfig::default()
+        };
+        let path = ResolvedPolicy::from_config(&cfg, tmp.path()).path;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"id":"legacy-id","timestamp":"2026-05-15T19:00:00Z","event_type":"legacy-test","message":"legacy-row"}"#,
+        )
+        .unwrap();
+
+        init_from_config(&cfg, tmp.path());
+        let mut event = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        event.message = Some("first-event-after-migration".to_string());
+        record_event(event);
+        flush_for_test().unwrap();
+
+        let lines: Vec<Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(lines.iter().any(|line| {
+            line["id"] == "legacy-id" && line["schema_version"] == LogEvent::SCHEMA_VERSION
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["message"] == "first-event-after-migration")
+        );
+    }
+
     // ── Rotation (StoragePolicy::Rotating) ───────────────────────
 
     fn install_rotating(

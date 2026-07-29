@@ -32,6 +32,7 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
     let mut reader = BufReader::new(in_file);
     let mut migrated: u64 = 0;
     let mut kept: u64 = 0;
+    let mut needs_eof_separator = false;
 
     let mut line = Vec::new();
     loop {
@@ -43,6 +44,7 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         {
             break;
         }
+        needs_eof_separator = !line.ends_with(b"\n");
         let trimmed = trim_ascii_whitespace(&line);
         if trimmed.is_empty() {
             out.write_all(&line)
@@ -73,6 +75,10 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
             out.write_all(&line)
                 .context("preserving current line during migrate")?;
         }
+    }
+    if needs_eof_separator {
+        out.write_all(b"\n")
+            .context("terminating migrated file for safe append")?;
     }
     out.flush().context("flushing migrated file")?;
     out.into_inner()
@@ -449,10 +455,11 @@ mod tests {
         let contents = fs::read(&path).unwrap();
         assert!(contents.starts_with(preserved.as_bytes()));
         assert!(
-            !contents.ends_with(b"\n"),
-            "unterminated legacy row must remain unterminated"
+            contents.ends_with(b"\n"),
+            "migration must add the separator required for the next append"
         );
-        let migrated: Value = serde_json::from_slice(&contents[preserved.len()..]).unwrap();
+        let migrated: Value =
+            serde_json::from_slice(trim_ascii_whitespace(&contents[preserved.len()..])).unwrap();
         assert_eq!(migrated["id"], "legacy");
         assert_eq!(migrated["schema_version"], LogEvent::SCHEMA_VERSION);
     }
