@@ -4,6 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use cpal::Sample;
 use tokio::sync::mpsc;
 
 use crate::transcription::TranscriptionManager;
@@ -11,6 +12,45 @@ use zeroclaw_config::schema::TranscriptionConfig;
 use zeroclaw_config::schema::VoiceWakeConfig;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+
+fn normalize_samples<T>(data: &[T]) -> Vec<f32>
+where
+    T: cpal::SizedSample,
+    f32: cpal::FromSample<T>,
+{
+    data.iter().copied().map(f32::from_sample).collect()
+}
+
+fn build_input_stream<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    audio_tx: mpsc::Sender<Vec<f32>>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: cpal::SizedSample,
+    f32: cpal::FromSample<T>,
+{
+    use cpal::traits::DeviceTrait;
+
+    device.build_input_stream(
+        config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            let samples = normalize_samples(data);
+            // Non-blocking: try_send and drop if full.
+            let _ = audio_tx.try_send(samples);
+        },
+        move |err| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "VoiceWake: audio stream error"
+            );
+        },
+        None,
+    )
+}
 
 // ── State machine ──────────────────────────────────────────────
 
@@ -131,31 +171,56 @@ impl Channel for VoiceWakeChannel {
             })?;
 
             let supported = device.default_input_config()?;
-            sample_rate = supported.sample_rate().0;
+            let sample_format = supported.sample_format();
+            sample_rate = supported.sample_rate();
             channels_count = supported.channels();
+            let device_name = device
+                .description()
+                .map(|description| description.name().to_owned())
+                .unwrap_or_default();
 
-            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"device": device.name().unwrap_or_default(), "sample_rate": sample_rate, "channels": channels_count})), "VoiceWake: opening audio input");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"device": device_name, "sample_rate": sample_rate, "channels": channels_count})), "VoiceWake: opening audio input");
 
             let stream_config: cpal::StreamConfig = supported.into();
-            let audio_tx_clone = audio_tx.clone();
-
-            let stream = device.build_input_stream(
-                &stream_config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    // Non-blocking: try_send and drop if full.
-                    let _ = audio_tx_clone.try_send(data.to_vec());
-                },
-                move |err| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                        "VoiceWake: audio stream error"
-                    );
-                },
-                None,
-            )?;
+            let stream = match sample_format {
+                cpal::SampleFormat::F32 => {
+                    build_input_stream::<f32>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::F64 => {
+                    build_input_stream::<f64>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::I8 => {
+                    build_input_stream::<i8>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::I16 => {
+                    build_input_stream::<i16>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::I24 => {
+                    build_input_stream::<cpal::I24>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::I32 => {
+                    build_input_stream::<i32>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::I64 => {
+                    build_input_stream::<i64>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::U8 => {
+                    build_input_stream::<u8>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::U16 => {
+                    build_input_stream::<u16>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::U24 => {
+                    build_input_stream::<cpal::U24>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::U32 => {
+                    build_input_stream::<u32>(&device, stream_config, audio_tx.clone())?
+                }
+                cpal::SampleFormat::U64 => {
+                    build_input_stream::<u64>(&device, stream_config, audio_tx.clone())?
+                }
+                sample_format => bail!("Unsupported input sample format: {sample_format}"),
+            };
 
             stream.play()?;
 
@@ -462,6 +527,18 @@ mod tests {
     #[test]
     fn rms_energy_of_empty_is_zero() {
         assert_eq!(compute_rms_energy(&[]), 0.0);
+    }
+
+    #[test]
+    fn sample_normalization_preserves_pcm_equilibrium() {
+        assert_eq!(normalize_samples(&[0_i16]), vec![0.0]);
+        assert_eq!(normalize_samples(&[32_768_u16]), vec![0.0]);
+        assert_eq!(normalize_samples(&[cpal::I24::new(0).unwrap()]), vec![0.0]);
+        assert_eq!(
+            normalize_samples(&[cpal::U24::new(1 << 23).unwrap()]),
+            vec![0.0]
+        );
+        assert_eq!(normalize_samples(&[0.5_f32]), vec![0.5]);
     }
 
     #[test]
