@@ -103,6 +103,15 @@ impl LucidMemory {
         }
     }
 
+    #[cfg(all(test, unix))]
+    pub(super) fn test_process_config(&self) -> (&str, Duration, Duration) {
+        (
+            &self.lucid_cmd,
+            self.recall_timeout,
+            self.store_timeout,
+        )
+    }
+
     fn in_failure_cooldown(&self) -> bool {
         let guard = self.last_failure_at.lock();
         guard
