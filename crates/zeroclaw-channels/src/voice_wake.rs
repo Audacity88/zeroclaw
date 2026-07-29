@@ -21,6 +21,44 @@ where
     data.iter().copied().map(f32::from_sample).collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PcmSampleFormat {
+    F32,
+    F64,
+    I8,
+    I16,
+    I24,
+    I32,
+    I64,
+    U8,
+    U16,
+    U24,
+    U32,
+    U64,
+}
+
+impl TryFrom<cpal::SampleFormat> for PcmSampleFormat {
+    type Error = anyhow::Error;
+
+    fn try_from(format: cpal::SampleFormat) -> Result<Self> {
+        match format {
+            cpal::SampleFormat::F32 => Ok(Self::F32),
+            cpal::SampleFormat::F64 => Ok(Self::F64),
+            cpal::SampleFormat::I8 => Ok(Self::I8),
+            cpal::SampleFormat::I16 => Ok(Self::I16),
+            cpal::SampleFormat::I24 => Ok(Self::I24),
+            cpal::SampleFormat::I32 => Ok(Self::I32),
+            cpal::SampleFormat::I64 => Ok(Self::I64),
+            cpal::SampleFormat::U8 => Ok(Self::U8),
+            cpal::SampleFormat::U16 => Ok(Self::U16),
+            cpal::SampleFormat::U24 => Ok(Self::U24),
+            cpal::SampleFormat::U32 => Ok(Self::U32),
+            cpal::SampleFormat::U64 => Ok(Self::U64),
+            format => bail!("Unsupported input sample format: {format}"),
+        }
+    }
+}
+
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
@@ -171,7 +209,7 @@ impl Channel for VoiceWakeChannel {
             })?;
 
             let supported = device.default_input_config()?;
-            let sample_format = supported.sample_format();
+            let sample_format = PcmSampleFormat::try_from(supported.sample_format())?;
             sample_rate = supported.sample_rate();
             channels_count = supported.channels();
             let device_name = device
@@ -183,43 +221,42 @@ impl Channel for VoiceWakeChannel {
 
             let stream_config: cpal::StreamConfig = supported.into();
             let stream = match sample_format {
-                cpal::SampleFormat::F32 => {
+                PcmSampleFormat::F32 => {
                     build_input_stream::<f32>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::F64 => {
+                PcmSampleFormat::F64 => {
                     build_input_stream::<f64>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::I8 => {
+                PcmSampleFormat::I8 => {
                     build_input_stream::<i8>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::I16 => {
+                PcmSampleFormat::I16 => {
                     build_input_stream::<i16>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::I24 => {
+                PcmSampleFormat::I24 => {
                     build_input_stream::<cpal::I24>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::I32 => {
+                PcmSampleFormat::I32 => {
                     build_input_stream::<i32>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::I64 => {
+                PcmSampleFormat::I64 => {
                     build_input_stream::<i64>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::U8 => {
+                PcmSampleFormat::U8 => {
                     build_input_stream::<u8>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::U16 => {
+                PcmSampleFormat::U16 => {
                     build_input_stream::<u16>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::U24 => {
+                PcmSampleFormat::U24 => {
                     build_input_stream::<cpal::U24>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::U32 => {
+                PcmSampleFormat::U32 => {
                     build_input_stream::<u32>(&device, stream_config, audio_tx.clone())?
                 }
-                cpal::SampleFormat::U64 => {
+                PcmSampleFormat::U64 => {
                     build_input_stream::<u64>(&device, stream_config, audio_tx.clone())?
                 }
-                sample_format => bail!("Unsupported input sample format: {sample_format}"),
             };
 
             stream.play()?;
@@ -530,15 +567,54 @@ mod tests {
     }
 
     #[test]
-    fn sample_normalization_preserves_pcm_equilibrium() {
-        assert_eq!(normalize_samples(&[0_i16]), vec![0.0]);
-        assert_eq!(normalize_samples(&[32_768_u16]), vec![0.0]);
-        assert_eq!(normalize_samples(&[cpal::I24::new(0).unwrap()]), vec![0.0]);
-        assert_eq!(
-            normalize_samples(&[cpal::U24::new(1 << 23).unwrap()]),
-            vec![0.0]
-        );
-        assert_eq!(normalize_samples(&[0.5_f32]), vec![0.5]);
+    fn all_pcm_formats_are_classified() {
+        let formats = [
+            cpal::SampleFormat::F32,
+            cpal::SampleFormat::F64,
+            cpal::SampleFormat::I8,
+            cpal::SampleFormat::I16,
+            cpal::SampleFormat::I24,
+            cpal::SampleFormat::I32,
+            cpal::SampleFormat::I64,
+            cpal::SampleFormat::U8,
+            cpal::SampleFormat::U16,
+            cpal::SampleFormat::U24,
+            cpal::SampleFormat::U32,
+            cpal::SampleFormat::U64,
+        ];
+
+        for format in formats {
+            assert!(PcmSampleFormat::try_from(format).is_ok());
+        }
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU8).is_err());
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU16).is_err());
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU32).is_err());
+    }
+
+    #[test]
+    fn all_pcm_formats_normalize_nonzero_samples() {
+        fn assert_round_trip<T>()
+        where
+            T: cpal::SizedSample + cpal::FromSample<f32>,
+            f32: cpal::FromSample<T>,
+        {
+            let input = T::from_sample(0.5);
+            let normalized = normalize_samples(&[input]);
+            assert!((normalized[0] - 0.5).abs() < 0.01);
+        }
+
+        assert_round_trip::<f32>();
+        assert_round_trip::<f64>();
+        assert_round_trip::<i8>();
+        assert_round_trip::<i16>();
+        assert_round_trip::<cpal::I24>();
+        assert_round_trip::<i32>();
+        assert_round_trip::<i64>();
+        assert_round_trip::<u8>();
+        assert_round_trip::<u16>();
+        assert_round_trip::<cpal::U24>();
+        assert_round_trip::<u32>();
+        assert_round_trip::<u64>();
     }
 
     #[test]
