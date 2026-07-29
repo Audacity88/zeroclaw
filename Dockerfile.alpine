@@ -130,8 +130,11 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry-alpine-${TARGETARCH},target=/u
        fi \
     && cp target/"$RUST_TARGET"/release/zeroclaw /app/zeroclaw \
     && cp target/"$RUST_TARGET"/release/zerocode /app/zerocode \
-    && zig objcopy --strip-all /app/zeroclaw \
-    && zig objcopy --strip-all /app/zerocode
+    && zig objcopy --strip-all /app/zeroclaw /app/zeroclaw.stripped \
+    && zig objcopy --strip-all /app/zerocode /app/zerocode.stripped \
+    && mv /app/zeroclaw.stripped /app/zeroclaw \
+    && mv /app/zerocode.stripped /app/zerocode \
+    && chmod 0755 /app/zeroclaw /app/zerocode
 RUN for binary in zeroclaw zerocode; do \
       size=$(stat -c%s "/app/$binary"); \
       if [ "$size" -lt 1000000 ]; then \
