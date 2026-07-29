@@ -1835,8 +1835,7 @@ store_timeout_ms = 40000
         config.validate().expect("Lucid aliases must validate");
 
         let local = SqliteMemory::new("sqlite", tmp.path()).unwrap();
-        let configured =
-            build_lucid_memory(tmp.path(), local, config.resolve_active_storage());
+        let configured = build_lucid_memory(tmp.path(), local, config.resolve_active_storage());
         let (lucid_cmd, recall_timeout, store_timeout) = configured.test_process_config();
         assert_eq!(lucid_cmd, selected_cmd);
         assert_eq!(recall_timeout, std::time::Duration::from_secs(10));
