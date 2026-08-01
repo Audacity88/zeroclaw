@@ -7974,7 +7974,8 @@ fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_po
 
 fn gateway_browser_host(host: &str) -> &str {
     match host {
-        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
         _ => host,
     }
 }
@@ -8701,7 +8702,7 @@ mod tests {
     fn paircode_no_code_message_uses_loopback_browser_hint_for_wildcard_hosts() {
         let default = config::GatewayConfig::default();
 
-        for host in ["0.0.0.0", "::", "[::]"] {
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
             let msg = paircode_no_code_message(
                 host,
                 9001,
@@ -8712,7 +8713,10 @@ mod tests {
                 None,
             );
 
-            assert!(msg.contains("open http://127.0.0.1:9001"), "{msg}");
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
             assert!(msg.contains(&format!("--port 9001 --host {host}")), "{msg}");
             assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
         }
@@ -8787,10 +8791,13 @@ mod tests {
 
     #[test]
     fn gateway_addr_in_use_message_uses_loopback_browser_hint_for_wildcard_default() {
-        for host in ["0.0.0.0", "::", "[::]"] {
+        for (host, browser_host) in [("0.0.0.0", "127.0.0.1"), ("::", "[::1]"), ("[::]", "[::1]")] {
             let msg = gateway_addr_in_use_message(host, 9001, host, 9001, None);
 
-            assert!(msg.contains("open http://127.0.0.1:9001"), "{msg}");
+            assert!(
+                msg.contains(&format!("open http://{browser_host}:9001")),
+                "{msg}"
+            );
             assert!(!msg.contains(&format!("open http://{host}:9001")), "{msg}");
         }
     }
