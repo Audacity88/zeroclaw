@@ -3873,14 +3873,14 @@ fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
     else {
         return;
     };
-    if !selection.dragged {
+    let Some((start, end)) = snapshot.selection_bounds(selection) else {
         return;
-    }
+    };
 
     let buffer = f.buffer_mut();
     for row in 0..snapshot.area.height {
         for column in 0..snapshot.area.width {
-            if snapshot.selection_contains(selection, CellPoint { column, row }) {
+            if TranscriptSnapshot::bounds_contain(start, end, CellPoint { column, row }) {
                 buffer[(snapshot.area.x + column, snapshot.area.y + row)]
                     .set_style(theme::selected_bg_style());
             }
@@ -4986,8 +4986,20 @@ impl TranscriptSnapshot {
         .is_some_and(|origin| !origin.symbol.chars().all(char::is_whitespace))
     }
 
-    fn row_has_text(&self, row: u16) -> bool {
-        (0..self.area.width).any(|column| self.has_text_at(CellPoint { column, row }))
+    fn row_text_bounds(&self, row: u16) -> Option<(u16, u16)> {
+        let first =
+            (0..self.area.width).find(|&column| self.has_text_at(CellPoint { column, row }))?;
+        let last = (0..self.area.width)
+            .rev()
+            .find(|&column| self.has_text_at(CellPoint { column, row }))?;
+        Some((first, last))
+    }
+
+    fn clamp_outer_whitespace(&self, mut point: CellPoint) -> CellPoint {
+        if let Some((first, last)) = self.row_text_bounds(point.row) {
+            point.column = point.column.clamp(first, last);
+        }
+        point
     }
 
     fn selection_bounds(&self, selection: TranscriptSelection) -> Option<(CellPoint, CellPoint)> {
@@ -4995,6 +5007,8 @@ impl TranscriptSnapshot {
             return None;
         }
         let (mut start, mut end) = selection.normalized();
+        start = self.clamp_outer_whitespace(start);
+        end = self.clamp_outer_whitespace(end);
         start.column = self.cell(start)?.span_start;
         let end_cell = self.cell(end)?;
         let origin = self.cell(CellPoint {
@@ -5012,12 +5026,16 @@ impl TranscriptSnapshot {
         Some((start, end))
     }
 
+    fn bounds_contain(start: CellPoint, end: CellPoint, point: CellPoint) -> bool {
+        (point.row, point.column) >= (start.row, start.column)
+            && (point.row, point.column) <= (end.row, end.column)
+    }
+
     fn selection_contains(&self, selection: TranscriptSelection, point: CellPoint) -> bool {
         let Some((start, end)) = self.selection_bounds(selection) else {
             return false;
         };
-        (point.row, point.column) >= (start.row, start.column)
-            && (point.row, point.column) <= (end.row, end.column)
+        Self::bounds_contain(start, end, point)
     }
 
     fn selected_text(&self, selection: TranscriptSelection) -> Option<String> {
@@ -5331,7 +5349,7 @@ impl ChatState {
             self.clear_transcript_selection();
             return false;
         };
-        if !snapshot.row_has_text(point.row) {
+        if snapshot.row_text_bounds(point.row).is_none() {
             self.clear_transcript_selection();
             return false;
         }
@@ -6874,6 +6892,13 @@ mod tests {
         state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
 
         assert!(state.begin_transcript_drag(17, 5));
+        assert!(state.update_transcript_drag(16, 5));
+        let snapshot = state.transcript_snapshot.as_ref().unwrap();
+        let selection = state.transcript_selection.unwrap();
+        assert_eq!(snapshot.selected_text(selection).as_deref(), Some("a"));
+        assert!(snapshot.selection_contains(selection, CellPoint { column: 4, row: 0 }));
+        assert!(!snapshot.selection_contains(selection, CellPoint { column: 6, row: 0 }));
+
         assert!(state.update_transcript_drag(10, 5));
         state.finish_transcript_drag();
 
