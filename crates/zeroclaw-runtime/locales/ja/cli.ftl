@@ -596,6 +596,7 @@ cli-quickstart-error-channel-bound = チャンネル `{$reference}` は既にエ
 cli-quickstart-error-channel-required = チャンネルタイプとエイリアスが必要です
 cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
 cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
+cli-quickstart-error-webhook-secret-required = Webhook 共有シークレットが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています

@@ -1554,7 +1554,7 @@ fn apply_channels(
                         QuickstartStep::Channels,
                         format!("channels[{idx}].fields.secret"),
                         "webhook secret is required",
-                        "cli-quickstart-error-channel-token-required",
+                        "cli-quickstart-error-webhook-secret-required",
                         &[],
                     ));
                     continue;
@@ -2995,6 +2995,25 @@ mod tests {
             cfg.channels.webhook["inbound"].port,
             zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
         );
+    }
+
+    #[test]
+    fn webhook_channel_cli_reports_webhook_secret_error() {
+        let cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "")],
+        ))];
+
+        let errors = validate_only_with_surface(&submission, &cfg, Surface::Cli)
+            .expect_err("empty webhook secret must be rejected");
+
+        assert!(errors.iter().any(|error| {
+            error.field == "channels[0].fields.secret"
+                && error.message == "Webhook shared secret is required"
+        }));
     }
 
     #[test]
