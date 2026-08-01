@@ -36,7 +36,6 @@ pub struct OpenAiCodexModelProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
-    client: Client,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,12 +139,18 @@ impl OpenAiCodexModelProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
-            client: Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
         })
+    }
+
+    fn http_client(&self) -> Client {
+        zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(300)),
+            "model_provider.openai",
+        )
+        .build()
+        .unwrap_or_else(|_| Client::new())
     }
 }
 
@@ -1314,7 +1319,7 @@ impl OpenAiCodexModelProvider {
         request: &ResponsesRequest,
     ) -> reqwest::RequestBuilder {
         let mut request_builder = self
-            .client
+            .http_client()
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {bearer_token}"))
             .header("OpenAI-Beta", "responses=experimental")
@@ -1748,6 +1753,130 @@ mod tests {
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
 
         (provider, captured, server_handle, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn codex_responses_provider_honors_runtime_proxy_after_construction() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        async fn proxy_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "proxied",
+                "output": []
+            }))
+        }
+
+        async fn direct_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "direct",
+                "output": []
+            }))
+        }
+
+        let _lock = crate::RUNTIME_PROXY_TEST_LOCK.lock().await;
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _reset_proxy = scopeguard::guard((), |_| {
+            set_runtime_proxy_config(ProxyConfig::default());
+        });
+
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_app = Router::new()
+            .fallback(proxy_response)
+            .with_state(Arc::clone(&proxy_hits));
+        let proxy_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(proxy_listener, proxy_app).await.unwrap();
+        });
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let direct_app = Router::new()
+            .route("/responses", post(direct_response))
+            .with_state(Arc::clone(&direct_hits));
+        let direct_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(direct_listener, direct_app).await.unwrap();
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some(format!("http://{direct_addr}")),
+            zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(format!("http://{proxy_addr}")),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.openai".to_string()],
+            ..Default::default()
+        });
+
+        let request = ResponsesRequest {
+            model: "gpt-5".to_string(),
+            input: vec![serde_json::json!({
+                "role": "user",
+                "content": "hello"
+            })],
+            instructions: DEFAULT_CODEX_INSTRUCTIONS.to_string(),
+            store: false,
+            stream: true,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: "medium".to_string(),
+                summary: "auto".to_string(),
+            },
+            include: vec!["reasoning.encrypted_content".to_string()],
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+        };
+        let request_builder =
+            provider.responses_request_builder("test-key", None, None, true, &request);
+        set_runtime_proxy_config(ProxyConfig::default());
+
+        let response_body: serde_json::Value = request_builder
+            .json(&request)
+            .send()
+            .await
+            .expect("codex Responses request should succeed through runtime proxy")
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+
+        proxy_server.abort();
+        direct_server.abort();
+
+        assert_eq!(
+            response_body
+                .get("output_text")
+                .and_then(serde_json::Value::as_str),
+            Some("proxied")
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            1,
+            "runtime proxy server should receive the Codex Responses request"
+        );
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            0,
+            "direct Codex Responses endpoint must not be contacted when runtime proxy applies"
+        );
     }
 
     #[test]

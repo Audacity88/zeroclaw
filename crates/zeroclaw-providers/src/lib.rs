@@ -34,6 +34,10 @@ pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
 
 mod request_payload;
 
+#[cfg(test)]
+pub(crate) static RUNTIME_PROXY_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
