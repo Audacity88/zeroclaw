@@ -174,6 +174,7 @@ function inspectFile(filePath) {
         }
       } else if (
         !specifier.startsWith("@/") &&
+        !specifier.startsWith("node:") &&
         !nodeBuiltins.has(specifier) &&
         !declaredPackages.has(packageName(specifier)) &&
         !allowedTransitiveImports.has(packageName(specifier))

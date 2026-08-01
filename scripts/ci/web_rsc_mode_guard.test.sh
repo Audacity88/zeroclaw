@@ -61,6 +61,14 @@ reset_fixture
 run_guard >/dev/null
 
 reset_fixture
+cat >"$fixture/web/src/node-test.ts" <<'TS'
+import test from "node:test";
+
+export { test };
+TS
+run_guard >/dev/null
+
+reset_fixture
 for section in dependencies devDependencies optionalDependencies peerDependencies; do
   node - "$fixture/web/package.json" "$section" <<'NODE'
 const fs = require("node:fs");
