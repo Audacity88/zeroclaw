@@ -1,6 +1,7 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::traits::Sandbox;
 use async_trait::async_trait;
+use std::ffi::OsString;
 use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +45,18 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
             .wrap_command(process.as_std_mut())
             .map_err(|error| CodingCliExecutionError::Prepare(error.into()))?;
 
+        let runtime_sandbox_env = command_env_snapshot(&process);
         process.env_clear();
+        for (key, value) in runtime_sandbox_env {
+            match value {
+                Some(value) => {
+                    process.env(key, value);
+                }
+                None => {
+                    process.env_remove(key);
+                }
+            }
+        }
         for (key, value) in command.env {
             process.env(key, value);
         }
@@ -55,6 +67,14 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
             .map_err(|_| CodingCliExecutionError::Timeout)?
             .map_err(CodingCliExecutionError::Io)
     }
+}
+
+fn command_env_snapshot(process: &tokio::process::Command) -> Vec<(OsString, Option<OsString>)> {
+    process
+        .as_std()
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(|value| value.to_os_string())))
+        .collect()
 }
 
 fn native_command(command: &CodingCliCommand) -> tokio::process::Command {
@@ -142,7 +162,12 @@ mod tests {
             *self.seen_command.lock().expect("fake runtime mutex") = Some(command.to_string());
             let mut process = tokio::process::Command::new("/bin/sh");
             process
-                .args(["-c", "printf '%s' \"$1\"", "zc-runtime"])
+                .args([
+                    "-c",
+                    "printf '%s:%s:%s' \"$ZC_RUNTIME_SENTINEL\" \"$ZC_SANDBOX_SENTINEL\" \"$1\"",
+                    "zc-runtime",
+                ])
+                .env("ZC_RUNTIME_SENTINEL", "runtime")
                 .current_dir(workspace_dir);
             Ok(process)
         }
@@ -154,6 +179,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     impl Sandbox for FakeSandbox {
         fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+            cmd.env("ZC_SANDBOX_SENTINEL", "sandbox");
             cmd.arg("sandboxed");
             Ok(())
         }
@@ -200,7 +226,7 @@ mod tests {
             .expect("codex_cli should return a tool result");
 
         assert!(result.success, "unexpected error: {:?}", result.error);
-        assert_eq!(result.output.trim(), "sandboxed");
+        assert_eq!(result.output.trim(), "runtime:sandbox:sandboxed");
         let command = seen_command
             .lock()
             .expect("fake runtime mutex")
