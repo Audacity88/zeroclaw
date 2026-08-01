@@ -45,12 +45,12 @@ Filed RFCs go through a discussion period of at least seven days, and larger pro
 
 Voting starts after the minimum discussion period when the proposal is stable. The required threshold depends on the change type: a simple majority for low-stakes documentation, tooling, and non-breaking features; a two-thirds majority for moderate-stakes API, subsystem, behavioral, release-process, and contribution-process changes; and unanimous agreement for architecture, security-model, breaking, governance-authority, team-organization, and ratification-rule changes. See [FND-003 §8.2](../foundations/fnd-003-governance.md#82-vote-thresholds) for the authoritative classifications, overlap rule, thresholds, electorate, and outcome precedence.
 
-A formal **REVISE** ballot closes the current vote without acceptance and returns the RFC to discussion under FND-003.
+A formal **REVISE** ballot closes the current vote without acceptance and returns the RFC to discussion under FND-003. It does not automatically require another seven-day period; only a resulting material revision restarts that minimum discussion period.
 
 The outcomes:
 
 - **Accepted**: issue carries `status:accepted`, and a maintainer comment records the final shape and links its durable disposition. Implementation PRs can proceed once that governance handoff is visible.
-- **Rejected**: issue closed with a maintainer comment giving the rationale. The record lives; re-proposing requires a materially different take.
+- **Rejected**: issue closed with a maintainer comment giving the rationale. This rejects the current proposal, not necessarily its underlying problem; the closing summary links any issue or tracker where that problem continues. The record lives; re-proposing requires a materially different take.
 - **Deferred**: issue stays open with a maintainer comment noting it's parked; revisit later. Add `status:blocked` when it's waiting on a specific prerequisite.
 - **Withdrawn**: the author pulls it. Closed without prejudice.
 

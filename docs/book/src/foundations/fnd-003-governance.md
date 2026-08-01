@@ -565,7 +565,7 @@ Ordinary author revisions are expected during the initial discussion period and 
    threshold calculation, result, and next action.
 ```
 
-The vote-opening snapshot is the immutable ballot target for that vote. Clarifications may be discussed while voting is open, but they do not alter the snapshot. A material proposal change cancels the vote and returns the RFC to a new minimum seven-day discussion period. The same reset applies when revisions responding to a `REVISE` outcome materially change the proposal.
+The vote-opening snapshot is the immutable ballot target for that vote. An `APPROVE` ballot accepts that snapshot as written. A voter may attach nonbinding implementation guidance to an approval, but when acceptance depends on changing the proposal, the voter must use `REVISE`. Clarifications may be discussed while voting is open, but they do not alter the snapshot. A material proposal change cancels the vote and returns the RFC to a new minimum seven-day discussion period. A `REVISE` outcome does not itself restart that period; the same reset applies only when the resulting revision materially changes the proposal.
 
 An author may withdraw an RFC at any point. The Core Team may defer an RFC instead of concluding ratification when timing or a prerequisite prevents a decision. Withdrawal and deferral are recorded on the issue; use `status:blocked` for deferral only when a specific unresolved prerequisite is named.
 
@@ -579,7 +579,7 @@ An author may withdraw an RFC at any point. The Core Team may defer an RFC inste
 
 Classification follows the proposal's substantive effect rather than the file it edits. When more than one category applies, use the strictest applicable threshold.
 
-**Active electorate.** "Active" Core Team members are those who have participated in at least one vote in the past 90 days. Inactive members do not count in the opening denominator but are notified of votes. Any current Core Team member may cast a ballot and thereby become active. Each vote's final denominator is its recorded opening active set plus any other current Core Team member who casts a ballot in that same vote. Activity gained in another concurrent vote does not change an already-open vote's denominator, but it does count when later votes establish their opening active set.
+**Active electorate.** Determine current Core Team membership from the public admission and removal decisions described in [section 5.3](#53-recording-team-membership), not from GitHub team membership, repository access, or CODEOWNERS. "Active" Core Team members are those who have participated in at least one vote in the past 90 days. Inactive members do not count in the opening denominator but are notified of votes. Any current Core Team member may cast a ballot and thereby become active. Each vote's final denominator is its recorded opening active set plus any other current Core Team member who casts a ballot in that same vote. Activity gained in another concurrent vote does not change an already-open vote's denominator, but it does count when later votes establish their opening active set.
 
 **Required vote record.** Each vote remains open for 72 hours from its recorded UTC opening time. The opening comment records the stable proposal snapshot, change classification, required threshold, opening active set with supporting recent-vote evidence, and exact UTC deadline. Each member's latest explicit ballot before the deadline supersedes that member's earlier ballots. The closing summary records the final electorate, each member's final ballot, the threshold calculation, the result, and the next action.
 
@@ -590,10 +590,12 @@ Apply the following outcomes in order when the vote closes:
 | Order | Condition | Outcome |
 |---|---|---|
 | 1 | Fewer than two current Core Team members cast ballots | Defer the decision; keep the issue open and record the next voting condition |
-| 2 | Quorum is met and any final ballot is `REJECT` | Reject the current RFC; close the issue and record the result and objections |
-| 3 | Quorum is met, no final ballot is `REJECT`, and any final ballot is `REVISE` | Close the current vote without acceptance and return the RFC to discussion |
+| 2 | Quorum is met and any final ballot is `REJECT` | Reject the current RFC; close the issue, record the result and objections, and state whether its underlying problem remains tracked elsewhere |
+| 3 | Quorum is met, no final ballot is `REJECT`, and any final ballot is `REVISE` | Close the current vote without acceptance, return the RFC to discussion, and route the next action to the author |
 | 4 | Quorum is met, there is no blocking ballot, and the required `APPROVE` threshold is met | Accept the RFC; record its final shape and durable follow-through, then apply `status:accepted` |
 | 5 | No preceding condition applies | Defer the decision; keep the issue open and record the next voting condition |
+
+A rejection disposes of the current proposal, not necessarily the problem that motivated it. When that problem remains valid, the closing summary links the issue or tracker where work continues. After a `REVISE` outcome, use `needs-author-action` while the author prepares the revision; restore `needs-maintainer-review` when a revised stable proposal is ready for Core action.
 
 Rev. 9 applies to votes opened after its ratification and does not automatically invalidate earlier RFC decisions. Any historical process audit or correction remains separate work.
 
