@@ -14425,8 +14425,10 @@ pub struct WebhookConfig {
     pub retry_max_delay_ms: Option<u64>,
 }
 
+pub const DEFAULT_WEBHOOK_CHANNEL_PORT: u16 = 8090;
+
 fn default_webhook_channel_port() -> u16 {
-    8090
+    DEFAULT_WEBHOOK_CHANNEL_PORT
 }
 
 impl ChannelConfig for WebhookConfig {
