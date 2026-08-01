@@ -4986,6 +4986,10 @@ impl TranscriptSnapshot {
         .is_some_and(|origin| !origin.symbol.chars().all(char::is_whitespace))
     }
 
+    fn row_has_text(&self, row: u16) -> bool {
+        (0..self.area.width).any(|column| self.has_text_at(CellPoint { column, row }))
+    }
+
     fn selection_bounds(&self, selection: TranscriptSelection) -> Option<(CellPoint, CellPoint)> {
         if !selection.dragged {
             return None;
@@ -5327,7 +5331,7 @@ impl ChatState {
             self.clear_transcript_selection();
             return false;
         };
-        if !snapshot.has_text_at(point) {
+        if !snapshot.row_has_text(point.row) {
             self.clear_transcript_selection();
             return false;
         }
@@ -6862,6 +6866,39 @@ mod tests {
         assert_eq!(state.transcript_selected_text().as_deref(), Some("be\nta"));
         assert_eq!(state.copy_feedback, None);
         assert!(state.info_message.is_none());
+    }
+
+    #[test]
+    fn transcript_selection_drag_can_start_in_side_whitespace() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
+
+        assert!(state.begin_transcript_drag(17, 5));
+        assert!(state.update_transcript_drag(10, 5));
+        state.finish_transcript_drag();
+
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn transcript_selection_side_whitespace_click_still_dismisses() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 8, 1), &["alpha"]));
+
+        assert!(state.begin_transcript_drag(17, 5));
+        state.finish_transcript_drag();
+
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[test]
+    fn transcript_selection_empty_row_cannot_start_drag() {
+        let mut state = state();
+        state.transcript_snapshot =
+            Some(transcript_snapshot(Rect::new(10, 5, 8, 2), &["alpha", ""]));
+
+        assert!(!state.begin_transcript_drag(17, 6));
+        assert_eq!(state.transcript_selection, None);
     }
 
     #[test]
