@@ -2480,13 +2480,12 @@ static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchC
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
-fn lock_gateway_chat_dispatch_capture_for_test() -> std::sync::MutexGuard<'static, ()> {
-    GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK
-        .lock()
-        .expect("gateway chat dispatch capture test mutex poisoned")
+async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
 #[cfg(test)]
@@ -7887,7 +7886,7 @@ mod tests {
         use zeroclaw_config::providers::ChannelRef;
         use zeroclaw_config::schema::AliasedAgentConfig;
 
-        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test();
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
         clear_gateway_chat_dispatch_captures_for_test();
 
         let mut config = Config::default();
@@ -7941,7 +7940,7 @@ mod tests {
         use zeroclaw_config::providers::ChannelRef;
         use zeroclaw_config::schema::AliasedAgentConfig;
 
-        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test();
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
         clear_gateway_chat_dispatch_captures_for_test();
 
         let mut config = Config::default();
