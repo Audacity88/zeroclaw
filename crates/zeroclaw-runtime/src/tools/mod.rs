@@ -1933,82 +1933,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_codex_cli_uses_configured_runtime_executor() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy {
-            autonomy: crate::security::AutonomyLevel::Full,
-            workspace_dir: tmp.path().to_path_buf(),
-            ..SecurityPolicy::default()
-        });
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-        let browser = BrowserConfig {
-            enabled: false,
-            ..BrowserConfig::default()
-        };
-        let mut cfg = test_config(&tmp);
-        cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
-        cfg.codex_cli.enabled = true;
-        cfg.codex_cli.timeout_secs = 5;
-        let risk = zeroclaw_config::schema::RiskProfileConfig {
-            sandbox_enabled: Some(false),
-            sandbox_backend: Some("none".to_string()),
-            ..zeroclaw_config::schema::RiskProfileConfig::default()
-        };
-        let seen_command = Arc::new(Mutex::new(None));
+    async fn registered_coding_cli_tools_use_configured_runtime_executor() {
+        type EnableCodingCli = fn(&mut Config);
 
-        let tools = all_tools_with_runtime(
-            Arc::new(cfg.clone()),
-            &security,
-            &risk,
-            "test-agent",
-            Arc::new(CapturingRuntime {
-                seen_command: Arc::clone(&seen_command),
+        let cases: [(&str, &str, EnableCodingCli); 4] = [
+            ("claude_code", "claude -p", |cfg: &mut Config| {
+                cfg.claude_code.enabled = true;
+                cfg.claude_code.timeout_secs = 5;
             }),
-            mem,
-            None,
-            None,
-            &browser,
-            &zeroclaw_config::schema::HttpRequestConfig::default(),
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
-        .tools;
-        let codex = tools
-            .iter()
-            .find(|tool| tool.name() == "codex_cli")
-            .expect("codex_cli should register");
+            ("codex_cli", "codex exec", |cfg: &mut Config| {
+                cfg.codex_cli.enabled = true;
+                cfg.codex_cli.timeout_secs = 5;
+            }),
+            ("gemini_cli", "gemini -p", |cfg: &mut Config| {
+                cfg.gemini_cli.enabled = true;
+                cfg.gemini_cli.timeout_secs = 5;
+            }),
+            ("opencode_cli", "opencode run", |cfg: &mut Config| {
+                cfg.opencode_cli.enabled = true;
+                cfg.opencode_cli.timeout_secs = 5;
+            }),
+        ];
 
-        let result = codex
-            .execute(serde_json::json!({"prompt": "route through runtime"}))
-            .await
-            .expect("codex_cli should return a tool result");
+        for (tool_name, expected_fragment, enable) in cases {
+            let tmp = TempDir::new().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Full,
+                workspace_dir: tmp.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            });
+            let mem_cfg = MemoryConfig {
+                backend: "markdown".into(),
+                ..MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> =
+                Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            let browser = BrowserConfig {
+                enabled: false,
+                ..BrowserConfig::default()
+            };
+            let mut cfg = test_config(&tmp);
+            cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+            cfg.claude_code.enabled = false;
+            cfg.codex_cli.enabled = false;
+            cfg.gemini_cli.enabled = false;
+            cfg.opencode_cli.enabled = false;
+            enable(&mut cfg);
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                sandbox_enabled: Some(false),
+                sandbox_backend: Some("none".to_string()),
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            };
+            let seen_command = Arc::new(Mutex::new(None));
 
-        assert!(result.success, "unexpected error: {:?}", result.error);
-        assert_eq!(result.output.trim(), "zc-runtime");
-        let command = seen_command
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("registry-wired codex_cli should call runtime");
-        assert!(command.contains("codex exec"), "command was {command:?}");
-        assert!(
-            command.contains("route through runtime"),
-            "command was {command:?}"
-        );
+            let tools = all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &risk,
+                "test-agent",
+                Arc::new(CapturingRuntime {
+                    seen_command: Arc::clone(&seen_command),
+                }),
+                mem,
+                None,
+                None,
+                &browser,
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .tools;
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name() == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} should register"));
+
+            let result = tool
+                .execute(serde_json::json!({"prompt": "route through runtime"}))
+                .await
+                .unwrap_or_else(|error| panic!("{tool_name} should return a tool result: {error}"));
+
+            assert!(
+                result.success,
+                "{tool_name} unexpected error: {:?}",
+                result.error
+            );
+            assert_eq!(result.output.trim(), "zc-runtime");
+            let command = seen_command
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| panic!("registry-wired {tool_name} should call runtime"));
+            assert!(
+                command.contains(expected_fragment),
+                "{tool_name} command was {command:?}"
+            );
+            assert!(
+                command.contains("route through runtime"),
+                "{tool_name} command was {command:?}"
+            );
+        }
     }
 
     #[test]
