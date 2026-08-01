@@ -173,6 +173,18 @@ TSX
 expect_failure "undeclared local alias"
 
 reset_fixture
+mkdir -p "$fixture/outside"
+cat >"$fixture/outside/bridge.ts" <<'TS'
+export const bridge = true;
+TS
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+import { bridge } from "../../outside/bridge";
+
+export { bridge };
+TSX
+expect_failure "relative import escaping the web root"
+
+reset_fixture
 cat >"$fixture/web/src/main.tsx" <<'TSX'
 const router = await import(`react-router-dom`);
 
