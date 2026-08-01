@@ -19,7 +19,7 @@ When secrets encryption is enabled, ZeroClaw normally persists non-empty `#[secr
 
 The key location is only one part of the contract. Every production consumer must agree on which source owns the key, how first-use provisioning differs from temporary unavailability, and what happens when a configured source cannot provide the expected key. A direct `.secret_key` read outside the canonical secrets boundary, an implicit fallback to another source, or an unsafe backend switch can make existing ciphertext unreadable or weaken the deployment's intended protection.
 
-RFC [#9127](https://github.com/zeroclaw-labs/zeroclaw/issues/9127) defines a phased key-source architecture. Initial implementation [#9194](https://github.com/zeroclaw-labs/zeroclaw/pull/9194) is limited to a behavior-preserving file-source extraction. This record captures the durable target without claiming that configured non-file sources or migration support have shipped.
+RFC [#9127](https://github.com/zeroclaw-labs/zeroclaw/issues/9127) defines a phased key-source architecture. Initial implementation [#9194](https://github.com/zeroclaw-labs/zeroclaw/pull/9194) extracts the file source and hardens atomic, no-replace, no-follow key-file publication while preserving configuration and ciphertext semantics. That hardening may require target-specific low-level dependencies; [#9460](https://github.com/zeroclaw-labs/zeroclaw/issues/9460) tracks the remaining Windows ACL-at-creation boundary. This record captures the durable target without claiming that configured non-file sources or migration support have shipped.
 
 ## Decision
 
@@ -31,7 +31,7 @@ One configured source is authoritative for a deployment at a time. The file sour
 
 Source selection is resolved from canonical typed `Config` and anchored to `Config::install_root_dir()`. The binary and runtime assembly layer constructs one shared source authority for each process generation and injects it into `SecretStore` and every other key consumer. Consumers may clone that authority, but they must not choose a root, reconstruct an authority from a retained secrets-configuration snapshot, or read backend material directly. Independent processes resolve the same configured authority deterministically; backend caches remain process-local.
 
-Whether a non-encryption consumer receives scoped access to the source or derives a purpose-specific subkey is a separate security decision. This ADR requires canonical acquisition but does not choose a derivation or compatibility contract for TUI identity signing or another protocol.
+Whether a non-encryption consumer receives scoped access to the source or derives a purpose-specific subkey is a separate security decision. This ADR requires canonical acquisition but does not choose a derivation or compatibility contract for TUI identity signing or another protocol. Until that decision is recorded, a non-encryption consumer must not silently reuse the raw encryption master key.
 
 The boundary may expose key bytes only for the duration of a synchronous operation. This is a correctness and lifetime constraint, not a sandbox: code executing inside that operation could still copy the bytes. Implementations must minimize copies and clear temporary material where the platform and dependency model permit it.
 
@@ -65,13 +65,15 @@ Moving the same master key to another source is migration. Generating a new key 
 
 Changing the configured source while encrypted values exist requires a verified migration path. Until migration tooling ships, ZeroClaw must reject a source change that cannot prove access to the key that decrypts the existing `enc2:` values. Migration must preserve the old source until the new source has been written and read back successfully. Rotation must retain the old key and original configuration until every value has been re-encrypted and the new configuration is committed atomically.
 
+`zeroclaw secrets migrate` must ship in or before the change that makes the first non-file source selectable. Each later source must have a supported transition path before operators can select it. A source that cannot import the existing master key, such as a purely passphrase-derived source, requires the separately reviewed rotation path rather than pretending that same-key migration is possible.
+
 Migration and rotation must inventory every persistent owner of `SecretStore` ciphertext. The initial inventory includes configuration TOML and generated or migrated configuration output, `<install>/auth-profiles.json`, `<install>/auth-<provider>-pending.json`, `<install>/otp-secret`, and `<data>/webauthn_credentials.json`. Future durable stores that write `enc2:` values enter the same inventory. Constructing a store without adding a persistent ciphertext format does not create another migration owner.
 
 Key-source selection is not live-applied by this decision. A saved source change takes effect only after migration validation and a full daemon reload or process restart. Any future live handoff must define generation fencing in a separate implementation decision.
 
 ### Adopt the boundary in safety order
 
-The file-source extraction lands first without changing configuration or ciphertext. Production consumers and fail-closed source selection move behind that boundary before a non-file source is enabled. Non-file sources then land one at a time with source-specific threat models and tests. Migration and rotation remain separately reviewed flows after source selection is stable.
+The file-source extraction lands first without changing configuration or ciphertext semantics. It may strengthen key-file creation and publication, with target-specific low-level dependencies, while retaining the file backend as the compatibility baseline. Production consumers and fail-closed source selection move behind that boundary next. Migration tooling must land no later than the first selectable non-file source. Non-file sources then land one at a time with source-specific threat models, transition support, and tests. General key rotation remains a separately reviewed flow.
 
 This ADR remains proposed until all of these conditions are met:
 
@@ -80,6 +82,7 @@ This ADR remains proposed until all of these conditions are met:
 - configuration selects exactly one source, defaults compatibly to the file source, and fails closed without fallback or replacement-key generation;
 - configured-source failure cannot implicitly enable unsigned TUI identity; any retained unsigned mode is explicit operator policy with its own threat model, diagnostics, and tests;
 - provisioning probes distinguish absent material from inspection failure, and successful `with_key` access invokes its callback exactly once, with boundary tests covering zero or multiple callback invocation and permission or transient inspection failures;
+- `zeroclaw secrets migrate` is available before the first non-file source becomes selectable, and each later source has a verified migration or rotation path before enablement;
 - at least one supported non-file source proves that the boundary works beyond the file implementation; and
 - source switching is rejected unless the complete persistent-ciphertext inventory can be decrypted or a documented, atomic, rollback-capable migration completes successfully.
 
@@ -103,6 +106,7 @@ Negative consequences:
 
 - [RFC #9127: Key-source abstraction and deployment classification](https://github.com/zeroclaw-labs/zeroclaw/issues/9127)
 - [PR #9194: File-backed key-source extraction](https://github.com/zeroclaw-labs/zeroclaw/pull/9194)
+- [Issue #9460: Windows key-file ACL hardening at creation](https://github.com/zeroclaw-labs/zeroclaw/issues/9460)
 - [Security model](../../security/model.md)
 - [Config lifecycle](../config-lifecycle.md)
 - `crates/zeroclaw-config/src/secrets.rs`
