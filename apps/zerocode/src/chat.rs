@@ -8386,13 +8386,20 @@ mod tests {
         state.dirty = LinesDirty::Clean;
         chat.phase = ChatPhase::Active(Box::new(state));
 
-        let click = MouseEvent {
+        let mouse_down = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: blank_col,
             row: blank_row,
             modifiers: KeyModifiers::NONE,
         };
-        chat.handle_mouse(click, area).await;
+        chat.handle_mouse(mouse_down, area).await;
+        let mouse_up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: blank_col,
+            row: blank_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(mouse_up, area).await;
 
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
