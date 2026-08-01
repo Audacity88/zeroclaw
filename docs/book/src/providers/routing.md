@@ -1,11 +1,11 @@
 # Routing
 
-Routing happens at the **agent layer**. Each agent points at exactly one provider; channels point at agents.
+ZeroClaw uses routing for two different decisions:
 
-Two layers of decisions:
+1. **Agent dispatch** selects which agent owns a channel or request. Each agent has its own provider profile and runtime policy.
+2. **Provider and model routing** selects a configured provider profile and model for a call, then applies that profile's retry and fallback policy.
 
-1. **Per-call backend selection**: "use the cheap model unless this prompt looks like reasoning." Each routing target is its own `[agents.<alias>]` entry with its own `model_provider`. Channels are routed to whichever agent should handle their traffic.
-2. **Provider reliability**: vendor-redundancy lives behind a single first-class provider. Configure OpenRouter (or an equivalent) as one provider and let it handle vendor fan-out at its endpoint.
+An external routing service such as OpenRouter can still perform vendor selection behind one provider profile. It is optional: ZeroClaw also supports first-party hint routes, same-profile model fallback, and fallback across provider profiles.
 
 ## Per-agent dispatch
 
@@ -22,6 +22,16 @@ A narrower mechanism: `[[model_routes]]` lets an agent override the configured `
 Routes only fire when a prompt explicitly carries the matching hint. The default request path uses the agent's primary `model_provider`.
 
 `model_provider` is always a provider profile reference in dotted `<type>.<alias>` form, such as `anthropic.sonnet` or `openai.default`. The profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and configured default model. The `model` field is provider-local state under that profile.
+
+> **Current limitation:** A routed target's reliable wrapper pins calls to the model configured on the target provider profile. If `model_routes[].model` differs from that profile model, the profile model is served. Keep the two values aligned until route-model precedence is fixed.
+
+## Reliability fallback
+
+A provider profile can declare `fallback_models` for alternate models on the same endpoint and `fallback` for other dotted provider profiles. ZeroClaw materializes the primary profile's models before walking fallback profiles depth-first. Each fallback profile keeps its own endpoint, credentials, headers, model, and nested fallback declarations.
+
+Effective execution can differ after a rate limit: entries from one profile share a cooldown key, so a `429` on the primary can skip that profile's remaining fallback models while the cooldown is active.
+
+Configure the chain through the ZeroCode Config editor, the dashboard, or `zeroclaw config set`; see [Provider configuration](./configuration.md#fallback-on-failure). The [Provider routing lifecycle](../architecture/provider-routing-lifecycle.md) documents construction, retry classification, streaming recovery, no-replay boundaries, and attribution ownership.
 
 ## Runtime model switching
 
@@ -49,4 +59,5 @@ For production deployments, wire the log output to Loki / Grafana. See [Operatio
 
 - [Overview](./overview.md): provider model and per-agent dispatch
 - [Configuration](./configuration.md): full `[providers.*]` schema
+- [Provider routing lifecycle](../architecture/provider-routing-lifecycle.md): selection, retry, fallback, streaming recovery, and attribution ownership
 - [Provider catalog](./catalog.md): every canonical slot
