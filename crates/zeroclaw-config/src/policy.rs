@@ -1508,9 +1508,11 @@ impl SecurityPolicy {
                 !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
             }
             "git" => {
-                !args_cased.iter().any(|arg| arg == "-c")
+                !args_cased.iter().any(|arg| arg.starts_with("-c"))
                     && !args.iter().any(|arg| {
-                        arg == "config"
+                        arg == "--config-env"
+                            || arg.starts_with("--config-env=")
+                            || arg == "config"
                             || arg.starts_with("config.")
                             || arg == "alias"
                             || arg.starts_with("alias.")
@@ -2972,6 +2974,50 @@ mod tests {
     }
 
     #[test]
+    fn git_command_scope_config_rejected_at_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "ZC_ALIAS='!/usr/bin/true' git --config-env=alias.zcprobe=ZC_ALIAS zcprobe",
+            "ZC_ALIAS='!/usr/bin/true' git --config-env alias.zcprobe=ZC_ALIAS zcprobe",
+            "git -c alias.zcprobe='!/usr/bin/true' zcprobe",
+            "git -calias.zcprobe='!/usr/bin/true' zcprobe",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("command-scope Git config must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        let status = p
+            .validate_command_execution("git status", false)
+            .expect("read-only Git status should remain allowed");
+        assert_eq!(status, CommandRiskLevel::Low);
+
+        let commit_denied = p
+            .validate_command_execution("git commit -m test", false)
+            .expect_err("Git write verbs still require approval");
+        assert!(
+            commit_denied.contains("medium-risk operation"),
+            "{commit_denied}"
+        );
+
+        let commit_allowed = p
+            .validate_command_execution("git commit -m test", true)
+            .expect("runtime-approved Git write verb should remain allowed");
+        assert_eq!(commit_allowed, CommandRiskLevel::Medium);
+    }
+
+    #[test]
     fn validate_command_blocks_high_risk_via_wildcard() {
         // Wildcard allows the command through is_command_allowed, but
         // block_high_risk_commands still rejects it because "*" does not
@@ -3712,6 +3758,7 @@ mod tests {
         assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
         assert!(!p.is_command_allowed("git alias.st status"));
         assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        assert!(!p.is_command_allowed("git --config-env=alias.st=ZC_ALIAS status"));
         // Legitimate commands should still work
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
