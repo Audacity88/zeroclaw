@@ -55,6 +55,28 @@ const GENERIC_REGISTRY_TERMS: &[&str] = &[
     "Webhook",
 ];
 
+struct ContextualRegistryTerm {
+    text: &'static str,
+    reference_words: &'static [&'static str],
+    identifiers: &'static [&'static str],
+}
+
+const CONTEXTUAL_REGISTRY_TERMS: &[ContextualRegistryTerm] = &[
+    ContextualRegistryTerm {
+        text: "Filesystem",
+        reference_words: &["channel", "listener", "trigger", "watcher"],
+        identifiers: &["channel-filesystem", "channels.filesystem"],
+    },
+    ContextualRegistryTerm {
+        text: "Signal",
+        reference_words: &[
+            "account", "bot", "channel", "client", "desktop", "does", "is", "message", "mobile",
+            "poll", "protocol",
+        ],
+        identifiers: &["signal-cli", "channel-signal", "channels.signal"],
+    },
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FenceLanguage {
     Toml,
@@ -130,8 +152,44 @@ fn collect_protected_terms(text: &str, literals: &mut Vec<ProtectedLiteral>) {
 }
 
 fn contains_protected_term(text: &str, term: &str) -> bool {
+    if let Some(context) = CONTEXTUAL_REGISTRY_TERMS
+        .iter()
+        .find(|candidate| candidate.text == term)
+    {
+        return text.match_indices(term).any(|(idx, _)| {
+            has_term_boundary(text, idx, term.len())
+                && has_explicit_registry_term_context(text, idx, term.len(), context)
+        });
+    }
+
     text.match_indices(term)
         .any(|(idx, _)| has_term_boundary(text, idx, term.len()))
+}
+
+fn has_explicit_registry_term_context(
+    text: &str,
+    start: usize,
+    len: usize,
+    context: &ContextualRegistryTerm,
+) -> bool {
+    if context
+        .identifiers
+        .iter()
+        .any(|identifier| text.contains(identifier))
+    {
+        return true;
+    }
+
+    text[start + len..]
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .take(3)
+        .any(|token| {
+            context
+                .reference_words
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(token))
+        })
 }
 
 fn has_term_boundary(text: &str, start: usize, len: usize) -> bool {
@@ -637,6 +695,52 @@ mod tests {
     #[test]
     fn ignores_generic_registry_terms() {
         assert!(!texts("Command").contains(&"Command".to_string()));
+    }
+
+    #[test]
+    fn ignores_ambiguous_registry_terms_in_generic_prose() {
+        assert!(
+            !texts("Signal reviewer trust and contributor experience.")
+                .contains(&"Signal".to_string())
+        );
+        assert!(
+            !texts("Signal name on the board; matched as board/signal.")
+                .contains(&"Signal".to_string())
+        );
+        assert!(
+            !texts("Filesystem access boundaries remain enforced.")
+                .contains(&"Filesystem".to_string())
+        );
+        assert!(!texts("Filesystem components live on disk.").contains(&"Filesystem".to_string()));
+        assert!(
+            !texts(
+                "| Contributor-tier labels | Signal reviewer trust and contributor experience |"
+            )
+            .contains(&"Signal".to_string())
+        );
+        assert!(!texts("A clear Signal.").contains(&"Signal".to_string()));
+        assert!(!texts("# Filesystem components").contains(&"Filesystem".to_string()));
+        assert!(!texts("**Filesystem components**").contains(&"Filesystem".to_string()));
+        assert!(!texts("| Filesystem drivers |").contains(&"Filesystem".to_string()));
+    }
+
+    #[test]
+    fn extracts_ambiguous_registry_terms_in_explicit_channel_contexts() {
+        assert!(texts("Configure the Signal channel.").contains(&"Signal".to_string()));
+        assert!(texts("Configure the Filesystem channel.").contains(&"Filesystem".to_string()));
+        assert!(texts("Signal account").contains(&"Signal".to_string()));
+        assert!(texts("Filesystem listener").contains(&"Filesystem".to_string()));
+        assert!(texts("Signal's desktop app").contains(&"Signal".to_string()));
+        assert!(texts("Signal-compatible client").contains(&"Signal".to_string()));
+        assert!(texts("Signal is unavailable").contains(&"Signal".to_string()));
+        assert!(
+            texts("Filesystem changes can start SOP runs through `channel-filesystem`.")
+                .contains(&"Filesystem".to_string())
+        );
+        assert!(
+            texts("Configure `[channels.signal.default]` for Signal.")
+                .contains(&"Signal".to_string())
+        );
     }
 
     #[test]
