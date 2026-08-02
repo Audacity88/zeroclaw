@@ -70,8 +70,8 @@ const CONTEXTUAL_REGISTRY_TERMS: &[ContextualRegistryTerm] = &[
     ContextualRegistryTerm {
         text: "Signal",
         reference_words: &[
-            "account", "bot", "channel", "client", "desktop", "does", "is", "message", "mobile",
-            "poll", "protocol",
+            "account", "bot", "channel", "client", "desktop", "message", "mobile", "poll",
+            "protocol",
         ],
         identifiers: &["signal-cli", "channel-signal", "channels.signal"],
     },
@@ -172,10 +172,25 @@ fn has_explicit_registry_term_context(
     len: usize,
     context: &ContextualRegistryTerm,
 ) -> bool {
+    if text.trim() == context.text {
+        return true;
+    }
+
     if context
         .identifiers
         .iter()
         .any(|identifier| text.contains(identifier))
+    {
+        return true;
+    }
+
+    if protected_terms()
+        .iter()
+        .filter(|peer| peer.as_str() != context.text)
+        .any(|peer| {
+            text.match_indices(peer)
+                .any(|(idx, _)| has_term_boundary(text, idx, peer.len()))
+        })
     {
         return true;
     }
@@ -719,6 +734,8 @@ mod tests {
             .contains(&"Signal".to_string())
         );
         assert!(!texts("A clear Signal.").contains(&"Signal".to_string()));
+        assert!(!texts("Signal is important.").contains(&"Signal".to_string()));
+        assert!(!texts("Signal does matter.").contains(&"Signal".to_string()));
         assert!(!texts("# Filesystem components").contains(&"Filesystem".to_string()));
         assert!(!texts("**Filesystem components**").contains(&"Filesystem".to_string()));
         assert!(!texts("| Filesystem drivers |").contains(&"Filesystem".to_string()));
@@ -730,9 +747,12 @@ mod tests {
         assert!(texts("Configure the Filesystem channel.").contains(&"Filesystem".to_string()));
         assert!(texts("Signal account").contains(&"Signal".to_string()));
         assert!(texts("Filesystem listener").contains(&"Filesystem".to_string()));
+        assert!(texts("Signal").contains(&"Signal".to_string()));
+        assert!(texts("Filesystem").contains(&"Filesystem".to_string()));
+        assert!(texts("Discord, Signal, Matrix").contains(&"Signal".to_string()));
+        assert!(texts("MQTT, Filesystem, AMQP").contains(&"Filesystem".to_string()));
         assert!(texts("Signal's desktop app").contains(&"Signal".to_string()));
         assert!(texts("Signal-compatible client").contains(&"Signal".to_string()));
-        assert!(texts("Signal is unavailable").contains(&"Signal".to_string()));
         assert!(
             texts("Filesystem changes can start SOP runs through `channel-filesystem`.")
                 .contains(&"Filesystem".to_string())
