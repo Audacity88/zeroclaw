@@ -3124,6 +3124,22 @@ mod tests {
     }
 
     #[test]
+    fn shell_policy_normalizes_non_git_executable_and_arguments() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "find".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("c\\at ./src/main.rs"));
+        assert!(!p.is_command_allowed("find . '-exec' echo"));
+        assert_eq!(p.forbidden_path_argument("cat './src/main.rs'"), None);
+        assert_eq!(
+            p.forbidden_path_argument("cat ..\\/secret.txt"),
+            Some("../secret.txt".into())
+        );
+    }
+
+    #[test]
     fn git_command_scope_config_rejected_at_policy_boundary() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
