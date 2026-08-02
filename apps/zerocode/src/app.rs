@@ -58,6 +58,7 @@ enum QuickstartChatDrain {
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
 
 fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
     match event {
@@ -77,16 +78,19 @@ where
         return Ok((current, None));
     };
 
-    loop {
+    let mut coalesced = 1;
+    while coalesced < MAX_COALESCED_MOUSE_DRAGS {
         let Some(next) = read_queued()? else {
             return Ok((current, None));
         };
         if mouse_drag_button(&next) == Some(button) {
             current = next;
+            coalesced += 1;
         } else {
             return Ok((current, Some(next)));
         }
     }
+    Ok((current, None))
 }
 
 /// Ephemeral interaction state for the keybinding overlay. Keybinding
@@ -1738,6 +1742,59 @@ mod tests {
             )
         );
         assert_eq!(pending, Some(mouse_up));
+    }
+
+    #[test]
+    fn coalescing_bounds_each_drag_batch_and_preserves_following_input() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            0,
+            0,
+        );
+        let mouse_up = mouse_event(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            MAX_COALESCED_MOUSE_DRAGS as u16,
+            0,
+        );
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut queued: VecDeque<Event> = (1..=MAX_COALESCED_MOUSE_DRAGS)
+            .map(|column| {
+                mouse_event(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    column as u16,
+                    0,
+                )
+            })
+            .chain([mouse_up.clone(), key.clone()])
+            .collect();
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce first batch");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                MAX_COALESCED_MOUSE_DRAGS.saturating_sub(1) as u16,
+                0,
+            )
+        );
+        assert_eq!(pending, None);
+
+        let next = queued.pop_front().expect("next drag remains queued");
+        let (current, pending) =
+            coalesce_mouse_drag(next, || Ok(queued.pop_front())).expect("coalesce next batch");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                MAX_COALESCED_MOUSE_DRAGS as u16,
+                0,
+            )
+        );
+        assert_eq!(pending, Some(mouse_up));
+        assert_eq!(queued.pop_front(), Some(key));
     }
 
     #[test]
