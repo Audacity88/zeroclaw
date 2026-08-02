@@ -479,7 +479,8 @@ fn visual_to_cursor(text: &str, target_row: u16, target_col: u16, width: u16) ->
 #[derive(Debug)]
 pub(crate) struct InputBarState {
     input: String,
-    /// Byte offset of the editing cursor within `input`. Always on a char boundary.
+    /// Byte offset of the editing cursor within `input`.
+    /// Kept on a grapheme boundary after each completed edit operation.
     cursor: usize,
     pending_attachments: Vec<PendingAttachment>,
     file_explorer: Option<FileExplorerState>,
@@ -774,6 +775,8 @@ impl InputBarState {
     pub fn pop_input_char(&mut self) {
         if self.selection.is_some() {
             self.delete_selection();
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
             self.update_autocomplete();
             return;
         }
@@ -781,7 +784,8 @@ impl InputBarState {
             let prev_start =
                 crate::text_navigation::previous_grapheme_boundary(&self.input, self.cursor);
             self.input.replace_range(prev_start..self.cursor, "");
-            self.cursor = prev_start;
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, prev_start);
             self.update_autocomplete();
         }
     }
@@ -789,6 +793,8 @@ impl InputBarState {
     pub fn delete_previous_word(&mut self) {
         if self.selection.is_some() {
             self.delete_selection();
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
             self.update_autocomplete();
             return;
         }
@@ -797,7 +803,7 @@ impl InputBarState {
         }
         let delete_from = crate::text_navigation::previous_word_boundary(&self.input, self.cursor);
         self.input.replace_range(delete_from..self.cursor, "");
-        self.cursor = delete_from;
+        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, delete_from);
         self.update_autocomplete();
     }
 
@@ -1785,6 +1791,64 @@ mod tests {
     }
 
     #[test]
+    fn backspace_normalizes_cursor_after_joining_emoji_graphemes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("🇺x🇸");
+        bar.move_cursor_left();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("🇺x🇸");
+        bar.move_cursor_left();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn backspace_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("🇺x🇸");
+        let selection_start = "🇺".len();
+        bar.selection = Some((selection_start, selection_start + 1));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("🇺x🇸");
+        let selection_start = "🇺".len();
+        bar.selection = Some((selection_start, selection_start + 1));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
     fn file_explorer_does_not_claim_word_navigation_chords() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut bar = InputBarState::new();
@@ -2660,6 +2724,21 @@ mod tests {
         bar.push_input_char('X');
         assert_eq!(bar.input(), "hXo");
         assert_eq!(bar.cursor(), 2);
+    }
+
+    #[test]
+    fn typing_over_unicode_selection_preserves_replacement_position() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("🇺x🇸");
+        let selection_start = "🇺".len();
+        bar.selection = Some((selection_start, selection_start + 1));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺y🇸");
+        assert_eq!(bar.cursor(), selection_start + 1);
     }
 
     // ── Dynamic height tests ─────────────────────────────────
