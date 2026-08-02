@@ -51,7 +51,7 @@ The outcomes:
 
 - **Accepted**: issue carries `status:accepted`, and a maintainer comment records the final shape and links its durable disposition. Implementation PRs can proceed once that governance handoff is visible.
 - **Rejected**: issue closed with a maintainer comment giving the rationale. This rejects the current proposal, not necessarily its underlying problem; the closing summary links any issue or tracker where that problem continues. The record lives; re-proposing requires a materially different take.
-- **Deferred**: issue stays open with a maintainer comment noting it's parked; revisit later. Add `status:blocked` when it's waiting on a specific prerequisite.
+- **Deferred**: issue stays open with a maintainer comment noting why it's parked and the condition for another vote. An unchanged proposal may return to a new vote without repeating the minimum discussion period; a material change restarts the seven-day minimum. Add `status:blocked` when it's waiting on a specific prerequisite.
 - **Withdrawn**: the author pulls it. Closed without prejudice.
 
 ## Implementing an accepted RFC
