@@ -184,13 +184,15 @@ fn has_explicit_registry_term_context(
         return true;
     }
 
-    if protected_terms()
-        .iter()
-        .filter(|peer| peer.as_str() != context.text)
-        .any(|peer| {
-            text.match_indices(peer)
-                .any(|(idx, _)| has_term_boundary(text, idx, peer.len()))
-        })
+    if text[..start].trim_end().ends_with(',')
+        && text[start + len..].trim_start().starts_with(',')
+        && protected_terms()
+            .iter()
+            .filter(|peer| peer.as_str() != context.text)
+            .any(|peer| {
+                text.match_indices(peer)
+                    .any(|(idx, _)| has_term_boundary(text, idx, peer.len()))
+            })
     {
         return true;
     }
@@ -736,6 +738,10 @@ mod tests {
         assert!(!texts("A clear Signal.").contains(&"Signal".to_string()));
         assert!(!texts("Signal is important.").contains(&"Signal".to_string()));
         assert!(!texts("Signal does matter.").contains(&"Signal".to_string()));
+        assert!(
+            !texts("Signal reviewer trust improves ZeroClaw contributions.")
+                .contains(&"Signal".to_string())
+        );
         assert!(!texts("# Filesystem components").contains(&"Filesystem".to_string()));
         assert!(!texts("**Filesystem components**").contains(&"Filesystem".to_string()));
         assert!(!texts("| Filesystem drivers |").contains(&"Filesystem".to_string()));
