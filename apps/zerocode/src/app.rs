@@ -59,6 +59,36 @@ enum QuickstartChatDrain {
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Drag(button) => Some(button),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn coalesce_mouse_drag<F>(mut current: Event, mut read_queued: F) -> Result<(Event, Option<Event>)>
+where
+    F: FnMut() -> Result<Option<Event>>,
+{
+    let Some(button) = mouse_drag_button(&current) else {
+        return Ok((current, None));
+    };
+
+    loop {
+        let Some(next) = read_queued()? else {
+            return Ok((current, None));
+        };
+        if mouse_drag_button(&next) == Some(button) {
+            current = next;
+        } else {
+            return Ok((current, Some(next)));
+        }
+    }
+}
+
 /// Ephemeral interaction state for the keybinding overlay. Keybinding
 /// metadata itself stays in the action/help registry and is resolved on draw.
 #[derive(Debug, Default)]
@@ -402,6 +432,7 @@ pub async fn run(
     )?;
     let mut chrome_status = ChromeStatus::default();
     chrome_status.tick(&rpc);
+    let mut pending_event = None;
 
     loop {
         // Draw
@@ -620,31 +651,44 @@ pub async fn run(
             }
         }
 
-        // Poll for input with a timeout so live panes refresh periodically.
-        if !event::poll(TICK)? {
-            if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+        let input_event = if let Some(pending) = pending_event.take() {
+            pending
+        } else {
+            // Poll for input with a timeout so live panes refresh periodically.
+            if !event::poll(TICK)? {
+                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                    continue;
+                }
+                if mode == Mode::Dashboard {
+                    dashboard_pane.tick().await;
+                }
+                if mode == Mode::Logs {
+                    logs_pane.tick().await;
+                }
+                if mode == Mode::Quickstart {
+                    quickstart.tick().await;
+                }
+                consume_pending_quickstart_chat(
+                    &conn_state,
+                    &reconnect_state,
+                    &mut mode,
+                    &mut chat_pane,
+                )
+                .await;
                 continue;
             }
-            if mode == Mode::Dashboard {
-                dashboard_pane.tick().await;
+            event::read()?
+        };
+        let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
+            if event::poll(Duration::ZERO)? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
             }
-            if mode == Mode::Logs {
-                logs_pane.tick().await;
-            }
-            if mode == Mode::Quickstart {
-                quickstart.tick().await;
-            }
-            consume_pending_quickstart_chat(
-                &conn_state,
-                &reconnect_state,
-                &mut mode,
-                &mut chat_pane,
-            )
-            .await;
-            continue;
-        }
+        })?;
+        pending_event = next_pending;
 
-        match event::read()? {
+        match input_event {
             Event::Key(key) => {
                 if key.kind == KeyEventKind::Release {
                     continue;
@@ -1616,6 +1660,101 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn coalesces_contiguous_mouse_drags_to_latest_position() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            1,
+            2,
+        );
+        let mut queued = VecDeque::from([
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                4,
+                5,
+            ),
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9,
+            ),
+        ]);
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce drag events");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9
+            )
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn coalescing_preserves_first_non_drag_event() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            1,
+            2,
+        );
+        let mouse_up = mouse_event(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            8,
+            9,
+        );
+        let mut queued = VecDeque::from([
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9,
+            ),
+            mouse_up.clone(),
+        ]);
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce drag events");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9
+            )
+        );
+        assert_eq!(pending, Some(mouse_up));
+    }
+
+    #[test]
+    fn non_drag_event_passes_through_without_reading_ahead() {
+        let first = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut read_ahead = false;
+
+        let (current, pending) = coalesce_mouse_drag(first.clone(), || {
+            read_ahead = true;
+            Ok(None)
+        })
+        .expect("leave non-drag event unchanged");
+
+        assert_eq!(current, first);
+        assert_eq!(pending, None);
+        assert!(!read_ahead);
+    }
 
     #[test]
     fn chrome_process_summary_shows_cpu_loading_without_health() {
