@@ -167,7 +167,7 @@ pub enum SopTrigger {
     Peripheral {
         /// Board identifier the signal originates from.
         board: String,
-        /// Signal name on the board; matched as `board/signal`.
+        /// Board signal name; matched as `board/signal`.
         signal: String,
         /// Optional expression evaluated against the signal payload.
         #[serde(default)]
