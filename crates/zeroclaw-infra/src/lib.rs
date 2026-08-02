@@ -61,9 +61,12 @@ fn open_sqlite_with_jsonl_import(
 ) -> std::io::Result<session_sqlite::SqliteSessionBackend> {
     let backend = session_sqlite::SqliteSessionBackend::new(workspace_dir)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    match backend.migrate_from_jsonl(workspace_dir) {
-        Ok(0) => {}
-        Ok(n) => ::zeroclaw_log::record!(
+    match backend
+        .migrate_from_jsonl(workspace_dir)
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    {
+        0 => {}
+        n => ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
@@ -71,15 +74,6 @@ fn open_sqlite_with_jsonl_import(
              {}/sessions; renamed to *.jsonl.migrated.",
                 workspace_dir.display()
             )
-        ),
-        Err(e) => ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"e": e.to_string()})),
-            "session_backend=sqlite: JSONL import skipped: . Existing JSONL \
-             sessions remain on disk; switch to session_backend = \"jsonl\" if \
-             you need them visible immediately."
         ),
     }
     Ok(backend)
@@ -158,5 +152,27 @@ mod tests {
             jsonl_migrated.exists(),
             ".jsonl.migrated rollback file should remain"
         );
+    }
+
+    #[test]
+    fn make_session_backend_sqlite_fails_closed_on_import_collision() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("legacy.jsonl"),
+            "{\"role\":\"user\",\"content\":\"from-jsonl\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("legacy.jsonl.migrated"),
+            "existing archive",
+        )
+        .unwrap();
+
+        let err = make_session_backend(tmp.path(), "sqlite")
+            .err()
+            .expect("migration collision must prevent SQLite startup");
+        assert!(err.to_string().contains("Refusing to replace"));
     }
 }
