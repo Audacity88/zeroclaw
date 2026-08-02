@@ -651,6 +651,14 @@ fn skip_env_assignments(s: &str) -> &str {
     }
 }
 
+fn is_env_assignment_word(word: &str) -> bool {
+    word.contains('=')
+        && word
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuoteState {
     None,
@@ -810,6 +818,164 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
     }
 
     segments
+}
+
+fn split_shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut in_word = false;
+
+    let push_word = |words: &mut Vec<String>, current: &mut String, in_word: &mut bool| {
+        if *in_word {
+            words.push(std::mem::take(current));
+            *in_word = false;
+        }
+    };
+
+    for ch in segment.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                } else {
+                    current.push(ch);
+                    in_word = true;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    current.push(ch);
+                    escaped = false;
+                    in_word = true;
+                    continue;
+                }
+                match ch {
+                    '\\' => {
+                        escaped = true;
+                        in_word = true;
+                    }
+                    '"' => quote = QuoteState::None,
+                    _ => {
+                        current.push(ch);
+                        in_word = true;
+                    }
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    current.push(ch);
+                    escaped = false;
+                    in_word = true;
+                    continue;
+                }
+                match ch {
+                    '\\' => {
+                        escaped = true;
+                        in_word = true;
+                    }
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        in_word = true;
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        in_word = true;
+                    }
+                    _ if ch.is_whitespace() => {
+                        push_word(&mut words, &mut current, &mut in_word);
+                    }
+                    _ => {
+                        current.push(ch);
+                        in_word = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    push_word(&mut words, &mut current, &mut in_word);
+    words
+}
+
+fn shell_words_after_env_assignments(segment: &str) -> Vec<String> {
+    let mut words = split_shell_words(segment);
+    let first_command = words
+        .iter()
+        .position(|word| !is_env_assignment_word(word))
+        .unwrap_or(words.len());
+    drop(words.drain(..first_command));
+    words
+}
+
+fn is_git_write_verb(verb: &str) -> bool {
+    matches!(
+        verb.to_ascii_lowercase().as_str(),
+        "commit"
+            | "push"
+            | "reset"
+            | "clean"
+            | "rebase"
+            | "merge"
+            | "cherry-pick"
+            | "revert"
+            | "branch"
+            | "checkout"
+            | "switch"
+            | "tag"
+    )
+}
+
+fn git_effective_subcommand(args: &[String]) -> Option<&str> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        match arg {
+            "--" => return args.get(idx + 1).map(String::as_str),
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+            | "--super-prefix" => {
+                idx += 2;
+            }
+            "--bare"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-pager"
+            | "--paginate"
+            | "--version"
+            | "--help"
+            | "-h"
+            | "-p" => {
+                idx += 1;
+            }
+            _ if arg.starts_with("-C") && arg.len() > 2 => {
+                idx += 1;
+            }
+            _ if arg.starts_with("--git-dir=")
+                || arg.starts_with("--work-tree=")
+                || arg.starts_with("--namespace=")
+                || arg.starts_with("--exec-path=")
+                || arg.starts_with("--super-prefix=") =>
+            {
+                idx += 1;
+            }
+            _ if arg.starts_with('-') => {
+                idx += 1;
+            }
+            _ => return Some(arg),
+        }
+    }
+
+    None
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
@@ -1201,15 +1367,16 @@ impl SecurityPolicy {
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(base_raw) = words.next() else {
+            let words = shell_words_after_env_assignments(&segment);
+            let Some(base_raw) = words.first() else {
                 continue;
             };
 
             let base_owned = command_basename(base_raw).to_ascii_lowercase();
             let base = strip_windows_exe_suffix(&base_owned);
 
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            let args_cased: Vec<String> = words.iter().skip(1).cloned().collect();
+            let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
             // High-risk commands (Unix and Windows)
@@ -1274,23 +1441,7 @@ impl SecurityPolicy {
 
             // Medium-risk commands (state-changing, but not inherently destructive)
             let medium = match base {
-                "git" => args.first().is_some_and(|verb| {
-                    matches!(
-                        verb.as_str(),
-                        "commit"
-                            | "push"
-                            | "reset"
-                            | "clean"
-                            | "rebase"
-                            | "merge"
-                            | "cherry-pick"
-                            | "revert"
-                            | "branch"
-                            | "checkout"
-                            | "switch"
-                            | "tag"
-                    )
-                }),
+                "git" => git_effective_subcommand(&args_cased).is_some_and(is_git_write_verb),
                 "npm" | "pnpm" | "yarn" => args.first().is_some_and(|verb| {
                     matches!(
                         verb.as_str(),
@@ -1359,9 +1510,9 @@ impl SecurityPolicy {
     fn is_command_explicitly_allowed(&self, command: &str) -> bool {
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            let cmd_part = skip_env_assignments(segment);
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let words = shell_words_after_env_assignments(segment);
+            let raw_executable =
+                strip_wrapping_quotes(words.first().map(String::as_str).unwrap_or_default()).trim();
             let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
                 &raw_executable[..idx]
             } else {
@@ -1390,8 +1541,9 @@ impl SecurityPolicy {
 
         // At least one real command must be present.
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            shell_words_after_env_assignments(s.trim())
+                .first()
+                .is_some_and(|w| !w.is_empty())
         })
     }
 
@@ -1454,11 +1606,9 @@ impl SecurityPolicy {
         // Split on unquoted command separators and validate each sub-command.
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            // Strip leading env var assignments (e.g. FOO=bar cmd)
-            let cmd_part = skip_env_assignments(segment);
-
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let words = shell_words_after_env_assignments(segment);
+            let raw_executable =
+                strip_wrapping_quotes(words.first().map(String::as_str).unwrap_or_default()).trim();
             // Strip inline redirections from the executable token, e.g.
             // `cat</dev/null` -> `cat`, so the allowlist check sees the real
             // command name rather than the redirect target path.
@@ -1486,7 +1636,7 @@ impl SecurityPolicy {
             // Both case-preserved and lowercased argument lists are provided:
             //   - `args_cased` for case-sensitive comparisons (e.g. git -C vs -c)
             //   - `args` (lowercased) for case-insensitive matches (e.g. subcommand names)
-            let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
+            let args_cased: Vec<String> = words.iter().skip(1).cloned().collect();
             let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
             if !self.is_args_safe(base_cmd, &args, &args_cased) {
                 return false;
@@ -1495,8 +1645,9 @@ impl SecurityPolicy {
 
         // At least one command must be present
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            shell_words_after_env_assignments(s.trim())
+                .first()
+                .is_some_and(|w| !w.is_empty())
         })
     }
 
@@ -1592,9 +1743,8 @@ impl SecurityPolicy {
         };
 
         for segment in split_unquoted_segments(command) {
-            let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(executable) = words.next() else {
+            let words = shell_words_after_env_assignments(&segment);
+            let Some(executable) = words.first() else {
                 continue;
             };
 
@@ -1615,7 +1765,7 @@ impl SecurityPolicy {
                 RedirectionArgument::FdOnly { .. } | RedirectionArgument::None => {}
             }
 
-            for token in words {
+            for token in words.iter().skip(1) {
                 let candidate = strip_wrapping_quotes(token).trim();
                 if candidate.is_empty() {
                     continue;
@@ -2987,6 +3137,11 @@ mod tests {
             "ZC_ALIAS='!/usr/bin/true' git --config-env alias.zcprobe=ZC_ALIAS zcprobe",
             "git -c alias.zcprobe='!/usr/bin/true' zcprobe",
             "git -calias.zcprobe='!/usr/bin/true' zcprobe",
+            "git '-c' foo.bar=ENV status",
+            "git '-cfoo.bar=ENV' status",
+            "git '--config-env' foo.bar=ENV status",
+            "git '--config-env=foo.bar=ENV' status",
+            "git --config-env\\=foo.bar=ENV status",
         ] {
             assert!(!p.is_command_allowed(command), "{command}");
             let err = p
@@ -3015,6 +3170,19 @@ mod tests {
             .validate_command_execution("git commit -m test", true)
             .expect("runtime-approved Git write verb should remain allowed");
         assert_eq!(commit_allowed, CommandRiskLevel::Medium);
+
+        let global_option_commit_denied = p
+            .validate_command_execution("git -C . commit -m test", false)
+            .expect_err("Git write verbs behind global options still require approval");
+        assert!(
+            global_option_commit_denied.contains("medium-risk operation"),
+            "{global_option_commit_denied}"
+        );
+
+        let global_option_commit_allowed = p
+            .validate_command_execution("git -C . commit -m test", true)
+            .expect("runtime-approved Git write verb behind global options should remain allowed");
+        assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
     }
 
     #[test]
