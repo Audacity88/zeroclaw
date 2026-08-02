@@ -5031,13 +5031,6 @@ impl TranscriptSnapshot {
             && (point.row, point.column) <= (end.row, end.column)
     }
 
-    fn selection_contains(&self, selection: TranscriptSelection, point: CellPoint) -> bool {
-        let Some((start, end)) = self.selection_bounds(selection) else {
-            return false;
-        };
-        Self::bounds_contain(start, end, point)
-    }
-
     fn selected_text(&self, selection: TranscriptSelection) -> Option<String> {
         if self.cells.is_empty() {
             return None;
@@ -6863,7 +6856,13 @@ mod tests {
         };
 
         assert!(snapshot.has_text_at(CellPoint { column: 2, row: 0 }));
-        assert!(snapshot.selection_contains(selection, CellPoint { column: 1, row: 0 }));
+        assert_eq!(
+            snapshot.selection_bounds(selection),
+            Some((
+                CellPoint { column: 1, row: 0 },
+                CellPoint { column: 3, row: 0 }
+            ))
+        );
         assert_eq!(snapshot.selected_text(selection).as_deref(), Some("界B"));
     }
 
@@ -6896,8 +6895,13 @@ mod tests {
         let snapshot = state.transcript_snapshot.as_ref().unwrap();
         let selection = state.transcript_selection.unwrap();
         assert_eq!(snapshot.selected_text(selection).as_deref(), Some("a"));
-        assert!(snapshot.selection_contains(selection, CellPoint { column: 4, row: 0 }));
-        assert!(!snapshot.selection_contains(selection, CellPoint { column: 6, row: 0 }));
+        assert_eq!(
+            snapshot.selection_bounds(selection),
+            Some((
+                CellPoint { column: 4, row: 0 },
+                CellPoint { column: 4, row: 0 }
+            ))
+        );
 
         assert!(state.update_transcript_drag(10, 5));
         state.finish_transcript_drag();
