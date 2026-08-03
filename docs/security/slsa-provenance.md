@@ -9,8 +9,8 @@
 ## Canonical model
 
 Downloadable release assets use GitHub artifact attestations as their single
-provenance mechanism. `actions/attest-build-provenance` records SLSA v1.0
-Build Level 2 provenance in GitHub's artifact-attestation API.
+provenance mechanism. `actions/attest` records SLSA v1.0 Build Level 2
+provenance in GitHub's artifact-attestation API.
 
 A release page produced by the consolidated workflow contains the payloads,
 `SHA256SUMS`, both SBOM formats, and at most one
