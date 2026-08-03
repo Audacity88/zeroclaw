@@ -275,7 +275,7 @@ impl SqliteSessionBackend {
         .with_context(|| format!("Failed to inspect JSONL import receipt for {source_name}"))
     }
 
-    fn reconcile_failed_import(
+    fn reconcile_failed_import<R>(
         &self,
         sessions_dir: &Path,
         mutation_guard: &mut crate::session_store::MutationState,
@@ -283,10 +283,14 @@ impl SqliteSessionBackend {
         staged_path: &Path,
         live_path: &Path,
         import_error: anyhow::Error,
-    ) -> anyhow::Error {
+        receipt_reader: &mut R,
+    ) -> anyhow::Error
+    where
+        R: FnMut(&Connection, &str) -> Result<Option<(String, String, i64)>>,
+    {
         let receipt = {
             let conn = self.conn.lock();
-            Self::import_receipt(&conn, name)
+            receipt_reader(&conn, name)
         };
         match receipt {
             Ok(Some(_)) => {
@@ -326,17 +330,24 @@ impl SqliteSessionBackend {
     where
         F: FnMut(&Path, &Path, &(String, i64)) -> Result<()>,
     {
-        self.migrate_from_jsonl_with_handlers(workspace_dir, Self::source_fingerprint, archive)
+        self.migrate_from_jsonl_with_handlers(
+            workspace_dir,
+            Self::source_fingerprint,
+            Self::import_receipt,
+            archive,
+        )
     }
 
-    fn migrate_from_jsonl_with_handlers<S, F>(
+    fn migrate_from_jsonl_with_handlers<S, R, F>(
         &self,
         workspace_dir: &Path,
         mut fingerprint: S,
+        mut failed_receipt: R,
         mut archive: F,
     ) -> Result<usize>
     where
         S: FnMut(&Path, &str) -> Result<(String, i64)>,
+        R: FnMut(&Connection, &str) -> Result<Option<(String, String, i64)>>,
         F: FnMut(&Path, &Path, &(String, i64)) -> Result<()>,
     {
         let sessions_dir = workspace_dir.join("sessions");
@@ -449,6 +460,7 @@ impl SqliteSessionBackend {
                         &staged_path,
                         &live_path,
                         import_error,
+                        &mut failed_receipt,
                     ));
                 }
             };
@@ -550,6 +562,7 @@ impl SqliteSessionBackend {
                     &staged_path,
                     &live_path,
                     import_error,
+                    &mut failed_receipt,
                 ));
             }
             crate::session_store::mark_session_directory_migrated(
@@ -2003,6 +2016,7 @@ mod tests {
             .migrate_from_jsonl_with_handlers(
                 tmp.path(),
                 |_, _| bail!("injected fingerprint failure"),
+                SqliteSessionBackend::import_receipt,
                 SqliteSessionBackend::archive_staged_jsonl,
             )
             .unwrap_err();
@@ -2018,6 +2032,43 @@ mod tests {
             .append("fingerprint_user", &ChatMessage::user("after failure"))
             .unwrap();
         assert_eq!(store.load("fingerprint_user").len(), 2);
+    }
+
+    #[test]
+    fn migrate_from_jsonl_deactivates_writer_when_receipt_check_fails() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("uncertain_user.jsonl"),
+            "{\"role\":\"user\",\"content\":\"before\"}\n",
+        )
+        .unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let error = backend
+            .migrate_from_jsonl_with_handlers(
+                tmp.path(),
+                |_, _| bail!("injected fingerprint failure"),
+                |_, _| bail!("injected receipt query failure"),
+                SqliteSessionBackend::archive_staged_jsonl,
+            )
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("injected fingerprint failure"));
+        assert!(message.contains("injected receipt query failure"));
+        assert!(!sessions_dir.join("uncertain_user.jsonl").exists());
+        assert!(sessions_dir.join("uncertain_user.jsonl.importing").exists());
+        let append_error = store
+            .append("uncertain_user", &ChatMessage::user("after failure"))
+            .unwrap_err();
+        assert!(
+            append_error
+                .to_string()
+                .contains("inactive after SQLite migration")
+        );
     }
 
     #[test]
