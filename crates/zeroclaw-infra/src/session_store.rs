@@ -258,6 +258,17 @@ pub(crate) fn mark_session_directory_migrated(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn forget_session_directory_migration_state_for_test(
+    sessions_dir: &Path,
+) -> std::io::Result<()> {
+    let key = sessions_dir.canonicalize()?;
+    if let Some(registry) = MUTATION_LOCKS.get() {
+        registry.lock().remove(&key);
+    }
+    Ok(())
+}
+
 impl SessionBackend for SessionStore {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         self.load(session_key)
