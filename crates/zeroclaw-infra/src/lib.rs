@@ -60,18 +60,18 @@ fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
 ) -> std::io::Result<session_sqlite::SqliteSessionBackend> {
     let backend = session_sqlite::SqliteSessionBackend::new(workspace_dir)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
     match backend
         .migrate_from_jsonl(workspace_dir)
-        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))?
     {
         0 => {}
         n => ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "session_backend=sqlite: imported {n} legacy JSONL session(s) from \
-             {}/sessions; renamed to *.jsonl.migrated.",
+                "session_backend=sqlite: completed {n} legacy JSONL session migration \
+             handoff(s) from {}/sessions to *.jsonl.migrated.",
                 workspace_dir.display()
             )
         ),
@@ -174,5 +174,18 @@ mod tests {
             .err()
             .expect("migration collision must prevent SQLite startup");
         assert!(err.to_string().contains("Refusing to replace"));
+    }
+
+    #[test]
+    fn make_session_backend_preserves_initialization_error_chain() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sessions/sessions.db")).unwrap();
+
+        let err = make_session_backend(tmp.path(), "sqlite")
+            .err()
+            .expect("a directory cannot be opened as the SQLite database");
+        let message = err.to_string();
+        assert!(message.contains("Failed to open session DB"));
+        assert!(message.contains("unable to open database file"));
     }
 }

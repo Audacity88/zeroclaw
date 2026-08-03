@@ -376,16 +376,19 @@ impl SqliteSessionBackend {
                 tx.commit()
                     .with_context(|| format!("Failed to finish JSONL receipt check for {name}"))?;
             } else {
-                let existing_rows: bool = tx
+                let existing_state: bool = tx
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1)",
+                        "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1) \
+                         OR EXISTS(SELECT 1 FROM session_metadata WHERE session_key = ?1)",
                         params![key],
                         |row| row.get(0),
                     )
-                    .with_context(|| format!("Failed to inspect existing SQLite session {key}"))?;
-                if existing_rows {
+                    .with_context(|| {
+                        format!("Failed to inspect existing SQLite session state for {key}")
+                    })?;
+                if existing_state {
                     bail!(
-                        "Refusing to import receipt-less JSONL session {name} into non-empty SQLite session {key}"
+                        "Refusing to import receipt-less JSONL session {name} over existing SQLite session state for {key}"
                     );
                 }
 
@@ -439,6 +442,11 @@ impl SqliteSessionBackend {
                 tx.commit()
                     .with_context(|| format!("Failed to commit JSONL import for {name}"))?;
             }
+            crate::session_store::mark_session_directory_migrated(
+                &sessions_dir,
+                &mut mutation_guard,
+            )
+            .context("Failed to deactivate JSONL after committed SQLite import")?;
             drop(conn);
 
             if migrated_path.exists() {
@@ -1559,6 +1567,104 @@ mod tests {
         assert!(err.to_string().contains("receipt-less JSONL session"));
         assert!(sessions_dir.join("legacy_user.jsonl.importing").exists());
         assert_eq!(backend.load("legacy_user").len(), 1);
+    }
+
+    #[test]
+    fn migrate_from_jsonl_rejects_receiptless_metadata_only_session() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("legacy_user.jsonl"),
+            "{\"role\":\"user\",\"content\":\"legacy\"}\n",
+        )
+        .unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("legacy_user", &ChatMessage::user("cleared"))
+            .unwrap();
+        backend
+            .set_session_name("legacy_user", "Preserved name")
+            .unwrap();
+        assert_eq!(backend.clear_messages("legacy_user").unwrap(), 1);
+
+        let err = backend.migrate_from_jsonl(tmp.path()).unwrap_err();
+
+        assert!(err.to_string().contains("existing SQLite session state"));
+        assert!(sessions_dir.join("legacy_user.jsonl.importing").exists());
+        assert!(backend.load("legacy_user").is_empty());
+        let metadata = backend.get_session_metadata("legacy_user").unwrap();
+        assert_eq!(metadata.message_count, 0);
+        assert_eq!(metadata.name.as_deref(), Some("Preserved name"));
+    }
+
+    #[test]
+    fn migrate_from_jsonl_keeps_jsonl_inactive_after_partial_batch_failure() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("a_import.jsonl"),
+            "{\"role\":\"user\",\"content\":\"imported\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("b_collision.jsonl"),
+            "{\"role\":\"user\",\"content\":\"legacy\"}\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append("b_collision", &ChatMessage::user("existing"))
+            .unwrap();
+
+        let workspace = tmp.path().to_path_buf();
+        let (archive_started_tx, archive_started_rx) = mpsc::channel();
+        let (release_archive_tx, release_archive_rx) = mpsc::channel();
+        let migration_backend = Arc::clone(&backend);
+        let migration = std::thread::spawn(move || {
+            migration_backend.migrate_from_jsonl_with_archive(&workspace, |from, to, expected| {
+                archive_started_tx.send(()).unwrap();
+                release_archive_rx.recv().unwrap();
+                SqliteSessionBackend::archive_staged_jsonl(from, to, expected)
+            })
+        });
+
+        archive_started_rx.recv().unwrap();
+        let writer_store = Arc::clone(&store);
+        let writer = std::thread::spawn(move || {
+            writer_store.append("a_import", &ChatMessage::user("late JSONL write"))
+        });
+        release_archive_tx.send(()).unwrap();
+
+        let migration_error = migration.join().unwrap().unwrap_err();
+        assert!(
+            migration_error
+                .to_string()
+                .contains("existing SQLite session state")
+        );
+        let writer_error = writer.join().unwrap().unwrap_err();
+        assert!(
+            writer_error
+                .to_string()
+                .contains("inactive after SQLite migration")
+        );
+        assert_eq!(backend.load("a_import").len(), 1);
+        assert!(!sessions_dir.join("a_import.jsonl").exists());
+        assert!(sessions_dir.join("a_import.jsonl.migrated").exists());
+
+        let reopened_store = SessionStore::new(tmp.path()).unwrap();
+        let reopened_error = reopened_store
+            .append("a_import", &ChatMessage::user("later"))
+            .unwrap_err();
+        assert!(
+            reopened_error
+                .to_string()
+                .contains("inactive after SQLite migration")
+        );
     }
 
     #[test]
