@@ -28,6 +28,14 @@ const repoRoot = path.resolve(process.argv[2]);
 const today = process.argv[3];
 const expires = process.argv[4];
 const webRoot = path.join(repoRoot, "web");
+const webSourceRoot = path.join(webRoot, "src");
+const advisoryWorkflowPath = path.join(
+  repoRoot,
+  ".github",
+  "workflows",
+  "npm-deps-review.yml",
+);
+const expectedGhsa = "GHSA-qwww-vcr4-c8h2";
 
 function fail(message) {
   console.error(`web-rsc-mode-guard: ${message}`);
@@ -48,7 +56,18 @@ function parseDate(label, value) {
 }
 
 if (parseDate("current", today) >= parseDate("expiry", expires)) {
-  fail(`GHSA-qwww-vcr4-c8h2 exception expired on ${expires}`);
+  fail(`${expectedGhsa} exception expired on ${expires}`);
+}
+
+if (!fs.existsSync(advisoryWorkflowPath)) {
+  fail("missing .github/workflows/npm-deps-review.yml");
+}
+const advisoryWorkflow = fs.readFileSync(advisoryWorkflowPath, "utf8");
+const allowGhsas = [
+  ...advisoryWorkflow.matchAll(/^\s*allow-ghsas:\s*([^#\r\n]+?)\s*(?:#.*)?$/gm),
+].map((match) => match[1].trim().replace(/^["']|["']$/g, ""));
+if (allowGhsas.length !== 1 || allowGhsas[0] !== expectedGhsa) {
+  fail(`dependency review must allow exactly ${expectedGhsa}`);
 }
 
 const packagePath = path.join(webRoot, "package.json");
@@ -125,6 +144,12 @@ function packageName(specifier) {
   return specifier.split("/", 1)[0];
 }
 
+function requireInsideWebRoot(resolved, relative, specifier) {
+  if (resolved !== webRoot && !resolved.startsWith(`${webRoot}${path.sep}`)) {
+    fail(`${relative} imports outside the guarded web root: ${specifier}`);
+  }
+}
+
 function inspectViteAliases(source, relative) {
   const aliasBlocks = [...source.matchAll(/\balias\s*:\s*\{([\s\S]*?)\n\s*\},/g)];
   if (/\balias\s*:/.test(source) && aliasBlocks.length !== 1) {
@@ -167,13 +192,13 @@ function inspectFile(filePath) {
       if (forbiddenSpecifier(specifier)) {
         fail(`${relative} imports RSC/server-capable module ${specifier}`);
       }
-      if (specifier.startsWith(".")) {
+      if (specifier.startsWith("@/")) {
+        const resolved = path.resolve(webSourceRoot, specifier.slice(2));
+        requireInsideWebRoot(resolved, relative, specifier);
+      } else if (specifier.startsWith(".")) {
         const resolved = path.resolve(path.dirname(filePath), specifier);
-        if (resolved !== webRoot && !resolved.startsWith(`${webRoot}${path.sep}`)) {
-          fail(`${relative} imports outside the guarded web root: ${specifier}`);
-        }
+        requireInsideWebRoot(resolved, relative, specifier);
       } else if (
-        !specifier.startsWith("@/") &&
         !specifier.startsWith("node:") &&
         !nodeBuiltins.has(specifier) &&
         !declaredPackages.has(packageName(specifier)) &&

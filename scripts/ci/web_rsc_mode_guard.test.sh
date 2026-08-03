@@ -7,8 +7,16 @@ fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 
 reset_fixture() {
-  rm -rf "$fixture/web"
-  mkdir -p "$fixture/web/src"
+  rm -rf "$fixture/web" "$fixture/.github"
+  mkdir -p "$fixture/web/src" "$fixture/.github/workflows"
+  cat >"$fixture/.github/workflows/npm-deps-review.yml" <<'YAML'
+jobs:
+  review:
+    steps:
+      - uses: actions/dependency-review-action@example
+        with:
+          allow-ghsas: GHSA-qwww-vcr4-c8h2
+YAML
   cat >"$fixture/web/package.json" <<'JSON'
 {
   "dependencies": {
@@ -59,6 +67,33 @@ expect_failure() {
 
 reset_fixture
 run_guard >/dev/null
+
+reset_fixture
+node - "$fixture/.github/workflows/npm-deps-review.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace("GHSA-qwww-vcr4-c8h2", "GHSA-xxxx-yyyy-zzzz"),
+);
+NODE
+expect_failure "different advisory exception"
+
+reset_fixture
+node - "$fixture/.github/workflows/npm-deps-review.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "GHSA-qwww-vcr4-c8h2",
+    "GHSA-qwww-vcr4-c8h2, GHSA-xxxx-yyyy-zzzz",
+  ),
+);
+NODE
+expect_failure "additional advisory exception"
 
 reset_fixture
 cat >"$fixture/web/src/node-test.ts" <<'TS'
@@ -183,6 +218,18 @@ import { bridge } from "../../outside/bridge";
 export { bridge };
 TSX
 expect_failure "relative import escaping the web root"
+
+reset_fixture
+mkdir -p "$fixture/outside"
+cat >"$fixture/outside/bridge.ts" <<'TS'
+export const bridge = true;
+TS
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+import { bridge } from "@/../../outside/bridge";
+
+export { bridge };
+TSX
+expect_failure "alias import escaping the web root"
 
 reset_fixture
 cat >"$fixture/web/src/main.tsx" <<'TSX'
