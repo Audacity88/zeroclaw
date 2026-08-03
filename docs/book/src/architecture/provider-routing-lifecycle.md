@@ -10,7 +10,7 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 | --- | --- | --- |
 | Provider profiles and fallback graph | `zeroclaw-config` provider schema and validation | A dotted `<family>.<alias>` identifies the endpoint, credentials, model, capabilities, and ordered fallback declarations for one profile. |
 | Provider construction | `zeroclaw-providers` factory functions | Materialize each profile with its own settings, flatten configured fallback entries in order, and compose routing around reliability. |
-| Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured provider target. The target's reliable wrapper currently pins calls to the target profile's configured model. |
+| Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured provider target and route model. The target's reliable wrapper then serves its pinned model: the active/default model used to construct the primary target, or the configured profile model for a non-primary target. |
 | Retry and failover | `ReliableModelProvider` | Classify failures, retry with bounded backoff, honor rate-limit cooldowns, and advance through the materialized entries. |
 | Provider stream termination | Concrete providers and `zeroclaw-providers/src/stream_guard.rs` | Translate each provider protocol's completion semantics into `StreamEvent::Final` or a truncation error. |
 | Stream replay and partial-output commitment | `zeroclaw-runtime/src/agent/turn/provider_call.rs` and `stream_consume.rs` | Retry a failed stream as non-streaming only before immutable event output is committed. Never replay a cancelled or visibly partial response. |
@@ -28,7 +28,7 @@ The runtime starts with an active provider reference and model from the selected
 
 There are two current construction constraints:
 
-- A non-primary route target is pinned to the model configured on its provider profile. `model_routes[].model` is passed into the router, but it does not override a different model pinned by the target's reliable wrapper. Keep the route model and target profile model aligned until that precedence is fixed.
+- Every route target is model-pinned. The primary target's reliable wrapper is pinned to the active/default model passed into provider construction, while each non-primary target is pinned to the model configured on its provider profile. `model_routes[].model` is passed into the router, but it does not override either pin. A hint that targets the primary profile therefore serves the active/default model when the route model differs; a hint that targets another profile serves that profile's model. Keep each route model aligned with its target's effective pin until that precedence is fixed.
 - Route targets are deduplicated by `model_provider`. If a route supplies `api_key`, the first matching route credential takes precedence when the shared target is constructed. Prefer credentials on the provider profile when several hints share one target.
 
 This ordering matters: routing chooses a reliability domain; it does not bypass reliability. An external routing service such as OpenRouter can still perform server-side selection behind one ZeroClaw profile, but it is optional and does not replace ZeroClaw's first-party route and fallback contracts.
@@ -83,7 +83,7 @@ Content refusal and safeguard fallback is also a separate proposed contract from
 For provider-routing changes, answer these before reviewer sign-off:
 
 - Does the change affect agent dispatch, hint selection, reliability fallback, or an external router? Name exactly one owner for each decision.
-- If a hint targets another provider profile, do the route model and the target profile's pinned model agree?
+- If a hint targets any provider profile, do the route model and the target's effective pin agree? For the primary target, compare against the active/default model used to construct the router; for a non-primary target, compare against the profile's configured model.
 - Does every fallback profile retain its own endpoint, credentials, model, headers, and capability overrides?
 - What is retryable, what advances immediately, and what error is returned after exhaustion?
 - Can a request be replayed after any output that a user or immutable consumer already observed?

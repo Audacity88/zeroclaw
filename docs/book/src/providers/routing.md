@@ -23,7 +23,7 @@ Routes only fire when a prompt explicitly carries the matching hint. The default
 
 `model_provider` is always a provider profile reference in dotted `<type>.<alias>` form, such as `anthropic.sonnet` or `openai.default`. The profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and configured default model. The `model` field is provider-local state under that profile.
 
-> **Current limitation:** A routed target's reliable wrapper pins calls to the model configured on the target provider profile. If `model_routes[].model` differs from that profile model, the profile model is served. Keep the two values aligned until route-model precedence is fixed.
+> **Current limitation:** Every routed target's reliable wrapper is model-pinned. The primary target is pinned to the active/default model used to construct the router; each non-primary target is pinned to its configured profile model. `model_routes[].model` selects the route's requested model but does not override either pin. Keep the route model aligned with the target's effective pin until route-model precedence is fixed.
 
 ## Reliability fallback
 
@@ -38,7 +38,7 @@ Configure the chain through the ZeroCode Config editor, the dashboard, or `zeroc
 Runtime switches use the same provider-profile contract as config-backed routing:
 
 - `/models <type>.<alias>` selects the active provider profile for the sender session. Channel runtimes can also accept a bare `<type>` shorthand when exactly one configured alias exists for that provider family.
-- `/model <model-id>` selects a model within the active provider profile. If the value matches a `[[model_routes]]` hint or model, that route can switch both provider profile and model together.
+- `/model <model-id>` selects a model within the active provider profile. If the value resolves through a `[[model_routes]]` entry, that route can select a different provider profile, but current pinning means the served model remains the target's effective pin rather than necessarily `model_routes[].model`.
 - The `model_switch` tool uses `model_provider = "<type>.<alias>"` plus `model = "<provider-local-model-id>"`.
 
 Runtime switches are session/runtime state. They do not edit `config.toml`; persisted defaults require an explicit config write. For tool-driven switches, bare provider family names such as `openai` are not switch targets because they do not identify which configured profile, credential, endpoint, or compatibility mode should be used.
