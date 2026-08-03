@@ -255,6 +255,26 @@ impl SqliteSessionBackend {
         })
     }
 
+    fn import_receipt(
+        conn: &Connection,
+        source_name: &str,
+    ) -> Result<Option<(String, String, i64)>> {
+        conn.query_row(
+            "SELECT session_key, source_hash, source_len FROM jsonl_import_receipts \
+             WHERE source_name = ?1",
+            params![source_name],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .with_context(|| format!("Failed to inspect JSONL import receipt for {source_name}"))
+    }
+
     fn migrate_from_jsonl_with_archive<F>(
         &self,
         workspace_dir: &Path,
@@ -366,32 +386,27 @@ impl SqliteSessionBackend {
             let (source_hash, source_len) = Self::source_fingerprint(&staged_path, &name)?;
             let expected = (source_hash.clone(), source_len);
             let mut conn = self.conn.lock();
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .with_context(|| format!("Failed to start JSONL import transaction for {name}"))?;
-            let receipt = tx
-                .query_row(
-                    "SELECT session_key, source_hash, source_len FROM jsonl_import_receipts \
-                     WHERE source_name = ?1",
-                    params![name],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .with_context(|| format!("Failed to inspect JSONL import receipt for {name}"))?;
+            let import_result = (|| -> Result<()> {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .with_context(|| {
+                        format!("Failed to start JSONL import transaction for {name}")
+                    })?;
+                let receipt = Self::import_receipt(&tx, &name)?;
 
-            if let Some((receipt_key, receipt_hash, receipt_len)) = receipt {
-                if receipt_key != key || receipt_hash != source_hash || receipt_len != source_len {
-                    bail!("JSONL session {name} does not match its committed import receipt");
+                if let Some((receipt_key, receipt_hash, receipt_len)) = receipt {
+                    if receipt_key != key
+                        || receipt_hash != source_hash
+                        || receipt_len != source_len
+                    {
+                        bail!("JSONL session {name} does not match its committed import receipt");
+                    }
+                    tx.commit().with_context(|| {
+                        format!("Failed to finish JSONL receipt check for {name}")
+                    })?;
+                    return Ok(());
                 }
-                tx.commit()
-                    .with_context(|| format!("Failed to finish JSONL receipt check for {name}"))?;
-            } else {
+
                 let existing_state: bool = tx
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key = ?1) \
@@ -403,8 +418,6 @@ impl SqliteSessionBackend {
                         format!("Failed to inspect existing SQLite session state for {key}")
                     })?;
                 if existing_state {
-                    drop(tx);
-                    Self::restore_uncommitted_jsonl(&staged_path, &live_path)?;
                     bail!(
                         "Refusing to import receipt-less JSONL session {name} over existing SQLite session state for {key}"
                     );
@@ -439,8 +452,6 @@ impl SqliteSessionBackend {
                 }
 
                 if inserted == 0 {
-                    drop(tx);
-                    Self::restore_uncommitted_jsonl(&staged_path, &live_path)?;
                     bail!("JSONL session {name} contains no valid messages to import");
                 }
                 tx.execute(
@@ -459,6 +470,41 @@ impl SqliteSessionBackend {
                 .with_context(|| format!("Failed to record JSONL import receipt for {name}"))?;
                 tx.commit()
                     .with_context(|| format!("Failed to commit JSONL import for {name}"))?;
+                Ok(())
+            })();
+
+            if let Err(import_error) = import_result {
+                match Self::import_receipt(&conn, &name) {
+                    Ok(Some(_)) => {
+                        crate::session_store::mark_session_directory_migrated(
+                            &sessions_dir,
+                            &mut mutation_guard,
+                        )
+                        .context("Failed to deactivate JSONL after committed SQLite import")?;
+                        return Err(import_error);
+                    }
+                    Ok(None) => {
+                        drop(conn);
+                        if let Err(restore_error) =
+                            Self::restore_uncommitted_jsonl(&staged_path, &live_path)
+                        {
+                            return Err(restore_error.context(format!(
+                                "JSONL import for {name} failed before commit: {import_error:#}"
+                            )));
+                        }
+                        return Err(import_error);
+                    }
+                    Err(receipt_error) => {
+                        crate::session_store::mark_session_directory_migrated(
+                            &sessions_dir,
+                            &mut mutation_guard,
+                        )
+                        .context("Failed to deactivate JSONL after uncertain SQLite import")?;
+                        return Err(receipt_error.context(format!(
+                            "Could not determine whether failed JSONL import for {name} committed: {import_error:#}"
+                        )));
+                    }
+                }
             }
             crate::session_store::mark_session_directory_migrated(
                 &sessions_dir,
@@ -1683,9 +1729,7 @@ mod tests {
 
         let reopened_store = SessionStore::new(tmp.path()).unwrap();
         let reopened_backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let retry_error = reopened_backend
-            .migrate_from_jsonl(tmp.path())
-            .unwrap_err();
+        let retry_error = reopened_backend.migrate_from_jsonl(tmp.path()).unwrap_err();
         assert!(
             retry_error
                 .to_string()
@@ -1850,6 +1894,7 @@ mod tests {
             "{\"role\":\"user\",\"content\":\"hello\"}\n{\"role\":\"assistant\",\"content\":\"fail\"}\n",
         )
         .unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
 
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         {
@@ -1863,25 +1908,36 @@ mod tests {
             .unwrap();
         }
 
-        backend.migrate_from_jsonl(tmp.path()).unwrap_err();
+        let error = backend.migrate_from_jsonl(tmp.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("injected import failure"));
         assert!(backend.load("rollback_user").is_empty());
-        let conn = backend.conn.lock();
-        let metadata_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_metadata WHERE session_key = 'rollback_user'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let receipt_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM jsonl_import_receipts WHERE source_name = 'rollback_user.jsonl'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let (metadata_count, receipt_count) = {
+            let conn = backend.conn.lock();
+            let metadata_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_metadata WHERE session_key = 'rollback_user'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let receipt_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM jsonl_import_receipts WHERE source_name = 'rollback_user.jsonl'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (metadata_count, receipt_count)
+        };
         assert_eq!(metadata_count, 0);
         assert_eq!(receipt_count, 0);
+        assert!(sessions_dir.join("rollback_user.jsonl").exists());
+        assert!(!sessions_dir.join("rollback_user.jsonl.importing").exists());
+
+        store
+            .append("rollback_user", &ChatMessage::user("after failure"))
+            .unwrap();
+        assert_eq!(store.load("rollback_user").len(), 3);
     }
 
     #[test]
