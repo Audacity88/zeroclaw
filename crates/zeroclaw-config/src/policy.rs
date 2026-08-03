@@ -659,6 +659,19 @@ fn is_env_assignment_word(word: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
+fn env_assignment_name(word: &str) -> Option<&str> {
+    let (name, _) = word.split_once('=')?;
+    if name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuoteState {
     None,
@@ -852,6 +865,10 @@ fn split_shell_words(segment: &str) -> Vec<String> {
                     continue;
                 }
                 match ch {
+                    '\\' if cfg!(target_os = "windows") => {
+                        current.push(ch);
+                        in_word = true;
+                    }
                     '\\' => {
                         escaped = true;
                         in_word = true;
@@ -871,6 +888,10 @@ fn split_shell_words(segment: &str) -> Vec<String> {
                     continue;
                 }
                 match ch {
+                    '\\' if cfg!(target_os = "windows") => {
+                        current.push(ch);
+                        in_word = true;
+                    }
                     '\\' => {
                         escaped = true;
                         in_word = true;
@@ -904,12 +925,44 @@ fn split_shell_words(segment: &str) -> Vec<String> {
 
 fn shell_words_after_env_assignments(segment: &str) -> Vec<String> {
     let mut words = split_shell_words(segment);
-    let first_command = words
-        .iter()
-        .position(|word| !is_env_assignment_word(word))
-        .unwrap_or(words.len());
+    let first_command = first_command_word_index(&words);
     drop(words.drain(..first_command));
     words
+}
+
+fn first_command_word_index(words: &[String]) -> usize {
+    words
+        .iter()
+        .position(|word| !is_env_assignment_word(word))
+        .unwrap_or(words.len())
+}
+
+fn is_git_config_env_assignment_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("GIT_CONFIG_COUNT")
+        || name.eq_ignore_ascii_case("GIT_CONFIG_PARAMETERS")
+        || name
+            .get(..15)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_KEY_"))
+        || name
+            .get(..17)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_VALUE_"))
+}
+
+fn has_git_config_env_assignment_for_git(words: &[String]) -> bool {
+    let first_command = first_command_word_index(words);
+    let Some(executable) = words.get(first_command) else {
+        return false;
+    };
+
+    let base_owned = command_basename(strip_wrapping_quotes(executable)).to_ascii_lowercase();
+    if strip_windows_exe_suffix(&base_owned) != "git" {
+        return false;
+    }
+
+    words[..first_command]
+        .iter()
+        .filter_map(|word| env_assignment_name(word))
+        .any(is_git_config_env_assignment_name)
 }
 
 fn is_git_write_verb(verb: &str) -> bool {
@@ -1200,6 +1253,68 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
             )
         {
             return true;
+        }
+    }
+
+    false
+}
+
+fn contains_unmodeled_shell_word_expansion(command: &str) -> bool {
+    if command.contains("\\\n") || command.contains("\\\r\n") {
+        return true;
+    }
+
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                continue;
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                continue;
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        continue;
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        continue;
+                    }
+                    '$' if chars.peek().is_some_and(|next| *next == '\'') => {
+                        return true;
+                    }
+                    '{' | '}' | '*' | '?' | '[' => return true,
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1568,6 +1683,7 @@ impl SecurityPolicy {
 
         if command.contains('`')
             || contains_unquoted_shell_variable_expansion(command)
+            || contains_unmodeled_shell_word_expansion(command)
             || command.contains("<(")
             || command.contains(">(")
         {
@@ -1606,7 +1722,12 @@ impl SecurityPolicy {
         // Split on unquoted command separators and validate each sub-command.
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            let words = shell_words_after_env_assignments(segment);
+            let mut words = split_shell_words(segment);
+            if has_git_config_env_assignment_for_git(&words) {
+                return false;
+            }
+            let first_command = first_command_word_index(&words);
+            drop(words.drain(..first_command));
             let raw_executable =
                 strip_wrapping_quotes(words.first().map(String::as_str).unwrap_or_default()).trim();
             // Strip inline redirections from the executable token, e.g.
@@ -3130,12 +3251,23 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
+        #[cfg(not(target_os = "windows"))]
         assert!(p.is_command_allowed("c\\at ./src/main.rs"));
+        #[cfg(target_os = "windows")]
+        assert!(!p.is_command_allowed("c\\at ./src/main.rs"));
+
         assert!(!p.is_command_allowed("find . '-exec' echo"));
         assert_eq!(p.forbidden_path_argument("cat './src/main.rs'"), None);
+
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(
             p.forbidden_path_argument("cat ..\\/secret.txt"),
             Some("../secret.txt".into())
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            p.forbidden_path_argument("cat ..\\/secret.txt"),
+            Some("..\\/secret.txt".into())
         );
     }
 
@@ -3151,6 +3283,8 @@ mod tests {
         for command in [
             "ZC_ALIAS='!/usr/bin/true' git --config-env=alias.zcprobe=ZC_ALIAS zcprobe",
             "ZC_ALIAS='!/usr/bin/true' git --config-env alias.zcprobe=ZC_ALIAS zcprobe",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.zcprobe GIT_CONFIG_VALUE_0='!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_PARAMETERS='alias.zcprobe=!/usr/bin/true' git zcprobe",
             "git -c alias.zcprobe='!/usr/bin/true' zcprobe",
             "git -calias.zcprobe='!/usr/bin/true' zcprobe",
             "git '-c' foo.bar=ENV status",
@@ -3168,6 +3302,11 @@ mod tests {
                 "{err}"
             );
         }
+
+        let env_status = p
+            .validate_command_execution("FOO=bar git status", false)
+            .expect("benign environment assignments should remain allowed");
+        assert_eq!(env_status, CommandRiskLevel::Low);
 
         let status = p
             .validate_command_execution("git status", false)
@@ -3199,6 +3338,48 @@ mod tests {
             .validate_command_execution("git -C . commit -m test", true)
             .expect("runtime-approved Git write verb behind global options should remain allowed");
         assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
+    }
+
+    #[test]
+    fn git_unmodeled_shell_expansions_rejected_at_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            concat!("git -C . com\\", "\n", "mit -m test"),
+            "git -C {.,commit} -m test",
+            "git -C . $'commit' -m test",
+            "git -C . com* -m test",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("unmodeled shell expansion must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_backslash_executable_is_not_normalized_to_allowlisted_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("c\\at ./src/main.rs", false)
+            .expect_err("Windows path separators must not become allowlisted command text");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
     }
 
     #[test]
