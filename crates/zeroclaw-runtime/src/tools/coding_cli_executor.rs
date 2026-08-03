@@ -1,7 +1,7 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::traits::Sandbox;
 use async_trait::async_trait;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,14 +36,21 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
         let mut process = if self.use_native_argv {
             native_command(&command)
         } else {
+            let env_keys: Vec<&OsStr> =
+                command.env.iter().map(|(key, _)| key.as_os_str()).collect();
             self.runtime
-                .build_shell_command(&shell_command(&command), &command.working_dir)
+                .build_shell_command_with_env_keys(
+                    &shell_command(&command),
+                    &command.working_dir,
+                    &env_keys,
+                )
                 .map_err(CodingCliExecutionError::Prepare)?
         };
 
         self.sandbox
             .wrap_command(process.as_std_mut())
             .map_err(|error| CodingCliExecutionError::Prepare(error.into()))?;
+        process.current_dir(&command.working_dir);
 
         let runtime_sandbox_env = command_env_snapshot(&process);
         process.env_clear();
@@ -197,6 +204,105 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
+    struct NoopSandbox;
+
+    #[cfg(not(target_os = "windows"))]
+    impl Sandbox for NoopSandbox {
+        fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "noop-sandbox"
+        }
+
+        fn description(&self) -> &str {
+            "test sandbox"
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    struct ReplacingPwdSandbox;
+
+    #[cfg(not(target_os = "windows"))]
+    impl Sandbox for ReplacingPwdSandbox {
+        fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+            *cmd = std::process::Command::new("/bin/pwd");
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "replacing-pwd-sandbox"
+        }
+
+        fn description(&self) -> &str {
+            "test sandbox"
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    struct EnvForwardingRuntime {
+        seen_env_keys: Arc<Mutex<Vec<OsString>>>,
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    impl RuntimeAdapter for EnvForwardingRuntime {
+        fn name(&self) -> &str {
+            "env-forwarding-runtime"
+        }
+
+        fn has_shell_access(&self) -> bool {
+            true
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            PathBuf::from("/tmp/env-forwarding-runtime")
+        }
+
+        fn supports_long_running(&self) -> bool {
+            true
+        }
+
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &std::path::Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            self.build_shell_command_with_env_keys(command, workspace_dir, &[])
+        }
+
+        fn build_shell_command_with_env_keys(
+            &self,
+            _command: &str,
+            workspace_dir: &std::path::Path,
+            env_keys: &[&OsStr],
+        ) -> anyhow::Result<tokio::process::Command> {
+            let mut seen_env_keys = self
+                .seen_env_keys
+                .lock()
+                .expect("env-forwarding runtime mutex");
+            *seen_env_keys = env_keys.iter().map(|key| key.to_os_string()).collect();
+            let mut process = tokio::process::Command::new("/bin/sh");
+            process
+                .args(["-c", "printf '%s' \"$ZC_CLI_TOKEN\""])
+                .current_dir(workspace_dir);
+            Ok(process)
+        }
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn codex_cli_uses_runtime_and_sandbox_executor() {
@@ -260,6 +366,61 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
             "hello; exit 7 sandboxed"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replacing_sandbox_preserves_validated_working_dir() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let workspace_path = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let runtime = Arc::new(FakeRuntime {
+            seen_command: Arc::new(Mutex::new(None)),
+        });
+        let executor =
+            RuntimeCodingCliExecutor::shared(runtime, Arc::new(ReplacingPwdSandbox), true);
+        let command = CodingCliCommand::new("/bin/false", workspace_path.clone(), 5);
+
+        let output = executor
+            .output(command)
+            .await
+            .expect("replacement sandbox command should execute");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            workspace_path.to_string_lossy()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn runtime_env_key_forwarding_delivers_selected_env_to_child() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let seen_env_keys = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(EnvForwardingRuntime {
+            seen_env_keys: Arc::clone(&seen_env_keys),
+        });
+        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(NoopSandbox), false);
+        let mut command = CodingCliCommand::new("codex", workspace.path().to_path_buf(), 5);
+        command.env("ZC_CLI_TOKEN", "secret-value-visible-only-to-child-env");
+
+        let output = executor
+            .output(command)
+            .await
+            .expect("runtime command should receive selected environment");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "secret-value-visible-only-to-child-env"
+        );
+        assert_eq!(
+            *seen_env_keys.lock().expect("env-forwarding runtime mutex"),
+            vec![OsString::from("ZC_CLI_TOKEN")]
         );
     }
 }
