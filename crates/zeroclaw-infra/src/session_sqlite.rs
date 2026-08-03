@@ -275,12 +275,68 @@ impl SqliteSessionBackend {
         .with_context(|| format!("Failed to inspect JSONL import receipt for {source_name}"))
     }
 
-    fn migrate_from_jsonl_with_archive<F>(
+    fn reconcile_failed_import(
+        &self,
+        sessions_dir: &Path,
+        mutation_guard: &mut crate::session_store::MutationState,
+        name: &str,
+        staged_path: &Path,
+        live_path: &Path,
+        import_error: anyhow::Error,
+    ) -> anyhow::Error {
+        let receipt = {
+            let conn = self.conn.lock();
+            Self::import_receipt(&conn, name)
+        };
+        match receipt {
+            Ok(Some(_)) => {
+                if let Err(state_error) = crate::session_store::mark_session_directory_migrated(
+                    sessions_dir,
+                    mutation_guard,
+                ) {
+                    return anyhow::Error::from(state_error).context(format!(
+                        "Failed to deactivate JSONL after committed import for {name}: {import_error:#}"
+                    ));
+                }
+                import_error
+            }
+            Ok(None) => match Self::restore_uncommitted_jsonl(staged_path, live_path) {
+                Ok(()) => import_error,
+                Err(restore_error) => restore_error.context(format!(
+                    "JSONL import for {name} failed before commit: {import_error:#}"
+                )),
+            },
+            Err(receipt_error) => {
+                if let Err(state_error) = crate::session_store::mark_session_directory_migrated(
+                    sessions_dir,
+                    mutation_guard,
+                ) {
+                    return anyhow::Error::from(state_error).context(format!(
+                        "Failed to deactivate JSONL after uncertain import for {name}; receipt inspection also failed: {receipt_error:#}; import error: {import_error:#}"
+                    ));
+                }
+                receipt_error.context(format!(
+                    "Could not determine whether failed JSONL import for {name} committed: {import_error:#}"
+                ))
+            }
+        }
+    }
+
+    fn migrate_from_jsonl_with_archive<F>(&self, workspace_dir: &Path, archive: F) -> Result<usize>
+    where
+        F: FnMut(&Path, &Path, &(String, i64)) -> Result<()>,
+    {
+        self.migrate_from_jsonl_with_handlers(workspace_dir, Self::source_fingerprint, archive)
+    }
+
+    fn migrate_from_jsonl_with_handlers<S, F>(
         &self,
         workspace_dir: &Path,
+        mut fingerprint: S,
         mut archive: F,
     ) -> Result<usize>
     where
+        S: FnMut(&Path, &str) -> Result<(String, i64)>,
         F: FnMut(&Path, &Path, &(String, i64)) -> Result<()>,
     {
         let sessions_dir = workspace_dir.join("sessions");
@@ -383,7 +439,19 @@ impl SqliteSessionBackend {
                     .with_context(|| format!("Failed to stage JSONL session {name} for import"))?;
             }
 
-            let (source_hash, source_len) = Self::source_fingerprint(&staged_path, &name)?;
+            let (source_hash, source_len) = match fingerprint(&staged_path, &name) {
+                Ok(fingerprint) => fingerprint,
+                Err(import_error) => {
+                    return Err(self.reconcile_failed_import(
+                        &sessions_dir,
+                        &mut mutation_guard,
+                        &name,
+                        &staged_path,
+                        &live_path,
+                        import_error,
+                    ));
+                }
+            };
             let expected = (source_hash.clone(), source_len);
             let mut conn = self.conn.lock();
             let import_result = (|| -> Result<()> {
@@ -474,37 +542,15 @@ impl SqliteSessionBackend {
             })();
 
             if let Err(import_error) = import_result {
-                match Self::import_receipt(&conn, &name) {
-                    Ok(Some(_)) => {
-                        crate::session_store::mark_session_directory_migrated(
-                            &sessions_dir,
-                            &mut mutation_guard,
-                        )
-                        .context("Failed to deactivate JSONL after committed SQLite import")?;
-                        return Err(import_error);
-                    }
-                    Ok(None) => {
-                        drop(conn);
-                        if let Err(restore_error) =
-                            Self::restore_uncommitted_jsonl(&staged_path, &live_path)
-                        {
-                            return Err(restore_error.context(format!(
-                                "JSONL import for {name} failed before commit: {import_error:#}"
-                            )));
-                        }
-                        return Err(import_error);
-                    }
-                    Err(receipt_error) => {
-                        crate::session_store::mark_session_directory_migrated(
-                            &sessions_dir,
-                            &mut mutation_guard,
-                        )
-                        .context("Failed to deactivate JSONL after uncertain SQLite import")?;
-                        return Err(receipt_error.context(format!(
-                            "Could not determine whether failed JSONL import for {name} committed: {import_error:#}"
-                        )));
-                    }
-                }
+                drop(conn);
+                return Err(self.reconcile_failed_import(
+                    &sessions_dir,
+                    &mut mutation_guard,
+                    &name,
+                    &staged_path,
+                    &live_path,
+                    import_error,
+                ));
             }
             crate::session_store::mark_session_directory_migrated(
                 &sessions_dir,
@@ -1938,6 +1984,40 @@ mod tests {
             .append("rollback_user", &ChatMessage::user("after failure"))
             .unwrap();
         assert_eq!(store.load("rollback_user").len(), 3);
+    }
+
+    #[test]
+    fn migrate_from_jsonl_restores_source_after_fingerprint_failure() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("fingerprint_user.jsonl"),
+            "{\"role\":\"user\",\"content\":\"before\"}\n",
+        )
+        .unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let error = backend
+            .migrate_from_jsonl_with_handlers(
+                tmp.path(),
+                |_, _| bail!("injected fingerprint failure"),
+                SqliteSessionBackend::archive_staged_jsonl,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected fingerprint failure"));
+        assert!(sessions_dir.join("fingerprint_user.jsonl").exists());
+        assert!(
+            !sessions_dir
+                .join("fingerprint_user.jsonl.importing")
+                .exists()
+        );
+        store
+            .append("fingerprint_user", &ChatMessage::user("after failure"))
+            .unwrap();
+        assert_eq!(store.load("fingerprint_user").len(), 2);
     }
 
     #[test]
