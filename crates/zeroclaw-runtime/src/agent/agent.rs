@@ -3748,8 +3748,10 @@ mod tests {
         }
     }
 
+    type CapturedLlmInputs = Arc<Mutex<Vec<(Vec<ChatMessage>, String)>>>;
+
     struct MutatingBeforeLlmHook {
-        seen_inputs: Arc<Mutex<Vec<(Vec<ChatMessage>, String)>>>,
+        seen_inputs: CapturedLlmInputs,
     }
 
     #[async_trait]
