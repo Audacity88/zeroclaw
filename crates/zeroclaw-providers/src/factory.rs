@@ -63,6 +63,17 @@ trait FamilyEndpointSpec {
     const ENDPOINT: ProviderEndpoint;
 }
 
+fn fixed_family_endpoint<T: FamilyEndpointSpec>() -> &'static str {
+    match T::ENDPOINT {
+        ProviderEndpoint::Fixed(url) => url,
+        ProviderEndpoint::Dynamic
+        | ProviderEndpoint::OperatorRequired
+        | ProviderEndpoint::CliBacked => {
+            unreachable!("fixed endpoint requested for a non-fixed provider family")
+        }
+    }
+}
+
 pub trait FamilyProviderFactory {
     fn create_provider(
         &self,
@@ -901,7 +912,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
 
         let mut b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("xAI")
-            .base_url(api_url.unwrap_or(XAI_DEFAULT_URL))
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()))
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             .models_dev_key("xai");
@@ -1091,10 +1102,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias).credential(key);
-        if let Some(url) = api_url {
-            b = b.base_url(url);
-        }
+        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
+            .credential(key)
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
         }
@@ -1173,7 +1183,7 @@ fn normalize_ollama_compat_base_url(api_url: Option<&str>) -> String {
     let raw = api_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(OLLAMA_COMPAT_DEFAULT_URL);
+        .unwrap_or(fixed_family_endpoint::<OllamaModelProviderConfig>());
 
     let Ok(mut url) = reqwest::Url::parse(raw) else {
         return raw.trim_end_matches('/').to_string();
@@ -1452,7 +1462,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("Groq")
-            .base_url(GROQ_DEFAULT_URL)
+            .base_url(fixed_family_endpoint::<Self>())
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             .models_dev_key("groq")
@@ -1554,7 +1564,7 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
             .unwrap_or("lm-studio");
         let b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("LM Studio")
-            .base_url(api_url.unwrap_or(LMSTUDIO_DEFAULT_URL))
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()))
             .credential(Some(lm_studio_key))
             .auth_style(AuthStyle::Bearer);
         Ok(apply_compat_options(b, opts))
@@ -1573,7 +1583,7 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let base_url = api_url.unwrap_or(LLAMACPP_DEFAULT_URL);
+        let base_url = api_url.unwrap_or(fixed_family_endpoint::<Self>());
         let llama_cpp_key = key
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1619,7 +1629,7 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
             .unwrap_or("osaurus");
         let b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("Osaurus")
-            .base_url(api_url.unwrap_or(OSAURUS_DEFAULT_URL))
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()))
             .credential(Some(osaurus_key))
             .auth_style(AuthStyle::Bearer);
         Ok(apply_compat_options(b, opts))
@@ -1641,7 +1651,7 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
         Ok(Box::new(
             crate::openai::OpenAiModelProvider::builder(alias)
                 .credential(key)
-                .base_url(OVH_DEFAULT_URL)
+                .base_url(fixed_family_endpoint::<Self>())
                 .build(),
         ))
     }
@@ -1756,6 +1766,33 @@ mod tests {
         assert!(endpoint_for_family("not_a_provider").is_none());
         assert!(endpoint_for_family("openai-compatible").is_none());
         assert!(endpoint_for_family("openai_compatible").is_none());
+    }
+
+    #[test]
+    fn every_fixed_endpoint_constructs_from_its_canonical_family_spec() {
+        macro_rules! assert_fixed_construction {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {{
+                let opts = ModelProviderRuntimeOptions::default();
+                $(
+                    if matches!(
+                        <$cfg_ty as FamilyEndpointSpec>::ENDPOINT,
+                        ProviderEndpoint::Fixed(_)
+                    ) {
+                        let config = <$cfg_ty>::default();
+                        config
+                            .create_provider($type_str, Some("test-key"), None, &opts)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "fixed provider family {:?} did not construct from its canonical endpoint: {error:#}",
+                                    $type_str
+                                )
+                            });
+                    }
+                )+
+            }};
+        }
+
+        zeroclaw_config::for_each_model_provider_slot!(assert_fixed_construction);
     }
 
     #[test]
