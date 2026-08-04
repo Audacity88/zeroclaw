@@ -214,6 +214,24 @@ impl ScopedToolRegistry {
             tools_registry.extend(peripheral_tools);
         }
 
+        // Mint the pipeline only after the effective caller policy is known. The
+        // same immutable Arc is used for top-level registration and any
+        // skill-scoped builtin elevation, so no unrestricted copy can escape.
+        let pipeline_tool = config.pipeline.enabled.then(|| {
+            Arc::new(tools::PipelineTool::with_access_policy(
+                config.pipeline.clone(),
+                unfiltered_tool_arcs.clone(),
+                zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                    security.allowed_tools.as_deref(),
+                    security.excluded_tools.as_deref(),
+                    caller_allowed,
+                ),
+            )) as Arc<dyn Tool>
+        });
+        if let Some(tool) = pipeline_tool.as_ref() {
+            tools_registry.push(Box::new(tools::ArcToolRef(Arc::clone(tool))));
+        }
+
         // 2. Built-in allow/deny filter (uniform: the gateway used to skip it entirely).
         //    `caller_allowed` narrows on top of the policy, for the `run` path only.
         let before_filter = tools_registry.len();
@@ -513,6 +531,7 @@ impl ScopedToolRegistry {
             .iter()
             .cloned()
             .chain(mcp_elevation_arcs.iter().cloned())
+            .chain(pipeline_tool.iter().cloned())
             .collect();
         register_skill_tools_with_context_and_runtime(
             &mut tools_registry,
@@ -554,8 +573,10 @@ impl ScopedToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::SkillTool;
     use crate::tools::{ToolOutput, ToolResult};
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockTool(&'static str);
 
@@ -565,6 +586,37 @@ mod tests {
         }
         fn alias(&self) -> &str {
             self.0
+        }
+    }
+
+    struct CountingTool {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(CountingTool);
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "count calls"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "ran".into(),
+                error: None,
+            })
         }
     }
 
@@ -599,6 +651,224 @@ mod tests {
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
         }
+    }
+
+    fn built_with_pipeline(calls: Arc<AtomicUsize>) -> AllToolsResult {
+        let shell: Arc<dyn Tool> = Arc::new(CountingTool {
+            name: "shell",
+            calls: Arc::clone(&calls),
+        });
+        let file_write: Arc<dyn Tool> = Arc::new(CountingTool {
+            name: "file_write",
+            calls,
+        });
+        AllToolsResult {
+            tools: vec![
+                Box::new(tools::ArcToolRef(Arc::clone(&shell))),
+                Box::new(tools::ArcToolRef(Arc::clone(&file_write))),
+            ],
+            delegate_handle: None,
+            ask_user_handle: None,
+            reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            channel_room_handle: None,
+            unfiltered_tool_arcs: vec![shell, file_write],
+        }
+    }
+
+    async fn assemble_pipeline(
+        security: Arc<SecurityPolicy>,
+        skills: &[Skill],
+        calls: Arc<AtomicUsize>,
+        caller_allowed: Option<&[String]>,
+    ) -> ScopedAssembled {
+        let mut config = Config::default();
+        config.pipeline.enabled = true;
+        config.pipeline.max_steps = 20;
+        config.pipeline.allowed_tools = vec!["shell".to_string(), "file_write".to_string()];
+        ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built: built_with_pipeline(calls),
+            skills,
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn assembled_pipeline_rejects_agent_denied_step_before_execution() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec![tools::PipelineTool::NAME.to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let assembled = assemble_pipeline(security, &[], Arc::clone(&calls), None).await;
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .expect("policy-admitted pipeline must be registered");
+
+        let result = pipeline
+            .execute(serde_json::json!({
+                "steps": [{"tool": "shell", "args": {}}]
+            }))
+            .await
+            .expect("pipeline denial is a tool result, not a transport error");
+
+        assert!(!result.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pipeline_omitted_when_top_level_policy_denies_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec!["shell".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let assembled = assemble_pipeline(security, &[], calls, None).await;
+
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .all(|tool| tool.name() != tools::PipelineTool::NAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_elevated_pipeline_keeps_the_same_agent_policy_ceiling() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "pipeline wrapper".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![SkillTool {
+                name: "chain".to_string(),
+                description: "run a pipeline".to_string(),
+                kind: "builtin".to_string(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some(tools::PipelineTool::NAME.to_string()),
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec!["ops__chain".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let assembled = assemble_pipeline(
+            security,
+            std::slice::from_ref(&skill),
+            Arc::clone(&calls),
+            None,
+        )
+        .await;
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .all(|tool| tool.name() != tools::PipelineTool::NAME)
+        );
+        let elevated = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "ops__chain")
+            .expect("skill elevation must resolve the scoped pipeline target");
+
+        let result = elevated
+            .execute(serde_json::json!({
+                "steps": [{"tool": "shell", "args": {}}]
+            }))
+            .await
+            .expect("pipeline denial is a tool result, not a transport error");
+
+        assert!(!result.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn assert_mixed_pipeline_is_prevalidated(parallel: bool) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec![
+                tools::PipelineTool::NAME.to_string(),
+                "shell".to_string(),
+            ]),
+            ..SecurityPolicy::default()
+        });
+        let assembled = assemble_pipeline(security, &[], Arc::clone(&calls), None).await;
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .expect("policy-admitted pipeline must be registered");
+
+        let result = pipeline
+            .execute(serde_json::json!({
+                "steps": [
+                    {"tool": "shell", "args": {}},
+                    {"tool": "file_write", "args": {}}
+                ],
+                "parallel": parallel
+            }))
+            .await
+            .expect("pipeline denial is a tool result, not a transport error");
+
+        assert!(!result.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sequential_pipeline_prevalidates_every_step() {
+        assert_mixed_pipeline_is_prevalidated(false).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_pipeline_prevalidates_every_step() {
+        assert_mixed_pipeline_is_prevalidated(true).await;
+    }
+
+    #[tokio::test]
+    async fn pipeline_steps_respect_the_run_caller_allowlist() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let security = Arc::new(SecurityPolicy::default());
+        let caller_allowed = vec![tools::PipelineTool::NAME.to_string(), "shell".to_string()];
+        let assembled =
+            assemble_pipeline(security, &[], Arc::clone(&calls), Some(&caller_allowed)).await;
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .expect("caller-admitted pipeline must be registered");
+
+        let result = pipeline
+            .execute(serde_json::json!({
+                "steps": [{"tool": "file_write", "args": {}}]
+            }))
+            .await
+            .expect("pipeline denial is a tool result, not a transport error");
+
+        assert!(!result.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     async fn assemble_names(
