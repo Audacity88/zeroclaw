@@ -1787,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_registry_distinguishes_fixed_and_non_fixed_families() {
+    fn endpoint_registry_matches_independent_non_fixed_oracle() {
         assert_eq!(
             endpoint_for_family("groq"),
             Some(ProviderEndpoint::Fixed("https://api.groq.com/openai/v1"))
@@ -1798,15 +1798,10 @@ mod tests {
                 "https://integrate.api.nvidia.com/v1"
             ))
         );
-        assert_eq!(
-            endpoint_for_family("moonshot"),
-            Some(ProviderEndpoint::Dynamic)
-        );
-        assert_eq!(
-            endpoint_for_family("azure"),
-            Some(ProviderEndpoint::Dynamic)
-        );
-        for family in ["openai", "gemini", "copilot", "qianfan"] {
+        for family in [
+            "openai", "azure", "moonshot", "qwen", "glm", "minimax", "zai", "qianfan", "gemini",
+            "bedrock", "copilot", "stepfun",
+        ] {
             assert_eq!(
                 endpoint_for_family(family),
                 Some(ProviderEndpoint::Dynamic),
@@ -1817,10 +1812,13 @@ mod tests {
             endpoint_for_family("custom"),
             Some(ProviderEndpoint::OperatorRequired)
         );
-        assert_eq!(
-            endpoint_for_family("gemini_cli"),
-            Some(ProviderEndpoint::CliBacked)
-        );
+        for family in ["gemini_cli", "kilocli"] {
+            assert_eq!(
+                endpoint_for_family(family),
+                Some(ProviderEndpoint::CliBacked),
+                "{family} invokes a CLI instead of a fixed HTTP endpoint"
+            );
+        }
     }
 
     #[test]
