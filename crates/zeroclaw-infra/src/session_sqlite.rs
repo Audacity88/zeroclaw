@@ -223,6 +223,7 @@ impl SqliteSessionBackend {
                 migrated_path.display()
             )
         })?;
+        Self::sync_parent_directory(migrated_path)?;
         let archive_name = migrated_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -237,6 +238,34 @@ impl SqliteSessionBackend {
                 staged_path.display()
             )
         })?;
+        Self::sync_parent_directory(staged_path)?;
+        Ok(())
+    }
+
+    fn sync_parent_directory(path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(parent)
+                .with_context(|| {
+                    format!(
+                        "Failed to open JSONL session directory for sync: {}",
+                        parent.display()
+                    )
+                })?
+                .sync_all()
+                .with_context(|| {
+                    format!(
+                        "Failed to sync JSONL session directory: {}",
+                        parent.display()
+                    )
+                })?;
+        }
+        #[cfg(not(unix))]
+        let _ = path;
         Ok(())
     }
 
@@ -354,15 +383,26 @@ impl SqliteSessionBackend {
         let mutation_lock = crate::session_store::mutation_lock_for(&sessions_dir)
             .context("Failed to acquire JSONL session mutation lock")?;
         let mut mutation_guard = mutation_lock.lock();
-        let has_committed_import: bool = self
-            .conn
-            .lock()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM jsonl_import_receipts LIMIT 1)",
-                [],
-                |row| row.get(0),
-            )
-            .context("Failed to inspect committed JSONL import receipts")?;
+        let receipt_inventory = self.conn.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM jsonl_import_receipts LIMIT 1)",
+            [],
+            |row| row.get(0),
+        );
+        let has_committed_import: bool = match receipt_inventory {
+            Ok(has_committed_import) => has_committed_import,
+            Err(receipt_error) => {
+                if let Err(state_error) = crate::session_store::mark_session_directory_migrated(
+                    &sessions_dir,
+                    &mut mutation_guard,
+                ) {
+                    return Err(anyhow::Error::from(state_error).context(format!(
+                        "Failed to deactivate JSONL after receipt inventory failed: {receipt_error}"
+                    )));
+                }
+                return Err(receipt_error)
+                    .context("Failed to inspect committed JSONL import receipts");
+            }
+        };
         if has_committed_import {
             crate::session_store::mark_session_directory_migrated(
                 &sessions_dir,
@@ -424,6 +464,7 @@ impl SqliteSessionBackend {
 
         let mut migrated = 0;
         for (name, key, live_path, staged_path, migrated_path, staged) in candidates {
+            let candidate_may_have_committed_receipt = staged && has_committed_import;
             if staged {
                 if live_path.exists() {
                     bail!(
@@ -453,19 +494,50 @@ impl SqliteSessionBackend {
             let (source_hash, source_len) = match fingerprint(&staged_path, &name) {
                 Ok(fingerprint) => fingerprint,
                 Err(import_error) => {
+                    if candidate_may_have_committed_receipt {
+                        return Err(self.reconcile_failed_import(
+                            &sessions_dir,
+                            &mut mutation_guard,
+                            &name,
+                            &staged_path,
+                            &live_path,
+                            import_error,
+                            &mut failed_receipt,
+                        ));
+                    }
+                    return match Self::restore_uncommitted_jsonl(&staged_path, &live_path) {
+                        Ok(()) => Err(import_error),
+                        Err(restore_error) => Err(restore_error.context(format!(
+                            "JSONL fingerprint for {name} failed before import: {import_error:#}"
+                        ))),
+                    };
+                }
+            };
+            let expected = (source_hash.clone(), source_len);
+            let mut conn = self.conn.lock();
+            if let Err(sync_error) = conn.execute_batch("PRAGMA synchronous = FULL;") {
+                drop(conn);
+                if candidate_may_have_committed_receipt {
                     return Err(self.reconcile_failed_import(
                         &sessions_dir,
                         &mut mutation_guard,
                         &name,
                         &staged_path,
                         &live_path,
-                        import_error,
+                        sync_error.into(),
                         &mut failed_receipt,
                     ));
                 }
-            };
-            let expected = (source_hash.clone(), source_len);
-            let mut conn = self.conn.lock();
+                return match Self::restore_uncommitted_jsonl(&staged_path, &live_path) {
+                    Ok(()) => Err(sync_error).with_context(|| {
+                        format!("Failed to enable durable JSONL import for {name}")
+                    }),
+                    Err(restore_error) => Err(restore_error.context(format!(
+                        "Failed to restore JSONL session {name} after durable import setup failed: {sync_error}"
+                    ))),
+                };
+            }
+            let mut receipt_observed_or_commit_attempted = candidate_may_have_committed_receipt;
             let import_result = (|| -> Result<()> {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -475,6 +547,7 @@ impl SqliteSessionBackend {
                 let receipt = Self::import_receipt(&tx, &name)?;
 
                 if let Some((receipt_key, receipt_hash, receipt_len)) = receipt {
+                    receipt_observed_or_commit_attempted = true;
                     if receipt_key != key
                         || receipt_hash != source_hash
                         || receipt_len != source_len
@@ -548,22 +621,51 @@ impl SqliteSessionBackend {
                     params![name, key, source_hash, source_len, now],
                 )
                 .with_context(|| format!("Failed to record JSONL import receipt for {name}"))?;
+                receipt_observed_or_commit_attempted = true;
                 tx.commit()
                     .with_context(|| format!("Failed to commit JSONL import for {name}"))?;
                 Ok(())
             })();
+            let normal_sync_result = conn
+                .execute_batch("PRAGMA synchronous = NORMAL;")
+                .context("Failed to restore normal SQLite synchronization mode");
 
             if let Err(import_error) = import_result {
                 drop(conn);
-                return Err(self.reconcile_failed_import(
+                let import_error = match normal_sync_result {
+                    Ok(()) => import_error,
+                    Err(sync_error) => sync_error.context(format!(
+                        "JSONL import for {name} also failed: {import_error:#}"
+                    )),
+                };
+                if receipt_observed_or_commit_attempted {
+                    return Err(self.reconcile_failed_import(
+                        &sessions_dir,
+                        &mut mutation_guard,
+                        &name,
+                        &staged_path,
+                        &live_path,
+                        import_error,
+                        &mut failed_receipt,
+                    ));
+                }
+                return match Self::restore_uncommitted_jsonl(&staged_path, &live_path) {
+                    Ok(()) => Err(import_error),
+                    Err(restore_error) => Err(restore_error.context(format!(
+                        "JSONL import for {name} failed before commit: {import_error:#}"
+                    ))),
+                };
+            }
+            if let Err(sync_error) = normal_sync_result {
+                crate::session_store::mark_session_directory_migrated(
                     &sessions_dir,
                     &mut mutation_guard,
-                    &name,
-                    &staged_path,
-                    &live_path,
-                    import_error,
-                    &mut failed_receipt,
-                ));
+                )
+                .context("Failed to deactivate JSONL after committed SQLite import")?;
+                drop(conn);
+                return Err(sync_error).with_context(|| {
+                    format!("JSONL import for {name} committed before sync mode restore failed")
+                });
             }
             crate::session_store::mark_session_directory_migrated(
                 &sessions_dir,
@@ -579,8 +681,10 @@ impl SqliteSessionBackend {
                         migrated_path.display()
                     );
                 }
+                Self::sync_parent_directory(&migrated_path)?;
                 std::fs::remove_file(&staged_path)
                     .with_context(|| format!("Failed to finish staged JSONL handoff for {name}"))?;
+                Self::sync_parent_directory(&staged_path)?;
             } else {
                 archive(&staged_path, &migrated_path, &expected)
                     .with_context(|| format!("Failed to archive imported JSONL session {name}"))?;
@@ -593,9 +697,6 @@ impl SqliteSessionBackend {
             }
             migrated += 1;
         }
-
-        crate::session_store::mark_session_directory_migrated(&sessions_dir, &mut mutation_guard)
-            .context("Failed to finalize JSONL-to-SQLite migration state")?;
 
         Ok(migrated)
     }
@@ -1633,6 +1734,19 @@ mod tests {
         drop(backend);
 
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let retry_error = backend
+            .migrate_from_jsonl_with_handlers(
+                tmp.path(),
+                |_, _| bail!("injected retry fingerprint failure"),
+                SqliteSessionBackend::import_receipt,
+                SqliteSessionBackend::archive_staged_jsonl,
+            )
+            .unwrap_err();
+        assert!(format!("{retry_error:#}").contains("injected retry fingerprint failure"));
+        assert!(!sessions_dir.join("linked_user.jsonl").exists());
+        assert!(sessions_dir.join("linked_user.jsonl.importing").exists());
+        assert!(sessions_dir.join("linked_user.jsonl.migrated").exists());
+
         assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 1);
         assert!(!sessions_dir.join("linked_user.jsonl.importing").exists());
         assert_eq!(backend.load("linked_user").len(), 1);
@@ -2035,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_from_jsonl_deactivates_writer_when_receipt_check_fails() {
+    fn migrate_from_jsonl_does_not_query_receipt_after_fingerprint_failure() {
         let tmp = TempDir::new().unwrap();
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
@@ -2051,16 +2165,35 @@ mod tests {
             .migrate_from_jsonl_with_handlers(
                 tmp.path(),
                 |_, _| bail!("injected fingerprint failure"),
-                |_, _| bail!("injected receipt query failure"),
+                |_, _| panic!("receipt query must not run before an import transaction"),
                 SqliteSessionBackend::archive_staged_jsonl,
             )
             .unwrap_err();
 
         let message = format!("{error:#}");
         assert!(message.contains("injected fingerprint failure"));
-        assert!(message.contains("injected receipt query failure"));
-        assert!(!sessions_dir.join("uncertain_user.jsonl").exists());
-        assert!(sessions_dir.join("uncertain_user.jsonl.importing").exists());
+        assert!(sessions_dir.join("uncertain_user.jsonl").exists());
+        assert!(!sessions_dir.join("uncertain_user.jsonl.importing").exists());
+        store
+            .append("uncertain_user", &ChatMessage::user("after failure"))
+            .unwrap();
+    }
+
+    #[test]
+    fn migrate_from_jsonl_deactivates_writer_when_receipt_inventory_fails() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .conn
+            .lock()
+            .execute("DROP TABLE jsonl_import_receipts", [])
+            .unwrap();
+
+        let error = backend.migrate_from_jsonl(tmp.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("Failed to inspect committed JSONL import receipts"));
         let append_error = store
             .append("uncertain_user", &ChatMessage::user("after failure"))
             .unwrap_err();

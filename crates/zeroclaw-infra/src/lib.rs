@@ -115,6 +115,19 @@ mod tests {
     }
 
     #[test]
+    fn make_session_backend_can_reload_from_empty_sqlite_to_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
+        drop(sqlite);
+
+        let jsonl = make_session_backend(tmp.path(), "jsonl").unwrap();
+        jsonl
+            .append("reload_user", &user_msg("hello after reload"))
+            .unwrap();
+        assert_eq!(jsonl.load("reload_user").len(), 1);
+    }
+
+    #[test]
     fn make_session_backend_unknown_value_falls_back_to_sqlite() {
         let tmp = TempDir::new().unwrap();
         let backend = make_session_backend(tmp.path(), "totally-not-a-backend").unwrap();
