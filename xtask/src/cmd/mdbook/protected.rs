@@ -218,26 +218,30 @@ fn has_explicit_registry_term_context(
         return true;
     }
 
-    let following_words: Vec<_> = text[start + len..]
+    let following = &text[start + len..];
+    let mut nearby_words = following
+        .split(['|', '\n'])
+        .next()
+        .unwrap_or("")
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .take(NEARBY_REFERENCE_WORD_LIMIT);
+    let following_words: Vec<_> = following
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .take(DISTANT_REFERENCE_WORD_LIMIT)
         .collect();
 
-    following_words
-        .iter()
-        .take(NEARBY_REFERENCE_WORD_LIMIT)
-        .any(|token| {
-            context
-                .reference_words
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(token))
+    nearby_words.any(|token| {
+        context
+            .reference_words
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(token))
+    }) || context.distant_reference_pairs.iter().any(|pair| {
+        following_words.windows(2).any(|window| {
+            pair.0.eq_ignore_ascii_case(window[0]) && pair.1.eq_ignore_ascii_case(window[1])
         })
-        || context.distant_reference_pairs.iter().any(|pair| {
-            following_words.windows(2).any(|window| {
-                pair.0.eq_ignore_ascii_case(window[0]) && pair.1.eq_ignore_ascii_case(window[1])
-            })
-        })
+    })
 }
 
 fn has_markdown_link_reference(text: &str, context: &ContextualRegistryTerm) -> bool {
@@ -838,6 +842,7 @@ mod tests {
             !texts("Status, Signal, indicator; Discord is documented elsewhere.")
                 .contains(&"Signal".to_string())
         );
+        assert!(!texts("| Signal | Log message |").contains(&"Signal".to_string()));
     }
 
     #[test]
