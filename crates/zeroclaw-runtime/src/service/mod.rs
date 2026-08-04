@@ -67,6 +67,7 @@ impl CaptureLock {
         }
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)
@@ -144,6 +145,7 @@ impl BoundedLog {
         }
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)

@@ -3534,6 +3534,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
         service_command,
         service_init,
