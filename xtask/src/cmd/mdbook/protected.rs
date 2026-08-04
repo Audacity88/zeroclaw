@@ -219,14 +219,12 @@ fn has_explicit_registry_term_context(
     }
 
     let following = &text[start + len..];
-    let mut nearby_words = following
-        .split(['|', '\n'])
-        .next()
-        .unwrap_or("")
+    let following_cell = following.split(['|', '\n']).next().unwrap_or("");
+    let mut nearby_words = following_cell
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .take(NEARBY_REFERENCE_WORD_LIMIT);
-    let following_words: Vec<_> = following
+    let following_words: Vec<_> = following_cell
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .take(DISTANT_REFERENCE_WORD_LIMIT)
@@ -865,6 +863,77 @@ mod tests {
             texts("Configure `[channels.signal.default]` for Signal.")
                 .contains(&"Signal".to_string())
         );
+    }
+
+    #[test]
+    fn configured_contextual_registry_term_fields_are_covered() {
+        for context in CONTEXTUAL_REGISTRY_TERMS {
+            for reference_word in context.reference_words {
+                let source = format!("{} {reference_word}", context.text);
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected reference word {reference_word:?} to protect {:?}",
+                    context.text
+                );
+            }
+
+            for (first, second) in context.distant_reference_pairs {
+                let source = format!(
+                    "{} change. Live: delivered by the {first} {second}.",
+                    context.text
+                );
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected distant pair ({first:?}, {second:?}) to protect {:?}",
+                    context.text
+                );
+            }
+
+            for identifier in context.identifiers {
+                let source = format!("Configure `{identifier}` for {}.", context.text);
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected identifier {identifier:?} to protect {:?}",
+                    context.text
+                );
+            }
+
+            for marker in context.preceding_markers {
+                let source = format!("{marker} {}", context.text);
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected marker {marker:?} to protect {:?}",
+                    context.text
+                );
+            }
+
+            for destination in context.link_destinations {
+                let source = format!("[{}]({destination})", context.text);
+                assert!(
+                    texts(&source).contains(&context.text.to_string()),
+                    "expected link destination {destination:?} to protect {:?}",
+                    context.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_registry_term_context_does_not_cross_table_cells_or_lines() {
+        for source in [
+            "| Signal | message |",
+            "Signal\nmessage",
+            "| Filesystem | watcher |",
+            "| Filesystem | filesystem watcher |",
+            "Filesystem\nfilesystem watcher",
+        ] {
+            assert!(
+                !texts(source)
+                    .iter()
+                    .any(|term| { term == "Signal" || term == "Filesystem" }),
+                "expected contextual registry term to stay unprotected in {source:?}"
+            );
+        }
     }
 
     #[test]
