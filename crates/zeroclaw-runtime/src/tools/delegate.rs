@@ -7411,8 +7411,10 @@ mod tests {
             &background_result(&pending, BackgroundTaskStatus::Running, None, None),
         );
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "action": "await_sessions",
@@ -7694,8 +7696,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         // Use a valid UUID format that doesn't correspond to any real task
         let fake_uuid = uuid::Uuid::new_v4().to_string();
         let result = tool
