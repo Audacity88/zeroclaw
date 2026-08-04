@@ -1031,7 +1031,7 @@ impl Agent {
 
     fn encode_response_cache_transcript(messages: &[ChatMessage]) -> String {
         let mut transcript = String::new();
-        for message in messages.iter().filter(|message| message.role != "system") {
+        for message in messages {
             transcript.push_str("role=");
             transcript.push_str(&message.role.len().to_string());
             transcript.push(':');
@@ -1065,10 +1065,17 @@ impl Agent {
         effective_model: &str,
     ) -> Option<String> {
         // Bypass the cache when a per-turn memory preamble the key cannot see
-        // will be injected downstream (see `memory_injection_active`).
+        // will be injected downstream (see `memory_injection_active`), or when
+        // hooks/tools can change the final provider request after this point.
         if self.temperature != Some(0.0)
             || self.response_cache.is_none()
             || self.memory_injection_active()
+            || self
+                .hook_runner
+                .as_ref()
+                .is_some_and(|runner| !runner.is_empty())
+            || !self.tools.is_empty()
+            || self.activated_tools.is_some()
         {
             return None;
         }
@@ -1081,15 +1088,20 @@ impl Agent {
             return None;
         }
 
-        let system = messages
-            .iter()
-            .find(|message| message.role == "system")
-            .map(|message| message.content.as_str());
         let transcript = Self::encode_response_cache_transcript(messages);
+        let provider_model_identity = format!(
+            "provider={}:{};alias={}:{};model={}:{}",
+            self.model_provider_name.len(),
+            self.model_provider_name,
+            self.model_provider.alias().len(),
+            self.model_provider.alias(),
+            effective_model.len(),
+            effective_model,
+        );
 
         Some(zeroclaw_memory::response_cache::ResponseCache::cache_key(
-            effective_model,
-            system,
+            &provider_model_identity,
+            None,
             &transcript,
         ))
     }
@@ -2326,10 +2338,9 @@ impl Agent {
             });
         }
 
-        // Split provider_messages: loop_history gets past turns only,
-        // loop_new_messages gets this turn's user message so the hook
-        // can observe/modify it. Seed loop_history with the user message so
-        // the provider sees it without clone-and-append.
+        // Split provider_messages: loop_history gets past turns only, while
+        // loop_new_messages carries the canonical current turn for replay.
+        // Request hooks mutate only the per-iteration provider snapshot.
         let split_idx = provider_messages
             .iter()
             .rposition(|m| m.role == "user")
@@ -2461,8 +2472,7 @@ impl Agent {
             );
         }
         // Pop the original user message (pushed before the loop) so the
-        // replayed version — which includes the user message, possibly
-        // modified by the hook.
+        // replayed canonical version, including the original user message.
         self.history.pop();
         for replayed in Self::replay_loop_messages(&loop_new_messages) {
             self.history.push(replayed);
@@ -2663,8 +2673,9 @@ impl Agent {
             });
         }
 
-        // Split provider_messages: loop_history gets past turns, user_msg_for_loop
-        // seeds round 0's round_added so the hook can observe/modify the user message.
+        // Split provider_messages: loop_history gets past turns, while
+        // user_msg_for_loop seeds round 0's canonical replay buffer. Request
+        // hooks mutate only the per-iteration provider snapshot.
         let split_idx = provider_messages
             .iter()
             .rposition(|m| m.role == "user")
@@ -3670,6 +3681,7 @@ mod tests {
     }
 
     struct TranscriptCaptureModelProvider {
+        alias: String,
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
         seen_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
     }
@@ -3715,7 +3727,56 @@ mod tests {
             )
         }
         fn alias(&self) -> &str {
-            "TranscriptCaptureModelProvider"
+            &self.alias
+        }
+    }
+
+    struct CancellingBeforeLlmHook;
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for CancellingBeforeLlmHook {
+        fn name(&self) -> &str {
+            "cancel-before-llm"
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            crate::hooks::HookResult::Cancel("blocked by request policy".into())
+        }
+    }
+
+    struct MutatingBeforeLlmHook {
+        seen_inputs: Arc<Mutex<Vec<(Vec<ChatMessage>, String)>>>,
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for MutatingBeforeLlmHook {
+        fn name(&self) -> &str {
+            "mutate-before-llm"
+        }
+
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            let last_user = messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.role == "user")
+                .expect("request must contain the current user message");
+            last_user.content = "hook-only provider request".into();
+            *model = "hook-selected-model".into();
+            crate::hooks::HookResult::Continue(())
+        }
+
+        async fn on_llm_input(&self, messages: &[ChatMessage], model: &str) {
+            self.seen_inputs
+                .lock()
+                .push((messages.to_vec(), model.to_string()));
         }
     }
 
@@ -7063,6 +7124,7 @@ mod tests {
         let seen_a = Arc::new(Mutex::new(Vec::new()));
         let seen_b = Arc::new(Mutex::new(Vec::new()));
         let provider_a = Box::new(TranscriptCaptureModelProvider {
+            alias: "transcript-a".into(),
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
                 text: Some("from prior transcript".into()),
                 tool_calls: vec![],
@@ -7072,6 +7134,7 @@ mod tests {
             seen_messages: seen_a.clone(),
         });
         let provider_b = Box::new(TranscriptCaptureModelProvider {
+            alias: "transcript-b".into(),
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
                 text: Some("from fresh transcript".into()),
                 tool_calls: vec![],
@@ -7084,7 +7147,7 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent_a = Agent::builder()
             .model_provider(provider_a)
-            .tools(vec![Box::new(MockTool)])
+            .tools(vec![])
             .memory(mem_a)
             .observer(observer.clone())
             .response_cache(Some(cache.clone()))
@@ -7101,7 +7164,7 @@ mod tests {
 
         let mut agent_b = Agent::builder()
             .model_provider(provider_b)
-            .tools(vec![Box::new(MockTool)])
+            .tools(vec![])
             .memory(mem_b)
             .observer(observer)
             .response_cache(Some(cache))
@@ -7126,6 +7189,345 @@ mod tests {
             1,
             "fresh transcript must not reuse a cache entry written for a different prior transcript"
         );
+    }
+
+    #[tokio::test]
+    async fn response_cache_hit_cannot_bypass_cancelling_before_llm_hook() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let seed_seen = Arc::new(Mutex::new(Vec::new()));
+
+        let mut seed_agent = Agent::builder()
+            .model_provider(Box::new(TranscriptCaptureModelProvider {
+                alias: "shared-provider-alias".into(),
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some("cached answer".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+                seen_messages: seed_seen,
+            }))
+            .model_provider_name("provider-a".into())
+            .tools(vec![])
+            .memory(memory())
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .response_cache(Some(cache.clone()))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .model_name("test-model".into())
+            .temperature(Some(0.0))
+            .turn_datetime(fixed_response_cache_turn_datetime)
+            .build()
+            .expect("seed agent should build");
+        assert_eq!(
+            seed_agent.turn("same request").await.unwrap(),
+            "cached answer"
+        );
+
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(CancellingBeforeLlmHook));
+        let guarded_seen = Arc::new(Mutex::new(Vec::new()));
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut guarded_agent = Agent::builder()
+            .model_provider(Box::new(TranscriptCaptureModelProvider {
+                alias: "shared-provider-alias".into(),
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some("must not be returned".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+                seen_messages: guarded_seen.clone(),
+            }))
+            .model_provider_name("provider-a".into())
+            .tools(vec![])
+            .memory(memory())
+            .observer(capturing.clone())
+            .response_cache(Some(cache))
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .model_name("test-model".into())
+            .temperature(Some(0.0))
+            .turn_datetime(fixed_response_cache_turn_datetime)
+            .build()
+            .expect("guarded agent should build");
+
+        let error = guarded_agent
+            .turn("same request")
+            .await
+            .expect_err("the request hook must cancel before cache reuse or provider dispatch");
+        assert!(error.to_string().contains("blocked by request policy"));
+        assert!(
+            guarded_seen.lock().is_empty(),
+            "a cancelling request hook must prevent provider dispatch"
+        );
+        assert!(
+            !capturing
+                .events
+                .lock()
+                .iter()
+                .any(|event| matches!(event, ObserverEvent::LlmRequest { .. })),
+            "a cancelling request hook must prevent request announcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_llm_hook_mutates_only_the_ephemeral_provider_request() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let seen_models = Arc::new(Mutex::new(Vec::new()));
+        let hook_inputs = Arc::new(Mutex::new(Vec::new()));
+        struct RequestCaptureProvider {
+            seen_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+            seen_models: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl ModelProvider for RequestCaptureProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                Ok("provider answer".into())
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.seen_messages.lock().push(request.messages.to_vec());
+                self.seen_models.lock().push(model.to_string());
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("provider answer".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for RequestCaptureProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "RequestCaptureProvider"
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(MutatingBeforeLlmHook {
+            seen_inputs: hook_inputs.clone(),
+        }));
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(RequestCaptureProvider {
+                seen_messages: seen_messages.clone(),
+                seen_models: seen_models.clone(),
+            }))
+            .model_provider_name("provider-a".into())
+            .tools(vec![])
+            .memory(memory)
+            .observer(capturing.clone())
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .model_name("base-model".into())
+            .temperature(Some(0.0))
+            .turn_datetime(fixed_response_cache_turn_datetime)
+            .build()
+            .expect("agent should build");
+
+        assert_eq!(
+            agent.turn("durable user request").await.unwrap(),
+            "provider answer"
+        );
+        let requests = seen_messages.lock();
+        let provider_user = requests[0]
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .expect("provider request must contain a user message");
+        assert_eq!(provider_user.content, "hook-only provider request");
+        assert_eq!(seen_models.lock().as_slice(), ["hook-selected-model"]);
+        let hook_inputs = hook_inputs.lock();
+        let hook_user = hook_inputs[0]
+            .0
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .expect("void hook input must contain a user message");
+        assert_eq!(hook_user.content, "hook-only provider request");
+        assert_eq!(hook_inputs[0].1, "hook-selected-model");
+        let observed_models: Vec<_> = capturing
+            .events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                ObserverEvent::LlmRequest { model, .. }
+                | ObserverEvent::LlmResponse { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            observed_models,
+            ["hook-selected-model", "hook-selected-model"],
+            "request and response telemetry must use the dispatched model"
+        );
+
+        let durable_user = agent
+            .history()
+            .iter()
+            .find_map(|message| match message {
+                ConversationMessage::Chat(chat) if chat.role == "user" => Some(&chat.content),
+                _ => None,
+            })
+            .expect("durable history must retain the user message");
+        assert!(durable_user.contains("durable user request"));
+        assert!(!durable_user.contains("hook-only provider request"));
+    }
+
+    #[tokio::test]
+    async fn response_cache_separates_configured_provider_identity() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let build =
+            |provider_alias: &str,
+             answer: &str,
+             seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+             cache: Arc<zeroclaw_memory::response_cache::ResponseCache>| {
+                Agent::builder()
+                    .model_provider(Box::new(TranscriptCaptureModelProvider {
+                        alias: provider_alias.into(),
+                        responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            text: Some(answer.into()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        }]),
+                        seen_messages: seen,
+                    }))
+                    .model_provider_name("provider-family".into())
+                    .tools(vec![])
+                    .memory(memory())
+                    .observer(Arc::from(crate::observability::NoopObserver {}))
+                    .response_cache(Some(cache))
+                    .tool_dispatcher(Box::new(NativeToolDispatcher))
+                    .workspace_dir(tmp.path().to_path_buf())
+                    .model_name("shared-model".into())
+                    .temperature(Some(0.0))
+                    .turn_datetime(fixed_response_cache_turn_datetime)
+                    .build()
+                    .expect("agent should build")
+            };
+
+        let mut agent_a = build("work", "answer-a", seen_a.clone(), cache.clone());
+        let mut agent_b = build("personal", "answer-b", seen_b.clone(), cache);
+        assert_eq!(agent_a.turn("same request").await.unwrap(), "answer-a");
+        assert_eq!(agent_b.turn("same request").await.unwrap(), "answer-b");
+        assert_eq!(seen_a.lock().len(), 1);
+        assert_eq!(seen_b.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_requests_that_can_advertise_tools() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let build =
+            |answer: &str,
+             seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+             cache: Arc<zeroclaw_memory::response_cache::ResponseCache>| {
+                Agent::builder()
+                    .model_provider(Box::new(TranscriptCaptureModelProvider {
+                        alias: "tool-capable".into(),
+                        responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            text: Some(answer.into()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        }]),
+                        seen_messages: seen,
+                    }))
+                    .model_provider_name("provider-a".into())
+                    .tools(vec![Box::new(MockTool)])
+                    .memory(memory())
+                    .observer(Arc::from(crate::observability::NoopObserver {}))
+                    .response_cache(Some(cache))
+                    .tool_dispatcher(Box::new(NativeToolDispatcher))
+                    .workspace_dir(tmp.path().to_path_buf())
+                    .model_name("shared-model".into())
+                    .temperature(Some(0.0))
+                    .turn_datetime(fixed_response_cache_turn_datetime)
+                    .build()
+                    .expect("agent should build")
+            };
+
+        let mut agent_a = build("answer-a", seen_a.clone(), cache.clone());
+        let mut agent_b = build("answer-b", seen_b.clone(), cache);
+        assert_eq!(agent_a.turn("same request").await.unwrap(), "answer-a");
+        assert_eq!(agent_b.turn("same request").await.unwrap(), "answer-b");
+        assert_eq!(seen_a.lock().len(), 1);
+        assert_eq!(seen_b.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -7258,6 +7660,7 @@ mod tests {
              seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
              cache: Arc<zeroclaw_memory::response_cache::ResponseCache>| {
                 let provider = Box::new(TranscriptCaptureModelProvider {
+                    alias: "memory-regression".into(),
                     responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
                         text: Some("answer".into()),
                         tool_calls: vec![],
@@ -7366,11 +7769,11 @@ mod tests {
                 .expect("response cache init"),
         );
 
-        let agent = Agent::builder()
+        let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(vec![])
             .memory(Arc::from(
                 zeroclaw_memory::create_memory(
                     &zeroclaw_config::schema::MemoryConfig {
@@ -7398,6 +7801,38 @@ mod tests {
         ];
         let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
         assert!(key.is_some(), "plain text prompt must produce a cache key");
+
+        let structurally_distinct_a = vec![
+            ChatMessage::system("s"),
+            ChatMessage::user("x|role=4:user;content=1:b"),
+        ];
+        let structurally_distinct_b = vec![
+            ChatMessage::system("s|role=4:user;content=25:x"),
+            ChatMessage::user("b"),
+        ];
+        assert_ne!(
+            agent.response_cache_key_for_messages(&structurally_distinct_a, "test-model"),
+            agent.response_cache_key_for_messages(&structurally_distinct_b, "test-model"),
+            "structurally distinct provider requests must not share a cache key"
+        );
+
+        let mut activated = crate::tools::ActivatedToolSet::new();
+        activated.activate("echo".into(), Arc::new(MockTool));
+        agent.activated_tools = Some(Arc::new(std::sync::Mutex::new(activated)));
+        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
+        assert!(
+            key.is_none(),
+            "an activated deferred tool can advertise a schema and must bypass response caching"
+        );
+        agent.activated_tools = None;
+
+        agent.hook_runner = Some(Arc::new(crate::hooks::HookRunner::new()));
+        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
+        assert!(
+            key.is_some(),
+            "an empty hook runner cannot change the request and must preserve cache eligibility"
+        );
+        agent.hook_runner = None;
 
         // Messages containing `[IMAGE:]` must return None (skip cache).
         let multimodal_messages = vec![
@@ -8625,7 +9060,7 @@ mod tests {
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(vec![])
             .memory(mem_a)
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .response_cache(Some(cache.clone()))
@@ -8651,7 +9086,7 @@ mod tests {
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(vec![])
             .memory(mem_b)
             .observer(observer)
             .response_cache(Some(cache))
