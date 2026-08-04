@@ -151,7 +151,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
-          cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max
+          cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max,ignore-error=true
 
       - name: Smoke Alpine binaries
         if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64'
