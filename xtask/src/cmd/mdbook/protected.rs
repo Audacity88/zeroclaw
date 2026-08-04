@@ -254,10 +254,7 @@ fn has_markdown_link_reference(text: &str, context: &ContextualRegistryTerm) -> 
                     .any(|candidate| dest_url.as_ref() == *candidate);
             }
             Event::Text(label) if matching_link => {
-                if label
-                    .match_indices(context.text)
-                    .any(|(idx, _)| has_term_boundary(label.as_ref(), idx, context.text.len()))
-                {
+                if label.trim() == context.text {
                     return true;
                 }
             }
@@ -975,6 +972,20 @@ mod tests {
                 .map(|literal| literal.text),
             Some("Signal".to_string())
         );
+    }
+
+    #[test]
+    fn ignores_generic_labels_on_ambiguous_registry_link_destinations() {
+        for source in [
+            "[Filesystem components](./filesystem.md).",
+            "memory, and identity (see [Filesystem components](./filesystem.md)), so by",
+            "- [Filesystem components](./filesystem.md): the workspace, memory, and identity",
+        ] {
+            assert!(
+                !texts(source).contains(&"Filesystem".to_string()),
+                "expected generic Filesystem link label to stay unprotected in {source:?}"
+            );
+        }
     }
 
     #[test]
