@@ -1055,6 +1055,7 @@ impl CompatFamilySpec for QianfanModelProviderConfig {
     // a placeholder.
     const DEFAULT_URL: &'static str = crate::QIANFAN_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("baidu");
     fn build_compat(
         &self,
@@ -1769,15 +1770,20 @@ mod tests {
     }
 
     #[test]
-    fn every_fixed_endpoint_constructs_from_its_canonical_family_spec() {
+    fn every_fixed_endpoint_matches_the_construction_projection() {
         macro_rules! assert_fixed_construction {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {{
                 let opts = ModelProviderRuntimeOptions::default();
                 $(
-                    if matches!(
-                        <$cfg_ty as FamilyEndpointSpec>::ENDPOINT,
-                        ProviderEndpoint::Fixed(_)
-                    ) {
+                    if let ProviderEndpoint::Fixed(metadata_url) =
+                        <$cfg_ty as FamilyEndpointSpec>::ENDPOINT
+                    {
+                        assert_eq!(
+                            metadata_url,
+                            fixed_family_endpoint::<$cfg_ty>(),
+                            "fixed provider family {:?} drifted from its construction projection",
+                            $type_str
+                        );
                         let config = <$cfg_ty>::default();
                         config
                             .create_provider($type_str, Some("test-key"), None, &opts)
@@ -1815,7 +1821,7 @@ mod tests {
             endpoint_for_family("azure"),
             Some(ProviderEndpoint::Dynamic)
         );
-        for family in ["openai", "gemini", "copilot"] {
+        for family in ["openai", "gemini", "copilot", "qianfan"] {
             assert_eq!(
                 endpoint_for_family(family),
                 Some(ProviderEndpoint::Dynamic),

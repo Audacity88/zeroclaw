@@ -1132,18 +1132,45 @@ mod generated_prose_gate {
     #[test]
     fn provider_docs_render_canonical_endpoint_classifications() {
         let catalog = super::render_model_provider_catalog_table();
-        assert!(catalog.contains("| `groq` | `https://api.groq.com/openai/v1` |"));
-        assert!(catalog.contains("| `nvidia` | `https://integrate.api.nvidia.com/v1` |"));
-        assert!(catalog.contains("| `azure` | dynamic / regional |"));
-        assert!(catalog.contains("| `copilot` | dynamic / regional |"));
-        assert!(catalog.contains("| `custom` | operator required |"));
-        assert!(catalog.contains("| `gemini_cli` | CLI-backed |"));
-
         let fields = super::render_model_provider_fields();
-        assert!(fields.contains("<code>https://api.groq.com/openai/v1</code>"));
-        assert!(fields.contains("dynamic / regional"));
-        assert!(fields.contains("operator required"));
-        assert!(fields.contains("CLI-backed"));
+
+        for provider in zeroclaw_providers::list_model_providers() {
+            use zeroclaw_providers::factory::ProviderEndpoint;
+
+            let endpoint = zeroclaw_providers::factory::endpoint_for_family(provider.name)
+                .unwrap_or_else(|| panic!("missing endpoint metadata for {:?}", provider.name));
+            let (catalog_endpoint, fields_endpoint) = match endpoint {
+                ProviderEndpoint::Fixed(url) => (format!("`{url}`"), format!("<code>{url}</code>")),
+                ProviderEndpoint::Dynamic => (
+                    "dynamic / regional".to_string(),
+                    "dynamic / regional".to_string(),
+                ),
+                ProviderEndpoint::OperatorRequired => (
+                    "operator required".to_string(),
+                    "operator required".to_string(),
+                ),
+                ProviderEndpoint::CliBacked => ("CLI-backed".to_string(), "CLI-backed".to_string()),
+            };
+            let catalog_local = if provider.local { "✓" } else { "" };
+            let fields_local = if provider.local { " · local" } else { "" };
+
+            assert!(
+                catalog.contains(&format!(
+                    "| `{}` | {} | {} |",
+                    provider.name, catalog_endpoint, catalog_local
+                )),
+                "catalog omitted or misclassified provider {:?}",
+                provider.name
+            );
+            assert!(
+                fields.contains(&format!(
+                    "<code>{}</code> <span class=\"provider-endpoint\">{}{}</span>",
+                    provider.name, fields_endpoint, fields_local
+                )),
+                "field reference omitted or misclassified provider {:?}",
+                provider.name
+            );
+        }
     }
 
     #[test]
