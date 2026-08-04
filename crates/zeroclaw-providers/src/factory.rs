@@ -27,6 +27,42 @@ use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use crate::traits::ModelProvider;
 use anyhow::Result;
 
+const XAI_DEFAULT_URL: &str = "https://api.x.ai/v1";
+const OLLAMA_COMPAT_DEFAULT_URL: &str = "http://localhost:11434/v1";
+const GROQ_DEFAULT_URL: &str = "https://api.groq.com/openai/v1";
+const LMSTUDIO_DEFAULT_URL: &str = "http://localhost:1234/v1";
+const LLAMACPP_DEFAULT_URL: &str = "http://localhost:8080/v1";
+const OSAURUS_DEFAULT_URL: &str = "http://localhost:1337/v1";
+const OVH_DEFAULT_URL: &str = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1";
+
+/// Family-level endpoint behavior when no operator alias is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderEndpoint {
+    /// The family has one stable default endpoint.
+    Fixed(&'static str),
+    /// The endpoint depends on region, credentials, discovery, or runtime state.
+    Dynamic,
+    /// The operator must configure an endpoint before construction.
+    OperatorRequired,
+    /// The family invokes a CLI rather than an HTTP model endpoint.
+    CliBacked,
+}
+
+impl ProviderEndpoint {
+    #[must_use]
+    /// Return the stable URL only for [`ProviderEndpoint::Fixed`].
+    pub const fn fixed_url(self) -> Option<&'static str> {
+        match self {
+            Self::Fixed(url) => Some(url),
+            Self::Dynamic | Self::OperatorRequired | Self::CliBacked => None,
+        }
+    }
+}
+
+trait FamilyEndpointSpec {
+    const ENDPOINT: ProviderEndpoint;
+}
+
 pub trait FamilyProviderFactory {
     fn create_provider(
         &self,
@@ -51,6 +87,7 @@ pub trait CompatFamilySpec {
     const DISPLAY: &'static str;
     const DEFAULT_URL: &'static str;
     const AUTH: AuthStyle;
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(Self::DEFAULT_URL);
     const FALLBACK_ALLOWS_MISSING_API_KEY: bool = false;
 
     const MODELS_DEV_KEY: Option<&'static str> = None;
@@ -104,6 +141,10 @@ pub trait CompatFamilySpec {
     ) -> crate::compatible::OpenAiCompatibleBuilder {
         self.build_compat_base(alias, key, api_url)
     }
+}
+
+impl<T: CompatFamilySpec> FamilyEndpointSpec for T {
+    const ENDPOINT: ProviderEndpoint = T::ENDPOINT;
 }
 
 impl<T: CompatFamilySpec> FamilyProviderFactory for T {
@@ -401,21 +442,108 @@ use zeroclaw_config::schema::{
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
-/// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
-/// Returns None if the provider type is not an OpenAI-compatible family with a DEFAULT_URL const.
+impl FamilyEndpointSpec for XaiModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(XAI_DEFAULT_URL);
+}
+
+impl FamilyEndpointSpec for MinimaxModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+}
+
+impl FamilyEndpointSpec for OpenRouterModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::openrouter::BASE_URL);
+}
+
+impl FamilyEndpointSpec for AnthropicModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::anthropic::BASE_URL);
+}
+
+impl FamilyEndpointSpec for OpenAIModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+}
+
+impl FamilyEndpointSpec for OllamaModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OLLAMA_COMPAT_DEFAULT_URL);
+}
+
+impl FamilyEndpointSpec for GeminiModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+}
+
+impl FamilyEndpointSpec for TelnyxModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::telnyx::BASE_URL);
+}
+
+impl FamilyEndpointSpec for AzureModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+}
+
+impl FamilyEndpointSpec for BedrockModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+}
+
+impl FamilyEndpointSpec for QwenModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+}
+
+impl FamilyEndpointSpec for GroqModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(GROQ_DEFAULT_URL);
+}
+
+impl FamilyEndpointSpec for CopilotModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+}
+
+impl FamilyEndpointSpec for GeminiCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+}
+
+impl FamilyEndpointSpec for KiloCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+}
+
+impl FamilyEndpointSpec for LmstudioModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(LMSTUDIO_DEFAULT_URL);
+}
+
+impl FamilyEndpointSpec for LlamacppModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(LLAMACPP_DEFAULT_URL);
+}
+
+impl FamilyEndpointSpec for OsaurusModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OSAURUS_DEFAULT_URL);
+}
+
+impl FamilyEndpointSpec for OvhModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OVH_DEFAULT_URL);
+}
+
+impl FamilyEndpointSpec for CustomModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
+}
+
+impl FamilyEndpointSpec for zeroclaw_config::schema::ModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
+}
+
+#[must_use]
+/// Resolve endpoint behavior for one canonical provider family.
+pub fn endpoint_for_family(provider_type: &str) -> Option<ProviderEndpoint> {
+    macro_rules! emit_endpoint {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match provider_type {
+                $( $type_str => Some(<$cfg_ty as FamilyEndpointSpec>::ENDPOINT), )+
+                _ => None,
+            }
+        };
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_endpoint)
+}
+
+/// Get the fixed default API URL for a canonical provider family.
+#[deprecated(note = "use endpoint_for_family or default_model_provider_url")]
 pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
-    Some(match provider_type {
-        "groq" => "https://api.groq.com/openai/v1",
-        "together" => <TogetherModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
-        "fireworks" => <FireworksModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
-        "deepinfra" => <DeepinfraModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
-        "hyperbolic" => <HyperbolicModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
-        "anyscale" => <AnyscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
-        "novita" => <NovitaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
-        "nebius" => <NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
-        "nvidia" => <NvidiaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
-        _ => return None,
-    })
+    endpoint_for_family(provider_type).and_then(ProviderEndpoint::fixed_url)
 }
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -657,6 +785,7 @@ impl CompatFamilySpec for StepfunModelProviderConfig {
     const DISPLAY: &'static str = "Stepfun";
     const DEFAULT_URL: &'static str = "https://api.stepfun.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
     const MODELS_DEV_KEY: Option<&'static str> = Some("stepfun");
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("stepfun");
 }
@@ -690,6 +819,7 @@ impl CompatFamilySpec for MoonshotModelProviderConfig {
     const DISPLAY: &'static str = "Moonshot";
     const DEFAULT_URL: &'static str = crate::MOONSHOT_INTL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
     const MODELS_DEV_KEY: Option<&'static str> = Some("moonshotai");
 
     fn build_compat(
@@ -762,7 +892,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
         if let Some(p) = build_responses_provider_if_requested(
             self.base.wire_api,
             alias,
-            api_url.or(Some("https://api.x.ai/v1")),
+            api_url.or(Some(XAI_DEFAULT_URL)),
             key,
             opts,
         ) {
@@ -771,7 +901,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
 
         let mut b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("xAI")
-            .base_url(api_url.unwrap_or("https://api.x.ai/v1"))
+            .base_url(api_url.unwrap_or(XAI_DEFAULT_URL))
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             .models_dev_key("xai");
@@ -837,6 +967,7 @@ impl CompatFamilySpec for ZaiModelProviderConfig {
     const DISPLAY: &'static str = "Z.AI";
     const DEFAULT_URL: &'static str = crate::ZAI_GLOBAL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::ZhipuJwt;
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
     const MODELS_DEV_KEY: Option<&'static str> = Some("zai");
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("z-ai");
 }
@@ -845,6 +976,7 @@ impl CompatFamilySpec for GlmModelProviderConfig {
     const DISPLAY: &'static str = "GLM";
     const DEFAULT_URL: &'static str = crate::GLM_GLOBAL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::ZhipuJwt;
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
     const MODELS_DEV_KEY: Option<&'static str> = Some("zhipuai");
     fn build_compat(
         &self,
@@ -910,7 +1042,7 @@ impl CompatFamilySpec for QianfanModelProviderConfig {
     // Default is meaningless — `build_compat` always computes via
     // `qianfan_base_url(api_url)`. Use the helper's default fallback as
     // a placeholder.
-    const DEFAULT_URL: &'static str = "https://qianfan.baidubce.com/v2";
+    const DEFAULT_URL: &'static str = crate::QIANFAN_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("baidu");
     fn build_compat(
@@ -1041,7 +1173,7 @@ fn normalize_ollama_compat_base_url(api_url: Option<&str>) -> String {
     let raw = api_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("http://localhost:11434/v1");
+        .unwrap_or(OLLAMA_COMPAT_DEFAULT_URL);
 
     let Ok(mut url) = reqwest::Url::parse(raw) else {
         return raw.trim_end_matches('/').to_string();
@@ -1320,7 +1452,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("Groq")
-            .base_url("https://api.groq.com/openai/v1")
+            .base_url(GROQ_DEFAULT_URL)
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             .models_dev_key("groq")
@@ -1422,7 +1554,7 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
             .unwrap_or("lm-studio");
         let b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("LM Studio")
-            .base_url(api_url.unwrap_or("http://localhost:1234/v1"))
+            .base_url(api_url.unwrap_or(LMSTUDIO_DEFAULT_URL))
             .credential(Some(lm_studio_key))
             .auth_style(AuthStyle::Bearer);
         Ok(apply_compat_options(b, opts))
@@ -1441,7 +1573,7 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let base_url = api_url.unwrap_or("http://localhost:8080/v1");
+        let base_url = api_url.unwrap_or(LLAMACPP_DEFAULT_URL);
         let llama_cpp_key = key
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1487,7 +1619,7 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
             .unwrap_or("osaurus");
         let b = OpenAiCompatibleModelProvider::builder(alias)
             .display_name("Osaurus")
-            .base_url(api_url.unwrap_or("http://localhost:1337/v1"))
+            .base_url(api_url.unwrap_or(OSAURUS_DEFAULT_URL))
             .credential(Some(osaurus_key))
             .auth_style(AuthStyle::Bearer);
         Ok(apply_compat_options(b, opts))
@@ -1509,7 +1641,7 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
         Ok(Box::new(
             crate::openai::OpenAiModelProvider::builder(alias)
                 .credential(key)
-                .base_url("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1")
+                .base_url(OVH_DEFAULT_URL)
                 .build(),
         ))
     }
@@ -1605,6 +1737,63 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+    #[test]
+    fn endpoint_registry_classifies_every_canonical_family() {
+        macro_rules! collect_names {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                [$($type_str),+]
+            };
+        }
+        let families = zeroclaw_config::for_each_model_provider_slot!(collect_names);
+
+        for family in families {
+            assert!(
+                endpoint_for_family(family).is_some(),
+                "canonical provider {family:?} is missing endpoint metadata"
+            );
+        }
+        assert!(endpoint_for_family("not_a_provider").is_none());
+        assert!(endpoint_for_family("openai-compatible").is_none());
+        assert!(endpoint_for_family("openai_compatible").is_none());
+    }
+
+    #[test]
+    fn endpoint_registry_distinguishes_fixed_and_non_fixed_families() {
+        assert_eq!(
+            endpoint_for_family("groq"),
+            Some(ProviderEndpoint::Fixed("https://api.groq.com/openai/v1"))
+        );
+        assert_eq!(
+            endpoint_for_family("nvidia"),
+            Some(ProviderEndpoint::Fixed(
+                "https://integrate.api.nvidia.com/v1"
+            ))
+        );
+        assert_eq!(
+            endpoint_for_family("moonshot"),
+            Some(ProviderEndpoint::Dynamic)
+        );
+        assert_eq!(
+            endpoint_for_family("azure"),
+            Some(ProviderEndpoint::Dynamic)
+        );
+        for family in ["openai", "gemini", "copilot"] {
+            assert_eq!(
+                endpoint_for_family(family),
+                Some(ProviderEndpoint::Dynamic),
+                "{family} selects its endpoint at runtime"
+            );
+        }
+        assert_eq!(
+            endpoint_for_family("custom"),
+            Some(ProviderEndpoint::OperatorRequired)
+        );
+        assert_eq!(
+            endpoint_for_family("gemini_cli"),
+            Some(ProviderEndpoint::CliBacked)
+        );
+    }
 
     #[test]
     fn kilo_gateway_default_url_matches_schema_endpoint() {

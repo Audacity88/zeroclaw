@@ -787,6 +787,19 @@ fn render_env_var_name(path: &str) -> anyhow::Result<String> {
     Ok(format!("`{}`", env_form(path)))
 }
 
+fn render_model_provider_endpoint(name: &str, format_fixed: impl FnOnce(&str) -> String) -> String {
+    use zeroclaw_providers::factory::ProviderEndpoint;
+
+    match zeroclaw_providers::factory::endpoint_for_family(name)
+        .unwrap_or_else(|| panic!("canonical provider {name:?} has no endpoint classification"))
+    {
+        ProviderEndpoint::Fixed(url) => format_fixed(url),
+        ProviderEndpoint::Dynamic => "dynamic / regional".to_string(),
+        ProviderEndpoint::OperatorRequired => "operator required".to_string(),
+        ProviderEndpoint::CliBacked => "CLI-backed".to_string(),
+    }
+}
+
 fn render_model_provider_catalog_table() -> String {
     use zeroclaw_providers::ModelProviderCategory as C;
     let category_title = |c: C| match c {
@@ -810,11 +823,9 @@ fn render_model_provider_catalog_table() -> String {
         out.push_str(&format!("\n### {}\n\n", category_title(*category)));
         out.push_str("| Slot | Default endpoint | Local |\n|---|---|---|\n");
         for p in rows {
-            let url = zeroclaw_providers::default_model_provider_url(p.name)
-                .map(|u| format!("`{u}`"))
-                .unwrap_or_else(|| "`—`".to_string());
+            let endpoint = render_model_provider_endpoint(p.name, |url| format!("`{url}`"));
             let local = if p.local { "✓" } else { "" };
-            out.push_str(&format!("| `{}` | {} | {} |\n", p.name, url, local));
+            out.push_str(&format!("| `{}` | {} | {} |\n", p.name, endpoint, local));
         }
     }
     out
@@ -895,9 +906,8 @@ fn render_model_provider_fields() -> String {
         out.push_str(&format!("\n### {}\n\n", category_title(*category)));
         out.push_str("<div class=\"provider-fields\">\n");
         for p in rows {
-            let endpoint = zeroclaw_providers::default_model_provider_url(p.name)
-                .map(|u| format!("<code>{u}</code>"))
-                .unwrap_or_else(|| "no fixed default".to_string());
+            let endpoint =
+                render_model_provider_endpoint(p.name, |url| format!("<code>{url}</code>"));
             let local = if p.local { " · local" } else { "" };
             let path = format!("providers.models.{}", p.name);
             let extras = zeroclaw_config::schema_markdown::field_table_for_path_excluding(
@@ -1117,6 +1127,23 @@ mod generated_prose_gate {
         assert!(
             streaming.contains("zeroclaw config set channels.slack.<alias>.stream_drafts <value>")
         );
+    }
+
+    #[test]
+    fn provider_docs_render_canonical_endpoint_classifications() {
+        let catalog = super::render_model_provider_catalog_table();
+        assert!(catalog.contains("| `groq` | `https://api.groq.com/openai/v1` |"));
+        assert!(catalog.contains("| `nvidia` | `https://integrate.api.nvidia.com/v1` |"));
+        assert!(catalog.contains("| `azure` | dynamic / regional |"));
+        assert!(catalog.contains("| `copilot` | dynamic / regional |"));
+        assert!(catalog.contains("| `custom` | operator required |"));
+        assert!(catalog.contains("| `gemini_cli` | CLI-backed |"));
+
+        let fields = super::render_model_provider_fields();
+        assert!(fields.contains("<code>https://api.groq.com/openai/v1</code>"));
+        assert!(fields.contains("dynamic / regional"));
+        assert!(fields.contains("operator required"));
+        assert!(fields.contains("CLI-backed"));
     }
 
     #[test]
