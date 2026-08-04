@@ -573,7 +573,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // Returns ~300 models across every model_provider OpenRouter proxies.
         let response = self
             .http_client()
-            .get("https://openrouter.ai/api/v1/models")
+            .get(format!("{BASE_URL}/models"))
             .send()
             .await?
             .error_for_status()?;
@@ -628,7 +628,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(format!("{BASE_URL}/chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -700,7 +700,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(format!("{BASE_URL}/chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -770,7 +770,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(format!("{BASE_URL}/chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -878,7 +878,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
             let response = match client
-                .post("https://openrouter.ai/api/v1/chat/completions")
+                .post(format!("{BASE_URL}/chat/completions"))
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
@@ -994,7 +994,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(format!("{BASE_URL}/chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
