@@ -2861,7 +2861,19 @@ exit 9
         assert!(error.to_string().contains("already active"));
 
         first.finish().await;
-        let replacement = CaptureWriters::open(CapturePaths::Combined(path)).unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match CaptureWriters::open(CapturePaths::Combined(path.clone())) {
+                    Ok(writers) => break writers,
+                    Err(error) if error.to_string().contains("already active") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("unexpected capture lock error: {error:#}"),
+                }
+            }
+        })
+        .await
+        .expect("capture lock should be released after the writer exits");
         replacement.finish().await;
     }
 
