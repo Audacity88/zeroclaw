@@ -25,10 +25,11 @@ permissions:
 
 jobs:
   changes:
-    name: Detect Docker source changes
+    name: Select Docker build scope
     runs-on: ubuntu-latest
     outputs:
-      source_builds: ${{ steps.detect.outputs.source_builds }}
+      prebuilt_images: ${{ steps.detect.outputs.prebuilt_images }}
+      source_matrix: ${{ steps.detect.outputs.source_matrix }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -37,13 +38,17 @@ jobs:
       - name: Detect source-build inputs
         id: detect
         run: |
-          source_builds=true
           changed_files=$(git diff --name-only HEAD^1 HEAD^2)
           if [ -n "$changed_files" ] && \
              ! printf '%s\n' "$changed_files" | grep -Eqv '^(docker-compose\.yml|docker-compose\.alpine\.yml)$'; then
-            source_builds=false
+            prebuilt_images=false
+            source_matrix='{"include":[{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64"}]}'
+          else
+            prebuilt_images=true
+            source_matrix='{"include":[{"dockerfile":"Dockerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-amd64"},{"dockerfile":"Dockerfile","platform":"linux/arm64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-arm64"},{"dockerfile":"Dockerfile.debian","platform":"linux/amd64","tag":"zeroclaw-pr-source-debian:build","cache-scope":"docker-source-debian"},{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64"},{"dockerfile":"Dockerfile.alpine","platform":"linux/arm64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-arm64"}]}'
           fi
-          echo "source_builds=$source_builds" >> "$GITHUB_OUTPUT"
+          echo "prebuilt_images=$prebuilt_images" >> "$GITHUB_OUTPUT"
+          echo "source_matrix=$source_matrix" >> "$GITHUB_OUTPUT"
 
   compose:
     name: Validate Alpine Compose merge
@@ -57,7 +62,7 @@ jobs:
   images:
     name: Docker Images Build (no push)
     needs: changes
-    if: needs.changes.outputs.source_builds == 'true'
+    if: needs.changes.outputs.prebuilt_images == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -111,33 +116,11 @@ jobs:
   source-images:
     name: Dockerfile Source Build (no push)
     needs: changes
-    if: needs.changes.outputs.source_builds == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - dockerfile: Dockerfile
-            platform: linux/amd64
-            tag: zeroclaw-pr-source-default:build
-            cache-scope: docker-source-default-amd64
-          - dockerfile: Dockerfile
-            platform: linux/arm64
-            tag: zeroclaw-pr-source-default:build
-            cache-scope: docker-source-default-arm64
-          - dockerfile: Dockerfile.debian
-            platform: linux/amd64
-            tag: zeroclaw-pr-source-debian:build
-            cache-scope: docker-source-debian
-          - dockerfile: Dockerfile.alpine
-            platform: linux/amd64
-            tag: zeroclaw-pr-source-alpine:build
-            cache-scope: docker-source-alpine-amd64
-          - dockerfile: Dockerfile.alpine
-            platform: linux/arm64
-            tag: zeroclaw-pr-source-alpine:build
-            cache-scope: docker-source-alpine-arm64
+      matrix: ${{ fromJSON(needs.changes.outputs.source_matrix) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
