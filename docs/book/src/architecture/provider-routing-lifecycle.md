@@ -8,9 +8,9 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 
 | Concern | Current owner | Contract |
 | --- | --- | --- |
-| Provider profiles and fallback graph | `zeroclaw-config` provider schema and validation | A dotted `<family>.<alias>` identifies the endpoint, credentials, model, capabilities, and ordered fallback declarations for one profile. |
+| Provider profiles and fallback graph | `zeroclaw-config` provider schema and validation | A dotted `<family>.<alias>` identifies the endpoint, credentials, optional primary model, capabilities, and ordered fallback declarations for one profile. |
 | Provider construction | `zeroclaw-providers` factory functions | Materialize each profile with its own settings, flatten configured fallback entries in order, and compose routing around reliability. |
-| Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured provider target and route model. The target's reliable wrapper then serves its pinned model: the active/default model used to construct the primary target, or the configured profile model for a non-primary target. |
+| Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured provider target and route model. The primary target is pinned to the active/default model. A non-primary target is pinned when its profile configures a model; otherwise its reliable entry remains unpinned and receives the route model. |
 | Retry and failover | `ReliableModelProvider` | Classify failures, retry with bounded backoff, honor rate-limit cooldowns, and advance through the materialized entries. |
 | Provider stream termination | Concrete providers and `zeroclaw-providers/src/stream_guard.rs` | Translate each provider protocol's completion semantics into `StreamEvent::Final` or a truncation error. |
 | Stream replay and partial-output commitment | `zeroclaw-runtime/src/agent/turn/provider_call.rs` and `stream_consume.rs` | Retry a failed stream as non-streaming only before immutable event output is committed. Never replay a cancelled or visibly partial response. |
@@ -22,13 +22,13 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 
 The runtime starts with an active provider reference and model from the selected agent, a session override, or an in-turn `model_switch`. Provider construction then composes two wrappers:
 
-1. The factory builds a `ReliableModelProvider` for the active provider profile. The profile's primary model, `fallback_models`, and recursively referenced `fallback` profiles become ordered entries. Each referenced profile keeps its own credentials, endpoint, headers, model, and capability overrides.
+1. The factory builds a `ReliableModelProvider` for the active provider profile. An effective primary model comes from an explicit construction override or the profile's configured `model`. When one exists, it and the profile's `fallback_models` become pinned entries. Without one, the profile contributes one unpinned entry and its `fallback_models` are not materialized. Recursively referenced `fallback` profiles are still walked. Each referenced profile keeps its own credentials, endpoint, headers, model, and capability overrides.
 2. When `model_routes` are configured, the factory builds a separate reliable provider for the primary route and each unique route target, then wraps them in `RouterModelProvider`.
 3. A recognized `hint:<name>` selects its configured target before the call enters that target's reliability policy. A normal model value uses the default route. An unknown hint logs a warning and remains on the default provider.
 
 There are two current construction constraints:
 
-- Every route target is model-pinned. The primary target's reliable wrapper is pinned to the active/default model passed into provider construction, while each non-primary target is pinned to the model configured on its provider profile. `model_routes[].model` is passed into the router, but it does not override either pin. A hint that targets the primary profile therefore serves the active/default model when the route model differs; a hint that targets another profile serves that profile's model. Keep each route model aligned with its target's effective pin until that precedence is fixed.
+- Route pinning is conditional. The primary target is pinned to the active/default model passed into provider construction. A non-primary target with a configured profile model is pinned to that model, so `model_routes[].model` does not override it. A non-primary target without a configured model is valid and remains unpinned; the route model reaches that provider, and that profile's `fallback_models` are not materialized even though its referenced fallback profiles are still walked. Keep each route model aligned with the target pin when one exists, and account for the unpinned behavior when the target profile omits `model`.
 - Route targets are deduplicated by `model_provider`. If a route supplies `api_key`, the first matching route credential takes precedence when the shared target is constructed. Prefer credentials on the provider profile when several hints share one target.
 
 This ordering matters: routing chooses a reliability domain; it does not bypass reliability. An external routing service such as OpenRouter can still perform server-side selection behind one ZeroClaw profile, but it is optional and does not replace ZeroClaw's first-party route and fallback contracts.
@@ -39,9 +39,9 @@ The operator-facing schema and examples live in [Provider configuration](../prov
 
 For a production alias, the factory flattens the configured graph depth-first. The effective order is:
 
-1. The profile's primary model.
-2. That profile's `fallback_models`, in order.
-3. Each `fallback` profile, in order, including that profile's own primary model, fallback models, and nested fallback profiles.
+1. The profile's effective primary model, or one unpinned entry when no effective primary model exists.
+2. That profile's `fallback_models`, in order, only when an effective primary model exists.
+3. Each `fallback` profile, in order, including that profile's own primary or unpinned entry, eligible fallback models, and nested fallback profiles.
 
 For each materialized entry, `ReliableModelProvider` attempts the request up to `provider_retries + 1` times. A retryable error normally stays on the entry and applies bounded backoff. A retryable rate limit places that provider profile on an in-memory cooldown and advances when another entry exists. Most non-retryable errors advance immediately; context-window errors have method-specific handling and can return early for runtime recovery. A successful response ends the walk; if every entry fails, the wrapper returns an aggregated error with the attempt failures.
 
@@ -83,7 +83,7 @@ Content refusal and safeguard fallback is also a separate proposed contract from
 For provider-routing changes, answer these before reviewer sign-off:
 
 - Does the change affect agent dispatch, hint selection, reliability fallback, or an external router? Name exactly one owner for each decision.
-- If a hint targets any provider profile, do the route model and the target's effective pin agree? For the primary target, compare against the active/default model used to construct the router; for a non-primary target, compare against the profile's configured model.
+- If a hint targets any provider profile, does its model handling match the target construction? Compare the primary target with the active/default pin. For a non-primary target with a configured model, compare the route model with that pin. If the profile omits `model`, confirm that the route model should flow through and that the profile's `fallback_models` will not be materialized.
 - Does every fallback profile retain its own endpoint, credentials, model, headers, and capability overrides?
 - What is retryable, what advances immediately, and what error is returned after exhaustion?
 - Can a request be replayed after any output that a user or immutable consumer already observed?
