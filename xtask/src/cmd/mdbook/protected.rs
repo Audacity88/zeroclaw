@@ -1,3 +1,4 @@
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
@@ -58,14 +59,25 @@ const GENERIC_REGISTRY_TERMS: &[&str] = &[
 struct ContextualRegistryTerm {
     text: &'static str,
     reference_words: &'static [&'static str],
+    distant_reference_pairs: &'static [(&'static str, &'static str)],
     identifiers: &'static [&'static str],
+    preceding_markers: &'static [&'static str],
+    link_destinations: &'static [&'static str],
 }
 
 const CONTEXTUAL_REGISTRY_TERMS: &[ContextualRegistryTerm] = &[
     ContextualRegistryTerm {
         text: "Filesystem",
         reference_words: &["channel", "listener", "trigger", "watcher"],
+        distant_reference_pairs: &[("filesystem", "watcher")],
         identifiers: &["channel-filesystem", "channels.filesystem"],
+        preceding_markers: &["SOP Fan-In:"],
+        link_destinations: &[
+            "./filesystem.md",
+            "./channels/filesystem.md",
+            "./sop/fan-in/filesystem.md",
+            "../sop/fan-in/filesystem.md",
+        ],
     },
     ContextualRegistryTerm {
         text: "Signal",
@@ -73,9 +85,15 @@ const CONTEXTUAL_REGISTRY_TERMS: &[ContextualRegistryTerm] = &[
             "account", "bot", "channel", "client", "desktop", "message", "mobile", "poll",
             "protocol",
         ],
+        distant_reference_pairs: &[],
         identifiers: &["signal-cli", "channel-signal", "channels.signal"],
+        preceding_markers: &[],
+        link_destinations: &["./signal.md", "./channels/signal.md"],
     },
 ];
+
+const NEARBY_REFERENCE_WORD_LIMIT: usize = 3;
+const DISTANT_REFERENCE_WORD_LIMIT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FenceLanguage {
@@ -156,6 +174,10 @@ fn contains_protected_term(text: &str, term: &str) -> bool {
         .iter()
         .find(|candidate| candidate.text == term)
     {
+        if has_markdown_link_reference(text, context) {
+            return true;
+        }
+
         return text.match_indices(term).any(|(idx, _)| {
             has_term_boundary(text, idx, term.len())
                 && has_explicit_registry_term_context(text, idx, term.len(), context)
@@ -184,29 +206,92 @@ fn has_explicit_registry_term_context(
         return true;
     }
 
-    if text[..start].trim_end().ends_with(',')
-        && text[start + len..].trim_start().starts_with(',')
-        && protected_terms()
-            .iter()
-            .filter(|peer| peer.as_str() != context.text)
-            .any(|peer| {
-                text.match_indices(peer)
-                    .any(|(idx, _)| has_term_boundary(text, idx, peer.len()))
-            })
+    if context
+        .preceding_markers
+        .iter()
+        .any(|marker| text[..start].trim_end().ends_with(marker))
     {
         return true;
     }
 
-    text[start + len..]
+    if has_adjacent_registry_peer(text, start, len, context.text) {
+        return true;
+    }
+
+    let following_words: Vec<_> = text[start + len..]
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
-        .take(3)
+        .take(DISTANT_REFERENCE_WORD_LIMIT)
+        .collect();
+
+    following_words
+        .iter()
+        .take(NEARBY_REFERENCE_WORD_LIMIT)
         .any(|token| {
             context
                 .reference_words
                 .iter()
                 .any(|candidate| candidate.eq_ignore_ascii_case(token))
         })
+        || context.distant_reference_pairs.iter().any(|pair| {
+            following_words.windows(2).any(|window| {
+                pair.0.eq_ignore_ascii_case(window[0]) && pair.1.eq_ignore_ascii_case(window[1])
+            })
+        })
+}
+
+fn has_markdown_link_reference(text: &str, context: &ContextualRegistryTerm) -> bool {
+    let mut matching_link = false;
+
+    for event in Parser::new(text) {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                matching_link = context
+                    .link_destinations
+                    .iter()
+                    .any(|candidate| dest_url.as_ref() == *candidate);
+            }
+            Event::Text(label) if matching_link => {
+                if label
+                    .match_indices(context.text)
+                    .any(|(idx, _)| has_term_boundary(label.as_ref(), idx, context.text.len()))
+                {
+                    return true;
+                }
+            }
+            Event::End(TagEnd::Link) => matching_link = false,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn has_adjacent_registry_peer(text: &str, start: usize, len: usize, term: &str) -> bool {
+    let before = text[..start].trim_end();
+    let after = text[start + len..].trim_start();
+    let (Some(before), Some(after)) = (before.strip_suffix(','), after.strip_prefix(',')) else {
+        return false;
+    };
+
+    let adjacent_segments = [
+        before
+            .rsplit([',', ';', '.', '\n', '|'])
+            .next()
+            .unwrap_or(""),
+        after.split([',', ';', '.', '\n', '|']).next().unwrap_or(""),
+    ];
+
+    adjacent_segments.iter().any(|segment| {
+        protected_terms()
+            .iter()
+            .filter(|peer| peer.as_str() != term)
+            .any(|peer| {
+                segment
+                    .match_indices(peer)
+                    .any(|(idx, _)| has_term_boundary(segment, idx, peer.len()))
+            })
+    })
 }
 
 fn has_term_boundary(text: &str, start: usize, len: usize) -> bool {
@@ -745,6 +830,14 @@ mod tests {
         assert!(!texts("# Filesystem components").contains(&"Filesystem".to_string()));
         assert!(!texts("**Filesystem components**").contains(&"Filesystem".to_string()));
         assert!(!texts("| Filesystem drivers |").contains(&"Filesystem".to_string()));
+        assert!(
+            !texts("Filesystem access is scoped separately from each channel.")
+                .contains(&"Filesystem".to_string())
+        );
+        assert!(
+            !texts("Status, Signal, indicator; Discord is documented elsewhere.")
+                .contains(&"Signal".to_string())
+        );
     }
 
     #[test]
@@ -766,6 +859,47 @@ mod tests {
         assert!(
             texts("Configure `[channels.signal.default]` for Signal.")
                 .contains(&"Signal".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_filesystem_from_actual_catalog_reference_shapes() {
+        for source in [
+            "SOP Fan-In: Filesystem",
+            "[SOP Fan-In: Filesystem](../sop/fan-in/filesystem.md): trigger syntax and path matching",
+            "Filesystem change. Live: delivered by the filesystem watcher.",
+        ] {
+            assert!(
+                texts(source).contains(&"Filesystem".to_string()),
+                "expected Filesystem to be protected in {source:?}"
+            );
+        }
+
+        assert_eq!(
+            missing_protected_literal("SOP Fan-In: Filesystem", "SOP Fan-In: Local storage")
+                .map(|literal| literal.text),
+            Some("Filesystem".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_ambiguous_registry_terms_from_channel_links() {
+        for (source, term) in [
+            ("[Signal](./signal.md)", "Signal"),
+            ("[Filesystem](./filesystem.md)", "Filesystem"),
+            ("[Signal](./channels/signal.md)", "Signal"),
+            ("[Filesystem](./channels/filesystem.md)", "Filesystem"),
+        ] {
+            assert!(
+                texts(source).contains(&term.to_string()),
+                "expected {term} to be protected in {source:?}"
+            );
+        }
+
+        assert_eq!(
+            missing_protected_literal("[Signal](./signal.md)", "[Senal](./signal.md)")
+                .map(|literal| literal.text),
+            Some("Signal".to_string())
         );
     }
 
