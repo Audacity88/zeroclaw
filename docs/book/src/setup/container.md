@@ -92,7 +92,7 @@ docker exec -it zeroclaw zeroclaw quickstart
 
 ## Running zerocode (the TUI)
 
-The image ships the [zerocode](../zerocode/overview.md) terminal interface alongside the `zeroclaw` binary. The default entrypoint is `zeroclaw`, so launch zerocode by overriding it with `--entrypoint zerocode` and an interactive TTY (`-it`). Both image variants carry it:
+The image ships the [zerocode](../zerocode/overview.md) terminal interface alongside the `zeroclaw` binary. The default entrypoint is `zeroclaw`, so launch zerocode by overriding it with `--entrypoint zerocode` and an interactive TTY (`-it`). Both published image variants carry it:
 
 <div class="os-tabs-src">
 
