@@ -63,15 +63,12 @@ trait FamilyEndpointSpec {
     const ENDPOINT: ProviderEndpoint;
 }
 
-fn fixed_family_endpoint<T: FamilyEndpointSpec>() -> &'static str {
-    match T::ENDPOINT {
-        ProviderEndpoint::Fixed(url) => url,
-        ProviderEndpoint::Dynamic
-        | ProviderEndpoint::OperatorRequired
-        | ProviderEndpoint::CliBacked => {
-            unreachable!("fixed endpoint requested for a non-fixed provider family")
-        }
-    }
+trait FixedFamilyEndpointSpec {
+    const FIXED_ENDPOINT: &'static str;
+}
+
+fn fixed_family_endpoint<T: FixedFamilyEndpointSpec>() -> &'static str {
+    T::FIXED_ENDPOINT
 }
 
 pub trait FamilyProviderFactory {
@@ -453,9 +450,20 @@ use zeroclaw_config::schema::{
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
-impl FamilyEndpointSpec for XaiModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(XAI_DEFAULT_URL);
+macro_rules! impl_fixed_family_endpoint {
+    ($config:ty, $url:expr) => {
+        impl FixedFamilyEndpointSpec for $config {
+            const FIXED_ENDPOINT: &'static str = $url;
+        }
+
+        impl FamilyEndpointSpec for $config {
+            const ENDPOINT: ProviderEndpoint =
+                ProviderEndpoint::Fixed(<$config as FixedFamilyEndpointSpec>::FIXED_ENDPOINT);
+        }
+    };
 }
+
+impl_fixed_family_endpoint!(XaiModelProviderConfig, XAI_DEFAULT_URL);
 
 impl FamilyEndpointSpec for MinimaxModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
@@ -465,17 +473,13 @@ impl FamilyEndpointSpec for OpenRouterModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::openrouter::BASE_URL);
 }
 
-impl FamilyEndpointSpec for AnthropicModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::anthropic::BASE_URL);
-}
+impl_fixed_family_endpoint!(AnthropicModelProviderConfig, crate::anthropic::BASE_URL);
 
 impl FamilyEndpointSpec for OpenAIModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
 }
 
-impl FamilyEndpointSpec for OllamaModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OLLAMA_COMPAT_DEFAULT_URL);
-}
+impl_fixed_family_endpoint!(OllamaModelProviderConfig, OLLAMA_COMPAT_DEFAULT_URL);
 
 impl FamilyEndpointSpec for GeminiModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
@@ -497,9 +501,7 @@ impl FamilyEndpointSpec for QwenModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
 }
 
-impl FamilyEndpointSpec for GroqModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(GROQ_DEFAULT_URL);
-}
+impl_fixed_family_endpoint!(GroqModelProviderConfig, GROQ_DEFAULT_URL);
 
 impl FamilyEndpointSpec for CopilotModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
@@ -513,21 +515,10 @@ impl FamilyEndpointSpec for KiloCliModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
 }
 
-impl FamilyEndpointSpec for LmstudioModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(LMSTUDIO_DEFAULT_URL);
-}
-
-impl FamilyEndpointSpec for LlamacppModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(LLAMACPP_DEFAULT_URL);
-}
-
-impl FamilyEndpointSpec for OsaurusModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OSAURUS_DEFAULT_URL);
-}
-
-impl FamilyEndpointSpec for OvhModelProviderConfig {
-    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OVH_DEFAULT_URL);
-}
+impl_fixed_family_endpoint!(LmstudioModelProviderConfig, LMSTUDIO_DEFAULT_URL);
+impl_fixed_family_endpoint!(LlamacppModelProviderConfig, LLAMACPP_DEFAULT_URL);
+impl_fixed_family_endpoint!(OsaurusModelProviderConfig, OSAURUS_DEFAULT_URL);
+impl_fixed_family_endpoint!(OvhModelProviderConfig, OVH_DEFAULT_URL);
 
 impl FamilyEndpointSpec for CustomModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
@@ -903,7 +894,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
         if let Some(p) = build_responses_provider_if_requested(
             self.base.wire_api,
             alias,
-            api_url.or(Some(XAI_DEFAULT_URL)),
+            api_url.or(Some(fixed_family_endpoint::<Self>())),
             key,
             opts,
         ) {
@@ -1770,20 +1761,14 @@ mod tests {
     }
 
     #[test]
-    fn every_fixed_endpoint_matches_the_construction_projection() {
+    fn every_fixed_endpoint_constructs_without_an_override() {
         macro_rules! assert_fixed_construction {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {{
                 let opts = ModelProviderRuntimeOptions::default();
                 $(
-                    if let ProviderEndpoint::Fixed(metadata_url) =
+                    if let ProviderEndpoint::Fixed(_) =
                         <$cfg_ty as FamilyEndpointSpec>::ENDPOINT
                     {
-                        assert_eq!(
-                            metadata_url,
-                            fixed_family_endpoint::<$cfg_ty>(),
-                            "fixed provider family {:?} drifted from its construction projection",
-                            $type_str
-                        );
                         let config = <$cfg_ty>::default();
                         config
                             .create_provider($type_str, Some("test-key"), None, &opts)
