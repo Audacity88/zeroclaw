@@ -9870,6 +9870,41 @@ pub fn build_runtime_proxy_client_with_timeouts(
     client
 }
 
+pub fn build_runtime_proxy_client_with_read_timeout(
+    service_key: &str,
+    read_timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    let cache_key = format!(
+        "{}|timeout=none|connect_timeout={}|read_timeout={}",
+        service_key.trim().to_ascii_lowercase(),
+        connect_timeout_secs,
+        read_timeout_secs,
+    );
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(read_timeout_secs));
+    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"service_key": service_key, "error": format!("{}", error)})
+                ),
+            "Failed to build proxied read-timeout client: "
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, client.clone());
+    client
+}
+
 /// Build an HTTP client for a channel, using an explicit per-channel proxy URL
 /// when configured. Falls back to the global runtime proxy when `proxy_url` is
 /// `None` or empty.
@@ -29836,6 +29871,30 @@ api_token = "tok"
         assert!(runtime_proxy_cache_contains(&cache_key));
 
         let _ = build_runtime_proxy_client(&service_key);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn runtime_proxy_client_cache_reuses_read_timeout_profile_key() {
+        let service_key = format!(
+            "model_provider.cache_read_timeout_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = format!(
+            "{}|timeout=none|connect_timeout=10|read_timeout=300",
+            service_key.trim().to_ascii_lowercase(),
+        );
+
+        clear_runtime_proxy_client_cache();
+        assert!(!runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_client_with_read_timeout(&service_key, 300, 10);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_client_with_read_timeout(&service_key, 300, 10);
         assert!(runtime_proxy_cache_contains(&cache_key));
     }
 

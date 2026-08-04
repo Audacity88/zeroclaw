@@ -1395,6 +1395,7 @@ mod tests {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
 
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let app = Router::new().route(
             "/responses",
             post(|| async {
@@ -1468,11 +1469,7 @@ mod tests {
             }))
         }
 
-        let _lock = crate::RUNTIME_PROXY_TEST_LOCK.lock().await;
-        set_runtime_proxy_config(ProxyConfig::default());
-        let _reset_proxy = scopeguard::guard((), |_| {
-            set_runtime_proxy_config(ProxyConfig::default());
-        });
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
 
         let proxy_hits = Arc::new(AtomicUsize::new(0));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

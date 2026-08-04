@@ -143,14 +143,11 @@ impl OpenAiCodexModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(300)),
+        zeroclaw_config::schema::build_runtime_proxy_client_with_read_timeout(
             "model_provider.openai",
+            300,
+            10,
         )
-        .build()
-        .unwrap_or_else(|_| Client::new())
     }
 }
 
@@ -1694,6 +1691,7 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         tokio::task::JoinHandle<()>,
         tempfile::TempDir,
+        crate::RuntimeProxyTestGuard,
     ) {
         use axum::http::header;
         use axum::response::IntoResponse;
@@ -1702,6 +1700,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 
+        let proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = Arc::clone(&captured);
         let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
@@ -1752,7 +1751,7 @@ mod tests {
         };
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
 
-        (provider, captured, server_handle, temp_dir)
+        (provider, captured, server_handle, temp_dir, proxy_guard)
     }
 
     #[tokio::test]
@@ -1781,11 +1780,7 @@ mod tests {
             }))
         }
 
-        let _lock = crate::RUNTIME_PROXY_TEST_LOCK.lock().await;
-        set_runtime_proxy_config(ProxyConfig::default());
-        let _reset_proxy = scopeguard::guard((), |_| {
-            set_runtime_proxy_config(ProxyConfig::default());
-        });
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
 
         let proxy_hits = Arc::new(AtomicUsize::new(0));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1999,7 +1994,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_propagates_non_streaming_responses_usage() {
-        let (provider, _captured, server_handle, _temp_dir) =
+        let (provider, _captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
                 "output_text": "ok",
                 "output": [],
@@ -2061,7 +2056,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_empty_tools_list_omits_tool_choice_and_parallel_tool_calls() {
-        let (provider, captured, server_handle, _temp_dir) =
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
                 "output_text": "ok",
                 "output": []
@@ -2164,14 +2159,15 @@ mod tests {
 
     #[tokio::test]
     async fn codex_retries_non_streaming_when_stream_decode_fails() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
-            MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
-            MockCodexReply::Json(serde_json::json!({
-                "output_text": "fallback ok",
-                "output": []
-            })),
-        ])
-        .await;
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![
+                MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+                MockCodexReply::Json(serde_json::json!({
+                    "output_text": "fallback ok",
+                    "output": []
+                })),
+            ])
+            .await;
 
         let messages = vec![ChatMessage::user("hello")];
         let response = provider
@@ -2199,7 +2195,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_retries_non_streaming_when_stream_contains_malformed_frame_after_text() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
             MockCodexReply::Sse(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\ndata: not-json\n\ndata: [DONE]\n",
             ),
@@ -2236,7 +2232,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_does_not_retry_stream_api_error_events() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
             MockCodexReply::Sse(
                 "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exceeded\"}}}\n\ndata: [DONE]\n",
             ),
@@ -2269,7 +2265,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_does_not_retry_failed_http_status() {
-        let (provider, captured, server_handle, _temp_dir) =
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![MockCodexReply::Status(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "server down",
