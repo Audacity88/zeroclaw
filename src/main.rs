@@ -3534,6 +3534,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    if let Commands::Service {
+        service_command,
+        service_init,
+    } = &cli.command
+        && matches!(service_command, ServiceCommands::RunDaemon { .. })
+    {
+        let init_system = service_init.parse()?;
+        return service::handle_command(service_command, &config, init_system).await;
+    }
     for section in config
         .degraded_sections
         .iter()
@@ -4889,7 +4898,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
             service_init,
         } => {
             let init_system = service_init.parse()?;
-            service::handle_command(&service_command, &config, init_system)
+            service::handle_command(&service_command, &config, init_system).await
         }
 
         Commands::Doctor { doctor_command } => match doctor_command {

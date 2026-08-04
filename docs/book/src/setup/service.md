@@ -1,6 +1,6 @@
 # Service Management
 
-ZeroClaw ships with first-class service integration for systemd (Linux), launchctl (macOS), and Task Scheduler (Windows). All three are driven by one CLI surface:
+ZeroClaw ships with first-class service integration for systemd and OpenRC (Linux), launchctl (macOS), and Task Scheduler (Windows). All are driven by one CLI surface:
 
 <div class="os-tabs-src">
 
@@ -129,6 +129,10 @@ rc-update add zeroclaw default    # start on boot
 
 </div>
 
+### Fixed-file service logs
+
+OpenRC, launchd, and Task Scheduler capture daemon stdout and stderr in fixed files. ZeroClaw keeps each file at or below 8 MiB by compacting it in place and retaining the newest output. OpenRC uses `/var/log/zeroclaw/access.log` and `error.log`; macOS and Windows use the paths documented in their sections below. These launcher logs are separate from the structured runtime-event log settings. Use `zeroclaw service logs` to read them through the supported CLI.
+
 ## macOS: LaunchAgent
 
 `zeroclaw service install` writes `~/Library/LaunchAgents/com.zeroclaw.daemon.plist` and loads it.
@@ -171,7 +175,7 @@ Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both e
 
 - Trigger: at logon (`/SC ONLOGON`)
 - Run level: `LIMITED` (runs as the current user, not elevated)
-- Action: runs the install wrapper `zeroclaw-daemon.cmd`, which launches `zeroclaw daemon`
+- Action: runs `zeroclaw.exe` through the bounded service supervisor, which captures daemon stdout and stderr
 
 Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw Daemon.
 

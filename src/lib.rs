@@ -215,6 +215,16 @@ Examples:
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
+    /// Internal bounded daemon launcher used by fixed-file service profiles
+    #[command(hide = true)]
+    RunDaemon {
+        #[arg(long, hide = true)]
+        desktop: bool,
+        #[arg(long, hide = true)]
+        port: Option<u16>,
+        #[arg(long, hide = true)]
+        preflight: bool,
+    },
     /// Install daemon service unit for auto-start and restart
     Install,
     /// Start daemon service

@@ -82,6 +82,13 @@ fn is_container() -> bool {
         })
 }
 
+fn service_supervisor_restart_info() -> RestartInfo {
+    RestartInfo {
+        mode: RestartMode::Supervised,
+        hint: get_required_cli_string("cli-gateway-restart-hint-process"),
+    }
+}
+
 /// Classify the runtime environment to pick exit-vs-manual and hint text.
 ///
 /// This only chooses what to *show*; the gateway does not act on it in Phase 1.
@@ -93,6 +100,10 @@ pub fn detect_restart() -> RestartInfo {
 }
 
 fn detect_restart_uncached() -> RestartInfo {
+    // Explicit process ownership outranks environment heuristics.
+    if env_present(zeroclaw_runtime::service::SERVICE_SUPERVISOR_ENV) {
+        return service_supervisor_restart_info();
+    }
     // Container first — default to manual since we can't see a restart policy.
     if is_container() {
         let hint = if env_present("KUBERNETES_SERVICE_HOST") {
@@ -788,6 +799,13 @@ mod tests {
     #[test]
     fn detect_restart_returns_a_nonempty_hint() {
         let info = detect_restart();
+        assert!(!info.hint.is_empty());
+    }
+
+    #[test]
+    fn service_supervisor_marker_maps_to_supervised_restart() {
+        let info = service_supervisor_restart_info();
+        assert_eq!(info.mode, RestartMode::Supervised);
         assert!(!info.hint.is_empty());
     }
 

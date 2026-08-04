@@ -1,12 +1,365 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use std::{collections::VecDeque, thread};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command as TokioCommand};
 use zeroclaw_config::schema::Config;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
+pub const SERVICE_SUPERVISOR_ENV: &str = "ZEROCLAW_SERVICE_SUPERVISOR";
+const SERVICE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const SERVICE_LOG_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
+const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
+const SERVICE_RESTART_DELAY: Duration = Duration::from_secs(1);
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVICE_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceDaemonProfile {
+    Service,
+    Desktop { port: u16 },
+}
+
+#[derive(Debug)]
+enum CapturePaths {
+    Combined(PathBuf),
+    Split { stdout: PathBuf, stderr: PathBuf },
+}
+
+impl CapturePaths {
+    fn lock_path(&self) -> PathBuf {
+        let path = match self {
+            Self::Combined(path) | Self::Split { stdout: path, .. } => path,
+        };
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        PathBuf::from(lock_path)
+    }
+}
+
+struct CaptureLock {
+    #[cfg(any(unix, windows))]
+    _file: fs::File,
+    #[cfg(all(not(unix), not(windows)))]
+    _private: (),
+}
+
+impl CaptureLock {
+    #[cfg(unix)]
+    fn acquire(path: &Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create service log directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("Failed to open service log lock {}", path.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            let code = error.raw_os_error();
+            if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+                bail!(
+                    "service log capture is already active for {}",
+                    path.display()
+                );
+            }
+            return Err(error)
+                .with_context(|| format!("Failed to lock service logs at {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(windows)]
+    fn acquire(path: &Path) -> Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create service log directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = match fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                bail!(
+                    "service log capture is already active for {}",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to lock service logs at {}", path.display()));
+            }
+        };
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    fn acquire(path: &Path) -> Result<Self> {
+        bail!(
+            "service log capture locking is unsupported for {}",
+            path.display()
+        )
+    }
+}
+
+struct BoundedLog {
+    file: fs::File,
+    len: u64,
+}
+
+impl BoundedLog {
+    fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create log directory {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("Failed to open service log {}", path.display()))?;
+        let mut log = Self {
+            len: file.metadata()?.len(),
+            file,
+        };
+        if log.len > SERVICE_LOG_MAX_BYTES {
+            log.retain_tail(SERVICE_LOG_MAX_BYTES)?;
+        }
+        Ok(log)
+    }
+
+    fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if chunk.len() as u64 >= SERVICE_LOG_MAX_BYTES {
+            let start = chunk.len() - SERVICE_LOG_MAX_BYTES as usize;
+            self.rewrite(&chunk[start..])?;
+            return Ok(());
+        }
+        if self.len + chunk.len() as u64 > SERVICE_LOG_MAX_BYTES {
+            let headroom = SERVICE_LOG_MAX_BYTES - chunk.len() as u64;
+            self.retain_tail(SERVICE_LOG_COMPACT_BYTES.min(headroom))?;
+        }
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(chunk)?;
+        self.len += chunk.len() as u64;
+        Ok(())
+    }
+
+    fn retain_tail(&mut self, keep: u64) -> Result<()> {
+        let keep = keep.min(self.len);
+        let mut tail = vec![0; keep as usize];
+        self.file.seek(SeekFrom::End(-(keep as i64)))?;
+        self.file.read_exact(&mut tail)?;
+        self.rewrite(&tail)
+    }
+
+    fn rewrite(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(bytes)?;
+        self.file.set_len(bytes.len() as u64)?;
+        self.file.flush()?;
+        self.len = bytes.len() as u64;
+        Ok(())
+    }
+}
+
+struct PendingLog {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+struct LogSinkInner {
+    pending: Mutex<PendingLog>,
+    ready: Condvar,
+}
+
+#[derive(Clone)]
+struct LogSink(Arc<LogSinkInner>);
+
+impl LogSink {
+    fn push(&self, mut chunk: Vec<u8>) {
+        if chunk.len() > SERVICE_LOG_PENDING_BYTES {
+            chunk = chunk.split_off(chunk.len() - SERVICE_LOG_PENDING_BYTES);
+        }
+        let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.closed {
+            return;
+        }
+        while pending.bytes + chunk.len() > SERVICE_LOG_PENDING_BYTES {
+            let Some(discarded) = pending.chunks.pop_front() else {
+                break;
+            };
+            pending.bytes -= discarded.len();
+        }
+        pending.bytes += chunk.len();
+        pending.chunks.push_back(chunk);
+        self.0.ready.notify_one();
+    }
+
+    fn close(&self) {
+        let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.closed = true;
+        self.0.ready.notify_one();
+    }
+}
+
+struct CaptureWriters {
+    stdout: LogSink,
+    stderr: LogSink,
+    tasks: Vec<JoinHandle<()>>,
+    _lock: Arc<CaptureLock>,
+}
+
+impl CaptureWriters {
+    fn open(paths: CapturePaths) -> Result<Self> {
+        let capture_lock = Arc::new(CaptureLock::acquire(&paths.lock_path())?);
+        match paths {
+            CapturePaths::Combined(path) => {
+                let log = BoundedLog::open(&path)?;
+                let (tx, task) = spawn_log_writer(path, log, Arc::clone(&capture_lock));
+                Ok(Self {
+                    stdout: tx.clone(),
+                    stderr: tx,
+                    tasks: vec![task],
+                    _lock: capture_lock,
+                })
+            }
+            CapturePaths::Split { stdout, stderr } => {
+                let stdout_log = BoundedLog::open(&stdout)?;
+                let stderr_log = BoundedLog::open(&stderr)?;
+                let (stdout_tx, stdout_task) =
+                    spawn_log_writer(stdout, stdout_log, Arc::clone(&capture_lock));
+                let (stderr_tx, stderr_task) =
+                    spawn_log_writer(stderr, stderr_log, Arc::clone(&capture_lock));
+                Ok(Self {
+                    stdout: stdout_tx,
+                    stderr: stderr_tx,
+                    tasks: vec![stdout_task, stderr_task],
+                    _lock: capture_lock,
+                })
+            }
+        }
+    }
+
+    async fn finish(mut self) {
+        self.stdout.close();
+        self.stderr.close();
+        let deadline = Instant::now() + SERVICE_PIPE_DRAIN_TIMEOUT;
+        for task in self.tasks.drain(..) {
+            while !task.is_finished() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if task.is_finished() {
+                let _ = task.join();
+            }
+        }
+    }
+}
+
+impl Drop for CaptureWriters {
+    fn drop(&mut self) {
+        self.stdout.close();
+        self.stderr.close();
+    }
+}
+
+fn spawn_log_writer(
+    path: PathBuf,
+    mut log: BoundedLog,
+    capture_lock: Arc<CaptureLock>,
+) -> (LogSink, JoinHandle<()>) {
+    let inner = Arc::new(LogSinkInner {
+        pending: Mutex::new(PendingLog {
+            chunks: VecDeque::new(),
+            bytes: 0,
+            closed: false,
+        }),
+        ready: Condvar::new(),
+    });
+    let sink = LogSink(Arc::clone(&inner));
+    let task = thread::spawn(move || {
+        let _capture_lock = capture_lock;
+        let mut writable = true;
+        loop {
+            let chunk = {
+                let mut pending = inner.pending.lock().unwrap_or_else(|e| e.into_inner());
+                while pending.chunks.is_empty() && !pending.closed {
+                    pending = inner.ready.wait(pending).unwrap_or_else(|e| e.into_inner());
+                }
+                let chunk = pending.chunks.pop_front();
+                if let Some(ref chunk) = chunk {
+                    pending.bytes -= chunk.len();
+                } else if pending.closed {
+                    break;
+                }
+                chunk
+            };
+            let Some(chunk) = chunk else {
+                continue;
+            };
+            if writable && let Err(error) = log.write_chunk(&chunk) {
+                eprintln!(
+                    "service log write failed for {}; continuing without capture: {error:#}",
+                    path.display()
+                );
+                writable = false;
+            }
+        }
+    });
+    (sink, task)
+}
+
+async fn drain_pipe<R>(mut pipe: R, sink: LogSink)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0; 16 * 1024];
+    loop {
+        match pipe.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                sink.push(buffer[..read].to_vec());
+            }
+            Err(error) => {
+                sink.push(format!("service log pipe read failed: {error}\n").into_bytes());
+                break;
+            }
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SystemdUserLinger {
@@ -169,6 +522,325 @@ fn linux_journalctl_args(config: &Config, lines: usize, follow: bool) -> Vec<Str
 
 fn linux_openrc_log_dir(config: &Config) -> PathBuf {
     Path::new("/var/log").join(linux_openrc_service(config))
+}
+
+fn macos_service_logs_dir(config: &Config) -> PathBuf {
+    config
+        .config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("logs")
+}
+
+fn service_capture_paths(
+    config: &Config,
+    init_system: InitSystem,
+    profile: ServiceDaemonProfile,
+) -> Result<CapturePaths> {
+    if matches!(profile, ServiceDaemonProfile::Desktop { .. }) {
+        return Ok(CapturePaths::Combined(
+            std::env::temp_dir().join("zeroclaw-desktop-daemon.log"),
+        ));
+    }
+
+    let logs_dir = if cfg!(target_os = "macos") {
+        macos_service_logs_dir(config)
+    } else if cfg!(target_os = "linux") {
+        if init_system.resolve()? != InitSystem::Openrc {
+            bail!("the internal service log runner is only used by OpenRC on Linux");
+        }
+        linux_openrc_log_dir(config)
+    } else if cfg!(target_os = "windows") {
+        config
+            .config_path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), PathBuf::from)
+            .join("logs")
+    } else {
+        bail!("the internal service log runner is unsupported on this platform");
+    };
+
+    let (stdout_name, stderr_name) = if cfg!(target_os = "linux") {
+        ("access.log", "error.log")
+    } else {
+        ("daemon.stdout.log", "daemon.stderr.log")
+    };
+    Ok(CapturePaths::Split {
+        stdout: logs_dir.join(stdout_name),
+        stderr: logs_dir.join(stderr_name),
+    })
+}
+
+pub async fn run_daemon(
+    config: &Config,
+    init_system: InitSystem,
+    profile: ServiceDaemonProfile,
+) -> Result<()> {
+    let executable = std::env::current_exe().context("Failed to resolve current executable")?;
+    let config_dir = config
+        .config_path
+        .parent()
+        .context("Configured path has no parent directory")?
+        .to_path_buf();
+    let writers = CaptureWriters::open(service_capture_paths(config, init_system, profile)?)?;
+    let result = supervise_daemon(&executable, &config_dir, profile, &writers).await;
+    if let Err(error) = &result {
+        writers
+            .stderr
+            .push(format!("service supervisor failed: {error:#}\n").into_bytes());
+    }
+    writers.finish().await;
+    result
+}
+
+pub async fn check_daemon_capture(
+    config: &Config,
+    init_system: InitSystem,
+    profile: ServiceDaemonProfile,
+) -> Result<()> {
+    let writers = CaptureWriters::open(service_capture_paths(config, init_system, profile)?)?;
+    writers.finish().await;
+    Ok(())
+}
+
+async fn supervise_daemon(
+    executable: &Path,
+    config_dir: &Path,
+    profile: ServiceDaemonProfile,
+    writers: &CaptureWriters,
+) -> Result<()> {
+    #[cfg(unix)]
+    let mut signals = SupervisorSignals::new()?;
+    #[cfg(windows)]
+    let job = WindowsChildJob::new()?;
+
+    loop {
+        let mut command = TokioCommand::new(executable);
+        command
+            .arg("--config-dir")
+            .arg(config_dir)
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env(SERVICE_SUPERVISOR_ENV, "1");
+        command.kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command
+                .as_std_mut()
+                .creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        if let ServiceDaemonProfile::Desktop { port } = profile {
+            command.arg("--port").arg(port.to_string());
+        }
+
+        let mut child = command.spawn().with_context(|| {
+            format!("Failed to start daemon child from {}", executable.display())
+        })?;
+        #[cfg(windows)]
+        job.assign(&child)?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("daemon stdout pipe unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("daemon stderr pipe unavailable")?;
+        let stdout_sink = writers.stdout.clone();
+        let stderr_sink = writers.stderr.clone();
+        let stdout_task = zeroclaw_spawn::spawn!(drain_pipe(stdout, stdout_sink));
+        let stderr_task = zeroclaw_spawn::spawn!(drain_pipe(stderr, stderr_sink));
+
+        #[cfg(unix)]
+        let outcome = wait_for_child(&mut child, &mut signals).await?;
+        #[cfg(not(unix))]
+        let outcome = wait_for_child(&mut child).await?;
+
+        finish_pipes(stdout_task, stderr_task).await;
+        if matches!(outcome, ChildOutcome::Stopped) {
+            return Ok(());
+        }
+
+        match outcome {
+            ChildOutcome::Stopped => unreachable!("stopped child returned above"),
+            ChildOutcome::Exited(status) if status.success() => {
+                #[cfg(unix)]
+                if restart_delay(&mut signals).await {
+                    return Ok(());
+                }
+                #[cfg(not(unix))]
+                if restart_delay().await {
+                    return Ok(());
+                }
+            }
+            ChildOutcome::Exited(status) => {
+                bail!("daemon child exited with status {status}");
+            }
+        }
+    }
+}
+
+async fn finish_pipes(
+    mut stdout: tokio::task::JoinHandle<()>,
+    mut stderr: tokio::task::JoinHandle<()>,
+) {
+    if tokio::time::timeout(SERVICE_PIPE_DRAIN_TIMEOUT, async {
+        let _ = tokio::join!(&mut stdout, &mut stderr);
+    })
+    .await
+    .is_err()
+    {
+        stdout.abort();
+        stderr.abort();
+        let _ = tokio::join!(stdout, stderr);
+    }
+}
+
+#[cfg(windows)]
+struct WindowsChildJob(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsChildJob {
+    fn new() -> Result<Self> {
+        use windows::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let handle = unsafe { CreateJobObjectW(None, None) }
+            .context("Failed to create daemon child job object")?;
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Err(error) = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        } {
+            unsafe { windows::Win32::Foundation::CloseHandle(handle) }.ok();
+            return Err(error).context("Failed to configure daemon child job object");
+        }
+        Ok(Self(handle))
+    }
+
+    fn assign(&self, child: &Child) -> Result<()> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let raw_handle = child
+            .raw_handle()
+            .context("daemon child process handle unavailable")?;
+        unsafe { AssignProcessToJobObject(self.0, HANDLE(raw_handle)) }
+            .context("Failed to assign daemon child to job object")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsChildJob {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::Foundation::CloseHandle(self.0) }.ok();
+    }
+}
+
+enum ChildOutcome {
+    Exited(std::process::ExitStatus),
+    Stopped,
+}
+
+#[cfg(unix)]
+struct SupervisorSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl SupervisorSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_child(
+    child: &mut Child,
+    signals: &mut SupervisorSignals,
+) -> Result<ChildOutcome> {
+    let signal = tokio::select! {
+        status = child.wait() => return Ok(ChildOutcome::Exited(status?)),
+        _ = signals.interrupt.recv() => libc::SIGINT,
+        _ = signals.terminate.recv() => libc::SIGTERM,
+    };
+
+    if let Some(pid) = child.id() {
+        // SAFETY: the PID belongs to the child owned by this supervisor.
+        unsafe {
+            libc::kill(pid as libc::pid_t, signal);
+        }
+    }
+    if tokio::time::timeout(SERVICE_STOP_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        child.kill().await.ok();
+        let _ = child.wait().await;
+    }
+    Ok(ChildOutcome::Stopped)
+}
+
+#[cfg(windows)]
+async fn wait_for_child(child: &mut Child) -> Result<ChildOutcome> {
+    use windows::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+
+    tokio::select! {
+        status = child.wait() => Ok(ChildOutcome::Exited(status?)),
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            if let Some(pid) = child.id() {
+                // SAFETY: the child was created as its own process group, whose ID is its PID.
+                unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) }
+                    .context("Failed to forward console stop to daemon child")?;
+            }
+            if tokio::time::timeout(SERVICE_STOP_TIMEOUT, child.wait()).await.is_err() {
+                child.kill().await.ok();
+                let _ = child.wait().await;
+            }
+            Ok(ChildOutcome::Stopped)
+        }
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+async fn wait_for_child(child: &mut Child) -> Result<ChildOutcome> {
+    let status = child.wait().await?;
+    Ok(ChildOutcome::Exited(status))
+}
+
+#[cfg(unix)]
+async fn restart_delay(signals: &mut SupervisorSignals) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(SERVICE_RESTART_DELAY) => false,
+        _ = signals.interrupt.recv() => true,
+        _ = signals.terminate.recv() => true,
+    }
+}
+
+#[cfg(not(unix))]
+async fn restart_delay() -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(SERVICE_RESTART_DELAY) => false,
+        result = tokio::signal::ctrl_c() => result.is_ok(),
+    }
 }
 
 /// Returns whether the ZeroClaw daemon service is currently running.
@@ -446,19 +1118,7 @@ pub fn logs(config: &Config, init_system: InitSystem, lines: usize, follow: bool
 }
 
 fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
-    // Try the launchd log files first (StandardOutPath / StandardErrorPath from the plist).
-    // These are the most reliable source since they capture all daemon output.
-    let exe = std::env::current_exe().ok();
-    let homebrew_var_dir = exe.as_ref().and_then(|e| homebrew_var_dir_from_exe(e));
-    let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
-        var_dir.join("logs")
-    } else {
-        config
-            .config_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join("logs")
-    };
+    let logs_dir = macos_service_logs_dir(config);
 
     let stderr_log = logs_dir.join("daemon.stderr.log");
     let stdout_log = logs_dir.join("daemon.stdout.log");
@@ -627,21 +1287,11 @@ pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "windows") {
         let task_name = windows_task_name();
         let _ = run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]));
-        // Remove the wrapper script. It now lives in the config dir root, but
-        // older installs left it under logs/ — clean up both so an upgrade
-        // doesn't strand the legacy copy.
         let base_dir = config
             .config_path
             .parent()
             .map_or_else(|| PathBuf::from("."), PathBuf::from);
-        for wrapper in [
-            base_dir.join("zeroclaw-daemon.cmd"),
-            base_dir.join("logs").join("zeroclaw-daemon.cmd"),
-        ] {
-            if wrapper.exists() {
-                fs::remove_file(&wrapper).ok();
-            }
-        }
+        remove_legacy_windows_service_wrappers(&base_dir);
         println!("✅ Service uninstalled");
         return Ok(());
     }
@@ -772,22 +1422,14 @@ fn install_macos(config: &Config) -> Result<()> {
         })?;
     }
 
-    let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
-        var_dir.join("logs")
-    } else {
-        config
-            .config_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join("logs")
-    };
+    let config_dir = config
+        .config_path
+        .parent()
+        .context("Configured path has no parent directory")?;
+    let logs_dir = config_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
-    let stdout = logs_dir.join("daemon.stdout.log");
-    let stderr = logs_dir.join("daemon.stderr.log");
-
-    let plist =
-        render_macos_launch_agent_plist(&exe, &stdout, &stderr, homebrew_var_dir.as_deref());
+    let plist = render_macos_launch_agent_plist(&exe, config_dir, homebrew_var_dir.as_deref());
 
     fs::write(&file, plist)?;
     println!("✅ Installed launchd service: {}", file.display());
@@ -802,28 +1444,27 @@ fn install_macos(config: &Config) -> Result<()> {
 /// and the caller is responsible for writing the returned XML to the plist path.
 fn render_macos_launch_agent_plist(
     exe: &Path,
-    stdout: &Path,
-    stderr: &Path,
+    config_dir: &Path,
     homebrew_var_dir: Option<&Path>,
 ) -> String {
-    // When running under Homebrew, inject ZEROCLAW_CONFIG_DIR and
-    // WorkingDirectory so the daemon finds its data in the Homebrew prefix.
-    let env_section = if let Some(var_dir) = homebrew_var_dir {
+    let working_dir_section = homebrew_var_dir.map_or_else(String::new, |var_dir| {
         format!(
-            r#"  <key>EnvironmentVariables</key>
+            r#"  <key>WorkingDirectory</key>
+  <string>{working_dir}</string>
+"#,
+            working_dir = xml_escape(&var_dir.display().to_string()),
+        )
+    });
+    let env_section = format!(
+        r#"  <key>EnvironmentVariables</key>
   <dict>
     <key>ZEROCLAW_CONFIG_DIR</key>
     <string>{config_dir}</string>
   </dict>
-  <key>WorkingDirectory</key>
-  <string>{working_dir}</string>
-"#,
-            config_dir = xml_escape(&var_dir.display().to_string()),
-            working_dir = xml_escape(&var_dir.display().to_string()),
-        )
-    } else {
-        String::new()
-    };
+{working_dir_section}"#,
+        config_dir = xml_escape(&config_dir.display().to_string()),
+        working_dir_section = working_dir_section,
+    );
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -835,24 +1476,20 @@ fn render_macos_launch_agent_plist(
   <key>ProgramArguments</key>
   <array>
     <string>{exe}</string>
-    <string>daemon</string>
+    <string>service</string>
+    <string>run-daemon</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
-{env_section}  <key>StandardOutPath</key>
-  <string>{stdout}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr}</string>
+{env_section}
 </dict>
 </plist>
 "#,
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
-        env_section = env_section,
-        stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string())
+        env_section = env_section
     )
 }
 
@@ -1287,13 +1924,11 @@ name="zeroclaw"
 description="ZeroClaw daemon"
 
 command="{exe}"
-command_args="--config-dir {config_dir} daemon"
+command_args="--config-dir {config_dir} service --service-init openrc run-daemon"
 command_background="yes"
 command_user="zeroclaw:zeroclaw"
 pidfile="/run/${{RC_SVCNAME}}.pid"
 umask 027
-output_log="/var/log/zeroclaw/access.log"
-error_log="/var/log/zeroclaw/error.log"
 
 # Provide HOME so headless browsers can create profile/cache directories.
 # Without this, Chromium/Firefox fail with sandbox or profile errors.
@@ -1490,21 +2125,8 @@ fn install_windows(config: &Config) -> Result<()> {
     let logs_dir = base_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
-    // The launch wrapper is an install artifact, not log output — keep it in
-    // the config dir root so the logs dir holds only `.log` files. (Previously
-    // it landed in logs/, where a `.cmd` next to the daemon's log files reads
-    // as misplaced.)
-    let wrapper = base_dir.join("zeroclaw-daemon.cmd");
-    let stdout_log = logs_dir.join("daemon.stdout.log");
-    let stderr_log = logs_dir.join("daemon.stderr.log");
-
-    let wrapper_content = format!(
-        "@echo off\r\n\"{}\" daemon >>\"{}\" 2>>\"{}\"",
-        exe.display().to_string(),
-        stdout_log.display().to_string(),
-        stderr_log.display()
-    );
-    fs::write(&wrapper, &wrapper_content)?;
+    remove_legacy_windows_service_wrappers(&base_dir);
+    let task_action = render_windows_service_action(&exe, &base_dir);
 
     let task_name = windows_task_name();
 
@@ -1520,17 +2142,36 @@ fn install_windows(config: &Config) -> Result<()> {
         "/SC",
         "ONLOGON",
         "/TR",
-        &format!("\"{}\"", wrapper.display().to_string()),
+        &task_action,
         "/RL",
         "LIMITED",
         "/F",
     ]))?;
 
     println!("✅ Installed Windows scheduled task: {}", task_name);
-    println!("   Wrapper: {}", wrapper.display().to_string());
+    println!("   Action: {}", task_action);
     println!("   Logs: {}", logs_dir.display().to_string());
     println!("   Start with: zeroclaw service start");
     Ok(())
+}
+
+fn render_windows_service_action(exe: &Path, config_dir: &Path) -> String {
+    format!(
+        "\"{}\" --config-dir \"{}\" service run-daemon",
+        exe.display(),
+        config_dir.display()
+    )
+}
+
+fn remove_legacy_windows_service_wrappers(base_dir: &Path) {
+    for wrapper in [
+        base_dir.join("zeroclaw-daemon.cmd"),
+        base_dir.join("logs").join("zeroclaw-daemon.cmd"),
+    ] {
+        if wrapper.exists() {
+            fs::remove_file(wrapper).ok();
+        }
+    }
 }
 
 fn macos_service_file() -> Result<PathBuf> {
@@ -1681,8 +2322,7 @@ mod macos_plist_tests {
     fn macos_plist_renderer_uses_plain_xml_quotes() {
         let plist = render_macos_launch_agent_plist(
             Path::new("/opt/homebrew/bin/zeroclaw"),
-            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stdout.log"),
-            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stderr.log"),
+            Path::new("/opt/homebrew/var/zeroclaw"),
             Some(Path::new("/opt/homebrew/var/zeroclaw")),
         );
 
@@ -1693,21 +2333,23 @@ mod macos_plist_tests {
         ));
         assert!(plist.contains(r#"<plist version="1.0">"#));
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("<string>service</string>"));
+        assert!(plist.contains("<string>run-daemon</string>"));
+        assert!(!plist.contains("StandardOutPath"));
+        assert!(!plist.contains("StandardErrorPath"));
     }
 
     #[test]
-    fn macos_plist_renderer_escapes_paths_and_omits_homebrew_section_when_absent() {
+    fn macos_plist_renderer_preserves_custom_config_and_omits_homebrew_working_dir() {
         let plist = render_macos_launch_agent_plist(
             Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
-            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
-            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            Path::new("/tmp/Custom Config<&>\"'/zeroclaw"),
             None,
         );
 
         assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/bin/zeroclaw"));
-        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stdout.log"));
-        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stderr.log"));
-        assert!(!plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("/tmp/Custom Config&lt;&amp;&gt;&quot;&apos;/zeroclaw"));
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
         assert!(!plist.contains("<key>WorkingDirectory</key>"));
     }
 
@@ -1716,8 +2358,7 @@ mod macos_plist_tests {
     fn macos_plist_renderer_emits_plutil_parseable_xml() {
         let plist = render_macos_launch_agent_plist(
             Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
-            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
-            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw"),
             Some(Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw")),
         );
 
@@ -2023,15 +2664,17 @@ mod service_helper_tests {
         assert!(script.contains("name=\"zeroclaw\""));
         assert!(script.contains("description=\"ZeroClaw daemon\""));
         assert!(script.contains("command=\"/usr/local/bin/zeroclaw\""));
-        assert!(script.contains("command_args=\"--config-dir /etc/zeroclaw daemon\""));
+        assert!(script.contains(
+            "command_args=\"--config-dir /etc/zeroclaw service --service-init openrc run-daemon\""
+        ));
         assert!(!script.contains("env ZEROCLAW_CONFIG_DIR"));
         assert!(!script.contains("env ZEROCLAW_WORKSPACE"));
         assert!(script.contains("command_background=\"yes\""));
         assert!(script.contains("command_user=\"zeroclaw:zeroclaw\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));
         assert!(script.contains("umask 027"));
-        assert!(script.contains("output_log=\"/var/log/zeroclaw/access.log\""));
-        assert!(script.contains("error_log=\"/var/log/zeroclaw/error.log\""));
+        assert!(!script.contains("output_log="));
+        assert!(!script.contains("error_log="));
         assert!(script.contains("depend()"));
         assert!(script.contains("need net"));
         assert!(script.contains("after firewall"));
@@ -2130,5 +2773,178 @@ mod service_helper_tests {
         // tail should succeed on existing file
         let result = tail_file(&log, 3, false);
         assert!(result.is_ok(), "tail on existing file should succeed");
+    }
+}
+
+#[cfg(test)]
+mod bounded_log_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_relaunches_clean_exit_and_propagates_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("daemon-fixture.sh");
+        let stdout_path = dir.path().join("stdout.log");
+        let stderr_path = dir.path().join("stderr.log");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+count_file="$dir/count"
+count=0
+if [ -f "$count_file" ]; then
+    count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf 'stdout-%s\n' "$count"
+printf 'stderr-%s\n' "$count" >&2
+if [ "$count" -eq 1 ]; then
+    dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\000' 'a'
+    printf 'stdout-tail-1\n'
+    dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\000' 'b' >&2
+    printf 'stderr-tail-1\n' >&2
+    exit 0
+fi
+exit 9
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let writers = CaptureWriters::open(CapturePaths::Split {
+            stdout: stdout_path.clone(),
+            stderr: stderr_path.clone(),
+        })
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(20),
+            supervise_daemon(
+                &executable,
+                dir.path(),
+                ServiceDaemonProfile::Service,
+                &writers,
+            ),
+        )
+        .await
+        .expect("supervisor should not block while draining saturated pipes")
+        .unwrap_err();
+        writers.finish().await;
+
+        assert!(error.to_string().contains("exit status: 9"));
+        assert_eq!(fs::read_to_string(dir.path().join("count")).unwrap(), "2");
+        let stdout = fs::read(stdout_path).unwrap();
+        let stderr = fs::read(stderr_path).unwrap();
+        assert!(stdout.len() as u64 <= SERVICE_LOG_MAX_BYTES);
+        assert!(stderr.len() as u64 <= SERVICE_LOG_MAX_BYTES);
+        assert!(stdout.ends_with(b"stdout-2\n"));
+        assert!(stderr.ends_with(b"stderr-2\n"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn capture_lock_rejects_concurrent_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let first = CaptureWriters::open(CapturePaths::Combined(path.clone())).unwrap();
+
+        let error = CaptureWriters::open(CapturePaths::Combined(path.clone()))
+            .err()
+            .expect("second capture owner should be rejected");
+        assert!(error.to_string().contains("already active"));
+
+        first.finish().await;
+        let replacement = CaptureWriters::open(CapturePaths::Combined(path)).unwrap();
+        replacement.finish().await;
+    }
+
+    #[test]
+    fn oversized_existing_log_keeps_newest_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let mut bytes = vec![b'a'; SERVICE_LOG_MAX_BYTES as usize];
+        bytes.extend(vec![b'b'; 1024]);
+        fs::write(&path, bytes).unwrap();
+
+        let log = BoundedLog::open(&path).unwrap();
+        assert_eq!(log.len, SERVICE_LOG_MAX_BYTES);
+        let retained = fs::read(path).unwrap();
+        assert!(retained.ends_with(&vec![b'b'; 1024]));
+    }
+
+    #[test]
+    fn pending_buffer_evicts_oldest_without_blocking_producers() {
+        let sink = LogSink(Arc::new(LogSinkInner {
+            pending: Mutex::new(PendingLog {
+                chunks: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }));
+        sink.push(vec![b'a'; 700 * 1024]);
+        sink.push(vec![b'b'; 700 * 1024]);
+
+        let pending = sink.0.pending.lock().unwrap();
+        assert!(pending.bytes <= SERVICE_LOG_PENDING_BYTES);
+        assert_eq!(pending.chunks.len(), 1);
+        assert_eq!(pending.chunks.front().unwrap()[0], b'b');
+    }
+
+    #[test]
+    fn overflowing_write_stays_bounded_and_keeps_newest_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        fs::write(&path, vec![b'a'; SERVICE_LOG_MAX_BYTES as usize]).unwrap();
+        let mut log = BoundedLog::open(&path).unwrap();
+
+        let chunk = vec![b'b'; 3 * 1024 * 1024];
+        log.write_chunk(&chunk).unwrap();
+        let retained = fs::read(path).unwrap();
+        assert!(retained.len() as u64 <= SERVICE_LOG_MAX_BYTES);
+        assert!(retained.ends_with(&chunk));
+    }
+
+    #[test]
+    fn oversized_chunk_keeps_only_its_newest_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let mut log = BoundedLog::open(&path).unwrap();
+        let mut chunk = vec![b'a'; SERVICE_LOG_MAX_BYTES as usize];
+        chunk.extend(vec![b'b'; 4096]);
+
+        log.write_chunk(&chunk).unwrap();
+        let retained = fs::read(path).unwrap();
+        assert_eq!(retained.len() as u64, SERVICE_LOG_MAX_BYTES);
+        assert!(retained.ends_with(&vec![b'b'; 4096]));
+    }
+
+    #[tokio::test]
+    async fn combined_capture_serializes_both_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop.log");
+        let writers = CaptureWriters::open(CapturePaths::Combined(path.clone())).unwrap();
+        writers.stdout.push(b"stdout\n".to_vec());
+        writers.stderr.push(b"stderr\n".to_vec());
+        writers.finish().await;
+
+        assert_eq!(fs::read(path).unwrap(), b"stdout\nstderr\n");
+    }
+
+    #[test]
+    fn windows_task_action_uses_bounded_service_runner_directly() {
+        let action = render_windows_service_action(
+            Path::new("C:\\ZeroClaw\\zeroclaw.exe"),
+            Path::new("C:\\Custom Config\\ZeroClaw"),
+        );
+        assert_eq!(
+            action,
+            "\"C:\\ZeroClaw\\zeroclaw.exe\" --config-dir \"C:\\Custom Config\\ZeroClaw\" service run-daemon"
+        );
     }
 }

@@ -201,7 +201,7 @@ zeroclaw service logs
 
 > **About `--service-init`.** The CLI exposes a `--service-init [auto|systemd|openrc]` flag for cross-platform consistency, but on Windows it is a no-op; the scheduled-task path is always used.
 
-Logs go to `%USERPROFILE%\.zeroclaw\logs\` (specifically, `<config_dir>/logs/` where `<config_dir>` defaults to `%USERPROFILE%\.zeroclaw\`). The scheduled-task wrapper itself, however, lives next to the config file at `%USERPROFILE%\.zeroclaw\zeroclaw-daemon.cmd`. Only the daemon output files (`daemon.stdout.log` / `daemon.stderr.log`) are written under `logs\`.
+Logs go to `%USERPROFILE%\.zeroclaw\logs\` (specifically, `<config_dir>/logs/` where `<config_dir>` defaults to `%USERPROFILE%\.zeroclaw\`). The scheduled task starts `zeroclaw.exe` through the bounded service supervisor; no separate command wrapper is installed. The daemon output files (`daemon.stdout.log` and `daemon.stderr.log`) are each limited to 8 MiB.
 
 > **Server / multi-user installs.** Native Windows Service / LocalSystem support is on the roadmap but not yet implemented. For now, on a server box, install ZeroClaw under the account that the agent should run as; the scheduled-task path will start it on that user's login. If you need it to start before any user logs in, use **Task Scheduler → ZeroClaw Daemon → Properties → General → "Run whether user is logged on or not."**
 

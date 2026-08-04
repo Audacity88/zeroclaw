@@ -55,24 +55,24 @@ pub fn find_zeroclaw_binary() -> Option<PathBuf> {
     None
 }
 
-/// Spawn `zeroclaw daemon -p <port>`, detached so it outlives the app, with
-/// stdio routed to a log file under the OS temp dir. The child handle is
-/// returned but intentionally not reaped — the daemon is a background service.
+/// Spawn the internal bounded daemon runner, detached so it outlives the app.
+/// The child handle is returned but intentionally not reaped because the
+/// runner owns the background daemon lifecycle.
 pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
-    let log_path = std::env::temp_dir().join("zeroclaw-desktop-daemon.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let log_err = log.try_clone()?;
+    let mut preflight = daemon_command(binary, port);
+    let output = preflight.arg("--preflight").output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "daemon log capture preflight failed: {}",
+            message.trim()
+        )));
+    }
 
-    let mut cmd = Command::new(binary);
-    cmd.arg("daemon")
-        .arg("-p")
-        .arg(port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+    let mut cmd = daemon_command(binary, port);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     // Detach so signals to the app's process group (e.g. Ctrl-C on a dev
     // `cargo run`) don't also stop the daemon, and so it survives app exit.
@@ -89,4 +89,43 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
     }
 
     cmd.spawn()
+}
+
+fn daemon_command(binary: &Path, port: u16) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.arg("service")
+        .arg("run-daemon")
+        .arg("--desktop")
+        .arg("--port")
+        .arg(port.to_string());
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_uses_bounded_service_runner() {
+        let command = daemon_command(Path::new("/tmp/zeroclaw"), 42617);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["service", "run-daemon", "--desktop", "--port", "42617"]
+        );
+    }
+
+    #[test]
+    fn desktop_preflight_uses_hidden_capture_check() {
+        let mut command = daemon_command(Path::new("/tmp/zeroclaw"), 42617);
+        command.arg("--preflight");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), Some("--preflight"));
+    }
 }
