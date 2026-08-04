@@ -12,7 +12,7 @@ Composite job with multiple matrix legs:
 - **fmt**: `cargo fmt --all -- --check`
 - **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
-- **check**: all features + no-default-features
+- **check**: all features plus a workspace-wide, warnings-fatal no-default-features pass (excluding `zeroclaw-desktop`)
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
 - **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
@@ -30,6 +30,8 @@ Fresh required CI is normally the shared evidence for the Cargo surfaces it actu
 - a desktop change did not trigger the desktop workflow;
 - a release target is outside the PR matrix and only covered by release/manual workflows;
 - stale, cancelled, skipped, or unavailable CI is not fresh evidence.
+
+When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
