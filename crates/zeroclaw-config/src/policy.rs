@@ -839,14 +839,14 @@ struct RedirectionMetadata {
 
 struct ShellWord {
     text: String,
-    assignment_name: Option<String>,
+    is_assignment: bool,
     redirection: Option<RedirectionMetadata>,
 }
 
 fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
     let mut words = Vec::new();
     let mut current = String::new();
-    let mut assignment_name = None;
+    let mut is_assignment = false;
     let mut assignment_prefix_is_unquoted = true;
     let mut word_prefix_is_unquoted = true;
     let mut redirection: Option<RedirectionMetadata> = None;
@@ -856,7 +856,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
 
     let push_word = |words: &mut Vec<ShellWord>,
                      current: &mut String,
-                     assignment_name: &mut Option<String>,
+                     is_assignment: &mut bool,
                      assignment_prefix_is_unquoted: &mut bool,
                      word_prefix_is_unquoted: &mut bool,
                      redirection: &mut Option<RedirectionMetadata>,
@@ -864,9 +864,10 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
         if *in_word {
             words.push(ShellWord {
                 text: std::mem::take(current),
-                assignment_name: assignment_name.take(),
+                is_assignment: *is_assignment,
                 redirection: redirection.take(),
             });
+            *is_assignment = false;
             *assignment_prefix_is_unquoted = true;
             *word_prefix_is_unquoted = true;
             *in_word = false;
@@ -892,7 +893,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
                         current.push(ch);
                     }
                     escaped = false;
-                    if assignment_name.is_none() {
+                    if !is_assignment {
                         assignment_prefix_is_unquoted = false;
                     }
                     if redirection.is_none() {
@@ -927,7 +928,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
                 if escaped {
                     current.push(ch);
                     escaped = false;
-                    if assignment_name.is_none() {
+                    if !is_assignment {
                         assignment_prefix_is_unquoted = false;
                     }
                     if redirection.is_none() {
@@ -957,7 +958,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
                         in_word = true;
                     }
                     '\'' if !cfg!(target_os = "windows") => {
-                        if assignment_name.is_none() {
+                        if !is_assignment {
                             assignment_prefix_is_unquoted = false;
                         }
                         if let Some(redirection) = &mut redirection {
@@ -969,7 +970,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
                         in_word = true;
                     }
                     '"' => {
-                        if assignment_name.is_none() {
+                        if !is_assignment {
                             assignment_prefix_is_unquoted = false;
                         }
                         if let Some(redirection) = &mut redirection {
@@ -984,7 +985,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
                         push_word(
                             &mut words,
                             &mut current,
-                            &mut assignment_name,
+                            &mut is_assignment,
                             &mut assignment_prefix_is_unquoted,
                             &mut word_prefix_is_unquoted,
                             &mut redirection,
@@ -992,9 +993,8 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
                         );
                     }
                     _ => {
-                        if ch == '=' && assignment_name.is_none() && assignment_prefix_is_unquoted {
-                            assignment_name =
-                                normalized_assignment_name(&current).map(str::to_string);
+                        if ch == '=' && !is_assignment && assignment_prefix_is_unquoted {
+                            is_assignment = normalized_assignment_name(&current).is_some();
                         }
                         if matches!(ch, '<' | '>') {
                             match &mut redirection {
@@ -1035,7 +1035,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
     push_word(
         &mut words,
         &mut current,
-        &mut assignment_name,
+        &mut is_assignment,
         &mut assignment_prefix_is_unquoted,
         &mut word_prefix_is_unquoted,
         &mut redirection,
@@ -1048,20 +1048,20 @@ fn shell_words_after_env_assignments(segment: &str) -> Vec<ShellWord> {
     let words = split_shell_words_with_metadata(segment);
     let first_command = words
         .iter()
-        .position(|word| word.assignment_name.is_none())
+        .position(|word| !word.is_assignment)
         .unwrap_or(words.len());
     words.into_iter().skip(first_command).collect()
 }
 
 struct NormalizedShellCommand {
-    assignment_names: Vec<String>,
+    has_leading_env_assignment: bool,
     words: Vec<String>,
     has_ambiguous_redirection: bool,
 }
 
 fn normalized_shell_command(segment: &str) -> NormalizedShellCommand {
     let raw_words = split_shell_words_with_metadata(segment);
-    let mut assignment_names = Vec::new();
+    let mut has_leading_env_assignment = false;
     let mut words = Vec::with_capacity(raw_words.len());
     let mut has_ambiguous_redirection = false;
     let mut before_executable = true;
@@ -1069,8 +1069,8 @@ fn normalized_shell_command(segment: &str) -> NormalizedShellCommand {
 
     while idx < raw_words.len() {
         let raw = raw_words[idx].text.as_str();
-        if before_executable && let Some(name) = &raw_words[idx].assignment_name {
-            assignment_names.push(name.clone());
+        if before_executable && raw_words[idx].is_assignment {
+            has_leading_env_assignment = true;
             idx += 1;
             continue;
         }
@@ -1106,34 +1106,10 @@ fn normalized_shell_command(segment: &str) -> NormalizedShellCommand {
     }
 
     NormalizedShellCommand {
-        assignment_names,
+        has_leading_env_assignment,
         words,
         has_ambiguous_redirection,
     }
-}
-
-fn is_git_process_control_env_assignment_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("GIT_EXEC_PATH")
-        || name
-            .get(.."GIT_CONFIG_".len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_"))
-}
-
-fn has_git_process_control_env_assignment_for_git(command: &NormalizedShellCommand) -> bool {
-    let Some(executable) = command.words.first() else {
-        return false;
-    };
-
-    let base_owned = command_basename(executable).to_ascii_lowercase();
-    if strip_windows_exe_suffix(&base_owned) != "git" {
-        return false;
-    }
-
-    command
-        .assignment_names
-        .iter()
-        .map(String::as_str)
-        .any(is_git_process_control_env_assignment_name)
 }
 
 fn is_git_write_verb(verb: &str) -> bool {
@@ -1983,9 +1959,7 @@ impl SecurityPolicy {
         let segments = split_unquoted_segments(command);
         for segment in &segments {
             let normalized = normalized_shell_command(segment);
-            if normalized.has_ambiguous_redirection
-                || has_git_process_control_env_assignment_for_git(&normalized)
-            {
+            if normalized.has_ambiguous_redirection || normalized.has_leading_env_assignment {
                 return false;
             }
             let words = normalized.words;
@@ -3543,11 +3517,11 @@ mod tests {
     }
 
     #[test]
-    fn git_command_scope_process_controls_rejected_at_policy_boundary() {
+    fn shell_environment_assignments_rejected_at_policy_boundary() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             require_approval_for_medium_risk: true,
-            allowed_commands: vec!["git".into(), "env".into()],
+            allowed_commands: vec!["git".into(), "env".into(), "ls".into(), "grep".into()],
             ..SecurityPolicy::default()
         };
 
@@ -3575,7 +3549,6 @@ mod tests {
             "git --config-env\\=foo.bar=ENV status",
             "git --exec-path ./tools zcprobe",
             "git --exec-path=./tools zcprobe",
-            "GIT_EXEC_PATH=./tools git zcprobe",
             "env GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
             "/usr/bin/env GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
             "env git status",
@@ -3587,6 +3560,26 @@ mod tests {
             assert!(
                 err.contains("Command not allowed by security policy"),
                 "{err}"
+            );
+        }
+
+        for command in [
+            "GIT_EXEC_PATH=./tools git zcprobe",
+            "GIT_SSH_COMMAND=./tools/zcprobe git fetch ssh://example.invalid/repo",
+            "GIT_SSH_COMMAND+=./tools/zcprobe git fetch ssh://example.invalid/repo",
+            "PATH=./tools:/usr/bin git zcprobe",
+            "PATH+=:./tools git zcprobe",
+            "PATH=./tools:/usr/bin ls",
+            "PATH+=:./tools ls",
+            "LD_PRELOAD=./tools/zcprobe.so ls",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("leading environment assignments must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
             );
         }
 
@@ -3610,15 +3603,6 @@ mod tests {
             );
         }
 
-        let env_status = p
-            .validate_command_execution("FOO=bar git status", false)
-            .expect("benign environment assignments should remain allowed");
-        assert_eq!(env_status, CommandRiskLevel::Low);
-        let quoted_env_status = p
-            .validate_command_execution(r#"FOO="bar" git status"#, false)
-            .expect("quoted assignment values should remain allowed");
-        assert_eq!(quoted_env_status, CommandRiskLevel::Low);
-
         let status = p
             .validate_command_execution("git status", false)
             .expect("read-only Git status should remain allowed");
@@ -3634,7 +3618,6 @@ mod tests {
 
         for command in [
             ">/dev/null git commit -m test",
-            "FOO=bar >/dev/null git commit -m test",
             "<<<payload git commit -m test",
             "git -C . 2>&1 commit -m test",
             "git -C . >/dev/null commit -m test",
@@ -4626,10 +4609,10 @@ mod tests {
     #[test]
     fn command_env_var_prefix_with_allowed_cmd() {
         let p = default_policy();
-        // env assignment + allowed command — OK
-        assert!(p.is_command_allowed("FOO=bar ls"));
-        assert!(p.is_command_allowed("LANG=C grep pattern file"));
-        // env assignment + disallowed command — blocked
+        // Per-invocation environment changes can alter executable resolution or
+        // command behavior before the allowlist and risk model see it.
+        assert!(!p.is_command_allowed("FOO=bar ls"));
+        assert!(!p.is_command_allowed("LANG=C grep pattern file"));
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
