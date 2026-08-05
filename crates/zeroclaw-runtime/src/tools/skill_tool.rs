@@ -1130,6 +1130,7 @@ mod tests {
             }],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
         crate::tools::register_skill_tools_with_context(
