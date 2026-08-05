@@ -2555,6 +2555,19 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         return Ok(false);
     };
 
+    // The alias already exists in the loaded config (e.g. a hyphenated cron
+    // alias the TOML loader accepts and `config get`/`config list` resolve):
+    // leave it alone. `create_map_key` applies the strict new-alias grammar,
+    // which would reject a valid loaded key. Mirror `Config::ensure_map_key_for_path`,
+    // which also skips creation for existing keys so alias validation runs only
+    // when auto-materializing a brand-new alias.
+    if config
+        .get_map_keys(section_path)
+        .is_some_and(|keys| keys.iter().any(|k| k == key))
+    {
+        return Ok(false);
+    }
+
     // Route through the shared `create_map_key_checked` (not raw
     // `create_map_key`) so this CLI path inherits the reserved `default`
     // agent guard from the one place it's defined, rather than re-deriving
@@ -4162,7 +4175,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+            let startup_feedback_enabled = !cli.verbose;
             loop {
+                if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = daemon::echo_daemon_starting_to_terminal(&mut stderr);
+                }
+
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
                 // first iteration; reload would otherwise see a moved value.
@@ -4200,7 +4219,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4215,6 +4234,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                ready_tx,
                             ))
                             .await
                         })
@@ -4274,10 +4294,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
-                            .await
+                        zeroclaw_runtime::rpc::local::run_local_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            ready_tx,
+                        )
+                        .await
                     })
                 }));
 
@@ -4316,6 +4341,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     port,
                     registry,
                     ephemeral,
+                    startup_feedback_enabled,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -7973,7 +7999,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -9451,6 +9477,39 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_leaves_existing_hyphenated_alias_alone() {
+        let mut config = Config::default();
+        config.cron.insert(
+            "morning-brief".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "cron.morning-brief.name")
+            .expect("an existing loaded alias must never be rejected by the create grammar");
+        assert!(
+            !created,
+            "the existing `morning-brief` alias must not be reported as newly created"
+        );
+        assert!(
+            config
+                .set_prop("cron.morning-brief.name", "Morning brief")
+                .is_ok(),
+            "setting a field on an existing hyphenated cron alias must succeed"
+        );
+        assert_eq!(
+            config.get_prop("cron.morning-brief.name").ok(),
+            Some("Morning brief".to_string())
+        );
+
+        let err = ensure_map_key_for_prop_path(&mut config, "cron.bad-alias.name")
+            .expect_err("creating a NEW hyphenated alias must still be rejected");
+        assert!(
+            err.to_string().contains("invalid character"),
+            "new-alias grammar must be preserved: {err}"
         );
     }
 
