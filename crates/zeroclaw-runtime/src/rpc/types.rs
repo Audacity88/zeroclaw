@@ -11,6 +11,7 @@ pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
+pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
@@ -73,6 +74,8 @@ rpc_type! {
     pub struct InitializeResult {
         pub protocol_version: u64,
         pub server_version: String,
+        /// OS process ID of the daemon serving this connection.
+        pub server_pid: u32,
         /// Assigned TUI session UID.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tui_id: Option<String>,
@@ -91,6 +94,14 @@ rpc_type! {
         pub protocol_version: u64,
         pub active_sessions: usize,
         pub session_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_kind: Option<RuntimeConfigKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub local_ipc_endpoint: Option<String>,
     }
 }
 

@@ -76,6 +76,18 @@ cli-skills-review-summary = { "  " }💾 Skill review: {$summary}
 cli-skills-install-start = Installing skill from: {$source}
 cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
 cli-skills-install-resolving-extra-registry = { "  " }Resolving '{$source}' from registry '{$registry}'...
+cli-skills-install-skill-requires-git = --skill <name> requires a git repository URL as the source (got '{$source}')
+cli-skills-install-catalog-failed = failed to install skill '{$skill}' from catalog {$source}
+cli-skills-install-invalid-skill-name = invalid --skill name '{$skill}': use a bare skill name (letters, digits, '-', '_')
+cli-skills-install-catalog-clone-failed = failed to clone skill catalog {$url}
+cli-skills-install-skill-not-in-catalog-empty = skill '{$skill}' not found in {$url}: no skills/ directory, or it is empty
+cli-skills-install-skill-not-in-catalog =
+    skill '{$skill}' not found in {$url}.
+    Available skills: {$available}
+cli-skills-install-catalog-root-symlink = skill catalog {$url} has a symlinked skills/ directory; refusing to inspect it
+cli-skills-install-catalog-root-escapes = skill catalog {$url} has a skills/ directory that resolves outside the cloned catalog; refusing to inspect it
+cli-skills-install-catalog-skill-symlink = skill '{$skill}' in {$url} is a symlink; catalog skills must be real directories inside the repository
+cli-skills-install-catalog-skill-escapes = skill '{$skill}' in {$url} resolves outside the cloned catalog; refusing to install
 cli-skills-install-git-failed = failed to install git skill source: {$source}
 cli-skills-install-registry-failed = failed to install skill from registry: {$source}
 cli-skills-install-extra-registry-failed = failed to install skill from extra registry: {$source}
@@ -688,6 +700,8 @@ cli-otp-enrollment-uri = Enrollment URI: {$uri}
 cli-otp-received = {"  "}✓ OTP received
 cli-secret-captured = {"  "}● Value captured — press Enter to save
 cli-secret-received = {"  "}✓ Secret received
+cli-secret-needs-tty = Secret input requires a terminal on stdin and stderr.
+cli-secret-empty = Value cannot be empty.
 cli-pairing-enabled = 🔐 Gateway pairing is enabled.
 cli-pairing-use-code = {"  "}Use this one-time code to pair a new device:
 cli-pairing-post = {"    "}POST /pair with header X-Pairing-Code: {$code}
@@ -894,6 +908,11 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Trailing notice appended (and streamed as a final chunk) when the resilient
+# provider wrapper served the turn with a different model or provider than the
+# one requested, so silent model downgrades stay visible on direct-turn
+# surfaces (WS, RPC/ZeroCode, ACP).
+turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
@@ -915,6 +934,12 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+channel-runtime-progress-received = Received
+channel-runtime-progress-planning = Planning
+channel-runtime-progress-waiting-on-model = Waiting on model
+channel-runtime-progress-running-tool = Running tool
+channel-runtime-progress-compacting-context = Compacting context
+channel-runtime-progress-finalizing-response = Finalizing response
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
@@ -922,6 +947,8 @@ channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-no-reply-refused = 🚫 I can't help with that request.
+channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
 channel-runtime-current-model-status =
     Current model_provider: `{ $provider }`
     Current model: `{ $model }`
@@ -1051,8 +1078,45 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
+cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
+sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
+sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
+sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
+sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = Tool approval required
+channel-approval-heading-shout = APPROVAL REQUIRED
+channel-approval-tool-label = Tool
+channel-approval-args-label = Args
+channel-approval-btn-approve = Approve
+channel-approval-btn-deny = Deny
+channel-approval-btn-always = Always
+channel-approval-tap-instruction = Tap a button below:
+channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
+channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-telegram-approval-ack-approved = Approved
+channel-telegram-approval-ack-always-approved = Always approved
+channel-telegram-approval-ack-denied = Denied
+channel-telegram-approval-ack-unknown = Unknown action
+channel-discord-approval-btn-allow-once = Allow once
+channel-discord-approval-btn-allow-session = Allow this session
+channel-discord-approval-btn-allow-always = Always allow
+channel-approval-title = Approve { $tool }?
+channel-approval-opt-allow-once = Allow once
+channel-approval-opt-allow-always = Always allow
+channel-approval-opt-reject = Reject
+channel-approval-opt-reject-with-edit = Reject with edit
