@@ -2027,8 +2027,10 @@ impl SecurityPolicy {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
             "find" => {
-                // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+                // GNU/BSD find execution predicates allow arbitrary child commands.
+                !args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
             }
             "git" => {
                 !args_cased.iter().any(|arg| arg.starts_with("-c"))
@@ -4560,9 +4562,21 @@ mod tests {
     #[test]
     fn command_argument_injection_blocked() {
         let p = default_policy();
-        // find -exec is a common bypass
-        assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
-        assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
+        for command in [
+            "find . -exec rm -rf '{}' +",
+            "find / -ok cat '{}' ';'",
+            "find . -execdir git commit '{}' +",
+            "find . -okdir env GIT_CONFIG_GLOBAL=./zc-config git zcprobe '{}' ';'",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("find command carriers must fail before child execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
         // git config/alias can execute commands
         assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
         assert!(!p.is_command_allowed("git alias.st status"));
