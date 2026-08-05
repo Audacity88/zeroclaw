@@ -21,9 +21,11 @@ A narrower mechanism: `[[model_routes]]` lets an agent override the configured `
 
 Routes only fire when a prompt explicitly carries the matching hint. The default request path uses the agent's primary `model_provider`.
 
+An unknown `hint:<name>` logs a warning and stays in the default reliability domain while preserving the literal hint as the requested model. A pinned default entry still serves its active/default pin. An unpinned default entry forwards the literal value, which the provider may reject before normal fallback or error handling continues.
+
 `model_provider` is always a provider profile reference in dotted `<type>.<alias>` form, such as `anthropic.sonnet` or `openai.default`. The profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and optional default model. The `model` field is provider-local state under that profile.
 
-> **Current limitation:** Route pinning depends on the target profile. The primary target is pinned to the active/default model used to construct the router. A non-primary target with a configured profile model is pinned to that model, so `model_routes[].model` does not override it. A non-primary target without a configured model remains unpinned and receives the route model; its `fallback_models` are not materialized, although referenced fallback profiles are still walked. Keep the route model aligned with the target pin when one exists.
+> **Current limitation:** Route pinning depends on the target profile. The primary target is pinned to the active/default model used to construct the router, including when a recognized hint points back to the active primary profile; that hint's `model_routes[].model` value does not override the primary pin. A non-primary target with a configured profile model is pinned to that model, so its route model does not override the profile model either. A non-primary target without a configured model remains unpinned and receives the route model; its `fallback_models` are not materialized, although referenced fallback profiles are still walked. Keep the route model aligned with the target pin when one exists.
 
 ## Reliability fallback
 
