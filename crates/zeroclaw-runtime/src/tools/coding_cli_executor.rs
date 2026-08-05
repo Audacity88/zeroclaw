@@ -33,9 +33,19 @@ impl RuntimeCodingCliExecutor {
 impl CodingCliExecutor for RuntimeCodingCliExecutor {
     async fn output(&self, command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
         if let Some(reason) = self.sandbox.coding_cli_unsupported_reason() {
-            return Err(CodingCliExecutionError::Prepare(anyhow::anyhow!(
-                "sandbox backend '{}' cannot run coding CLI tools: {reason}",
-                self.sandbox.name()
+            let backend = self.sandbox.name();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "sandbox": backend,
+                        "reason": reason,
+                    })),
+                "coding CLI execution rejected because sandbox backend is unsupported"
+            );
+            return Err(CodingCliExecutionError::Prepare(anyhow::Error::msg(
+                format!("sandbox backend '{backend}' cannot run coding CLI tools: {reason}"),
             )));
         }
 
