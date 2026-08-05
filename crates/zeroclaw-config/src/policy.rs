@@ -1433,6 +1433,14 @@ fn contains_unmodeled_shell_word_expansion(command: &str) -> bool {
         return true;
     }
 
+    // cmd.exe expands `%NAME%` variables, can expand `!NAME!` variables when
+    // delayed expansion is enabled by host policy, and removes caret escapes
+    // before launching the executable. The policy does not model those
+    // transforms, so reject them before command identity or Git risk is accepted.
+    if cfg!(target_os = "windows") && command.contains(['%', '!', '^']) {
+        return true;
+    }
+
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let mut chars = command.chars().peekable();
@@ -3666,6 +3674,30 @@ mod tests {
             err.contains("Command not allowed by security policy"),
             "{err}"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cmd_expansions_cannot_hide_git_write_verbs() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git %ZC_GIT_VERB%",
+            "git !ZC_GIT_VERB!",
+            "git co^mmit -m test",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("cmd.exe transformations must fail closed before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
     }
 
     #[test]
