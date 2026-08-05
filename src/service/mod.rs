@@ -1,14 +1,7 @@
 pub use zeroclaw_runtime::service::*;
 
 use crate::config::Config;
-use anyhow::{Context, Result};
-use std::path::Path;
-
-#[allow(dead_code)]
-pub async fn handle_run_launchd_daemon(config_dir: Option<&Path>) -> Result<()> {
-    let config_dir = config_dir.context("launchd runner requires --config-dir")?;
-    run_launchd_daemon(config_dir).await
-}
+use anyhow::Result;
 
 #[allow(dead_code)]
 pub fn handle_command(

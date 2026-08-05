@@ -3538,10 +3538,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
         ..
     } = &cli.command
     {
-        return service::handle_run_launchd_daemon(
-            cli.config_dir.as_deref().map(std::path::Path::new),
-        )
-        .await;
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("launchd runner requires --config-dir")?;
+        return service::run_launchd_daemon(config_dir).await;
     }
 
     // All other commands need config loaded first
