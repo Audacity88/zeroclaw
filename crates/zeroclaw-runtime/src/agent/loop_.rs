@@ -15749,9 +15749,13 @@ Let me check the result."#;
         provider.uri = Some(format!("http://{mock_addr}"));
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
-        config
-            .risk_profiles
-            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
         config.agents.insert(
             "test-agent".to_string(),
             AliasedAgentConfig {
