@@ -1418,7 +1418,21 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
         if next.is_ascii_alphanumeric()
             || matches!(
                 next,
-                '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
+                '_' | '{'
+                    | '('
+                    | '#'
+                    | '?'
+                    | '!'
+                    | '$'
+                    | '*'
+                    | '@'
+                    | '-'
+                    | '='
+                    | '+'
+                    | '^'
+                    | '~'
+                    | '['
+                    | '<'
             )
         {
             return true;
@@ -1525,7 +1539,7 @@ fn contains_unmodeled_shell_word_expansion(command: &str) -> bool {
                         assignment_name_valid = false;
                         continue;
                     }
-                    '$' if chars.peek().is_some_and(|next| *next == '\'') => {
+                    '$' if chars.peek().is_some_and(|next| matches!(*next, '\'' | '"')) => {
                         return true;
                     }
                     // Parentheses participate in extended-glob syntax in
@@ -3691,6 +3705,13 @@ mod tests {
             concat!("git -C . com\\", "\n", "mit -m test"),
             "git -C {.,commit} -m test",
             "git -C . $'commit' -m test",
+            "git -C . $\"commit\" -m test",
+            "git -C . $=verb -m test",
+            "git -C . $+verb -m test",
+            "git -C . $^verb -m test",
+            "git -C . $~verb -m test",
+            "git -C . \"$[2+3]\" -m test",
+            "git -C . \"$<\" -m test",
             "git -C . com* -m test",
             "git -C . @(commit) -m test",
             "git -C . +(commit) -m test",
