@@ -400,14 +400,13 @@ async fn stop_launchd_child(
     child: &mut Child,
     signal: libc::c_int,
 ) -> Result<std::process::ExitStatus> {
-    if let Err(error) = forward_launchd_signal(child, signal) {
-        if error
+    if let Err(error) = forward_launchd_signal(child, signal)
+        && error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::raw_os_error)
             != Some(libc::ESRCH)
-        {
-            return Err(error);
-        }
+    {
+        return Err(error);
     }
 
     match tokio::time::timeout(LAUNCHD_STOP_TIMEOUT, child.wait()).await {
