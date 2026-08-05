@@ -664,7 +664,7 @@ mod tests {
             .iter()
             .map(|name| {
                 Arc::new(CountingTool {
-                    name: *name,
+                    name,
                     calls: Arc::clone(&calls),
                 }) as Arc<dyn Tool>
             })
