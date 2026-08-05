@@ -636,13 +636,7 @@ fn skip_env_assignments(s: &str) -> &str {
         let Some(word) = rest.split_whitespace().next() else {
             return rest;
         };
-        // Environment assignment: contains '=' and starts with a letter or underscore
-        if word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        {
+        if is_env_assignment_word(word) {
             // Advance past this word
             rest = rest[word.len()..].trim_start();
         } else {
@@ -652,19 +646,20 @@ fn skip_env_assignments(s: &str) -> &str {
 }
 
 fn is_env_assignment_word(word: &str) -> bool {
-    word.contains('=')
-        && word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    env_assignment_name(word).is_some()
 }
 
 fn env_assignment_name(word: &str) -> Option<&str> {
-    let (name, _) = word.split_once('=')?;
-    if name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    let (raw_name, _) = word.split_once('=')?;
+    normalized_assignment_name(raw_name)
+}
+
+fn normalized_assignment_name(raw_name: &str) -> Option<&str> {
+    let name = raw_name.strip_suffix('+').unwrap_or(raw_name);
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         Some(name)
     } else {
@@ -833,16 +828,47 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
     segments
 }
 
-fn split_shell_words(segment: &str) -> Vec<String> {
+#[derive(Clone, Copy)]
+struct RedirectionMetadata {
+    marker_idx: usize,
+    operator_end: usize,
+    has_attached_word: bool,
+    prefix_is_unquoted: bool,
+    has_multiple_operators: bool,
+}
+
+struct ShellWord {
+    text: String,
+    assignment_name: Option<String>,
+    redirection: Option<RedirectionMetadata>,
+}
+
+fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
     let mut words = Vec::new();
     let mut current = String::new();
+    let mut assignment_name = None;
+    let mut assignment_prefix_is_unquoted = true;
+    let mut word_prefix_is_unquoted = true;
+    let mut redirection: Option<RedirectionMetadata> = None;
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let mut in_word = false;
 
-    let push_word = |words: &mut Vec<String>, current: &mut String, in_word: &mut bool| {
+    let push_word = |words: &mut Vec<ShellWord>,
+                     current: &mut String,
+                     assignment_name: &mut Option<String>,
+                     assignment_prefix_is_unquoted: &mut bool,
+                     word_prefix_is_unquoted: &mut bool,
+                     redirection: &mut Option<RedirectionMetadata>,
+                     in_word: &mut bool| {
         if *in_word {
-            words.push(std::mem::take(current));
+            words.push(ShellWord {
+                text: std::mem::take(current),
+                assignment_name: assignment_name.take(),
+                redirection: redirection.take(),
+            });
+            *assignment_prefix_is_unquoted = true;
+            *word_prefix_is_unquoted = true;
             *in_word = false;
         }
     };
@@ -859,13 +885,30 @@ fn split_shell_words(segment: &str) -> Vec<String> {
             }
             QuoteState::Double => {
                 if escaped {
-                    current.push(ch);
+                    if matches!(ch, '$' | '`' | '"' | '\\') {
+                        current.push(ch);
+                    } else if ch != '\n' {
+                        current.push('\\');
+                        current.push(ch);
+                    }
                     escaped = false;
+                    if assignment_name.is_none() {
+                        assignment_prefix_is_unquoted = false;
+                    }
+                    if redirection.is_none() {
+                        word_prefix_is_unquoted = false;
+                    }
+                    if let Some(redirection) = &mut redirection {
+                        redirection.has_attached_word = true;
+                    }
                     in_word = true;
                     continue;
                 }
                 match ch {
                     '\\' if cfg!(target_os = "windows") => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
                         current.push(ch);
                         in_word = true;
                     }
@@ -884,30 +927,100 @@ fn split_shell_words(segment: &str) -> Vec<String> {
                 if escaped {
                     current.push(ch);
                     escaped = false;
+                    if assignment_name.is_none() {
+                        assignment_prefix_is_unquoted = false;
+                    }
+                    if redirection.is_none() {
+                        word_prefix_is_unquoted = false;
+                    }
+                    if let Some(redirection) = &mut redirection {
+                        redirection.has_attached_word = true;
+                    }
                     in_word = true;
                     continue;
                 }
                 match ch {
                     '\\' if cfg!(target_os = "windows") => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
                         current.push(ch);
                         in_word = true;
                     }
                     '\\' => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
                         escaped = true;
                         in_word = true;
                     }
-                    '\'' => {
+                    '\'' if !cfg!(target_os = "windows") => {
+                        if assignment_name.is_none() {
+                            assignment_prefix_is_unquoted = false;
+                        }
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
                         quote = QuoteState::Single;
                         in_word = true;
                     }
                     '"' => {
+                        if assignment_name.is_none() {
+                            assignment_prefix_is_unquoted = false;
+                        }
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
                         quote = QuoteState::Double;
                         in_word = true;
                     }
                     _ if ch.is_whitespace() => {
-                        push_word(&mut words, &mut current, &mut in_word);
+                        push_word(
+                            &mut words,
+                            &mut current,
+                            &mut assignment_name,
+                            &mut assignment_prefix_is_unquoted,
+                            &mut word_prefix_is_unquoted,
+                            &mut redirection,
+                            &mut in_word,
+                        );
                     }
                     _ => {
+                        if ch == '=' && assignment_name.is_none() && assignment_prefix_is_unquoted {
+                            assignment_name =
+                                normalized_assignment_name(&current).map(str::to_string);
+                        }
+                        if matches!(ch, '<' | '>') {
+                            match &mut redirection {
+                                Some(redirection)
+                                    if !redirection.has_attached_word
+                                        && current.len() == redirection.operator_end =>
+                                {
+                                    redirection.operator_end += ch.len_utf8();
+                                }
+                                None => {
+                                    redirection = Some(RedirectionMetadata {
+                                        marker_idx: current.len(),
+                                        operator_end: current.len() + ch.len_utf8(),
+                                        has_attached_word: false,
+                                        prefix_is_unquoted: word_prefix_is_unquoted,
+                                        has_multiple_operators: false,
+                                    });
+                                }
+                                Some(redirection) => {
+                                    redirection.has_multiple_operators = true;
+                                    redirection.has_attached_word = true;
+                                }
+                            }
+                        } else if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
                         current.push(ch);
                         in_word = true;
                     }
@@ -919,49 +1032,105 @@ fn split_shell_words(segment: &str) -> Vec<String> {
     if escaped {
         current.push('\\');
     }
-    push_word(&mut words, &mut current, &mut in_word);
+    push_word(
+        &mut words,
+        &mut current,
+        &mut assignment_name,
+        &mut assignment_prefix_is_unquoted,
+        &mut word_prefix_is_unquoted,
+        &mut redirection,
+        &mut in_word,
+    );
     words
 }
 
-fn shell_words_after_env_assignments(segment: &str) -> Vec<String> {
-    let mut words = split_shell_words(segment);
-    let first_command = first_command_word_index(&words);
-    drop(words.drain(..first_command));
-    words
-}
-
-fn first_command_word_index(words: &[String]) -> usize {
-    words
+fn shell_words_after_env_assignments(segment: &str) -> Vec<ShellWord> {
+    let words = split_shell_words_with_metadata(segment);
+    let first_command = words
         .iter()
-        .position(|word| !is_env_assignment_word(word))
-        .unwrap_or(words.len())
+        .position(|word| word.assignment_name.is_none())
+        .unwrap_or(words.len());
+    words.into_iter().skip(first_command).collect()
+}
+
+struct NormalizedShellCommand {
+    assignment_names: Vec<String>,
+    words: Vec<String>,
+    has_ambiguous_redirection: bool,
+}
+
+fn normalized_shell_command(segment: &str) -> NormalizedShellCommand {
+    let raw_words = split_shell_words_with_metadata(segment);
+    let mut assignment_names = Vec::new();
+    let mut words = Vec::with_capacity(raw_words.len());
+    let mut has_ambiguous_redirection = false;
+    let mut before_executable = true;
+    let mut idx = 0;
+
+    while idx < raw_words.len() {
+        let raw = raw_words[idx].text.as_str();
+        if before_executable && let Some(name) = &raw_words[idx].assignment_name {
+            assignment_names.push(name.clone());
+            idx += 1;
+            continue;
+        }
+
+        let redirection_metadata = raw_words[idx].redirection;
+        if redirection_metadata.is_some_and(|metadata| metadata.has_multiple_operators) {
+            has_ambiguous_redirection = true;
+        }
+        let redirection = redirection_metadata.map_or(RedirectionArgument::None, |metadata| {
+            parse_redirection_argument_at(raw, metadata)
+        });
+        let (prefix, consumes_next) = match redirection {
+            RedirectionArgument::Target { prefix, .. } | RedirectionArgument::FdOnly { prefix } => {
+                (prefix, false)
+            }
+            RedirectionArgument::NeedsNextToken { prefix } => (prefix, true),
+            RedirectionArgument::None => {
+                words.push(raw_words[idx].text.clone());
+                before_executable = false;
+                idx += 1;
+                continue;
+            }
+        };
+
+        let is_io_number = !prefix.is_empty()
+            && prefix.chars().all(|c| c.is_ascii_digit())
+            && redirection_metadata.is_some_and(|metadata| metadata.prefix_is_unquoted);
+        if !prefix.is_empty() && !is_io_number {
+            words.push(prefix.to_string());
+            before_executable = false;
+        }
+        idx += if consumes_next { 2 } else { 1 };
+    }
+
+    NormalizedShellCommand {
+        assignment_names,
+        words,
+        has_ambiguous_redirection,
+    }
 }
 
 fn is_git_config_env_assignment_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("GIT_CONFIG_COUNT")
-        || name.eq_ignore_ascii_case("GIT_CONFIG_PARAMETERS")
-        || name
-            .get(..15)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_KEY_"))
-        || name
-            .get(..17)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_VALUE_"))
+    name.get(.."GIT_CONFIG_".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_"))
 }
 
-fn has_git_config_env_assignment_for_git(words: &[String]) -> bool {
-    let first_command = first_command_word_index(words);
-    let Some(executable) = words.get(first_command) else {
+fn has_git_config_env_assignment_for_git(command: &NormalizedShellCommand) -> bool {
+    let Some(executable) = command.words.first() else {
         return false;
     };
 
-    let base_owned = command_basename(strip_wrapping_quotes(executable)).to_ascii_lowercase();
+    let base_owned = command_basename(executable).to_ascii_lowercase();
     if strip_windows_exe_suffix(&base_owned) != "git" {
         return false;
     }
 
-    words[..first_command]
+    command
+        .assignment_names
         .iter()
-        .filter_map(|word| env_assignment_name(word))
+        .map(String::as_str)
         .any(is_git_config_env_assignment_name)
 }
 
@@ -1365,28 +1534,25 @@ enum RedirectionArgument<'a> {
     None,
 }
 
-fn parse_redirection_argument(token: &str) -> RedirectionArgument<'_> {
-    let Some(marker_idx) = token.find(['<', '>']) else {
-        return RedirectionArgument::None;
-    };
-    let prefix = token[..marker_idx].trim();
-    let mut rest = &token[marker_idx + 1..];
-    rest = rest.trim_start_matches(['<', '>']);
+fn parse_redirection_argument_at(
+    token: &str,
+    metadata: RedirectionMetadata,
+) -> RedirectionArgument<'_> {
+    let prefix = &token[..metadata.marker_idx];
+    let rest = &token[metadata.operator_end..];
     if let Some(after_amp) = rest.strip_prefix('&') {
-        let remaining = after_amp.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
-        if remaining.is_empty() {
+        if after_amp == "-"
+            || (!after_amp.is_empty() && after_amp.chars().all(|c| c.is_ascii_digit()))
+        {
             return RedirectionArgument::FdOnly { prefix };
         }
     }
-    rest = rest.trim_start_matches('&');
-    rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-    let trimmed = rest.trim();
-    if trimmed.is_empty() {
+    if rest.is_empty() && !metadata.has_attached_word {
         RedirectionArgument::NeedsNextToken { prefix }
     } else {
         RedirectionArgument::Target {
             prefix,
-            target: trimmed,
+            target: rest,
         }
     }
 }
@@ -1406,11 +1572,18 @@ fn is_safe_device_redirect_target(target: &str) -> bool {
     SAFE_DEVICE_REDIRECT_TARGETS.contains(&strip_wrapping_quotes(target).trim())
 }
 
-/// Extract the basename from a command path, handling both Unix (`/`) and
-/// Windows (`\`) separators so that `C:\Git\bin\git.exe` resolves to `git.exe`.
+/// Extract the basename using the current platform's path separators.
+/// Windows accepts both `/` and `\`, while Unix treats `\` as a literal.
 fn command_basename(raw: &str) -> &str {
     let after_fwd = raw.rsplit('/').next().unwrap_or(raw);
-    after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    #[cfg(target_os = "windows")]
+    {
+        after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        after_fwd
+    }
 }
 
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
@@ -1482,7 +1655,11 @@ impl SecurityPolicy {
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
-            let words = shell_words_after_env_assignments(&segment);
+            let normalized = normalized_shell_command(&segment);
+            if normalized.has_ambiguous_redirection {
+                return CommandRiskLevel::High;
+            }
+            let words = normalized.words;
             let Some(base_raw) = words.first() else {
                 continue;
             };
@@ -1625,14 +1802,12 @@ impl SecurityPolicy {
     fn is_command_explicitly_allowed(&self, command: &str) -> bool {
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            let words = shell_words_after_env_assignments(segment);
-            let raw_executable =
-                strip_wrapping_quotes(words.first().map(String::as_str).unwrap_or_default()).trim();
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
+            let normalized = normalized_shell_command(segment);
+            if normalized.has_ambiguous_redirection {
+                return false;
+            }
+            let words = normalized.words;
+            let executable = words.first().map(String::as_str).unwrap_or_default();
             let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
             let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
 
@@ -1656,7 +1831,8 @@ impl SecurityPolicy {
 
         // At least one real command must be present.
         segments.iter().any(|s| {
-            shell_words_after_env_assignments(s.trim())
+            normalized_shell_command(s.trim())
+                .words
                 .first()
                 .is_some_and(|w| !w.is_empty())
         })
@@ -1722,22 +1898,14 @@ impl SecurityPolicy {
         // Split on unquoted command separators and validate each sub-command.
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            let mut words = split_shell_words(segment);
-            if has_git_config_env_assignment_for_git(&words) {
+            let normalized = normalized_shell_command(segment);
+            if normalized.has_ambiguous_redirection
+                || has_git_config_env_assignment_for_git(&normalized)
+            {
                 return false;
             }
-            let first_command = first_command_word_index(&words);
-            drop(words.drain(..first_command));
-            let raw_executable =
-                strip_wrapping_quotes(words.first().map(String::as_str).unwrap_or_default()).trim();
-            // Strip inline redirections from the executable token, e.g.
-            // `cat</dev/null` -> `cat`, so the allowlist check sees the real
-            // command name rather than the redirect target path.
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
+            let words = normalized.words;
+            let executable = words.first().map(String::as_str).unwrap_or_default();
             let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
             let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
 
@@ -1766,7 +1934,8 @@ impl SecurityPolicy {
 
         // At least one command must be present
         segments.iter().any(|s| {
-            shell_words_after_env_assignments(s.trim())
+            normalized_shell_command(s.trim())
+                .words
                 .first()
                 .is_some_and(|w| !w.is_empty())
         })
@@ -1869,7 +2038,11 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let executable_redirect = parse_redirection_argument(strip_wrapping_quotes(executable));
+            let executable_redirect = executable
+                .redirection
+                .map_or(RedirectionArgument::None, |metadata| {
+                    parse_redirection_argument_at(&executable.text, metadata)
+                });
             let mut next_is_redirect_target = false;
             // Cover inline forms like `cat</etc/passwd`.
             match executable_redirect {
@@ -1887,7 +2060,7 @@ impl SecurityPolicy {
             }
 
             for token in words.iter().skip(1) {
-                let candidate = strip_wrapping_quotes(token).trim();
+                let candidate = strip_wrapping_quotes(&token.text).trim();
                 if candidate.is_empty() {
                     continue;
                 }
@@ -1907,7 +2080,12 @@ impl SecurityPolicy {
                     continue;
                 }
 
-                match parse_redirection_argument(candidate) {
+                let redirection = token
+                    .redirection
+                    .map_or(RedirectionArgument::None, |metadata| {
+                        parse_redirection_argument_at(&token.text, metadata)
+                    });
+                match redirection {
                     RedirectionArgument::Target { prefix, target } => {
                         if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
                             return Some(blocked);
@@ -3285,6 +3463,16 @@ mod tests {
             "ZC_ALIAS='!/usr/bin/true' git --config-env alias.zcprobe=ZC_ALIAS zcprobe",
             "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.zcprobe GIT_CONFIG_VALUE_0='!/usr/bin/true' git zcprobe",
             "GIT_CONFIG_PARAMETERS='alias.zcprobe=!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_COUNT+=1 git zcprobe",
+            "GIT_CONFIG_KEY_0+=alias.zcprobe git zcprobe",
+            "GIT_CONFIG_VALUE_0+='!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_PARAMETERS+='alias.zcprobe=!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
+            "GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "GIT_CONFIG_NOGLOBAL=1 git zcprobe",
+            "GIT_CONFIG_NOSYSTEM=1 git zcprobe",
+            "GIT_CONFIG_GLOBAL=./zc-config >/dev/null git zcprobe",
+            ">/dev/null GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
             "git -c alias.zcprobe='!/usr/bin/true' zcprobe",
             "git -calias.zcprobe='!/usr/bin/true' zcprobe",
             "git '-c' foo.bar=ENV status",
@@ -3303,10 +3491,28 @@ mod tests {
             );
         }
 
+        for command in [
+            "git 2>&1> /dev/null commit -m test",
+            "git <&0> /dev/null commit -m test",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("ambiguous packed redirections must fail closed");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
         let env_status = p
             .validate_command_execution("FOO=bar git status", false)
             .expect("benign environment assignments should remain allowed");
         assert_eq!(env_status, CommandRiskLevel::Low);
+        let quoted_env_status = p
+            .validate_command_execution(r#"FOO="bar" git status"#, false)
+            .expect("quoted assignment values should remain allowed");
+        assert_eq!(quoted_env_status, CommandRiskLevel::Low);
 
         let status = p
             .validate_command_execution("git status", false)
@@ -3320,6 +3526,32 @@ mod tests {
             commit_denied.contains("medium-risk operation"),
             "{commit_denied}"
         );
+
+        for command in [
+            ">/dev/null git commit -m test",
+            "FOO=bar >/dev/null git commit -m test",
+            "<<<payload git commit -m test",
+            "git -C . 2>&1 commit -m test",
+            "git -C . >/dev/null commit -m test",
+            "git -C . <<<payload commit -m test",
+            "git -C . <<< payload commit -m test",
+            r#"git -C . <<<" " commit -m test"#,
+            r#"git -C . <<<"" commit -m test"#,
+            r#"git -C . <<<'' commit -m test"#,
+            "git -C . <<<123 commit -m test",
+            r#"git -C . <<<"<" commit -m test"#,
+            r#"git -C . <<<">" commit -m test"#,
+            "git -C . <<<\\  commit -m test",
+            "git -C . commit -m test 2>&1",
+            "git -C . commit -m test >/dev/null",
+            "git -C . commit -m test <<<payload",
+        ] {
+            assert!(p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("redirections must not hide a Git write verb");
+            assert!(err.contains("medium-risk operation"), "{command}: {err}");
+        }
 
         let commit_allowed = p
             .validate_command_execution("git commit -m test", true)
@@ -3338,6 +3570,43 @@ mod tests {
             .validate_command_execution("git -C . commit -m test", true)
             .expect("runtime-approved Git write verb behind global options should remain allowed");
         assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_literal_backslash_executable_is_not_allowlist_match() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            r#""g\it" status"#,
+            r#"'foo\git' status"#,
+            r#"'git>helper' status"#,
+            r#""git<helper" status"#,
+            r#""FOO=bar" git status"#,
+            r#"FOO\=bar git status"#,
+            r#"git\" status"#,
+            r#"\"git status"#,
+            r#""git\"" status"#,
+            r#"'git ' status"#,
+            r#"' git' status"#,
+            "git\\  status",
+            r#"'git '>/dev/null status"#,
+            r#"' git'>/dev/null status"#,
+            r#"'2'>/dev/null git status"#,
+            r#"\2>/dev/null git status"#,
+            "git\\ >/dev/null status",
+        ] {
+            let result = p.validate_command_execution(command, false);
+            assert!(result.is_err(), "{command}: {result:?}");
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -3376,6 +3645,23 @@ mod tests {
         let err = p
             .validate_command_execution("c\\at ./src/main.rs", false)
             .expect_err("Windows path separators must not become allowlisted command text");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_single_quotes_remain_literal_executable_text() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("g'i't.exe status", false)
+            .expect_err("cmd.exe single quotes must not normalize to an allowlisted executable");
         assert!(
             err.contains("Command not allowed by security policy"),
             "{err}"
@@ -4311,6 +4597,16 @@ mod tests {
         // Single-quoted variant of the same shape.
         assert_eq!(
             p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_ignores_quoted_redirection_markers() {
+        let p = unix_forbidden_path_policy();
+
+        assert_eq!(
+            p.forbidden_path_argument("cat 'literal>' --file=/etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
