@@ -2041,6 +2041,11 @@ impl SecurityPolicy {
                             || arg.starts_with("alias.")
                     })
             }
+            // `env` is also a command carrier. Its option, assignment, and
+            // child-command grammar varies across platforms, so accepting
+            // arguments here would let the nested executable bypass this
+            // allowlist and risk-classification boundary.
+            "env" => args.is_empty(),
             "python" | "python3" => !args
                 .iter()
                 .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
@@ -3536,7 +3541,7 @@ mod tests {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             require_approval_for_medium_risk: true,
-            allowed_commands: vec!["git".into()],
+            allowed_commands: vec!["git".into(), "env".into()],
             ..SecurityPolicy::default()
         };
 
@@ -3562,6 +3567,9 @@ mod tests {
             "git '--config-env' foo.bar=ENV status",
             "git '--config-env=foo.bar=ENV' status",
             "git --config-env\\=foo.bar=ENV status",
+            "env GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
+            "/usr/bin/env GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "env git status",
         ] {
             assert!(!p.is_command_allowed(command), "{command}");
             let err = p
@@ -3572,6 +3580,12 @@ mod tests {
                 "{err}"
             );
         }
+
+        assert!(p.is_command_allowed("env"));
+        let env_only = p
+            .validate_command_execution("env", false)
+            .expect("bare env has no nested command to bypass policy");
+        assert_eq!(env_only, CommandRiskLevel::Low);
 
         for command in [
             "git 2>&1> /dev/null commit -m test",
