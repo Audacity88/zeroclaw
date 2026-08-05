@@ -269,6 +269,18 @@ impl SqliteSessionBackend {
         Ok(())
     }
 
+    fn sync_staged_jsonl(path: &Path, name: &str) -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        options.write(true);
+        options
+            .open(path)
+            .with_context(|| format!("Failed to open staged JSONL session {name} for sync"))?
+            .sync_all()
+            .with_context(|| format!("Failed to sync staged JSONL session {name}"))
+    }
+
     fn restore_uncommitted_jsonl(staged_path: &Path, live_path: &Path) -> Result<()> {
         if live_path.exists() {
             bail!(
@@ -491,7 +503,12 @@ impl SqliteSessionBackend {
                     .with_context(|| format!("Failed to stage JSONL session {name} for import"))?;
             }
 
-            let (source_hash, source_len) = match fingerprint(&staged_path, &name) {
+            let prepared_source = (|| -> Result<(String, i64)> {
+                Self::sync_staged_jsonl(&staged_path, &name)?;
+                Self::sync_parent_directory(&staged_path)?;
+                fingerprint(&staged_path, &name)
+            })();
+            let (source_hash, source_len) = match prepared_source {
                 Ok(fingerprint) => fingerprint,
                 Err(import_error) => {
                     if candidate_may_have_committed_receipt {
@@ -508,7 +525,7 @@ impl SqliteSessionBackend {
                     return match Self::restore_uncommitted_jsonl(&staged_path, &live_path) {
                         Ok(()) => Err(import_error),
                         Err(restore_error) => Err(restore_error.context(format!(
-                            "JSONL fingerprint for {name} failed before import: {import_error:#}"
+                            "JSONL staging preparation for {name} failed before import: {import_error:#}"
                         ))),
                     };
                 }
@@ -580,6 +597,7 @@ impl SqliteSessionBackend {
                     .with_context(|| format!("Failed to open staged JSONL session {name}"))?;
                 let now = Utc::now().to_rfc3339();
                 let mut inserted = 0_i64;
+                let mut has_non_whitespace_source = false;
                 {
                     let mut insert = tx
                         .prepare(
@@ -591,10 +609,18 @@ impl SqliteSessionBackend {
                         let line = line.with_context(|| {
                             format!("Failed to read staged JSONL session {name}")
                         })?;
-                        let Some(line) = std::str::from_utf8(&line).ok() else {
-                            continue;
+                        let line = match std::str::from_utf8(&line) {
+                            Ok(line) => line.trim(),
+                            Err(_) => {
+                                has_non_whitespace_source = true;
+                                continue;
+                            }
                         };
-                        let Ok(message) = serde_json::from_str::<ChatMessage>(line.trim()) else {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        has_non_whitespace_source = true;
+                        let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
                             continue;
                         };
                         insert
@@ -604,7 +630,7 @@ impl SqliteSessionBackend {
                     }
                 }
 
-                if inserted == 0 {
+                if inserted == 0 && has_non_whitespace_source {
                     bail!("JSONL session {name} contains no valid messages to import");
                 }
                 tx.execute(
@@ -1651,6 +1677,69 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn migrate_from_jsonl_preserves_cleared_and_whitespace_only_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        let store = SessionStore::new(tmp.path()).unwrap();
+        store
+            .append("cleared_user", &ChatMessage::user("before clear"))
+            .unwrap();
+        assert_eq!(store.clear_messages("cleared_user").unwrap(), 1);
+        std::fs::write(
+            sessions_dir.join("whitespace_user.jsonl"),
+            " \n\t\n\u{2003}\n",
+        )
+        .unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 2);
+
+        assert!(backend.load("cleared_user").is_empty());
+        assert!(backend.load("whitespace_user").is_empty());
+        let mut sessions = backend.list_sessions();
+        sessions.sort();
+        assert_eq!(sessions, vec!["cleared_user", "whitespace_user"]);
+        for key in ["cleared_user", "whitespace_user"] {
+            assert!(!sessions_dir.join(format!("{key}.jsonl")).exists());
+            assert!(sessions_dir.join(format!("{key}.jsonl.migrated")).exists());
+        }
+
+        let conn = backend.conn.lock();
+        let zero_count_metadata: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_metadata WHERE message_count = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jsonl_import_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(zero_count_metadata, 2);
+        assert_eq!(receipt_count, 2);
+    }
+
+    #[test]
+    fn migrate_from_jsonl_rejects_invalid_utf8_without_messages() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let jsonl_path = sessions_dir.join("invalid_utf8.jsonl");
+        std::fs::write(&jsonl_path, [0xff, b'\n']).unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let err = backend.migrate_from_jsonl(tmp.path()).unwrap_err();
+
+        assert!(err.to_string().contains("no valid messages"));
+        assert!(jsonl_path.exists());
+        assert!(!sessions_dir.join("invalid_utf8.jsonl.importing").exists());
+        assert!(!sessions_dir.join("invalid_utf8.jsonl.migrated").exists());
+        assert!(backend.list_sessions().is_empty());
     }
 
     #[test]
