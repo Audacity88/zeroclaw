@@ -8108,15 +8108,27 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        let state = linq_test_state_with_config("work", None, config);
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
 
         let message = "hello from linq work alias";
         let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
 
         let response = Box::pin(handle_linq_webhook_alias(
             State(state),
             Path("work".to_string()),
-            HeaderMap::new(),
+            headers,
             Bytes::from(body),
         ))
         .await
@@ -8162,14 +8174,28 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        let state = linq_test_state_with_config("work", None, config);
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
 
         let message = "do not route me to alpha";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
         let response = Box::pin(handle_linq_webhook_alias(
             State(state),
             Path("work".to_string()),
-            HeaderMap::new(),
-            Bytes::from(linq_webhook_body("+15551234567", message)),
+            headers,
+            Bytes::from(body),
         ))
         .await
         .into_response();
