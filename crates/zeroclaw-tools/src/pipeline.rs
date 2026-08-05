@@ -782,7 +782,14 @@ mod tests {
         ];
 
         for (case, step, policy) in cases {
-            let tool = PipelineTool::with_access_policy(config.clone(), vec![], Some(policy));
+            let tool = PipelineTool::with_access_policy(
+                config.clone(),
+                vec![Arc::new(EchoTool {
+                    name: step.to_string(),
+                    output: String::new(),
+                })],
+                Some(policy),
+            );
             let request = PipelineRequest {
                 steps: vec![PipelineStep {
                     tool: step.to_string(),
