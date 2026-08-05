@@ -131,7 +131,8 @@ impl PipelineTool {
         for step in &request.steps {
             let globally_allowed = self.allowed_set.contains(&step.tool);
             let caller_allowed = self.policy_allows_exact_name(&step.tool);
-            if !globally_allowed || !caller_allowed {
+            let child_exists = self.find_tool(&step.tool).is_some();
+            if !globally_allowed || !caller_allowed || !child_exists {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
         }
@@ -619,7 +620,19 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(
+            config,
+            vec![
+                Arc::new(EchoTool {
+                    name: "shell".into(),
+                    output: String::new(),
+                }),
+                Arc::new(EchoTool {
+                    name: "file_read".into(),
+                    output: String::new(),
+                }),
+            ],
+        );
 
         let request = PipelineRequest {
             steps: vec![
@@ -671,7 +684,14 @@ mod tests {
             ]),
             ..ToolAccessPolicy::default()
         };
-        let tool = PipelineTool::with_access_policy(config, vec![], Some(policy));
+        let tool = PipelineTool::with_access_policy(
+            config,
+            vec![Arc::new(EchoTool {
+                name: "shell".into(),
+                output: String::new(),
+            })],
+            Some(policy),
+        );
         let request = PipelineRequest {
             steps: vec![PipelineStep {
                 tool: "shell".into(),
@@ -699,7 +719,14 @@ mod tests {
             ]),
             ..ToolAccessPolicy::default()
         };
-        let tool = PipelineTool::with_access_policy(config, vec![], Some(policy));
+        let tool = PipelineTool::with_access_policy(
+            config,
+            vec![Arc::new(EchoTool {
+                name: "file_read".into(),
+                output: String::new(),
+            })],
+            Some(policy),
+        );
         let request = PipelineRequest {
             steps: vec![PipelineStep {
                 tool: "file_read".into(),

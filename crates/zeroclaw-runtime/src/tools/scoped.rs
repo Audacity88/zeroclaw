@@ -164,6 +164,11 @@ impl ScopedAssembled {
     }
 }
 
+fn tool_allowed_in_context(name: &str, exclude_memory: bool, acp_delivery: bool) -> bool {
+    (!exclude_memory || !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&name))
+        && (acp_delivery || name != "deliver_file")
+}
+
 impl ScopedToolRegistry {
     /// Mint a scoped, gated registry from already-built eager tools. The single seam
     /// every construction path goes through.
@@ -217,10 +222,15 @@ impl ScopedToolRegistry {
         // Mint the pipeline only after the effective caller policy is known. The
         // same immutable Arc is used for top-level registration and any
         // skill-scoped builtin elevation, so no unrestricted copy can escape.
+        let context_filtered_tool_arcs: Vec<Arc<dyn Tool>> = unfiltered_tool_arcs
+            .iter()
+            .filter(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery))
+            .cloned()
+            .collect();
         let pipeline_tool = config.pipeline.enabled.then(|| {
             Arc::new(tools::PipelineTool::with_access_policy(
                 config.pipeline.clone(),
-                unfiltered_tool_arcs.clone(),
+                context_filtered_tool_arcs.clone(),
                 zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
                     security.allowed_tools.as_deref(),
                     security.excluded_tools.as_deref(),
@@ -252,18 +262,11 @@ impl ScopedToolRegistry {
             );
         }
 
-        // 3. Documented divergence: ACP strips persistent memory tools.
-        if exclude_memory {
-            tools_registry.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
-        }
-
-        // 3b. `deliver_file` is an ACP-only delivery surface: only an ACP-capable
-        //     turn transports the typed attachment it emits, so every other path
-        //     drops it rather than let it report a false success on a channel that
-        //     silently discards the artifact (see the delivery-contract fix).
-        if !acp_delivery {
-            tools_registry.retain(|t| t.name() != "deliver_file");
-        }
+        // 3. Apply the assembly context to every executable view. Pipeline children
+        //    were minted above from this same predicate, so nested execution cannot
+        //    recover memory or delivery tools removed from the outer registry.
+        tools_registry
+            .retain(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery));
 
         // 4. MCP: scope servers per `mcp_bundles` (omission is not a grant), then gate
         //    each tool. Skipped only when this path does not connect MCP (ACP) or MCP
@@ -526,8 +529,8 @@ impl ScopedToolRegistry {
         }
 
         // 5. Skills (uniform: the gateway used to skip them). Registered under the same
-        //    `SecurityPolicy`, resolving builtin/MCP elevation against the pre-filter arcs.
-        let resolution_registry: Vec<Arc<dyn Tool>> = unfiltered_tool_arcs
+        //    `SecurityPolicy`, resolving builtin elevation against context-filtered arcs.
+        let resolution_registry: Vec<Arc<dyn Tool>> = context_filtered_tool_arcs
             .iter()
             .cloned()
             .chain(mcp_elevation_arcs.iter().cloned())
@@ -653,28 +656,38 @@ mod tests {
         }
     }
 
-    fn built_with_pipeline(calls: Arc<AtomicUsize>) -> AllToolsResult {
-        let shell: Arc<dyn Tool> = Arc::new(CountingTool {
-            name: "shell",
-            calls: Arc::clone(&calls),
-        });
-        let file_write: Arc<dyn Tool> = Arc::new(CountingTool {
-            name: "file_write",
-            calls,
-        });
+    fn built_with_counting_tools(
+        calls: Arc<AtomicUsize>,
+        names: &[&'static str],
+    ) -> AllToolsResult {
+        let unfiltered_tool_arcs: Vec<Arc<dyn Tool>> = names
+            .iter()
+            .map(|name| {
+                Arc::new(CountingTool {
+                    name: *name,
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn Tool>
+            })
+            .collect();
+        let tools = unfiltered_tool_arcs
+            .iter()
+            .cloned()
+            .map(|tool| Box::new(tools::ArcToolRef(tool)) as Box<dyn Tool>)
+            .collect();
         AllToolsResult {
-            tools: vec![
-                Box::new(tools::ArcToolRef(Arc::clone(&shell))),
-                Box::new(tools::ArcToolRef(Arc::clone(&file_write))),
-            ],
+            tools,
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             poll_handle: None,
             escalate_handle: None,
             channel_room_handle: None,
-            unfiltered_tool_arcs: vec![shell, file_write],
+            unfiltered_tool_arcs,
         }
+    }
+
+    fn built_with_pipeline(calls: Arc<AtomicUsize>) -> AllToolsResult {
+        built_with_counting_tools(calls, &["shell", "file_write"])
     }
 
     async fn assemble_pipeline(
@@ -869,6 +882,161 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn assert_pipeline_context_prevalidates_excluded_tool(
+        child_name: &'static str,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        parallel: bool,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut config = Config::default();
+        config.pipeline.enabled = true;
+        config.pipeline.allowed_tools = vec!["shell".to_string(), child_name.to_string()];
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec![
+                tools::PipelineTool::NAME.to_string(),
+                "shell".to_string(),
+                child_name.to_string(),
+            ]),
+            ..SecurityPolicy::default()
+        });
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built: built_with_counting_tools(Arc::clone(&calls), &["shell", child_name]),
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory,
+            acp_delivery,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .all(|tool| tool.name() != child_name),
+            "context-excluded tool must be absent from the outer registry"
+        );
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .expect("context filtering must not remove the admitted pipeline");
+        let result = pipeline
+            .execute(serde_json::json!({
+                "steps": [
+                    {"tool": "shell", "args": {}},
+                    {"tool": child_name, "args": {}}
+                ],
+                "parallel": parallel
+            }))
+            .await
+            .expect("pipeline denial is a tool result, not a transport error");
+
+        assert!(!result.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sequential_pipeline_prevalidates_memory_excluded_by_assembly_context() {
+        assert_pipeline_context_prevalidates_excluded_tool("memory_recall", true, true, false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn parallel_pipeline_prevalidates_memory_excluded_by_assembly_context() {
+        assert_pipeline_context_prevalidates_excluded_tool("memory_recall", true, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn sequential_pipeline_prevalidates_delivery_outside_acp_context() {
+        assert_pipeline_context_prevalidates_excluded_tool("deliver_file", false, false, false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn parallel_pipeline_prevalidates_delivery_outside_acp_context() {
+        assert_pipeline_context_prevalidates_excluded_tool("deliver_file", false, false, true)
+            .await;
+    }
+
+    async fn assert_skill_context_excludes_tool(
+        child_name: &'static str,
+        exclude_memory: bool,
+        acp_delivery: bool,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "context-filtered builtin wrapper".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![SkillTool {
+                name: "restricted".to_string(),
+                description: "wrap a context-restricted builtin".to_string(),
+                kind: "builtin".to_string(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some(child_name.to_string()),
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec!["ops__restricted".to_string()]),
+            ..SecurityPolicy::default()
+        });
+        let config = Config::default();
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built: built_with_counting_tools(Arc::clone(&calls), &[child_name]),
+            skills: std::slice::from_ref(&skill),
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory,
+            acp_delivery,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .all(|tool| tool.name() != "ops__restricted")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn skill_cannot_recover_memory_excluded_by_assembly_context() {
+        assert_skill_context_excludes_tool("memory_recall", true, true).await;
+    }
+
+    #[tokio::test]
+    async fn skill_cannot_recover_delivery_outside_acp_context() {
+        assert_skill_context_excludes_tool("deliver_file", false, false).await;
     }
 
     async fn assemble_names(
