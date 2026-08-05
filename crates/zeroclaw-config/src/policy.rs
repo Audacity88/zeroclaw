@@ -1443,6 +1443,10 @@ fn contains_unmodeled_shell_word_expansion(command: &str) -> bool {
 
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let mut at_tilde_prefix = true;
+    let mut assignment_name_valid = true;
+    let mut assignment_name_len = 0usize;
+    let mut in_assignment_value = false;
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -1451,46 +1455,103 @@ fn contains_unmodeled_shell_word_expansion(command: &str) -> bool {
                 if ch == '\'' {
                     quote = QuoteState::None;
                 }
+                at_tilde_prefix = false;
+                assignment_name_valid = false;
                 continue;
             }
             QuoteState::Double => {
                 if escaped {
                     escaped = false;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
                     continue;
                 }
                 if ch == '"' {
                     quote = QuoteState::None;
                 }
+                at_tilde_prefix = false;
+                assignment_name_valid = false;
                 continue;
             }
             QuoteState::None => {
                 if escaped {
                     escaped = false;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch.is_whitespace() || matches!(ch, '|' | '&' | ';' | '<' | '>') {
+                    at_tilde_prefix = true;
+                    assignment_name_valid = true;
+                    assignment_name_len = 0;
+                    in_assignment_value = false;
+                    continue;
+                }
+                if ch == '='
+                    && !in_assignment_value
+                    && assignment_name_valid
+                    && assignment_name_len > 0
+                {
+                    in_assignment_value = true;
+                    at_tilde_prefix = true;
+                    continue;
+                }
+                if ch == ':' && in_assignment_value {
+                    at_tilde_prefix = true;
                     continue;
                 }
                 match ch {
                     '\'' => {
                         quote = QuoteState::Single;
+                        at_tilde_prefix = false;
+                        assignment_name_valid = false;
                         continue;
                     }
                     '"' => {
                         quote = QuoteState::Double;
+                        at_tilde_prefix = false;
+                        assignment_name_valid = false;
                         continue;
                     }
                     '$' if chars.peek().is_some_and(|next| *next == '\'') => {
                         return true;
                     }
-                    '{' | '}' | '*' | '?' | '[' => return true,
+                    // Parentheses participate in extended-glob syntax in
+                    // supported configurable shells such as ksh. Even when
+                    // the operator prefix is otherwise ordinary text, the
+                    // shell can replace the token after policy validation.
+                    // zsh EXTENDED_GLOB also gives unquoted `#` and `^`
+                    // pattern meaning, while infix `~` excludes a pattern.
+                    // Preserve leading and assignment-value `~` expansion.
+                    '{' | '}' | '(' | ')' | '*' | '?' | '[' | '^' => return true,
+                    '#' if cfg!(not(target_os = "windows")) => return true,
+                    '~' if cfg!(not(target_os = "windows")) && !at_tilde_prefix => return true,
                     _ => {}
                 }
+                if !in_assignment_value {
+                    let valid_name_char = if assignment_name_len == 0 {
+                        ch.is_ascii_alphabetic() || ch == '_'
+                    } else {
+                        ch.is_ascii_alphanumeric()
+                            || ch == '_'
+                            || (ch == '+' && chars.peek().is_some_and(|next| *next == '='))
+                    };
+                    assignment_name_valid &= valid_name_char;
+                    assignment_name_len += 1;
+                }
+                at_tilde_prefix = false;
             }
         }
     }
@@ -3631,6 +3692,10 @@ mod tests {
             "git -C {.,commit} -m test",
             "git -C . $'commit' -m test",
             "git -C . com* -m test",
+            "git -C . @(commit) -m test",
+            "git -C . +(commit) -m test",
+            "git -C . !(status) -m test",
+            "git -C . ^status -m test",
         ] {
             let err = p
                 .validate_command_execution(command, false)
@@ -3639,6 +3704,33 @@ mod tests {
                 err.contains("Command not allowed by security policy"),
                 "{err}"
             );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        for command in ["git -C . com#mit -m test", "git -C . crates~status -m test"] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("zsh extended glob must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        assert!(!contains_unmodeled_shell_word_expansion(
+            "git -C ~/repo status"
+        ));
+        assert!(!contains_unmodeled_shell_word_expansion(
+            "FOO=~/repo git status"
+        ));
+        assert!(!contains_unmodeled_shell_word_expansion(
+            "FOO=x:~/repo git status"
+        ));
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(!contains_unmodeled_shell_word_expansion("echo C#"));
+            assert!(!contains_unmodeled_shell_word_expansion("echo file~backup"));
         }
     }
 
