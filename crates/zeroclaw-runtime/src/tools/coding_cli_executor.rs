@@ -32,12 +32,22 @@ impl RuntimeCodingCliExecutor {
 #[async_trait]
 impl CodingCliExecutor for RuntimeCodingCliExecutor {
     async fn output(&self, command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
+        if let Some(reason) = self.sandbox.coding_cli_unsupported_reason() {
+            return Err(CodingCliExecutionError::Prepare(anyhow::anyhow!(
+                "sandbox backend '{}' cannot run coding CLI tools: {reason}",
+                self.sandbox.name()
+            )));
+        }
+
         let timeout_secs = command.timeout_secs;
         let mut process = if self.use_native_argv {
             native_command(&command)
         } else {
-            let env_keys: Vec<&OsStr> =
-                command.env.iter().map(|(key, _)| key.as_os_str()).collect();
+            let env_keys: Vec<&OsStr> = command
+                .runtime_env_keys
+                .iter()
+                .map(|key| key.as_os_str())
+                .collect();
             self.runtime
                 .build_shell_command_with_env_keys(
                     &shell_command(&command),
@@ -227,6 +237,32 @@ mod tests {
     }
 
     #[cfg(not(target_os = "windows"))]
+    struct UnsupportedSandbox;
+
+    #[cfg(not(target_os = "windows"))]
+    impl Sandbox for UnsupportedSandbox {
+        fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+            panic!("unsupported coding CLI sandbox should not wrap commands")
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "unsupported-sandbox"
+        }
+
+        fn description(&self) -> &str {
+            "test unsupported sandbox"
+        }
+
+        fn coding_cli_unsupported_reason(&self) -> Option<&'static str> {
+            Some("test unsupported sandbox")
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
     struct ReplacingPwdSandbox;
 
     #[cfg(not(target_os = "windows"))]
@@ -370,6 +406,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn unsupported_sandbox_rejects_coding_cli_before_runtime_wrapping() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let seen_command = Arc::new(Mutex::new(None));
+        let runtime = Arc::new(FakeRuntime {
+            seen_command: Arc::clone(&seen_command),
+        });
+        let executor =
+            RuntimeCodingCliExecutor::shared(runtime, Arc::new(UnsupportedSandbox), false);
+        let command = CodingCliCommand::new("codex", workspace.path().to_path_buf(), 5);
+
+        let error = executor
+            .output(command)
+            .await
+            .expect_err("unsupported sandbox should fail during command preparation");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("unsupported-sandbox"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("test unsupported sandbox"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            seen_command.lock().expect("fake runtime mutex").is_none(),
+            "unsupported sandbox should fail before runtime command rendering"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn replacing_sandbox_preserves_validated_working_dir() {
         let workspace = tempfile::TempDir::new().expect("temp workspace");
@@ -407,6 +475,7 @@ mod tests {
         let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(NoopSandbox), false);
         let mut command = CodingCliCommand::new("codex", workspace.path().to_path_buf(), 5);
         command.env("ZC_CLI_TOKEN", "secret-value-visible-only-to-child-env");
+        command.runtime_env_key("ZC_CLI_TOKEN");
 
         let output = executor
             .output(command)
@@ -418,6 +487,33 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "secret-value-visible-only-to-child-env"
         );
+        assert_eq!(
+            *seen_env_keys.lock().expect("env-forwarding runtime mutex"),
+            vec![OsString::from("ZC_CLI_TOKEN")]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn runtime_env_key_forwarding_omits_implicit_safe_env() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let seen_env_keys = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(EnvForwardingRuntime {
+            seen_env_keys: Arc::clone(&seen_env_keys),
+        });
+        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(NoopSandbox), false);
+        let mut command = CodingCliCommand::new("codex", workspace.path().to_path_buf(), 5);
+        command.env("PATH", "/host/bin");
+        command.env("HOME", "/host/home");
+        command.env("ZC_CLI_TOKEN", "secret-value-visible-only-to-child-env");
+        command.runtime_env_key("ZC_CLI_TOKEN");
+
+        let output = executor
+            .output(command)
+            .await
+            .expect("runtime command should receive selected environment");
+
+        assert!(output.status.success());
         assert_eq!(
             *seen_env_keys.lock().expect("env-forwarding runtime mutex"),
             vec![OsString::from("ZC_CLI_TOKEN")]

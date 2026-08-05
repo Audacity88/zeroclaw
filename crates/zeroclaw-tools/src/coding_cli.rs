@@ -11,6 +11,7 @@ pub struct CodingCliCommand {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
+    pub runtime_env_keys: Vec<OsString>,
     pub working_dir: PathBuf,
     pub timeout_secs: u64,
 }
@@ -21,6 +22,7 @@ impl CodingCliCommand {
             program: program.into(),
             args: Vec::new(),
             env: Vec::new(),
+            runtime_env_keys: Vec::new(),
             working_dir,
             timeout_secs,
         }
@@ -42,6 +44,14 @@ impl CodingCliCommand {
 
     pub fn env(&mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> &mut Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    pub fn runtime_env_key(&mut self, key: impl Into<OsString>) -> &mut Self {
+        let key = key.into();
+        if !self.runtime_env_keys.contains(&key) {
+            self.runtime_env_keys.push(key);
+        }
         self
     }
 }
@@ -129,6 +139,7 @@ pub fn add_safe_env(command: &mut CodingCliCommand, safe_vars: &[&str], passthro
             && let Ok(val) = std::env::var(trimmed)
         {
             command.env(trimmed, val);
+            command.runtime_env_key(trimmed);
         }
     }
 }
@@ -171,5 +182,23 @@ mod tests {
                 OsString::from("codex")
             );
         }
+    }
+
+    #[test]
+    fn runtime_env_keys_are_explicit_and_deduplicated() {
+        let mut command = CodingCliCommand::new("codex", PathBuf::from("."), 5);
+
+        command.env("PATH", "/usr/bin");
+        command.runtime_env_key("OPENAI_API_KEY");
+        command.runtime_env_key("OPENAI_API_KEY");
+
+        assert_eq!(
+            command.env,
+            vec![(OsString::from("PATH"), OsString::from("/usr/bin"))]
+        );
+        assert_eq!(
+            command.runtime_env_keys,
+            vec![OsString::from("OPENAI_API_KEY")]
+        );
     }
 }
