@@ -4855,6 +4855,7 @@ mod tests {
         let mut manager = test_manager();
         let mut editable = field("example.name");
         editable.value = Some(serde_json::Value::String("alpha beta".into()));
+        editable.populated = true;
         manager.fields = vec![editable];
         manager.screen = Screen::FieldEdit {
             section_idx: 0,
