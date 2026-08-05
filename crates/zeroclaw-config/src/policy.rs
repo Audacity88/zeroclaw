@@ -1112,12 +1112,14 @@ fn normalized_shell_command(segment: &str) -> NormalizedShellCommand {
     }
 }
 
-fn is_git_config_env_assignment_name(name: &str) -> bool {
-    name.get(.."GIT_CONFIG_".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_"))
+fn is_git_process_control_env_assignment_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("GIT_EXEC_PATH")
+        || name
+            .get(.."GIT_CONFIG_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_"))
 }
 
-fn has_git_config_env_assignment_for_git(command: &NormalizedShellCommand) -> bool {
+fn has_git_process_control_env_assignment_for_git(command: &NormalizedShellCommand) -> bool {
     let Some(executable) = command.words.first() else {
         return false;
     };
@@ -1131,7 +1133,7 @@ fn has_git_config_env_assignment_for_git(command: &NormalizedShellCommand) -> bo
         .assignment_names
         .iter()
         .map(String::as_str)
-        .any(is_git_config_env_assignment_name)
+        .any(is_git_process_control_env_assignment_name)
 }
 
 fn is_git_write_verb(verb: &str) -> bool {
@@ -1982,7 +1984,7 @@ impl SecurityPolicy {
         for segment in &segments {
             let normalized = normalized_shell_command(segment);
             if normalized.has_ambiguous_redirection
-                || has_git_config_env_assignment_for_git(&normalized)
+                || has_git_process_control_env_assignment_for_git(&normalized)
             {
                 return false;
             }
@@ -2037,6 +2039,8 @@ impl SecurityPolicy {
                     && !args.iter().any(|arg| {
                         arg == "--config-env"
                             || arg.starts_with("--config-env=")
+                            || arg == "--exec-path"
+                            || arg.starts_with("--exec-path=")
                             || arg == "config"
                             || arg.starts_with("config.")
                             || arg == "alias"
@@ -3539,7 +3543,7 @@ mod tests {
     }
 
     #[test]
-    fn git_command_scope_config_rejected_at_policy_boundary() {
+    fn git_command_scope_process_controls_rejected_at_policy_boundary() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             require_approval_for_medium_risk: true,
@@ -3569,6 +3573,9 @@ mod tests {
             "git '--config-env' foo.bar=ENV status",
             "git '--config-env=foo.bar=ENV' status",
             "git --config-env\\=foo.bar=ENV status",
+            "git --exec-path ./tools zcprobe",
+            "git --exec-path=./tools zcprobe",
+            "GIT_EXEC_PATH=./tools git zcprobe",
             "env GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
             "/usr/bin/env GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
             "env git status",
@@ -3576,7 +3583,7 @@ mod tests {
             assert!(!p.is_command_allowed(command), "{command}");
             let err = p
                 .validate_command_execution(command, false)
-                .expect_err("command-scope Git config must be rejected before execution");
+                .expect_err("command-scope Git process controls must fail before execution");
             assert!(
                 err.contains("Command not allowed by security policy"),
                 "{err}"
