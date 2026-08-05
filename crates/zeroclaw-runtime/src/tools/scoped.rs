@@ -783,6 +783,7 @@ mod tests {
             }],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
         let security = Arc::new(SecurityPolicy {
@@ -995,6 +996,7 @@ mod tests {
             }],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
         let security = Arc::new(SecurityPolicy {
