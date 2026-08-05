@@ -1,6 +1,6 @@
 # Multi-Model Setup
 
-A walkthrough of the common patterns for using multiple model providers: per-agent dispatch, hint routes, cost tiering, local-first with hosted backup, provider fallback, and rate-limit handling.
+A walkthrough of the common patterns for using multiple model providers: per-agent dispatch, hint routes, cost tiering, local-first with hosted backup, non-streaming provider fallback, rate-limit handling, and streaming recovery.
 
 > **Reference material** for the provider system lives in:
 > - [Model Providers → Overview](../providers/overview.md): what providers are, configuration shape
@@ -15,7 +15,7 @@ Multi-model configuration is useful for:
 2. **Capability routing**: vision-capable model for image-bearing channels, reasoning model for research workflows
 3. **Local-first development**: local Ollama for development, hosted endpoint for production
 4. **Per-team isolation**: different teams use different agents with different model_providers and credentials
-5. **Rate-limit handling**: move to another configured provider profile after a retryable `429`
+5. **Non-streaming rate-limit handling**: move to another configured provider profile after a retryable `429`
 
 ## Core idea: per-agent dispatch
 
@@ -25,13 +25,17 @@ To run multiple models, run multiple agents, each binding to one model provider.
 
 ## Cross-provider reliability
 
-ZeroClaw can walk an ordered fallback graph across provider profiles. Each fallback profile keeps its own endpoint, credentials, model, headers, capability overrides, and nested fallback declarations. The runtime retries or advances according to the error classification and profile cooldown state.
+For non-streaming calls, ZeroClaw can walk an ordered fallback graph across provider profiles. Each fallback profile keeps its own endpoint, credentials, model, headers, capability overrides, and nested fallback declarations. The runtime retries or advances according to the error classification and profile cooldown state.
 
 OpenRouter remains a first-class provider and can perform vendor selection behind one endpoint. It is an optional external routing layer, not a requirement for ZeroClaw's first-party fallback.
 
-## Retry and fallback
+## Non-streaming retry and fallback
 
-For transient errors such as a network failure, `503`, or timeout, ZeroClaw retries with bounded exponential backoff, configurable globally under `reliability` (defaults: 2 retries, 500 ms initial backoff). After an entry is exhausted, the reliable wrapper advances through the profile's `fallback_models` and fallback profiles.
+For transient errors such as a network failure, `503`, or timeout, a non-streaming call retries with bounded exponential backoff, configurable globally under `reliability` (defaults: 2 retries, 500 ms initial backoff). After an entry is exhausted, the reliable wrapper advances through the profile's `fallback_models` and fallback profiles.
+
+## Streaming recovery boundary
+
+A streaming call selects the first eligible, non-cooling entry that supports the required stream capabilities. It does not advance to another entry after that stream starts. If the stream fails before visible output reaches an immutable consumer, the runtime retries the whole call through the non-streaming path, which can walk the fallback graph. Once visible output exists, the runtime preserves the partial response and does not replay the request or switch providers. See [Provider routing lifecycle](../architecture/provider-routing-lifecycle.md#streaming-and-replay-boundary) for the complete contract.
 
 ## API key rotation limitation
 
@@ -101,9 +105,9 @@ Run two agents and route channels to the appropriate tier. The `delegate` tool l
 
 The frontline agent handles every inbound message on Haiku. When it needs deeper reasoning, it calls the `delegate` tool with `agent = "heavy"`; because both agents share the `trusted` risk profile and that profile allows delegation, the heavier agent picks up the sub-task on Opus.
 
-## Error handling
+## Non-streaming error handling
 
-Retryable failures include:
+For non-streaming calls, retryable failures include:
 
 1. **Timeout**: provider did not respond within the configured timeout
 2. **Connection error**: network or DNS failure
