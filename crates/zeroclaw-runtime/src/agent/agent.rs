@@ -1070,6 +1070,9 @@ impl Agent {
         if self.temperature != Some(0.0)
             || self.response_cache.is_none()
             || self.memory_injection_active()
+            || zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .try_with(Option::is_some)
+                .unwrap_or(false)
             || self
                 .hook_runner
                 .as_ref()
@@ -7472,6 +7475,81 @@ mod tests {
         let mut agent_b = build("personal", "answer-b", seen_b.clone(), cache);
         assert_eq!(agent_a.turn("same request").await.unwrap(), "answer-a");
         assert_eq!(agent_b.turn("same request").await.unwrap(), "answer-b");
+        assert_eq!(seen_a.lock().len(), 1);
+        assert_eq!(seen_b.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_native_thinking_overrides() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let build =
+            |answer: &str,
+             seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+             cache: Arc<zeroclaw_memory::response_cache::ResponseCache>| {
+                Agent::builder()
+                    .model_provider(Box::new(TranscriptCaptureModelProvider {
+                        alias: "thinking-provider".into(),
+                        responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            text: Some(answer.into()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        }]),
+                        seen_messages: seen,
+                    }))
+                    .model_provider_name("provider-family".into())
+                    .tools(vec![])
+                    .memory(memory())
+                    .observer(Arc::from(crate::observability::NoopObserver {}))
+                    .response_cache(Some(cache))
+                    .tool_dispatcher(Box::new(NativeToolDispatcher))
+                    .workspace_dir(tmp.path().to_path_buf())
+                    .model_name("shared-model".into())
+                    .temperature(Some(0.0))
+                    .turn_datetime(fixed_response_cache_turn_datetime)
+                    .build()
+                    .expect("agent should build")
+            };
+
+        let mut agent_a = build("answer-a", seen_a.clone(), cache.clone());
+        let mut agent_b = build("answer-b", seen_b.clone(), cache);
+        let answer_a = zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(
+                Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                    budget_tokens: 1_024,
+                }),
+                agent_a.turn("same request"),
+            )
+            .await
+            .unwrap();
+        let answer_b = zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(
+                Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                    budget_tokens: 2_048,
+                }),
+                agent_b.turn("same request"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answer_a, "answer-a");
+        assert_eq!(answer_b, "answer-b");
         assert_eq!(seen_a.lock().len(), 1);
         assert_eq!(seen_b.lock().len(), 1);
     }
