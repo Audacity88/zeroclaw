@@ -244,6 +244,7 @@ fn has_explicit_registry_term_context(
 
 fn has_markdown_link_reference(text: &str, context: &ContextualRegistryTerm) -> bool {
     let mut matching_link = false;
+    let mut visible_label = String::new();
 
     for event in Parser::new(text) {
         match event {
@@ -252,13 +253,19 @@ fn has_markdown_link_reference(text: &str, context: &ContextualRegistryTerm) -> 
                     .link_destinations
                     .iter()
                     .any(|candidate| dest_url.as_ref() == *candidate);
+                visible_label.clear();
             }
-            Event::Text(label) if matching_link => {
-                if label.trim() == context.text {
+            Event::Text(label) | Event::Code(label) if matching_link => {
+                visible_label.push_str(&label);
+            }
+            Event::SoftBreak | Event::HardBreak if matching_link => visible_label.push(' '),
+            Event::End(TagEnd::Link) => {
+                if matching_link && visible_label.trim() == context.text {
                     return true;
                 }
+                matching_link = false;
+                visible_label.clear();
             }
-            Event::End(TagEnd::Link) => matching_link = false,
             _ => {}
         }
     }
@@ -958,6 +965,8 @@ mod tests {
         for (source, term) in [
             ("[Signal](./signal.md)", "Signal"),
             ("[Filesystem](./filesystem.md)", "Filesystem"),
+            ("[**Signal**](./signal.md)", "Signal"),
+            ("[**Filesystem**](./filesystem.md)", "Filesystem"),
             ("[Signal](./channels/signal.md)", "Signal"),
             ("[Filesystem](./channels/filesystem.md)", "Filesystem"),
         ] {
@@ -978,6 +987,8 @@ mod tests {
     fn ignores_generic_labels_on_ambiguous_registry_link_destinations() {
         for source in [
             "[Filesystem components](./filesystem.md).",
+            "[Filesystem **components**](./filesystem.md).",
+            "[Filesystem `components`](./filesystem.md).",
             "memory, and identity (see [Filesystem components](./filesystem.md)), so by",
             "- [Filesystem components](./filesystem.md): the workspace, memory, and identity",
         ] {
