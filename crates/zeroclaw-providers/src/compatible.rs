@@ -33,6 +33,7 @@ pub struct OpenAiCompatibleModelProvider {
     pub alias: String,
     pub name: String,
     pub base_url: String,
+    canonical_base_url: Option<&'static str>,
     pub credential: Option<String>,
     auth_service: Option<AuthService>,
     auth_model_provider: Option<String>,
@@ -292,6 +293,7 @@ pub struct OpenAiCompatibleBuilder {
     alias: String,
     name: Option<String>,
     base_url: Option<String>,
+    canonical_base_url: Option<&'static str>,
     credential: Option<String>,
     auth_style: Option<AuthStyle>,
     supports_vision: bool,
@@ -340,6 +342,11 @@ impl OpenAiCompatibleBuilder {
     /// supplied them. Required.
     pub fn base_url(mut self, base_url: &str) -> Self {
         self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub(crate) fn canonical_base_url(mut self, base_url: &'static str) -> Self {
+        self.canonical_base_url = Some(base_url);
         self
     }
 
@@ -553,6 +560,7 @@ impl OpenAiCompatibleBuilder {
             alias: self.alias,
             name,
             base_url,
+            canonical_base_url: self.canonical_base_url,
             credential: self.credential,
             auth_service: self.auth_service,
             auth_model_provider: self.auth_model_provider,
@@ -591,6 +599,7 @@ impl OpenAiCompatibleModelProvider {
             alias: alias.to_string(),
             name: None,
             base_url: None,
+            canonical_base_url: None,
             credential: None,
             auth_style: None,
             supports_vision: false,
@@ -2484,6 +2493,10 @@ impl OpenAiCompatibleModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleModelProvider {
+    fn default_base_url(&self) -> Option<&str> {
+        self.canonical_base_url
+    }
+
     fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
         zeroclaw_api::model_provider::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,

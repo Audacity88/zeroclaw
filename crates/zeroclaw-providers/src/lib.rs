@@ -3026,6 +3026,10 @@ mod tests {
         assert_eq!(default_model_provider_url("custom"), None);
         assert_eq!(default_model_provider_url("gemini_cli"), None);
         assert_eq!(
+            default_model_provider_url("qianfan"),
+            Some(QIANFAN_BASE_URL)
+        );
+        assert_eq!(
             default_model_provider_url("morph"),
             Some("https://api.morphllm.com/v1")
         );
@@ -3053,6 +3057,32 @@ mod tests {
         assert_eq!(
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
+        );
+    }
+
+    #[test]
+    fn openrouter_context_window_url_uses_the_shared_default() {
+        for uri in [None, Some(""), Some("<unset>")] {
+            let config = zeroclaw_config::schema::ModelProviderConfig {
+                uri: uri.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                openrouter_context_window_url(&config),
+                "https://openrouter.ai/api/v1/models"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_context_window_url_preserves_the_configured_uri() {
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            uri: Some("https://proxy.example.test/openrouter/models".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            openrouter_context_window_url(&config),
+            "https://proxy.example.test/openrouter/models"
         );
     }
 
@@ -4533,13 +4563,9 @@ async fn fetch_openrouter_context_window(
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
     let client = reqwest::Client::new();
-    let url = config
-        .uri
-        .as_deref()
-        .filter(|s| !s.is_empty() && *s != "<unset>")
-        .unwrap_or("https://openrouter.ai/api/v1/models");
+    let url = openrouter_context_window_url(config);
     let resp = client
-        .get(url)
+        .get(url.as_ref())
         .send()
         .await
         .ok()?
@@ -4553,6 +4579,19 @@ async fn fetch_openrouter_context_window(
         .find(|m| m["id"].as_str() == Some(model))?["context_length"]
         .as_u64()
         .map(|v| v as usize)
+}
+
+fn openrouter_context_window_url(
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> std::borrow::Cow<'_, str> {
+    config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .map_or_else(
+            || std::borrow::Cow::Owned(openrouter::endpoint_url("models")),
+            std::borrow::Cow::Borrowed,
+        )
 }
 
 async fn fetch_openai_compatible_context_window(
