@@ -13,6 +13,9 @@ pub async fn get_status(state: State<'_, SharedState>) -> Result<serde_json::Val
 #[tauri::command]
 pub async fn get_health(state: State<'_, SharedState>) -> Result<bool, String> {
     let s = state.read().await;
+    if !s.daemon_capture_ownership.allows_dashboard() {
+        return Ok(false);
+    }
     let client = GatewayClient::new(&s.gateway_url, s.token.as_deref());
     drop(s);
     client.get_health().await.map_err(|e| e.to_string())

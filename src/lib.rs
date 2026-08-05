@@ -223,7 +223,9 @@ pub enum ServiceCommands {
         #[arg(long, hide = true)]
         port: Option<u16>,
         #[arg(long, hide = true)]
-        preflight: bool,
+        capture_status: bool,
+        #[arg(long, hide = true)]
+        ready_signal: bool,
     },
     /// Install daemon service unit for auto-start and restart
     Install,

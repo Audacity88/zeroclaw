@@ -12,6 +12,19 @@ pub enum AgentStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonCaptureOwnership {
+    Unknown,
+    Owned,
+    Blocked,
+}
+
+impl DaemonCaptureOwnership {
+    pub fn allows_dashboard(self) -> bool {
+        self == Self::Owned
+    }
+}
+
 /// Shared application state behind an `Arc<RwLock<_>>`.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -19,6 +32,7 @@ pub struct AppState {
     pub token: Option<String>,
     pub connected: bool,
     pub agent_status: AgentStatus,
+    pub daemon_capture_ownership: DaemonCaptureOwnership,
 }
 
 impl Default for AppState {
@@ -28,6 +42,7 @@ impl Default for AppState {
             token: None,
             connected: false,
             agent_status: AgentStatus::Idle,
+            daemon_capture_ownership: DaemonCaptureOwnership::Unknown,
         }
     }
 }
@@ -50,7 +65,18 @@ mod tests {
         assert_eq!(state.gateway_url, "http://127.0.0.1:42617");
         assert!(state.token.is_none());
         assert!(!state.connected);
+        assert_eq!(
+            state.daemon_capture_ownership,
+            DaemonCaptureOwnership::Unknown
+        );
         assert_eq!(state.agent_status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn dashboard_requires_owned_capture() {
+        assert!(!DaemonCaptureOwnership::Unknown.allows_dashboard());
+        assert!(DaemonCaptureOwnership::Owned.allows_dashboard());
+        assert!(!DaemonCaptureOwnership::Blocked.allows_dashboard());
     }
 
     #[test]

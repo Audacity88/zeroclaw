@@ -2,6 +2,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+use std::{io::BufRead, io::Read};
+
+const CAPTURE_READY: &str = "ZEROCLAW_SERVICE_CAPTURE_READY";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureStatus {
+    Active,
+    Inactive,
+}
 
 /// Filename of the kernel binary on the current platform.
 fn zeroclaw_exe_name() -> &'static str {
@@ -59,20 +69,11 @@ pub fn find_zeroclaw_binary() -> Option<PathBuf> {
 /// The child handle is returned but intentionally not reaped because the
 /// runner owns the background daemon lifecycle.
 pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
-    let mut preflight = daemon_command(binary, port);
-    let output = preflight.arg("--preflight").output()?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
-        return Err(std::io::Error::other(format!(
-            "daemon log capture preflight failed: {}",
-            message.trim()
-        )));
-    }
-
     let mut cmd = daemon_command(binary, port);
+    cmd.arg("--ready-signal");
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     // Detach so signals to the app's process group (e.g. Ctrl-C on a dev
     // `cargo run`) don't also stop the daemon, and so it survives app exit.
@@ -88,7 +89,67 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
         cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
     }
 
-    cmd.spawn()
+    let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("daemon readiness pipe unavailable"))?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .map(|_| line);
+        let _ = ready_tx.send(result);
+    });
+
+    match ready_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(line)) if line.trim() == CAPTURE_READY => {
+            if let Some(mut stderr) = child.stderr.take() {
+                std::thread::spawn(move || {
+                    let mut discard = [0_u8; 1024];
+                    while stderr.read(&mut discard).is_ok_and(|read| read > 0) {}
+                });
+            }
+            Ok(child)
+        }
+        outcome => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            let detail = match outcome {
+                Ok(Ok(line)) if !line.trim().is_empty() => line.trim().to_string(),
+                Ok(Ok(_)) => stderr.trim().to_string(),
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "timed out waiting for bounded capture".to_string(),
+            };
+            Err(std::io::Error::other(format!(
+                "daemon log capture did not become ready: {detail}"
+            )))
+        }
+    }
+}
+
+pub fn capture_status(binary: &Path, port: u16) -> std::io::Result<CaptureStatus> {
+    let output = daemon_command(binary, port)
+        .arg("--capture-status")
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "could not inspect daemon log capture: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "active" => Ok(CaptureStatus::Active),
+        "inactive" => Ok(CaptureStatus::Inactive),
+        other => Err(std::io::Error::other(format!(
+            "unexpected daemon capture status: {other}"
+        ))),
+    }
 }
 
 fn daemon_command(binary: &Path, port: u16) -> Command {
@@ -119,13 +180,24 @@ mod tests {
     }
 
     #[test]
-    fn desktop_preflight_uses_hidden_capture_check() {
+    fn desktop_status_uses_hidden_capture_check() {
         let mut command = daemon_command(Path::new("/tmp/zeroclaw"), 42617);
-        command.arg("--preflight");
+        command.arg("--capture-status");
         let args: Vec<_> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args.last().map(String::as_str), Some("--preflight"));
+        assert_eq!(args.last().map(String::as_str), Some("--capture-status"));
+    }
+
+    #[test]
+    fn desktop_actual_runner_emits_readiness() {
+        let mut command = daemon_command(Path::new("/tmp/zeroclaw"), 42617);
+        command.arg("--ready-signal");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), Some("--ready-signal"));
     }
 }

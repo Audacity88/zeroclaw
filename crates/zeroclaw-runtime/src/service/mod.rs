@@ -4,6 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -21,6 +22,75 @@ const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
 const SERVICE_RESTART_DELAY: Duration = Duration::from_secs(1);
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVICE_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+static PREPARED_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct PreparedFile {
+    destination: PathBuf,
+    temporary: PathBuf,
+    committed: bool,
+}
+
+impl PreparedFile {
+    fn new(destination: &Path, contents: &[u8], mode: u32) -> Result<Self> {
+        let parent = destination
+            .parent()
+            .context("service definition path has no parent directory")?;
+        fs::create_dir_all(parent)?;
+        let counter = PREPARED_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = destination
+            .file_name()
+            .context("service definition path has no file name")?
+            .to_string_lossy();
+        let temporary = parent.join(format!(
+            ".{name}.zeroclaw-new-{}-{counter}",
+            std::process::id()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("Failed to prepare {}", destination.display()))?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        Ok(Self {
+            destination: destination.to_path_buf(),
+            temporary,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        fs::rename(&self.temporary, &self.destination).with_context(|| {
+            format!(
+                "Failed to replace service definition {}",
+                self.destination.display()
+            )
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceDaemonProfile {
@@ -52,9 +122,14 @@ struct CaptureLock {
     _private: (),
 }
 
+enum CaptureLockAttempt {
+    Acquired(CaptureLock),
+    Contended,
+}
+
 impl CaptureLock {
     #[cfg(unix)]
-    fn acquire(path: &Path) -> Result<Self> {
+    fn try_acquire(path: &Path) -> Result<CaptureLockAttempt> {
         use std::os::fd::AsRawFd;
 
         if let Some(parent) = path.parent() {
@@ -76,19 +151,16 @@ impl CaptureLock {
             let error = std::io::Error::last_os_error();
             let code = error.raw_os_error();
             if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
-                bail!(
-                    "service log capture is already active for {}",
-                    path.display()
-                );
+                return Ok(CaptureLockAttempt::Contended);
             }
             return Err(error)
                 .with_context(|| format!("Failed to lock service logs at {}", path.display()));
         }
-        Ok(Self { _file: file })
+        Ok(CaptureLockAttempt::Acquired(Self { _file: file }))
     }
 
     #[cfg(windows)]
-    fn acquire(path: &Path) -> Result<Self> {
+    fn try_acquire(path: &Path) -> Result<CaptureLockAttempt> {
         use std::os::windows::fs::OpenOptionsExt;
 
         const ERROR_SHARING_VIOLATION: i32 = 32;
@@ -110,25 +182,34 @@ impl CaptureLock {
         {
             Ok(file) => file,
             Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
-                bail!(
-                    "service log capture is already active for {}",
-                    path.display()
-                );
+                return Ok(CaptureLockAttempt::Contended);
             }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("Failed to lock service logs at {}", path.display()));
             }
         };
-        Ok(Self { _file: file })
+        Ok(CaptureLockAttempt::Acquired(Self { _file: file }))
     }
 
     #[cfg(all(not(unix), not(windows)))]
-    fn acquire(path: &Path) -> Result<Self> {
+    fn try_acquire(path: &Path) -> Result<CaptureLockAttempt> {
         bail!(
             "service log capture locking is unsupported for {}",
             path.display()
         )
+    }
+
+    fn acquire(path: &Path) -> Result<Self> {
+        match Self::try_acquire(path)? {
+            CaptureLockAttempt::Acquired(lock) => Ok(lock),
+            CaptureLockAttempt::Contended => {
+                bail!(
+                    "service log capture is already active for {}",
+                    path.display()
+                )
+            }
+        }
     }
 }
 
@@ -522,8 +603,24 @@ fn linux_journalctl_args(config: &Config, lines: usize, follow: bool) -> Vec<Str
     args
 }
 
-fn linux_openrc_log_dir(config: &Config) -> PathBuf {
-    Path::new("/var/log").join(linux_openrc_service(config))
+fn service_base_from_config_dir(config_dir: &Path) -> String {
+    let Some(dir_name) = config_dir.file_name().and_then(|name| name.to_str()) else {
+        return "zeroclaw".to_string();
+    };
+    let base = dir_name.strip_prefix('.').unwrap_or(dir_name);
+    if base == "zeroclaw" {
+        return base.to_string();
+    }
+    if let Some(suffix) = base.strip_prefix("zeroclaw-")
+        && !suffix.is_empty()
+    {
+        return base.to_string();
+    }
+    "zeroclaw".to_string()
+}
+
+fn linux_openrc_log_dir(config_dir: &Path) -> PathBuf {
+    Path::new("/var/log").join(service_base_from_config_dir(config_dir))
 }
 
 fn macos_service_logs_dir(config: &Config) -> PathBuf {
@@ -535,7 +632,7 @@ fn macos_service_logs_dir(config: &Config) -> PathBuf {
 }
 
 fn service_capture_paths(
-    config: &Config,
+    config_dir: Option<&Path>,
     init_system: InitSystem,
     profile: ServiceDaemonProfile,
 ) -> Result<CapturePaths> {
@@ -545,19 +642,17 @@ fn service_capture_paths(
         ));
     }
 
+    let config_dir = config_dir.context("internal service runner requires --config-dir")?;
+
     let logs_dir = if cfg!(target_os = "macos") {
-        macos_service_logs_dir(config)
+        config_dir.join("logs")
     } else if cfg!(target_os = "linux") {
         if init_system.resolve()? != InitSystem::Openrc {
             bail!("the internal service log runner is only used by OpenRC on Linux");
         }
-        linux_openrc_log_dir(config)
+        linux_openrc_log_dir(config_dir)
     } else if cfg!(target_os = "windows") {
-        config
-            .config_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join("logs")
+        config_dir.join("logs")
     } else {
         bail!("the internal service log runner is unsupported on this platform");
     };
@@ -574,18 +669,34 @@ fn service_capture_paths(
 }
 
 pub async fn run_daemon(
-    config: &Config,
+    config_dir: Option<&Path>,
     init_system: InitSystem,
     profile: ServiceDaemonProfile,
+    ready_signal: bool,
 ) -> Result<()> {
-    let executable = std::env::current_exe().context("Failed to resolve current executable")?;
-    let config_dir = config
-        .config_path
-        .parent()
-        .context("Configured path has no parent directory")?
-        .to_path_buf();
-    let writers = CaptureWriters::open(service_capture_paths(config, init_system, profile)?)?;
-    let result = supervise_daemon(&executable, &config_dir, profile, &writers).await;
+    run_daemon_with_paths(
+        service_capture_paths(config_dir, init_system, profile)?,
+        config_dir,
+        profile,
+        ready_signal,
+        || std::env::current_exe().context("Failed to resolve current executable"),
+    )
+    .await
+}
+
+async fn run_daemon_with_paths(
+    paths: CapturePaths,
+    config_dir: Option<&Path>,
+    profile: ServiceDaemonProfile,
+    ready_signal: bool,
+    resolve_executable: impl FnOnce() -> Result<PathBuf>,
+) -> Result<()> {
+    let writers = CaptureWriters::open(paths)?;
+    let result = async {
+        let executable = resolve_executable()?;
+        supervise_daemon(&executable, config_dir, profile, &writers, ready_signal).await
+    }
+    .await;
     if let Err(error) = &result {
         writers
             .stderr
@@ -595,22 +706,46 @@ pub async fn run_daemon(
     result
 }
 
-pub async fn check_daemon_capture(
-    config: &Config,
+pub fn daemon_capture_is_active(
+    config_dir: Option<&Path>,
     init_system: InitSystem,
     profile: ServiceDaemonProfile,
-) -> Result<()> {
-    let writers = CaptureWriters::open(service_capture_paths(config, init_system, profile)?)?;
-    writers.finish().await;
-    Ok(())
+) -> Result<bool> {
+    let paths = service_capture_paths(config_dir, init_system, profile)?;
+    match CaptureLock::try_acquire(&paths.lock_path())? {
+        CaptureLockAttempt::Acquired(_lock) => Ok(false),
+        CaptureLockAttempt::Contended => Ok(true),
+    }
 }
 
 async fn supervise_daemon(
     executable: &Path,
-    config_dir: &Path,
+    config_dir: Option<&Path>,
     profile: ServiceDaemonProfile,
     writers: &CaptureWriters,
+    ready_signal: bool,
 ) -> Result<()> {
+    let ready = ready_signal.then_some(emit_capture_ready as fn() -> Result<()>);
+    supervise_daemon_with_ready(executable, config_dir, profile, writers, ready).await
+}
+
+fn emit_capture_ready() -> Result<()> {
+    println!("ZEROCLAW_SERVICE_CAPTURE_READY");
+    std::io::stdout()
+        .flush()
+        .context("Failed to signal capture readiness")
+}
+
+async fn supervise_daemon_with_ready<F>(
+    executable: &Path,
+    config_dir: Option<&Path>,
+    profile: ServiceDaemonProfile,
+    writers: &CaptureWriters,
+    mut ready: Option<F>,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
     #[cfg(unix)]
     let mut signals = SupervisorSignals::new()?;
     #[cfg(windows)]
@@ -618,9 +753,10 @@ async fn supervise_daemon(
 
     loop {
         let mut command = TokioCommand::new(executable);
+        if let Some(config_dir) = config_dir {
+            command.arg("--config-dir").arg(config_dir);
+        }
         command
-            .arg("--config-dir")
-            .arg(config_dir)
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -652,6 +788,9 @@ async fn supervise_daemon(
             .stderr
             .take()
             .context("daemon stderr pipe unavailable")?;
+        if let Some(signal_ready) = ready.take() {
+            signal_ready()?;
+        }
         let stdout_sink = writers.stdout.clone();
         let stderr_sink = writers.stderr.clone();
         let stdout_task = zeroclaw_spawn::spawn!(drain_pipe(stdout, stdout_sink));
@@ -892,6 +1031,29 @@ pub fn install(config: &Config, init_system: InitSystem) -> Result<()> {
     } else {
         anyhow::bail!("Service management is supported on macOS and Linux only");
     }
+}
+
+fn quiesce_legacy_launcher(
+    label: &str,
+    mut is_active: impl FnMut() -> Result<bool>,
+    mut stop: impl FnMut() -> Result<()>,
+    mut wait: impl FnMut(),
+) -> Result<()> {
+    if !is_active()? {
+        return Ok(());
+    }
+    stop().with_context(|| format!("Failed to stop existing {label}"))?;
+    for _ in 0..100 {
+        if !is_active()? {
+            return Ok(());
+        }
+        wait();
+    }
+    bail!("Timed out waiting for existing {label} to stop; launcher was not replaced")
+}
+
+fn wait_for_service_manager() {
+    thread::sleep(Duration::from_millis(100));
 }
 
 pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
@@ -1173,7 +1335,11 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
         }
         InitSystem::Openrc => {
             // OpenRC logs go to /var/log/<service>/error.log (as configured in the init script).
-            let log_dir = linux_openrc_log_dir(config);
+            let config_dir = config
+                .config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let log_dir = linux_openrc_log_dir(config_dir);
             let log_file = log_dir.join("error.log");
             if !log_file.exists() {
                 // Fall back to access log
@@ -1432,14 +1598,37 @@ fn install_macos(config: &Config) -> Result<()> {
     fs::create_dir_all(&logs_dir)?;
 
     let plist = render_macos_launch_agent_plist(&exe, config_dir, homebrew_var_dir.as_deref());
+    let prepared = PreparedFile::new(&file, plist.as_bytes(), 0o644)?;
 
-    fs::write(&file, plist)?;
+    quiesce_legacy_launcher(
+        "launchd service",
+        launchd_service_loaded,
+        || run_checked(Command::new("launchctl").arg("unload").arg("-w").arg(&file)),
+        wait_for_service_manager,
+    )?;
+    prepared.commit()?;
     println!("✅ Installed launchd service: {}", file.display());
     if let Some(ref var_dir) = homebrew_var_dir {
         println!("   Homebrew var: {}", var_dir.display());
     }
     println!("   Start with: zeroclaw service start");
     Ok(())
+}
+
+fn launchd_service_loaded() -> Result<bool> {
+    let output = Command::new("launchctl")
+        .arg("list")
+        .output()
+        .context("Failed to query launchd")?;
+    if !output.status.success() {
+        bail!(
+            "Failed to query launchd: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(SERVICE_LABEL)))
 }
 
 /// Renders the macOS LaunchAgent plist; path arguments are XML-escaped before interpolation,
@@ -1960,6 +2149,42 @@ fn resolve_openrc_executable() -> Result<PathBuf> {
     Ok(exe)
 }
 
+#[cfg(unix)]
+fn openrc_service_active(pidfile: &Path) -> Result<bool> {
+    let contents = match fs::read_to_string(pidfile) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read OpenRC pidfile {}", pidfile.display()));
+        }
+    };
+    let pid: i32 = contents
+        .trim()
+        .parse()
+        .with_context(|| format!("Invalid PID in OpenRC pidfile {}", pidfile.display()))?;
+    if pid <= 0 {
+        bail!("Invalid PID in OpenRC pidfile {}", pidfile.display());
+    }
+
+    // SAFETY: signal 0 performs an existence/permission probe and does not
+    // deliver a signal. The PID is validated as positive above.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to inspect OpenRC process {pid}")),
+    }
+}
+
+#[cfg(not(unix))]
+fn openrc_service_active(_pidfile: &Path) -> Result<bool> {
+    bail!("OpenRC process inspection is unsupported on this platform")
+}
+
 fn install_linux_openrc(config: &Config) -> Result<()> {
     if !is_root() {
         bail!(
@@ -1967,6 +2192,8 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
              Please run with sudo: sudo zeroclaw service install"
         );
     }
+
+    let init_path = Path::new("/etc/init.d/zeroclaw");
 
     ensure_zeroclaw_user()?;
 
@@ -2095,20 +2322,17 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     }
 
     let init_script = generate_openrc_script(&exe, config_dir);
-    let init_path = Path::new("/etc/init.d/zeroclaw");
-    fs::write(init_path, init_script)
-        .with_context(|| format!("Failed to write {}", init_path.display().to_string()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(init_path, fs::Permissions::from_mode(0o755)).with_context(|| {
-            format!(
-                "Failed to set permissions on {}",
-                init_path.display().to_string()
-            )
-        })?;
+    let prepared = PreparedFile::new(init_path, init_script.as_bytes(), 0o755)?;
+    if init_path.exists() {
+        let pidfile = Path::new("/run/zeroclaw.pid");
+        quiesce_legacy_launcher(
+            "OpenRC service",
+            || openrc_service_active(pidfile),
+            || run_checked(Command::new("rc-service").args(["zeroclaw", "stop"])),
+            wait_for_service_manager,
+        )?;
     }
+    prepared.commit()?;
 
     run_checked(Command::new("rc-update").args(["add", "zeroclaw", "default"]))?;
     println!("✅ Installed OpenRC service: /etc/init.d/zeroclaw");
@@ -2127,33 +2351,148 @@ fn install_windows(config: &Config) -> Result<()> {
     let logs_dir = base_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
-    remove_legacy_windows_service_wrappers(&base_dir);
-    let task_action = render_windows_service_action(&exe, &base_dir);
-
     let task_name = windows_task_name();
+    let task_action = render_windows_service_action(&exe, &base_dir);
+    let existing = windows_task_state(task_name)? == WindowsTaskState::Present;
+    if existing {
+        run_checked(Command::new("schtasks").args(["/Change", "/TN", task_name, "/Disable"]))?;
+    }
 
-    // Remove any existing task first (ignore errors if it doesn't exist)
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", task_name, "/F"])
-        .output();
+    let replace = (|| -> Result<()> {
+        if existing {
+            Command::new("schtasks")
+                .args(["/End", "/TN", task_name])
+                .output()
+                .context("Failed to ask Task Scheduler to end the existing task")?;
+            wait_for_windows_legacy_capture_release(&logs_dir)?;
+        }
+        run_checked(Command::new("schtasks").args([
+            "/Create",
+            "/TN",
+            task_name,
+            "/SC",
+            "ONLOGON",
+            "/TR",
+            &task_action,
+            "/RL",
+            "LIMITED",
+            "/F",
+        ]))
+    })();
+    if let Err(error) = replace {
+        if existing {
+            if let Err(restore_error) =
+                run_checked(Command::new("schtasks").args(["/Change", "/TN", task_name, "/Enable"]))
+            {
+                return Err(error.context(format!(
+                    "replacement failed and the prior scheduled task could not be re-enabled: {restore_error:#}"
+                )));
+            }
+        }
+        return Err(error);
+    }
 
-    run_checked(Command::new("schtasks").args([
-        "/Create",
-        "/TN",
-        task_name,
-        "/SC",
-        "ONLOGON",
-        "/TR",
-        &task_action,
-        "/RL",
-        "LIMITED",
-        "/F",
-    ]))?;
+    remove_legacy_windows_service_wrappers(&base_dir);
 
     println!("✅ Installed Windows scheduled task: {}", task_name);
     println!("   Action: {}", task_action);
     println!("   Logs: {}", logs_dir.display().to_string());
     println!("   Start with: zeroclaw service start");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsTaskState {
+    Absent,
+    Present,
+}
+
+#[cfg(any(windows, test))]
+fn classify_windows_task_query(
+    query_succeeded: bool,
+    xml: &str,
+    task_file_exists: Result<bool>,
+) -> Result<WindowsTaskState> {
+    if query_succeeded {
+        if xml.trim().is_empty() {
+            bail!("Task Scheduler returned an empty task definition");
+        }
+        return Ok(WindowsTaskState::Present);
+    }
+    if task_file_exists? {
+        bail!("Task Scheduler query failed for an existing ZeroClaw task");
+    }
+    Ok(WindowsTaskState::Absent)
+}
+
+#[cfg(windows)]
+fn windows_task_state(task_name: &str) -> Result<WindowsTaskState> {
+    let output = Command::new("schtasks")
+        .args(["/Query", "/TN", task_name, "/XML"])
+        .output()
+        .context("Failed to query Task Scheduler")?;
+    let task_file = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .context("SystemRoot is unavailable")?
+        .join("System32")
+        .join("Tasks")
+        .join(task_name);
+    classify_windows_task_query(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        task_file.try_exists().with_context(|| {
+            format!(
+                "Failed to inspect scheduled task file {}",
+                task_file.display()
+            )
+        }),
+    )
+}
+
+#[cfg(not(windows))]
+fn windows_task_state(_task_name: &str) -> Result<WindowsTaskState> {
+    Ok(WindowsTaskState::Absent)
+}
+
+fn wait_for_windows_legacy_capture_release(logs_dir: &Path) -> Result<()> {
+    let mut last_error = None;
+    for _ in 0..100 {
+        match verify_windows_legacy_capture_released(logs_dir) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        wait_for_service_manager();
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("legacy capture remained active")))
+        .context("Timed out waiting for the existing Windows service logs to be released")
+}
+
+#[cfg(windows)]
+fn verify_windows_legacy_capture_released(logs_dir: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    for name in ["daemon.stdout.log", "daemon.stderr.log"] {
+        let path = logs_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "Legacy service log {} is still open; stop the old daemon before reinstalling",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_windows_legacy_capture_released(_logs_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2443,11 +2782,11 @@ mod linux_service_tests {
     #[test]
     fn linux_openrc_log_dir_uses_named_instance() {
         assert_eq!(
-            linux_openrc_log_dir(&config_at("/home/user/.zeroclaw/config.toml")),
+            linux_openrc_log_dir(Path::new("/home/user/.zeroclaw")),
             PathBuf::from("/var/log/zeroclaw")
         );
         assert_eq!(
-            linux_openrc_log_dir(&config_at("/home/user/.zeroclaw-p100-104/config.toml")),
+            linux_openrc_log_dir(Path::new("/home/user/.zeroclaw-p100-104")),
             PathBuf::from("/var/log/zeroclaw-p100-104")
         );
     }
@@ -2828,9 +3167,10 @@ exit 9
             Duration::from_secs(20),
             supervise_daemon(
                 &executable,
-                dir.path(),
+                Some(dir.path()),
                 ServiceDaemonProfile::Service,
                 &writers,
+                false,
             ),
         )
         .await
@@ -2846,6 +3186,75 @@ exit 9
         assert!(stderr.len() as u64 <= SERVICE_LOG_MAX_BYTES);
         assert!(stdout.ends_with(b"stdout-2\n"));
         assert!(stderr.ends_with(b"stderr-2\n"));
+    }
+
+    #[tokio::test]
+    async fn failed_initial_spawn_does_not_signal_readiness() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let writers =
+            CaptureWriters::open(CapturePaths::Combined(dir.path().join("desktop.log"))).unwrap();
+        let signalled = Arc::new(AtomicBool::new(false));
+        let observed = signalled.clone();
+
+        let error = supervise_daemon_with_ready(
+            &dir.path().join("missing-zeroclaw"),
+            None,
+            ServiceDaemonProfile::Desktop { port: 42617 },
+            &writers,
+            Some(move || {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .await
+        .expect_err("missing initial child must fail");
+        writers.finish().await;
+
+        assert!(error.to_string().contains("Failed to start daemon child"));
+        assert!(!signalled.load(Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_initial_spawn_signals_readiness() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("daemon-fixture.sh");
+        fs::write(&executable, "#!/bin/sh\nexit 9\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let writers =
+            CaptureWriters::open(CapturePaths::Combined(dir.path().join("desktop.log"))).unwrap();
+        let signalled = Arc::new(AtomicBool::new(false));
+        let observed = signalled.clone();
+
+        let error = supervise_daemon_with_ready(
+            &executable,
+            None,
+            ServiceDaemonProfile::Desktop { port: 42617 },
+            &writers,
+            Some(move || {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .await
+        .expect_err("fixture exits unsuccessfully");
+        writers.finish().await;
+
+        assert!(error.to_string().contains("exit status: 9"));
+        assert!(signalled.load(Ordering::SeqCst));
     }
 
     #[cfg(any(unix, windows))]
@@ -2875,6 +3284,133 @@ exit 9
         .await
         .expect("capture lock should be released after the writer exits");
         replacement.finish().await;
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn capture_status_distinguishes_active_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop.log");
+
+        let writers = CaptureWriters::open(CapturePaths::Combined(path.clone())).unwrap();
+        let status =
+            match CaptureLock::try_acquire(&CapturePaths::Combined(path.clone()).lock_path())
+                .unwrap()
+            {
+                CaptureLockAttempt::Acquired(_) => false,
+                CaptureLockAttempt::Contended => true,
+            };
+        assert!(status, "held capture lock must report an active supervisor");
+        writers.finish().await;
+
+        let status =
+            match CaptureLock::try_acquire(&CapturePaths::Combined(path).lock_path()).unwrap() {
+                CaptureLockAttempt::Acquired(_) => false,
+                CaptureLockAttempt::Contended => true,
+            };
+        assert!(!status, "released capture lock must report inactive");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_failure_is_written_after_capture_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout.log");
+        let stderr_path = dir.path().join("stderr.log");
+        let error = run_daemon_with_paths(
+            CapturePaths::Split {
+                stdout: stdout_path,
+                stderr: stderr_path.clone(),
+            },
+            Some(dir.path()),
+            ServiceDaemonProfile::Service,
+            false,
+            || bail!("synthetic executable resolution failure"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic executable resolution failure")
+        );
+        assert!(
+            fs::read_to_string(stderr_path)
+                .unwrap()
+                .contains("synthetic executable resolution failure")
+        );
+    }
+
+    #[test]
+    fn legacy_handoff_waits_for_observed_stop() {
+        let mut checks = 0;
+        let mut stop_calls = 0;
+        quiesce_legacy_launcher(
+            "test launcher",
+            || {
+                checks += 1;
+                Ok(checks < 3)
+            },
+            || {
+                stop_calls += 1;
+                Ok(())
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(stop_calls, 1);
+        assert_eq!(checks, 3);
+    }
+
+    #[test]
+    fn legacy_handoff_timeout_preserves_existing_definition() {
+        let error =
+            quiesce_legacy_launcher("test launcher", || Ok(true), || Ok(()), || {}).unwrap_err();
+        assert!(error.to_string().contains("launcher was not replaced"));
+    }
+
+    #[test]
+    fn legacy_handoff_query_failure_does_not_stop_launcher() {
+        let mut stop_calls = 0;
+        let error = quiesce_legacy_launcher(
+            "test launcher",
+            || bail!("manager query failed"),
+            || {
+                stop_calls += 1;
+                Ok(())
+            },
+            || {},
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("manager query failed"));
+        assert_eq!(stop_calls, 0);
+    }
+
+    #[test]
+    fn prepared_file_replaces_definition_only_when_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("service-definition");
+        fs::write(&destination, b"old").unwrap();
+
+        let prepared = PreparedFile::new(&destination, b"new", 0o644).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
+        prepared.commit().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+    }
+
+    #[test]
+    fn windows_task_query_uses_status_and_xml_not_localized_state() {
+        assert_eq!(
+            classify_windows_task_query(true, "<Task />", Ok(false)).unwrap(),
+            WindowsTaskState::Present
+        );
+        assert_eq!(
+            classify_windows_task_query(false, "localized error", Ok(false)).unwrap(),
+            WindowsTaskState::Absent
+        );
+        assert!(classify_windows_task_query(false, "", Ok(true)).is_err());
+        assert!(classify_windows_task_query(true, "", Ok(false)).is_err());
     }
 
     #[test]

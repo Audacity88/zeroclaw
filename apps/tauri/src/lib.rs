@@ -10,7 +10,7 @@ pub mod state;
 pub mod tray;
 
 use gateway_client::GatewayClient;
-use state::shared_state;
+use state::{DaemonCaptureOwnership, shared_state};
 use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 /// Loopback port the desktop app expects the gateway/daemon on. Matches the
@@ -37,18 +37,61 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
         s.gateway_url.clone()
     };
     let client = GatewayClient::new(&url, None);
+    let binary = daemon::find_zeroclaw_binary();
 
     // Give an already-running gateway/daemon a moment to answer before we
     // decide nothing is there — avoids racing a daemon that's mid-startup.
     for _ in 0..3 {
         if client.get_health().await.unwrap_or(false) {
-            return; // Reuse the existing instance.
+            let status = match binary.clone() {
+                Some(binary) => tokio::task::spawn_blocking(move || {
+                    daemon::capture_status(&binary, GATEWAY_PORT)
+                })
+                .await
+                .map_err(|error| format!("capture status task failed: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string())),
+                None => Err("the ZeroClaw binary could not be located".to_string()),
+            };
+            match status {
+                Ok(daemon::CaptureStatus::Active) => {
+                    state.write().await.daemon_capture_ownership = DaemonCaptureOwnership::Owned;
+                    return;
+                }
+                Ok(daemon::CaptureStatus::Inactive) => {
+                    let mut shared = state.write().await;
+                    shared.daemon_capture_ownership = DaemonCaptureOwnership::Blocked;
+                    drop(shared);
+                    let _ = app.emit(
+                        "zeroclaw://splash-status",
+                        SplashStatus {
+                            kind: "error",
+                            message: "An existing ZeroClaw daemon predates bounded Desktop logs. Stop that daemon, then reopen ZeroClaw Desktop. The app left it running because it cannot prove Desktop owns the process.".to_string(),
+                        },
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let mut shared = state.write().await;
+                    shared.daemon_capture_ownership = DaemonCaptureOwnership::Blocked;
+                    drop(shared);
+                    let _ = app.emit(
+                        "zeroclaw://splash-status",
+                        SplashStatus {
+                            kind: "error",
+                            message: format!(
+                                "Couldn't verify bounded Desktop logging: {error}. Stop the existing daemon, then reopen ZeroClaw Desktop."
+                            ),
+                        },
+                    );
+                    return;
+                }
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     }
 
     // Nothing listening — start our own daemon.
-    match daemon::find_zeroclaw_binary() {
+    match binary {
         Some(bin) => {
             let _ = app.emit(
                 "zeroclaw://splash-status",
@@ -57,7 +100,14 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
                     message: "Starting the ZeroClaw daemon…".to_string(),
                 },
             );
-            if let Err(e) = daemon::spawn_daemon(&bin, GATEWAY_PORT) {
+            let started = tokio::task::spawn_blocking(move || {
+                daemon::spawn_daemon(&bin, GATEWAY_PORT).map(|_| ())
+            })
+            .await
+            .map_err(|error| std::io::Error::other(format!("daemon startup task failed: {error}")))
+            .and_then(|result| result);
+            if let Err(e) = started {
+                state.write().await.daemon_capture_ownership = DaemonCaptureOwnership::Blocked;
                 let _ = app.emit(
                     "zeroclaw://splash-status",
                     SplashStatus {
@@ -65,11 +115,14 @@ async fn ensure_daemon(app: tauri::AppHandle, state: state::SharedState) {
                         message: format!("Couldn't start the ZeroClaw daemon: {e}"),
                     },
                 );
+            } else {
+                state.write().await.daemon_capture_ownership = DaemonCaptureOwnership::Owned;
             }
             // On success the splash's health poll detects the daemon and
             // calls `open_dashboard`.
         }
         None => {
+            state.write().await.daemon_capture_ownership = DaemonCaptureOwnership::Blocked;
             let _ = app.emit(
                 "zeroclaw://splash-status",
                 SplashStatus {
@@ -127,6 +180,14 @@ async fn open_dashboard(
     app: tauri::AppHandle,
     state: tauri::State<'_, state::SharedState>,
 ) -> Result<(), String> {
+    if !state
+        .read()
+        .await
+        .daemon_capture_ownership
+        .allows_dashboard()
+    {
+        return Err("daemon startup is not owned by ZeroClaw Desktop".into());
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
