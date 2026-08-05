@@ -1623,12 +1623,11 @@ fn parse_redirection_argument_at(
 ) -> RedirectionArgument<'_> {
     let prefix = &token[..metadata.marker_idx];
     let rest = &token[metadata.operator_end..];
-    if let Some(after_amp) = rest.strip_prefix('&') {
-        if after_amp == "-"
-            || (!after_amp.is_empty() && after_amp.chars().all(|c| c.is_ascii_digit()))
-        {
-            return RedirectionArgument::FdOnly { prefix };
-        }
+    if let Some(after_amp) = rest.strip_prefix('&')
+        && (after_amp == "-"
+            || (!after_amp.is_empty() && after_amp.chars().all(|c| c.is_ascii_digit())))
+    {
+        return RedirectionArgument::FdOnly { prefix };
     }
     if rest.is_empty() && !metadata.has_attached_word {
         RedirectionArgument::NeedsNextToken { prefix }
