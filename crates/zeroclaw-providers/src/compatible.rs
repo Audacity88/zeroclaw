@@ -18,12 +18,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Max wait for the next streaming body read before the connection is treated
-/// as stalled. Streaming clients omit reqwest's overall `.timeout()` (it kills
-/// long-running responses mid-stream), so without a per-read bound a connection
-/// that goes silent after the headers park the body stream forever and the turn
-/// hangs on "working". `read_timeout` caps the gap between reads and converts a
-/// silent stall into a retryable stream error.
+/// Maximum silence between body reads for OpenAI-compatible SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
@@ -987,6 +982,12 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Extra fields merged at the top level of the serialized JSON body.
+    /// Mirrors `NativeChatRequest::extra_body` so config-driven extras
+    /// (`provider_extra`, `chat_template_kwargs`) reach the no-tools request
+    /// paths too, not just the native-tools path.
+    #[serde(flatten)]
+    extra_body: Option<serde_json::Value>,
 }
 
 /// OpenAI-compatible `stream_options.include_usage` toggle.
@@ -1695,7 +1696,7 @@ fn sse_bytes_to_chunks(
         // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
         let mut utf8_buf: Vec<u8> = Vec::new();
 
-        while let Some(item) = bytes_stream.next().await {
+        'stream: while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
                     utf8_buf.extend_from_slice(&bytes);
@@ -1726,6 +1727,10 @@ fn sse_bytes_to_chunks(
                     while let Some(pos) = buffer.find('\n') {
                         let line = buffer[..pos].to_string();
                         buffer.drain(..=pos);
+
+                        if line.trim().strip_prefix("data:").map(str::trim) == Some("[DONE]") {
+                            break 'stream;
+                        }
 
                         match parse_sse_line(&line) {
                             Ok(Some(chunk)) => {
@@ -1800,7 +1805,7 @@ fn sse_bytes_to_events_for_contract(
         let mut bytes_stream = response.bytes_stream();
         // Accumulate partial UTF-8 sequences split across chunk boundaries.
         let mut utf8_buf: Vec<u8> = Vec::new();
-        while let Some(item) = bytes_stream.next().await {
+        'stream: while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
                     utf8_buf.extend_from_slice(&bytes);
@@ -1847,6 +1852,7 @@ fn sse_bytes_to_events_for_contract(
                                     == Some("[DONE]")
                                 {
                                     saw_completion = true;
+                                    break 'stream;
                                 }
                                 continue;
                             }
@@ -2698,6 +2704,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         };
 
         let url = self.chat_completions_url();
@@ -2787,6 +2794,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         };
 
         let url = self.chat_completions_url();
@@ -3171,6 +3179,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
+                    extra_body: provider.extra_body.clone(),
                 })
             };
 
@@ -3322,6 +3331,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
+                extra_body: provider.extra_body.clone(),
             };
 
             let url = provider.chat_completions_url();
@@ -3440,6 +3450,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
+                extra_body: provider.extra_body.clone(),
             };
 
             let url = provider.chat_completions_url();
@@ -3757,6 +3768,87 @@ mod tests {
         events
     }
 
+    async fn open_sse_response(
+        body: &'static str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use axum::{Router, response::IntoResponse, routing::get};
+
+        let app = Router::new().route(
+            "/stream",
+            get(move || async move {
+                let first = futures_util::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        body.as_bytes(),
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind SSE test server");
+        let addr = listener.local_addr().expect("SSE test server address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve SSE test");
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .expect("request SSE test stream");
+        (response, server)
+    }
+
+    #[tokio::test]
+    async fn done_sentinel_finishes_chunk_stream_without_eof() {
+        let (response, server) = open_sse_response(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let mut stream = sse_bytes_to_chunks(response, false);
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("text delta must arrive before the connection closes")
+            .expect("chunk stream must yield text")
+            .expect("text chunk must be valid");
+        assert_eq!(first.delta, "hi");
+        let final_chunk = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("[DONE] must finish the stream without EOF")
+            .expect("chunk stream must yield Final")
+            .expect("Final chunk must be valid");
+        assert!(final_chunk.is_final);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn done_sentinel_finishes_event_stream_without_eof() {
+        let (response, server) = open_sse_response(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let mut stream = sse_bytes_to_events(response, false);
+        let mut saw_final = false;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = stream.next().await {
+                if matches!(event, Ok(StreamEvent::Final)) {
+                    saw_final = true;
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("[DONE] must finish the event stream without EOF");
+
+        server.abort();
+        assert!(saw_final, "terminal sentinel must emit Final");
+    }
+
     #[tokio::test]
     async fn eof_after_done_sentinel_emits_final() {
         let events = collect_stream_events(
@@ -3893,6 +3985,44 @@ mod tests {
     }
 
     #[test]
+    fn api_chat_request_flattens_extra_body_into_top_level() {
+        // Regression: the no-tools request struct (`chat_with_system`,
+        // `chat_with_history`, no-tools streaming) must also carry the
+        // config-driven `extra_body`, not just the native-tools path.
+        let req = ApiChatRequest {
+            model: "qwen".to_string(),
+            messages: vec![],
+            temperature: None,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            extra_body: Some(serde_json::json!({
+                "top_p": 0.95,
+                "chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"},
+            })),
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("top_p").and_then(serde_json::Value::as_f64),
+            Some(0.95),
+            "provider_extra keys must serialize at the top level of a no-tools request"
+        );
+        assert_eq!(
+            value.pointer("/chat_template_kwargs/reasoning_effort"),
+            Some(&serde_json::json!("max")),
+            "chat_template_kwargs must be nested under its own top-level key in a no-tools request"
+        );
+        assert!(
+            value.get("extra_body").is_none(),
+            "extra_body key itself must not appear in serialized JSON"
+        );
+    }
+
+    #[test]
     fn normalize_model_ids_trims_filters_and_sorts() {
         let body = serde_json::from_value(serde_json::json!({
             "data": [
@@ -3928,6 +4058,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -5182,6 +5313,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -5218,6 +5350,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5253,6 +5386,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -6777,6 +6911,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         }
     }
 
