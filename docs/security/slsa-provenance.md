@@ -1,6 +1,6 @@
 # SLSA Provenance Attestation
 
-**Last updated:** 2026-07-20
+**Last updated:** 2026-08-06
 
 **Related:** Issue #9101, PR #8277, RFC #8177
 
