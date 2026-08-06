@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 #[cfg(any(target_os = "macos", test))]
 use std::collections::VecDeque;
 use std::fs;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,10 +23,14 @@ use zeroclaw_config::schema::Config;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
-#[cfg(any(target_os = "macos", test))]
-const LAUNCHD_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
-#[cfg(any(target_os = "macos", test))]
-const LAUNCHD_LOG_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const SERVICE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const SERVICE_LOG_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const OPENRC_STDOUT_LOG: &str = "/var/log/zeroclaw/access.log";
+#[cfg(target_os = "linux")]
+const OPENRC_STDERR_LOG: &str = "/var/log/zeroclaw/error.log";
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_LOG_PENDING_BYTES: usize = 1024 * 1024;
 #[cfg(any(target_os = "macos", test))]
@@ -50,14 +54,14 @@ fn launchd_capture_paths(config_dir: &Path) -> LaunchdCapturePaths {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-struct BoundedLaunchdLog {
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+struct BoundedServiceLog {
     file: fs::File,
     len: u64,
 }
 
-#[cfg(any(target_os = "macos", test))]
-impl BoundedLaunchdLog {
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+impl BoundedServiceLog {
     fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -69,13 +73,13 @@ impl BoundedLaunchdLog {
             .read(true)
             .write(true)
             .open(path)
-            .with_context(|| format!("Failed to open launchd log {}", path.display()))?;
+            .with_context(|| format!("Failed to open service log {}", path.display()))?;
         let mut log = Self {
             len: file.metadata()?.len(),
             file,
         };
-        if log.len > LAUNCHD_LOG_MAX_BYTES {
-            log.retain_tail(LAUNCHD_LOG_MAX_BYTES)?;
+        if log.len > SERVICE_LOG_MAX_BYTES {
+            log.retain_tail(SERVICE_LOG_MAX_BYTES)?;
         }
         Ok(log)
     }
@@ -84,13 +88,13 @@ impl BoundedLaunchdLog {
         if chunk.is_empty() {
             return Ok(());
         }
-        if chunk.len() as u64 >= LAUNCHD_LOG_MAX_BYTES {
-            let start = chunk.len() - LAUNCHD_LOG_MAX_BYTES as usize;
+        if chunk.len() as u64 >= SERVICE_LOG_MAX_BYTES {
+            let start = chunk.len() - SERVICE_LOG_MAX_BYTES as usize;
             return self.rewrite(&chunk[start..]);
         }
-        if self.len + chunk.len() as u64 > LAUNCHD_LOG_MAX_BYTES {
-            let headroom = LAUNCHD_LOG_MAX_BYTES - chunk.len() as u64;
-            self.retain_tail(LAUNCHD_LOG_COMPACT_BYTES.min(headroom))?;
+        if self.len + chunk.len() as u64 > SERVICE_LOG_MAX_BYTES {
+            let headroom = SERVICE_LOG_MAX_BYTES - chunk.len() as u64;
+            self.retain_tail(SERVICE_LOG_COMPACT_BYTES.min(headroom))?;
         }
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(chunk)?;
@@ -113,6 +117,60 @@ impl BoundedLaunchdLog {
         self.file.flush()?;
         self.len = bytes.len() as u64;
         Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn drain_bounded_service_log<R: Read>(mut input: R, path: &Path) -> Result<()> {
+    let mut log = match BoundedServiceLog::open(path) {
+        Ok(log) => Some(log),
+        Err(error) => {
+            let mut buffer = [0_u8; 16 * 1024];
+            while input.read(&mut buffer)? != 0 {}
+            return Err(error);
+        }
+    };
+    let mut first_write_error = None;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .context("Failed to read service log input")?;
+        if read == 0 {
+            break;
+        }
+        if let Some(writer) = log.as_mut()
+            && let Err(error) = writer.write_chunk(&buffer[..read])
+        {
+            first_write_error = Some(error.context(format!(
+                "Failed to write bounded service log {}",
+                path.display()
+            )));
+            log = None;
+        }
+    }
+    if let Some(error) = first_write_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn run_openrc_log_writer(stderr: bool) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stderr;
+        bail!("the OpenRC log writer is only supported on Linux")
+    }
+
+    #[cfg(target_os = "linux")]
+    let path = Path::new(if stderr {
+        OPENRC_STDERR_LOG
+    } else {
+        OPENRC_STDOUT_LOG
+    });
+    #[cfg(target_os = "linux")]
+    {
+        drain_bounded_service_log(std::io::stdin().lock(), path)
     }
 }
 
@@ -171,8 +229,8 @@ struct LaunchdCaptureWriters {
 #[cfg(any(target_os = "macos", test))]
 impl LaunchdCaptureWriters {
     fn open(paths: &LaunchdCapturePaths) -> Result<Self> {
-        let stdout_log = BoundedLaunchdLog::open(&paths.stdout)?;
-        let stderr_log = BoundedLaunchdLog::open(&paths.stderr)?;
+        let stdout_log = BoundedServiceLog::open(&paths.stdout)?;
+        let stderr_log = BoundedServiceLog::open(&paths.stderr)?;
         let (stdout, stdout_task) = spawn_launchd_log_writer(paths.stdout.clone(), stdout_log);
         let (stderr, stderr_task) = spawn_launchd_log_writer(paths.stderr.clone(), stderr_log);
         Ok(Self {
@@ -208,7 +266,7 @@ impl Drop for LaunchdCaptureWriters {
 #[cfg(any(target_os = "macos", test))]
 fn spawn_launchd_log_writer(
     path: PathBuf,
-    mut log: BoundedLaunchdLog,
+    mut log: BoundedServiceLog,
 ) -> (LaunchdLogSink, JoinHandle<()>) {
     let inner = Arc::new(LaunchdLogSinkInner {
         pending: Mutex::new(PendingLaunchdLog {
@@ -1607,9 +1665,23 @@ fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn openrc_log_writer_command(exe_path: &Path, stream: &str) -> String {
+    format!(
+        "{} service run-openrc-log-writer {stream}",
+        exe_path.to_string_lossy()
+    )
+}
+
+fn openrc_executable_path_is_safe(exe_path: &Path) -> bool {
+    let raw = exe_path.to_string_lossy();
+    !raw.is_empty()
+        && raw.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'.' | b'-' | b'+')
+        })
 }
 
 #[cfg(unix)]
@@ -1709,6 +1781,8 @@ fn warn_if_binary_in_home(exe_path: &Path) {
 
 /// Generate OpenRC init script content (pure function for testability)
 fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
+    let output_logger = openrc_log_writer_command(exe_path, "stdout");
+    let error_logger = openrc_log_writer_command(exe_path, "stderr");
     format!(
         r#"#!/sbin/openrc-run
 
@@ -1721,8 +1795,8 @@ command_background="yes"
 command_user="zeroclaw:zeroclaw"
 pidfile="/run/${{RC_SVCNAME}}.pid"
 umask 027
-output_log="/var/log/zeroclaw/access.log"
-error_log="/var/log/zeroclaw/error.log"
+output_logger="{output_logger}"
+error_logger="{error_logger}"
 
 # Provide HOME so headless browsers can create profile/cache directories.
 # Without this, Chromium/Firefox fail with sandbox or profile errors.
@@ -1739,6 +1813,8 @@ start_pre() {{
 "#,
         exe = exe_path.display().to_string(),
         config_dir = config_dir.display().to_string(),
+        output_logger = output_logger,
+        error_logger = error_logger,
     )
 }
 
@@ -1760,9 +1836,14 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    ensure_zeroclaw_user()?;
-
     let exe = resolve_openrc_executable()?;
+    if !openrc_executable_path_is_safe(&exe) {
+        bail!(
+            "OpenRC service executable path contains unsupported shell characters: {}. Install ZeroClaw at /usr/local/bin/zeroclaw and retry",
+            exe.display()
+        );
+    }
+    ensure_zeroclaw_user()?;
     warn_if_binary_in_home(&exe);
 
     let config_dir = Path::new("/etc/zeroclaw");
@@ -2186,21 +2267,21 @@ mod macos_plist_tests {
 }
 
 #[cfg(test)]
-mod bounded_launchd_tests {
+mod bounded_service_log_tests {
     use super::*;
 
     #[test]
     fn opening_oversized_log_keeps_newest_bytes() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("daemon.stdout.log");
-        let mut original = vec![b'a'; LAUNCHD_LOG_MAX_BYTES as usize + 17];
+        let mut original = vec![b'a'; SERVICE_LOG_MAX_BYTES as usize + 17];
         original[17..].fill(b'b');
         fs::write(&path, original).expect("write oversized log");
 
-        drop(BoundedLaunchdLog::open(&path).expect("open bounded log"));
+        drop(BoundedServiceLog::open(&path).expect("open bounded log"));
 
         let bytes = fs::read(&path).expect("read compacted log");
-        assert_eq!(bytes.len(), LAUNCHD_LOG_MAX_BYTES as usize);
+        assert_eq!(bytes.len(), SERVICE_LOG_MAX_BYTES as usize);
         assert!(bytes.iter().all(|byte| *byte == b'b'));
     }
 
@@ -2208,7 +2289,7 @@ mod bounded_launchd_tests {
     fn crossing_limit_compacts_before_appending_newest_chunk() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("daemon.stderr.log");
-        let mut log = BoundedLaunchdLog::open(&path).expect("open bounded log");
+        let mut log = BoundedServiceLog::open(&path).expect("open bounded log");
         log.write_chunk(&vec![b'a'; 5 * 1024 * 1024])
             .expect("write initial chunk");
         log.write_chunk(&vec![b'b'; 4 * 1024 * 1024])
@@ -2216,7 +2297,7 @@ mod bounded_launchd_tests {
         drop(log);
 
         let bytes = fs::read(&path).expect("read bounded log");
-        assert_eq!(bytes.len(), LAUNCHD_LOG_MAX_BYTES as usize);
+        assert_eq!(bytes.len(), SERVICE_LOG_MAX_BYTES as usize);
         assert!(bytes[..4 * 1024 * 1024].iter().all(|byte| *byte == b'a'));
         assert!(bytes[4 * 1024 * 1024..].iter().all(|byte| *byte == b'b'));
     }
@@ -2225,15 +2306,50 @@ mod bounded_launchd_tests {
     fn oversized_chunk_keeps_only_its_tail() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("daemon.stdout.log");
-        let mut log = BoundedLaunchdLog::open(&path).expect("open bounded log");
-        let mut chunk = vec![b'a'; LAUNCHD_LOG_MAX_BYTES as usize + 23];
+        let mut log = BoundedServiceLog::open(&path).expect("open bounded log");
+        let mut chunk = vec![b'a'; SERVICE_LOG_MAX_BYTES as usize + 23];
         chunk[23..].fill(b'z');
         log.write_chunk(&chunk).expect("write oversized chunk");
         drop(log);
 
         let bytes = fs::read(&path).expect("read bounded log");
-        assert_eq!(bytes.len(), LAUNCHD_LOG_MAX_BYTES as usize);
+        assert_eq!(bytes.len(), SERVICE_LOG_MAX_BYTES as usize);
         assert!(bytes.iter().all(|byte| *byte == b'z'));
+    }
+
+    #[test]
+    fn openrc_stream_worker_writes_to_the_bounded_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("access.log");
+
+        drain_bounded_service_log(std::io::Cursor::new(b"openrc-output"), &path)
+            .expect("drain logger input");
+
+        assert_eq!(fs::read(path).expect("read log"), b"openrc-output");
+    }
+
+    #[test]
+    fn openrc_stream_worker_drains_input_when_destination_cannot_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bytes = vec![b'x'; 64 * 1024];
+        let mut input = std::io::Cursor::new(bytes.clone());
+
+        drain_bounded_service_log(&mut input, dir.path())
+            .expect_err("directory cannot be opened as a service log");
+
+        assert_eq!(input.position(), bytes.len() as u64);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openrc_stream_worker_drains_input_after_destination_write_fails() {
+        let bytes = vec![b'x'; 64 * 1024];
+        let mut input = std::io::Cursor::new(bytes.clone());
+
+        drain_bounded_service_log(&mut input, Path::new("/dev/full"))
+            .expect_err("writes to /dev/full must fail");
+
+        assert_eq!(input.position(), bytes.len() as u64);
     }
 
     #[test]
@@ -2619,8 +2735,14 @@ mod service_helper_tests {
         assert!(script.contains("command_user=\"zeroclaw:zeroclaw\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));
         assert!(script.contains("umask 027"));
-        assert!(script.contains("output_log=\"/var/log/zeroclaw/access.log\""));
-        assert!(script.contains("error_log=\"/var/log/zeroclaw/error.log\""));
+        assert!(script.contains(
+            "output_logger=\"/usr/local/bin/zeroclaw service run-openrc-log-writer stdout\""
+        ));
+        assert!(script.contains(
+            "error_logger=\"/usr/local/bin/zeroclaw service run-openrc-log-writer stderr\""
+        ));
+        assert!(!script.contains("output_log="));
+        assert!(!script.contains("error_log="));
         assert!(script.contains("depend()"));
         assert!(script.contains("need net"));
         assert!(script.contains("after firewall"));
@@ -2663,6 +2785,19 @@ mod service_helper_tests {
             shell_single_quote("/tmp/weird'path"),
             "'/tmp/weird'\"'\"'path'"
         );
+    }
+
+    #[test]
+    fn openrc_executable_path_rejects_shell_syntax() {
+        assert!(openrc_executable_path_is_safe(Path::new(
+            "/usr/local/bin/zeroclaw"
+        )));
+        assert!(!openrc_executable_path_is_safe(Path::new(
+            "/opt/zero claw/bin/zeroclaw"
+        )));
+        assert!(!openrc_executable_path_is_safe(Path::new(
+            "/opt/$zero/bin/zeroclaw"
+        )));
     }
 
     #[cfg(unix)]

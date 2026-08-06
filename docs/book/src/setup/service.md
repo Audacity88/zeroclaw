@@ -129,6 +129,11 @@ rc-update add zeroclaw default    # start on boot
 
 </div>
 
+OpenRC keeps daemon output in `/var/log/zeroclaw/access.log` and
+`/var/log/zeroclaw/error.log`. Each file retains recent output within an 8 MiB
+bound. Reinstall and restart the service after upgrading so the generated init
+script uses bounded logger processes.
+
 ## macOS: LaunchAgent
 
 `zeroclaw service install` writes `~/Library/LaunchAgents/com.zeroclaw.daemon.plist` and loads it.
