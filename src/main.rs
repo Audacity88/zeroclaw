@@ -8228,18 +8228,21 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn openrc_log_writer_cli_accepts_only_known_streams() {
-        let cli = Cli::try_parse_from(["zeroclaw", "service", "run-openrc-log-writer", "stderr"])
-            .expect("internal OpenRC logger should parse");
-        assert!(matches!(
-            cli.command,
-            Commands::Service {
-                service_command: ServiceCommands::RunOpenrcLogWriter {
-                    stream: ServiceLogStream::Stderr
-                },
-                ..
-            }
-        ));
+    fn openrc_log_writer_cli_maps_only_known_streams() {
+        for (value, expected) in [
+            ("stdout", ServiceLogStream::Stdout),
+            ("stderr", ServiceLogStream::Stderr),
+        ] {
+            let cli = Cli::try_parse_from(["zeroclaw", "service", "run-openrc-log-writer", value])
+                .expect("internal OpenRC logger should parse");
+            assert!(matches!(
+                cli.command,
+                Commands::Service {
+                    service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+                    ..
+                } if stream == expected
+            ));
+        }
         assert!(
             Cli::try_parse_from([
                 "zeroclaw",

@@ -27,9 +27,9 @@ const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
 const SERVICE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 const SERVICE_LOG_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const OPENRC_STDOUT_LOG: &str = "/var/log/zeroclaw/access.log";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const OPENRC_STDERR_LOG: &str = "/var/log/zeroclaw/error.log";
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_LOG_PENDING_BYTES: usize = 1024 * 1024;
@@ -163,15 +163,18 @@ pub fn run_openrc_log_writer(stderr: bool) -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
-    let path = Path::new(if stderr {
+    {
+        drain_bounded_service_log(std::io::stdin().lock(), openrc_log_path(stderr))
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn openrc_log_path(stderr: bool) -> &'static Path {
+    Path::new(if stderr {
         OPENRC_STDERR_LOG
     } else {
         OPENRC_STDOUT_LOG
-    });
-    #[cfg(target_os = "linux")]
-    {
-        drain_bounded_service_log(std::io::stdin().lock(), path)
-    }
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2326,6 +2329,20 @@ mod bounded_service_log_tests {
             .expect("drain logger input");
 
         assert_eq!(fs::read(path).expect("read log"), b"openrc-output");
+    }
+
+    #[test]
+    fn openrc_streams_map_to_the_established_log_paths() {
+        assert_eq!(openrc_log_path(false), Path::new(OPENRC_STDOUT_LOG));
+        assert_eq!(openrc_log_path(true), Path::new(OPENRC_STDERR_LOG));
+        assert_eq!(
+            openrc_log_path(false),
+            Path::new("/var/log/zeroclaw/access.log")
+        );
+        assert_eq!(
+            openrc_log_path(true),
+            Path::new("/var/log/zeroclaw/error.log")
+        );
     }
 
     #[test]
