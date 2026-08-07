@@ -2493,7 +2493,6 @@ mod tests {
                 !provider.capabilities().vision,
                 "{name}: capabilities().vision must stay consistent with supports_vision()"
             );
-
             // `None` preserves the family default (vision-capable here).
             let provider = create_model_provider_inner(
                 None,
@@ -2508,6 +2507,25 @@ mod tests {
                 provider.supports_vision(),
                 "{name}: no override should keep the family default"
             );
+        }
+    }
+
+    #[test]
+    fn factory_leaves_have_stable_request_identity() {
+        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
+            for vision in [None, Some(false)] {
+                let options = ModelProviderRuntimeOptions {
+                    vision,
+                    ..Default::default()
+                };
+                let provider =
+                    create_model_provider_inner(None, name, "default", None, None, &options)
+                        .unwrap();
+                assert!(
+                    provider.has_stable_request_identity("model"),
+                    "{name}: factory-created leaves must attest to a stable request identity"
+                );
+            }
         }
     }
 

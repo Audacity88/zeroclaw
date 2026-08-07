@@ -228,6 +228,7 @@ impl zeroclaw_api::attribution::Attributable for VisionOverrideProvider {
 mod tests {
     use super::*;
     use crate::traits::ProviderCapabilities;
+    use std::sync::Arc;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::ModelPricing;
 
@@ -290,5 +291,27 @@ mod tests {
             models[0].pricing.is_some(),
             "vision override must delegate list_models_with_pricing and keep pricing"
         );
+    }
+
+    #[test]
+    fn request_identity_defaults_unstable_and_arc_delegates() {
+        let unknown = PricedVisionFake;
+        assert!(!unknown.has_stable_request_identity("model"));
+
+        let stable = Arc::new(VisionOverrideProvider::factory_leaf(
+            Box::new(PricedVisionFake),
+            None,
+        ));
+        assert!(stable.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn ordinary_vision_override_preserves_inner_request_identity() {
+        let unstable = VisionOverrideProvider::new(Box::new(PricedVisionFake), false);
+        assert!(!unstable.has_stable_request_identity("model"));
+
+        let stable_inner = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
+        let stable = VisionOverrideProvider::new(Box::new(stable_inner), false);
+        assert!(stable.has_stable_request_identity("model"));
     }
 }
