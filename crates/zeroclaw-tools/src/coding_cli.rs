@@ -114,8 +114,8 @@ fn find_claude_on_path() -> Option<OsString> {
 }
 
 fn missing_claude_error() -> CodingCliExecutionError {
-    CodingCliExecutionError::Prepare(anyhow::anyhow!(
-        "Claude Code executable 'claude' was not found on PATH before applying the workspace working directory"
+    CodingCliExecutionError::Prepare(anyhow::Error::msg(
+        "Claude Code executable 'claude' was not found on PATH before applying the workspace working directory",
     ))
 }
 
