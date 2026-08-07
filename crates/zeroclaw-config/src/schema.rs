@@ -602,7 +602,10 @@ pub struct Config {
     #[serde(default)]
     pub locale: Option<String>,
 
-    /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]`).
+    /// Verifiable Intent (VI) credential issuance and constraint checking
+    /// (`[verifiable_intent]`). No credential chain verifier exists yet, so the
+    /// `vi_verify` tool is not registered for the model and this section does not
+    /// currently enable verification of anything.
     #[serde(default)]
     #[nested]
     #[group = "Agent"]
@@ -912,9 +915,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
-    /// in the request body (llama.cpp-specific). Use this to pass model-family
-    /// template variables that control behaviour not exposed by other fields.
+    /// Arbitrary key/value pairs forwarded verbatim as a top-level
+    /// `chat_template_kwargs` object in the request body of OpenAI-compatible
+    /// providers. Consumed by chat-template-aware backends such as vLLM,
+    /// SGLang, and llama.cpp to pass model-family template variables that
+    /// control behaviour not exposed by other fields. Must be a JSON object
+    /// (TOML inline table); non-object values are ignored with a warning.
     /// Example (Qwen3 thinking suppression):
     ///   `chat_template_kwargs = { enable_thinking = false }`
     #[tab(Advanced)]
@@ -2268,6 +2274,33 @@ pub struct CloudflareModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Atlas Cloud ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AtlasCloudEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AtlasCloudEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.atlascloud.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.atlascloud"]
+pub struct AtlasCloudModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3282,6 +3315,7 @@ impl_default_family_endpoint! {
     TelnyxModelProviderConfig,
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
+    AtlasCloudModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
@@ -5037,18 +5071,30 @@ impl Default for McpConfig {
     }
 }
 
-/// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section).
+/// Verifiable Intent (VI) credential issuance and constraint checking
+/// (`[verifiable_intent]` section).
+///
+/// ZeroClaw implements issuance, crypto, types and constraint checking, but not
+/// a credential chain verifier. Until one exists the `vi_verify` tool is
+/// withheld from the model-visible registry, so neither key below enables
+/// verification of a credential. The library paths are unaffected.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "verifiable_intent"]
 pub struct VerifiableIntentConfig {
-    /// Enable VI credential verification on commerce tool calls (default: false).
+    /// Opt in to the VI section (default: false).
+    ///
+    /// While the tool is withheld this does not enable credential verification
+    /// on commerce tool calls. It currently causes a warning naming that gap,
+    /// emitted once per config application: at process startup, and again when
+    /// a daemon reload re-reads config from disk.
     #[serde(default)]
     pub enabled: bool,
 
-    /// Strictness mode for constraint evaluation: "strict" (fail-closed on unknown
-    /// constraint types) or "permissive" (skip unknown types with a warning).
-    /// Default: "strict".
+    /// Intended strictness mode for constraint evaluation.
+    ///
+    /// Accepts `"strict"` or `"permissive"`, and defaults to `"strict"`. No
+    /// production code reads it while the tool is withheld.
     #[serde(default = "default_vi_strictness")]
     pub strictness: String,
 }
@@ -34039,7 +34085,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
             &bin_dir,
             r#"#!/bin/sh
 if [ "$1" = "read" ] && [ "$2" = "op://zeroclaw/provider/openai-api-key" ]; then
-  sleep 1
+  sleep 3
   printf '%s\n' 'sk-proj-from-onepassword'
   exit 0
 fi
@@ -34073,8 +34119,11 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let load_task = tokio::spawn(Config::load_or_init());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // Threshold sized against the 3s fake-op sleep: a blocked worker pins
+        // elapsed at >=3s, while scheduler latency under full-suite CI load
+        // stays well under 1.5s.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
+            started.elapsed() < std::time::Duration::from_millis(1500),
             "op:// config load should not block the async runtime worker"
         );
 
