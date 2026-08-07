@@ -4,6 +4,7 @@
 
 use crate::auth::AuthService;
 use crate::multimodal;
+use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -77,6 +78,13 @@ pub struct OpenAiCompatibleModelProvider {
     tls_ca_cert_pem: Option<Vec<u8>>,
     /// Extra JSON fields merged into every API request body.
     extra_body: Option<serde_json::Value>,
+    /// Memoized cleaned tool schemas: each registered schema is cleaned once
+    /// per strategy per provider instance and then `Arc`-shared into every
+    /// request body instead of being deep-copied per request. `Arc` so
+    /// provider clones (e.g. the streaming path's owned copy) share one
+    /// memo. Paths that rebuild the provider per call (e.g. the
+    /// per-iteration vision route) start it empty each time.
+    schema_cache: std::sync::Arc<zeroclaw_api::schema::SchemaCleanCache>,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -574,6 +582,7 @@ impl OpenAiCompatibleBuilder {
             public_model_listing: self.public_model_listing,
             tls_ca_cert_pem,
             extra_body: self.extra_body,
+            schema_cache: std::sync::Arc::new(zeroclaw_api::schema::SchemaCleanCache::new()),
         }
     }
 }
@@ -982,6 +991,12 @@ struct ApiChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Extra fields merged at the top level of the serialized JSON body.
+    /// Mirrors `NativeChatRequest::extra_body` so config-driven extras
+    /// (`provider_extra`, `chat_template_kwargs`) reach the no-tools request
+    /// paths too, not just the native-tools path.
+    #[serde(flatten)]
+    extra_body: Option<serde_json::Value>,
 }
 
 /// OpenAI-compatible `stream_options.include_usage` toggle.
@@ -1023,6 +1038,27 @@ struct ApiChatResponse {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+}
+
+/// OpenAI-compatible chat response, either in the standard top-level shape or
+/// wrapped by a gateway in a top-level `data` object.
+///
+/// Keep the direct variant first: a valid top-level response remains
+/// authoritative when a provider also includes a `data` metadata field.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ApiChatResponseEnvelope {
+    Direct(ApiChatResponse),
+    Wrapped { data: ApiChatResponse },
+}
+
+impl ApiChatResponseEnvelope {
+    fn into_response(self) -> ApiChatResponse {
+        match self {
+            Self::Direct(response) => response,
+            Self::Wrapped { data } => data,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1304,7 +1340,7 @@ struct Function {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest {
+struct NativeChatRequest<T = Vec<NativeToolSpec>> {
     model: String,
     messages: Vec<NativeMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1318,7 +1354,7 @@ struct NativeChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<serde_json::Value>>,
+    tools: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1958,22 +1994,24 @@ fn sse_bytes_to_events_for_contract(
 }
 
 fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
-    serde_json::from_str(body).map_err(|_| {
-        let sanitized = super::sanitize_api_error(body);
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "model_provider": name,
-                    "body": &sanitized,
-                })),
-            "compatible: unexpected chat-completions payload"
-        );
-        anyhow::Error::msg(format!(
-            "{name} API returned an unexpected chat-completions payload; body={sanitized}"
-        ))
-    })
+    serde_json::from_str::<ApiChatResponseEnvelope>(body)
+        .map(ApiChatResponseEnvelope::into_response)
+        .map_err(|_| {
+            let sanitized = super::sanitize_api_error(body);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": name,
+                        "body": &sanitized,
+                    })),
+                "compatible: unexpected chat-completions payload"
+            );
+            anyhow::Error::msg(format!(
+                "{name} API returned an unexpected chat-completions payload; body={sanitized}"
+            ))
+        })
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -1986,27 +2024,27 @@ impl OpenAiCompatibleModelProvider {
     }
 
     fn convert_tool_specs(
+        &self,
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
-    ) -> Option<Vec<serde_json::Value>> {
+    ) -> Option<Vec<NativeToolSpec>> {
         tools.map(|items| {
             items
                 .iter()
-                .map(|tool| {
-                    // Owned copy is required here: the per-model sanitizer
-                    // (`convert_tool_specs_for_model`) mutates these Value
-                    // trees in place, so they cannot share the registry's
-                    // Arc-backed schema
-                    let params = zeroclaw_api::schema::SchemaCleanr::clean_for_openai(
-                        (*tool.parameters).clone(),
-                    );
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": params,
-                        }
-                    })
+                .map(|tool| NativeToolSpec {
+                    kind: "function".to_string(),
+                    extra: serde_json::Map::new(),
+                    function: NativeToolFunctionSpec {
+                        extra: serde_json::Map::new(),
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        // Cleaned at most once per registered schema per
+                        // provider instance (memoized), then `Arc`-shared into every request
+                        // body — never deep-copied per request.
+                        parameters: self.schema_cache.clean_shared(
+                            &tool.parameters,
+                            zeroclaw_api::schema::CleaningStrategy::OpenAI,
+                        ),
+                    },
                 })
                 .collect()
         })
@@ -2016,29 +2054,27 @@ impl OpenAiCompatibleModelProvider {
         &self,
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
         model: &str,
-    ) -> Option<Vec<serde_json::Value>> {
-        let converted = Self::convert_tool_specs(tools)?;
+    ) -> Option<Vec<NativeToolSpec>> {
+        let mut converted = self.convert_tool_specs(tools)?;
         if !self.local_model_tool_sanitize || !Self::should_sanitize_local_tool_schema(model) {
             return Some(converted);
         }
-        Some(
-            converted
-                .into_iter()
-                .map(|mut tool| {
-                    let Some(raw_parameters) = tool.get("parameters").cloned() else {
-                        return tool;
-                    };
-                    let cleaned = zeroclaw_api::schema::SchemaCleanr::clean(
-                        raw_parameters,
-                        zeroclaw_api::schema::CleaningStrategy::Conservative,
-                    );
-                    if let Some(obj) = tool.as_object_mut() {
-                        obj.insert("parameters".to_string(), cleaned);
-                    }
-                    tool
-                })
-                .collect(),
-        )
+        // Preserve the pre-existing compatible-provider wire behavior in
+        // this allocation-only change. The legacy sanitizer inspected a
+        // top-level `parameters` extension even though ordinary OpenAI tool
+        // specs place it under `function`; activating a nested rewrite is a
+        // separate protocol change that needs its own compatibility contract.
+        for tool in &mut converted {
+            let Some(raw_parameters) = tool.extra.get("parameters").cloned() else {
+                continue;
+            };
+            let cleaned = zeroclaw_api::schema::SchemaCleanr::clean(
+                raw_parameters,
+                zeroclaw_api::schema::CleaningStrategy::Conservative,
+            );
+            tool.extra.insert("parameters".to_string(), cleaned);
+        }
+        Some(converted)
     }
 
     fn should_sanitize_local_tool_schema(model: &str) -> bool {
@@ -2049,7 +2085,7 @@ impl OpenAiCompatibleModelProvider {
     fn build_native_tool_chat_request(
         &self,
         effective_messages: &[ChatMessage],
-        tools: Option<Vec<serde_json::Value>>,
+        tools: Option<Vec<NativeToolSpec>>,
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
@@ -2067,6 +2103,73 @@ impl OpenAiCompatibleModelProvider {
             stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
+            tools,
+            tool_choice,
+            max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
+        }
+    }
+
+    fn build_raw_native_tool_chat_request<'a>(
+        &self,
+        effective_messages: &[ChatMessage],
+        tools: Option<&'a [serde_json::Value]>,
+        model: &str,
+        temperature: Option<f64>,
+        allow_user_image_parts: bool,
+    ) -> NativeChatRequest<&'a [serde_json::Value]> {
+        let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
+        NativeChatRequest {
+            model: model.to_string(),
+            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
+            temperature,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: self.tool_stream_for_tools(has_tool_entries),
+            tools,
+            tool_choice: has_tool_entries.then(|| "auto".to_string()),
+            max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
+        }
+    }
+
+    /// Streaming counterpart of [`Self::build_native_tool_chat_request`],
+    /// used by `stream_chat` when native tools are present.
+    fn build_streaming_native_tool_request(
+        &self,
+        model: &str,
+        effective_messages: &[ChatMessage],
+        tools: Option<Vec<NativeToolSpec>>,
+        temperature: Option<f64>,
+        options_enabled: bool,
+        merge: bool,
+    ) -> NativeChatRequest {
+        // Guard on the converted tools being non-empty (not just the raw
+        // input being non-empty): convert_tool_specs_for_model can sanitize
+        // a non-empty input down to None, and tool_choice without a tools
+        // field is an HTTP 400 on vLLM 0.19+. Computed before `tools` moves
+        // into the request so the converted list is never copied.
+        let tool_choice = tools
+            .as_ref()
+            .and_then(|t| (!t.is_empty()).then(|| "auto".to_string()));
+        NativeChatRequest {
+            model: model.to_string(),
+            messages: self.convert_messages_for_native(effective_messages, !merge),
+            temperature,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: if options_enabled {
+                self.tool_stream_for_tools(true)
+            } else {
+                None
+            },
+            stream: Some(options_enabled),
+            // Mirror the no-tools path: opt the streaming response into a
+            // final `usage` event so `/ws/chat` can record token usage
+            // even when native tools are active.
+            stream_options: options_enabled.then_some(StreamOptionsBody {
+                include_usage: true,
+            }),
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
@@ -2698,6 +2801,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         };
 
         let url = self.chat_completions_url();
@@ -2787,6 +2891,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools: None,
             tool_choice: None,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         };
 
         let url = self.chat_completions_url();
@@ -2855,14 +2960,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         } else {
             self.strip_native_tool_messages(&effective_messages)
         };
-        let tools = if tools.is_empty() {
-            None
-        } else {
-            Some(tools.to_vec())
-        };
-        let request = self.build_native_tool_chat_request(
+        let request = self.build_raw_native_tool_chat_request(
             &effective_messages,
-            tools,
+            (!tools.is_empty()).then_some(tools),
             model,
             temperature,
             !merge,
@@ -3024,7 +3124,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let native_response: ApiChatResponse = response.json().await?;
+        let body = response.text().await?;
+        let native_response = parse_chat_response_body(&self.name, &body)?;
         let usage = native_response.usage.map(UsageInfo::into_provider_usage);
         let message = native_response
             .choices
@@ -3117,34 +3218,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             let payload_result = if has_tools {
-                serde_json::to_value(NativeChatRequest {
-                    model: model.clone(),
-                    messages: provider.convert_messages_for_native(&effective_messages, !merge),
+                serde_json::to_value(provider.build_streaming_native_tool_request(
+                    &model,
+                    &effective_messages,
+                    tools,
                     temperature,
-                    reasoning_effort: provider.reasoning_effort_for_model(&model),
-                    tool_stream: if options_enabled {
-                        provider.tool_stream_for_tools(true)
-                    } else {
-                        None
-                    },
-                    stream: Some(options_enabled),
-                    // Mirror the no-tools path: opt the streaming response into a
-                    // final `usage` event so `/ws/chat` can record token usage
-                    // even when native tools are active.
-                    stream_options: options_enabled.then_some(StreamOptionsBody {
-                        include_usage: true,
-                    }),
-                    tools: tools.clone(),
-                    // Guard on the converted tools being non-empty (not just
-                    // `has_tools`): convert_tool_specs_for_model can sanitize a
-                    // non-empty input down to None, and tool_choice without a
-                    // tools field is an HTTP 400 on vLLM 0.19+.
-                    tool_choice: tools
-                        .as_ref()
-                        .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
-                    max_tokens: provider.max_tokens,
-                    extra_body: provider.extra_body.clone(),
-                })
+                    options_enabled,
+                    merge,
+                ))
             } else {
                 let messages = effective_messages
                     .iter()
@@ -3171,6 +3252,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
+                    extra_body: provider.extra_body.clone(),
                 })
             };
 
@@ -3322,6 +3404,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
+                extra_body: provider.extra_body.clone(),
             };
 
             let url = provider.chat_completions_url();
@@ -3440,6 +3523,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 tools: None,
                 tool_choice: None,
                 max_tokens: provider.max_tokens,
+                extra_body: provider.extra_body.clone(),
             };
 
             let url = provider.chat_completions_url();
@@ -3583,6 +3667,265 @@ mod tests {
             .build()
     }
 
+    async fn mock_non_streaming_response(
+        response_body: serde_json::Value,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                let response_body = response_body.clone();
+                async move {
+                    captured.lock().unwrap().push(request);
+                    Json(response_body)
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
+
+        (provider, captured, server)
+    }
+
+    fn non_streaming_response_cases() -> Vec<(&'static str, serde_json::Value, Option<&'static str>)>
+    {
+        vec![
+            (
+                "direct",
+                serde_json::json!({
+                    "choices": [{"message": {"content": "direct"}}]
+                }),
+                Some("direct"),
+            ),
+            (
+                "wrapped",
+                serde_json::json!({
+                    "data": {
+                        "choices": [{"message": {"content": "wrapped"}}]
+                    },
+                    "success": true
+                }),
+                Some("wrapped"),
+            ),
+            (
+                "direct_precedence",
+                serde_json::json!({
+                    "choices": [{"message": {"content": "top-level"}}],
+                    "data": {
+                        "choices": [{"message": {"content": "nested"}}]
+                    }
+                }),
+                Some("top-level"),
+            ),
+            (
+                "malformed",
+                serde_json::json!({
+                    "data": {
+                        "choices": "invalid",
+                        "api_key": "sk-test-secret-value"
+                    }
+                }),
+                None,
+            ),
+        ]
+    }
+
+    fn assert_sanitized_envelope_error(error: &anyhow::Error, case: &str) {
+        let message = error.to_string();
+        assert!(
+            message.contains("custom API returned an unexpected chat-completions payload"),
+            "{case}: unexpected error: {message}"
+        );
+        assert!(
+            message.contains("[REDACTED]"),
+            "{case}: sanitized body missing redaction: {message}"
+        );
+        assert!(
+            !message.contains("sk-test-secret-value"),
+            "{case}: secret leaked in error: {message}"
+        );
+    }
+
+    #[test]
+    fn convert_tool_specs_serializes_openai_wire_shape() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        // Clean schema (shared as-is) and dirty schema (rewritten by the
+        // OpenAI strategy's strategy-independent passes).
+        let tools = vec![
+            zeroclaw_api::tool::ToolSpec::new(
+                "get_weather",
+                "Fetch the weather",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } }
+                }),
+            ),
+            zeroclaw_api::tool::ToolSpec::new(
+                "set_mode",
+                "Set the mode",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "mode": { "const": "fast" } }
+                }),
+            ),
+        ];
+
+        let converted = p.convert_tool_specs(Some(&tools)).expect("Some(tools) in");
+        let raw = serde_json::to_string(&converted).unwrap();
+
+        // Raw string, not `serde_json::Value` equality: `Value` object
+        // equality ignores key order, so it cannot pin the declared
+        // key-order delta (typed structs serialize `type`/`function`, and
+        // `name`/`description`/`parameters` within it, in field-declaration
+        // order; the `parameters` schema itself is a plain `Value` with no
+        // `preserve_order` feature enabled, so its own keys always come out
+        // alphabetical regardless of insertion order, e.g. `properties`
+        // before `type`). `const` is also rewritten to a single-value
+        // `enum` by the cleaner, exactly as the pre-typed-struct pipeline
+        // did.
+        assert_eq!(
+            raw,
+            concat!(
+                r#"[{"type":"function","function":{"name":"get_weather","description":"Fetch the weather","parameters":{"properties":{"city":{"type":"string"}},"type":"object"}}},"#,
+                r#"{"type":"function","function":{"name":"set_mode","description":"Set the mode","parameters":{"properties":{"mode":{"enum":["fast"]}},"type":"object"}}}]"#
+            ),
+            "typed tool specs must serialize to the same byte-for-byte wire \
+             shape (including key order) as the previous json!-built payload"
+        );
+    }
+
+    #[test]
+    fn convert_tool_specs_shares_clean_schema_and_memoizes_dirty_schema() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let tools = vec![
+            zeroclaw_api::tool::ToolSpec::new(
+                "clean_tool",
+                "already clean",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } }
+                }),
+            ),
+            zeroclaw_api::tool::ToolSpec::new(
+                "dirty_tool",
+                "needs cleaning",
+                serde_json::json!({ "type": "string", "const": "x" }),
+            ),
+        ];
+
+        let first = p.convert_tool_specs(Some(&tools)).unwrap();
+        let second = p.convert_tool_specs(Some(&tools)).unwrap();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&first[0].function.parameters, &tools[0].parameters),
+            "clean schemas must be shared straight from the registry Arc"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &first[1].function.parameters,
+                &second[1].function.parameters
+            ),
+            "dirty schemas must be cleaned once and memoized, not re-copied per request"
+        );
+    }
+
+    #[test]
+    fn streaming_native_tool_request_serializes_tools_and_guards_tool_choice() {
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Fetch the weather",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        )];
+        let converted = p.convert_tool_specs_for_model(Some(&tools), "test-model");
+
+        let value = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            converted,
+            Some(0.5),
+            true,
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(value["stream"], serde_json::json!(true));
+        assert_eq!(
+            value["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
+        assert_eq!(value["tool_choice"], serde_json::json!("auto"));
+        assert_eq!(
+            value["tools"],
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Fetch the weather",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]),
+            "streaming payload must carry the typed tools in OpenAI wire shape"
+        );
+
+        // Converted-empty tools must omit tool_choice (vLLM 0.19+ rejects
+        // tool_choice without a tools field).
+        let empty = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+        ))
+        .unwrap();
+        assert!(
+            empty.get("tool_choice").is_none(),
+            "empty converted tools must not set tool_choice; got: {empty}"
+        );
+    }
+
+    #[test]
+    fn provider_clones_share_one_schema_memo() {
+        // stream_chat clones the provider per call and relies on the
+        // Arc<SchemaCleanCache> field so the clone shares the instance memo;
+        // a rebuild-per-call refactor would silently reintroduce per-request
+        // cold-cache cleaning on the streaming path with identical wire
+        // bytes, so pin the sharing directly.
+        let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "dirty_tool",
+            "needs cleaning",
+            serde_json::json!({ "type": "string", "const": "x" }),
+        )];
+
+        let original = p.convert_tool_specs(Some(&tools)).unwrap();
+        let via_clone = p.clone().convert_tool_specs(Some(&tools)).unwrap();
+
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &original[0].function.parameters,
+                &via_clone[0].function.parameters
+            ),
+            "provider clones must serve dirty schemas from the same memo"
+        );
+    }
+
     #[test]
     fn creates_with_key() {
         let p = make_model_provider(
@@ -3637,10 +3980,16 @@ mod tests {
     fn build_native_tool_chat_request_sets_tool_choice_when_tools_present() {
         let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
         let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![serde_json::json!({
-            "type": "function",
-            "function": { "name": "get_weather", "description": "", "parameters": {} }
-        })];
+        let tools = vec![NativeToolSpec {
+            kind: "function".to_string(),
+            extra: serde_json::Map::new(),
+            function: NativeToolFunctionSpec {
+                extra: serde_json::Map::new(),
+                name: "get_weather".to_string(),
+                description: String::new(),
+                parameters: std::sync::Arc::new(serde_json::json!({})),
+            },
+        }];
         let req =
             p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
         let value = serde_json::to_value(&req).unwrap();
@@ -3886,7 +4235,7 @@ mod tests {
         // into a final `usage` SSE event, otherwise OpenAI-compatible providers
         // never report token counts on the `/ws/chat` path (the gateway's
         // primary path uses native tools). See Audacity88'sreview.
-        let req = NativeChatRequest {
+        let req: NativeChatRequest = NativeChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![NativeMessage {
                 role: "user".to_string(),
@@ -3904,7 +4253,16 @@ mod tests {
             }),
             reasoning_effort: None,
             tool_stream: None,
-            tools: Some(vec![serde_json::json!({"name": "echo"})]),
+            tools: Some(vec![NativeToolSpec {
+                kind: "function".to_string(),
+                extra: serde_json::Map::new(),
+                function: NativeToolFunctionSpec {
+                    extra: serde_json::Map::new(),
+                    name: "echo".to_string(),
+                    description: String::new(),
+                    parameters: std::sync::Arc::new(serde_json::json!({})),
+                },
+            }]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
             extra_body: None,
@@ -3926,7 +4284,7 @@ mod tests {
         // Non-streaming path (e.g. classic `chat()` call) does not need
         // `stream_options.include_usage` because the final response carries
         // `usage` directly. The field must be skipped in serialization.
-        let req = NativeChatRequest {
+        let req: NativeChatRequest = NativeChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![],
             temperature: Some(0.7),
@@ -3948,7 +4306,7 @@ mod tests {
 
     #[test]
     fn extra_body_flattens_into_request_top_level() {
-        let req = NativeChatRequest {
+        let req: NativeChatRequest = NativeChatRequest {
             model: "qwen".to_string(),
             messages: vec![],
             temperature: None,
@@ -3966,6 +4324,44 @@ mod tests {
             value.get("thinking").and_then(serde_json::Value::as_str),
             Some("off"),
             "extra_body fields must serialize at the top level, not nested"
+        );
+        assert!(
+            value.get("extra_body").is_none(),
+            "extra_body key itself must not appear in serialized JSON"
+        );
+    }
+
+    #[test]
+    fn api_chat_request_flattens_extra_body_into_top_level() {
+        // Regression: the no-tools request struct (`chat_with_system`,
+        // `chat_with_history`, no-tools streaming) must also carry the
+        // config-driven `extra_body`, not just the native-tools path.
+        let req = ApiChatRequest {
+            model: "qwen".to_string(),
+            messages: vec![],
+            temperature: None,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            extra_body: Some(serde_json::json!({
+                "top_p": 0.95,
+                "chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"},
+            })),
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("top_p").and_then(serde_json::Value::as_f64),
+            Some(0.95),
+            "provider_extra keys must serialize at the top level of a no-tools request"
+        );
+        assert_eq!(
+            value.pointer("/chat_template_kwargs/reasoning_effort"),
+            Some(&serde_json::json!("max")),
+            "chat_template_kwargs must be nested under its own top-level key in a no-tools request"
         );
         assert!(
             value.get("extra_body").is_none(),
@@ -4009,6 +4405,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -4074,6 +4471,88 @@ mod tests {
         assert!(msg.contains("body="));
         assert!(msg.contains("[REDACTED]"));
         assert!(!msg.contains("sk-test-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_non_streaming_path_uses_shared_envelope_parser() {
+        for (case, response_body, expected_text) in non_streaming_response_cases() {
+            let (provider, captured, server) = mock_non_streaming_response(response_body).await;
+            let result = provider
+                .chat_with_system(None, "hello", "test-model", None)
+                .await;
+            server.abort();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{case}: expected one request");
+            assert!(
+                requests[0].get("tools").is_none(),
+                "{case}: ordinary request unexpectedly contained tools: {}",
+                requests[0]
+            );
+
+            match expected_text {
+                Some(expected) => assert_eq!(
+                    result.unwrap_or_else(|error| panic!("{case}: request failed: {error}")),
+                    expected,
+                    "{case}: response text mismatch"
+                ),
+                None => assert_sanitized_envelope_error(
+                    &result.expect_err("malformed response must fail"),
+                    case,
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_tool_non_streaming_path_uses_shared_envelope_parser() {
+        for (case, response_body, expected_text) in non_streaming_response_cases() {
+            let (provider, captured, server) = mock_non_streaming_response(response_body).await;
+            let messages = vec![ChatMessage::user("hello")];
+            let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+                "echo",
+                "Echo a value",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }),
+            )];
+            let result = provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+            server.abort();
+
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{case}: expected one request");
+            assert_eq!(
+                requests[0]["tools"][0]["function"]["name"], "echo",
+                "{case}: request did not exercise the native-tool path: {}",
+                requests[0]
+            );
+
+            match expected_text {
+                Some(expected) => assert_eq!(
+                    result
+                        .unwrap_or_else(|error| panic!("{case}: request failed: {error}"))
+                        .text
+                        .as_deref(),
+                    Some(expected),
+                    "{case}: response text mismatch"
+                ),
+                None => assert_sanitized_envelope_error(
+                    &result.expect_err("malformed response must fail"),
+                    case,
+                ),
+            }
+        }
     }
 
     #[test]
@@ -4743,14 +5222,16 @@ mod tests {
             stream_options: None,
             reasoning_effort: None,
             tool_stream: None,
-            tools: Some(vec![serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "shell",
-                    "description": "Run a shell command",
-                    "parameters": {"type": "object"}
-                }
-            })]),
+            tools: Some(vec![NativeToolSpec {
+                kind: "function".to_string(),
+                extra: serde_json::Map::new(),
+                function: NativeToolFunctionSpec {
+                    extra: serde_json::Map::new(),
+                    name: "shell".to_string(),
+                    description: "Run a shell command".to_string(),
+                    parameters: std::sync::Arc::new(serde_json::json!({"type": "object"})),
+                },
+            }]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
             extra_body: None,
@@ -5263,6 +5744,7 @@ mod tests {
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -5299,6 +5781,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5334,6 +5817,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5477,14 +5961,16 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"src\nCargo.toml"}"#),
             ChatMessage::user("continue"),
         ];
-        let tools = vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "shell",
-                "description": "Run a shell command",
-                "parameters": {}
-            }
-        })];
+        let tools = vec![NativeToolSpec {
+            kind: "function".to_string(),
+            extra: serde_json::Map::new(),
+            function: NativeToolFunctionSpec {
+                extra: serde_json::Map::new(),
+                name: "shell".to_string(),
+                description: "Run a shell command".to_string(),
+                parameters: std::sync::Arc::new(serde_json::json!({})),
+            },
+        }];
 
         let request = p.build_native_tool_chat_request(
             &messages,
@@ -6760,6 +7246,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_with_tools_sends_typed_tools_in_streaming_body() {
+        use axum::response::IntoResponse;
+        use axum::{Json, Router, routing::post};
+        use futures_util::StreamExt as _;
+        use std::sync::Mutex;
+        use tokio::net::TcpListener;
+
+        // Pins the stream_chat call-site wiring into
+        // build_streaming_native_tool_request (helper-level tests alone
+        // would not catch e.g. swapped bool arguments or tools dropped at
+        // the call site).
+        let captured: std::sync::Arc<Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = make_model_provider("vllm", &format!("http://{addr}"), Some("key"));
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Fetch the weather",
+            serde_json::json!({ "type": "object", "properties": {} }),
+        )];
+
+        let mut stream = provider.stream_chat(
+            crate::traits::ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: Some(&tools),
+                thinking: None,
+            },
+            "test-model",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+        while stream.next().await.is_some() {}
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no streaming request captured");
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["tool_choice"], serde_json::json!("auto"));
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Fetch the weather",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]),
+            "streaming request body must carry the converted typed tools"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_forwards_raw_specs_without_validation_or_sanitizing() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::Mutex;
+        use tokio::net::TcpListener;
+
+        let captured: std::sync::Arc<Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    Json(serde_json::json!({
+                        "id": "chatcmpl-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "ok" },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleModelProvider::builder("lmstudio")
+            .display_name("lmstudio")
+            .base_url(&format!("http://{addr}"))
+            .credential(Some("key"))
+            .auth_style(AuthStyle::Bearer)
+            .local_model_tool_sanitize()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![
+            // OpenAI permits both description and parameters to be omitted.
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": "get_weather" }
+            }),
+            // Raw callers historically controlled vendor extensions and
+            // schema shape. Even with local sanitization configured, this
+            // entry must not be parsed or cleaned in this allocation-only PR.
+            serde_json::json!({
+                "type": "vendor_extension",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "$defs": { "Id": { "type": "string" } },
+                        "additionalProperties": false
+                    }
+                },
+                "x_vendor_hint": "keep-me"
+            }),
+        ];
+
+        let result = provider
+            .chat_with_tools(&messages, &tools, "gemma-4-9b-it", None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "raw compatible-provider specs must be forwarded: {:?}",
+            result.err()
+        );
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured by mock server");
+        assert_eq!(
+            body["tools"],
+            serde_json::json!(tools),
+            "raw tools must reach the request body byte-shape-equivalent, \
+             including optional-field omissions and sanitizer-sensitive keys"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!("auto"),
+            "tool_choice must be auto when tools are present"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
     async fn dropping_stream_aborts_forwarder_and_closes_upstream_socket() {
         use axum::Router;
         use axum::response::IntoResponse;
@@ -6858,6 +7520,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         }
     }
 
