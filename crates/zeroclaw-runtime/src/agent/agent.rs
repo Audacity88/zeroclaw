@@ -7462,7 +7462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_llm_hook_mutates_only_the_ephemeral_provider_request() {
+    async fn before_llm_hook_mutates_ephemeral_request_and_attributes_selected_model() {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let seen_messages = Arc::new(Mutex::new(Vec::new()));
         let seen_models = Arc::new(Mutex::new(Vec::new()));
@@ -7494,7 +7494,11 @@ mod tests {
                 Ok(zeroclaw_providers::ChatResponse {
                     text: Some("provider answer".into()),
                     tool_calls: vec![],
-                    usage: None,
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: None,
+                        output_tokens: Some(200),
+                    }),
                     reasoning_content: None,
                 })
             }
@@ -7525,6 +7529,21 @@ mod tests {
             seen_inputs: hook_inputs.clone(),
         }));
         let capturing = Arc::new(CapturingObserver::default());
+        let turn_usage = Arc::new(parking_lot::Mutex::new(
+            crate::agent::cost::TurnUsage::default(),
+        ));
+        let cost_context = crate::agent::cost::ToolLoopCostTrackingContext {
+            tracker: None,
+            model_provider_pricing: Arc::new(std::collections::HashMap::from([(
+                "provider-a".to_string(),
+                std::collections::HashMap::from([
+                    ("hook-selected-model.input".to_string(), 3.0),
+                    ("hook-selected-model.output".to_string(), 15.0),
+                ]),
+            )])),
+            turn_usage: turn_usage.clone(),
+            agent_alias: None,
+        };
         let mut agent = Agent::builder()
             .model_provider(Box::new(RequestCaptureProvider {
                 seen_messages: seen_messages.clone(),
@@ -7543,10 +7562,11 @@ mod tests {
             .build()
             .expect("agent should build");
 
-        assert_eq!(
-            agent.turn("durable user request").await.unwrap(),
-            "provider answer"
-        );
+        let answer = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(cost_context), agent.turn("durable user request"))
+            .await
+            .unwrap();
+        assert_eq!(answer, "provider answer");
         let requests = seen_messages.lock();
         let provider_user = requests[0]
             .iter()
@@ -7579,6 +7599,13 @@ mod tests {
             ["hook-selected-model", "hook-selected-model"],
             "request and response telemetry must use the dispatched model"
         );
+        let usage = *turn_usage.lock();
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.output_tokens, 200);
+        assert!(
+            (usage.cost_usd - 0.006).abs() < f64::EPSILON,
+            "cost tracking must use the hook-selected model's configured rates"
+        );
 
         let durable_user = agent
             .history()
@@ -7590,6 +7617,63 @@ mod tests {
             .expect("durable history must retain the user message");
         assert!(durable_user.contains("durable user request"));
         assert!(!durable_user.contains("hook-only provider request"));
+    }
+
+    #[tokio::test]
+    async fn before_llm_hook_selected_model_attributes_provider_failure() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(MutatingBeforeLlmHook {
+            seen_inputs: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(FailingModelProvider))
+            .model_provider_name("provider-a".into())
+            .tools(vec![])
+            .memory(memory)
+            .observer(capturing.clone())
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .model_name("base-model".into())
+            .temperature(Some(0.0))
+            .turn_datetime(fixed_response_cache_turn_datetime)
+            .build()
+            .expect("agent should build");
+
+        agent
+            .turn("durable user request")
+            .await
+            .expect_err("provider failure must surface");
+
+        let events = capturing.events.lock();
+        let observed: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ObserverEvent::LlmRequest { model, .. } => Some((model.as_str(), None)),
+                ObserverEvent::LlmResponse { model, success, .. } => {
+                    Some((model.as_str(), Some(*success)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                ("hook-selected-model", None),
+                ("hook-selected-model", Some(false)),
+            ],
+            "request and failure telemetry must use the dispatched model"
+        );
     }
 
     #[tokio::test]
