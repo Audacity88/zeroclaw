@@ -2414,6 +2414,30 @@ mod tests {
     }
 
     #[test]
+    fn request_identity_is_unstable_when_model_fallback_is_configured() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "primary",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        )
+        .with_model_fallbacks(HashMap::from([(
+            "model".to_string(),
+            vec!["fallback-model".to_string()],
+        )]));
+
+        assert!(!model_provider.has_stable_request_identity("model"));
+    }
+
+    #[test]
     fn single_provider_request_identity_remains_stable() {
         let model_provider = ReliableModelProvider::new(
             "test",
