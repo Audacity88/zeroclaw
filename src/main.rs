@@ -799,9 +799,9 @@ an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
   zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
   zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -3569,6 +3569,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
+    // Must follow the trace sink init above, or the record has no destination.
+    // The daemon reload arm calls the same helper against its reloaded config.
+    #[cfg(feature = "agent-runtime")]
+    warn_verifiable_intent_withheld(&config);
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -4365,6 +4369,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             &current_config.observability,
                             &current_config.data_dir,
                         );
+                        // A reload applies config the process has not seen, so an
+                        // operator who just enabled the section learns why the tool
+                        // is still absent without having to restart.
+                        #[cfg(feature = "agent-runtime")]
+                        warn_verifiable_intent_withheld(&current_config);
                         if let Some(handle) = degraded_nag.take() {
                             handle.abort();
                         }
@@ -7643,6 +7652,27 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             Ok(())
         }
     }
+}
+
+/// Tell the operator that `vi_verify` is withheld from the model-visible
+/// registry while no credential chain verifier exists.
+///
+/// Called once per config application: at process config load, and again when
+/// the daemon reload arm re-reads config from disk. Registry assembly is the
+/// wrong home for it, because that runs on ordinary gateway requests and on
+/// nested SOP and delegation rebuilds. Each call site must sit after its
+/// `runtime_trace::init_from_config`, or the record has no sink.
+#[cfg(feature = "agent-runtime")]
+fn warn_verifiable_intent_withheld(config: &Config) {
+    if !config.verifiable_intent.enabled {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+    );
 }
 
 fn gate_security_posture(
