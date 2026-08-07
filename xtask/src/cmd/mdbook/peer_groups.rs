@@ -794,7 +794,7 @@ fn render_model_provider_endpoint(name: &str, format_fixed: impl FnOnce(&str) ->
         .unwrap_or_else(|| panic!("canonical provider {name:?} has no endpoint classification"))
     {
         ProviderEndpoint::Fixed(url) => format_fixed(url),
-        ProviderEndpoint::Dynamic => "dynamic / regional".to_string(),
+        ProviderEndpoint::Dynamic => "dynamic / resolved at runtime".to_string(),
         ProviderEndpoint::OperatorRequired => "operator required".to_string(),
         ProviderEndpoint::CliBacked => "CLI-backed".to_string(),
     }
@@ -1142,8 +1142,8 @@ mod generated_prose_gate {
             let (catalog_endpoint, fields_endpoint) = match endpoint {
                 ProviderEndpoint::Fixed(url) => (format!("`{url}`"), format!("<code>{url}</code>")),
                 ProviderEndpoint::Dynamic => (
-                    "dynamic / regional".to_string(),
-                    "dynamic / regional".to_string(),
+                    "dynamic / resolved at runtime".to_string(),
+                    "dynamic / resolved at runtime".to_string(),
                 ),
                 ProviderEndpoint::OperatorRequired => (
                     "operator required".to_string(),
