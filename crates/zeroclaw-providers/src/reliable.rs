@@ -1014,10 +1014,9 @@ impl ModelProvider for ReliableModelProvider {
             return false;
         }
 
-        self.model_providers.first().is_some_and(|entry| {
-            let served_model = entry.served_model(model);
-            entry.provider().has_stable_request_identity(served_model)
-        })
+        self.model_providers
+            .first()
+            .is_some_and(|entry| entry.provider().has_stable_request_identity(model))
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -2432,6 +2431,30 @@ mod tests {
         );
 
         assert!(model_provider.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn pinned_request_identity_is_stable_only_without_a_model_remap() {
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.default",
+                "primary.default",
+                "pinned-model",
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "primary",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        assert!(model_provider.has_stable_request_identity("pinned-model"));
+        assert!(!model_provider.has_stable_request_identity("requested-model"));
     }
 
     /// A `fallback_models` downgrade uses model-PINNED entries on one

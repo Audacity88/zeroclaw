@@ -3230,6 +3230,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for MockModelProvider {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -7800,7 +7804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_cache_bypasses_model_pin_remaps() {
+    async fn response_cache_distinguishes_model_pin_identity() {
         let tmp = tempfile::tempdir().expect("temp response cache dir");
         let cache = Arc::new(
             zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
@@ -7818,6 +7822,8 @@ mod tests {
         };
         let seen_a = Arc::new(Mutex::new(Vec::new()));
         let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = Arc::new(Mutex::new(Vec::new()));
+        let seen_d = Arc::new(Mutex::new(Vec::new()));
         let build = |answer: &str, pinned_model: &str, seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>| {
             let pinned = zeroclaw_providers::model_pin::ModelPinnedProvider::builder("shared-pin")
                 .pinned_model(pinned_model)
@@ -7860,6 +7866,16 @@ mod tests {
         assert_eq!(second.turn("same request").await.unwrap(), "pin-b");
         assert_eq!(seen_a.lock().len(), 1);
         assert_eq!(seen_b.lock().len(), 1);
+
+        let mut third = build("stable-pin-a", "requested-model", seen_c.clone());
+        let mut fourth = build("stable-pin-b", "requested-model", seen_d.clone());
+        assert_eq!(third.turn("stable request").await.unwrap(), "stable-pin-a");
+        assert_eq!(fourth.turn("stable request").await.unwrap(), "stable-pin-a");
+        assert_eq!(seen_c.lock().len(), 1);
+        assert!(
+            seen_d.lock().is_empty(),
+            "identity-preserving pins must retain ordinary response-cache reuse"
+        );
     }
 
     #[tokio::test]
