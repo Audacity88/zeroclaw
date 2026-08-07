@@ -215,6 +215,13 @@ impl Tool for ArcToolRef {
     }
 }
 
+fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
+    root_config.claude_code.enabled
+        || root_config.codex_cli.enabled
+        || root_config.gemini_cli.enabled
+        || root_config.opencode_cli.enabled
+}
+
 #[derive(Clone)]
 struct ArcDelegatingTool {
     inner: Arc<dyn Tool>,
@@ -577,6 +584,7 @@ pub fn all_tools_with_runtime(
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
+    let register_coding_cli_tools = has_shell_access && persistent_writes;
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
@@ -1081,8 +1089,17 @@ pub fn all_tools_with_runtime(
         );
     }
 
+    if any_coding_cli_tool_enabled(root_config) && !register_coding_cli_tools {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "coding_cli: skipped registration because runtime shell or filesystem access is unavailable"
+        );
+    }
+
     // Claude Code delegation tool
-    if root_config.claude_code.enabled {
+    if register_coding_cli_tools && root_config.claude_code.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             ClaudeCodeTool::new_with_executor(
                 security.clone(),
@@ -1110,7 +1127,7 @@ pub fn all_tools_with_runtime(
     }
 
     // Codex CLI delegation tool
-    if root_config.codex_cli.enabled {
+    if register_coding_cli_tools && root_config.codex_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             CodexCliTool::new_with_executor(
                 security.clone(),
@@ -1122,7 +1139,7 @@ pub fn all_tools_with_runtime(
     }
 
     // Gemini CLI delegation tool
-    if root_config.gemini_cli.enabled {
+    if register_coding_cli_tools && root_config.gemini_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             GeminiCliTool::new_with_executor(
                 security.clone(),
@@ -1134,7 +1151,7 @@ pub fn all_tools_with_runtime(
     }
 
     // OpenCode CLI delegation tool
-    if root_config.opencode_cli.enabled {
+    if register_coding_cli_tools && root_config.opencode_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             OpenCodeCliTool::new_with_executor(
                 security.clone(),
@@ -1904,6 +1921,7 @@ mod tests {
 
     struct CapturingRuntime {
         seen_command: Arc<Mutex<Option<String>>>,
+        filesystem_access: bool,
     }
 
     impl RuntimeAdapter for CapturingRuntime {
@@ -1914,7 +1932,7 @@ mod tests {
             true
         }
         fn has_filesystem_access(&self) -> bool {
-            true
+            self.filesystem_access
         }
         fn storage_path(&self) -> std::path::PathBuf {
             std::env::temp_dir()
@@ -1997,6 +2015,7 @@ mod tests {
                 "test-agent",
                 Arc::new(CapturingRuntime {
                     seen_command: Arc::clone(&seen_command),
+                    filesystem_access: true,
                 }),
                 mem,
                 None,
@@ -2046,6 +2065,77 @@ mod tests {
                 "{tool_name} command was {command:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn docker_without_workspace_mount_does_not_register_coding_cli_tools() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let mut cfg = test_config(&tmp);
+        cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+        cfg.runtime.docker.mount_workspace = false;
+        cfg.claude_code.enabled = true;
+        cfg.codex_cli.enabled = true;
+        cfg.gemini_cli.enabled = true;
+        cfg.opencode_cli.enabled = true;
+        let risk = zeroclaw_config::schema::RiskProfileConfig {
+            sandbox_enabled: Some(false),
+            sandbox_backend: Some("none".to_string()),
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(zeroclaw_config::platform::DockerRuntime::new(
+                cfg.runtime.docker.clone(),
+            )),
+            mem,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        for tool_name in ["claude_code", "codex_cli", "gemini_cli", "opencode_cli"] {
+            assert!(
+                !names.contains(&tool_name),
+                "{tool_name} must not register without runtime filesystem access"
+            );
+        }
+        assert!(
+            names.contains(&"shell"),
+            "positive control: ordinary tools should still register"
+        );
     }
 
     #[test]

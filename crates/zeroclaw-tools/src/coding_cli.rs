@@ -83,7 +83,7 @@ impl DirectCodingCliExecutor {
 #[async_trait]
 impl CodingCliExecutor for DirectCodingCliExecutor {
     async fn output(&self, command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
-        let mut process = Command::new(host_native_program(&command.program));
+        let mut process = Command::new(host_native_program(&command.program)?);
         process.args(&command.args);
         process.env_clear();
         for (key, value) in command.env {
@@ -99,32 +99,60 @@ impl CodingCliExecutor for DirectCodingCliExecutor {
     }
 }
 
-pub fn host_native_program(program: &OsStr) -> OsString {
+pub fn host_native_program(program: &OsStr) -> Result<OsString, CodingCliExecutionError> {
     if cfg!(target_os = "windows") {
         host_native_windows_program(program)
     } else {
-        program.to_os_string()
+        host_native_non_windows_program(program)
     }
 }
 
-fn host_native_windows_program(program: &OsStr) -> OsString {
-    host_native_windows_program_with(program, || {
-        which::which("claude")
-            .ok()
-            .map(|path| path.into_os_string())
-    })
+fn find_claude_on_path() -> Option<OsString> {
+    which::which("claude")
+        .ok()
+        .map(|path| path.into_os_string())
 }
 
-fn host_native_windows_program_with<F>(program: &OsStr, find_claude: F) -> OsString
+fn missing_claude_error() -> CodingCliExecutionError {
+    CodingCliExecutionError::Prepare(anyhow::anyhow!(
+        "Claude Code executable 'claude' was not found on PATH before applying the workspace working directory"
+    ))
+}
+
+fn host_native_non_windows_program(program: &OsStr) -> Result<OsString, CodingCliExecutionError> {
+    host_native_non_windows_program_with(program, find_claude_on_path)
+}
+
+fn host_native_non_windows_program_with<F>(
+    program: &OsStr,
+    find_claude: F,
+) -> Result<OsString, CodingCliExecutionError>
 where
     F: FnOnce() -> Option<OsString>,
 {
     match program.to_str() {
+        Some("claude") => find_claude().ok_or_else(missing_claude_error),
+        _ => Ok(program.to_os_string()),
+    }
+}
+
+fn host_native_windows_program(program: &OsStr) -> Result<OsString, CodingCliExecutionError> {
+    host_native_windows_program_with(program, find_claude_on_path)
+}
+
+fn host_native_windows_program_with<F>(
+    program: &OsStr,
+    find_claude: F,
+) -> Result<OsString, CodingCliExecutionError>
+where
+    F: FnOnce() -> Option<OsString>,
+{
+    Ok(match program.to_str() {
         Some("codex") => OsString::from("codex.cmd"),
         Some("gemini") => OsString::from("gemini.cmd"),
         Some("claude") => find_claude().unwrap_or_else(|| OsString::from("claude.cmd")),
         _ => program.to_os_string(),
-    }
+    })
 }
 
 pub fn add_safe_env(command: &mut CodingCliCommand, safe_vars: &[&str], passthrough: &[String]) {
@@ -151,25 +179,26 @@ mod tests {
     #[test]
     fn host_native_windows_program_preserves_known_cli_shims() {
         assert_eq!(
-            host_native_windows_program_with(OsStr::new("codex"), || None),
+            host_native_windows_program_with(OsStr::new("codex"), || None).unwrap(),
             OsString::from("codex.cmd")
         );
         assert_eq!(
-            host_native_windows_program_with(OsStr::new("gemini"), || None),
+            host_native_windows_program_with(OsStr::new("gemini"), || None).unwrap(),
             OsString::from("gemini.cmd")
         );
         assert_eq!(
-            host_native_windows_program_with(OsStr::new("claude"), || None),
+            host_native_windows_program_with(OsStr::new("claude"), || None).unwrap(),
             OsString::from("claude.cmd")
         );
         assert_eq!(
             host_native_windows_program_with(OsStr::new("claude"), || Some(OsString::from(
                 r"C:\Tools\claude.exe"
-            ))),
+            )))
+            .unwrap(),
             OsString::from(r"C:\Tools\claude.exe")
         );
         assert_eq!(
-            host_native_windows_program_with(OsStr::new("opencode"), || None),
+            host_native_windows_program_with(OsStr::new("opencode"), || None).unwrap(),
             OsString::from("opencode")
         );
     }
@@ -178,10 +207,34 @@ mod tests {
     fn host_native_program_leaves_names_neutral_on_non_windows() {
         if !cfg!(target_os = "windows") {
             assert_eq!(
-                host_native_program(OsStr::new("codex")),
+                host_native_program(OsStr::new("codex")).unwrap(),
                 OsString::from("codex")
             );
         }
+    }
+
+    #[test]
+    fn host_native_non_windows_program_resolves_claude_before_workspace_cwd() {
+        assert_eq!(
+            host_native_non_windows_program_with(OsStr::new("claude"), || Some(OsString::from(
+                "/usr/local/bin/claude"
+            )))
+            .unwrap(),
+            OsString::from("/usr/local/bin/claude")
+        );
+        let error = host_native_non_windows_program_with(OsStr::new("claude"), || None)
+            .expect_err("unresolved Unix Claude path should fail closed");
+        assert!(
+            error.to_string().contains("was not found on PATH"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            host_native_non_windows_program_with(OsStr::new("codex"), || Some(OsString::from(
+                "/tmp/claude"
+            )))
+            .unwrap(),
+            OsString::from("codex")
+        );
     }
 
     #[test]

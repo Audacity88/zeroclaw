@@ -51,7 +51,7 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
 
         let timeout_secs = command.timeout_secs;
         let mut process = if self.use_native_argv {
-            native_command(&command)
+            native_command(&command)?
         } else {
             let env_keys: Vec<&OsStr> = command
                 .runtime_env_keys
@@ -104,11 +104,13 @@ fn command_env_snapshot(process: &tokio::process::Command) -> Vec<(OsString, Opt
         .collect()
 }
 
-fn native_command(command: &CodingCliCommand) -> tokio::process::Command {
-    let mut process = tokio::process::Command::new(host_native_program(&command.program));
+fn native_command(
+    command: &CodingCliCommand,
+) -> Result<tokio::process::Command, CodingCliExecutionError> {
+    let mut process = tokio::process::Command::new(host_native_program(&command.program)?);
     process.args(&command.args);
     process.current_dir(&command.working_dir);
-    process
+    Ok(process)
 }
 
 fn shell_command(command: &CodingCliCommand) -> String {
