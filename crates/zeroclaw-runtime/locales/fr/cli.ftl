@@ -197,9 +197,9 @@ cli-cron-long-about =
 
     Exemples :
     zeroclaw cron list
-    zeroclaw cron add '0 9 * * 1-5' 'Bonjour' --tz America/New_York --agent
-    zeroclaw cron add '*/30 * * * *' 'Vérifier la santé du système' --agent
-    zeroclaw cron add '*/5 * * * *' 'echo ok'
+    zeroclaw cron add '0 9 * * 1-5' 'Bonjour' --agent sentinel --prompt --tz America/New_York
+    zeroclaw cron add '*/30 * * * *' 'Vérifier la santé du système' --agent sentinel --prompt
+    zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
     zeroclaw cron add-at 2025-01-15T14:00:00Z 'Envoyer un rappel' --agent
     zeroclaw cron add-every 60000 'Ping de santé'
     zeroclaw cron once 30m 'Lancer une sauvegarde dans 30 minutes' --agent
@@ -930,6 +930,13 @@ cli-gateway-restart-hint-process = redémarrez le processus `zeroclaw daemon`
 
 cli-daemon-gateway-already-running = Une passerelle ZeroClaw est déjà en cours d'exécution sur {$host}:{$port}. Le démon supervise sa propre passerelle et ne démarrera pas une seconde passerelle sur la même adresse. Arrêtez cette passerelle (ou pointez le démon vers un port libre avec `zeroclaw config set gateway.port <port>`), puis relancez le démon.
 cli-daemon-gateway-port-occupied = L'adresse de passerelle {$host}:{$port} est déjà utilisée par un autre processus. Libérez le port ou pointez le démon vers un port libre (`zeroclaw config set gateway.port <port>`), puis relancez le démon.
+cli-daemon-starting-title = 🧠 Le démon ZeroClaw démarre…
+cli-daemon-starting-detail = Préparation des endpoints configurés du démon
+cli-daemon-started-title = 🧠 Le démon ZeroClaw est prêt
+cli-daemon-started-gateway = Passerelle : {$url}
+cli-daemon-started-socket = Socket :     {$path}
+cli-daemon-started-pairing = Appairage : activé (voir ci-dessus l'état actuel de la passerelle)
+cli-daemon-started-stop = Ctrl+C ou SIGTERM pour arrêter
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: inconnu / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}

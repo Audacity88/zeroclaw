@@ -197,9 +197,9 @@ cli-cron-long-about =
 
     Ejemplos:
     zeroclaw cron list
-    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-    zeroclaw cron add '*/5 * * * *' 'echo ok'
+    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+    zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
     zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
     zeroclaw cron add-every 60000 'Ping heartbeat'
     zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -927,6 +927,13 @@ cli-gateway-restart-hint-process = reinicie el proceso `zeroclaw daemon`
 
 cli-daemon-gateway-already-running = Ya hay un gateway de ZeroClaw ejecutándose en {$host}:{$port}. El daemon supervisa su propio gateway y no iniciará un segundo en la misma dirección. Detén ese gateway (o apunta el daemon a un puerto libre con `zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
 cli-daemon-gateway-port-occupied = La dirección del gateway {$host}:{$port} ya está en uso por otro proceso. Libera el puerto o apunta el daemon a un puerto libre (`zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
+cli-daemon-starting-title = 🧠 El daemon de ZeroClaw se está iniciando…
+cli-daemon-starting-detail = Preparando los endpoints configurados del daemon
+cli-daemon-started-title = 🧠 El daemon de ZeroClaw está listo
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-pairing = Emparejamiento: activado (consulta arriba el estado actual del gateway)
+cli-daemon-started-stop = Ctrl+C o SIGTERM para detener
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: desconocido / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: ya tiene context_window = {$ctx}
