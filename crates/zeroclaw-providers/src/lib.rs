@@ -1097,22 +1097,16 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
-/// Apply the config `vision` capability override to a freshly-constructed
-/// provider. Called at every exit of `create_model_provider_inner`, the single
-/// construction choke point every subsystem funnels through, so the override
-/// lands once and `supports_vision()` stays consistent across the
-/// vision-routing gate, the channel media pipeline, and the model router
-/// without per-family or per-consumer re-derivation.
-fn apply_vision_override(
+/// Mark a freshly constructed provider as a known leaf and apply its optional
+/// config `vision` capability override. Called at every exit of
+/// `create_model_provider_inner`, before Reliable/Router composition.
+fn apply_factory_leaf_metadata(
     provider: Box<dyn ModelProvider>,
     vision: Option<bool>,
 ) -> Box<dyn ModelProvider> {
-    match vision {
-        Some(vision) => Box::new(vision_override::VisionOverrideProvider::new(
-            provider, vision,
-        )),
-        None => provider,
-    }
+    Box::new(vision_override::VisionOverrideProvider::factory_leaf(
+        provider, vision,
+    ))
 }
 
 /// Factory: create model_provider with optional base URL and runtime options.
@@ -1154,7 +1148,7 @@ fn create_model_provider_inner(
     // factory callers that pass the legacy spelling expect a working
     // construction here.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
-        return Ok(apply_vision_override(
+        return Ok(apply_factory_leaf_metadata(
             Box::new(openai_codex::OpenAiCodexModelProvider::new(
                 alias, options, api_key,
             )?),
@@ -1205,7 +1199,7 @@ fn create_model_provider_inner(
             Some(url) => url,
             None => moonshot_code_base_url(),
         };
-        return Ok(apply_vision_override(
+        return Ok(apply_factory_leaf_metadata(
             factory::apply_compat_options(
                 factory::build_kimi_code_compat(alias, key, base_url),
                 options,
@@ -1215,7 +1209,7 @@ fn create_model_provider_inner(
     }
 
     factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
-        .map(|provider| apply_vision_override(provider, options.vision))
+        .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
 
 pub fn create_resilient_model_provider_with_options(

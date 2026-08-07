@@ -1079,6 +1079,9 @@ impl Agent {
                 .is_some_and(|runner| !runner.is_empty())
             || !self.tools.is_empty()
             || self.activated_tools.is_some()
+            || !self
+                .model_provider
+                .has_stable_request_identity(effective_model)
         {
             return None;
         }
@@ -3691,6 +3694,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for TranscriptCaptureModelProvider {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -3731,6 +3738,71 @@ mod tests {
         }
         fn alias(&self) -> &str {
             &self.alias
+        }
+    }
+
+    struct AlwaysFailModelProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for AlwaysFailModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("synthetic primary failure")
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for AlwaysFailModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "always-fail"
+        }
+    }
+
+    struct CountingAnswerModelProvider {
+        calls: Arc<AtomicUsize>,
+        answer: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingAnswerModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.answer.clone())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingAnswerModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "counting-answer"
         }
     }
 
@@ -7477,6 +7549,316 @@ mod tests {
         assert_eq!(agent_b.turn("same request").await.unwrap(), "answer-b");
         assert_eq!(seen_a.lock().len(), 1);
         assert_eq!(seen_b.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_non_streaming_provider_failover() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let build = |answer: &str| {
+            Agent::builder()
+                .model_provider(Box::new(
+                    zeroclaw_providers::reliable::ReliableModelProvider::new(
+                        "shared-reliable",
+                        vec![
+                            (
+                                "primary".into(),
+                                Box::new(AlwaysFailModelProvider {
+                                    calls: primary_calls.clone(),
+                                }),
+                            ),
+                            (
+                                "fallback".into(),
+                                Box::new(CountingAnswerModelProvider {
+                                    calls: fallback_calls.clone(),
+                                    answer: answer.into(),
+                                }),
+                            ),
+                        ],
+                        0,
+                        1,
+                    ),
+                ))
+                .model_provider_name("provider-family".into())
+                .tools(vec![])
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("shared-model".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("fallback-a");
+        let mut second = build("fallback-b");
+        assert!(
+            first
+                .turn("same request")
+                .await
+                .unwrap()
+                .contains("fallback-a")
+        );
+        assert!(
+            second
+                .turn("same request")
+                .await
+                .unwrap()
+                .contains("fallback-b")
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_streamed_provider_failover() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let build = |answer: &str| {
+            Agent::builder()
+                .model_provider(Box::new(
+                    zeroclaw_providers::reliable::ReliableModelProvider::new(
+                        "shared-reliable",
+                        vec![
+                            (
+                                "primary".into(),
+                                Box::new(AlwaysFailModelProvider {
+                                    calls: primary_calls.clone(),
+                                }),
+                            ),
+                            (
+                                "fallback".into(),
+                                Box::new(CountingAnswerModelProvider {
+                                    calls: fallback_calls.clone(),
+                                    answer: answer.into(),
+                                }),
+                            ),
+                        ],
+                        0,
+                        1,
+                    ),
+                ))
+                .model_provider_name("provider-family".into())
+                .tools(vec![])
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("shared-model".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("fallback-a");
+        let mut second = build("fallback-b");
+        let (event_tx_a, _event_rx_a) = tokio::sync::mpsc::channel(32);
+        let (event_tx_b, _event_rx_b) = tokio::sync::mpsc::channel(32);
+        let first_response = first
+            .turn_streamed("same request", event_tx_a, None)
+            .await
+            .unwrap()
+            .0;
+        let second_response = second
+            .turn_streamed("same request", event_tx_b, None)
+            .await
+            .unwrap()
+            .0;
+        assert!(first_response.contains("fallback-a"));
+        assert!(second_response.contains("fallback-b"));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_model_pin_remaps() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let build = |answer: &str, pinned_model: &str, seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>| {
+            let pinned = zeroclaw_providers::model_pin::ModelPinnedProvider::builder("shared-pin")
+                .pinned_model(pinned_model)
+                .inner(Box::new(TranscriptCaptureModelProvider {
+                    alias: "shared-child".into(),
+                    responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                        text: Some(answer.into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    }]),
+                    seen_messages: seen,
+                }))
+                .build();
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "shared-reliable",
+                vec![("only".into(), Box::new(pinned))],
+                0,
+                1,
+            );
+            Agent::builder()
+                .model_provider(Box::new(reliable))
+                .model_provider_name("provider-family".into())
+                .tools(vec![])
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("requested-model".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("pin-a", "model-a", seen_a.clone());
+        let mut second = build("pin-b", "model-b", seen_b.clone());
+        assert_eq!(first.turn("same request").await.unwrap(), "pin-a");
+        assert_eq!(second.turn("same request").await.unwrap(), "pin-b");
+        assert_eq!(seen_a.lock().len(), 1);
+        assert_eq!(seen_b.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_router_hint_remaps() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = Arc::new(Mutex::new(Vec::new()));
+        let seen_d = Arc::new(Mutex::new(Vec::new()));
+        let build = |answer: &str, routed_model: &str, seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>| {
+            let router = zeroclaw_providers::router::RouterModelProvider::new(
+                "shared-router",
+                vec![(
+                    "provider.default".into(),
+                    Box::new(TranscriptCaptureModelProvider {
+                        alias: "shared-child".into(),
+                        responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            text: Some(answer.into()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        }]),
+                        seen_messages: seen,
+                    }),
+                )],
+                vec![(
+                    "fast".into(),
+                    zeroclaw_providers::router::Route {
+                        provider_name: "provider.default".into(),
+                        model: routed_model.into(),
+                    },
+                )],
+                "default-model".into(),
+            );
+            Agent::builder()
+                .model_provider(Box::new(router))
+                .model_provider_name("router".into())
+                .tools(vec![])
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("hint:fast".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("route-a", "model-a", seen_a.clone());
+        let mut second = build("route-b", "model-b", seen_b.clone());
+        assert_eq!(first.turn("same request").await.unwrap(), "route-a");
+        assert_eq!(second.turn("same request").await.unwrap(), "route-b");
+        assert_eq!(seen_a.lock().len(), 1);
+        assert_eq!(seen_b.lock().len(), 1);
+
+        let mut third = build("route-c", "model-c", seen_c.clone());
+        let mut fourth = build("route-d", "model-d", seen_d.clone());
+        let (event_tx_c, _event_rx_c) = tokio::sync::mpsc::channel(32);
+        let (event_tx_d, _event_rx_d) = tokio::sync::mpsc::channel(32);
+        assert_eq!(
+            third
+                .turn_streamed("same request", event_tx_c, None)
+                .await
+                .unwrap()
+                .0,
+            "route-c"
+        );
+        assert_eq!(
+            fourth
+                .turn_streamed("same request", event_tx_d, None)
+                .await
+                .unwrap()
+                .0,
+            "route-d"
+        );
+        assert_eq!(seen_c.lock().len(), 1);
+        assert_eq!(seen_d.lock().len(), 1);
     }
 
     #[tokio::test]

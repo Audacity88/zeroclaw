@@ -75,6 +75,10 @@ impl ModelPinnedProvider {
 
 #[async_trait]
 impl ModelProvider for ModelPinnedProvider {
+    fn has_stable_request_identity(&self, _model: &str) -> bool {
+        false
+    }
+
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
         self.inner.capabilities()
     }
