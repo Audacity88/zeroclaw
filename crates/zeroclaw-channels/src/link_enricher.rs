@@ -57,7 +57,7 @@ fn is_blocked_url(url: &reqwest::Url) -> bool {
     }
 
     url.host_str()
-        .is_none_or(|host| zeroclaw_infra::net_guard::is_private_or_local_host(host))
+        .is_none_or(zeroclaw_infra::net_guard::is_private_or_local_host)
 }
 
 fn redirect_policy() -> reqwest::redirect::Policy {
