@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::sync::Arc;
 use tokio::process::Command;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -11,6 +13,7 @@ use zeroclaw_config::schema::ClaudeCodeRunnerConfig;
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
+const MAX_SLACK_CHANNEL_ID_LEN: usize = 64;
 
 /// Event payload received from Claude Code HTTP hooks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +35,7 @@ pub struct ClaudeCodeRunnerTool {
     config: ClaudeCodeRunnerConfig,
     /// Base URL of the ZeroClaw gateway (e.g. `"http://localhost:3000"`).
     gateway_url: String,
+    tmux_binary: PathBuf,
 }
 
 impl ClaudeCodeRunnerTool {
@@ -44,7 +48,14 @@ impl ClaudeCodeRunnerTool {
             security,
             config,
             gateway_url,
+            tmux_binary: PathBuf::from("tmux"),
         }
+    }
+
+    #[cfg(test)]
+    fn with_tmux_binary(mut self, tmux_binary: PathBuf) -> Self {
+        self.tmux_binary = tmux_binary;
+        self
     }
 
     /// Build the tmux session name from the configured prefix and a unique id.
@@ -171,10 +182,28 @@ impl Tool for ClaudeCodeRunnerTool {
             self.security.workspace_dir.clone()
         };
 
-        let slack_channel = args
-            .get("slack_channel")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let slack_channel = match args.get("slack_channel") {
+            None => None,
+            Some(serde_json::Value::String(channel)) => Some(channel.clone()),
+            Some(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("slack_channel must be a string".to_string()),
+                });
+            }
+        };
+        if let Some(channel) = slack_channel.as_deref()
+            && !is_valid_slack_channel_id(channel)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "slack_channel must be a Slack conversation ID starting with C, G, D, or U and containing at most {MAX_SLACK_CHANNEL_ID_LEN} uppercase ASCII letters or digits"
+                )),
+            });
+        }
 
         // Generate a unique session ID
         let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -202,20 +231,18 @@ impl Tool for ClaudeCodeRunnerTool {
         let mut env_exports = String::new();
         for var in SAFE_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
-                use std::fmt::Write;
-                let _ = write!(env_exports, "{}={} ", var, shell_escape(&val));
+                append_env_assignment(&mut env_exports, var, &val);
             }
         }
         // Pass session metadata via env vars so the hook can correlate events
-        use std::fmt::Write;
-        let _ = write!(env_exports, "CLAUDE_CODE_SESSION_ID={} ", session_id);
+        append_env_assignment(&mut env_exports, "CLAUDE_CODE_SESSION_ID", &session_id);
         if let Some(ref ch) = slack_channel {
-            let _ = write!(env_exports, "CLAUDE_CODE_SLACK_CHANNEL={} ", ch);
+            append_env_assignment(&mut env_exports, "CLAUDE_CODE_SLACK_CHANNEL", ch);
         }
-        let _ = write!(env_exports, "CLAUDE_CODE_HOOK_URL={} ", hook_url);
+        append_env_assignment(&mut env_exports, "CLAUDE_CODE_HOOK_URL", &hook_url);
 
         // Create tmux session
-        let create_result = Command::new("tmux")
+        let create_result = Command::new(&self.tmux_binary)
             .args(["new-session", "-d", "-s", &session_name])
             .arg("-c")
             .arg(
@@ -258,39 +285,54 @@ impl Tool for ClaudeCodeRunnerTool {
                 .join(" ")
         );
 
-        let send_result = Command::new("tmux")
+        let send_result = Command::new(&self.tmux_binary)
             .args(["send-keys", "-t", &session_name, &full_command, "Enter"])
             .output()
             .await;
 
-        if let Err(e) = send_result {
-            // Clean up the session we just created
-            let _ = Command::new("tmux")
-                .args(["kill-session", "-t", &session_name])
-                .output()
-                .await;
+        let send_error = match send_result {
+            Ok(output) => tmux_command_failure("send command", &output),
+            Err(error) => Some(format!("Failed to send command to tmux session: {error}")),
+        };
+        if let Some(error) = send_error {
+            let error = match kill_tmux_session(&self.tmux_binary, &session_name).await {
+                Ok(()) => error,
+                Err(cleanup_error) => format!("{error}; cleanup also failed: {cleanup_error}"),
+            };
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Failed to send command to tmux session: {e}")),
+                error: Some(error),
             });
         }
 
         // Schedule session TTL cleanup
         let ttl = self.config.session_ttl;
         let cleanup_session = session_name.clone();
+        let tmux_binary = self.tmux_binary.clone();
         zeroclaw_spawn::spawn!(async move {
             tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
-            let _ = Command::new("tmux")
-                .args(["kill-session", "-t", &cleanup_session])
-                .output()
-                .await;
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"session": cleanup_session})),
-                "Claude Code runner session TTL expired, cleaned up"
-            );
+            match kill_tmux_session(&tmux_binary, &cleanup_session).await {
+                Ok(()) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"session": cleanup_session})),
+                        "Claude Code runner session TTL expired, cleaned up"
+                    );
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"session": cleanup_session, "error": error})
+                            ),
+                        "Claude Code runner session TTL cleanup failed"
+                    );
+                }
+            }
         });
 
         // Build response
@@ -317,6 +359,47 @@ impl Tool for ClaudeCodeRunnerTool {
             output: output_parts.join("\n").into(),
             error: None,
         })
+    }
+}
+
+fn is_valid_slack_channel_id(value: &str) -> bool {
+    value.len() >= 2
+        && value.len() <= MAX_SLACK_CHANNEL_ID_LEN
+        && matches!(value.as_bytes()[0], b'C' | b'G' | b'D' | b'U')
+        && value.as_bytes()[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn append_env_assignment(command: &mut String, name: &str, value: &str) {
+    command.push_str(name);
+    command.push('=');
+    command.push_str(&shell_escape(value));
+    command.push(' ');
+}
+
+fn tmux_command_failure(operation: &str, output: &Output) -> Option<String> {
+    if output.status.success() {
+        return None;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Some(format!(
+        "Failed to {operation} in tmux ({}): {}",
+        output.status,
+        stderr.trim()
+    ))
+}
+
+async fn kill_tmux_session(tmux_binary: &Path, session_name: &str) -> Result<(), String> {
+    let output = Command::new(tmux_binary)
+        .args(["kill-session", "-t", session_name])
+        .output()
+        .await
+        .map_err(|error| format!("Failed to start tmux cleanup: {error}"))?;
+    match tmux_command_failure("kill session", &output) {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -498,6 +581,162 @@ mod tests {
                 .unwrap_or("")
                 .contains("outside the workspace")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_shell_syntax_in_slack_channel_before_starting_tmux() {
+        let tool = ClaudeCodeRunnerTool::new(
+            test_security(AutonomyLevel::Full),
+            test_config(),
+            "http://localhost:3000".into(),
+        );
+        let result = tool
+            .execute(json!({
+                "prompt": "hello",
+                "slack_channel": "C123; touch /tmp/owned"
+            }))
+            .await
+            .expect("invalid channel should return a result");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Slack conversation ID")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_string_slack_channel_before_starting_tmux() {
+        let tool = ClaudeCodeRunnerTool::new(
+            test_security(AutonomyLevel::Full),
+            test_config(),
+            "http://localhost:3000".into(),
+        );
+        let result = tool
+            .execute(json!({"prompt": "hello", "slack_channel": 42}))
+            .await
+            .expect("invalid channel type should return a result");
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("slack_channel must be a string")
+        );
+    }
+
+    #[test]
+    fn environment_assignments_escape_every_value() {
+        let mut command = String::new();
+        append_env_assignment(&mut command, "CLAUDE_CODE_HOOK_URL", "https://host/a b'c");
+        assert_eq!(command, "CLAUDE_CODE_HOOK_URL='https://host/a b'\\''c' ");
+    }
+
+    #[test]
+    fn slack_channel_validation_accepts_ids_and_rejects_shell_input() {
+        assert!(is_valid_slack_channel_id("C0123456789"));
+        assert!(is_valid_slack_channel_id("GABC123"));
+        assert!(is_valid_slack_channel_id("D123"));
+        assert!(is_valid_slack_channel_id("U123"));
+        assert!(!is_valid_slack_channel_id(""));
+        assert!(!is_valid_slack_channel_id("channel"));
+        assert!(!is_valid_slack_channel_id("C123;whoami"));
+        assert!(!is_valid_slack_channel_id(
+            &"C".repeat(MAX_SLACK_CHANNEL_ID_LEN + 1)
+        ));
+    }
+
+    #[cfg(unix)]
+    fn fake_tmux(send_exit: u8, kill_exit: u8) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().expect("fake tmux directory");
+        let binary = temp.path().join("tmux");
+        let log = temp.path().join("tmux.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  new-session) exit 0 ;;\n  send-keys) exit {send_exit} ;;\n  kill-session) exit {kill_exit} ;;\n  *) exit 64 ;;\nesac\n",
+            shell_escape(log.to_str().expect("log path is UTF-8"))
+        );
+        std::fs::write(&binary, script).expect("write fake tmux");
+        let mut permissions = std::fs::metadata(&binary)
+            .expect("fake tmux metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("make fake tmux executable");
+        (temp, binary, log)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_tmux_send_cleans_up_and_returns_failure() {
+        let (_temp, binary, log) = fake_tmux(7, 0);
+        let tool = ClaudeCodeRunnerTool::new(
+            test_security(AutonomyLevel::Full),
+            test_config(),
+            "http://localhost:3000".into(),
+        )
+        .with_tmux_binary(binary);
+        let result = tool
+            .execute(json!({"prompt": "hello", "slack_channel": "C123"}))
+            .await
+            .expect("tmux failure should return a result");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to send command")
+        );
+        let calls = std::fs::read_to_string(log).expect("read fake tmux calls");
+        assert!(calls.lines().any(|line| line.starts_with("new-session ")));
+        assert!(calls.lines().any(|line| line.starts_with("send-keys ")));
+        assert!(calls.lines().any(|line| line.starts_with("kill-session ")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_failure_reports_cleanup_failure() {
+        let (_temp, binary, _log) = fake_tmux(7, 8);
+        let tool = ClaudeCodeRunnerTool::new(
+            test_security(AutonomyLevel::Full),
+            test_config(),
+            "http://localhost:3000".into(),
+        )
+        .with_tmux_binary(binary);
+        let result = tool
+            .execute(json!({"prompt": "hello", "slack_channel": "C123"}))
+            .await
+            .expect("tmux failure should return a result");
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("cleanup also failed"));
+        assert!(error.contains("Failed to kill session"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assembled_tmux_command_quotes_untrusted_values() {
+        let (_temp, binary, log) = fake_tmux(0, 0);
+        let gateway_url = "http://localhost/a b';touch";
+        let prompt = "review $(touch /tmp/not-owned) and 'quote'";
+        let tool = ClaudeCodeRunnerTool::new(
+            test_security(AutonomyLevel::Full),
+            test_config(),
+            gateway_url.into(),
+        )
+        .with_tmux_binary(binary);
+        let result = tool
+            .execute(json!({"prompt": prompt, "slack_channel": "C123"}))
+            .await
+            .expect("fake tmux should return a result");
+        assert!(result.success);
+        let calls = std::fs::read_to_string(log).expect("read fake tmux calls");
+        let send_call = calls
+            .lines()
+            .find(|line| line.starts_with("send-keys "))
+            .expect("send-keys call");
+        assert!(send_call.contains(&shell_escape(prompt)));
+        assert!(send_call.contains(&shell_escape(&format!("{gateway_url}/hooks/claude-code"))));
     }
 
     #[test]
