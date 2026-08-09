@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,37 +61,80 @@ class GitHubClient:
             raise ValueError("missing GitHub token")
         self.token = token
         self.api_url = api_url.rstrip("/")
+        self.api_origin = urllib.parse.urlparse(self.api_url)
+        if self.api_origin.scheme not in {"http", "https"} or not self.api_origin.netloc:
+            raise ValueError(f"invalid GitHub API URL: {api_url!r}")
+
+    def _parse_url(self, path_or_url: str) -> urllib.parse.ParseResult:
+        if path_or_url.startswith("/"):
+            return urllib.parse.urlparse(f"{self.api_url}{path_or_url}")
+        parsed = urllib.parse.urlparse(path_or_url)
+        if (
+            parsed.scheme != self.api_origin.scheme
+            or parsed.netloc != self.api_origin.netloc
+            or not parsed.path.startswith("/")
+        ):
+            raise ValueError(f"refusing non-GitHub-API URL: {path_or_url!r}")
+        return parsed
+
+    def _send(
+        self,
+        method: str,
+        path_or_url: str,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, str], bytes]:
+        parsed = self._parse_url(path_or_url)
+        request_path = parsed.path
+        if parsed.query:
+            request_path = f"{request_path}?{parsed.query}"
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        connection_class = (
+            http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        )
+        connection = connection_class(parsed.netloc, timeout=30)
+        try:
+            connection.request(method, request_path, body=body, headers=headers)
+            response = connection.getresponse()
+            data = response.read()
+            response_headers = {key: value for key, value in response.getheaders()}
+            return response.status, response_headers, data
+        finally:
+            connection.close()
 
     def request(self, method: str, path_or_url: str, payload: dict[str, Any] | None = None) -> Any:
-        url = path_or_url if path_or_url.startswith("http") else f"{self.api_url}{path_or_url}"
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method=method)
-        request.add_header("Accept", "application/vnd.github+json")
-        request.add_header("Authorization", f"Bearer {self.token}")
-        request.add_header("X-GitHub-Api-Version", "2022-11-28")
-        if body is not None:
-            request.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(request, timeout=30) as response:
-            data = response.read()
-            if not data:
-                return None
-            return json.loads(data.decode("utf-8"))
+        status, _headers, data = self._send(method, path_or_url, payload)
+        if status >= 400:
+            raise GitHubHTTPError(status, data.decode("utf-8", errors="replace"))
+        if not data:
+            return None
+        return json.loads(data.decode("utf-8"))
 
     def paginate(self, path: str) -> list[dict[str, Any]]:
-        url: str | None = f"{self.api_url}{path}"
+        url: str | None = path
         results: list[dict[str, Any]] = []
         while url:
-            request = urllib.request.Request(url, method="GET")
-            request.add_header("Accept", "application/vnd.github+json")
-            request.add_header("Authorization", f"Bearer {self.token}")
-            request.add_header("X-GitHub-Api-Version", "2022-11-28")
-            with urllib.request.urlopen(request, timeout=30) as response:
-                page = json.loads(response.read().decode("utf-8"))
-                if not isinstance(page, list):
-                    raise ValueError(f"expected list response from {url}")
-                results.extend(page)
-                url = next_link(response.headers.get("Link"))
+            status, headers, data = self._send("GET", url)
+            if status >= 400:
+                raise GitHubHTTPError(status, data.decode("utf-8", errors="replace"))
+            page = json.loads(data.decode("utf-8"))
+            if not isinstance(page, list):
+                raise ValueError(f"expected list response from {url}")
+            results.extend(page)
+            url = next_link(headers.get("Link"))
         return results
+
+
+class GitHubHTTPError(RuntimeError):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(f"GitHub API request failed with HTTP {status}: {message}")
+        self.status = status
 
 
 def next_link(link_header: str | None) -> str | None:
@@ -200,8 +242,8 @@ def apply_size_plan(client: GitHubClient, repo: str, issue_number: int, plan: Si
         encoded_label = urllib.parse.quote(label, safe="")
         try:
             client.request("DELETE", f"/repos/{encoded_repo}/issues/{issue_number}/labels/{encoded_label}")
-        except urllib.error.HTTPError as error:
-            if error.code != 404:
+        except GitHubHTTPError as error:
+            if error.status != 404:
                 raise
 
 

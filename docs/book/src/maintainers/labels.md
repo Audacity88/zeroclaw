@@ -43,7 +43,7 @@ Some legacy labels may remain live during a staged migration. New or manual appl
 
 Live PR label automation is split by source. `pr-path-labeler.yml` runs `actions/labeler` from `.github/labeler.yml` on PR open, reopen, and every pushed update. Because that workflow uses `sync-labels: true`, labels owned by `.github/labeler.yml` are recalculated from the current PR file set: matching path labels are added, and path labels that no longer match are removed.
 
-`pr-size-labeler.yml` owns canonical `size:*` labels. It runs on PR open, reopen, and every pushed update, reads GitHub PR file metadata from the API, and applies the one canonical size label that matches the effective changed-line count. The workflow checks out only the trusted base revision that contains the classifier script; it must not check out, build, import, source, or execute pull-request code in its elevated label-writing context.
+`pr-size-labeler.yml` owns canonical `size:*` labels. It runs on PR open, reopen, and every pushed update, reads GitHub PR file metadata from the API, and applies the one canonical size label that matches the effective changed-line count. The workflow fetches the classifier script from the trusted base revision; it must not check out, build, import, source, or execute pull-request code in its elevated label-writing context.
 
 Dependabot also seeds configured labels on its own PRs from `.github/dependabot.yml`: Cargo updates get `dependencies`; GitHub Actions and Docker updates get `ci` and `dependencies`. Those labels are initial Dependabot PR metadata, not the synchronized path-labeler contract.
 

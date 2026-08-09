@@ -57,7 +57,7 @@ Dependabot has separate label configuration in `.github/dependabot.yml` for its 
 
 Applies exactly one canonical `size:*` label from PR file metadata. It runs on PR open, reopen, and every pushed update to the PR branch. The classifier counts additions plus deletions after excluding docs-like files and `Cargo.lock`, then applies the threshold table from [Labels](./labels.md#size-labels).
 
-This workflow runs in `pull_request_target` so it can write labels on fork PRs, but it checks out only the trusted base revision that contains the classifier script. It does not check out, build, import, source, or execute pull-request code. It does not apply `risk:*`, `type:*`, contributor-tier, status, resolution, stale, pickup, or ProjectV2 fields.
+This workflow runs in `pull_request_target` so it can write labels on fork PRs, but it fetches the classifier script from the trusted base revision. It does not check out, build, import, source, or execute pull-request code. It does not apply `risk:*`, `type:*`, contributor-tier, status, resolution, stale, pickup, or ProjectV2 fields.
 
 ### Project Dashboard Planner (`project-dashboard-plan.yml`)
 

@@ -88,6 +88,14 @@ class PrSizeLabelTest(unittest.TestCase):
                 {"filename": "src/main.rs", "additions": 0, "deletions": False}
             )
 
+    def test_client_rejects_non_api_urls(self) -> None:
+        client = size_labeler.GitHubClient("token")
+        self.assertEqual(client._parse_url("/repos/zeroclaw-labs/zeroclaw").scheme, "https")
+        with self.assertRaisesRegex(ValueError, "non-GitHub-API URL"):
+            client._parse_url("file:///tmp/token")
+        with self.assertRaisesRegex(ValueError, "non-GitHub-API URL"):
+            client._parse_url("https://example.com/repos/zeroclaw-labs/zeroclaw")
+
     def test_docs_threshold_parser_matches_expected_table(self) -> None:
         docs = "\n".join(
             [
