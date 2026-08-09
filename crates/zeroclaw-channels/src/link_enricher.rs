@@ -56,8 +56,11 @@ fn is_blocked_url(url: &reqwest::Url) -> bool {
         return true;
     }
 
-    url.host_str()
-        .is_none_or(zeroclaw_infra::net_guard::is_private_or_local_host)
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    let canonical_host = host.trim_end_matches('.');
+    canonical_host.is_empty() || zeroclaw_infra::net_guard::is_private_or_local_host(canonical_host)
 }
 
 fn redirect_policy() -> reqwest::redirect::Policy {
@@ -270,6 +273,19 @@ mod tests {
     fn ssrf_blocks_localhost() {
         assert!(is_ssrf_target("http://localhost/admin"));
         assert!(is_ssrf_target("https://localhost:8080/api"));
+        for host in [
+            "localhost.",
+            "localhost..",
+            "foo.localhost...",
+            "local.",
+            "printer.local..",
+            "127.0.0.1..",
+        ] {
+            assert!(
+                is_ssrf_target(&format!("http://{host}/admin")),
+                "absolute local hostname {host} must be blocked"
+            );
+        }
     }
 
     #[test]
@@ -327,6 +343,7 @@ mod tests {
         assert!(is_ssrf_target("not a url"));
         assert!(is_ssrf_target("file:///etc/passwd"));
         assert!(is_ssrf_target("http://"));
+        assert!(is_ssrf_target("http://.../"));
     }
 
     #[tokio::test]
@@ -335,12 +352,20 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        let port = server.address().port();
         Mock::given(method("GET"))
             .and(path("/start"))
             .respond_with(
-                ResponseTemplate::new(302).insert_header("Location", "http://127.0.0.1/private"),
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("http://127.0.0.1:{port}/private")),
             )
             .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -348,7 +373,39 @@ mod tests {
             .resolve("public.test", *server.address())
             .build()
             .unwrap();
-        let url = format!("http://public.test:{}/start", server.address().port());
+        let url = format!("http://public.test:{port}/start");
+        assert!(fetch_link_summary(&client, &url).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_rejects_absolute_localhost_hop() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("http://localhost..:{port}/private")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/private"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = http_client_builder(5)
+            .resolve("public.test", *server.address())
+            .resolve("localhost..", *server.address())
+            .build()
+            .unwrap();
+        let url = format!("http://public.test:{port}/start");
         assert!(fetch_link_summary(&client, &url).await.is_none());
     }
 
@@ -376,10 +433,10 @@ mod tests {
             .await;
 
         let client = http_client_builder(5)
-            .resolve("public.test", *server.address())
+            .resolve("public.test.", *server.address())
             .build()
             .unwrap();
-        let summary = fetch_link_summary(&client, &format!("http://public.test:{port}/start"))
+        let summary = fetch_link_summary(&client, &format!("http://public.test.:{port}/start"))
             .await
             .expect("public redirect should succeed");
         assert_eq!(summary.title, "redirected");
