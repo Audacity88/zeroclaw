@@ -306,27 +306,7 @@ impl Tool for ClaudeCodeRunnerTool {
         let tmux_binary = self.tmux_binary.clone();
         zeroclaw_spawn::spawn!(async move {
             tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
-            match kill_tmux_session(&tmux_binary, &cleanup_session).await {
-                Ok(()) => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"session": cleanup_session})),
-                        "Claude Code runner session TTL expired, cleaned up"
-                    );
-                }
-                Err(error) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"session": cleanup_session, "error": error})
-                            ),
-                        "Claude Code runner session TTL cleanup failed"
-                    );
-                }
-            }
+            let _ = cleanup_expired_session(&tmux_binary, &cleanup_session).await;
         });
 
         // Build response
@@ -404,6 +384,30 @@ async fn kill_tmux_session(tmux_binary: &Path, session_name: &str) -> Result<(),
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+async fn cleanup_expired_session(tmux_binary: &Path, session_name: &str) -> Result<(), String> {
+    let result = kill_tmux_session(tmux_binary, session_name).await;
+    match &result {
+        Ok(()) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"session": session_name})),
+                "Claude Code runner session TTL expired, cleaned up"
+            );
+        }
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"session": session_name, "error": error})),
+                "Claude Code runner session TTL cleanup failed"
+            );
+        }
+    }
+    result
 }
 
 /// Minimal shell escaping for values embedded in tmux send-keys.
@@ -733,6 +737,88 @@ mod tests {
         );
         write_executable(&binary, script);
         (temp, binary, log)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_log_event(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        expected_message: &str,
+    ) -> serde_json::Value {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(event) = rx.recv().await
+                    && event.get("message").and_then(|value| value.as_str())
+                        == Some(expected_message)
+                {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("expected log event before timeout")
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn successful_session_runs_ttl_cleanup() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let (_temp, binary, log) = fake_tmux(0, 0);
+        let mut config = test_config();
+        config.session_ttl = 0;
+        let tool = ClaudeCodeRunnerTool::new(
+            test_security(AutonomyLevel::Full),
+            config,
+            "http://localhost:3000".into(),
+        )
+        .with_tmux_binary(binary);
+
+        let result = tool
+            .execute(json!({"prompt": "hello", "slack_channel": "C123"}))
+            .await
+            .expect("fake tmux should return a result");
+        assert!(result.success);
+        let event = wait_for_log_event(
+            &mut rx,
+            "Claude Code runner session TTL expired, cleaned up",
+        )
+        .await;
+        assert_eq!(event["event"]["action"], "note");
+        let calls = std::fs::read_to_string(log).expect("read fake tmux calls");
+        assert!(calls.lines().any(|line| line.starts_with("kill-session ")));
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn expired_session_cleanup_propagates_tmux_failure() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let (_temp, binary, log) = fake_tmux(0, 8);
+        let error = cleanup_expired_session(&binary, "zc-test-expired")
+            .await
+            .expect_err("failed cleanup should remain observable");
+        assert!(error.contains("Failed to kill session"));
+        let event =
+            wait_for_log_event(&mut rx, "Claude Code runner session TTL cleanup failed").await;
+        assert_eq!(event["event"]["action"], "reject");
+        assert!(
+            event["attributes"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Failed to kill session")
+        );
+        let calls = std::fs::read_to_string(log).expect("read fake tmux calls");
+        assert!(calls.lines().any(|line| line.starts_with("kill-session ")));
     }
 
     #[cfg(unix)]
