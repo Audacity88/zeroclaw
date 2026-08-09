@@ -7463,6 +7463,112 @@ mod tests {
         );
     }
 
+    /// B1 risk #2, automated: a bounded-range off-by-one can still satisfy the
+    /// line-count assertions the other tests make, and would surface only as
+    /// mis-aimed clicks and wrong copy regions in a real terminal.
+    ///
+    /// This sweeps EVERY scroll offset over a wrapped history (prose plus code
+    /// fences) and pins the coordinate invariants that scrolling, bottom
+    /// anchoring, copy targets and `entry_rects` all read:
+    ///   1. the resolved entry range covers the whole viewport window, so no
+    ///      visible row is projected from outside the range;
+    ///   2. the returned `local_scroll` indexes a real row of the slice;
+    ///   3. `visible_copy_scan` agrees exactly with the slice the renderer
+    ///      draws, so copy/hit-test coordinates cannot drift from the pixels.
+    #[test]
+    fn visible_range_coordinate_invariants_hold_at_every_scroll_offset() {
+        let mut s = state();
+        for i in 0..120 {
+            if i % 5 == 0 {
+                s.entries
+                    .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                        "entry {i} with a deliberately long prose line that must wrap across \
+                         several screen rows at this width so screen and line coordinates diverge"
+                    ))));
+            } else if i % 5 == 1 {
+                s.entries
+                    .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                        "```rust\nfn generated_{i}() -> usize {{\n    {i}\n}}\n```"
+                    ))));
+            } else {
+                s.entries
+                    .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                        "short {i}"
+                    ))));
+            }
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+
+        let total_rows = s.cached_total_rows;
+        assert!(
+            total_rows > 200,
+            "expected a history far deeper than one viewport, got {total_rows} rows"
+        );
+
+        for height in [1u16, 7, 20, 41] {
+            for scroll in 0..=total_rows {
+                let visible = s.visible_cached_entry_range(scroll, height);
+                let (slice, local_scroll) = s.visible_line_slice(scroll, &visible);
+
+                if visible.is_empty() {
+                    assert!(
+                        slice.is_empty(),
+                        "empty entry range must project no lines \
+                         (height={height}, scroll={scroll})"
+                    );
+                    continue;
+                }
+
+                // 1. The range must cover the viewport window it was resolved for.
+                let screen_lo = s.cached_screen_ranges[visible.start].1;
+                let screen_hi = s.cached_screen_ranges[visible.end - 1].2;
+                let view_end = scroll.saturating_add(height).min(total_rows);
+                assert!(
+                    screen_lo <= scroll,
+                    "range starts below the viewport top: screen_lo={screen_lo} > scroll={scroll} \
+                     (height={height})"
+                );
+                assert!(
+                    screen_hi >= view_end,
+                    "range ends above the viewport bottom: screen_hi={screen_hi} < \
+                     view_end={view_end} (height={height}, scroll={scroll})"
+                );
+
+                // 2. local_scroll must index a real row of the returned slice.
+                assert!(
+                    (local_scroll as usize) <= slice.len(),
+                    "local_scroll={local_scroll} outside slice of {} rows \
+                     (height={height}, scroll={scroll})",
+                    slice.len()
+                );
+                assert_eq!(
+                    local_scroll,
+                    scroll - screen_lo,
+                    "local_scroll must be the offset of the viewport into the first visible entry \
+                     (height={height}, scroll={scroll})"
+                );
+
+                // 3. Copy projection must agree with the drawn slice exactly.
+                let (copy_lines, copy_screen_lo) = s.visible_copy_scan(&visible);
+                assert_eq!(
+                    copy_screen_lo, screen_lo,
+                    "copy projection origin drifted from the rendered slice origin \
+                     (height={height}, scroll={scroll})"
+                );
+                assert_eq!(
+                    copy_lines.len(),
+                    slice.len(),
+                    "copy projection spans {} lines but the renderer drew {} \
+                     (height={height}, scroll={scroll})",
+                    copy_lines.len(),
+                    slice.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn visible_line_slice_renders_only_the_viewport_not_the_whole_history() {
         let mut s = state();
