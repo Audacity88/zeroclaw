@@ -145,6 +145,35 @@ fn format_image_tool_output(
     )
 }
 
+async fn read_fal_success_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    let body = response_body::read_bounded(response, Some(FAL_RESPONSE_LIMIT_BYTES))
+        .await
+        .context("Failed to read fal.ai response")?;
+    if body.overflowed {
+        anyhow::bail!("fal.ai response exceeds the 1 MiB size limit");
+    }
+    Ok(body.bytes)
+}
+
+async fn read_fal_error_text(response: reqwest::Response) -> anyhow::Result<String> {
+    response_body::read_text(response, Some(FAL_ERROR_LIMIT_BYTES))
+        .await
+        .map(|(text, _)| text)
+}
+
+async fn read_generated_image_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    let body = response_body::read_bounded(response, Some(GENERATED_IMAGE_LIMIT_BYTES))
+        .await
+        .context("Failed to read generated image bytes")?;
+    if body.overflowed {
+        anyhow::bail!(
+            "Generated image exceeds the {} MiB size limit",
+            GENERATED_IMAGE_LIMIT_BYTES / (1024 * 1024)
+        );
+    }
+    Ok(body.bytes)
+}
+
 pub struct ImageGenTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
@@ -230,16 +259,7 @@ impl ImageGenTool {
                 );
             }
 
-            let body = response_body::read_bounded(response, Some(GENERATED_IMAGE_LIMIT_BYTES))
-                .await
-                .context("Failed to read generated image bytes")?;
-            if body.overflowed {
-                anyhow::bail!(
-                    "Generated image exceeds the {} MiB size limit",
-                    GENERATED_IMAGE_LIMIT_BYTES / (1024 * 1024)
-                );
-            }
-            return Ok(body.bytes);
+            return read_generated_image_body(response).await;
         }
 
         unreachable!("redirect loop exits through success or redirect limit")
@@ -360,10 +380,7 @@ impl ImageGenTool {
 
         let status = resp.status();
         if !status.is_success() {
-            let body_text = response_body::read_text(resp, Some(FAL_ERROR_LIMIT_BYTES))
-                .await
-                .map(|(text, _)| text)
-                .unwrap_or_default();
+            let body_text = read_fal_error_text(resp).await.unwrap_or_default();
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -371,14 +388,9 @@ impl ImageGenTool {
             });
         }
 
-        let fal_body = response_body::read_bounded(resp, Some(FAL_RESPONSE_LIMIT_BYTES))
-            .await
-            .context("Failed to read fal.ai response")?;
-        if fal_body.overflowed {
-            anyhow::bail!("fal.ai response exceeds the 1 MiB size limit");
-        }
-        let resp_json: serde_json::Value = serde_json::from_slice(&fal_body.bytes)
-            .context("Failed to parse fal.ai response as JSON")?;
+        let fal_body = read_fal_success_body(resp).await?;
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&fal_body).context("Failed to parse fal.ai response as JSON")?;
 
         let image_url = resp_json
             .pointer("/images/0/url")
@@ -492,8 +504,59 @@ impl Tool for ImageGenTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
+
+    async fn held_open_chunked_response(
+        byte_count: usize,
+    ) -> (
+        reqwest::Response,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = byte_count;
+            while remaining > 0 {
+                let chunk_len = remaining.min(chunk.len());
+                stream
+                    .write_all(format!("{chunk_len:x}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&chunk[..chunk_len]).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+                remaining -= chunk_len;
+            }
+            let _ = release_rx.await;
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+
+        (
+            reqwest::get(format!("http://{addr}")).await.unwrap(),
+            release_tx,
+            server,
+        )
+    }
+
+    async fn finish_held_open_response(
+        release: tokio::sync::oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = release.send(());
+        server.await.unwrap();
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -625,9 +688,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fal_client_does_not_follow_redirects() {
-        use tokio::io::AsyncWriteExt;
+    async fn generated_image_body_rejects_oversized_chunked_response() {
+        let (response, release, server) =
+            held_open_chunked_response(GENERATED_IMAGE_LIMIT_BYTES + 1).await;
 
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_generated_image_body(response),
+        )
+        .await;
+        finish_held_open_response(release, server).await;
+        let error = result
+            .expect("generated image reader waited for EOF after crossing its limit")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("20 MiB size limit"));
+    }
+
+    #[tokio::test]
+    async fn fal_success_body_rejects_oversized_chunked_response() {
+        let (response, release, server) =
+            held_open_chunked_response(FAL_RESPONSE_LIMIT_BYTES + 1).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_fal_success_body(response),
+        )
+        .await;
+        finish_held_open_response(release, server).await;
+        let error = result
+            .expect("fal.ai success reader waited for EOF after crossing its limit")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("1 MiB size limit"));
+    }
+
+    #[tokio::test]
+    async fn fal_error_body_is_bounded_during_streaming() {
+        let (response, release, server) =
+            held_open_chunked_response(FAL_ERROR_LIMIT_BYTES + 1).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_fal_error_text(response),
+        )
+        .await;
+        finish_held_open_response(release, server).await;
+        let body = result
+            .expect("fal.ai error reader waited for EOF after crossing its limit")
+            .unwrap();
+
+        assert_eq!(body.len(), FAL_ERROR_LIMIT_BYTES);
+        assert!(body.bytes().all(|byte| byte == b'x'));
+    }
+
+    #[tokio::test]
+    async fn fal_client_does_not_follow_redirects() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         zeroclaw_spawn::spawn!(async move {
