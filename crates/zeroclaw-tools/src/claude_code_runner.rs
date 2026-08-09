@@ -52,7 +52,7 @@ impl ClaudeCodeRunnerTool {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_tmux_binary(mut self, tmux_binary: PathBuf) -> Self {
         self.tmux_binary = tmux_binary;
         self
