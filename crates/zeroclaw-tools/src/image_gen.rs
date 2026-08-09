@@ -103,6 +103,14 @@ fn generated_image_client(target: &ValidatedImageTarget) -> anyhow::Result<reqwe
     generated_image_client_with_builder(target, reqwest::Client::builder())
 }
 
+async fn prepare_generated_image_target(
+    raw_url: &str,
+) -> anyhow::Result<(ValidatedImageTarget, reqwest::Client)> {
+    let target = validate_image_target(raw_url).await?;
+    let client = generated_image_client(&target)?;
+    Ok((target, client))
+}
+
 fn resolve_redirect_url(current: &reqwest::Url, location: &str) -> anyhow::Result<reqwest::Url> {
     current
         .join(location)
@@ -181,12 +189,12 @@ impl ImageGenTool {
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
-    fn http_client() -> reqwest::Client {
+    fn http_client() -> anyhow::Result<reqwest::Client> {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default()
+            .context("Failed to build fal.ai HTTP client")
     }
 
     async fn download_generated_image(image_url: &str) -> anyhow::Result<Vec<u8>> {
@@ -194,8 +202,7 @@ impl ImageGenTool {
             reqwest::Url::parse(image_url).context("Invalid generated image URL")?;
 
         for redirect_count in 0..=MAX_IMAGE_REDIRECTS {
-            let target = validate_image_target(current_url.as_str()).await?;
-            let client = generated_image_client(&target)?;
+            let (target, client) = prepare_generated_image_target(current_url.as_str()).await?;
             let response = client
                 .get(target.url.clone())
                 .send()
@@ -333,7 +340,7 @@ impl ImageGenTool {
         };
 
         // ── Call fal.ai ────────────────────────────────────────────
-        let client = Self::http_client();
+        let client = Self::http_client()?;
         let url = format!("https://fal.run/{model}");
 
         let body = json!({
@@ -516,12 +523,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_image_redirect_to_private_target_is_rejected() {
+    #[tokio::test]
+    async fn generated_image_redirect_to_private_target_is_rejected() {
         let current = reqwest::Url::parse("https://cdn.example.com/image.png").unwrap();
         let redirect = resolve_redirect_url(&current, "https://127.0.0.1/private.png").unwrap();
 
-        assert!(parse_public_https_url(redirect.as_str()).is_err());
+        assert!(
+            prepare_generated_image_target(redirect.as_str())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -537,9 +548,10 @@ mod tests {
 
     #[tokio::test]
     async fn generated_image_target_accepts_public_ipv6_literal_without_dns() {
-        let target = validate_image_target("https://[2606:4700:4700::1111]/image.png")
-            .await
-            .unwrap();
+        let (target, _client) =
+            prepare_generated_image_target("https://[2606:4700:4700::1111]/image.png")
+                .await
+                .unwrap();
         let expected_ip = "2606:4700:4700::1111".parse::<IpAddr>().unwrap();
 
         assert_eq!(target.host, expected_ip.to_string());
@@ -547,7 +559,6 @@ mod tests {
             target.resolved_addrs,
             vec![SocketAddr::new(expected_ip, 443)]
         );
-        generated_image_client(&target).unwrap();
     }
 
     #[tokio::test]
@@ -630,6 +641,7 @@ mod tests {
         });
 
         let response = ImageGenTool::http_client()
+            .unwrap()
             .get(format!("http://{addr}/start"))
             .send()
             .await
