@@ -41,14 +41,13 @@ fn parse_public_https_url(raw_url: &str) -> anyhow::Result<(reqwest::Url, String
     if request_host.ends_with('.') {
         anyhow::bail!("Generated image URL host must not end with a dot");
     }
-    let host = request_host.to_ascii_lowercase();
+    let host = domain_guard::normalize_domain(request_host)
+        .ok_or_else(|| anyhow::Error::msg("Generated image URL host is invalid"))?;
+    let ip_literal = host.parse::<IpAddr>().ok();
     if domain_guard::is_private_or_local_host(&host) {
         anyhow::bail!("Generated image URL targets a local or non-global host");
     }
-    if host
-        .parse::<IpAddr>()
-        .is_ok_and(domain_guard::is_cloud_metadata_ip)
-    {
+    if ip_literal.is_some_and(domain_guard::is_cloud_metadata_ip) {
         anyhow::bail!("Generated image URL targets a cloud metadata host");
     }
 
@@ -60,10 +59,14 @@ fn parse_public_https_url(raw_url: &str) -> anyhow::Result<(reqwest::Url, String
 
 async fn validate_image_target(raw_url: &str) -> anyhow::Result<ValidatedImageTarget> {
     let (url, host, port) = parse_public_https_url(raw_url)?;
-    let resolved_addrs = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .with_context(|| format!("Failed to resolve generated image host '{host}'"))?
-        .collect::<Vec<_>>();
+    let resolved_addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .with_context(|| format!("Failed to resolve generated image host '{host}'"))?
+            .collect::<Vec<_>>()
+    };
     let ips = resolved_addrs
         .iter()
         .map(|addr| addr.ip())
@@ -75,6 +78,29 @@ async fn validate_image_target(raw_url: &str) -> anyhow::Result<ValidatedImageTa
         host,
         resolved_addrs,
     })
+}
+
+fn generated_image_client_with_builder(
+    target: &ValidatedImageTarget,
+    builder: reqwest::ClientBuilder,
+) -> anyhow::Result<reqwest::Client> {
+    let builder = builder
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    let builder = if target.host.parse::<IpAddr>().is_ok() {
+        builder
+    } else {
+        builder.resolve_to_addrs(&target.host, &target.resolved_addrs)
+    };
+    builder
+        .build()
+        .context("Failed to build generated image HTTP client")
+}
+
+fn generated_image_client(target: &ValidatedImageTarget) -> anyhow::Result<reqwest::Client> {
+    generated_image_client_with_builder(target, reqwest::Client::builder())
 }
 
 fn resolve_redirect_url(current: &reqwest::Url, location: &str) -> anyhow::Result<reqwest::Url> {
@@ -169,18 +195,7 @@ impl ImageGenTool {
 
         for redirect_count in 0..=MAX_IMAGE_REDIRECTS {
             let target = validate_image_target(current_url.as_str()).await?;
-            let builder = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none());
-            let builder = if target.host.parse::<IpAddr>().is_ok() {
-                builder
-            } else {
-                builder.resolve_to_addrs(&target.host, &target.resolved_addrs)
-            };
-            let client = builder
-                .build()
-                .context("Failed to build generated image HTTP client")?;
+            let client = generated_image_client(&target)?;
             let response = client
                 .get(target.url.clone())
                 .send()
@@ -518,6 +533,83 @@ mod tests {
     #[test]
     fn generated_image_target_rejects_trailing_dot_host() {
         assert!(parse_public_https_url("https://example.com./image.png").is_err());
+    }
+
+    #[tokio::test]
+    async fn generated_image_target_accepts_public_ipv6_literal_without_dns() {
+        let target = validate_image_target("https://[2606:4700:4700::1111]/image.png")
+            .await
+            .unwrap();
+        let expected_ip = "2606:4700:4700::1111".parse::<IpAddr>().unwrap();
+
+        assert_eq!(target.host, expected_ip.to_string());
+        assert_eq!(
+            target.resolved_addrs,
+            vec![SocketAddr::new(expected_ip, 443)]
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_image_client_clears_proxy_configuration() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let direct_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let direct_task = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = direct_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+                )
+                .await
+                .unwrap();
+        });
+        let proxy_task = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproxy",
+                )
+                .await
+                .unwrap();
+        });
+
+        let target = ValidatedImageTarget {
+            url: reqwest::Url::parse(&format!("http://image.test:{}/", direct_addr.port()))
+                .unwrap(),
+            host: "image.test".to_string(),
+            resolved_addrs: vec![direct_addr],
+        };
+        let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap();
+        let proxied_response = reqwest::Client::builder()
+            .proxy(proxy.clone())
+            .resolve_to_addrs(&target.host, &target.resolved_addrs)
+            .build()
+            .unwrap()
+            .get(target.url.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(proxied_response.text().await.unwrap(), "proxy");
+        proxy_task.await.unwrap();
+
+        let direct_response =
+            generated_image_client_with_builder(&target, reqwest::Client::builder().proxy(proxy))
+                .unwrap()
+                .get(target.url.clone())
+                .send()
+                .await
+                .unwrap();
+
+        assert_eq!(direct_response.text().await.unwrap(), "direct");
+        direct_task.await.unwrap();
     }
 
     #[tokio::test]
