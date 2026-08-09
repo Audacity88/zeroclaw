@@ -547,6 +547,7 @@ mod tests {
             target.resolved_addrs,
             vec![SocketAddr::new(expected_ip, 443)]
         );
+        generated_image_client(&target).unwrap();
     }
 
     #[tokio::test]
