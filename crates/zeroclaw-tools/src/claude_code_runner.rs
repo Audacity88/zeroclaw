@@ -96,7 +96,10 @@ impl Tool for ClaudeCodeRunnerTool {
                 },
                 "slack_channel": {
                     "type": "string",
-                    "description": "Slack channel ID to post progress updates to"
+                    "description": "Slack conversation ID to post progress updates to",
+                    "pattern": "^[CGD][A-Z0-9]{1,63}$",
+                    "minLength": 2,
+                    "maxLength": MAX_SLACK_CHANNEL_ID_LEN
                 }
             },
             "required": ["prompt"]
@@ -200,7 +203,7 @@ impl Tool for ClaudeCodeRunnerTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!(
-                    "slack_channel must be a Slack conversation ID starting with C, G, D, or U and containing at most {MAX_SLACK_CHANNEL_ID_LEN} uppercase ASCII letters or digits"
+                    "slack_channel must be a Slack conversation ID starting with C, G, or D and containing at most {MAX_SLACK_CHANNEL_ID_LEN} uppercase ASCII letters or digits"
                 )),
             });
         }
@@ -227,19 +230,20 @@ impl Tool for ClaudeCodeRunnerTool {
         claude_args.push("--hook-url".to_string());
         claude_args.push(hook_url.clone());
 
-        // Build env string for tmux send-keys
-        let mut env_exports = String::new();
+        // Build the command sent through tmux.
+        let mut full_command = String::new();
         for var in SAFE_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
-                append_env_assignment(&mut env_exports, var, &val);
+                append_env_assignment(&mut full_command, var, &val);
             }
         }
         // Pass session metadata via env vars so the hook can correlate events
-        append_env_assignment(&mut env_exports, "CLAUDE_CODE_SESSION_ID", &session_id);
+        append_env_assignment(&mut full_command, "CLAUDE_CODE_SESSION_ID", &session_id);
         if let Some(ref ch) = slack_channel {
-            append_env_assignment(&mut env_exports, "CLAUDE_CODE_SLACK_CHANNEL", ch);
+            append_env_assignment(&mut full_command, "CLAUDE_CODE_SLACK_CHANNEL", ch);
         }
-        append_env_assignment(&mut env_exports, "CLAUDE_CODE_HOOK_URL", &hook_url);
+        append_env_assignment(&mut full_command, "CLAUDE_CODE_HOOK_URL", &hook_url);
+        append_shell_arguments(&mut full_command, &claude_args);
 
         // Create tmux session
         let create_result = Command::new(&self.tmux_binary)
@@ -275,16 +279,6 @@ impl Tool for ClaudeCodeRunnerTool {
         }
 
         // Send the claude command into the tmux session
-        let full_command = format!(
-            "{env_exports}{cmd}",
-            env_exports = env_exports,
-            cmd = claude_args
-                .iter()
-                .map(|a| shell_escape(a))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-
         let send_result = Command::new(&self.tmux_binary)
             .args(["send-keys", "-t", &session_name, &full_command, "Enter"])
             .output()
@@ -365,7 +359,7 @@ impl Tool for ClaudeCodeRunnerTool {
 fn is_valid_slack_channel_id(value: &str) -> bool {
     value.len() >= 2
         && value.len() <= MAX_SLACK_CHANNEL_ID_LEN
-        && matches!(value.as_bytes()[0], b'C' | b'G' | b'D' | b'U')
+        && matches!(value.as_bytes()[0], b'C' | b'G' | b'D')
         && value.as_bytes()[1..]
             .iter()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
@@ -376,6 +370,15 @@ fn append_env_assignment(command: &mut String, name: &str, value: &str) {
     command.push('=');
     command.push_str(&shell_escape(value));
     command.push(' ');
+}
+
+fn append_shell_arguments(command: &mut String, args: &[String]) {
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            command.push(' ');
+        }
+        command.push_str(&shell_escape(arg));
+    }
 }
 
 fn tmux_command_failure(operation: &str, output: &Output) -> Option<String> {
@@ -449,13 +452,22 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_has_prompt() {
+    fn tool_schema_has_prompt_and_slack_contract() {
         let tool = ClaudeCodeRunnerTool::new(
             test_security(AutonomyLevel::Supervised),
             test_config(),
             "http://localhost:3000".into(),
         );
         let schema = tool.parameters_schema();
+        assert_eq!(
+            schema["properties"]["slack_channel"]["pattern"],
+            "^[CGD][A-Z0-9]{1,63}$"
+        );
+        assert_eq!(schema["properties"]["slack_channel"]["minLength"], 2);
+        assert_eq!(
+            schema["properties"]["slack_channel"]["maxLength"],
+            MAX_SLACK_CHANNEL_ID_LEN
+        );
         assert!(schema["properties"]["prompt"].is_object());
         assert!(
             schema["required"]
@@ -632,12 +644,76 @@ mod tests {
         assert_eq!(command, "CLAUDE_CODE_HOOK_URL='https://host/a b'\\''c' ");
     }
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, contents).expect("write executable fixture");
+        let mut permissions = std::fs::metadata(path)
+            .expect("executable fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fixture executable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_command_preserves_untrusted_values_through_shell_parsing() {
+        let temp = tempfile::TempDir::new().expect("shell fixture directory");
+        let recorder = temp.path().join("record-command");
+        let env_log = temp.path().join("env.log");
+        let args_log = temp.path().join("args.log");
+        let sentinel = temp.path().join("injected");
+        write_executable(
+            &recorder,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$TEST_UNTRUSTED\" > {}\nprintf '%s\\n' \"$@\" > {}\n",
+                shell_escape(env_log.to_str().expect("env log path is UTF-8")),
+                shell_escape(args_log.to_str().expect("args log path is UTF-8")),
+            ),
+        );
+
+        let prompt = format!("review $(touch {}) and 'quote'", sentinel.display());
+        let hook_url = format!("https://host/a b'; touch {}", sentinel.display());
+        let env_value = format!("$(touch {}) ; 'value'", sentinel.display());
+        let args = vec![
+            recorder.to_string_lossy().into_owned(),
+            "-p".to_string(),
+            prompt.clone(),
+            "--hook-url".to_string(),
+            hook_url.clone(),
+        ];
+        let mut command = String::new();
+        append_env_assignment(&mut command, "TEST_UNTRUSTED", &env_value);
+        append_shell_arguments(&mut command, &args);
+        let output = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .output()
+            .await
+            .expect("execute assembled command through a shell");
+
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(env_log).expect("read recorded environment"),
+            env_value
+        );
+        assert_eq!(
+            std::fs::read_to_string(args_log)
+                .expect("read recorded arguments")
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["-p", prompt.as_str(), "--hook-url", hook_url.as_str()]
+        );
+        assert!(!sentinel.exists());
+    }
+
     #[test]
     fn slack_channel_validation_accepts_ids_and_rejects_shell_input() {
         assert!(is_valid_slack_channel_id("C0123456789"));
         assert!(is_valid_slack_channel_id("GABC123"));
         assert!(is_valid_slack_channel_id("D123"));
-        assert!(is_valid_slack_channel_id("U123"));
+        assert!(!is_valid_slack_channel_id("U123"));
+        assert!(!is_valid_slack_channel_id("W123"));
         assert!(!is_valid_slack_channel_id(""));
         assert!(!is_valid_slack_channel_id("channel"));
         assert!(!is_valid_slack_channel_id("C123;whoami"));
@@ -648,8 +724,6 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_tmux(send_exit: u8, kill_exit: u8) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::TempDir::new().expect("fake tmux directory");
         let binary = temp.path().join("tmux");
         let log = temp.path().join("tmux.log");
@@ -657,12 +731,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  new-session) exit 0 ;;\n  send-keys) exit {send_exit} ;;\n  kill-session) exit {kill_exit} ;;\n  *) exit 64 ;;\nesac\n",
             shell_escape(log.to_str().expect("log path is UTF-8"))
         );
-        std::fs::write(&binary, script).expect("write fake tmux");
-        let mut permissions = std::fs::metadata(&binary)
-            .expect("fake tmux metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&binary, permissions).expect("make fake tmux executable");
+        write_executable(&binary, script);
         (temp, binary, log)
     }
 
