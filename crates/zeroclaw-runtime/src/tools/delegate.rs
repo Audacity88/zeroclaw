@@ -2314,8 +2314,8 @@ impl DelegateTool {
     ) -> anyhow::Result<Option<(BackgroundResultState, serde_json::Value, Option<String>)>> {
         let control_plane = self.background_control_plane().await?;
         if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
-            if !self.owns_delegate_task(&snapshot.task)
-                && !(allow_legacy_terminal && self.can_read_delegate_task(&snapshot.task))
+            if !(self.owns_delegate_task(&snapshot.task)
+                || allow_legacy_terminal && self.can_read_delegate_task(&snapshot.task))
             {
                 return Ok(None);
             }
