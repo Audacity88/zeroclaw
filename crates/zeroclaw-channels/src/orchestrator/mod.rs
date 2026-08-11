@@ -22146,7 +22146,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_default_mode_preserves_instructions_with_compact_loader() {
+    fn prompt_helpers_default_mode_preserves_instructions_with_compact_loader() {
         let ws = make_workspace();
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
@@ -22179,6 +22179,16 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             None,
         );
+        let prompt_with_tool_calls =
+            zeroclaw_runtime::agent::system_prompt::build_system_prompt_with_tool_calls(
+                ws.path(),
+                "model",
+                &[("read_skill", "Load skill instructions by name")],
+                &skills,
+                None,
+                None,
+                true,
+            );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -22193,6 +22203,12 @@ BTC is currently around $65,000 based on latest tool output."#
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review__lint</name>"));
+        assert!(prompt_with_tool_calls.contains("<instructions>"));
+        assert!(
+            prompt_with_tool_calls.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
     }
 
     #[test]
