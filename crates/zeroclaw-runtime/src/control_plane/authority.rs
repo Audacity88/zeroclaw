@@ -22,12 +22,10 @@ fn is_authoritative_with_process_probe(
     }
 
     let expected_started_at = match parse_process_identity(&rec.owner_boot_id) {
-        ProcessIdentity::Structured {
-            pid,
-            started_at: Some(started_at),
-        } if pid == rec.owner_pid => Some(started_at),
+        ProcessIdentity::Structured { pid, started_at } if pid == rec.owner_pid => started_at,
         ProcessIdentity::Structured { .. } => return false,
         ProcessIdentity::Legacy => None,
+        ProcessIdentity::Malformed => return false,
     };
 
     matches!(
@@ -39,6 +37,7 @@ fn is_authoritative_with_process_probe(
 enum ProcessIdentity {
     Structured { pid: u32, started_at: Option<u64> },
     Legacy,
+    Malformed,
 }
 
 fn parse_process_identity(boot_id: &str) -> ProcessIdentity {
@@ -46,19 +45,26 @@ fn parse_process_identity(boot_id: &str) -> ProcessIdentity {
     if parts.next() != Some("zc-process-v1") {
         return ProcessIdentity::Legacy;
     }
-    let pid = parts.next().and_then(|value| value.parse().ok());
-    let started_at = parts.next().and_then(|value| value.parse().ok());
-    let nonce = parts.next();
-    if nonce.is_none() || parts.next().is_some() {
-        return ProcessIdentity::Structured {
-            pid: pid.unwrap_or_default(),
-            started_at: None,
+    let (Some(pid), Some(started_at), Some(nonce), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return ProcessIdentity::Malformed;
+    };
+    let Ok(pid) = pid.parse() else {
+        return ProcessIdentity::Malformed;
+    };
+    let started_at = if started_at == "unknown" {
+        None
+    } else {
+        let Ok(started_at) = started_at.parse() else {
+            return ProcessIdentity::Malformed;
         };
+        Some(started_at)
+    };
+    if nonce.is_empty() {
+        return ProcessIdentity::Malformed;
     }
-    ProcessIdentity::Structured {
-        pid: pid.unwrap_or_default(),
-        started_at,
-    }
+    ProcessIdentity::Structured { pid, started_at }
 }
 
 fn process_state(pid: u32, expected_started_at: Option<u64>) -> ProcessState {
@@ -101,7 +107,41 @@ fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    } {
+        Ok(handle) => {
+            let wait = unsafe { WaitForSingleObject(handle, 0) };
+            // SAFETY: `handle` was returned by `OpenProcess` in this function.
+            let _ = unsafe { CloseHandle(handle) };
+            if wait == WAIT_OBJECT_0 {
+                Some(true)
+            } else if wait == WAIT_TIMEOUT {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => Some(true),
+        Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => Some(false),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn pid_is_definitely_absent(_pid: u32) -> Option<bool> {
     None
 }
@@ -207,10 +247,44 @@ mod tests {
     }
 
     #[test]
+    fn structured_identity_without_start_time_uses_proven_pid_state() {
+        let rec = rec(42, "zc-process-v1:42:unknown:owner");
+        assert!(is_authoritative_with_process_probe(
+            &rec,
+            |_, started_at| {
+                assert_eq!(started_at, None);
+                ProcessState::AbsentOrReused
+            }
+        ));
+        assert!(!is_authoritative_with_process_probe(&rec, |_, _| {
+            ProcessState::SameProcessAlive
+        }));
+        assert!(!is_authoritative_with_process_probe(&rec, |_, _| {
+            ProcessState::Unknown
+        }));
+    }
+
+    #[test]
     fn unknown_process_state_fails_closed() {
         assert!(!is_authoritative_with_process_probe(
             &rec(42, "boot-OLD"),
             |_, _| ProcessState::Unknown,
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_exit_is_detected() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn long-lived Windows child");
+        let pid = child.id();
+        let live = rec(pid, &format!("zc-process-v1:{pid}:unknown:test"));
+        assert!(!is_authoritative(&live));
+
+        child.kill().expect("terminate Windows child");
+        child.wait().expect("reap Windows child");
+        assert!(is_authoritative(&live));
     }
 }
