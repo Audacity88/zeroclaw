@@ -2395,94 +2395,106 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
-        let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
-            .scope(
-                Some(cost_context.clone()),
-                crate::agent::tool_receipts::scope_receipts(
-                    receipt_scope.clone(),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                            crate::agent::loop_::ResolvedModelAccess {
-                                model_provider: self.model_provider.as_ref(),
-                                provider_name: &self.model_provider_name,
-                                model: &effective_model,
-                                temperature: self.temperature,
-                            },
-                            crate::agent::loop_::ResolvedIo {
-                                tools_registry: &self.tools,
-                                observer: self.observer.as_ref(),
-                                silent: false,
-                                approval: self.approval_manager.as_deref(),
-                                multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
-                                hooks: self.hook_runner.as_deref(),
-                                activated_tools: self.activated_tools.as_ref(),
-                                model_switch_callback: None,
-                                receipt_generator: receipt_scope
-                                    .as_ref()
-                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                            },
-                            crate::agent::loop_::ResolvedRuntimeKnobs {
-                                max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                excluded_tools: &[],
-                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                                pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                                parallel_tools: self.config.resolved.parallel_tools,
-                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self
-                                    .config
-                                    .resolved
-                                    .effective_context_budget(),
-                                knobs: &knobs,
-                            },
-                        ),
-                        history: &mut loop_history,
-                        channel_name: &self.channel_name,
-                        channel_reply_target: None,
-                        cancellation_token: None,
-                        on_delta: None,
-                        shared_budget: None,
-                        channel: None,
-                        collected_receipts: receipt_scope
-                            .as_ref()
-                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                        event_tx: None,
-                        steering: None,
-                        new_messages_out: Some(&mut loop_new_messages),
-                        image_cache: Some(&mut self.image_cache),
-                        // Direct embedded Agent::turn call; source/transport/
-                        // trust stay placeholders, not yet stamped at the edge.
-                        memory: Some(crate::agent::memory_inject::TurnMemory {
-                            handle: self.memory.as_ref(),
-                            query: user_message.to_string(),
-                            sessions: vec![self.memory_session_id.clone()],
-                            suppress: false,
-                            cfg: self.memory_inject_cfg,
-                        }),
-                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                        agent_alias: agent_alias_for_loop.as_deref(),
-                        parent_agent_alias: None,
-                        turn_id: &turn_id,
-                        // Live-daemon SOP path: re-assemble a nested step's agent
-                        // when it delegates elsewhere. Config survives only via
-                        // `provider_switch_config`; with `None` (test builder) a
-                        // cross-agent step FAILS CLOSED rather than inheriting
-                        // this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+        let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+            Some(cost_context.clone()),
+            crate::agent::tool_receipts::scope_receipts(
+                receipt_scope.clone(),
+                crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                    exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                        crate::agent::loop_::ResolvedModelAccess {
+                            model_provider: self.model_provider.as_ref(),
+                            provider_name: &self.model_provider_name,
+                            model: &effective_model,
+                            temperature: self.temperature,
+                        },
+                        crate::agent::loop_::ResolvedIo {
+                            tools_registry: &self.tools,
+                            observer: self.observer.as_ref(),
+                            silent: false,
+                            approval: self.approval_manager.as_deref(),
+                            multimodal_config: &self.multimodal_config,
+                            // Inlined `full_config()` (per-field borrow) so it coexists with
+                            // the `&mut self.image_cache` in this same ToolLoop expression.
+                            config: self
+                                .provider_switch_config
+                                .as_ref()
+                                .and_then(|c| c.config.as_deref()),
+                            hooks: self.hook_runner.as_deref(),
+                            activated_tools: self.activated_tools.as_ref(),
+                            model_switch_callback: None,
+                            receipt_generator: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                        },
+                        crate::agent::loop_::ResolvedRuntimeKnobs {
+                            max_tool_iterations: self.config.resolved.max_tool_iterations,
+                            excluded_tools: &[],
+                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                            pacing: &pacing,
+                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                            parallel_tools: self.config.resolved.parallel_tools,
+                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                            context_token_budget: self.config.resolved.effective_context_budget(),
+                            knobs: &knobs,
+                        },
+                    ),
+                    history: &mut loop_history,
+                    channel_name: &self.channel_name,
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: receipt_scope
+                        .as_ref()
+                        .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: Some(&mut loop_new_messages),
+                    image_cache: Some(&mut self.image_cache),
+                    // Direct embedded Agent::turn call; source/transport/
+                    // trust stay placeholders, not yet stamped at the edge.
+                    memory: Some(crate::agent::memory_inject::TurnMemory {
+                        handle: self.memory.as_ref(),
+                        query: user_message.to_string(),
+                        sessions: vec![self.memory_session_id.clone()],
+                        suppress: false,
+                        cfg: self.memory_inject_cfg,
                     }),
-                ),
-            )
-            .await;
+                    ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                    agent_alias: agent_alias_for_loop.as_deref(),
+                    parent_agent_alias: None,
+                    turn_id: &turn_id,
+                    // Live-daemon SOP path: re-assemble a nested step's agent
+                    // when it delegates elsewhere. Config survives only via
+                    // `provider_switch_config`; with `None` (test builder) a
+                    // cross-agent step FAILS CLOSED rather than inheriting
+                    // this turn's context.
+                    sop_reassembly: self
+                        .provider_switch_config
+                        .as_ref()
+                        .and_then(|c| c.config.as_deref())
+                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                }),
+            ),
+        );
+        // Context-window recovery can change the provider-visible transcript
+        // without changing provider/model identity. Capture the resilient
+        // wrapper's recovery record only when this turn could write a cache
+        // entry. Boxing mirrors the streamed path and keeps the extra scoped
+        // future off the worker stack in debug builds.
+        let (loop_result, turn_provider_recovery) = if cache_key.is_some() {
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = Box::pin(turn_loop).await;
+                (
+                    result,
+                    zeroclaw_providers::reliable::take_last_provider_fallback(),
+                )
+            })
+            .await
+        } else {
+            (turn_loop.await, None)
+        };
 
         // Feed the accumulated per-call usage into the AgentEnd guard before
         // any return below drops it — including the error path, which must
@@ -2517,6 +2529,7 @@ impl Agent {
         // tool-free exchange (exactly one assistant message), mirroring the
         // old "no tool calls" put condition.
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
+            && turn_provider_recovery.is_none()
             && loop_new_messages.len() == 2
             && loop_new_messages
                 .last()
@@ -2620,7 +2633,7 @@ impl Agent {
         // task-local record inside `zeroclaw_providers::reliable`, consumed
         // once per round below; this is a per-turn transient resolved at
         // use-time, never stored on the agent.
-        let mut turn_model_fallback: Option<zeroclaw_providers::reliable::ProviderFallbackInfo> =
+        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo> =
             None;
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
@@ -2908,7 +2921,7 @@ impl Agent {
                 })
                 .await;
             if round_fallback.is_some() {
-                turn_model_fallback = round_fallback;
+                turn_provider_recovery = round_fallback;
             }
 
             // Feed cumulative usage into the AgentEnd guard before any return
@@ -2959,6 +2972,7 @@ impl Agent {
                     // Cache put only when the turn was a single tool-free
                     // exchange, mirroring the old "no tool calls" condition.
                     if single_text_exchange
+                        && turn_provider_recovery.is_none()
                         && let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
                     {
                         #[allow(clippy::cast_possible_truncation)]
@@ -2971,7 +2985,7 @@ impl Agent {
                         self.append_receipts_block(committed_response, receipt_scope.as_ref());
                     let committed_response = Self::append_model_fallback_notice(
                         committed_response,
-                        turn_model_fallback.as_ref(),
+                        turn_provider_recovery.as_ref(),
                         &event_tx,
                     )
                     .await;
@@ -3811,6 +3825,61 @@ mod tests {
     struct CountingAnswerModelProvider {
         calls: Arc<AtomicUsize>,
         answer: String,
+    }
+
+    struct ContextWindowModelProvider {
+        calls: Arc<AtomicUsize>,
+        answer: String,
+        reject_full_context: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ContextWindowModelProvider {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            unreachable!("response-cache regression uses the structured chat path")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_full_context && request.messages.len() > 2 {
+                anyhow::bail!("input exceeds the context window of this model")
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(self.answer.clone()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ContextWindowModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "context-window-provider"
+        }
     }
 
     #[async_trait]
@@ -7731,6 +7800,149 @@ mod tests {
         assert_eq!(agent_b.turn("same request").await.unwrap(), "answer-b");
         assert_eq!(seen_a.lock().len(), 1);
         assert_eq!(seen_b.lock().len(), 1);
+    }
+
+    fn context_recovery_cache_agent(
+        workspace: &std::path::Path,
+        cache: Arc<zeroclaw_memory::response_cache::ResponseCache>,
+        calls: Arc<AtomicUsize>,
+        answer: &str,
+        reject_full_context: bool,
+    ) -> Agent {
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &zeroclaw_config::schema::MemoryConfig {
+                    backend: "none".into(),
+                    ..zeroclaw_config::schema::MemoryConfig::default()
+                },
+                workspace,
+                None,
+            )
+            .expect("memory creation should succeed"),
+        );
+        Agent::builder()
+            .model_provider(Box::new(
+                zeroclaw_providers::reliable::ReliableModelProvider::new(
+                    "shared-reliable",
+                    vec![(
+                        "primary".into(),
+                        Box::new(ContextWindowModelProvider {
+                            calls,
+                            answer: answer.into(),
+                            reject_full_context,
+                        }),
+                    )],
+                    1,
+                    1,
+                ),
+            ))
+            .model_provider_name("provider-family".into())
+            .tools(vec![])
+            .memory(memory)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .response_cache(Some(cache))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.to_path_buf())
+            .model_name("shared-model".into())
+            .temperature(Some(0.0))
+            .turn_datetime(fixed_response_cache_turn_datetime)
+            .build()
+            .expect("agent should build")
+    }
+
+    fn seed_context_recovery_history(agent: &mut Agent) {
+        agent.seed_history(&[
+            ChatMessage::user("older request"),
+            ChatMessage::assistant("older answer"),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn response_cache_does_not_store_non_streaming_context_recovery() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let recovering_calls = Arc::new(AtomicUsize::new(0));
+        let full_context_calls = Arc::new(AtomicUsize::new(0));
+        let mut recovering = context_recovery_cache_agent(
+            tmp.path(),
+            cache.clone(),
+            recovering_calls.clone(),
+            "truncated answer",
+            true,
+        );
+        let mut full_context = context_recovery_cache_agent(
+            tmp.path(),
+            cache,
+            full_context_calls.clone(),
+            "full-context answer",
+            false,
+        );
+        seed_context_recovery_history(&mut recovering);
+        seed_context_recovery_history(&mut full_context);
+
+        assert_eq!(
+            recovering.turn("same request").await.unwrap(),
+            "truncated answer"
+        );
+        assert_eq!(recovering_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            full_context.turn("same request").await.unwrap(),
+            "full-context answer",
+            "the full-context turn must reach its provider instead of reusing the recovered response"
+        );
+        assert_eq!(full_context_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn response_cache_does_not_store_streamed_context_recovery() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let recovering_calls = Arc::new(AtomicUsize::new(0));
+        let full_context_calls = Arc::new(AtomicUsize::new(0));
+        let mut recovering = context_recovery_cache_agent(
+            tmp.path(),
+            cache.clone(),
+            recovering_calls.clone(),
+            "truncated stream",
+            true,
+        );
+        let mut full_context = context_recovery_cache_agent(
+            tmp.path(),
+            cache,
+            full_context_calls.clone(),
+            "full-context stream",
+            false,
+        );
+        seed_context_recovery_history(&mut recovering);
+        seed_context_recovery_history(&mut full_context);
+        let (event_tx_a, _event_rx_a) = tokio::sync::mpsc::channel(32);
+        let (event_tx_b, _event_rx_b) = tokio::sync::mpsc::channel(32);
+
+        assert_eq!(
+            recovering
+                .turn_streamed("same request", event_tx_a, None)
+                .await
+                .unwrap()
+                .0,
+            "truncated stream"
+        );
+        assert_eq!(recovering_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            full_context
+                .turn_streamed("same request", event_tx_b, None)
+                .await
+                .unwrap()
+                .0,
+            "full-context stream",
+            "the streamed full-context turn must reach its provider instead of reusing the recovered response"
+        );
+        assert_eq!(full_context_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
