@@ -3499,6 +3499,19 @@ mod tests {
             .unwrap();
         assert_eq!(state, BackgroundResultState::Completed);
         assert_eq!(view["output"], "legacy inline output");
+
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(checked.success);
+        assert!(checked.output.contains("legacy inline output"));
+        let awaited = tool
+            .handle_await_sessions(&json!({"task_ids": [task_id], "timeout_ms": 0}))
+            .await
+            .unwrap();
+        assert!(awaited.success);
+        assert!(awaited.output.contains("legacy inline output"));
     }
 
     #[tokio::test]
@@ -3564,6 +3577,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(view["output"], "legacy output");
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(checked.success);
+        assert!(checked.output.contains("legacy output"));
+        let awaited = tool
+            .handle_await_sessions(&json!({"task_ids": [task_id], "timeout_ms": 0}))
+            .await
+            .unwrap();
+        assert!(awaited.success);
+        assert!(awaited.output.contains("legacy output"));
         assert!(
             tool.read_background_view(task_id, false)
                 .await
