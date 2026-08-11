@@ -1131,12 +1131,17 @@ fn is_git_write_verb(verb: &str) -> bool {
 }
 
 fn git_effective_subcommand(args: &[String]) -> Option<&str> {
+    args.get(git_effective_subcommand_index(args)?)
+        .map(String::as_str)
+}
+
+fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
     let mut idx = 0;
     while idx < args.len() {
         let arg = args[idx].as_str();
 
         match arg {
-            "--" => return args.get(idx + 1).map(String::as_str),
+            "--" => return args.get(idx + 1).map(|_| idx + 1),
             "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
             | "--super-prefix" => {
                 idx += 2;
@@ -1171,11 +1176,91 @@ fn git_effective_subcommand(args: &[String]) -> Option<&str> {
             _ if arg.starts_with('-') => {
                 idx += 1;
             }
-            _ => return Some(arg),
+            _ => return Some(idx),
         }
     }
 
     None
+}
+
+fn git_delegates_to_external_command(args: &[String]) -> bool {
+    let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
+        return args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| git_arg_is_paginate(arg) || git_arg_is_external_diff_option(arg));
+    };
+
+    if args[..subcommand_idx]
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| git_arg_is_paginate(arg) || git_arg_is_external_diff_option(arg))
+    {
+        return true;
+    }
+
+    let subcommand = args[subcommand_idx].as_str();
+    if git_arg_eq(subcommand, "difftool")
+        || git_arg_eq(subcommand, "difftool--helper")
+        || git_arg_eq(subcommand, "mergetool")
+        || git_arg_eq(subcommand, "mergetool--helper")
+        || git_arg_eq(subcommand, "submodule--helper")
+    {
+        return true;
+    }
+
+    if git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_is_external_diff_option) {
+        return true;
+    }
+
+    match subcommand.to_ascii_lowercase().as_str() {
+        "bisect" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|arg| git_arg_eq(arg, "run")),
+        "submodule" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|arg| git_arg_eq(arg, "foreach")),
+        "grep" => {
+            git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_opens_files_in_pager)
+        }
+        "help" => git_args_before_pathspec(args, subcommand_idx + 1)
+            .any(|arg| git_arg_eq(arg, "-w") || git_arg_eq(arg, "--web")),
+        _ => false,
+    }
+}
+
+fn git_args_before_pathspec(args: &[String], start: usize) -> impl Iterator<Item = &str> {
+    args[start..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+}
+
+fn git_first_non_option_before_pathspec(args: &[String], start: usize) -> Option<&str> {
+    git_args_before_pathspec(args, start).find(|arg| !arg.starts_with('-'))
+}
+
+fn git_arg_eq(arg: &str, expected: &str) -> bool {
+    arg.eq_ignore_ascii_case(expected)
+}
+
+fn git_arg_starts_with(arg: &str, prefix: &str) -> bool {
+    arg.get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+fn git_arg_is_paginate(arg: &str) -> bool {
+    git_arg_eq(arg, "-p") || git_arg_eq(arg, "--paginate")
+}
+
+fn git_arg_is_external_diff_option(arg: &str) -> bool {
+    git_arg_eq(arg, "--ext-diff")
+        || git_arg_eq(arg, "--extcmd")
+        || git_arg_starts_with(arg, "--extcmd=")
+}
+
+fn git_arg_opens_files_in_pager(arg: &str) -> bool {
+    arg.starts_with("-O")
+        || git_arg_eq(arg, "--open-files-in-pager")
+        || git_arg_starts_with(arg, "--open-files-in-pager=")
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
@@ -2010,6 +2095,7 @@ impl SecurityPolicy {
             }
             "git" => {
                 !args_cased.iter().any(|arg| arg.starts_with("-c"))
+                    && !git_delegates_to_external_command(args_cased)
                     && !args.iter().any(|arg| {
                         arg == "--config-env"
                             || arg.starts_with("--config-env=")
@@ -3590,6 +3676,38 @@ mod tests {
         assert_eq!(env_only, CommandRiskLevel::Low);
 
         for command in [
+            "git difftool --no-prompt --extcmd=./helper -- file",
+            "git difftool --no-prompt -x ./helper -- file",
+            "git difftool --tool=vimdiff -- file",
+            "git difftool--helper --extcmd=./helper -- file",
+            "git mergetool --tool=vimdiff file",
+            "git mergetool--helper --tool=vimdiff file",
+            "git diff --ext-diff -- file",
+            "git log --ext-diff -1",
+            "git show --ext-diff --stat HEAD",
+            "git -p status",
+            "git --paginate status",
+            "git grep -O pattern",
+            "git grep -O./pager pattern",
+            "git grep --open-files-in-pager pattern",
+            "git grep --open-files-in-pager=./pager pattern",
+            "git help -w status",
+            "git help --web status",
+            "git --no-pager bisect run ./helper",
+            "git -C . submodule --quiet foreach './helper'",
+            "git submodule--helper foreach -- './helper'",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("Git delegated-execution surfaces must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        for command in [
             "git 2>&1> /dev/null commit -m test",
             "git <&0> /dev/null commit -m test",
         ] {
@@ -3607,6 +3725,27 @@ mod tests {
             .validate_command_execution("git status", false)
             .expect("read-only Git status should remain allowed");
         assert_eq!(status, CommandRiskLevel::Low);
+
+        for command in [
+            "git diff --stat",
+            "git diff --no-ext-diff --stat",
+            "git log --oneline -1",
+            "git show --stat --no-patch HEAD",
+            "git submodule status",
+            "git diff -- --ext-diff",
+            "git log -- --ext-diff",
+            "git submodule status foreach",
+            "git submodule status -- foreach",
+            "git bisect log run",
+            "git --no-pager status",
+            "git log -p -1",
+            "git grep -o pattern",
+        ] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("read-only Git commands should remain allowed");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
 
         let commit_denied = p
             .validate_command_execution("git commit -m test", false)
