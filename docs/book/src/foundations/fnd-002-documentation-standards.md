@@ -39,7 +39,7 @@
 | 4 | 2026-07-14 | Reconciled the foundational ADR backlog with the restored ADR set and separated retroactive records from implementation-gated roadmap decisions ([#9042](https://github.com/zeroclaw-labs/zeroclaw/pull/9042)) |
 | 5 | 2026-07-18 | Added proposed ADR-006 and ADR-007 records for the resolved runtime-channel-plugin and separate-gateway-process targets while keeping acceptance implementation-gated ([#9133](https://github.com/zeroclaw-labs/zeroclaw/pull/9133)) |
 | 6 | 2026-07-20 | Defined the compact root coding-agent contract, architecture-map routing, optional detailed guidance, and crate-policy safety floor ([#9050](https://github.com/zeroclaw-labs/zeroclaw/pull/9050)) |
-| 7 | 2026-08-06 | Defined the foundation revision policy and reconciled revision metadata across the FND suite ([#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)) |
+| 7 | 2026-08-06 | Defined the foundation revision policy and reconciled revision metadata across the FND suite ([#9778](https://github.com/zeroclaw-labs/zeroclaw/pull/9778)) |
 
 ### Foundation Revision Policy
 
