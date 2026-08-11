@@ -64,7 +64,7 @@ Large RFCs often ship across multiple PRs over several releases. The RFC's track
 
 ## Current open RFCs
 
-Open RFCs are the best primary source for "what's coming next" in ZeroClaw. Browse:
+Open RFCs are the best primary source for "what's coming next" in ZeroClaw. [Browse the current open RFCs on GitHub](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22type%3Arfc%22) or run:
 
 <div class="os-tabs-src">
 
@@ -75,14 +75,6 @@ gh issue list --repo zeroclaw-labs/zeroclaw --label type:rfc --state open
 ```
 
 </div>
-
-The list above is the canonical source. A snapshot of notable open RFCs at time of writing (browse the live list for the current set):
-
-- **#6808**: Work Lanes, Board Automation, and Label Cleanup (governance, in progress)
-- **#6971**: Security UX, runtime credential boundaries, and isolation defaults
-- **#6996**: Granular sandbox policy: filesystem and network restrictions
-- **#7218**: A2A agent discovery (`.well-known/agent-card.json`) for multi-agent installs
-- **#7184**: Move translated `.ftl` and `.po` files into a git submodule
 
 ## Ratified foundational RFCs
 
