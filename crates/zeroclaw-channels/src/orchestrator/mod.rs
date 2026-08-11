@@ -22146,7 +22146,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_preserve_instructions_without_compact_loader() {
+    fn prompt_skills_default_mode_preserves_instructions_with_compact_loader() {
         let ws = make_workspace();
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
@@ -22171,7 +22171,14 @@ BTC is currently around $65,000 based on latest tool output."#
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
+        let prompt = build_system_prompt(
+            ws.path(),
+            "model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            None,
+        );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -24200,6 +24207,8 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
         config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
         let initial_skills =
             zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
