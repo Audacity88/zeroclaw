@@ -6,7 +6,7 @@ use crate::session_backend::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,43 @@ use zeroclaw_api::model_provider::ChatMessage;
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
+}
+
+fn committed_jsonl_import_receipts_exist(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jsonl_import_receipts LIMIT 1)",
+        [],
+        |row| row.get(0),
+    )
+    .context("Failed to inspect committed JSONL import receipts")
+}
+
+pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Result<bool> {
+    let db_path = workspace_dir.join("sessions/sessions.db");
+    match std::fs::metadata(&db_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect session DB: {}", db_path.display()));
+        }
+    }
+
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open session DB: {}", db_path.display()))?;
+    let receipt_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'jsonl_import_receipts')",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to inspect JSONL import receipt schema")?;
+    if !receipt_table_exists {
+        return Ok(false);
+    }
+
+    committed_jsonl_import_receipts_exist(&conn)
 }
 
 impl SqliteSessionBackend {
@@ -395,11 +432,7 @@ impl SqliteSessionBackend {
         let mutation_lock = crate::session_store::mutation_lock_for(&sessions_dir)
             .context("Failed to acquire JSONL session mutation lock")?;
         let mut mutation_guard = mutation_lock.lock();
-        let receipt_inventory = self.conn.lock().query_row(
-            "SELECT EXISTS(SELECT 1 FROM jsonl_import_receipts LIMIT 1)",
-            [],
-            |row| row.get(0),
-        );
+        let receipt_inventory = committed_jsonl_import_receipts_exist(&self.conn.lock());
         let has_committed_import: bool = match receipt_inventory {
             Ok(has_committed_import) => has_committed_import,
             Err(receipt_error) => {
@@ -2122,6 +2155,58 @@ mod tests {
                 .to_string()
                 .contains("inactive after SQLite migration")
         );
+    }
+
+    #[test]
+    fn session_store_restores_migration_fence_from_receipt_after_restart() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        let store = SessionStore::new(tmp.path()).unwrap();
+        store
+            .append("restart_user", &ChatMessage::user("before migration"))
+            .unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+        drop(store);
+        drop(backend);
+        crate::session_store::forget_session_directory_migration_state_for_test(&sessions_dir)
+            .unwrap();
+
+        let reopened_store = SessionStore::new(tmp.path()).unwrap();
+        let error = reopened_store
+            .append("restart_user", &ChatMessage::user("after restart"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inactive after SQLite migration")
+        );
+        assert!(!sessions_dir.join("restart_user.jsonl").exists());
+    }
+
+    #[test]
+    fn session_store_fails_closed_when_migration_state_is_unreadable() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(sessions_dir.join("sessions.db"), "not a sqlite database").unwrap();
+
+        let error = match SessionStore::new(tmp.path()) {
+            Ok(_) => panic!("corrupt receipt state must reject JSONL construction"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to inspect durable JSONL migration state")
+        );
+
+        std::fs::remove_file(sessions_dir.join("sessions.db")).unwrap();
+        let recovered_store = SessionStore::new(tmp.path()).unwrap();
+        recovered_store
+            .append("recovered", &ChatMessage::user("receipt-free"))
+            .unwrap();
     }
 
     #[test]

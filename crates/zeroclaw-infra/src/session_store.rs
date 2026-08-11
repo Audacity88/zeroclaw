@@ -11,6 +11,7 @@ pub use zeroclaw_api::session_keys::sanitize_session_key;
 #[derive(Default)]
 pub(crate) struct MutationState {
     migrated: bool,
+    receipt_state_uncertain: bool,
 }
 
 pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;
@@ -35,6 +36,19 @@ impl SessionStore {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
         let mutation_lock = mutation_lock_for(&sessions_dir)?;
+        {
+            let mut state = mutation_lock.lock();
+            match crate::session_sqlite::has_committed_jsonl_import_receipts(workspace_dir) {
+                Ok(true) => mark_session_directory_migrated(&sessions_dir, &mut state)?,
+                Ok(false) => state.receipt_state_uncertain = false,
+                Err(error) => {
+                    state.receipt_state_uncertain = true;
+                    return Err(std::io::Error::other(format!(
+                        "Failed to inspect durable JSONL migration state: {error:#}"
+                    )));
+                }
+            }
+        }
         Ok(Self {
             sessions_dir,
             mutation_lock,
@@ -81,7 +95,7 @@ impl SessionStore {
 
     fn mutation_guard(&self) -> std::io::Result<parking_lot::MutexGuard<'_, MutationState>> {
         let guard = self.mutation_lock.lock();
-        if guard.migrated {
+        if guard.migrated || guard.receipt_state_uncertain {
             return Err(std::io::Error::other(
                 "JSONL session store is inactive after SQLite migration",
             ));
@@ -234,7 +248,10 @@ pub(crate) fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<Muta
     }
 
     let migrated = locks.get(&key).is_some_and(|record| record.migrated);
-    let lock = Arc::new(MutationLock::new(MutationState { migrated }));
+    let lock = Arc::new(MutationLock::new(MutationState {
+        migrated,
+        receipt_state_uncertain: false,
+    }));
     locks.insert(
         key,
         MutationLockRecord {
@@ -250,6 +267,7 @@ pub(crate) fn mark_session_directory_migrated(
     state: &mut MutationState,
 ) -> std::io::Result<()> {
     state.migrated = true;
+    state.receipt_state_uncertain = false;
     let key = sessions_dir.canonicalize()?;
     let registry = MUTATION_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     if let Some(record) = registry.lock().get_mut(&key) {
