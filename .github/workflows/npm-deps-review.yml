@@ -1,12 +1,6 @@
 name: npm Dependency Review
 
 on:
-  pull_request:
-    branches: [master]
-    paths:
-      - web/package-lock.json
-      - web/package.json
-      - .github/workflows/npm-deps-review.yml
   schedule:
     - cron: "17 6 * * *"
 
@@ -23,17 +17,3 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Verify the temporary exception remains valid
         run: bash scripts/ci/web_rsc_mode_guard.sh
-
-  review:
-    name: Check npm advisories
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019 # v4.5.0
-        with:
-          fail-on-severity: high
-          # The guarded Vite SPA does not use the advisory's unstable RSC APIs.
-          # Remove this exception when the remediation tracked by #9383 upgrades React Router.
-          allow-ghsas: GHSA-qwww-vcr4-c8h2

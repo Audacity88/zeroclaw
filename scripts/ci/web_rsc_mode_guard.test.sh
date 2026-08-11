@@ -9,13 +9,21 @@ trap 'rm -rf "$fixture"' EXIT
 reset_fixture() {
   rm -rf "$fixture/web" "$fixture/.github"
   mkdir -p "$fixture/web/src" "$fixture/.github/workflows"
-  cat >"$fixture/.github/workflows/npm-deps-review.yml" <<'YAML'
+  cat >"$fixture/.github/workflows/ci.yml" <<'YAML'
 jobs:
-  review:
+  npm-dependency-review:
+    if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/dependency-review-action@example
+      - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019
         with:
           allow-ghsas: GHSA-qwww-vcr4-c8h2
+  gate:
+    needs: [npm-dependency-review]
+    steps:
+      - run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.npm-dependency-review.result }}" != "success" ]]; then
+            exit 1
+          fi
 YAML
   cat >"$fixture/web/package.json" <<'JSON'
 {
@@ -69,7 +77,7 @@ reset_fixture
 run_guard >/dev/null
 
 reset_fixture
-node - "$fixture/.github/workflows/npm-deps-review.yml" <<'NODE'
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
 const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
@@ -81,7 +89,7 @@ NODE
 expect_failure "different advisory exception"
 
 reset_fixture
-node - "$fixture/.github/workflows/npm-deps-review.yml" <<'NODE'
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
 const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
@@ -94,6 +102,103 @@ fs.writeFileSync(
 );
 NODE
 expect_failure "additional advisory exception"
+
+reset_fixture
+cat >"$fixture/.github/workflows/ci.yml" <<'YAML'
+jobs:
+  npm-dependency-review:
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@example
+        with:
+          allow-ghsas: GHSA-qwww-vcr4-c8h2
+  gate:
+    needs: [npm-dependency-review]
+    steps:
+      - run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.npm-dependency-review.result }}" != "success" ]]; then
+            exit 1
+          fi
+YAML
+expect_failure "advisory exception detached from dependency-review action"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace("needs: [npm-dependency-review]", "needs: []"),
+);
+NODE
+expect_failure "dependency-review action detached from required gate"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace("3b139cfc5fae8b618d3eae3675e383bb1769c019", "main"),
+);
+NODE
+expect_failure "unpinned dependency-review action"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace("if: github.event_name == 'pull_request'", "if: false"),
+);
+NODE
+expect_failure "skipped dependency-review job"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "      - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019",
+    "      - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019\n        continue-on-error: true",
+  ),
+);
+NODE
+expect_failure "failure-tolerant dependency-review action"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "needs: [npm-dependency-review]",
+    "needs: [npm-dependency-review-shadow]",
+  ),
+);
+NODE
+expect_failure "lookalike dependency-review gate need"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace('!= "success"', '== "success"'),
+);
+NODE
+expect_failure "required gate without dependency-review success check"
 
 reset_fixture
 cat >"$fixture/web/src/node-test.ts" <<'TS'
@@ -128,6 +233,36 @@ NODE
 expect_failure "direct react-router dependency"
 
 reset_fixture
+node - "$fixture/web/package.json" <<'NODE'
+const fs = require("node:fs");
+const packagePath = process.argv[2];
+const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+pkg.dependencies.rr = "npm:react-router@7.18.2";
+fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
+NODE
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+import * as router from "rr";
+
+export { router };
+TSX
+expect_failure "npm alias for react-router"
+
+reset_fixture
+node - "$fixture/web/package.json" <<'NODE'
+const fs = require("node:fs");
+const packagePath = process.argv[2];
+const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+pkg.dependencies.rr = "npm:react-router-dom@7.18.2";
+fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
+NODE
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+import * as router from "rr";
+
+export { router };
+TSX
+expect_failure "npm alias for react-router-dom"
+
+reset_fixture
 cat >"$fixture/web/src/server.ts" <<'TS'
 import { reactRouter } from "@react-router/dev/vite";
 
@@ -158,6 +293,52 @@ import rsc from "@vitejs/plugin-rsc";
 export default rsc;
 JSX
 expect_failure "RSC import in JSX source"
+
+reset_fixture
+mkdir -p "$fixture/web/src/dist"
+cat >"$fixture/web/src/dist/server.ts" <<'TS'
+import { reactRouter } from "@react-router/dev/vite";
+
+export { reactRouter };
+TS
+expect_failure "RSC import in nested dist directory"
+
+reset_fixture
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+import { BrowserRouter } from "react-router-dom"; import { ServerRouter } from "react-router";
+
+export { BrowserRouter, ServerRouter };
+TSX
+expect_failure "same-line forbidden import"
+
+reset_fixture
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+const router = await import("react-" + "router");
+
+export { router };
+TSX
+expect_failure "computed dynamic import"
+
+reset_fixture
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+const packageName = "react-router";
+const router = require(packageName);
+
+export { router };
+TSX
+expect_failure "computed require"
+
+reset_fixture
+mkdir -p "$fixture/web/node_modules/local-rsc"
+cat >"$fixture/web/node_modules/local-rsc/index.ts" <<'TS'
+export const server = true;
+TS
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+import { server } from "../node_modules/local-rsc/index";
+
+export { server };
+TSX
+expect_failure "relative import into skipped node_modules"
 
 reset_fixture
 cat >"$fixture/web/entry.rsc.mjs" <<'JS'
@@ -198,6 +379,21 @@ export default defineConfig({
 });
 TS
 expect_failure "Vite alias escaping the web root"
+
+reset_fixture
+cat >"$fixture/web/vite.config.ts" <<'TS'
+import { defineConfig } from "vite";
+import path from "path";
+
+export default defineConfig({
+  resolve: {
+    ["alias"]: {
+      "@": path.resolve(__dirname, "./node_modules"),
+    },
+  },
+});
+TS
+expect_failure "computed Vite alias property"
 
 reset_fixture
 cat >"$fixture/web/src/main.tsx" <<'TSX'

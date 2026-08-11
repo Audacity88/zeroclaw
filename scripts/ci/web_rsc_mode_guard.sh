@@ -29,13 +29,15 @@ const today = process.argv[3];
 const expires = process.argv[4];
 const webRoot = path.join(repoRoot, "web");
 const webSourceRoot = path.join(webRoot, "src");
-const advisoryWorkflowPath = path.join(
+const ciWorkflowPath = path.join(
   repoRoot,
   ".github",
   "workflows",
-  "npm-deps-review.yml",
+  "ci.yml",
 );
 const expectedGhsa = "GHSA-qwww-vcr4-c8h2";
+const expectedDependencyReviewRef =
+  "3b139cfc5fae8b618d3eae3675e383bb1769c019";
 
 function fail(message) {
   console.error(`web-rsc-mode-guard: ${message}`);
@@ -59,15 +61,106 @@ if (parseDate("current", today) >= parseDate("expiry", expires)) {
   fail(`${expectedGhsa} exception expired on ${expires}`);
 }
 
-if (!fs.existsSync(advisoryWorkflowPath)) {
-  fail("missing .github/workflows/npm-deps-review.yml");
+if (!fs.existsSync(ciWorkflowPath)) {
+  fail("missing .github/workflows/ci.yml");
 }
-const advisoryWorkflow = fs.readFileSync(advisoryWorkflowPath, "utf8");
-const allowGhsas = [
-  ...advisoryWorkflow.matchAll(/^\s*allow-ghsas:\s*([^#\r\n]+?)\s*(?:#.*)?$/gm),
-].map((match) => match[1].trim().replace(/^["']|["']$/g, ""));
-if (allowGhsas.length !== 1 || allowGhsas[0] !== expectedGhsa) {
-  fail(`dependency review must allow exactly ${expectedGhsa}`);
+
+function workflowJob(lines, name) {
+  const start = lines.findIndex((line) => line === `  ${name}:`);
+  if (start === -1) {
+    fail(`missing ${name} job in .github/workflows/ci.yml`);
+  }
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^  [A-Za-z0-9_-]+:\s*$/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  return { start, end, lines: lines.slice(start, end) };
+}
+
+const ciWorkflow = fs.readFileSync(ciWorkflowPath, "utf8");
+const ciLines = ciWorkflow.split(/\r?\n/);
+const reviewJob = workflowJob(ciLines, "npm-dependency-review");
+const reviewIf = reviewJob.lines.filter((line) => /^\s+if:/.test(line));
+if (
+  reviewIf.length !== 1 ||
+  reviewIf[0].trim() !== "if: github.event_name == 'pull_request'" ||
+  reviewJob.lines.some((line) => /^\s+continue-on-error:/.test(line))
+) {
+  fail("npm-dependency-review must run only on pull requests and fail closed");
+}
+const actionPattern = /^(\s*)-\s+uses:\s*actions\/dependency-review-action@([^\s#]+)(?:\s+#.*)?$/;
+const actionSteps = [];
+for (let index = reviewJob.start; index < reviewJob.end; index += 1) {
+  const match = ciLines[index].match(actionPattern);
+  if (match) {
+    actionSteps.push({ index, indent: match[1].length });
+  }
+}
+if (actionSteps.length !== 1) {
+  fail("required CI must contain exactly one dependency-review action step");
+}
+const actionRef = ciLines[actionSteps[0].index].match(actionPattern)?.[2];
+if (actionRef !== expectedDependencyReviewRef) {
+  fail("dependency-review action must use the approved pinned revision");
+}
+
+const actionStep = actionSteps[0];
+let actionEnd = reviewJob.end;
+for (let index = actionStep.index + 1; index < reviewJob.end; index += 1) {
+  const nextStep = ciLines[index].match(/^(\s*)-\s+/);
+  if (nextStep && nextStep[1].length <= actionStep.indent) {
+    actionEnd = index;
+    break;
+  }
+}
+const actionLines = ciLines.slice(actionStep.index + 1, actionEnd);
+if (actionLines.some((line) => /^\s+(?:if|continue-on-error):/.test(line))) {
+  fail("dependency-review action cannot be skipped or failure-tolerant");
+}
+const withIndexes = actionLines
+  .map((line, index) => ({ match: line.match(/^(\s*)with:\s*(?:#.*)?$/), index }))
+  .filter(({ match }) => match);
+if (withIndexes.length !== 1) {
+  fail("dependency-review action must contain exactly one with block");
+}
+const withIndent = withIndexes[0].match[1].length;
+const allowGhsas = actionLines
+  .slice(withIndexes[0].index + 1)
+  .map((line) => line.match(/^(\s*)allow-ghsas:\s*([^#\r\n]+?)\s*(?:#.*)?$/))
+  .filter((match) => match && match[1].length > withIndent)
+  .map((match) => match[2].trim().replace(/^["']|["']$/g, ""));
+const allAllowGhsas = [
+  ...ciWorkflow.matchAll(/^\s*allow-ghsas:\s*([^#\r\n]+?)\s*(?:#.*)?$/gm),
+];
+if (
+  allowGhsas.length !== 1 ||
+  allowGhsas[0] !== expectedGhsa ||
+  allAllowGhsas.length !== 1
+) {
+  fail(`dependency-review action must allow exactly ${expectedGhsa}`);
+}
+
+const gateJob = workflowJob(ciLines, "gate");
+const gateNeeds = gateJob.lines.find((line) => /^\s+needs:\s*\[/.test(line));
+const gateNeedNames = gateNeeds
+  ?.match(/\[([^\]]*)\]/)?.[1]
+  .split(",")
+  .map((name) => name.trim())
+  .filter(Boolean);
+if (
+  !gateNeedNames ||
+  gateNeedNames.filter((name) => name === "npm-dependency-review").length !== 1
+) {
+  fail("CI Required Gate must depend on npm-dependency-review");
+}
+const gateSource = gateJob.lines.join("\n");
+const requiredReviewResult =
+  `if [[ "\${{ github.event_name }}" == "pull_request" && "\${{ needs.npm-dependency-review.result }}" != "success" ]]; then`;
+if (!gateSource.includes(requiredReviewResult)) {
+  fail("CI Required Gate must require successful npm dependency review on pull requests");
 }
 
 const packagePath = path.join(webRoot, "package.json");
@@ -89,7 +182,7 @@ const dependencySections = [
 const declaredPackages = new Set();
 const forbiddenPackages = [];
 for (const section of dependencySections) {
-  for (const name of Object.keys(pkg[section] ?? {})) {
+  for (const [name, version] of Object.entries(pkg[section] ?? {})) {
     declaredPackages.add(name);
     if (
       name === "react-router" ||
@@ -99,6 +192,12 @@ for (const section of dependencySections) {
       name.startsWith("react-server-dom-")
     ) {
       forbiddenPackages.push(`${section}:${name}`);
+    }
+    if (typeof version === "string" && version.startsWith("npm:")) {
+      const target = version.slice(4).match(/^(@[^/]+\/[^@]+|[^@]+)(?:@.*)?$/)?.[1];
+      if (!target || target === "react-router-dom" || forbiddenSpecifier(target)) {
+        forbiddenPackages.push(`${section}:${name}->${version}`);
+      }
     }
   }
 }
@@ -121,7 +220,11 @@ const scannedExtensions = new Set([
   ".cts",
   ".mdx",
 ]);
-const ignoredDirectories = new Set(["dist", "node_modules", ".git"]);
+const ignoredPaths = new Set([
+  path.join(webRoot, "dist"),
+  path.join(webRoot, "node_modules"),
+]);
+const nodeModulesRoot = path.join(webRoot, "node_modules");
 const nodeBuiltins = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
 const allowedTransitiveImports = new Set(["@codemirror/theme-one-dark"]);
 const forbiddenRscApi = /\b(?:unstable_)?(?:RSCHydratedRouter|RSCStaticRouter|createCallServer|getRSCStream|matchRSCServerRequest|routeRSCServerRequest|reactRouterRSC)\b/;
@@ -148,15 +251,22 @@ function requireInsideWebRoot(resolved, relative, specifier) {
   if (resolved !== webRoot && !resolved.startsWith(`${webRoot}${path.sep}`)) {
     fail(`${relative} imports outside the guarded web root: ${specifier}`);
   }
+  if (resolved === nodeModulesRoot || resolved.startsWith(`${nodeModulesRoot}${path.sep}`)) {
+    fail(`${relative} imports into skipped node_modules: ${specifier}`);
+  }
 }
 
 function inspectViteAliases(source, relative) {
-  const aliasBlocks = [...source.matchAll(/\balias\s*:\s*\{([\s\S]*?)\n\s*\},/g)];
-  if (/\balias\s*:/.test(source) && aliasBlocks.length !== 1) {
-    fail(`${relative} uses an unsupported alias declaration`);
+  if (/\[\s*["'](?:resolve|alias)["']\s*\]\s*:/.test(source)) {
+    fail(`${relative} uses a computed resolve or alias property`);
   }
-  if (aliasBlocks.length === 0) {
-    return;
+  if (/\.\.\./.test(source)) {
+    fail(`${relative} uses an unsupported object spread`);
+  }
+  const aliasTokens = [...source.matchAll(/\balias\b/g)];
+  const aliasBlocks = [...source.matchAll(/\balias\s*:\s*\{([\s\S]*?)\n\s*\},/g)];
+  if (aliasTokens.length !== 1 || aliasBlocks.length !== 1) {
+    fail(`${relative} uses an unsupported alias declaration`);
   }
 
   const compact = aliasBlocks[0][1].replace(/\s+/g, "");
@@ -180,9 +290,15 @@ function inspectFile(filePath) {
   const importSource = source
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/^\s*\/\/.*$/gm, "");
+  for (const match of importSource.matchAll(/\b(?:import|require)\s*\(([^)]*)\)/g)) {
+    const argument = match[1].trim();
+    if (!/^(?:"[^"]+"|'[^']+'|`[^`$]+`)$/.test(argument)) {
+      fail(`${relative} uses a non-literal dynamic module specifier`);
+    }
+  }
   const specifierPatterns = [
-    /(?:^|\n)\s*(?:import|export)\b[^;]*?\sfrom\s*["']([^"']+)["']/g,
-    /(?:^|\n)\s*import\s*["']([^"']+)["']/g,
+    /(?:^|[;\n])\s*(?:import|export)\b[^;]*?\sfrom\s*["']([^"']+)["']/g,
+    /(?:^|[;\n])\s*import\s*["']([^"']+)["']/g,
     /\bimport\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g,
     /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
   ];
@@ -222,16 +338,16 @@ function inspectFile(filePath) {
     fail(`${relative} contains an unstable RSC API or server directive`);
   }
   if (/^vite\.config\./.test(basename)) {
-    inspectViteAliases(source, relative);
+    inspectViteAliases(importSource, relative);
   }
 }
 
 function walk(directory) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    if (entry.isDirectory() && ignoredDirectories.has(entry.name)) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory() && ignoredPaths.has(entryPath)) {
       continue;
     }
-    const entryPath = path.join(directory, entry.name);
     if (entry.isSymbolicLink()) {
       fail(`${path.relative(webRoot, entryPath)} is a symbolic link outside the scanned file contract`);
     } else if (entry.isDirectory()) {
