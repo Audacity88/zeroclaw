@@ -276,6 +276,14 @@ pub(crate) fn mark_session_directory_migrated(
     Ok(())
 }
 
+pub(crate) fn mark_session_directory_receipt_state_uncertain(state: &mut MutationState) {
+    state.receipt_state_uncertain = true;
+}
+
+pub(crate) fn clear_session_directory_receipt_state_uncertain(state: &mut MutationState) {
+    state.receipt_state_uncertain = false;
+}
+
 #[cfg(test)]
 pub(crate) fn forget_session_directory_migration_state_for_test(
     sessions_dir: &Path,

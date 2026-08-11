@@ -436,14 +436,9 @@ impl SqliteSessionBackend {
         let has_committed_import: bool = match receipt_inventory {
             Ok(has_committed_import) => has_committed_import,
             Err(receipt_error) => {
-                if let Err(state_error) = crate::session_store::mark_session_directory_migrated(
-                    &sessions_dir,
+                crate::session_store::mark_session_directory_receipt_state_uncertain(
                     &mut mutation_guard,
-                ) {
-                    return Err(anyhow::Error::from(state_error).context(format!(
-                        "Failed to deactivate JSONL after receipt inventory failed: {receipt_error}"
-                    )));
-                }
+                );
                 return Err(receipt_error)
                     .context("Failed to inspect committed JSONL import receipts");
             }
@@ -454,6 +449,10 @@ impl SqliteSessionBackend {
                 &mut mutation_guard,
             )
             .context("Failed to restore JSONL migration state from committed receipts")?;
+        } else {
+            crate::session_store::clear_session_directory_receipt_state_uncertain(
+                &mut mutation_guard,
+            );
         }
         let entries = std::fs::read_dir(&sessions_dir)
             .context("Failed to enumerate JSONL sessions for SQLite migration")?;
@@ -2183,6 +2182,22 @@ mod tests {
                 .contains("inactive after SQLite migration")
         );
         assert!(!sessions_dir.join("restart_user.jsonl").exists());
+
+        let reopened_backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        reopened_backend
+            .conn
+            .lock()
+            .execute("DELETE FROM jsonl_import_receipts", [])
+            .unwrap();
+        assert_eq!(reopened_backend.migrate_from_jsonl(tmp.path()).unwrap(), 0);
+        let error = reopened_store
+            .append("restart_user", &ChatMessage::user("after receipt removal"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inactive after SQLite migration")
+        );
     }
 
     #[test]
@@ -2354,7 +2369,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_from_jsonl_deactivates_writer_when_receipt_inventory_fails() {
+    fn migrate_from_jsonl_temporarily_blocks_writer_until_receipt_inventory_recovers() {
         let tmp = TempDir::new().unwrap();
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
@@ -2376,6 +2391,24 @@ mod tests {
                 .to_string()
                 .contains("inactive after SQLite migration")
         );
+
+        backend
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TABLE jsonl_import_receipts (
+                    source_name  TEXT PRIMARY KEY,
+                    session_key  TEXT NOT NULL,
+                    source_hash  TEXT NOT NULL,
+                    source_len   INTEGER NOT NULL,
+                    imported_at  TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 0);
+        store
+            .append("uncertain_user", &ChatMessage::user("after repair"))
+            .unwrap();
     }
 
     #[test]
