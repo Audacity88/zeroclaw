@@ -16,12 +16,16 @@ jobs:
     steps:
       - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019
         with:
+          fail-on-severity: high
           allow-ghsas: GHSA-qwww-vcr4-c8h2
   gate:
+    if: always()
     needs: [npm-dependency-review]
     steps:
-      - run: |
+      - name: Check results
+        run: |
           if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.npm-dependency-review.result }}" != "success" ]]; then
+            echo "::error::npm dependency review did not complete successfully"
             exit 1
           fi
 YAML
@@ -111,16 +115,60 @@ jobs:
     steps:
       - uses: actions/checkout@example
         with:
+          fail-on-severity: high
           allow-ghsas: GHSA-qwww-vcr4-c8h2
   gate:
+    if: always()
     needs: [npm-dependency-review]
     steps:
-      - run: |
+      - name: Check results
+        run: |
           if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.npm-dependency-review.result }}" != "success" ]]; then
+            echo "::error::npm dependency review did not complete successfully"
             exit 1
           fi
 YAML
 expect_failure "advisory exception detached from dependency-review action"
+
+reset_fixture
+cat >"$fixture/.github/workflows/ci.yml" <<'YAML'
+jobs:
+  npm-dependency-review:
+    if: github.event_name == 'pull_request'
+    steps:
+      - run: |
+          echo "dependency review skipped"
+          - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019
+            with:
+              fail-on-severity: high
+              allow-ghsas: GHSA-qwww-vcr4-c8h2
+  gate:
+    if: always()
+    needs: [npm-dependency-review]
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.npm-dependency-review.result }}" != "success" ]]; then
+            echo "::error::npm dependency review did not complete successfully"
+            exit 1
+          fi
+YAML
+expect_failure "dependency-review action represented only by scalar text"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "        with:\n          fail-on-severity: high\n          allow-ghsas: GHSA-qwww-vcr4-c8h2",
+    "        with: { fail-on-severity: critical, allow-ghsas: GHSA-qwww-vcr4-c8h2 }",
+  ),
+);
+NODE
+expect_failure "inline dependency-review inputs"
 
 reset_fixture
 node - "$fixture/.github/workflows/ci.yml" <<'NODE'
@@ -180,6 +228,18 @@ const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
+  workflow.replace("fail-on-severity: high", "fail-on-severity: critical"),
+);
+NODE
+expect_failure "weakened dependency-review severity"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
   workflow.replace(
     "needs: [npm-dependency-review]",
     "needs: [npm-dependency-review-shadow]",
@@ -199,6 +259,128 @@ fs.writeFileSync(
 );
 NODE
 expect_failure "required gate without dependency-review success check"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(workflowPath, workflow.replace("    if: always()\n", ""));
+NODE
+expect_failure "required gate without always condition"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "      - name: Check results",
+    "      - name: Check results\n        continue-on-error: true",
+  ),
+);
+NODE
+expect_failure "failure-tolerant required gate step"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "      - name: Check results",
+    "      - name: Check results\n        if: false",
+  ),
+);
+NODE
+expect_failure "skipped required gate step"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "        run: |\n          if [[",
+    "        run: |\n          exit 0\n          if [[",
+  ),
+);
+NODE
+expect_failure "unreachable required gate assertion"
+
+reset_fixture
+cat >"$fixture/.github/workflows/ci.yml" <<'YAML'
+jobs:
+  npm-dependency-review:
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019
+        with:
+          fail-on-severity: high
+          allow-ghsas: GHSA-qwww-vcr4-c8h2
+  gate:
+    if: always()
+    needs: [npm-dependency-review]
+    steps:
+      - name: Harmless step
+        run: |
+          exit 0
+          - name: Check results
+            run: |
+              if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.npm-dependency-review.result }}" != "success" ]]; then
+                echo "::error::npm dependency review did not complete successfully"
+                exit 1
+              fi
+YAML
+expect_failure "required gate represented only by scalar text"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "      - name: Check results",
+    "      - name: Check results\n        shell: bash -n {0}",
+  ),
+);
+NODE
+expect_failure "required gate shell override"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  `defaults:\n  run:\n    shell: bash -n {0}\n${workflow}`,
+);
+NODE
+expect_failure "workflow-wide shell override"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace(
+    "      - name: Check results",
+    '      - name: Check results\n        "continue-on-error": true',
+  ),
+);
+NODE
+expect_failure "quoted failure-tolerant required gate field"
 
 reset_fixture
 cat >"$fixture/web/src/node-test.ts" <<'TS'
@@ -277,6 +459,40 @@ import { StaticRouter } from "react-router-dom/server";
 export { StaticRouter };
 TS
 expect_failure "React Router DOM server subpath import"
+
+reset_fixture
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+const marker = "/*";
+import { StaticRouter } from "react-router-dom/server";
+const end = "*/";
+
+export { StaticRouter };
+TSX
+expect_failure "comment delimiters in literals hiding a server import"
+
+reset_fixture
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+import { StaticRouter } from /* comment */ "react-router-dom/server";
+
+export { StaticRouter };
+TSX
+expect_failure "comment-separated static server import"
+
+reset_fixture
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+const router = import/* comment */("react-router");
+
+export { router };
+TSX
+expect_failure "comment-separated dynamic server import"
+
+reset_fixture
+cat >"$fixture/web/src/main.tsx" <<'TSX'
+const router = require/* comment */("react-router-dom/server");
+
+export { router };
+TSX
+expect_failure "comment-separated require server import"
 
 reset_fixture
 cat >"$fixture/web/src/server.ts" <<'TS'
