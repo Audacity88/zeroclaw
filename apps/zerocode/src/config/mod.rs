@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::keymap::{Chord, GlobalAction, overrides::OverrideTable};
+use crate::keymap::{ChatTabAction, Chord, GlobalAction, overrides::OverrideTable};
 use crate::theme::{self, Theme};
 
 const FILE_NAME: &str = "zerocode-config.toml";
@@ -60,6 +60,23 @@ fn migrate_legacy_help_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
     }
 
     rows.insert(key, ChordSpec::Many(GlobalAction::Help.default_chords()));
+    true
+}
+
+fn migrate_legacy_copy_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
+    let key = ChatTabAction::CopySelection.action_key();
+    let legacy = [Chord::char('y')];
+    let Some(spec) = rows.get(&key) else {
+        return false;
+    };
+    if spec.as_slice() != legacy {
+        return false;
+    }
+
+    rows.insert(
+        key,
+        ChordSpec::Many(ChatTabAction::CopySelection.default_chords()),
+    );
     true
 }
 
@@ -290,6 +307,20 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
                             .clone(),
                     )
                     .context("serializing migrated Help binding")?;
+                    doc.get_mut("keybindings")
+                        .and_then(toml::Value::as_table_mut)
+                        .expect("parsed keybindings remain a table")
+                        .insert(key, value);
+                    migrated_keybindings = true;
+                }
+                if migrate_legacy_copy_binding(&mut rows) {
+                    let key = ChatTabAction::CopySelection.action_key();
+                    let value = toml::Value::try_from(
+                        rows.get(&key)
+                            .expect("migrated Copy binding remains present")
+                            .clone(),
+                    )
+                    .context("serializing migrated Copy binding")?;
                     doc.get_mut("keybindings")
                         .and_then(toml::Value::as_table_mut)
                         .expect("parsed keybindings remain a table")
@@ -884,6 +915,53 @@ mod tests {
             vec![Chord::char('?'), Chord::ctrl('h')]
         );
         assert!(read(dir.path()).contains("ctrl+h"));
+    }
+
+    #[test]
+    fn legacy_copy_default_migrates_without_touching_other_config() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.copy_selection\" = [\"y\"]\n\"dashboard.up\" = [\"k\"]\n\n[future]\nkeep = 1\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["copy_selection"],
+            vec![
+                Chord::char('y'),
+                Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
+            ]
+        );
+        assert_eq!(resolved["dashboard"]["up"], vec![Chord::char('k')]);
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        let copy: Vec<Chord> = doc["keybindings"]["chat.copy_selection"]
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(copy, ChatTabAction::CopySelection.default_chords());
+        assert_eq!(doc["future"]["keep"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn customized_copy_binding_is_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.copy_selection\" = [\"y\", \"alt+c\"]\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["copy_selection"],
+            vec![Chord::char('y'), "alt+c".parse::<Chord>().unwrap()]
+        );
+        assert!(read(dir.path()).contains("alt+c"));
     }
 
     #[test]

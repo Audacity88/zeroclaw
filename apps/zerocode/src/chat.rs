@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -1272,6 +1272,23 @@ impl Chat {
             return false;
         }
 
+        // The transcript context menu is modal within an active chat. Handle
+        // it before selection clearing or input dispatch so Esc cannot leak
+        // into the editor and Enter cannot submit a prompt.
+        if state.copy_context_menu.is_some() {
+            use crate::keymap::ModalAction;
+            match ModalAction::from_chord(&key) {
+                Some(ModalAction::Confirm) => {
+                    state.activate_copy_context_menu();
+                }
+                Some(ModalAction::Cancel) => {
+                    state.dismiss_copy_context_menu();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // The attachment manager is modal within the input surface. Higher
         // overlays above have already had first refusal; handle it before queue,
         // browse, and other pane-level shortcuts.
@@ -1337,6 +1354,14 @@ impl Chat {
             }
         }
 
+        // Copy must run before the general "any key clears mouse highlight"
+        // path below. Otherwise Command+C / Ctrl+Shift+C would erase a
+        // character-level transcript selection before extracting it.
+        if should_copy_current_selection(state, &key) {
+            state.copy_current_selection();
+            return false;
+        }
+
         // Any key press clears the mouse-click highlight — the user is done
         // with visual selection and is interacting via keyboard.
         state.clear_mouse_highlight();
@@ -1360,6 +1385,7 @@ impl Chat {
                             | ChatTabAction::BrowseSelectExtendDown
                             | ChatTabAction::BrowseExitSelection
                             | ChatTabAction::CopySelection
+                            | ChatTabAction::CopyAllVisible
                     )
                 )
             };
@@ -1721,18 +1747,6 @@ impl Chat {
                     && !state.turn_in_flight =>
             {
                 state.browse_move_down(1, false);
-            }
-            Some(ChatTabAction::CopySelection) if state.has_selection() => {
-                let text = state.yank_selection();
-                if !text.is_empty() {
-                    crate::mouse::copy_osc52(&text);
-                }
-            }
-            Some(ChatTabAction::CopyAllVisible) if state.has_selection() => {
-                let text = state.yank_selection();
-                if !text.is_empty() {
-                    crate::mouse::copy_osc52(&text);
-                }
             }
             _ => {}
         }
@@ -2275,6 +2289,31 @@ impl Chat {
                 return;
             }
 
+            if state.copy_context_menu.is_some() {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let activate = state
+                            .copy_context_menu
+                            .as_ref()
+                            .is_some_and(|menu| menu.action_contains(mouse.column, mouse.row));
+                        if activate {
+                            state.activate_copy_context_menu();
+                        } else {
+                            state.dismiss_copy_context_menu();
+                        }
+                        return;
+                    }
+                    MouseEventKind::Down(MouseButton::Right)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown => {
+                        state.dismiss_copy_context_menu();
+                    }
+                    MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left) => return,
+                    _ => {}
+                }
+            }
+
             if state.input_bar.handle_mouse(mouse) {
                 state.clear_mouse_highlight();
                 return;
@@ -2368,6 +2407,11 @@ impl Chat {
                     return;
                 }
                 _ => {}
+            }
+
+            if let MouseEventKind::Down(MouseButton::Right) = mouse.kind {
+                state.open_copy_context_menu(col, row);
+                return;
             }
 
             if !state.in_browse_mode() {
@@ -2798,7 +2842,9 @@ impl crate::widgets::HelpContext for Chat {
                             crate::i18n::t("zc-chat-help-extend-selection"),
                         ),
                         E::new(
-                            action_key_labels(C::CopySelection),
+                            action_key_labels(C::CopySelection)
+                                .into_iter()
+                                .chain(action_key_labels(C::CopyAllVisible)),
                             crate::i18n::t("zc-chat-help-yank-selection"),
                         ),
                         E::new(return_keys, crate::i18n::t("zc-chat-help-return-to-input")),
@@ -3615,6 +3661,48 @@ fn message_copied_label() -> String {
     crate::i18n::t("zc-chat-copy-message-copied")
 }
 
+fn context_menu_copy_label() -> String {
+    crate::i18n::t("zc-chat-context-menu-copy")
+}
+
+fn should_copy_current_selection(state: &ChatState, key: &KeyEvent) -> bool {
+    use crate::keymap::ChatTabAction;
+
+    match ChatTabAction::from_chord(key) {
+        Some(ChatTabAction::CopySelection) => {
+            state.in_browse_mode()
+                || (state.transcript_selection.is_some()
+                    && key.modifiers.contains(KeyModifiers::SUPER))
+        }
+        Some(ChatTabAction::CopyAllVisible) => {
+            state.in_browse_mode() || state.transcript_selection.is_some()
+        }
+        _ => false,
+    }
+}
+
+fn copy_context_menu_rect(column: u16, row: u16, bounds: Rect) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+
+    if bounds.width < 3 || bounds.height < 3 {
+        return None;
+    }
+    let width = (UnicodeWidthStr::width(context_menu_copy_label().as_str()) as u16 + 4)
+        .min(bounds.width)
+        .max(3);
+    let height = 3;
+    let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
+    let max_y = bounds
+        .y
+        .saturating_add(bounds.height.saturating_sub(height));
+    Some(Rect::new(
+        column.clamp(bounds.x, max_x),
+        row.clamp(bounds.y, max_y),
+        width,
+        height,
+    ))
+}
+
 /// Recover the fence language token from a code-fence header bar line. The
 /// header's first span is `┌─ lang ─────`; the ` code ` fallback label and an
 /// empty info string both yield `None` so the rebuilt fence stays unlabelled.
@@ -3659,6 +3747,32 @@ fn copy_region(
     }
     Some(CopyHitRegion {
         rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
+        text: text.to_string(),
+        kind: CopyHitKind::Code,
+        group,
+    })
+}
+
+fn code_context_region(
+    global_start: u16,
+    global_end: u16,
+    scroll: u16,
+    body: Rect,
+    text: &str,
+    group: usize,
+) -> Option<CopyHitRegion> {
+    let visible_start = global_start.max(scroll);
+    let visible_end = global_end.min(scroll.saturating_add(body.height));
+    if visible_end <= visible_start || text.is_empty() {
+        return None;
+    }
+    Some(CopyHitRegion {
+        rect: Rect::new(
+            body.x,
+            body.y + visible_start.saturating_sub(scroll),
+            body.width,
+            visible_end - visible_start,
+        ),
         text: text.to_string(),
         kind: CopyHitKind::Code,
         group,
@@ -3856,6 +3970,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
     render_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
+    render_copy_context_menu(f, state);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -4007,6 +4122,26 @@ fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
             render_copied_label(f, &message_copied_label(), rect);
         }
     }
+}
+
+fn render_copy_context_menu(f: &mut Frame, state: &ChatState) {
+    let Some(menu) = &state.copy_context_menu else {
+        return;
+    };
+    f.render_widget(Clear, menu.rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            context_menu_copy_label(),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::accent_style()),
+        ),
+        menu.rect,
+    );
 }
 
 fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
@@ -4943,12 +5078,30 @@ enum CopyHitKind {
     Transcript,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CopyHitRegion {
     rect: Rect,
     text: String,
     kind: CopyHitKind,
     group: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyContextMenu {
+    rect: Rect,
+    target: CopyHitRegion,
+}
+
+impl CopyContextMenu {
+    fn action_contains(&self, column: u16, row: u16) -> bool {
+        self.rect.width > 2
+            && self.rect.height > 2
+            && mouse::in_rect(
+                column,
+                row,
+                Rect::new(self.rect.x + 1, self.rect.y + 1, self.rect.width - 2, 1),
+            )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5208,6 +5361,10 @@ pub struct ChatState {
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
+    /// Full code-block targets used by right-click context-menu resolution.
+    context_copy_regions: Vec<CopyHitRegion>,
+    /// Active one-action transcript context menu.
+    copy_context_menu: Option<CopyContextMenu>,
     /// Temporary `[Copied]` overlay for copy labels.
     copy_feedback: Option<CopyFeedback>,
     /// Clickable provider/model title spans from the last draw.
@@ -5329,6 +5486,8 @@ impl ChatState {
             transcript_selection: None,
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
+            context_copy_regions: Vec::new(),
+            copy_context_menu: None,
             copy_feedback: None,
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
@@ -5378,9 +5537,13 @@ impl ChatState {
     fn clear_transcript_selection(&mut self) {
         let changed = self.transcript_selection.is_some()
             || !self.copy_hit_regions.is_empty()
+            || !self.context_copy_regions.is_empty()
+            || self.copy_context_menu.is_some()
             || self.copy_feedback.is_some();
         self.transcript_selection = None;
         self.copy_hit_regions.clear();
+        self.context_copy_regions.clear();
+        self.copy_context_menu = None;
         self.copy_feedback = None;
         if changed {
             self.mark_dirty_full();
@@ -5438,7 +5601,6 @@ impl ChatState {
         }
     }
 
-    #[cfg(test)]
     fn transcript_selected_text(&self) -> Option<String> {
         self.transcript_snapshot
             .as_ref()?
@@ -5469,12 +5631,14 @@ impl ChatState {
             || self.browse_cursor.is_some()
             || self.browse_anchor.is_some()
             || !self.browse_multi.is_empty()
+            || self.copy_context_menu.is_some()
             || self.copy_feedback.is_some()
         {
             self.mouse_down_entry = None;
             self.browse_cursor = None;
             self.browse_anchor = None;
             self.browse_multi.clear();
+            self.copy_context_menu = None;
             self.copy_feedback = None;
             self.mark_dirty_full();
         }
@@ -5487,9 +5651,94 @@ impl ChatState {
         self.browse_cursor.is_some()
     }
 
-    /// True when anything is selected — cursor, range, or multi.
-    fn has_selection(&self) -> bool {
-        self.browse_cursor.is_some() || !self.browse_multi.is_empty()
+    fn copy_current_selection(&mut self) -> bool {
+        let text = self.current_selection_text();
+        if text.is_empty() {
+            return false;
+        }
+        crate::mouse::copy_osc52(&text);
+        self.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+        true
+    }
+
+    fn current_selection_text(&self) -> String {
+        self.transcript_selected_text()
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| self.yank_selection())
+    }
+
+    fn dismiss_copy_context_menu(&mut self) {
+        if self.copy_context_menu.take().is_some() {
+            self.mark_dirty_full();
+        }
+    }
+
+    fn open_copy_context_menu(&mut self, column: u16, row: u16) -> bool {
+        let Some(bounds) = self
+            .transcript_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.area)
+        else {
+            return false;
+        };
+        if !mouse::in_rect(column, row, bounds) {
+            return false;
+        }
+
+        // Code blocks are nested inside message rows, so resolve their more
+        // specific target first.
+        let target = self
+            .context_copy_regions
+            .iter()
+            .find(|region| mouse::in_rect(column, row, region.rect))
+            .cloned()
+            .or_else(|| {
+                self.entry_rects
+                    .iter()
+                    .find(|(_, rect)| row >= rect.y && row < rect.y.saturating_add(rect.height))
+                    .and_then(|(idx, rect)| {
+                        let text = self.yank_single_entry(*idx);
+                        (!text.is_empty()).then_some(CopyHitRegion {
+                            rect: *rect,
+                            text,
+                            kind: CopyHitKind::Message,
+                            group: *idx,
+                        })
+                    })
+            });
+        let Some(target) = target else {
+            return false;
+        };
+        let Some(rect) = copy_context_menu_rect(column, row, bounds) else {
+            return false;
+        };
+        self.copy_context_menu = Some(CopyContextMenu { rect, target });
+        self.mark_dirty_full();
+        true
+    }
+
+    fn activate_copy_context_menu(&mut self) -> bool {
+        let Some(menu) = self.copy_context_menu.take() else {
+            return false;
+        };
+        if menu.target.text.is_empty() {
+            self.mark_dirty_full();
+            return false;
+        }
+
+        crate::mouse::copy_osc52(&menu.target.text);
+        self.clear_mouse_highlight();
+        self.clear_browse_selection();
+        match menu.target.kind {
+            CopyHitKind::Code => {
+                self.set_copy_feedback(CopyFeedbackTarget::Code(menu.target.group));
+            }
+            CopyHitKind::Message | CopyHitKind::Transcript => {
+                self.set_overlay_copy_feedback(menu.target.rect);
+            }
+        }
+        self.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+        true
     }
 
     /// Yank a single entry's body text for explicit copy actions.
@@ -5537,6 +5786,8 @@ impl ChatState {
         self.mouse_down_entry = None;
         self.browse_anchor = None;
         self.copy_hit_regions.clear();
+        self.context_copy_regions.clear();
+        self.copy_context_menu = None;
         self.copy_feedback = None;
         self.mark_dirty_full();
     }
@@ -5811,6 +6062,7 @@ impl ChatState {
     fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
         let copy_lbl = " [Copy] ";
         let mut regions: Vec<CopyHitRegion> = Vec::new();
+        let mut context_regions: Vec<CopyHitRegion> = Vec::new();
         let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
         let mut pending: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
         for line in &lines {
@@ -5832,6 +6084,12 @@ impl ChatState {
                     pending.take()
                 {
                     let text = fenced_text(lang.as_deref(), &acc);
+                    let block_end = screen_cursor.saturating_add(wrapped_rows(line, width));
+                    if let Some(region) =
+                        code_context_region(header_row, block_end, scroll, body, &text, group)
+                    {
+                        context_regions.push(region);
+                    }
                     if let Some(r) = copy_region(
                         header_row,
                         header_col,
@@ -5869,6 +6127,7 @@ impl ChatState {
             screen_cursor += wrapped_rows(line, width);
         }
         self.copy_hit_regions = regions;
+        self.context_copy_regions = context_regions;
     }
 
     fn message_copy_region(&self, body: Rect) -> Option<CopyHitRegion> {
@@ -6693,6 +6952,8 @@ impl ChatState {
         self.cached_lines.clear();
         self.entry_rects.clear();
         self.copy_hit_regions.clear();
+        self.context_copy_regions.clear();
+        self.copy_context_menu = None;
         self.copy_feedback = None;
         self.dirty = LinesDirty::Full;
         self.cached_entry_count = 0;
@@ -6955,6 +7216,183 @@ mod tests {
         assert_eq!(snapshot.selected_text(forward).as_deref(), Some("be\nta"));
         assert_eq!(snapshot.selected_text(reverse).as_deref(), Some("be\nta"));
         assert_eq!(snapshot.selected_text(click), None);
+    }
+
+    #[test]
+    fn copy_context_menu_is_clamped_to_conversation_bounds() {
+        use unicode_width::UnicodeWidthStr;
+
+        let bounds = Rect::new(10, 5, 20, 8);
+        let menu_width = (UnicodeWidthStr::width(context_menu_copy_label().as_str()) as u16 + 4)
+            .min(bounds.width)
+            .max(3);
+
+        assert_eq!(
+            copy_context_menu_rect(29, 12, bounds),
+            Some(Rect::new(
+                bounds.x + bounds.width - menu_width,
+                bounds.y + bounds.height - 3,
+                menu_width,
+                3,
+            ))
+        );
+        assert_eq!(copy_context_menu_rect(0, 0, bounds).unwrap().x, bounds.x);
+        assert_eq!(copy_context_menu_rect(0, 0, bounds).unwrap().y, bounds.y);
+    }
+
+    #[test]
+    fn context_menu_targets_message_from_side_whitespace() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 30, 3), &["hello"]));
+        state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
+
+        assert!(state.open_copy_context_menu(35, 5));
+        let menu = state.copy_context_menu.as_ref().expect("menu opens");
+        assert_eq!(menu.target.kind, CopyHitKind::Message);
+        assert_eq!(menu.target.text, "hello");
+    }
+
+    #[test]
+    fn context_menu_prefers_code_block_over_containing_message() {
+        let mut state = state();
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "before\n```sh\necho hi\n```\nafter",
+        )));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 40, 6),
+            &["before", "code", "echo hi", "", "after"],
+        ));
+        state.entry_rects.push((0, Rect::new(0, 0, 20, 5)));
+        state.context_copy_regions.push(CopyHitRegion {
+            rect: Rect::new(0, 1, 40, 3),
+            text: "echo hi".to_string(),
+            kind: CopyHitKind::Code,
+            group: 7,
+        });
+
+        assert!(state.open_copy_context_menu(2, 2));
+        let menu = state.copy_context_menu.as_ref().expect("menu opens");
+        assert_eq!(menu.target.kind, CopyHitKind::Code);
+        assert_eq!(menu.target.text, "echo hi");
+        assert_eq!(menu.target.group, 7);
+    }
+
+    #[test]
+    fn context_menu_dismissal_does_not_change_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 10, 3),
+            &["hello", "", ""],
+        ));
+        state.entry_rects.push((0, Rect::new(0, 0, 5, 1)));
+        state.browse_cursor = Some(0);
+
+        assert!(state.open_copy_context_menu(1, 0));
+        state.dismiss_copy_context_menu();
+
+        assert!(state.copy_context_menu.is_none());
+        assert_eq!(state.browse_cursor, Some(0));
+        assert!(state.info_message.is_none());
+        assert_eq!(state.copy_feedback, None);
+    }
+
+    #[test]
+    fn context_menu_activation_copies_target_and_clears_stale_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 10, 1), &["hello"]));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
+        state.browse_cursor = Some(0);
+        state.copy_context_menu = Some(CopyContextMenu {
+            rect: Rect::new(0, 0, 8, 3),
+            target: CopyHitRegion {
+                rect: Rect::new(0, 0, 5, 1),
+                text: "hello".to_string(),
+                kind: CopyHitKind::Message,
+                group: 0,
+            },
+        });
+
+        assert!(state.activate_copy_context_menu());
+        assert!(state.copy_context_menu.is_none());
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.browse_cursor, None);
+        assert!(state.info_message.is_some());
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn keyboard_copy_prefers_character_selection_then_browse_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.browse_cursor = Some(0);
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 12, 1),
+            &["visible text"],
+        ));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 6, row: 0 },
+            dragged: true,
+        });
+
+        assert_eq!(state.current_selection_text(), "visible");
+        state.clear_transcript_selection();
+        assert_eq!(state.current_selection_text(), "whole message");
+        state.browse_cursor = None;
+        assert!(state.current_selection_text().is_empty());
+    }
+
+    #[test]
+    fn copy_shortcuts_do_not_swallow_normal_y_input() {
+        use crossterm::event::KeyCode;
+
+        let mut state = state();
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let command_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        let terminal_copy = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+        );
+
+        assert!(!should_copy_current_selection(&state, &y));
+
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
+        assert!(!should_copy_current_selection(&state, &y));
+        assert!(should_copy_current_selection(&state, &command_c));
+        assert!(should_copy_current_selection(&state, &terminal_copy));
+
+        state.transcript_selection = None;
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.browse_cursor = Some(0);
+        assert!(should_copy_current_selection(&state, &y));
     }
 
     #[test]
