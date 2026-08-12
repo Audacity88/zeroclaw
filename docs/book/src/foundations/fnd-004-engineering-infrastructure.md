@@ -33,8 +33,8 @@
 | 1 | 2026-04-09 | Initial draft |
 | 2 | 2026-06-04 | Replaced format-and-lint serial gating with format-only gating followed by parallel required Rust jobs ([#7111](https://github.com/zeroclaw-labs/zeroclaw/pull/7111)) |
 | 3 | 2026-06-10 | Required trusted `master` runs to seed caches consumed by pull requests ([#7355](https://github.com/zeroclaw-labs/zeroclaw/pull/7355)) |
-| 4 | 2026-06-22 | Changed the plugin build and release target from `wasm32-wasip1` to `wasm32-wasip2` ([#8061](https://github.com/zeroclaw-labs/zeroclaw/pull/8061)) |
-| 5 | 2026-07-01 | Removed the desktop artifact and its release-pipeline obligations ([#8544](https://github.com/zeroclaw-labs/zeroclaw/pull/8544)) |
+| 4 | 2026-06-21 | Changed the plugin build and release target from `wasm32-wasip1` to `wasm32-wasip2` ([#8061](https://github.com/zeroclaw-labs/zeroclaw/pull/8061)) |
+| 5 | 2026-06-30 | Removed the desktop artifact and its release-pipeline obligations ([#8544](https://github.com/zeroclaw-labs/zeroclaw/pull/8544)) |
 | 6 | 2026-07-04 | Restored the desktop artifact and its release-pipeline obligations ([#8565](https://github.com/zeroclaw-labs/zeroclaw/pull/8565)) |
 | 7 | 2026-08-07 | Replaced `actions/attest-build-provenance` guidance with direct `actions/attest` artifact attestation ([#9717](https://github.com/zeroclaw-labs/zeroclaw/pull/9717)) |
 
