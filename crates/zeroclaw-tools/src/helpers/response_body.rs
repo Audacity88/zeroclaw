@@ -58,7 +58,7 @@ pub(crate) async fn read_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn chunked_response(chunks: &[&[u8]]) -> reqwest::Response {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -70,6 +70,13 @@ mod tests {
 
         zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
