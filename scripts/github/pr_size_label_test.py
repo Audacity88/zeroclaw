@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import pr_size_label as size_labeler
@@ -95,6 +96,154 @@ class PrSizeLabelTest(unittest.TestCase):
             client._parse_url("file:///tmp/token")
         with self.assertRaisesRegex(ValueError, "non-GitHub-API URL"):
             client._parse_url("https://example.com/repos/zeroclaw-labs/zeroclaw")
+
+    def test_client_sends_required_user_agent_header(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            status = 200
+
+            def read(self) -> bytes:
+                return b"{}"
+
+            def getheaders(self) -> list[tuple[str, str]]:
+                return []
+
+        class FakeConnection:
+            def __init__(self, netloc: str, timeout: int) -> None:
+                captured["netloc"] = netloc
+                captured["timeout"] = timeout
+
+            def request(
+                self,
+                method: str,
+                path: str,
+                body: bytes | None = None,
+                headers: dict[str, str] | None = None,
+            ) -> None:
+                captured["method"] = method
+                captured["path"] = path
+                captured["body"] = body
+                captured["headers"] = headers or {}
+
+            def getresponse(self) -> FakeResponse:
+                return FakeResponse()
+
+            def close(self) -> None:
+                captured["closed"] = True
+
+        client = size_labeler.GitHubClient("token")
+        with mock.patch.object(size_labeler.http.client, "HTTPSConnection", FakeConnection):
+            client._send("GET", "/repos/zeroclaw-labs/zeroclaw/pulls/1")
+
+        headers = captured["headers"]
+        self.assertIsInstance(headers, dict)
+        self.assertEqual(headers["User-Agent"], size_labeler.USER_AGENT)
+        self.assertEqual(headers["Accept"], "application/vnd.github+json")
+
+    def test_load_pr_changed_file_count_reads_trusted_metadata(self) -> None:
+        class FakeClient:
+            def request(self, method: str, path: str) -> dict[str, int]:
+                self.method = method
+                self.path = path
+                return {"changed_files": 3}
+
+        client = FakeClient()
+        self.assertEqual(size_labeler.load_pr_changed_file_count(client, "zeroclaw-labs/zeroclaw", 9), 3)
+        self.assertEqual(client.method, "GET")
+        self.assertEqual(client.path, "/repos/zeroclaw-labs/zeroclaw/pulls/9")
+
+    def test_load_pr_changed_file_count_rejects_malformed_metadata(self) -> None:
+        class FakeClient:
+            def __init__(self, payload: object) -> None:
+                self.payload = payload
+
+            def request(self, method: str, path: str) -> object:
+                return self.payload
+
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            size_labeler.load_pr_changed_file_count(FakeClient([]), "zeroclaw-labs/zeroclaw", 9)
+        with self.assertRaisesRegex(ValueError, "invalid changed_files"):
+            size_labeler.load_pr_changed_file_count(
+                FakeClient({"changed_files": True}),
+                "zeroclaw-labs/zeroclaw",
+                9,
+            )
+
+    def test_load_pr_files_rejects_incomplete_capped_file_list(self) -> None:
+        class FakeClient:
+            def paginate(self, path: str) -> list[dict[str, object]]:
+                self.path = path
+                return [
+                    {"filename": f"docs/generated-{index}.md", "additions": 1, "deletions": 0}
+                    for index in range(3000)
+                ]
+
+        client = FakeClient()
+        with self.assertRaisesRegex(ValueError, "incomplete PR file list"):
+            size_labeler.load_pr_files(client, "zeroclaw-labs/zeroclaw", 9, expected_file_count=3001)
+        self.assertEqual(client.path, "/repos/zeroclaw-labs/zeroclaw/pulls/9/files?per_page=100")
+
+    def test_load_pr_files_accepts_complete_file_list(self) -> None:
+        class FakeClient:
+            def paginate(self, path: str) -> list[dict[str, object]]:
+                return [
+                    {"filename": "docs/guide.md", "additions": 5, "deletions": 0},
+                    {"filename": "src/main.rs", "additions": 7, "deletions": 1},
+                ]
+
+        files = size_labeler.load_pr_files(
+            FakeClient(),
+            "zeroclaw-labs/zeroclaw",
+            9,
+            expected_file_count=2,
+        )
+        self.assertEqual(files, [change("docs/guide.md", 5), change("src/main.rs", 7, 1)])
+
+    def test_main_refuses_incomplete_file_list_before_label_read_or_mutation(self) -> None:
+        calls: list[tuple[str, str, str]] = []
+
+        class FakeClient:
+            def __init__(self, token: str, api_url: str) -> None:
+                calls.append(("init", token, api_url))
+
+            def request(
+                self,
+                method: str,
+                path: str,
+                payload: dict[str, object] | None = None,
+            ) -> object:
+                calls.append(("request", method, path))
+                if path == "/repos/zeroclaw-labs/zeroclaw/pulls/9":
+                    return {"changed_files": 3001}
+                raise AssertionError(f"unexpected label request or mutation: {method} {path}")
+
+            def paginate(self, path: str) -> list[dict[str, object]]:
+                calls.append(("paginate", "GET", path))
+                return [
+                    {"filename": f"docs/generated-{index}.md", "additions": 1, "deletions": 0}
+                    for index in range(3000)
+                ]
+
+        with mock.patch.object(size_labeler, "GitHubClient", FakeClient):
+            with self.assertRaisesRegex(ValueError, "incomplete PR file list"):
+                size_labeler.main(
+                    [
+                        "--repo",
+                        "zeroclaw-labs/zeroclaw",
+                        "--pr",
+                        "9",
+                        "--token",
+                        "token",
+                        "--dry-run",
+                    ]
+                )
+
+        self.assertNotIn(("request", "GET", "/repos/zeroclaw-labs/zeroclaw/issues/9/labels?per_page=100"), calls)
+        self.assertFalse(any("/issues/9/labels" in call[2] for call in calls if len(call) == 3))
+
+    def test_default_docs_contract_matches_repository_docs(self) -> None:
+        size_labeler.validate_docs_contract()
 
     def test_docs_threshold_parser_matches_expected_table(self) -> None:
         docs = "\n".join(

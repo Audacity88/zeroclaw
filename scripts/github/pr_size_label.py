@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import urllib.parse
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ DOCS_LIKE_CONTRACT_SENTENCE = (
     "`.markdownlint-cli2.yaml`, and `LICENSE`."
 )
 DEFAULT_DOCS_PATH = Path(__file__).resolve().parents[2] / "docs/book/src/maintainers/labels.md"
+USER_AGENT = "zeroclaw-pr-size-labeler/1.0"
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,7 @@ class GitHubClient:
         headers = {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {self.token}",
+            "User-Agent": USER_AGENT,
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if body is not None:
@@ -116,9 +119,8 @@ class GitHubClient:
             return None
         return json.loads(data.decode("utf-8"))
 
-    def paginate(self, path: str) -> list[dict[str, Any]]:
+    def paginate(self, path: str) -> Iterator[dict[str, Any]]:
         url: str | None = path
-        results: list[dict[str, Any]] = []
         while url:
             status, headers, data = self._send("GET", url)
             if status >= 400:
@@ -126,9 +128,8 @@ class GitHubClient:
             page = json.loads(data.decode("utf-8"))
             if not isinstance(page, list):
                 raise ValueError(f"expected list response from {url}")
-            results.extend(page)
+            yield from page
             url = next_link(headers.get("Link"))
-        return results
 
 
 class GitHubHTTPError(RuntimeError):
@@ -218,10 +219,33 @@ def parse_repo(value: str) -> str:
     return value
 
 
-def load_pr_files(client: GitHubClient, repo: str, pr_number: int) -> list[FileChange]:
+def load_pr_changed_file_count(client: GitHubClient, repo: str, pr_number: int) -> int:
     encoded_repo = urllib.parse.quote(repo, safe="/")
-    entries = client.paginate(f"/repos/{encoded_repo}/pulls/{pr_number}/files?per_page=100")
-    return [file_change_from_api(entry) for entry in entries]
+    payload = client.request("GET", f"/repos/{encoded_repo}/pulls/{pr_number}")
+    if not isinstance(payload, dict):
+        raise ValueError(f"pull request metadata must be an object: {payload!r}")
+    changed_files = payload.get("changed_files")
+    if type(changed_files) is not int or changed_files < 0:
+        raise ValueError(f"pull request metadata has invalid changed_files: {changed_files!r}")
+    return changed_files
+
+
+def load_pr_files(
+    client: GitHubClient,
+    repo: str,
+    pr_number: int,
+    expected_file_count: int,
+) -> list[FileChange]:
+    encoded_repo = urllib.parse.quote(repo, safe="/")
+    files: list[FileChange] = []
+    for entry in client.paginate(f"/repos/{encoded_repo}/pulls/{pr_number}/files?per_page=100"):
+        files.append(file_change_from_api(entry))
+    if len(files) != expected_file_count:
+        raise ValueError(
+            "refusing to classify incomplete PR file list: "
+            f"fetched {len(files)} files, GitHub reports {expected_file_count}"
+        )
+    return files
 
 
 def load_issue_labels(client: GitHubClient, repo: str, issue_number: int) -> set[str]:
@@ -316,7 +340,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.pr <= 0:
         raise ValueError("--pr must be a positive pull request number")
     client = GitHubClient(args.token, args.api_url)
-    files = load_pr_files(client, repo, args.pr)
+    expected_file_count = load_pr_changed_file_count(client, repo, args.pr)
+    files = load_pr_files(client, repo, args.pr, expected_file_count)
     current_labels = load_issue_labels(client, repo, args.pr)
     plan = plan_size_label(files, current_labels)
     print(plan_as_json(plan, args.dry_run))
