@@ -201,12 +201,12 @@ pub(crate) fn copy_file_atomic(
         options.access_mode(GENERIC_WRITE | DELETE);
     }
     let mut output = parent.open_with(&temp_name, &options)?;
-    if let Some(permissions) = permissions {
-        if let Err(error) = output.set_permissions(permissions) {
-            drop(output);
-            let _ = parent.remove_file(&temp_name);
-            return Err(error);
-        }
+    if let Some(permissions) = permissions
+        && let Err(error) = output.set_permissions(permissions)
+    {
+        drop(output);
+        let _ = parent.remove_file(&temp_name);
+        return Err(error);
     }
     let result = io::copy(input, &mut output)
         .and_then(|_| output.flush())

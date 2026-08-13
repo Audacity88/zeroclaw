@@ -383,8 +383,7 @@ fn stage_purge_candidates(candidates: &[PurgeCandidate], cutoff_epoch: u64) -> a
         }
     }
 
-    let mut staged = 0usize;
-    for candidate in candidates {
+    for (staged, candidate) in candidates.iter().enumerate() {
         if let Err(error) = rename_noreplace(
             &candidate.parent,
             Path::new(&candidate.name),
@@ -392,9 +391,8 @@ fn stage_purge_candidates(candidates: &[PurgeCandidate], cutoff_epoch: u64) -> a
         ) {
             return Err(with_rollback_error(error.into(), &candidates[..staged]));
         }
-        staged += 1;
         if let Err(error) = candidate.revalidate_name(&candidate.staging_name, cutoff_epoch) {
-            return Err(with_rollback_error(error, &candidates[..staged]));
+            return Err(with_rollback_error(error, &candidates[..=staged]));
         }
     }
     Ok(())
@@ -436,7 +434,7 @@ fn rollback_staged_candidates(candidates: &[PurgeCandidate]) -> anyhow::Result<(
 fn with_rollback_error(original: anyhow::Error, candidates: &[PurgeCandidate]) -> anyhow::Error {
     match rollback_staged_candidates(candidates) {
         Ok(()) => original,
-        Err(rollback) => anyhow::anyhow!("{original}; {rollback}"),
+        Err(rollback) => anyhow::Error::msg(format!("{original}; {rollback}")),
     }
 }
 

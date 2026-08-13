@@ -345,7 +345,7 @@ impl BackupTool {
         for sub in &restore_items {
             self.authorize_write(&workspace_path.join(sub))?;
             let src = open_dir_no_symlinks(&backup, Path::new(sub))?
-                .ok_or_else(|| anyhow::anyhow!("Backup entry disappeared: {sub}"))?;
+                .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
             let destination = open_dir_no_symlinks(&workspace, Path::new(sub))?;
             validate_copy_destination(&src, destination.as_ref(), Path::new(sub))?;
         }
@@ -360,7 +360,7 @@ impl BackupTool {
 
         for sub in &restore_items {
             let src = open_dir_no_symlinks(&backup, Path::new(sub))?
-                .ok_or_else(|| anyhow::anyhow!("Backup entry disappeared: {sub}"))?;
+                .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
             let dst = create_dir_path_nofollow(&workspace, Path::new(sub))?;
             copy_dir_recursive(&src, &dst)?;
         }
@@ -1327,6 +1327,7 @@ mod tests {
         assert!(items[0]["name"].as_str().unwrap() >= items[1]["name"].as_str().unwrap());
     }
 
+    #[cfg(unix)]
     fn walkdir_contains(root: &Path, needle: &str) -> bool {
         let Ok(entries) = std::fs::read_dir(root) else {
             return false;
