@@ -431,10 +431,28 @@ pub struct ModelInfo {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Maximum input window in tokens, as reported by the provider catalog.
+    /// `None` when the catalog does not publish one — callers must treat that
+    /// as "unknown" rather than substituting a default, so an operator can be
+    /// told the window is unset instead of silently getting a stub value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
 }
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
+    /// Whether repeated requests for `model` are dispatched to one stable
+    /// provider/model identity.
+    ///
+    /// The default is deliberately unstable. Known leaf providers are marked
+    /// stable at their construction choke point; composite and out-of-tree
+    /// providers must opt in only when they can prove one concrete dispatch
+    /// identity. Callers use this fact to fail closed for identity-sensitive
+    /// behavior such as persistent full-response caching.
+    fn has_stable_request_identity(&self, _model: &str) -> bool {
+        false
+    }
+
     /// Query model_provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
@@ -527,7 +545,11 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             .list_models()
             .await?
             .into_iter()
-            .map(|id| ModelInfo { id, pricing: None })
+            .map(|id| ModelInfo {
+                id,
+                pricing: None,
+                context_window: None,
+            })
             .collect())
     }
 
@@ -703,6 +725,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 /// boilerplate in test and production code.
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
+    fn has_stable_request_identity(&self, model: &str) -> bool {
+        self.as_ref().has_stable_request_identity(model)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         self.as_ref().capabilities()
     }
