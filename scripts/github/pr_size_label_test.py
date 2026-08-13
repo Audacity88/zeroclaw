@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -244,6 +246,58 @@ class PrSizeLabelTest(unittest.TestCase):
 
         self.assertNotIn(("request", "GET", "/repos/zeroclaw-labs/zeroclaw/issues/9/labels?per_page=100"), calls)
         self.assertFalse(any("/issues/9/labels" in call[2] for call in calls if len(call) == 3))
+
+    def test_main_dry_run_prints_plan_without_label_mutation(self) -> None:
+        calls: list[tuple[str, str, str]] = []
+
+        class FakeClient:
+            def __init__(self, token: str, api_url: str) -> None:
+                calls.append(("init", token, api_url))
+
+            def request(
+                self,
+                method: str,
+                path: str,
+                payload: dict[str, object] | None = None,
+            ) -> object:
+                calls.append(("request", method, path))
+                if method == "GET" and path == "/repos/zeroclaw-labs/zeroclaw/pulls/9":
+                    return {"changed_files": 1}
+                if method in {"POST", "DELETE"}:
+                    raise AssertionError(f"dry run must not mutate labels: {method} {path}")
+                raise AssertionError(f"unexpected request: {method} {path}")
+
+            def paginate(self, path: str) -> list[dict[str, object]]:
+                calls.append(("paginate", "GET", path))
+                if path == "/repos/zeroclaw-labs/zeroclaw/pulls/9/files?per_page=100":
+                    return [{"filename": "src/main.rs", "additions": 501, "deletions": 0}]
+                if path == "/repos/zeroclaw-labs/zeroclaw/issues/9/labels?per_page=100":
+                    return [{"name": "size:M"}]
+                raise AssertionError(f"unexpected pagination: {path}")
+
+        stdout = io.StringIO()
+        with mock.patch.object(size_labeler, "GitHubClient", FakeClient):
+            with contextlib.redirect_stdout(stdout):
+                size_labeler.main(
+                    [
+                        "--repo",
+                        "zeroclaw-labs/zeroclaw",
+                        "--pr",
+                        "9",
+                        "--token",
+                        "token",
+                        "--dry-run",
+                    ]
+                )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(payload["effective_changed_lines"], 501)
+        self.assertEqual(payload["selected_label"], "size:L")
+        self.assertEqual(payload["labels_to_add"], ["size:L"])
+        self.assertEqual(payload["labels_to_remove"], ["size:M"])
+        self.assertNotIn(("request", "POST", "/repos/zeroclaw-labs/zeroclaw/issues/9/labels"), calls)
+        self.assertFalse(any(call[0] == "request" and call[1] == "DELETE" for call in calls))
 
     def test_apply_size_plan_posts_and_deletes_only_planned_canonical_size_labels(self) -> None:
         calls: list[tuple[str, str, dict[str, object] | None]] = []
