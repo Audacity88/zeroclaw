@@ -27,7 +27,6 @@ struct ViolationKey {
 struct Violation {
     key: ViolationKey,
     line: usize,
-    snippet: String,
 }
 
 #[test]
@@ -149,7 +148,6 @@ impl Detector<'_> {
                 literal: literal.clone(),
             },
             line: target_start.line,
-            snippet: format!("{kind}: {literal}"),
         });
     }
 
@@ -527,13 +525,10 @@ fn compare_with_legacy_baseline(violations: &[Violation], baseline: &str) -> Vec
                 .map(|violation| format!("{}:{}", key.path, violation.line))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let snippet = actual_violations
-                .first()
-                .map(|violation| violation.snippet.as_str())
-                .unwrap_or(&key.literal);
             problems.push(format!(
-                "  new/increased {kind} literal (expected {expected_count}, found {actual_count}) at {locations}: {snippet}",
-                kind = key.kind
+                "  new/increased {kind} literal (expected {expected_count}, found {actual_count}) at {locations}: {kind}: {literal}",
+                kind = key.kind,
+                literal = key.literal
             ));
         } else {
             problems.push(format!(
@@ -555,6 +550,9 @@ fn sample() {
     eprintln!["Error text"];
     println! { r#"Quoted \"text\" stays visible"# }
     println!(/* context */ "After comment");
+    println!(
+        "Multiline literal"
+    );
     wrapper! { println!["Nested text"]; }
     wrapper! {
         #[command(about = "Nested clap text", long_about("Nested method text"))]
@@ -583,6 +581,7 @@ fn sample() {
             ("eprintln", "\"Error text\""),
             ("println", "r#\"Quoted \\\"text\\\" stays visible\"#"),
             ("println", "\"After comment\""),
+            ("println", "\"Multiline literal\""),
             ("println", "\"Nested text\""),
             ("clap-about", "\"Nested clap text\""),
             ("clap-long-about", "\"Nested method text\""),
@@ -648,7 +647,6 @@ fn fluent_legacy_baseline_is_count_sensitive_and_shrinks() {
             literal: "\"Legacy text\"".to_string(),
         },
         line: 3,
-        snippet: "println: \"Legacy text\"".to_string(),
     };
     let baseline = "sample.rs\tprintln\t1\t\"Legacy text\"\n";
     assert!(compare_with_legacy_baseline(std::slice::from_ref(&violation), baseline).is_empty());
