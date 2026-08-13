@@ -1075,6 +1075,43 @@ mod tests {
         assert!(!tmp.path().join("backups").exists());
     }
 
+    #[tokio::test]
+    async fn read_only_policy_blocks_restore_before_any_write() {
+        let workspace = TempDir::new().unwrap();
+        for directory in ["config", "memory"] {
+            std::fs::create_dir_all(workspace.path().join(directory)).unwrap();
+            std::fs::write(workspace.path().join(directory).join("value.txt"), "backup").unwrap();
+        }
+
+        let creator = make_tool(&workspace);
+        let created = creator.execute(json!({"command": "create"})).await.unwrap();
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        let backup_name = created["backup"].as_str().unwrap();
+
+        std::fs::write(workspace.path().join("config/value.txt"), "current-config").unwrap();
+        std::fs::write(workspace.path().join("memory/value.txt"), "current-memory").unwrap();
+        let read_only = make_tool_with_autonomy(&workspace, AutonomyLevel::ReadOnly);
+
+        let result = read_only
+            .execute(json!({
+                "command": "restore",
+                "backup_name": backup_name,
+                "confirm": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("config/value.txt")).unwrap(),
+            "current-config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("memory/value.txt")).unwrap(),
+            "current-memory"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn create_refuses_symlinked_include_directory() {
