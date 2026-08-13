@@ -1,5 +1,6 @@
 use crate::helpers::filesystem_boundary::{
     FilesystemBoundaryError, open_absolute_dir_nofollow, open_dir_nofollow, rename_noreplace,
+    rename_noreplace_supported,
 };
 use async_trait::async_trait;
 use cap_fs_ext::MetadataExt;
@@ -21,7 +22,15 @@ pub struct DataManagementTool {
 }
 
 impl DataManagementTool {
-    pub fn new(retention_days: u64, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(workspace_dir: PathBuf, retention_days: u64) -> Self {
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir,
+            ..SecurityPolicy::default()
+        });
+        Self::new_with_security(retention_days, security)
+    }
+
+    pub fn new_with_security(retention_days: u64, security: Arc<SecurityPolicy>) -> Self {
         Self {
             retention_days,
             security,
@@ -31,9 +40,11 @@ impl DataManagementTool {
     fn open_workspace(&self) -> anyhow::Result<(PathBuf, Dir)> {
         let canonical = std::fs::canonicalize(&self.security.workspace_dir)?;
         if !self.security.is_resolved_path_readable(&canonical) {
-            return Err(data_boundary_violation(
-                self.security.resolved_path_violation_message(&canonical),
-            ));
+            return Err(data_boundary_violation(tool_text_arg(
+                "tool-data-management-error-read-blocked",
+                "path",
+                &canonical.display().to_string(),
+            )));
         }
         Ok((canonical.clone(), open_absolute_dir_nofollow(&canonical)?))
     }
@@ -60,14 +71,26 @@ impl DataManagementTool {
 
     fn cmd_purge(&self, dry_run: bool) -> anyhow::Result<ToolResult> {
         if !dry_run
-            && let Err(error) = self
+            && self
                 .security
                 .enforce_tool_operation(ToolOperation::Act, "data retention purge")
+                .is_err()
         {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(error),
+                error: Some(crate::i18n::get_required_tool_string(
+                    "tool-data-management-error-action-blocked",
+                )),
+            });
+        }
+        if !dry_run && !rename_noreplace_supported() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_tool_string(
+                    "tool-data-management-error-purge-platform",
+                )),
             });
         }
 
@@ -79,10 +102,11 @@ impl DataManagementTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(
-                    self.security
-                        .resolved_path_violation_message(&workspace_path),
-                ),
+                error: Some(tool_text_arg(
+                    "tool-data-management-error-write-blocked",
+                    "path",
+                    &workspace_path.display().to_string(),
+                )),
             });
         }
         let workspace = Arc::new(workspace);
@@ -95,6 +119,19 @@ impl DataManagementTool {
             &mut candidates,
         )?;
         if !dry_run {
+            for candidate in &candidates {
+                if !self.security.is_resolved_path_allowed(&candidate.resolved) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(tool_text_arg(
+                            "tool-data-management-error-write-blocked",
+                            "path",
+                            &candidate.resolved.display().to_string(),
+                        )),
+                    });
+                }
+            }
             stage_purge_candidates(&candidates, cutoff_ts)?;
             delete_staged_candidates(&candidates)?;
         }
@@ -243,6 +280,10 @@ fn data_boundary_violation(message: impl Into<String>) -> anyhow::Error {
     DataBoundaryViolation(message.into()).into()
 }
 
+fn tool_text_arg(key: &str, name: &str, value: &str) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, &[(name, value)])
+}
+
 fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
     let (key, path) = error
         .localization()
@@ -320,9 +361,10 @@ impl PurgeCandidate {
             || metadata.ino() != self.ino
             || epoch >= cutoff_epoch
         {
-            return Err(data_boundary_violation(format!(
-                "Retention candidate changed before deletion: {}",
-                self.resolved.display()
+            return Err(data_boundary_violation(tool_text_arg(
+                "tool-data-management-error-candidate-changed",
+                "path",
+                &self.resolved.display().to_string(),
             )));
         }
         Ok(())
@@ -334,9 +376,10 @@ fn stage_purge_candidates(candidates: &[PurgeCandidate], cutoff_epoch: u64) -> a
         match candidate.parent.symlink_metadata(&candidate.staging_name) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(_) => {
-                return Err(data_boundary_violation(format!(
-                    "Retention staging path already exists: {}",
-                    candidate.staging_name.to_string_lossy()
+                return Err(data_boundary_violation(tool_text_arg(
+                    "tool-data-management-error-staging-exists",
+                    "path",
+                    &candidate.staging_name.to_string_lossy(),
                 )));
             }
             Err(error) => return Err(error.into()),
@@ -526,6 +569,11 @@ fn count_dir_contents(dir: &Dir) -> anyhow::Result<(usize, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_constructor_remains_available() {
+        let _ = DataManagementTool::new(std::env::temp_dir().join("workspace"), 30);
+    }
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
 
@@ -539,7 +587,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
-        DataManagementTool::new(90, security)
+        DataManagementTool::new_with_security(90, security)
     }
 
     #[tokio::test]
@@ -577,6 +625,43 @@ mod tests {
         assert!(tmp.path().join("recent.txt").exists());
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
+    #[tokio::test]
+    async fn confirmed_purge_deletes_eligible_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let old = tmp.path().join("old.txt");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&old)
+            .unwrap();
+        file.set_len(4).unwrap();
+        file.set_modified(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400),
+        )
+        .unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = DataManagementTool::new_with_security(1, security);
+
+        let result = tool
+            .execute(json!({"command": "purge", "dry_run": false}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(!old.exists());
+    }
+
     #[tokio::test]
     async fn read_only_policy_blocks_destructive_purge() {
         let tmp = TempDir::new().unwrap();
@@ -592,7 +677,15 @@ mod tests {
         assert!(tmp.path().join("keep.txt").exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        )
+    ))]
     #[tokio::test]
     async fn retention_walks_do_not_follow_symlinked_directories() {
         use std::os::unix::fs::symlink;
@@ -639,6 +732,82 @@ mod tests {
 
         assert!(stage_purge_candidates(&candidates, u64::MAX).is_err());
         assert_eq!(std::fs::read_to_string(original).unwrap(), "replacement");
+    }
+
+    #[test]
+    fn purge_staging_collision_causes_zero_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("old.txt");
+        std::fs::write(&original, "old").unwrap();
+        let parent =
+            Arc::new(Dir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap());
+        let metadata = parent.symlink_metadata("old.txt").unwrap();
+        let staging_name = OsString::from("occupied-stage");
+        std::fs::write(tmp.path().join(&staging_name), "occupied").unwrap();
+        let candidate = PurgeCandidate {
+            parent,
+            name: OsString::from("old.txt"),
+            staging_name,
+            resolved: original.clone(),
+            bytes: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+
+        assert!(stage_purge_candidates(&[candidate], u64::MAX).is_err());
+        assert_eq!(std::fs::read_to_string(original).unwrap(), "old");
+    }
+
+    #[test]
+    fn rollback_reports_recreated_original_path() {
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("old.txt");
+        let staged = tmp.path().join("stage");
+        std::fs::write(&staged, "quarantined").unwrap();
+        std::fs::write(&original, "replacement").unwrap();
+        let parent =
+            Arc::new(Dir::open_ambient_dir(tmp.path(), cap_std::ambient_authority()).unwrap());
+        let metadata = parent.symlink_metadata("stage").unwrap();
+        let candidate = PurgeCandidate {
+            parent,
+            name: OsString::from("old.txt"),
+            staging_name: OsString::from("stage"),
+            resolved: original,
+            bytes: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+
+        let error = rollback_staged_candidates(&[candidate]).unwrap_err();
+        assert!(error.to_string().contains("recreated"));
+        assert_eq!(std::fs::read_to_string(staged).unwrap(), "quarantined");
+    }
+
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    )))]
+    #[tokio::test]
+    async fn confirmed_purge_fails_closed_when_quarantine_is_unsupported() {
+        let tmp = TempDir::new().unwrap();
+        let missing_workspace = tmp.path().join("missing");
+        let tool = DataManagementTool::new(missing_workspace, 90);
+
+        let result = tool
+            .execute(json!({"command": "purge", "dry_run": false}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unavailable")
+        );
     }
 
     #[tokio::test]

@@ -1053,7 +1053,7 @@ pub fn all_tools_with_runtime(
 
     // Backup tool (enabled by default)
     if root_config.backup.enabled {
-        tool_arcs.push(Arc::new(BackupTool::new(
+        tool_arcs.push(Arc::new(BackupTool::new_with_security(
             root_config.backup.include_dirs.clone(),
             root_config.backup.max_keep,
             security.clone(),
@@ -1062,7 +1062,7 @@ pub fn all_tools_with_runtime(
 
     // Data management tool (disabled by default)
     if root_config.data_retention.enabled {
-        tool_arcs.push(Arc::new(DataManagementTool::new(
+        tool_arcs.push(Arc::new(DataManagementTool::new_with_security(
             root_config.data_retention.retention_days,
             security.clone(),
         )));

@@ -164,7 +164,11 @@ impl Tool for FileWriteTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Path blocked by security policy: {path}")),
+                error: Some(tool_text_arg(
+                    "tool-file-write-error-path-blocked",
+                    "path",
+                    path,
+                )),
             });
         }
 
@@ -174,7 +178,7 @@ impl Tool for FileWriteTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some("Invalid path: missing parent directory".into()),
+                error: Some(tool_text("tool-file-write-error-missing-parent")),
             });
         };
 
@@ -190,7 +194,7 @@ impl Tool for FileWriteTool {
                         return Ok(ToolResult {
                             success: false,
                             output: ToolOutput::default(),
-                            error: Some("Failed to resolve an existing parent directory".into()),
+                            error: Some(tool_text("tool-file-write-error-no-existing-parent")),
                         });
                     };
                     existing_ancestor = next;
@@ -204,11 +208,15 @@ impl Tool for FileWriteTool {
         let canonical_ancestor = tokio::fs::canonicalize(existing_ancestor).await?;
         let missing_suffix = match parent.strip_prefix(existing_ancestor) {
             Ok(suffix) => suffix,
-            Err(error) => {
+            Err(_) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to resolve file-write parent path: {error}")),
+                    error: Some(tool_text_arg(
+                        "tool-file-write-error-parent-binding",
+                        "path",
+                        &parent.display().to_string(),
+                    )),
                 });
             }
         };
@@ -217,10 +225,11 @@ impl Tool for FileWriteTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(
-                    self.security
-                        .resolved_path_violation_message(&prospective_parent),
-                ),
+                error: Some(tool_text_arg(
+                    "tool-file-write-error-path-blocked",
+                    "path",
+                    &prospective_parent.display().to_string(),
+                )),
             });
         }
 
@@ -228,7 +237,7 @@ impl Tool for FileWriteTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some("Invalid path: missing file name".into()),
+                error: Some(tool_text("tool-file-write-error-missing-name")),
             });
         };
         let prospective_target = prospective_parent.join(file_name);
@@ -238,10 +247,11 @@ impl Tool for FileWriteTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(
-                    self.security
-                        .runtime_config_violation_message(&prospective_target),
-                ),
+                error: Some(tool_text_arg(
+                    "tool-file-write-error-runtime-config",
+                    "path",
+                    &prospective_target.display().to_string(),
+                )),
             });
         }
 
@@ -251,9 +261,7 @@ impl Tool for FileWriteTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(
-                        "Failed to bind file-write parent to an authorized directory".into(),
-                    ),
+                    error: Some(tool_text("tool-file-write-error-capability-binding")),
                 });
             }
         };
@@ -287,9 +295,10 @@ impl Tool for FileWriteTool {
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Refusing to write through symlink: {}",
-                            prospective_target.display()
+                        error: Some(tool_text_arg(
+                            "tool-file-write-error-symlink",
+                            "path",
+                            &prospective_target.display().to_string(),
                         )),
                     });
                 }
@@ -319,6 +328,14 @@ fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
         .localization()
         .expect("denied boundary has localization");
     crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+}
+
+fn tool_text(key: &str) -> String {
+    crate::i18n::get_required_tool_string(key)
+}
+
+fn tool_text_arg(key: &str, name: &str, value: &str) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, &[(name, value)])
 }
 
 #[cfg(test)]
@@ -851,7 +868,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("escapes workspace")
+                .contains("Path blocked by security policy")
         );
         assert!(!outside.join("hijack.txt").exists());
 

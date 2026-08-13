@@ -23,7 +23,19 @@ pub struct BackupTool {
 }
 
 impl BackupTool {
-    pub fn new(include_dirs: Vec<String>, max_keep: usize, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(workspace_dir: PathBuf, include_dirs: Vec<String>, max_keep: usize) -> Self {
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir,
+            ..SecurityPolicy::default()
+        });
+        Self::new_with_security(include_dirs, max_keep, security)
+    }
+
+    pub fn new_with_security(
+        include_dirs: Vec<String>,
+        max_keep: usize,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
         Self {
             include_dirs,
             max_keep,
@@ -32,16 +44,15 @@ impl BackupTool {
     }
 
     fn cmd_create(&self) -> anyhow::Result<ToolResult> {
-        if let Err(error) = self
+        if self
             .security
             .enforce_tool_operation(ToolOperation::Act, "backup create")
+            .is_err()
         {
-            return Ok(rejected(error));
+            return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
         }
         if self.max_keep == 0 {
-            return Ok(rejected(
-                "Backup retention max_keep must be at least 1".to_string(),
-            ));
+            return Ok(rejected(tool_text("tool-backup-error-max-keep")));
         }
 
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
@@ -56,9 +67,10 @@ impl BackupTool {
         for sub in &self.include_dirs {
             let relative = contained_relative_path(sub)?.to_path_buf();
             if relative.starts_with("backups") || Path::new("backups").starts_with(&relative) {
-                return Ok(rejected(format!(
-                    "Backup source cannot contain the backup output directory: {}",
-                    relative.display()
+                return Ok(rejected(tool_text_arg(
+                    "tool-backup-error-source-overlap",
+                    "path",
+                    &relative.display().to_string(),
                 )));
             }
             if let Some(src) = open_dir_no_symlinks(&workspace, &relative)? {
@@ -74,9 +86,9 @@ impl BackupTool {
                 .transpose()?
                 .map_or(0, |names| names.len());
             if existing >= self.max_keep {
-                return Err(boundary_violation(
-                    "Backup rotation is disabled on Windows because the available recursive deletion API cannot preserve the verified directory-handle boundary",
-                ));
+                return Err(boundary_violation(tool_text(
+                    "tool-backup-error-rotation-platform",
+                )));
             }
         }
 
@@ -118,9 +130,9 @@ impl BackupTool {
                 #[cfg(not(windows))]
                 backups_dir.remove_dir_all(old)?;
                 #[cfg(windows)]
-                return Err(boundary_violation(
-                    "Backup rotation is disabled on Windows because the available recursive deletion API cannot preserve the verified directory-handle boundary",
-                ));
+                return Err(boundary_violation(tool_text(
+                    "tool-backup-error-rotation-platform",
+                )));
             }
         }
         Ok(())
@@ -129,9 +141,11 @@ impl BackupTool {
     fn open_workspace(&self) -> anyhow::Result<(PathBuf, Dir)> {
         let canonical = std::fs::canonicalize(&self.security.workspace_dir)?;
         if !self.security.is_resolved_path_readable(&canonical) {
-            return Err(boundary_violation(
-                self.security.resolved_path_violation_message(&canonical),
-            ));
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-read-blocked",
+                "path",
+                &canonical.display().to_string(),
+            )));
         }
         let dir = open_absolute_dir_nofollow(&canonical)?;
         Ok((canonical, dir))
@@ -139,9 +153,11 @@ impl BackupTool {
 
     fn authorize_write(&self, path: &Path) -> anyhow::Result<()> {
         if !self.security.is_resolved_path_allowed(path) {
-            return Err(boundary_violation(
-                self.security.resolved_path_violation_message(path),
-            ));
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-write-blocked",
+                "path",
+                &path.display().to_string(),
+            )));
         }
         Ok(())
     }
@@ -195,12 +211,20 @@ impl BackupTool {
         }
         let (_, workspace) = self.open_workspace()?;
         let Some(backups) = open_dir_no_symlinks(&workspace, Path::new("backups"))? else {
-            return Ok(rejected(format!("Backup not found: {backup_name}")));
+            return Ok(rejected(tool_text_arg(
+                "tool-backup-error-not-found",
+                "name",
+                backup_name,
+            )));
         };
         let backup = match open_named_backup(&backups, backup_name) {
             Ok(dir) => dir,
             Err(error) if is_not_found(&error) => {
-                return Ok(rejected(format!("Backup not found: {backup_name}")));
+                return Ok(rejected(tool_text_arg(
+                    "tool-backup-error-not-found",
+                    "name",
+                    backup_name,
+                )));
             }
             Err(error) => return Err(error),
         };
@@ -244,7 +268,7 @@ impl BackupTool {
             error: if pass {
                 None
             } else {
-                Some("Integrity check failed".into())
+                Some(tool_text("tool-backup-error-integrity"))
             },
         })
     }
@@ -255,12 +279,20 @@ impl BackupTool {
         }
         let (workspace_path, workspace) = self.open_workspace()?;
         let Some(backups) = open_dir_no_symlinks(&workspace, Path::new("backups"))? else {
-            return Ok(rejected(format!("Backup not found: {backup_name}")));
+            return Ok(rejected(tool_text_arg(
+                "tool-backup-error-not-found",
+                "name",
+                backup_name,
+            )));
         };
         let backup = match open_named_backup(&backups, backup_name) {
             Ok(dir) => dir,
             Err(error) if is_not_found(&error) => {
-                return Ok(rejected(format!("Backup not found: {backup_name}")));
+                return Ok(rejected(tool_text_arg(
+                    "tool-backup-error-not-found",
+                    "name",
+                    backup_name,
+                )));
             }
             Err(error) => return Err(error),
         };
@@ -272,14 +304,16 @@ impl BackupTool {
             let name = entry
                 .file_name()
                 .into_string()
-                .map_err(|_| boundary_violation("Backup contains a non-UTF-8 entry name"))?;
+                .map_err(|_| boundary_violation(tool_text("tool-backup-error-non-utf8")))?;
             if name == "manifest.json" {
                 continue;
             }
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
-                return Err(boundary_violation(format!(
-                    "Refusing to traverse symlink in backup: {name}"
+                return Err(boundary_violation(tool_text_arg(
+                    "tool-backup-error-symlink",
+                    "path",
+                    &name,
                 )));
             }
             if file_type.is_dir() {
@@ -316,11 +350,12 @@ impl BackupTool {
             validate_copy_destination(&src, destination.as_ref(), Path::new(sub))?;
         }
 
-        if let Err(error) = self
+        if self
             .security
             .enforce_tool_operation(ToolOperation::Act, "backup restore")
+            .is_err()
         {
-            return Ok(rejected(error));
+            return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
         }
 
         for sub in &restore_items {
@@ -488,6 +523,14 @@ fn boundary_violation(message: impl Into<String>) -> anyhow::Error {
     BoundaryViolation(message.into()).into()
 }
 
+fn tool_text(key: &str) -> String {
+    crate::i18n::get_required_tool_string(key)
+}
+
+fn tool_text_arg(key: &str, name: &str, value: &str) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, &[(name, value)])
+}
+
 fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
     let (key, path) = error
         .localization()
@@ -523,8 +566,10 @@ fn contained_relative_path(path: &str) -> anyhow::Result<&Path> {
             .components()
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
-        return Err(boundary_violation(format!(
-            "Backup path must stay within the workspace: {path:?}"
+        return Err(boundary_violation(tool_text_arg(
+            "tool-backup-error-contained",
+            "path",
+            &path.display().to_string(),
         )));
     }
     Ok(path)
@@ -533,7 +578,11 @@ fn contained_relative_path(path: &str) -> anyhow::Result<&Path> {
 fn validate_backup_name(name: &str) -> anyhow::Result<()> {
     let path = contained_relative_path(name)?;
     if path.components().count() != 1 || !name.starts_with("backup-") {
-        return Err(boundary_violation(format!("Invalid backup name: {name}")));
+        return Err(boundary_violation(tool_text_arg(
+            "tool-backup-error-invalid-name",
+            "name",
+            name,
+        )));
     }
     Ok(())
 }
@@ -541,9 +590,10 @@ fn validate_backup_name(name: &str) -> anyhow::Result<()> {
 fn reject_symlink(dir: &Dir, path: &Path) -> anyhow::Result<()> {
     match dir.symlink_metadata(path) {
         Ok(metadata) if metadata.is_symlink() => {
-            return Err(boundary_violation(format!(
-                "Refusing to follow symlink: {}",
-                path.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-symlink",
+                "path",
+                &path.display().to_string(),
             )));
         }
         Ok(_) => {}
@@ -557,9 +607,10 @@ fn open_dir_no_symlinks(root: &Dir, relative: &Path) -> anyhow::Result<Option<Di
     let mut current = root.try_clone()?;
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
-            return Err(boundary_violation(format!(
-                "Path must be relative and contained: {}",
-                relative.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-contained",
+                "path",
+                &relative.display().to_string(),
             )));
         };
         let metadata = match current.symlink_metadata(name) {
@@ -568,9 +619,10 @@ fn open_dir_no_symlinks(root: &Dir, relative: &Path) -> anyhow::Result<Option<Di
             Err(error) => return Err(error.into()),
         };
         if metadata.is_symlink() {
-            return Err(boundary_violation(format!(
-                "Refusing to traverse symlink: {}",
-                relative.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-symlink",
+                "path",
+                &relative.display().to_string(),
             )));
         }
         if !metadata.is_dir() {
@@ -586,7 +638,11 @@ fn open_named_backup(backups: &Dir, name: &str) -> anyhow::Result<Dir> {
     reject_symlink(backups, Path::new(name))?;
     let metadata = backups.symlink_metadata(name)?;
     if !metadata.is_dir() {
-        return Err(boundary_violation(format!("Backup not found: {name}")));
+        return Err(boundary_violation(tool_text_arg(
+            "tool-backup-error-not-found",
+            "name",
+            name,
+        )));
     }
     Ok(open_dir_nofollow(backups, Path::new(name))?)
 }
@@ -614,24 +670,27 @@ fn copy_dir_recursive(src: &Dir, dst: &Dir) -> anyhow::Result<()> {
         let name = entry.file_name();
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
-            return Err(boundary_violation(format!(
-                "Refusing to copy symlink: {}",
-                name.to_string_lossy()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-symlink",
+                "path",
+                &name.to_string_lossy(),
             )));
         }
         if file_type.is_dir() {
             match dst.symlink_metadata(&name) {
                 Ok(metadata) if metadata.is_symlink() => {
-                    return Err(boundary_violation(format!(
-                        "Refusing to copy through symlink: {}",
-                        name.to_string_lossy()
+                    return Err(boundary_violation(tool_text_arg(
+                        "tool-backup-error-symlink",
+                        "path",
+                        &name.to_string_lossy(),
                     )));
                 }
                 Ok(metadata) if metadata.is_dir() => {}
                 Ok(_) => {
-                    return Err(boundary_violation(format!(
-                        "Copy destination is not a directory: {}",
-                        name.to_string_lossy()
+                    return Err(boundary_violation(tool_text_arg(
+                        "tool-backup-error-not-directory",
+                        "path",
+                        &name.to_string_lossy(),
                     )));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -648,9 +707,10 @@ fn copy_dir_recursive(src: &Dir, dst: &Dir) -> anyhow::Result<()> {
             let permissions = input.metadata()?.permissions();
             copy_file_atomic(dst, Path::new(&name), &mut input, Some(permissions))?;
         } else {
-            return Err(boundary_violation(format!(
-                "Refusing to copy special file: {}",
-                name.to_string_lossy()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-special-file",
+                "path",
+                &name.to_string_lossy(),
             )));
         }
     }
@@ -664,17 +724,19 @@ fn validate_tree_no_symlinks(dir: &Dir, relative: &Path) -> anyhow::Result<()> {
         let path = relative.join(&name);
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
-            return Err(boundary_violation(format!(
-                "Refusing to traverse symlink: {}",
-                path.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-symlink",
+                "path",
+                &path.display().to_string(),
             )));
         }
         if file_type.is_dir() {
             validate_tree_no_symlinks(&open_dir_nofollow(dir, Path::new(&name))?, &path)?;
         } else if !file_type.is_file() {
-            return Err(boundary_violation(format!(
-                "Refusing to traverse special file: {}",
-                path.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-special-file",
+                "path",
+                &path.display().to_string(),
             )));
         }
     }
@@ -699,9 +761,10 @@ fn validate_copy_destination(src: &Dir, dst: Option<&Dir>, relative: &Path) -> a
             .as_ref()
             .is_some_and(cap_std::fs::Metadata::is_symlink)
         {
-            return Err(boundary_violation(format!(
-                "Refusing to restore through symlink: {}",
-                path.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-symlink",
+                "path",
+                &path.display().to_string(),
             )));
         }
         if file_type.is_dir() {
@@ -710,9 +773,10 @@ fn validate_copy_destination(src: &Dir, dst: Option<&Dir>, relative: &Path) -> a
                     Some(open_dir_nofollow(dir, Path::new(&name))?)
                 }
                 (_, Some(_)) => {
-                    return Err(boundary_violation(format!(
-                        "Restore destination is not a directory: {}",
-                        path.display()
+                    return Err(boundary_violation(tool_text_arg(
+                        "tool-backup-error-not-directory",
+                        "path",
+                        &path.display().to_string(),
                     )));
                 }
                 _ => None,
@@ -727,9 +791,10 @@ fn validate_copy_destination(src: &Dir, dst: Option<&Dir>, relative: &Path) -> a
                 .as_ref()
                 .is_some_and(cap_std::fs::Metadata::is_dir)
         {
-            return Err(boundary_violation(format!(
-                "Restore destination is a directory: {}",
-                path.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-is-directory",
+                "path",
+                &path.display().to_string(),
             )));
         }
     }
@@ -753,9 +818,10 @@ fn walk_and_hash(
         let path = relative.join(&name);
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
-            return Err(boundary_violation(format!(
-                "Refusing to hash symlink: {}",
-                path.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-symlink",
+                "path",
+                &path.display().to_string(),
             )));
         }
         if file_type.is_dir() {
@@ -779,9 +845,10 @@ fn walk_and_hash(
             let hash = hex::encode(hasher.finalize());
             map.insert(rel, hash);
         } else {
-            return Err(boundary_violation(format!(
-                "Refusing to hash special file: {}",
-                path.display()
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-special-file",
+                "path",
+                &path.display().to_string(),
             )));
         }
     }
@@ -791,6 +858,15 @@ fn walk_and_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_constructor_remains_available() {
+        let _ = BackupTool::new(
+            std::env::temp_dir().join("workspace"),
+            vec!["config".into()],
+            3,
+        );
+    }
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
 
@@ -816,7 +892,7 @@ mod tests {
             workspace_dir: workspace.to_path_buf(),
             ..SecurityPolicy::default()
         });
-        BackupTool::new(vec!["config".into(), "memory".into()], max_keep, security)
+        BackupTool::new_with_security(vec!["config".into(), "memory".into()], max_keep, security)
     }
 
     #[tokio::test]
@@ -858,7 +934,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
-        let tool = BackupTool::new(vec!["backups".into()], 10, security);
+        let tool = BackupTool::new_with_security(vec!["backups".into()], 10, security);
 
         let result = tool.execute(json!({"command": "create"})).await.unwrap();
 

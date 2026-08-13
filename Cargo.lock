@@ -13878,6 +13878,7 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.7",
  "which",
+ "windows-sys 0.61.2",
  "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",
