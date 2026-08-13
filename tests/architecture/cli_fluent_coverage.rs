@@ -593,6 +593,25 @@ fn sample() {
 }
 
 #[test]
+fn fluent_detector_covers_each_direct_print_macro() {
+    let source = r#"
+fn sample() {
+    println!("Standard output line");
+    print!("Standard output");
+    eprintln!("Standard error line");
+    eprint!("Standard error");
+}
+"#;
+    let mut violations = Vec::new();
+    scan_source("sample.rs", source, &mut violations).unwrap();
+    let observed = violations
+        .iter()
+        .map(|violation| violation.key.kind.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(observed, vec!["println", "print", "eprintln", "eprint"]);
+}
+
+#[test]
 fn fluent_detector_handles_clap_attributes_structurally() {
     let source = r###"
 const LOOKALIKE: &str = r#"about = "not an attribute""#;
@@ -654,6 +673,53 @@ fn fluent_legacy_baseline_is_count_sensitive_and_shrinks() {
     assert!(increased[0].contains("new/increased"));
     let decreased = compare_with_legacy_baseline(&[], baseline);
     assert!(decreased[0].contains("stale baseline"));
+
+    let new_signature = Violation {
+        key: ViolationKey {
+            path: "sample.rs".to_string(),
+            kind: "eprintln".to_string(),
+            literal: "\"New text\"".to_string(),
+        },
+        line: 8,
+    };
+    let new_problems = compare_with_legacy_baseline(&[new_signature], baseline);
+    assert!(new_problems.iter().any(|problem| {
+        problem.contains("new/increased eprintln literal (expected 0, found 1)")
+    }));
+}
+
+#[test]
+fn fluent_detector_fails_closed_on_invalid_source_and_missing_roots() {
+    let mut violations = Vec::new();
+    let parse_error = scan_source("invalid.rs", "fn broken(", &mut violations).unwrap_err();
+    assert!(parse_error.contains("could not parse invalid.rs"));
+
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    let traversal_error = scan_dir(root.path(), &missing, &mut violations).unwrap_err();
+    assert!(traversal_error.contains("could not inspect"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fluent_detector_rejects_root_and_descendant_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let real_root = workspace.path().join("real-root");
+    fs::create_dir(&real_root).unwrap();
+    let linked_root = workspace.path().join("linked-root");
+    symlink(&real_root, &linked_root).unwrap();
+
+    let mut violations = Vec::new();
+    let root_error = scan_dir(workspace.path(), &linked_root, &mut violations).unwrap_err();
+    assert!(root_error.contains("symlink used as localization scan root"));
+
+    let descendant_target = workspace.path().join("descendant-target.rs");
+    fs::write(&descendant_target, "fn sample() {}\n").unwrap();
+    symlink(&descendant_target, real_root.join("linked.rs")).unwrap();
+    let descendant_error = scan_dir(workspace.path(), &real_root, &mut violations).unwrap_err();
+    assert!(descendant_error.contains("symlink under localization scan root"));
 }
 
 #[test]
