@@ -6,10 +6,13 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 import pr_size_label as size_labeler
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def change(filename: str, additions: int, deletions: int = 0) -> size_labeler.FileChange:
@@ -241,6 +244,67 @@ class PrSizeLabelTest(unittest.TestCase):
 
         self.assertNotIn(("request", "GET", "/repos/zeroclaw-labs/zeroclaw/issues/9/labels?per_page=100"), calls)
         self.assertFalse(any("/issues/9/labels" in call[2] for call in calls if len(call) == 3))
+
+    def test_apply_size_plan_posts_and_deletes_only_planned_canonical_size_labels(self) -> None:
+        calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+        class FakeClient:
+            def request(
+                self,
+                method: str,
+                path: str,
+                payload: dict[str, object] | None = None,
+            ) -> object:
+                calls.append((method, path, payload))
+                return None
+
+        plan = size_labeler.SizePlan(
+            effective_changed_lines=514,
+            selected_label="size:L",
+            labels_to_add=("size:L",),
+            labels_to_remove=("size:M", "size:XS"),
+        )
+
+        size_labeler.apply_size_plan(FakeClient(), "zeroclaw-labs/zeroclaw", 9, plan)
+
+        self.assertEqual(
+            calls,
+            [
+                ("POST", "/repos/zeroclaw-labs/zeroclaw/issues/9/labels", {"labels": ["size:L"]}),
+                ("DELETE", "/repos/zeroclaw-labs/zeroclaw/issues/9/labels/size%3AM", None),
+                ("DELETE", "/repos/zeroclaw-labs/zeroclaw/issues/9/labels/size%3AXS", None),
+            ],
+        )
+
+    def test_apply_size_plan_treats_missing_stale_label_as_already_removed(self) -> None:
+        class FakeClient:
+            def request(
+                self,
+                method: str,
+                path: str,
+                payload: dict[str, object] | None = None,
+            ) -> object:
+                raise size_labeler.GitHubHTTPError(404, "not found")
+
+        plan = size_labeler.SizePlan(
+            effective_changed_lines=514,
+            selected_label="size:L",
+            labels_to_add=(),
+            labels_to_remove=("size:M",),
+        )
+
+        size_labeler.apply_size_plan(FakeClient(), "zeroclaw-labs/zeroclaw", 9, plan)
+
+    def test_workflow_fetches_base_classifier_without_checking_out_pr_code(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/pr-size-labeler.yml").read_text(encoding="utf-8")
+
+        self.assertIn("pull_request_target:", workflow)
+        self.assertNotIn("actions/checkout", workflow)
+        self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha }}", workflow)
+        self.assertIn("?ref=$BASE_SHA", workflow)
+        self.assertIn('"$RUNNER_TEMP/pr_size_label.py"', workflow)
+        self.assertIn("issues: write", workflow)
+        self.assertIn("pull-requests: read", workflow)
 
     def test_default_docs_contract_matches_repository_docs(self) -> None:
         size_labeler.validate_docs_contract()
