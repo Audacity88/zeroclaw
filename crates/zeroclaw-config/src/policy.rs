@@ -916,7 +916,7 @@ struct ShellWord {
     redirection: Option<RedirectionMetadata>,
 }
 
-fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
+fn split_shell_words_with_metadata(segment: &str, backslash_is_literal: bool) -> Vec<ShellWord> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut is_assignment = false;
@@ -979,7 +979,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
                     continue;
                 }
                 match ch {
-                    '\\' if cfg!(target_os = "windows") => {
+                    '\\' if backslash_is_literal => {
                         if let Some(redirection) = &mut redirection {
                             redirection.has_attached_word = true;
                         }
@@ -1014,7 +1014,7 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
                     continue;
                 }
                 match ch {
-                    '\\' if cfg!(target_os = "windows") => {
+                    '\\' if backslash_is_literal => {
                         if let Some(redirection) = &mut redirection {
                             redirection.has_attached_word = true;
                         }
@@ -1117,8 +1117,8 @@ fn split_shell_words_with_metadata(segment: &str) -> Vec<ShellWord> {
     words
 }
 
-fn shell_words_after_env_assignments(segment: &str) -> Vec<ShellWord> {
-    let words = split_shell_words_with_metadata(segment);
+fn shell_words_after_env_assignments(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
+    let words = split_shell_words_with_metadata(segment, shell_uses_windows_path_syntax(dialect));
     let first_command = words
         .iter()
         .position(|word| !word.is_assignment)
@@ -1133,7 +1133,7 @@ struct NormalizedShellCommand {
 }
 
 fn normalized_shell_command(segment: &str) -> NormalizedShellCommand {
-    let raw_words = split_shell_words_with_metadata(segment);
+    let raw_words = split_shell_words_with_metadata(segment, cfg!(target_os = "windows"));
     let mut has_leading_env_assignment = false;
     let mut words = Vec::with_capacity(raw_words.len());
     let mut has_ambiguous_redirection = false;
@@ -3110,7 +3110,7 @@ impl SecurityPolicy {
         };
 
         for segment in split_unquoted_segments(command) {
-            let words = shell_words_after_env_assignments(&segment);
+            let words = shell_words_after_env_assignments(&segment, dialect);
             let Some(executable) = words.first() else {
                 continue;
             };
@@ -7300,6 +7300,26 @@ mod tests {
                 .as_deref(),
             Some(r"link\secret.txt"),
             "PowerShell backslash paths must retain workspace symlink resolution"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::WindowsCmd,
+                )
+                .as_deref(),
+            Some(r"link\secret.txt"),
+            "cmd.exe backslash paths must retain workspace symlink resolution"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::Posix,
+                )
+                .as_deref(),
+            None,
+            "POSIX backslash escapes must retain their existing tokenization"
         );
 
         // A DANGLING symlink (its target directory does not exist yet) still
