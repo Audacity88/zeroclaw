@@ -35,21 +35,13 @@ When a definition or import is feature-gated, compare its `cfg` predicate with e
 
 ### Scheduled Platform Tests (`platform-tests.yml`)
 
-Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop
---no-fail-fast` on `macos-14` and `windows-latest` after a cheap Linux formatting
-check. The matrix runs for:
+Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` on `macos-14` and `windows-latest` after a cheap Linux formatting check. The matrix runs for:
 
 - pull requests that change `platform-tests.yml` itself;
 - manual dispatches; and
 - the nightly 03:17 UTC schedule.
 
-The jobs use `continue-on-error` and do not feed `CI Required Gate`. They are
-portability evidence, not merge requirements. Ordinary code PRs do not launch
-the matrix automatically; maintainers can manually dispatch it against a branch
-when focused platform proof is useful. The workflow does not run for ordinary
-`push` or `merge_group` events. Nightly and manually dispatched runs on `master`
-can write trusted caches; pull-request runs cannot.
-`--no-fail-fast` keeps every platform failure visible in a single run.
+The jobs use `continue-on-error` and do not feed `CI Required Gate`. They are portability evidence, not merge requirements. Ordinary code PRs do not launch the matrix automatically; maintainers can manually dispatch it against a branch when focused platform proof is useful. The workflow does not run for ordinary `push` or `merge_group` events. Nightly and manually dispatched runs on `master` can write trusted caches; pull-request runs cannot. `--no-fail-fast` keeps every platform failure visible in a single run.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
