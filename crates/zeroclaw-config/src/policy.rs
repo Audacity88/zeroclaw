@@ -2638,6 +2638,19 @@ impl SecurityPolicy {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
 
+        // Path confinement here is specific to Windows shell dialects, whose
+        // relative forms (`..\x`, `C:x`) the host-default PathGuardedTool
+        // scanner cannot recognize. Run it before the allowlist so a path-shaped
+        // executable cannot be rejected as merely unknown before confinement
+        // reports the actual boundary violation. POSIX path policy is already
+        // enforced by that wrapper; running it again here would reject legitimate
+        // absolute arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
+        if shell_uses_windows_path_syntax(dialect)
+            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
+        {
+            return Err(format!("Command blocked: forbidden path argument: {path}"));
+        }
+
         if !self.is_command_allowed_for_shell(command, dialect) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -2666,17 +2679,6 @@ impl SecurityPolicy {
             return Err(
                 "Command requires explicit approval (approved=true): medium-risk operation".into(),
             );
-        }
-
-        // Path confinement here is specific to Windows shell dialects, whose
-        // relative forms (`..\x`, `C:x`) the host-default PathGuardedTool
-        // scanner cannot recognize. POSIX path policy is already enforced by
-        // that wrapper; running it again here would reject legitimate absolute
-        // arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
-        if shell_uses_windows_path_syntax(dialect)
-            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
-        {
-            return Err(format!("Command blocked: forbidden path argument: {path}"));
         }
 
         Ok(risk)
