@@ -595,6 +595,8 @@ Accepted RFCs carry `status:accepted`, and the closing record addresses every `R
 
 Use the live `type:rfc` and `status:accepted` labels. There is no parallel `rfc:*` status label family.
 
+Rev. 15 applies to RFC votes opened after ratification. It does not automatically invalidate earlier accepted RFCs; historical-process audit and correction work remain tracked separately.
+
 A vote may close early only when every member of the final active electorate has explicitly approved and no otherwise inactive Core contributor has asked for the full window. The closing record must say why it closed before the deadline. An exceptional unanimous vote may close early only on explicit approval from every assigned voter.
 
 ### 8.2 Vote Thresholds

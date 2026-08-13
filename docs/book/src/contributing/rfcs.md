@@ -72,6 +72,8 @@ Outcomes, applied in this order:
 
 A vote may close early only when every member of the final active electorate has explicitly approved and no inactive Core contributor has asked for the full window. The closing record must say why it closed early.
 
+The current protocol applies to RFC votes opened after ratification. It does not automatically invalidate earlier accepted RFCs; historical-process audit and correction work are tracked separately.
+
 ## Implementing an accepted RFC
 
 Implementation PRs should:
