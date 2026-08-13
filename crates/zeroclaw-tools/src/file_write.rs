@@ -272,20 +272,16 @@ impl Tool for FileWriteTool {
         tokio::task::spawn_blocking(move || {
             let parent_dir = match create_dir_beneath(&capability_root, &capability_relative) {
                 Ok(dir) => dir,
-                Err(error)
-                    if error
-                        .downcast_ref::<FilesystemBoundaryError>()
-                        .is_some_and(FilesystemBoundaryError::is_denied) =>
-                {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(localize_filesystem_boundary(
-                            error.downcast_ref::<FilesystemBoundaryError>().unwrap(),
-                        )),
-                    });
-                }
-                Err(error) => return Err(error),
+                Err(error) => match error.downcast_ref::<FilesystemBoundaryError>() {
+                    Some(boundary) if boundary.is_denied() => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(localize_filesystem_boundary(boundary)),
+                        });
+                    }
+                    _ => return Err(error),
+                },
             };
 
             // The returned parent handle is the bound authority. Re-resolving
@@ -324,10 +320,12 @@ fn create_dir_beneath(root: &Path, relative: &Path) -> anyhow::Result<Dir> {
 }
 
 fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
-    let (key, path) = error
-        .localization()
-        .expect("denied boundary has localization");
-    crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+    match error.localization() {
+        Some((key, path)) => {
+            crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+        }
+        None => error.to_string(),
+    }
 }
 
 fn tool_text(key: &str) -> String {

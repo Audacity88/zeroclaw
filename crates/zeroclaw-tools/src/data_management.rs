@@ -238,6 +238,7 @@ impl Tool for DataManagementTool {
         };
 
         match result {
+            Ok(result) => Ok(result),
             Err(error) if error.downcast_ref::<DataBoundaryViolation>().is_some() => {
                 Ok(ToolResult {
                     success: false,
@@ -245,20 +246,14 @@ impl Tool for DataManagementTool {
                     error: Some(error.to_string()),
                 })
             }
-            Err(error)
-                if error
-                    .downcast_ref::<FilesystemBoundaryError>()
-                    .is_some_and(FilesystemBoundaryError::is_denied) =>
-            {
-                Ok(ToolResult {
+            Err(error) => match error.downcast_ref::<FilesystemBoundaryError>() {
+                Some(boundary) if boundary.is_denied() => Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(localize_filesystem_boundary(
-                        error.downcast_ref::<FilesystemBoundaryError>().unwrap(),
-                    )),
-                })
-            }
-            other => other,
+                    error: Some(localize_filesystem_boundary(boundary)),
+                }),
+                _ => Err(error),
+            },
         }
     }
 }
@@ -285,10 +280,12 @@ fn tool_text_arg(key: &str, name: &str, value: &str) -> String {
 }
 
 fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
-    let (key, path) = error
-        .localization()
-        .expect("denied boundary has localization");
-    crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+    match error.localization() {
+        Some((key, path)) => {
+            crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+        }
+        None => error.to_string(),
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {

@@ -490,18 +490,16 @@ impl Tool for BackupTool {
         };
 
         match result {
+            Ok(result) => Ok(result),
             Err(error) if error.downcast_ref::<BoundaryViolation>().is_some() => {
                 Ok(rejected(error.to_string()))
             }
-            Err(error)
-                if error
-                    .downcast_ref::<FilesystemBoundaryError>()
-                    .is_some_and(FilesystemBoundaryError::is_denied) =>
-            {
-                let boundary = error.downcast_ref::<FilesystemBoundaryError>().unwrap();
-                Ok(rejected(localize_filesystem_boundary(boundary)))
-            }
-            other => other,
+            Err(error) => match error.downcast_ref::<FilesystemBoundaryError>() {
+                Some(boundary) if boundary.is_denied() => {
+                    Ok(rejected(localize_filesystem_boundary(boundary)))
+                }
+                _ => Err(error),
+            },
         }
     }
 }
@@ -532,10 +530,12 @@ fn tool_text_arg(key: &str, name: &str, value: &str) -> String {
 }
 
 fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
-    let (key, path) = error
-        .localization()
-        .expect("denied boundary has localization");
-    crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+    match error.localization() {
+        Some((key, path)) => {
+            crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+        }
+        None => error.to_string(),
+    }
 }
 
 fn is_not_found(error: &anyhow::Error) -> bool {
