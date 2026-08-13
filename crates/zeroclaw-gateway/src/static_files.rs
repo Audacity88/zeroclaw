@@ -20,11 +20,9 @@ static EMBEDDED_WEB_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web/
 
 /// Serve static files from `/_app/*` path
 pub async fn handle_static(State(state): State<AppState>, uri: Uri) -> Response {
-    let path = uri
-        .path()
-        .strip_prefix("/_app/")
-        .unwrap_or(uri.path())
-        .trim_start_matches('/');
+    let Some(path) = static_request_path(&uri) else {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    };
 
     #[cfg(feature = "embedded-web")]
     if let Some(resp) = serve_embedded_file(path) {
@@ -116,6 +114,10 @@ async fn load_index_html_bytes(dist_dir: Option<&PathBuf>) -> Option<Vec<u8>> {
 }
 
 async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
+    if !is_valid_relative_path(path) {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+
     let Some(dir) = dist_dir else {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
@@ -163,6 +165,25 @@ async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
 enum FsPathError {
     Invalid,
     Unavailable,
+}
+
+fn static_request_path(uri: &Uri) -> Option<&str> {
+    let path = uri.path().strip_prefix("/_app/").unwrap_or(uri.path());
+
+    is_valid_relative_path(path).then_some(path)
+}
+
+fn is_valid_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 async fn resolve_fs_file(root: &Path, relative: &Path) -> Result<PathBuf, FsPathError> {
@@ -233,6 +254,23 @@ mod tests {
             .to_vec()
     }
 
+    #[test]
+    fn static_route_rejects_malformed_path_syntax() {
+        for path in [
+            "/_app//index.html",
+            "/_app/assets//app.js",
+            "/_app/assets/./app.js",
+            "/_app/assets/app.js/",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert_eq!(
+                static_request_path(&uri),
+                None,
+                "route path should be rejected: {path}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fs_asset_serves_contained_nested_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -260,6 +298,13 @@ mod tests {
             "assets/../secret",
             "./index.html",
             "/etc/passwd",
+            "assets//app.js",
+            "assets/./app.js",
+            "assets/app.js/",
+            r"assets\\app.js",
+            r"assets\.\app.js",
+            r"\assets\app.js",
+            r"assets\app.js\",
         ] {
             let response = serve_fs_file(Some(&root), path).await;
             assert_eq!(
