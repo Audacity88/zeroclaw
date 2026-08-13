@@ -732,7 +732,6 @@ impl AcpServer {
                         "cwd is not a usable directory ({}): {e}",
                         requested.display()
                     ),
-                    data: None,
                 })?;
                 if canon == install_root {
                     config.agent_workspace_dir(&agent_alias)
