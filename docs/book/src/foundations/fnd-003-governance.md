@@ -724,7 +724,7 @@ Terminal closure labels are operational policy, not part of the historical `stat
 
 ### `rfc:` RFC-specific status
 
-Retired in Rev. 9 and never created as live labels. RFC state uses the live `type:rfc` and `status:accepted` labels; see §8.1.
+Retired in Rev. 15 and never created as live labels. RFC state uses the live `type:rfc` and `status:accepted` labels; see §8.1.
 
 ---
 

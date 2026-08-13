@@ -4,7 +4,7 @@ An RFC records a durable project-level decision before implementation. The proce
 
 Most work does not need one. The RFC trigger is deliberately narrow so that proposals which genuinely need a project-level decision are not queued behind ordinary features.
 
-RFC scope, discussion timing, and ratification rules were last set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), accepted 2026-08-10 and adopted as FND-003 Rev. 9. See [FND-003](../foundations/fnd-003-governance.md) for the durable protocol.
+RFC scope, discussion timing, and ratification rules were last set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), accepted 2026-08-10 and adopted as FND-003 Rev. 15. See [FND-003](../foundations/fnd-003-governance.md) for the durable protocol.
 
 ## When to file an RFC vs. just a PR
 
@@ -106,7 +106,7 @@ These shape everything else. Read them before proposing cross-cutting changes:
 
 - **#5574**: Microkernel transition: crate split, feature-flag taxonomy, v1.0 path
 - **#5576**: Documentation standards and knowledge architecture
-- **#5577**: Project governance: core team, this document's authority. Its RFC scope and voting thresholds are superseded by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496) (FND-003 Rev. 9)
+- **#5577**: Project governance: core team, this document's authority. Its RFC scope and voting thresholds are superseded by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496) (FND-003 Rev. 15)
 - **#5579**: Engineering infrastructure: CI pipelines, release automation
 - **#5615**: Contribution culture: human/AI co-authorship norms
 - **#5653**: Zero Compromise: error handling, dead-code policy, release-readiness bar
