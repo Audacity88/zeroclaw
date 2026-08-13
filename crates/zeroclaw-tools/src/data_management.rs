@@ -1,29 +1,49 @@
+use crate::helpers::filesystem_boundary::{
+    FilesystemBoundaryError, open_absolute_dir_nofollow, open_dir_nofollow, rename_noreplace,
+};
 use async_trait::async_trait;
+use cap_fs_ext::MetadataExt;
+use cap_std::fs::Dir;
 use serde_json::json;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use tokio::fs;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
 /// Workspace data lifecycle tool: retention status, time-based purge, and
 /// storage statistics.
+#[derive(Clone)]
 pub struct DataManagementTool {
-    workspace_dir: PathBuf,
     retention_days: u64,
+    security: Arc<SecurityPolicy>,
 }
 
 impl DataManagementTool {
-    pub fn new(workspace_dir: PathBuf, retention_days: u64) -> Self {
+    pub fn new(retention_days: u64, security: Arc<SecurityPolicy>) -> Self {
         Self {
-            workspace_dir,
             retention_days,
+            security,
         }
     }
 
-    async fn cmd_retention_status(&self) -> anyhow::Result<ToolResult> {
+    fn open_workspace(&self) -> anyhow::Result<(PathBuf, Dir)> {
+        let canonical = std::fs::canonicalize(&self.security.workspace_dir)?;
+        if !self.security.is_resolved_path_readable(&canonical) {
+            return Err(data_boundary_violation(
+                self.security.resolved_path_violation_message(&canonical),
+            ));
+        }
+        Ok((canonical.clone(), open_absolute_dir_nofollow(&canonical)?))
+    }
+
+    fn cmd_retention_status(&self) -> anyhow::Result<ToolResult> {
         let cutoff = chrono::Utc::now()
             - chrono::Duration::days(i64::try_from(self.retention_days).unwrap_or(i64::MAX));
         let cutoff_ts = cutoff.timestamp().try_into().unwrap_or(0u64);
-        let count = count_files_older_than(&self.workspace_dir, cutoff_ts).await?;
+        let (_, workspace) = self.open_workspace()?;
+        let count = count_files_older_than(&workspace, cutoff_ts)?;
 
         Ok(ToolResult {
             success: true,
@@ -38,11 +58,51 @@ impl DataManagementTool {
         })
     }
 
-    async fn cmd_purge(&self, dry_run: bool) -> anyhow::Result<ToolResult> {
+    fn cmd_purge(&self, dry_run: bool) -> anyhow::Result<ToolResult> {
+        if !dry_run
+            && let Err(error) = self
+                .security
+                .enforce_tool_operation(ToolOperation::Act, "data retention purge")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
         let cutoff = chrono::Utc::now()
             - chrono::Duration::days(i64::try_from(self.retention_days).unwrap_or(i64::MAX));
         let cutoff_ts: u64 = cutoff.timestamp().try_into().unwrap_or(0);
-        let (deleted, bytes) = purge_old_files(&self.workspace_dir, cutoff_ts, dry_run).await?;
+        let (workspace_path, workspace) = self.open_workspace()?;
+        if !dry_run && !self.security.is_resolved_path_allowed(&workspace_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&workspace_path),
+                ),
+            });
+        }
+        let workspace = Arc::new(workspace);
+        let mut candidates = Vec::new();
+        collect_purge_candidates(
+            &workspace,
+            Path::new(""),
+            &workspace_path,
+            cutoff_ts,
+            &mut candidates,
+        )?;
+        if !dry_run {
+            stage_purge_candidates(&candidates, cutoff_ts)?;
+            delete_staged_candidates(&candidates)?;
+        }
+        let deleted = candidates.len();
+        let bytes = candidates
+            .iter()
+            .map(|candidate| candidate.bytes)
+            .sum::<u64>();
 
         Ok(ToolResult {
             success: true,
@@ -58,8 +118,9 @@ impl DataManagementTool {
         })
     }
 
-    async fn cmd_stats(&self) -> anyhow::Result<ToolResult> {
-        let (total_files, total_bytes, breakdown) = dir_stats(&self.workspace_dir).await?;
+    fn cmd_stats(&self) -> anyhow::Result<ToolResult> {
+        let (_, workspace) = self.open_workspace()?;
+        let (total_files, total_bytes, breakdown) = dir_stats(&workspace)?;
         Ok(ToolResult {
             success: true,
             output: json!({
@@ -115,26 +176,79 @@ impl Tool for DataManagementTool {
             }
         };
 
-        match command {
-            "retention_status" => self.cmd_retention_status().await,
+        let result = match command {
+            "retention_status" => {
+                let tool = self.clone();
+                tokio::task::spawn_blocking(move || tool.cmd_retention_status()).await?
+            }
             "purge" => {
                 let dry_run = args
                     .get("dry_run")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                self.cmd_purge(dry_run).await
+                let tool = self.clone();
+                tokio::task::spawn_blocking(move || tool.cmd_purge(dry_run)).await?
             }
-            "stats" => self.cmd_stats().await,
+            "stats" => {
+                let tool = self.clone();
+                tokio::task::spawn_blocking(move || tool.cmd_stats()).await?
+            }
             other => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Unknown command: {other}")),
             }),
+        };
+
+        match result {
+            Err(error) if error.downcast_ref::<DataBoundaryViolation>().is_some() => {
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                })
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<FilesystemBoundaryError>()
+                    .is_some_and(FilesystemBoundaryError::is_denied) =>
+            {
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(localize_filesystem_boundary(
+                        error.downcast_ref::<FilesystemBoundaryError>().unwrap(),
+                    )),
+                })
+            }
+            other => other,
         }
     }
 }
 
 // -- Helpers ------------------------------------------------------------------
+
+#[derive(Debug)]
+struct DataBoundaryViolation(String);
+
+impl std::fmt::Display for DataBoundaryViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DataBoundaryViolation {}
+
+fn data_boundary_violation(message: impl Into<String>) -> anyhow::Error {
+    DataBoundaryViolation(message.into()).into()
+}
+
+fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
+    let (key, path) = error
+        .localization()
+        .expect("denied boundary has localization");
+    crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+}
 
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -151,18 +265,23 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-async fn count_files_older_than(dir: &Path, cutoff_epoch: u64) -> anyhow::Result<usize> {
+fn count_files_older_than(dir: &Dir, cutoff_epoch: u64) -> anyhow::Result<usize> {
     let mut count = 0;
-    if !dir.is_dir() {
-        return Ok(0);
-    }
-    let mut rd = fs::read_dir(dir).await?;
-    while let Some(entry) = rd.next_entry().await? {
-        let path = entry.path();
-        if path.is_dir() {
-            count += Box::pin(count_files_older_than(&path, cutoff_epoch)).await?;
-        } else if let Ok(meta) = fs::metadata(&path).await {
-            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let metadata = dir.symlink_metadata(&name)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            count +=
+                count_files_older_than(&open_dir_nofollow(dir, Path::new(&name))?, cutoff_epoch)?;
+        } else if file_type.is_file() {
+            let modified = metadata
+                .modified()
+                .map(cap_std::time::SystemTime::into_std)?;
             let epoch = modified
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -175,65 +294,203 @@ async fn count_files_older_than(dir: &Path, cutoff_epoch: u64) -> anyhow::Result
     Ok(count)
 }
 
-async fn purge_old_files(
-    dir: &Path,
-    cutoff_epoch: u64,
-    dry_run: bool,
-) -> anyhow::Result<(usize, u64)> {
-    let mut deleted = 0usize;
-    let mut bytes = 0u64;
-    if !dir.is_dir() {
-        return Ok((0, 0));
+struct PurgeCandidate {
+    parent: Arc<Dir>,
+    name: OsString,
+    staging_name: OsString,
+    resolved: PathBuf,
+    bytes: u64,
+    dev: u64,
+    ino: u64,
+}
+
+impl PurgeCandidate {
+    fn revalidate_name(&self, name: &std::ffi::OsStr, cutoff_epoch: u64) -> anyhow::Result<()> {
+        let metadata = self.parent.symlink_metadata(name)?;
+        let modified = metadata
+            .modified()
+            .map(cap_std::time::SystemTime::into_std)?;
+        let epoch = modified
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if !metadata.is_file()
+            || metadata.is_symlink()
+            || metadata.dev() != self.dev
+            || metadata.ino() != self.ino
+            || epoch >= cutoff_epoch
+        {
+            return Err(data_boundary_violation(format!(
+                "Retention candidate changed before deletion: {}",
+                self.resolved.display()
+            )));
+        }
+        Ok(())
     }
-    let mut rd = fs::read_dir(dir).await?;
-    while let Some(entry) = rd.next_entry().await? {
-        let path = entry.path();
-        if path.is_dir() {
-            let (d, b) = Box::pin(purge_old_files(&path, cutoff_epoch, dry_run)).await?;
-            deleted += d;
-            bytes += b;
-        } else if let Ok(meta) = fs::metadata(&path).await {
-            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+}
+
+fn stage_purge_candidates(candidates: &[PurgeCandidate], cutoff_epoch: u64) -> anyhow::Result<()> {
+    for candidate in candidates {
+        match candidate.parent.symlink_metadata(&candidate.staging_name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(data_boundary_violation(format!(
+                    "Retention staging path already exists: {}",
+                    candidate.staging_name.to_string_lossy()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let mut staged = 0usize;
+    for candidate in candidates {
+        if let Err(error) = rename_noreplace(
+            &candidate.parent,
+            Path::new(&candidate.name),
+            Path::new(&candidate.staging_name),
+        ) {
+            return Err(with_rollback_error(error.into(), &candidates[..staged]));
+        }
+        staged += 1;
+        if let Err(error) = candidate.revalidate_name(&candidate.staging_name, cutoff_epoch) {
+            return Err(with_rollback_error(error, &candidates[..staged]));
+        }
+    }
+    Ok(())
+}
+
+fn rollback_staged_candidates(candidates: &[PurgeCandidate]) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for candidate in candidates.iter().rev() {
+        match candidate.parent.symlink_metadata(&candidate.name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = rename_noreplace(
+                    &candidate.parent,
+                    Path::new(&candidate.staging_name),
+                    Path::new(&candidate.name),
+                ) {
+                    failures.push(format!("{}: {error}", candidate.resolved.display()));
+                }
+            }
+            Ok(_) => failures.push(format!(
+                "{}: original path was recreated during rollback",
+                candidate.resolved.display()
+            )),
+            Err(error) => failures.push(format!(
+                "{}: failed to inspect original path during rollback: {error}",
+                candidate.resolved.display()
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Failed to restore quarantined retention files: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn with_rollback_error(original: anyhow::Error, candidates: &[PurgeCandidate]) -> anyhow::Error {
+    match rollback_staged_candidates(candidates) {
+        Ok(()) => original,
+        Err(rollback) => anyhow::anyhow!("{original}; {rollback}"),
+    }
+}
+
+fn delete_staged_candidates(candidates: &[PurgeCandidate]) -> anyhow::Result<()> {
+    for (index, candidate) in candidates.iter().enumerate() {
+        if let Err(error) = candidate.parent.remove_file(&candidate.staging_name) {
+            return Err(with_rollback_error(error.into(), &candidates[index..]));
+        }
+    }
+    Ok(())
+}
+
+fn collect_purge_candidates(
+    dir: &Arc<Dir>,
+    relative: &Path,
+    workspace_path: &Path,
+    cutoff_epoch: u64,
+    candidates: &mut Vec<PurgeCandidate>,
+) -> anyhow::Result<()> {
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let entry_relative = relative.join(&name);
+        let metadata = dir.symlink_metadata(&name)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let child = Arc::new(open_dir_nofollow(dir, Path::new(&name))?);
+            collect_purge_candidates(
+                &child,
+                &entry_relative,
+                workspace_path,
+                cutoff_epoch,
+                candidates,
+            )?;
+        } else if file_type.is_file() {
+            let modified = metadata
+                .modified()
+                .map(cap_std::time::SystemTime::into_std)?;
             let epoch = modified
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             if epoch < cutoff_epoch {
-                bytes += meta.len();
-                deleted += 1;
-                if !dry_run {
-                    let _ = fs::remove_file(&path).await;
-                }
+                static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+                let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let staging_name = OsString::from(format!(
+                    ".zeroclaw-purge-{}-{}-{}-{sequence}",
+                    std::process::id(),
+                    metadata.dev(),
+                    metadata.ino()
+                ));
+                candidates.push(PurgeCandidate {
+                    parent: dir.clone(),
+                    name,
+                    staging_name,
+                    resolved: workspace_path.join(&entry_relative),
+                    bytes: metadata.len(),
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                });
             }
         }
     }
-    Ok((deleted, bytes))
+    Ok(())
 }
 
-async fn dir_stats(root: &Path) -> anyhow::Result<(usize, u64, serde_json::Value)> {
+fn dir_stats(root: &Dir) -> anyhow::Result<(usize, u64, serde_json::Value)> {
     let mut total_files = 0usize;
     let mut total_bytes = 0u64;
     let mut breakdown = serde_json::Map::new();
 
-    if !root.is_dir() {
-        return Ok((0, 0, serde_json::Value::Object(breakdown)));
-    }
-
-    let mut rd = fs::read_dir(root).await?;
-    while let Some(entry) = rd.next_entry().await? {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let (f, b) = count_dir_contents(&path).await?;
+    for entry in root.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let metadata = root.symlink_metadata(&name)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let display_name = name.to_string_lossy().to_string();
+            let (f, b) = count_dir_contents(&open_dir_nofollow(root, Path::new(&name))?)?;
             total_files += f;
             total_bytes += b;
             breakdown.insert(
-                name,
+                display_name,
                 json!({"files": f, "size": b, "size_human": format_bytes(b)}),
             );
-        } else if let Ok(meta) = fs::metadata(&path).await {
+        } else if file_type.is_file() {
             total_files += 1;
-            total_bytes += meta.len();
+            total_bytes += metadata.len();
         }
     }
     Ok((
@@ -243,19 +500,24 @@ async fn dir_stats(root: &Path) -> anyhow::Result<(usize, u64, serde_json::Value
     ))
 }
 
-async fn count_dir_contents(dir: &Path) -> anyhow::Result<(usize, u64)> {
+fn count_dir_contents(dir: &Dir) -> anyhow::Result<(usize, u64)> {
     let mut files = 0usize;
     let mut bytes = 0u64;
-    let mut rd = fs::read_dir(dir).await?;
-    while let Some(entry) = rd.next_entry().await? {
-        let path = entry.path();
-        if path.is_dir() {
-            let (f, b) = Box::pin(count_dir_contents(&path)).await?;
+    for entry in dir.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let metadata = dir.symlink_metadata(&name)?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let (f, b) = count_dir_contents(&open_dir_nofollow(dir, Path::new(&name))?)?;
             files += f;
             bytes += b;
-        } else if let Ok(meta) = fs::metadata(&path).await {
+        } else if file_type.is_file() {
             files += 1;
-            bytes += meta.len();
+            bytes += metadata.len();
         }
     }
     Ok((files, bytes))
@@ -265,9 +527,19 @@ async fn count_dir_contents(dir: &Path) -> anyhow::Result<(usize, u64)> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use zeroclaw_config::autonomy::AutonomyLevel;
 
     fn make_tool(tmp: &TempDir) -> DataManagementTool {
-        DataManagementTool::new(tmp.path().to_path_buf(), 90)
+        make_tool_with_autonomy(tmp, AutonomyLevel::Supervised)
+    }
+
+    fn make_tool_with_autonomy(tmp: &TempDir, autonomy: AutonomyLevel) -> DataManagementTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        DataManagementTool::new(90, security)
     }
 
     #[tokio::test]
@@ -303,6 +575,70 @@ mod tests {
         assert_eq!(v["files"], 0);
         // File still exists.
         assert!(tmp.path().join("recent.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn read_only_policy_blocks_destructive_purge() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("keep.txt"), "data").unwrap();
+        let tool = make_tool_with_autonomy(&tmp, AutonomyLevel::ReadOnly);
+
+        let result = tool
+            .execute(json!({"command": "purge", "dry_run": false}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(tmp.path().join("keep.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retention_walks_do_not_follow_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("outside.txt"), "outside").unwrap();
+        symlink(outside.path(), tmp.path().join("linked-outside")).unwrap();
+        let tool = make_tool(&tmp);
+
+        let stats = tool.execute(json!({"command": "stats"})).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats.output).unwrap();
+        assert_eq!(stats["total_files"], 0);
+
+        let purge = tool
+            .execute(json!({"command": "purge", "dry_run": false}))
+            .await
+            .unwrap();
+        assert!(purge.success);
+        assert!(outside.path().join("outside.txt").exists());
+    }
+
+    #[test]
+    fn purge_candidate_rejects_replaced_file_identity() {
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("old.txt");
+        std::fs::write(&original, "old").unwrap();
+        let workspace = Arc::new(
+            open_absolute_dir_nofollow(&std::fs::canonicalize(tmp.path()).unwrap()).unwrap(),
+        );
+        let mut candidates = Vec::new();
+        collect_purge_candidates(
+            &workspace,
+            Path::new(""),
+            tmp.path(),
+            u64::MAX,
+            &mut candidates,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        std::fs::rename(&original, tmp.path().join("moved.txt")).unwrap();
+        std::fs::write(&original, "replacement").unwrap();
+
+        assert!(stage_purge_candidates(&candidates, u64::MAX).is_err());
+        assert_eq!(std::fs::read_to_string(original).unwrap(), "replacement");
     }
 
     #[tokio::test]

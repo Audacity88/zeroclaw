@@ -1054,17 +1054,17 @@ pub fn all_tools_with_runtime(
     // Backup tool (enabled by default)
     if root_config.backup.enabled {
         tool_arcs.push(Arc::new(BackupTool::new(
-            workspace_dir.to_path_buf(),
             root_config.backup.include_dirs.clone(),
             root_config.backup.max_keep,
+            security.clone(),
         )));
     }
 
     // Data management tool (disabled by default)
     if root_config.data_retention.enabled {
         tool_arcs.push(Arc::new(DataManagementTool::new(
-            workspace_dir.to_path_buf(),
             root_config.data_retention.retention_days,
+            security.clone(),
         )));
     }
 

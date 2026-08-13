@@ -89,6 +89,10 @@ tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ 
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
+tool-filesystem-boundary-error-symlink = Refusing to follow a symlink at '{ $path }'
+tool-filesystem-boundary-error-contained = Path must be relative and contained: '{ $path }'
+tool-filesystem-boundary-error-not-directory = Path component is not a directory: '{ $path }'
+tool-filesystem-boundary-error-not-regular = Refusing to open a non-regular file: '{ $path }'
 
 tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.

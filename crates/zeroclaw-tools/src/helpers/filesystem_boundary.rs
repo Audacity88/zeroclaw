@@ -1,0 +1,279 @@
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::{ambient_authority, fs::Dir};
+use std::ffi::OsString;
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug)]
+pub(crate) enum FilesystemBoundaryError {
+    Denied { key: &'static str, path: PathBuf },
+    Io(io::Error),
+}
+
+impl FilesystemBoundaryError {
+    pub(crate) fn is_denied(&self) -> bool {
+        matches!(self, Self::Denied { .. })
+    }
+
+    pub(crate) fn localization(&self) -> Option<(&'static str, String)> {
+        match self {
+            Self::Denied { key, path } => Some((key, path.display().to_string())),
+            Self::Io(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FilesystemBoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied { key, path } => write!(formatter, "{key}: {}", path.display()),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for FilesystemBoundaryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Denied { .. } => None,
+            Self::Io(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for FilesystemBoundaryError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+fn classify_nofollow(error: io::Error, path: &Path) -> FilesystemBoundaryError {
+    if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+        FilesystemBoundaryError::Denied {
+            key: "tool-filesystem-boundary-error-symlink",
+            path: path.to_path_buf(),
+        }
+    } else {
+        FilesystemBoundaryError::Io(error)
+    }
+}
+
+/// Open an absolute canonical directory without following any component that
+/// is replaced by a symlink while the path is being acquired.
+pub(crate) fn open_absolute_dir_nofollow(path: &Path) -> Result<Dir, FilesystemBoundaryError> {
+    if !path.is_absolute() {
+        return Err(FilesystemBoundaryError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "capability root must be absolute",
+        )));
+    }
+
+    let mut anchor = PathBuf::new();
+    let mut names: Vec<OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            Component::RootDir => anchor.push(component.as_os_str()),
+            Component::Normal(name) => names.push(name.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(FilesystemBoundaryError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "capability root must be canonical",
+                )));
+            }
+        }
+    }
+    if anchor.as_os_str().is_empty() {
+        return Err(FilesystemBoundaryError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "capability root has no filesystem anchor",
+        )));
+    }
+
+    let mut current = Dir::open_ambient_dir(anchor, ambient_authority())?;
+    for name in names {
+        current = current
+            .open_dir_nofollow(&name)
+            .map_err(|error| classify_nofollow(error, Path::new(&name)))?;
+    }
+    Ok(current)
+}
+
+pub(crate) fn open_dir_nofollow(parent: &Dir, name: &Path) -> Result<Dir, FilesystemBoundaryError> {
+    parent
+        .open_dir_nofollow(name)
+        .map_err(|error| classify_nofollow(error, name))
+}
+
+pub(crate) fn create_dir_path_nofollow(
+    root: &Dir,
+    relative: &Path,
+) -> Result<Dir, FilesystemBoundaryError> {
+    let mut current = root.try_clone()?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(FilesystemBoundaryError::Denied {
+                key: "tool-filesystem-boundary-error-contained",
+                path: relative.to_path_buf(),
+            });
+        };
+        match current.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_symlink() => {
+                return Err(FilesystemBoundaryError::Denied {
+                    key: "tool-filesystem-boundary-error-symlink",
+                    path: relative.to_path_buf(),
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(FilesystemBoundaryError::Denied {
+                    key: "tool-filesystem-boundary-error-not-directory",
+                    path: relative.to_path_buf(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => current.create_dir(name)?,
+            Err(error) => return Err(error.into()),
+        }
+        current = open_dir_nofollow(&current, Path::new(name))?;
+    }
+    Ok(current)
+}
+
+pub(crate) fn open_file_nofollow(
+    parent: &Dir,
+    name: &Path,
+) -> Result<cap_std::fs::File, FilesystemBoundaryError> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
+    let file = parent
+        .open_with(name, &options)
+        .map_err(|error| classify_nofollow(error, name))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(FilesystemBoundaryError::Denied {
+            key: "tool-filesystem-boundary-error-not-regular",
+            path: name.to_path_buf(),
+        });
+    }
+    Ok(file)
+}
+
+pub(crate) fn copy_file_atomic(
+    parent: &Dir,
+    destination: &Path,
+    input: &mut impl Read,
+    source_permissions: Option<cap_std::fs::Permissions>,
+) -> io::Result<()> {
+    static TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_name = format!(".zeroclaw-write-{}-{sequence}.tmp", std::process::id());
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    options.follow(FollowSymlinks::No);
+    let mut output = parent.open_with(&temp_name, &options)?;
+    let permissions = match source_permissions {
+        Some(permissions) => Some(permissions),
+        None => match parent.symlink_metadata(destination) {
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        },
+    };
+    let result = io::copy(input, &mut output)
+        .and_then(|_| output.flush())
+        .and_then(|_| match permissions {
+            Some(permissions) => output.set_permissions(permissions),
+            None => Ok(()),
+        })
+        .and_then(|_| output.sync_all());
+    drop(output);
+    if let Err(error) = result {
+        let _ = parent.remove_file(&temp_name);
+        return Err(error);
+    }
+    if let Err(error) = parent.rename(&temp_name, parent, destination) {
+        let _ = parent.remove_file(&temp_name);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn write_file_atomic(parent: &Dir, destination: &Path, bytes: &[u8]) -> io::Result<()> {
+    copy_file_atomic(parent, destination, &mut io::Cursor::new(bytes), None)
+}
+
+/// Rename a child without replacing an existing destination. Both names stay
+/// relative to the already-authorized directory capability.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+pub(crate) fn rename_noreplace(parent: &Dir, source: &Path, destination: &Path) -> io::Result<()> {
+    Ok(rustix::fs::renameat_with(
+        parent,
+        source,
+        parent,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+)))]
+pub(crate) fn rename_noreplace(
+    _parent: &Dir,
+    _source: &Path,
+    _destination: &Path,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no-replace capability rename is unavailable on this platform",
+    ))
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    )
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_noreplace_preserves_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), "source").unwrap();
+        std::fs::write(temp.path().join("destination"), "destination").unwrap();
+        let dir = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+
+        let result = rename_noreplace(&dir, Path::new("source"), Path::new("destination"));
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("source")).unwrap(),
+            "source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("destination")).unwrap(),
+            "destination"
+        );
+    }
+}
