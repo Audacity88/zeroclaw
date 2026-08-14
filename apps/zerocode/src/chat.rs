@@ -7322,14 +7322,16 @@ mod tests {
         let mut state = state();
         state
             .entries
-            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello   ")));
-        state.transcript_snapshot =
-            Some(transcript_snapshot(Rect::new(10, 5, 10, 1), &["hello   "]));
-        state.entry_rects.push((0, Rect::new(10, 5, 8, 1)));
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 10, 2),
+            &["hello", "   "],
+        ));
+        state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
         state.browse_cursor = Some(0);
         state.transcript_selection = Some(TranscriptSelection {
-            anchor: CellPoint { column: 5, row: 0 },
-            head: CellPoint { column: 7, row: 0 },
+            anchor: CellPoint { column: 0, row: 1 },
+            head: CellPoint { column: 2, row: 1 },
             dragged: true,
         });
 
