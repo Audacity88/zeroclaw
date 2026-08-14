@@ -5646,7 +5646,23 @@ impl ChatState {
 
     fn copy_current_selection(&mut self) -> bool {
         let text = self.current_selection_text();
-        self.copy_text_and_clear_selection(&text)
+        let feedback_anchor = self
+            .copy_hit_regions
+            .iter()
+            .find(|region| matches!(region.kind, CopyHitKind::Message | CopyHitKind::Transcript))
+            .map(|region| region.rect)
+            .or_else(|| {
+                self.transcript_snapshot
+                    .as_ref()?
+                    .selection_anchor_rect(self.transcript_selection?)
+            });
+        if !self.copy_text_and_clear_selection(&text) {
+            return false;
+        }
+        if let Some(anchor) = feedback_anchor {
+            self.set_overlay_copy_feedback(anchor);
+        }
+        true
     }
 
     fn copy_text_and_clear_selection(&mut self, text: &str) -> bool {
@@ -7380,10 +7396,30 @@ mod tests {
         assert_eq!(state.transcript_selection, None);
         assert_eq!(state.browse_cursor, None);
         assert!(state.info_message.is_some());
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
+        ));
 
         state.browse_cursor = Some(0);
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(0, 0, 8, 1),
+            text: "whole message".to_string(),
+            kind: CopyHitKind::Message,
+            group: 0,
+        });
         assert!(state.copy_current_selection());
         assert_eq!(state.browse_cursor, None);
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
+        ));
     }
 
     #[test]
