@@ -5709,8 +5709,11 @@ impl ChatState {
                 let Some(text) = snapshot.selected_text(selection) else {
                     return false;
                 };
+                let Some(rect) = snapshot.selection_anchor_rect(selection) else {
+                    return false;
+                };
                 Some(CopyHitRegion {
-                    rect: snapshot.selection_anchor_rect(selection)?,
+                    rect,
                     text,
                     kind: CopyHitKind::Transcript,
                     group: 0,
