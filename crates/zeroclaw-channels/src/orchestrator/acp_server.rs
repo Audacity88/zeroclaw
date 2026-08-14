@@ -520,6 +520,7 @@ impl AcpServer {
                 Err(RpcError {
                     code: METHOD_NOT_FOUND,
                     message: format!("Method not found: {}", request.method),
+                    data: None,
                 })
             }
         };
@@ -537,7 +538,7 @@ impl AcpServer {
                             .with_attrs(::serde_json::json!({
                                 "method": request.method,
                                 "error_code": e.code,
-                                "error": e.message,
+                                "error": e.diagnostic(),
                             })),
                         "ACP request failed"
                     );
@@ -627,10 +628,12 @@ impl AcpServer {
                 message: format!(
                     "Unknown agent `{agent_alias}` — no [agents.{agent_alias}] entry configured"
                 ),
+                data: None,
             }),
             Some(agent) if !agent.is_dispatchable() => Err(RpcError {
                 code: INVALID_PARAMS,
                 message: format!("Agent `{agent_alias}` is not enabled for dispatch"),
+                data: None,
             }),
             Some(_) => Ok(()),
         }
@@ -667,6 +670,7 @@ impl AcpServer {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let config = self.config_snapshot();
+
         // Every ACP session is bound to an explicit agent alias.
         // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`,
         // then the connection-scoped default (`?agent=`), then
@@ -699,6 +703,7 @@ impl AcpServer {
                 message: "session/new requires `agentAlias` (alias of a configured \
                           [agents.<alias>] entry)"
                     .to_string(),
+                data: None,
             })?;
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
 
@@ -732,6 +737,7 @@ impl AcpServer {
                         "cwd is not a usable directory ({}): {e}",
                         requested.display()
                     ),
+                    data: None,
                 })?;
                 if canon == install_root {
                     config.agent_workspace_dir(&agent_alias)
@@ -768,6 +774,7 @@ impl AcpServer {
                         "Maximum session limit reached ({})",
                         self.acp_config.max_sessions
                     ),
+                    data: None,
                 });
             }
             loading.insert(session_id.clone());
@@ -832,6 +839,7 @@ impl AcpServer {
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to create agent: {error}"),
+                    data: None,
                 });
             }
         };
@@ -871,6 +879,7 @@ impl AcpServer {
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to persist session: {detail}"),
+                    data: None,
                 });
             }
         }
@@ -937,12 +946,14 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
+                data: None,
             })?
             .to_string();
 
         let store = self.store.as_ref().ok_or_else(|| RpcError {
             code: SESSION_NOT_FOUND,
             message: format!("Session not found: {session_id}"),
+            data: None,
         })?;
 
         // Atomically check and reserve the session slot
@@ -969,6 +980,7 @@ impl AcpServer {
                         "Maximum session limit reached ({})",
                         self.acp_config.max_sessions
                     ),
+                    data: None,
                 });
             }
             if sessions.contains_key(&session_id) || loading.contains(&session_id) {
@@ -985,6 +997,7 @@ impl AcpServer {
                     message: format!(
                         "Session already active: {session_id}. Call session/close first."
                     ),
+                    data: None,
                 });
             }
             loading.insert(session_id.clone());
@@ -998,11 +1011,13 @@ impl AcpServer {
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to load session: {e}"),
+                data: None,
             })
             .and_then(|opt| {
                 opt.ok_or_else(|| RpcError {
                     code: SESSION_NOT_FOUND,
                     message: format!("Session not found: {session_id}"),
+                    data: None,
                 })
             });
 
@@ -1035,6 +1050,7 @@ impl AcpServer {
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to create agent: {e}"),
+                data: None,
             });
 
         let mut agent = match agent_result {
@@ -1147,12 +1163,14 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
+                data: None,
             })?
             .to_string();
 
         let store = self.store.as_ref().ok_or_else(|| RpcError {
             code: SESSION_NOT_FOUND,
             message: format!("Session not found: {session_id}"),
+            data: None,
         })?;
 
         // Atomically check and reserve the session slot
@@ -1179,6 +1197,7 @@ impl AcpServer {
                         "Maximum session limit reached ({})",
                         self.acp_config.max_sessions
                     ),
+                    data: None,
                 });
             }
             if sessions.contains_key(&session_id) || loading.contains(&session_id) {
@@ -1195,6 +1214,7 @@ impl AcpServer {
                     message: format!(
                         "Session already active: {session_id}. Call session/close first."
                     ),
+                    data: None,
                 });
             }
             loading.insert(session_id.clone());
@@ -1205,11 +1225,13 @@ impl AcpServer {
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to load session: {e}"),
+                data: None,
             })
             .and_then(|opt| {
                 opt.ok_or_else(|| RpcError {
                     code: SESSION_NOT_FOUND,
                     message: format!("Session not found: {session_id}"),
+                    data: None,
                 })
             });
 
@@ -1242,6 +1264,7 @@ impl AcpServer {
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("Failed to create agent: {e}"),
+                data: None,
             });
 
         let mut agent = match agent_result {
@@ -1340,6 +1363,7 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
+                data: None,
             })?;
 
         // Fire the cancel token for any in-flight turn before acquiring the session lock.
@@ -1365,6 +1389,7 @@ impl AcpServer {
             sessions.remove(session_id).ok_or_else(|| RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
+                data: None,
             })?
         };
 
@@ -1408,6 +1433,7 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
+                data: None,
             })?
             .to_string();
 
@@ -1419,6 +1445,7 @@ impl AcpServer {
             sessions.get(&session_id).cloned().ok_or_else(|| RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
+                data: None,
             })?
         };
 
@@ -1635,6 +1662,7 @@ impl AcpServer {
         let turn_result = turn_handle.await.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
             message: format!("Agent task panicked: {e}"),
+            data: None,
         })?;
 
         // Per ACP spec: a cancelled turn must respond with stopReason "cancelled",
@@ -1661,19 +1689,17 @@ impl AcpServer {
         }
 
         let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
+            let (diagnostic, rpc_error) = acp_turn_failure(&e);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "error": e.to_string(),
-                    })),
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error": diagnostic,
+                })),
                 "ACP session/prompt turn failed"
             );
-            RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("Agent turn failed: {e}"),
-            }
+            rpc_error
         })?;
 
         // Persist new messages on successful, non-cancelled turns.
@@ -1769,6 +1795,7 @@ impl AcpServer {
             return Err(RpcError {
                 code: SESSION_BUSY,
                 message: format!("Session already has an active prompt turn: {session_id}"),
+                data: None,
             });
         }
         tokens.insert(session_id.to_string(), cancel_token);
@@ -1846,11 +1873,13 @@ impl AcpServer {
                                 code: INVALID_PARAMS,
                                 message: "resource.blob requires an active session workspace"
                                     .to_string(),
+                                data: None,
                             });
                         }
                         acp_embedded::decode_embedded_blob(blob).map_err(|e| RpcError {
                             code: INVALID_PARAMS,
                             message: e.0,
+                            data: None,
                         })?;
                     }
                 }
@@ -1882,6 +1911,7 @@ impl AcpServer {
                                     code: INVALID_PARAMS,
                                     message: "resource.blob requires an active session workspace"
                                         .to_string(),
+                                    data: None,
                                 });
                             };
                             let uri = res.get("uri").and_then(|v| v.as_str());
@@ -1891,6 +1921,7 @@ impl AcpServer {
                                     .map_err(|e| RpcError {
                                         code: INVALID_PARAMS,
                                         message: e.0,
+                                        data: None,
                                     })?;
                             if added || !joined.is_empty() {
                                 joined.push_str("\n\n");
@@ -1904,6 +1935,7 @@ impl AcpServer {
                         code: INVALID_PARAMS,
                         message: "Parameter 'prompt' array must contain at least one text part"
                             .to_string(),
+                        data: None,
                     });
                 }
                 Ok(joined)
@@ -1912,6 +1944,7 @@ impl AcpServer {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: prompt (must be string or array of parts)"
                     .to_string(),
+                data: None,
             }),
         }
     }
@@ -1924,6 +1957,7 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
+                data: None,
             })?;
 
         let session_arc = {
@@ -1931,6 +1965,7 @@ impl AcpServer {
             sessions.remove(session_id).ok_or_else(|| RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
+                data: None,
             })?
         };
 
@@ -1970,6 +2005,7 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
+                data: None,
             })?;
 
         let token = self
@@ -2001,6 +2037,7 @@ impl AcpServer {
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: sessionId".to_string(),
+                data: None,
             })?
             .to_string();
 
@@ -2041,6 +2078,7 @@ impl AcpServer {
             Err(RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
+                data: None,
             })
         }
     }
@@ -2552,6 +2590,40 @@ fn history_notifications_for_message(
 struct RpcError {
     code: i32,
     message: String,
+    /// Reserved for JSON-RPC structured error data. The ACP writer currently
+    /// deliberately omits it, so terminal-turn failures use it internally to
+    /// retain their stable diagnostic while `message` carries localized text.
+    data: Option<Value>,
+}
+
+impl RpcError {
+    fn diagnostic(&self) -> &str {
+        self.data
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap_or(&self.message)
+    }
+}
+
+/// Keep the stable diagnostic used by logs separate from the localized text
+/// exposed through the ACP JSON-RPC boundary.
+fn acp_turn_failure(error: &anyhow::Error) -> (String, RpcError) {
+    let diagnostic = error.to_string();
+    let user_message = zeroclaw_runtime::agent::terminal_completion_error_message(error, None);
+    (
+        diagnostic.clone(),
+        acp_turn_failure_from_parts(&diagnostic, user_message.as_deref()),
+    )
+}
+
+fn acp_turn_failure_from_parts(diagnostic: &str, user_message: Option<&str>) -> RpcError {
+    RpcError {
+        code: INTERNAL_ERROR,
+        message: user_message
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Agent turn failed: {diagnostic}")),
+        data: Some(Value::String(diagnostic.to_owned())),
+    }
 }
 
 type RpcResult = std::result::Result<Value, RpcError>;
@@ -2559,6 +2631,180 @@ type RpcResult = std::result::Result<Value, RpcError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use zeroclaw_api::model_provider::ModelProvider;
+
+    struct EmptyTerminalProvider;
+
+    #[async_trait]
+    impl ModelProvider for EmptyTerminalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyTerminalProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "EmptyTerminalProvider"
+        }
+    }
+
+    fn acp_test_agent(workspace_dir: std::path::PathBuf) -> Agent {
+        Agent::builder()
+            .model_provider(Box::new(EmptyTerminalProvider))
+            .tools(Vec::new())
+            .observer(Arc::from(zeroclaw_runtime::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(workspace_dir)
+            .exclude_memory(true)
+            .build()
+            .expect("test agent must build")
+    }
+
+    #[test]
+    fn acp_terminal_failure_keeps_diagnostic_out_of_localized_delivery() {
+        let diagnostic = "provider completed without final text or tool calls";
+        let localized = "Réponse terminale invalide.";
+
+        let error = acp_turn_failure_from_parts(diagnostic, Some(localized));
+
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.message, "Réponse terminale invalide.");
+        assert!(
+            !error.message.contains(diagnostic),
+            "ACP must not expose the stable diagnostic when Fluent supplies delivery text"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_projects_a_terminal_failure_through_acp_rpc() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+        let session = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = session["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session must be registered");
+        session.lock().await.agent = acp_test_agent(cwd.path().to_path_buf());
+
+        let error = server
+            .handle_session_prompt(
+                &serde_json::json!({"sessionId": session_id, "prompt": "hello"}),
+                &serde_json::json!(1),
+            )
+            .await
+            .expect_err("a terminal empty completion must become an ACP error");
+
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(
+            error.message,
+            zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+        );
+        assert_ne!(
+            error.message, "provider completed without final text or tool calls",
+            "ACP wire delivery must not expose the stable diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_line_serializes_terminal_failure_without_relogging_localized_text() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+        ));
+        let session = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = session["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session must be registered");
+        session.lock().await.agent = acp_test_agent(cwd.path().to_path_buf());
+
+        server
+            .process_line(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "session/prompt",
+                    "params": {"sessionId": session_id, "prompt": "hello"}
+                })
+                .to_string(),
+            )
+            .await;
+        let wire = tokio::time::timeout(Duration::from_secs(5), writer_rx.recv())
+            .await
+            .expect("serialized ACP response deadline")
+            .expect("serialized ACP response");
+        let response: Value = serde_json::from_str(&wire).expect("valid JSON-RPC");
+        let error = &response["error"];
+
+        assert_eq!(error["code"], INTERNAL_ERROR);
+        assert_eq!(
+            error["message"],
+            zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+        );
+        assert_ne!(
+            error["message"], "provider completed without final text or tool calls",
+            "only the localized delivery projection may reach the ACP wire"
+        );
+
+        let error = acp_turn_failure_from_parts(
+            "provider completed without final text or tool calls",
+            Some("Réponse terminale invalide."),
+        );
+        assert_eq!(
+            error.diagnostic(),
+            "provider completed without final text or tool calls"
+        );
+        assert_eq!(error.message, "Réponse terminale invalide.");
+    }
 
     /// Upper bound for "this must not deadlock" waits in these tests.
     ///
