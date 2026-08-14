@@ -3676,13 +3676,10 @@ fn should_copy_action(
     use crate::keymap::ChatTabAction;
 
     match action {
-        Some(ChatTabAction::CopySelection) => {
+        Some(action @ (ChatTabAction::CopySelection | ChatTabAction::CopyAllVisible)) => {
             state.in_browse_mode()
                 || (state.transcript_selection.is_some()
-                    && crate::keymap::action_bypasses_text_input(ChatTabAction::CopySelection, key))
-        }
-        Some(ChatTabAction::CopyAllVisible) => {
-            state.in_browse_mode() || state.transcript_selection.is_some()
+                    && crate::keymap::action_bypasses_text_input(action, key))
         }
         _ => false,
     }
@@ -7504,6 +7501,7 @@ mod tests {
 
     #[test]
     fn copy_shortcuts_do_not_swallow_normal_y_input() {
+        use crate::keymap::ChatTabAction;
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let mut state = state();
@@ -7513,6 +7511,7 @@ mod tests {
             KeyCode::Char('C'),
             KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
         );
+        let bare_custom_copy_all = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
 
         assert!(!should_copy_current_selection(&state, &y));
 
@@ -7525,6 +7524,11 @@ mod tests {
         assert!(!should_copy_current_selection(&state, &y));
         assert!(should_copy_current_selection(&state, &command_c));
         assert!(should_copy_current_selection(&state, &terminal_copy));
+        assert!(!should_copy_action(
+            &state,
+            &bare_custom_copy_all,
+            Some(ChatTabAction::CopyAllVisible),
+        ));
 
         state.transcript_selection = None;
         state
