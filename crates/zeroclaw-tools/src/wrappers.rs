@@ -549,8 +549,7 @@ mod tests {
             },
             sec.clone(),
         );
-        let call =
-            zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        let call = zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
         entered.notified().await;
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
@@ -595,8 +594,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool = RateLimitedTool::new(PanickingTool, sec.clone());
-        let call =
-            zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        let call = zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
         assert!(call.await.unwrap_err().is_panic());
 
         let (inner, calls) = CountingTool::new();
