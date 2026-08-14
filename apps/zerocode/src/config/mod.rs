@@ -65,11 +65,10 @@ fn migrate_legacy_help_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
 
 fn migrate_legacy_copy_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
     let key = ChatTabAction::CopySelection.action_key();
-    let legacy = [Chord::char('y')];
-    let Some(spec) = rows.get(&key) else {
+    let Some(ChordSpec::Many(chords)) = rows.get(&key) else {
         return false;
     };
-    if spec.as_slice() != legacy {
+    if chords.as_slice() != [Chord::char('y')] {
         return false;
     }
 
@@ -961,6 +960,29 @@ mod tests {
             vec![Chord::char('y'), "alt+c".parse::<Chord>().unwrap()]
         );
         assert!(read(dir.path()).contains("alt+c"));
+    }
+
+    #[test]
+    fn bare_copy_binding_is_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.copy_selection\" = \"y\"\n\"global.help\" = [\"?\", \"f1\", \"ctrl+f1\"]\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(resolved["chat"]["copy_selection"], vec![Chord::char('y')]);
+        assert_eq!(
+            resolved["global"]["help"],
+            vec![Chord::char('?'), Chord::ctrl('g')]
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["keybindings"]["chat.copy_selection"].as_str(),
+            Some("y")
+        );
     }
 
     #[test]
