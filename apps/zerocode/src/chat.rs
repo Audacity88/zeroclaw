@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -3665,11 +3665,20 @@ fn context_menu_copy_label() -> String {
 fn should_copy_current_selection(state: &ChatState, key: &KeyEvent) -> bool {
     use crate::keymap::ChatTabAction;
 
-    match ChatTabAction::from_chord(key) {
+    should_copy_action(state, key, ChatTabAction::from_chord(key))
+}
+
+fn should_copy_action(
+    state: &ChatState,
+    key: &KeyEvent,
+    action: Option<crate::keymap::ChatTabAction>,
+) -> bool {
+    use crate::keymap::ChatTabAction;
+
+    match action {
         Some(ChatTabAction::CopySelection) => {
-            state.in_browse_mode()
-                || (state.transcript_selection.is_some()
-                    && key.modifiers.contains(KeyModifiers::SUPER))
+            let is_plain_y = key.code == KeyCode::Char('y') && key.modifiers.is_empty();
+            state.in_browse_mode() || (state.transcript_selection.is_some() && !is_plain_y)
         }
         Some(ChatTabAction::CopyAllVisible) => {
             state.in_browse_mode() || state.transcript_selection.is_some()
@@ -5532,19 +5541,11 @@ impl ChatState {
     }
 
     fn clear_transcript_selection(&mut self) {
-        let changed = self.transcript_selection.is_some()
-            || !self.copy_hit_regions.is_empty()
-            || !self.context_copy_regions.is_empty()
-            || self.copy_context_menu.is_some()
-            || self.copy_feedback.is_some();
         self.transcript_selection = None;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.copy_context_menu = None;
         self.copy_feedback = None;
-        if changed {
-            self.mark_dirty_full();
-        }
     }
 
     fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
@@ -5616,27 +5617,24 @@ impl ChatState {
     }
 
     fn clear_mouse_highlight(&mut self) {
-        let had_mouse_down = self.mouse_down_entry.take().is_some();
+        self.mouse_down_entry = None;
         self.clear_transcript_selection();
-        if had_mouse_down {
-            self.mark_dirty_full();
-        }
     }
 
     fn clear_browse_selection(&mut self) {
-        if self.mouse_down_entry.is_some()
+        let lines_changed = self.mouse_down_entry.is_some()
             || self.browse_cursor.is_some()
             || self.browse_anchor.is_some()
-            || !self.browse_multi.is_empty()
-            || self.copy_context_menu.is_some()
-            || self.copy_feedback.is_some()
-        {
+            || !self.browse_multi.is_empty();
+        if lines_changed || self.copy_context_menu.is_some() || self.copy_feedback.is_some() {
             self.mouse_down_entry = None;
             self.browse_cursor = None;
             self.browse_anchor = None;
             self.browse_multi.clear();
             self.copy_context_menu = None;
             self.copy_feedback = None;
+        }
+        if lines_changed {
             self.mark_dirty_full();
         }
     }
@@ -5681,15 +5679,14 @@ impl ChatState {
     }
 
     fn current_selection_text(&self) -> String {
-        self.transcript_selected_text()
-            .filter(|text| !text.is_empty())
-            .unwrap_or_else(|| self.yank_selection())
+        if self.transcript_selection.is_some() {
+            return self.transcript_selected_text().unwrap_or_default();
+        }
+        self.yank_selection()
     }
 
     fn dismiss_copy_context_menu(&mut self) {
-        if self.copy_context_menu.take().is_some() {
-            self.mark_dirty_full();
-        }
+        self.copy_context_menu = None;
     }
 
     fn open_copy_context_menu(&mut self, column: u16, row: u16) -> bool {
@@ -5704,15 +5701,23 @@ impl ChatState {
             return false;
         }
 
-        let selected_target = self.transcript_selection.and_then(|selection| {
-            let snapshot = self.transcript_snapshot.as_ref()?;
-            Some(CopyHitRegion {
-                rect: snapshot.selection_anchor_rect(selection)?,
-                text: snapshot.selected_text(selection)?,
-                kind: CopyHitKind::Transcript,
-                group: 0,
-            })
-        });
+        let selected_target = match self.transcript_selection {
+            Some(selection) => {
+                let Some(snapshot) = self.transcript_snapshot.as_ref() else {
+                    return false;
+                };
+                let Some(text) = snapshot.selected_text(selection) else {
+                    return false;
+                };
+                Some(CopyHitRegion {
+                    rect: snapshot.selection_anchor_rect(selection)?,
+                    text,
+                    kind: CopyHitKind::Transcript,
+                    group: 0,
+                })
+            }
+            None => None,
+        };
 
         // Code blocks are nested inside message rows, so resolve their more
         // specific target before falling back to the containing message.
@@ -5743,7 +5748,6 @@ impl ChatState {
             return false;
         };
         self.copy_context_menu = Some(CopyContextMenu { rect, target });
-        self.mark_dirty_full();
         true
     }
 
@@ -5752,7 +5756,6 @@ impl ChatState {
             return false;
         };
         if menu.target.text.is_empty() {
-            self.mark_dirty_full();
             return false;
         }
 
@@ -6738,7 +6741,6 @@ impl ChatState {
     /// and consistent rendering with model-switch notes.
     pub fn set_info_notice(&mut self, msg: String) {
         self.info_message = Some(crate::widgets::InfoMessage::note(msg));
-        self.mark_dirty_full();
     }
 
     fn set_overlay_copy_feedback(&mut self, anchor: Rect) {
@@ -6752,14 +6754,12 @@ impl ChatState {
             target,
             shown_at: Instant::now(),
         });
-        self.mark_dirty_full();
     }
 
     /// Drop the active info-bar message (on submit, inject, or turn start).
     pub fn clear_info_notice(&mut self) {
-        if self.info_message.take().is_some() || self.copy_feedback.take().is_some() {
-            self.mark_dirty_full();
-        }
+        self.info_message = None;
+        self.copy_feedback = None;
     }
 
     fn expire_copy_feedback(&mut self) {
@@ -6768,7 +6768,6 @@ impl ChatState {
             .is_some_and(|feedback| feedback.shown_at.elapsed() >= COPY_FEEDBACK_TTL);
         if expired {
             self.copy_feedback = None;
-            self.mark_dirty_full();
         }
     }
 
@@ -7316,6 +7315,27 @@ mod tests {
     }
 
     #[test]
+    fn empty_character_selection_never_falls_back_to_another_copy_target() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello   ")));
+        state.transcript_snapshot =
+            Some(transcript_snapshot(Rect::new(10, 5, 10, 1), &["hello   "]));
+        state.entry_rects.push((0, Rect::new(10, 5, 8, 1)));
+        state.browse_cursor = Some(0);
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 5, row: 0 },
+            head: CellPoint { column: 7, row: 0 },
+            dragged: true,
+        });
+
+        assert!(state.current_selection_text().is_empty());
+        assert!(!state.open_copy_context_menu(10, 5));
+        assert!(state.copy_context_menu.is_none());
+    }
+
+    #[test]
     fn context_menu_prefers_code_block_over_containing_message() {
         let mut state = state();
         state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
@@ -7352,14 +7372,17 @@ mod tests {
         ));
         state.entry_rects.push((0, Rect::new(0, 0, 5, 1)));
         state.browse_cursor = Some(0);
+        state.dirty = LinesDirty::Clean;
 
         assert!(state.open_copy_context_menu(1, 0));
+        assert_eq!(state.dirty, LinesDirty::Clean);
         state.dismiss_copy_context_menu();
 
         assert!(state.copy_context_menu.is_none());
         assert_eq!(state.browse_cursor, Some(0));
         assert!(state.info_message.is_none());
         assert_eq!(state.copy_feedback, None);
+        assert_eq!(state.dirty, LinesDirty::Clean);
     }
 
     #[test]
@@ -7429,7 +7452,6 @@ mod tests {
         state
             .entries
             .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
-        state.browse_cursor = Some(0);
         state.transcript_snapshot = Some(transcript_snapshot(
             Rect::new(0, 0, 12, 1),
             &["visible text"],
@@ -7439,6 +7461,7 @@ mod tests {
             head: CellPoint { column: 6, row: 0 },
             dragged: true,
         });
+        state.dirty = LinesDirty::Clean;
 
         assert!(state.copy_current_selection());
         assert_eq!(state.transcript_selection, None);
@@ -7451,8 +7474,10 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(state.dirty, LinesDirty::Clean);
 
         state.browse_cursor = Some(0);
+        state.dirty = LinesDirty::Clean;
         state.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(0, 0, 8, 1),
             text: "whole message".to_string(),
@@ -7461,6 +7486,7 @@ mod tests {
         });
         assert!(state.copy_current_selection());
         assert_eq!(state.browse_cursor, None);
+        assert_eq!(state.dirty, LinesDirty::Full);
         assert!(matches!(
             state.copy_feedback,
             Some(CopyFeedback {
@@ -7472,6 +7498,7 @@ mod tests {
 
     #[test]
     fn copy_shortcuts_do_not_swallow_normal_y_input() {
+        use crate::keymap::ChatTabAction;
         use crossterm::event::KeyCode;
 
         let mut state = state();
@@ -7481,6 +7508,7 @@ mod tests {
             KeyCode::Char('C'),
             KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
         );
+        let custom_copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
 
         assert!(!should_copy_current_selection(&state, &y));
 
@@ -7493,6 +7521,11 @@ mod tests {
         assert!(!should_copy_current_selection(&state, &y));
         assert!(should_copy_current_selection(&state, &command_c));
         assert!(should_copy_current_selection(&state, &terminal_copy));
+        assert!(should_copy_action(
+            &state,
+            &custom_copy,
+            Some(ChatTabAction::CopySelection)
+        ));
 
         state.transcript_selection = None;
         state
@@ -9043,8 +9076,8 @@ mod tests {
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
             state.dirty,
-            LinesDirty::Full,
-            "clearing the highlight must invalidate rendered transcript lines"
+            LinesDirty::Clean,
+            "clearing an overlay-only selection must preserve cached transcript lines"
         );
     }
 
@@ -9168,8 +9201,8 @@ mod tests {
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
             state.dirty,
-            LinesDirty::Full,
-            "clearing the highlight must invalidate rendered transcript lines"
+            LinesDirty::Clean,
+            "clearing an overlay-only selection must preserve cached transcript lines"
         );
     }
 
