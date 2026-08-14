@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -3677,8 +3677,9 @@ fn should_copy_action(
 
     match action {
         Some(ChatTabAction::CopySelection) => {
-            let is_plain_y = key.code == KeyCode::Char('y') && key.modifiers.is_empty();
-            state.in_browse_mode() || (state.transcript_selection.is_some() && !is_plain_y)
+            state.in_browse_mode()
+                || (state.transcript_selection.is_some()
+                    && crate::keymap::action_bypasses_text_input(ChatTabAction::CopySelection, key))
         }
         Some(ChatTabAction::CopyAllVisible) => {
             state.in_browse_mode() || state.transcript_selection.is_some()
@@ -7503,7 +7504,6 @@ mod tests {
 
     #[test]
     fn copy_shortcuts_do_not_swallow_normal_y_input() {
-        use crate::keymap::ChatTabAction;
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let mut state = state();
@@ -7513,7 +7513,6 @@ mod tests {
             KeyCode::Char('C'),
             KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
         );
-        let custom_copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
 
         assert!(!should_copy_current_selection(&state, &y));
 
@@ -7526,11 +7525,6 @@ mod tests {
         assert!(!should_copy_current_selection(&state, &y));
         assert!(should_copy_current_selection(&state, &command_c));
         assert!(should_copy_current_selection(&state, &terminal_copy));
-        assert!(should_copy_action(
-            &state,
-            &custom_copy,
-            Some(ChatTabAction::CopySelection)
-        ));
 
         state.transcript_selection = None;
         state
