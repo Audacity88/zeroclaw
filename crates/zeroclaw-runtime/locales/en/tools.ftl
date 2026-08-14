@@ -56,7 +56,7 @@ tool-cron-runs = List recent run history for a cron job
 
 tool-cron-update = Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)
 
-tool-data-management = Workspace data retention, purge, and storage statistics
+tool-data-management = Workspace retention preview and storage statistics
 
 tool-delegate = Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop.
 
@@ -101,12 +101,8 @@ tool-filesystem-boundary-error-symlink = Refusing to follow a symlink at '{ $pat
 tool-filesystem-boundary-error-contained = Path must be relative and contained: '{ $path }'
 tool-filesystem-boundary-error-not-directory = Path component is not a directory: '{ $path }'
 tool-filesystem-boundary-error-not-regular = Refusing to open a non-regular file: '{ $path }'
-tool-data-management-error-purge-platform = Confirmed purge is unavailable on this platform because an atomic no-replace quarantine rename is not supported
-tool-data-management-error-action-blocked = Confirmed purge is blocked by the security policy
+tool-data-management-error-purge-disabled = Confirmed purge is unavailable; use dry_run to preview eligible files
 tool-data-management-error-read-blocked = Workspace path is not readable under the security policy: '{ $path }'
-tool-data-management-error-write-blocked = Retention candidate is not writable under the security policy: '{ $path }'
-tool-data-management-error-candidate-changed = Retention candidate changed before deletion: '{ $path }'
-tool-data-management-error-staging-exists = Retention staging path already exists: '{ $path }'
 tool-backup-error-max-keep = Backup retention max_keep must be at least 1
 tool-backup-error-action-blocked = Backup mutation is blocked by the security policy
 tool-backup-error-source-overlap = Backup source cannot contain the backup output directory: '{ $path }'
