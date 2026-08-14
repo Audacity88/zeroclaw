@@ -337,7 +337,8 @@ mod tests {
             },
             sec.clone(),
         );
-        let first_call = tokio::spawn(async move { first.execute(serde_json::json!({})).await });
+        let first_call =
+            zeroclaw_spawn::spawn!(async move { first.execute(serde_json::json!({})).await });
         entered.notified().await;
 
         let (second_inner, second_calls) = CountingTool::new();
@@ -548,7 +549,8 @@ mod tests {
             },
             sec.clone(),
         );
-        let call = tokio::spawn(async move { tool.execute(serde_json::json!({})).await });
+        let call =
+            zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
         entered.notified().await;
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
@@ -593,7 +595,8 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool = RateLimitedTool::new(PanickingTool, sec.clone());
-        let call = tokio::spawn(async move { tool.execute(serde_json::json!({})).await });
+        let call =
+            zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
         assert!(call.await.unwrap_err().is_panic());
 
         let (inner, calls) = CountingTool::new();
