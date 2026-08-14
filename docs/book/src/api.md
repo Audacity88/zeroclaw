@@ -32,7 +32,7 @@ The trait definitions are the source of truth for exact methods, defaults, and t
 | [`zeroclaw-plugins`](/api/zeroclaw_plugins/index.html) | WASM plugin host |
 | [`zeroclaw-hardware`](/api/zeroclaw_hardware/index.html) | GPIO / I2C / SPI / USB |
 | [`zeroclaw-log`](/api/zeroclaw_log/index.html) | Workspace logging and observability integration |
-| [`zeroclaw-infra`](/api/zeroclaw_infra/index.html) | Process and session infrastructure |
+| [`zeroclaw-infra`](/api/zeroclaw_infra/index.html) | Channel session backends, debouncing, and stall watchdog |
 
 See [Architecture → Crates](./architecture/crates.md) for a plain-English description of how the crates fit together.
 
