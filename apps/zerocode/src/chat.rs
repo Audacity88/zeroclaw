@@ -7288,7 +7288,7 @@ mod tests {
         state
             .entries
             .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
-        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 10, 1), &["hello"]));
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 10, 3), &["hello"]));
         state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
         state.transcript_selection = Some(TranscriptSelection {
             anchor: CellPoint { column: 1, row: 0 },
