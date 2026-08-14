@@ -2409,7 +2409,11 @@ impl Chat {
                 _ => {}
             }
 
-            if let MouseEventKind::Down(MouseButton::Right) = mouse.kind {
+            let opens_context_menu = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                || (cfg!(target_os = "macos")
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && mouse.modifiers.contains(KM::CONTROL));
+            if opens_context_menu {
                 state.open_copy_context_menu(col, row);
                 return;
             }
@@ -9250,7 +9254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modifier_click_does_not_copy_whole_message_outside_browse_mode() {
+    async fn control_click_uses_platform_secondary_click_behavior() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -9295,6 +9299,11 @@ mod tests {
         assert_eq!(
             state.browse_cursor, None,
             "modifier-click outside browse mode should not select the whole message"
+        );
+        assert_eq!(
+            state.copy_context_menu.is_some(),
+            cfg!(target_os = "macos"),
+            "Control+click should open the context menu only on macOS"
         );
     }
 
