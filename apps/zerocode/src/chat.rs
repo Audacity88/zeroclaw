@@ -5704,27 +5704,38 @@ impl ChatState {
             return false;
         }
 
+        let selected_target = self.transcript_selection.and_then(|selection| {
+            let snapshot = self.transcript_snapshot.as_ref()?;
+            Some(CopyHitRegion {
+                rect: snapshot.selection_anchor_rect(selection)?,
+                text: snapshot.selected_text(selection)?,
+                kind: CopyHitKind::Transcript,
+                group: 0,
+            })
+        });
+
         // Code blocks are nested inside message rows, so resolve their more
-        // specific target first.
-        let target = self
-            .context_copy_regions
-            .iter()
-            .find(|region| mouse::in_rect(column, row, region.rect))
-            .cloned()
-            .or_else(|| {
-                self.entry_rects
-                    .iter()
-                    .find(|(_, rect)| row >= rect.y && row < rect.y.saturating_add(rect.height))
-                    .and_then(|(idx, rect)| {
-                        let text = self.yank_single_entry(*idx);
-                        (!text.is_empty()).then_some(CopyHitRegion {
-                            rect: *rect,
-                            text,
-                            kind: CopyHitKind::Message,
-                            group: *idx,
+        // specific target before falling back to the containing message.
+        let target = selected_target.or_else(|| {
+            self.context_copy_regions
+                .iter()
+                .find(|region| mouse::in_rect(column, row, region.rect))
+                .cloned()
+                .or_else(|| {
+                    self.entry_rects
+                        .iter()
+                        .find(|(_, rect)| row >= rect.y && row < rect.y.saturating_add(rect.height))
+                        .and_then(|(idx, rect)| {
+                            let text = self.yank_single_entry(*idx);
+                            (!text.is_empty()).then_some(CopyHitRegion {
+                                rect: *rect,
+                                text,
+                                kind: CopyHitKind::Message,
+                                group: *idx,
+                            })
                         })
-                    })
-            });
+                })
+        });
         let Some(target) = target else {
             return false;
         };
@@ -7266,6 +7277,39 @@ mod tests {
         state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
 
         assert!(state.open_copy_context_menu(35, 5));
+        let menu = state.copy_context_menu.as_ref().expect("menu opens");
+        assert_eq!(menu.target.kind, CopyHitKind::Message);
+        assert_eq!(menu.target.text, "hello");
+    }
+
+    #[test]
+    fn context_menu_prefers_active_selected_text_until_selection_is_cleared() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 10, 1), &["hello"]));
+        state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 1, row: 0 },
+            head: CellPoint { column: 3, row: 0 },
+            dragged: true,
+        });
+
+        assert!(state.open_copy_context_menu(12, 5));
+        let menu = state.copy_context_menu.as_ref().expect("menu opens");
+        assert_eq!(menu.target.kind, CopyHitKind::Transcript);
+        assert_eq!(menu.target.text, "ell");
+
+        state.dismiss_copy_context_menu();
+        assert!(state.open_copy_context_menu(10, 5));
+        let menu = state.copy_context_menu.as_ref().expect("menu opens");
+        assert_eq!(menu.target.kind, CopyHitKind::Transcript);
+        assert_eq!(menu.target.text, "ell");
+
+        state.dismiss_copy_context_menu();
+        state.clear_transcript_selection();
+        assert!(state.open_copy_context_menu(10, 5));
         let menu = state.copy_context_menu.as_ref().expect("menu opens");
         assert_eq!(menu.target.kind, CopyHitKind::Message);
         assert_eq!(menu.target.text, "hello");
