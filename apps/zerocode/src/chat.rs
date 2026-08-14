@@ -2428,11 +2428,9 @@ impl Chat {
                             })
                             .cloned()
                         {
-                            if !region.text.is_empty() {
-                                crate::mouse::copy_osc52(&region.text);
+                            if state.copy_text_and_clear_selection(&region.text) {
                                 match region.kind {
                                     CopyHitKind::Code => {
-                                        state.clear_mouse_highlight();
                                         state.set_copy_feedback(CopyFeedbackTarget::Code(
                                             region.group,
                                         ));
@@ -2442,7 +2440,6 @@ impl Chat {
                                     }
                                     CopyHitKind::Message => {}
                                 }
-                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
                             }
                         } else {
                             state.clear_mouse_highlight();
@@ -2470,22 +2467,18 @@ impl Chat {
                         .find(|r| mouse::in_rect(col, row, r.rect))
                         .cloned()
                     {
-                        if !region.text.is_empty() {
-                            crate::mouse::copy_osc52(&region.text);
+                        if state.copy_text_and_clear_selection(&region.text) {
                             match region.kind {
                                 CopyHitKind::Code => {
-                                    state.clear_mouse_highlight();
                                     state.set_copy_feedback(CopyFeedbackTarget::Code(region.group));
                                 }
                                 CopyHitKind::Message => {
-                                    state.clear_browse_selection();
                                     state.set_overlay_copy_feedback(region.rect);
                                 }
                                 CopyHitKind::Transcript => {
                                     state.set_overlay_copy_feedback(region.rect);
                                 }
                             }
-                            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
                         }
                         return;
                     }
@@ -5653,10 +5646,16 @@ impl ChatState {
 
     fn copy_current_selection(&mut self) -> bool {
         let text = self.current_selection_text();
+        self.copy_text_and_clear_selection(&text)
+    }
+
+    fn copy_text_and_clear_selection(&mut self, text: &str) -> bool {
         if text.is_empty() {
             return false;
         }
-        crate::mouse::copy_osc52(&text);
+        crate::mouse::copy_osc52(text);
+        self.clear_mouse_highlight();
+        self.clear_browse_selection();
         self.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
         true
     }
@@ -5726,9 +5725,7 @@ impl ChatState {
             return false;
         }
 
-        crate::mouse::copy_osc52(&menu.target.text);
-        self.clear_mouse_highlight();
-        self.clear_browse_selection();
+        self.copy_text_and_clear_selection(&menu.target.text);
         match menu.target.kind {
             CopyHitKind::Code => {
                 self.set_copy_feedback(CopyFeedbackTarget::Code(menu.target.group));
@@ -5737,7 +5734,6 @@ impl ChatState {
                 self.set_overlay_copy_feedback(menu.target.rect);
             }
         }
-        self.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
         true
     }
 
@@ -7364,6 +7360,33 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_copy_clears_character_and_browse_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.browse_cursor = Some(0);
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 12, 1),
+            &["visible text"],
+        ));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 6, row: 0 },
+            dragged: true,
+        });
+
+        assert!(state.copy_current_selection());
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.browse_cursor, None);
+        assert!(state.info_message.is_some());
+
+        state.browse_cursor = Some(0);
+        assert!(state.copy_current_selection());
+        assert_eq!(state.browse_cursor, None);
+    }
+
+    #[test]
     fn copy_shortcuts_do_not_swallow_normal_y_input() {
         use crossterm::event::KeyCode;
 
@@ -7679,6 +7702,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
+        assert_eq!(state.transcript_selection, None);
         assert!(matches!(
             state.copy_feedback,
             Some(CopyFeedback {
@@ -9341,6 +9365,49 @@ mod tests {
                 target: CopyFeedbackTarget::Code(group),
                 ..
             }) if group == copy_group
+        ));
+    }
+
+    #[tokio::test]
+    async fn browse_mode_code_copy_clears_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```sh\necho hi\n```",
+        )));
+        state.browse_cursor = Some(0);
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(2, 2, 6, 1),
+            text: "echo hi".to_string(),
+            kind: CopyHitKind::Code,
+            group: 0,
+        });
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.browse_cursor, None);
+        assert!(state.info_message.is_some());
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Code(0),
+                ..
+            })
         ));
     }
 
