@@ -315,16 +315,15 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
                 }
                 if migrate_legacy_copy_binding(&mut rows) {
                     let key = ChatTabAction::CopySelection.action_key();
-                    let value = toml::Value::try_from(
-                        rows.get(&key)
-                            .expect("migrated Copy binding remains present")
-                            .clone(),
-                    )
+                    let value = toml::Value::try_from(ChordSpec::Many(
+                        ChatTabAction::CopySelection.default_chords(),
+                    ))
                     .context("serializing migrated Copy binding")?;
-                    doc.get_mut("keybindings")
+                    let bindings = doc
+                        .get_mut("keybindings")
                         .and_then(toml::Value::as_table_mut)
-                        .expect("parsed keybindings remain a table")
-                        .insert(key, value);
+                        .context("accessing parsed keybindings table")?;
+                    bindings.insert(key, value);
                     migrated_keybindings = true;
                 }
                 config.keybindings = rows;

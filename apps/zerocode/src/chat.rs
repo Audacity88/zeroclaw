@@ -9390,6 +9390,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn right_click_copy_context_menu_activation_runs_through_mouse_boundary() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.mark_dirty_full();
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+        let entry_rect = state.entry_rects[0].1;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: entry_rect.x + 1,
+                row: entry_rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let menu_action = {
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            let menu = state.copy_context_menu.as_ref().expect("menu opens");
+            assert!(state.info_message.is_none());
+            (menu.rect.x + 1, menu.rect.y + 1)
+        };
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: menu_action.0,
+                row: menu_action.1,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.copy_context_menu.is_none());
+        assert!(state.info_message.is_some());
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback {
+                target: CopyFeedbackTarget::Overlay(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn outside_click_dismisses_copy_context_menu_without_copying() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.mark_dirty_full();
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+        let entry_rect = state.entry_rects[0].1;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: entry_rect.x + 1,
+                row: entry_rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.copy_context_menu.is_some());
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.copy_context_menu.is_none());
+        assert!(state.info_message.is_none());
+        assert!(state.copy_feedback.is_none());
+    }
+
+    #[tokio::test]
     async fn mouse_up_after_browse_drag_does_not_copy_selection() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
