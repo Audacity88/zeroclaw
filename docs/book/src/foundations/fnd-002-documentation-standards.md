@@ -34,7 +34,7 @@
 | Rev | Date | Summary |
 |---|---|---|
 | 1 | 2026-04-20 | Initial ratified documentation standard |
-| 2 | 2026-06-22 | Changed the foundational plugin ADR target from the Extism model to the Extism-to-WIT transition ([#8061](https://github.com/zeroclaw-labs/zeroclaw/pull/8061)) |
+| 2 | 2026-06-21 | Changed the foundational plugin ADR target from the Extism model to the Extism-to-WIT transition ([#8061](https://github.com/zeroclaw-labs/zeroclaw/pull/8061)) |
 | 3 | 2026-07-05 | Reconciled the canonical ADR location and set, and moved the RFC lifecycle from proposal files and PRs to RFC issues ([#8694](https://github.com/zeroclaw-labs/zeroclaw/pull/8694)) |
 | 4 | 2026-07-14 | Reconciled the foundational ADR backlog with the restored ADR set and separated retroactive records from implementation-gated roadmap decisions ([#9042](https://github.com/zeroclaw-labs/zeroclaw/pull/9042)) |
 | 5 | 2026-07-18 | Added proposed ADR-006 and ADR-007 records for the resolved runtime-channel-plugin and separate-gateway-process targets while keeping acceptance implementation-gated ([#9133](https://github.com/zeroclaw-labs/zeroclaw/pull/9133)) |
