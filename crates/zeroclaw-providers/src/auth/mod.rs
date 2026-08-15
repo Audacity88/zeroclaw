@@ -6,13 +6,14 @@ pub mod openai_oauth;
 pub mod profiles;
 pub mod xai_oauth;
 
-use crate::auth::oauth_common::{RefreshRetryPolicy, refresh_with_retries};
+use crate::auth::oauth_common::{RefreshAttemptError, RefreshRetryPolicy, refresh_with_retries};
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
     AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
 };
 use anyhow::Result;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -705,13 +706,8 @@ async fn refresh_openai_access_token_with_retries(
     client: &reqwest::Client,
     refresh_token: &str,
 ) -> Result<TokenSet> {
-    refresh_with_retries(
-        RefreshRetryPolicy {
-            max_attempts: OAUTH_REFRESH_MAX_ATTEMPTS,
-            base_delay_ms: OAUTH_REFRESH_RETRY_BASE_DELAY_MS,
-        },
+    refresh_oauth_access_token_with_retries(
         || refresh_access_token(client, refresh_token),
-        |_| false,
         |failure| {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": failure.attempt, "max_attempts": failure.max_attempts, "retry": failure.should_retry, "error": format!("{}", failure.error)})), "OpenAI token refresh failed");
         },
@@ -725,15 +721,10 @@ async fn refresh_gemini_access_token_with_retries(
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<TokenSet> {
-    refresh_with_retries(
-        RefreshRetryPolicy {
-            max_attempts: OAUTH_REFRESH_MAX_ATTEMPTS,
-            base_delay_ms: OAUTH_REFRESH_RETRY_BASE_DELAY_MS,
-        },
+    refresh_oauth_access_token_with_retries(
         || {
             gemini_oauth::refresh_access_token(client, client_id, client_secret, refresh_token)
         },
-        |_| false,
         |failure| {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": failure.attempt, "max_attempts": failure.max_attempts, "retry": failure.should_retry, "error": format!("{}", failure.error)})), "Gemini token refresh failed");
         },
@@ -748,11 +739,7 @@ async fn refresh_email_access_token_with_retries(
     refresh_token: &str,
     scopes: &[String],
 ) -> Result<TokenSet> {
-    refresh_with_retries(
-        RefreshRetryPolicy {
-            max_attempts: OAUTH_REFRESH_MAX_ATTEMPTS,
-            base_delay_ms: oauth_refresh_retry_base_delay_ms(),
-        },
+    refresh_oauth_access_token_with_retries(
         || {
             email_oauth2::refresh_access_token(
                 client,
@@ -762,7 +749,6 @@ async fn refresh_email_access_token_with_retries(
                 scopes,
             )
         },
-        is_non_retryable_oauth_refresh_error,
         |failure| {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": failure.attempt, "max_attempts": failure.max_attempts, "retry": failure.should_retry, "non_retryable": failure.non_retryable, "error": format!("{}", failure.error)})), "Email OAuth2 token refresh failed");
         },
@@ -782,14 +768,39 @@ async fn refresh_xai_access_token_with_retries(
     client: &reqwest::Client,
     refresh_token: &str,
 ) -> Result<TokenSet> {
+    refresh_oauth_access_token_with_retries(
+        || crate::auth::xai_oauth::refresh_access_token(client, refresh_token),
+        |_| {},
+    )
+    .await
+}
+
+async fn refresh_oauth_access_token_with_retries<Operation, OperationFuture, Observe>(
+    mut operation: Operation,
+    observe_error: Observe,
+) -> Result<TokenSet>
+where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = Result<TokenSet>>,
+    Observe: FnMut(RefreshAttemptError<'_>),
+{
     refresh_with_retries(
         RefreshRetryPolicy {
             max_attempts: OAUTH_REFRESH_MAX_ATTEMPTS,
-            base_delay_ms: OAUTH_REFRESH_RETRY_BASE_DELAY_MS,
+            base_delay_ms: oauth_refresh_retry_base_delay_ms(),
         },
-        || crate::auth::xai_oauth::refresh_access_token(client, refresh_token),
-        |_| false,
-        |_| {},
+        || {
+            let future = operation();
+            async move {
+                let tokens = future.await?;
+                if tokens.access_token.trim().is_empty() {
+                    anyhow::bail!("Malformed OAuth token response: access_token is empty");
+                }
+                Ok(tokens)
+            }
+        },
+        is_non_retryable_oauth_refresh_error,
+        observe_error,
     )
     .await
 }
@@ -798,8 +809,11 @@ fn is_non_retryable_oauth_refresh_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     let msg_lower = msg.to_lowercase();
 
-    if msg_lower.contains("temporarily_unavailable") || msg_lower.contains("server_error") {
-        return false;
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+    {
+        return true;
     }
 
     let permanent_oauth_hints = [
@@ -817,19 +831,46 @@ fn is_non_retryable_oauth_refresh_error(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-        && let Some(status) = reqwest_err.status()
-    {
-        let code = status.as_u16();
-        return status.is_client_error() && code != 429 && code != 408;
+    if msg_lower.contains("malformed oauth token response") {
+        return true;
     }
 
-    for word in msg.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = word.parse::<u16>()
-            && (400..500).contains(&code)
-        {
-            return code != 429 && code != 408;
+    let textual_status = msg
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|word| word.parse::<u16>().ok())
+        .find(|code| (400..600).contains(code));
+
+    if matches!(textual_status, Some(401 | 403)) {
+        return true;
+    }
+
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && matches!(
+            reqwest_err.status().map(|status| status.as_u16()),
+            Some(401 | 403)
+        )
+    {
+        return true;
+    }
+
+    if msg_lower.contains("temporarily_unavailable") || msg_lower.contains("server_error") {
+        return false;
+    }
+
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if reqwest_err.is_decode() {
+            return true;
         }
+        if let Some(status) = reqwest_err.status() {
+            let code = status.as_u16();
+            return status.is_client_error() && code != 429 && code != 408;
+        }
+    }
+
+    if let Some(code) = textual_status
+        && (400..500).contains(&code)
+    {
+        return code != 429 && code != 408;
     }
 
     let auth_failure_hints = [
@@ -1241,10 +1282,8 @@ impl AuthProviderFlow for OpenaiCodexFlow {
             );
             anyhow::Error::msg("paste-redirect requires the redirect URL or OAuth code")
         })?;
-        let code = crate::auth::openai_oauth::parse_code_from_redirect(
-            redirect_input,
-            Some(&pending.state),
-        )?;
+        let code =
+            crate::auth::openai_oauth::parse_manual_code_input(redirect_input, &pending.state)?;
         let pkce = crate::auth::openai_oauth::PkceState {
             code_verifier: pending.code_verifier.clone(),
             code_challenge: String::new(),
@@ -1498,10 +1537,8 @@ impl AuthProviderFlow for GeminiFlow {
             );
             anyhow::Error::msg("paste-redirect requires the redirect URL or OAuth code")
         })?;
-        let code = crate::auth::gemini_oauth::parse_code_from_redirect(
-            redirect_input,
-            Some(&pending.state),
-        )?;
+        let code =
+            crate::auth::gemini_oauth::parse_manual_code_input(redirect_input, &pending.state)?;
         let pkce = crate::auth::gemini_oauth::PkceState {
             code_verifier: pending.code_verifier.clone(),
             code_challenge: String::new(),
@@ -2021,15 +2058,33 @@ mod tests {
     }
 
     #[test]
-    fn email_oauth_refresh_classifier_keeps_permanent_and_transient_errors_separate() {
+    fn oauth_refresh_classifier_keeps_permanent_and_transient_errors_separate() {
         assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             r#"Email OAuth2 token request failed (400 Bad Request): {"error":"invalid_grant"}"#
         )));
         assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             "Email OAuth2 token request failed (401 Unauthorized): invalid client"
         )));
+        assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "Google OAuth refresh error (400 Bad Request): invalid_request"
+        )));
+        assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "Google OAuth refresh error (401 Unauthorized): invalid_client - server_error in description"
+        )));
+        assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "OAuth refresh failed (401 Unauthorized): server_error"
+        )));
+        assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "OAuth refresh failed (403 Forbidden): temporarily_unavailable"
+        )));
+        assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "OAuth refresh failed (408 Request Timeout): retry later"
+        )));
         assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             "Email OAuth2 token request failed (429 Too Many Requests): retry later"
+        )));
+        assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "OAuth refresh failed (500 Internal Server Error): retry later"
         )));
         assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             r#"Email OAuth2 token request failed (400 Bad Request): {"error":"temporarily_unavailable"}"#
@@ -2037,6 +2092,57 @@ mod tests {
         assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             "Failed to refresh email OAuth2 token: connection reset"
         )));
+
+        let malformed =
+            serde_json::from_str::<serde_json::Value>("{").expect_err("fixture must be malformed");
+        assert!(is_non_retryable_oauth_refresh_error(
+            &anyhow::Error::new(malformed).context("Failed to parse Gemini refresh response")
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_oauth_refresh_policy_stops_after_permanent_failure() {
+        let attempts = AtomicUsize::new(0);
+
+        let error = refresh_oauth_access_token_with_retries(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { anyhow::bail!("invalid_grant") }
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("permanent OAuth failure must be returned");
+
+        assert_eq!(error.to_string(), "invalid_grant");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_oauth_refresh_policy_rejects_empty_access_token_without_retry() {
+        let attempts = AtomicUsize::new(0);
+
+        let error = refresh_oauth_access_token_with_retries(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok(TokenSet {
+                        access_token: "   ".to_string(),
+                        refresh_token: None,
+                        id_token: None,
+                        expires_at: None,
+                        token_type: None,
+                        scope: None,
+                    })
+                }
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("empty access token must fail permanently");
+
+        assert!(error.to_string().contains("access_token is empty"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     async fn email_oauth_permanent_failure_handler(

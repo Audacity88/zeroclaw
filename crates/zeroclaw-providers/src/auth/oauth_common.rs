@@ -165,10 +165,60 @@ pub fn parse_query_params(input: &str) -> BTreeMap<String, String> {
     out
 }
 
+pub(super) fn is_structured_callback_input(input: &str, expected_path: &str) -> bool {
+    let trimmed = input.trim();
+    let target = trimmed
+        .split_once('?')
+        .map_or(trimmed, |(target, _)| target);
+    let path = ["http://", "https://"]
+        .iter()
+        .find_map(|scheme| target.strip_prefix(scheme))
+        .and_then(|authority_and_path| {
+            authority_and_path
+                .find('/')
+                .map(|index| &authority_and_path[index..])
+        })
+        .unwrap_or(target);
+
+    path == expected_path
+        || ["code=", "state=", "error="]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn callback_shape_distinguishes_structured_input_from_bare_codes() {
+        for input in [
+            "http://localhost:1455/auth/callback",
+            "/auth/callback",
+            "code=abc",
+            "state=xyz",
+            "error=access_denied",
+        ] {
+            assert!(
+                is_structured_callback_input(input, "/auth/callback"),
+                "{input}"
+            );
+        }
+
+        for input in [
+            "raw-code",
+            "4/0AcvDMrC1234567890abcdef",
+            "/opaque-code",
+            "opaque?code",
+            "opaque://code",
+        ] {
+            assert!(
+                !is_structured_callback_input(input, "/auth/callback"),
+                "{input}"
+            );
+        }
+    }
 
     fn retry_policy(max_attempts: usize, base_delay_ms: u64) -> RefreshRetryPolicy {
         RefreshRetryPolicy {
