@@ -570,8 +570,14 @@ mod tests {
         let missing = parse_manual_code_input("/auth/callback?code=x", "b").unwrap_err();
         assert!(missing.to_string().contains("Missing OAuth state"));
 
-        let err = parse_manual_code_input("/auth/callback?code=x&state=a", "b").unwrap_err();
-        assert!(err.to_string().contains("state mismatch"));
+        for input in [
+            "/auth/callback?code=x&state=a",
+            "?code=x&state=a",
+            "https://example.test/other?code=x&state=a",
+        ] {
+            let err = parse_manual_code_input(input, "b").unwrap_err();
+            assert!(err.to_string().contains("state mismatch"), "{input}");
+        }
     }
 
     #[test]

@@ -633,7 +633,13 @@ mod tests {
     #[test]
     fn manual_callback_input_rejects_missing_or_mismatched_state() {
         assert!(parse_manual_code_input("/auth/callback?code=4/0test", "xyz").is_err());
-        assert!(parse_manual_code_input("/auth/callback?code=4/0test&state=wrong", "xyz").is_err());
+        for input in [
+            "/auth/callback?code=4/0test&state=wrong",
+            "?code=4/0test&state=wrong",
+            "https://example.test/other?code=4/0test&state=wrong",
+        ] {
+            assert!(parse_manual_code_input(input, "xyz").is_err(), "{input}");
+        }
     }
 
     #[test]
