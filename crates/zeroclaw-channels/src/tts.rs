@@ -1818,10 +1818,11 @@ mod tests {
         // reducing the failure to a missing marker.
         let startup = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(path) = std::fs::read_to_string(&out_path_file) {
-                    if !path.is_empty() && std::path::Path::new(&path).exists() {
-                        break path;
-                    }
+                if let Ok(path) = std::fs::read_to_string(&out_path_file)
+                    && !path.is_empty()
+                    && std::path::Path::new(&path).exists()
+                {
+                    break path;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
