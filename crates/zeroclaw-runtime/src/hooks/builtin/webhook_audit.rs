@@ -302,6 +302,18 @@ impl HookHandler for WebhookAuditHook {
         -100
     }
 
+    async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)> {
+        let context = ToolCallHookContext::uncorrelated("webhook-audit:legacy-before");
+        self.before_tool_call_with_context(&context, name, args)
+            .await
+    }
+
+    async fn on_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
+        let context = ToolCallHookContext::uncorrelated("webhook-audit:legacy-after");
+        self.on_after_tool_call_with_context(&context, tool, result, duration)
+            .await;
+    }
+
     async fn before_tool_call_with_context(
         &self,
         context: &ToolCallHookContext,
@@ -523,6 +535,61 @@ mod tests {
             .await;
 
         assert!(pending_args.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_legacy_handler_calls_remain_fail_closed() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut hook = make_hook(vec!["Bash"], true);
+        hook.config.url = server.uri();
+        let before = hook
+            .before_tool_call(
+                "Bash".into(),
+                serde_json::json!({"command": "printf compatibility"}),
+            )
+            .await;
+        assert!(!before.is_cancel());
+        assert!(hook.pending_args.lock().unwrap().is_empty());
+
+        hook.on_after_tool_call(
+            "Bash",
+            &ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            },
+            Duration::ZERO,
+        )
+        .await;
+
+        let request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(request) = server
+                    .received_requests()
+                    .await
+                    .expect("request recording enabled")
+                    .into_iter()
+                    .next()
+                {
+                    break request;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("legacy direct completion must dispatch an audit event");
+        let payload: Value = serde_json::from_slice(&request.body).expect("JSON audit payload");
+        assert_eq!(payload["tool"], "Bash");
+        assert_eq!(payload["args"], Value::Null);
+        assert!(hook.pending_args.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
