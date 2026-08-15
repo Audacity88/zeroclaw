@@ -437,7 +437,7 @@ fn parse_callback_request(request: &str, expected_state: &str) -> Result<String>
     let first_line = request.lines().next().unwrap_or("");
     let path = first_line.split_whitespace().nth(1).unwrap_or("");
 
-    parse_callback_code(&path, expected_state)
+    parse_callback_code(path, expected_state)
 }
 
 fn parse_callback_code(input: &str, expected_state: &str) -> Result<String> {
