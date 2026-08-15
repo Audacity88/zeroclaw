@@ -1,13 +1,15 @@
 use async_trait::async_trait;
+use lru::LruCache;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::agent::loop_::scrub_for_export;
 use crate::agent::turn::redact::scrub_credentials_value;
 use crate::hooks::traits::{HookHandler, HookResult};
+use zeroclaw_api::hook::ToolCallHookContext;
 use zeroclaw_api::tool::ToolResult;
 use zeroclaw_config::schema::WebhookAuditConfig;
 
@@ -103,8 +105,10 @@ fn reject_private_ip(addr: IpAddr) -> Result<(), String> {
 pub struct WebhookAuditHook {
     config: WebhookAuditConfig,
     client: reqwest::Client,
-    pending_args: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    pending_args: Arc<Mutex<LruCache<String, Value>>>,
 }
+
+const MAX_PENDING_ARGS: usize = 1024;
 
 impl WebhookAuditHook {
     pub fn new(config: WebhookAuditConfig) -> Result<Self, String> {
@@ -120,7 +124,9 @@ impl WebhookAuditHook {
         Ok(Self {
             config,
             client,
-            pending_args: Arc::new(Mutex::new(HashMap::new())),
+            pending_args: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_PENDING_ARGS).expect("pending audit capacity is non-zero"),
+            ))),
         })
     }
 }
@@ -242,6 +248,50 @@ fn prepare_args_for_export(args: Value, max_bytes: u64) -> Value {
     truncate_args(scrubbed, max_bytes)
 }
 
+impl WebhookAuditHook {
+    fn build_payload(
+        &self,
+        context: &ToolCallHookContext,
+        tool: &str,
+        result: &ToolResult,
+        duration: Duration,
+    ) -> Option<Value> {
+        let raw_args = if self.config.include_args && context.is_correlated() {
+            self.pending_args
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop(context.invocation_id())
+        } else {
+            None
+        };
+
+        if !matches_any_pattern(&self.config.tool_patterns, tool) {
+            return None;
+        }
+
+        let args_value = if self.config.include_args {
+            raw_args
+                .map(|args| prepare_args_for_export(args, self.config.max_args_bytes))
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+
+        #[allow(clippy::cast_possible_truncation)]
+        let duration_ms = duration.as_millis() as u64;
+
+        Some(serde_json::json!({
+            "event": "tool_call",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "tool": tool,
+            "success": result.success,
+            "duration_ms": duration_ms,
+            "error": result.error,
+            "args": args_value,
+        }))
+    }
+}
+
 #[async_trait]
 impl HookHandler for WebhookAuditHook {
     fn name(&self) -> &str {
@@ -252,67 +302,44 @@ impl HookHandler for WebhookAuditHook {
         -100
     }
 
-    async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)> {
-        if self.config.include_args && matches_any_pattern(&self.config.tool_patterns, &name) {
+    async fn before_tool_call_with_context(
+        &self,
+        context: &ToolCallHookContext,
+        name: String,
+        args: Value,
+    ) -> HookResult<(String, Value)> {
+        if self.config.include_args
+            && context.is_correlated()
+            && matches_any_pattern(&self.config.tool_patterns, &name)
+        {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"hook": "webhook-audit", "tool": name})),
                 "capturing args for audit"
             );
-            self.pending_args
+            let invocation_id = context.invocation_id().to_string();
+            let args_snapshot = args.clone();
+            let evicted = self
+                .pending_args
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .entry(name.clone())
-                .or_default()
-                .push(args.clone());
+                .push(invocation_id, args_snapshot);
+            drop(evicted);
         }
         HookResult::Continue((name, args))
     }
 
-    async fn on_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
-        // Skip tools that don't match the configured patterns.
-        if !matches_any_pattern(&self.config.tool_patterns, tool) {
+    async fn on_after_tool_call_with_context(
+        &self,
+        context: &ToolCallHookContext,
+        tool: &str,
+        result: &ToolResult,
+        duration: Duration,
+    ) {
+        let Some(payload) = self.build_payload(context, tool, result, duration) else {
             return;
-        }
-
-        // Pop the first captured args entry for this tool (FIFO) and optionally truncate.
-        let args_value: Value = if self.config.include_args {
-            let raw = {
-                let mut map = self.pending_args.lock().unwrap_or_else(|e| e.into_inner());
-                let entry = map.get_mut(tool).and_then(|v| {
-                    if v.is_empty() {
-                        None
-                    } else {
-                        Some(v.remove(0))
-                    }
-                });
-                // Clean up empty entries.
-                if map.get(tool).is_some_and(|v| v.is_empty()) {
-                    map.remove(tool);
-                }
-                entry
-            };
-            match raw {
-                Some(a) => prepare_args_for_export(a, self.config.max_args_bytes),
-                None => Value::Null,
-            }
-        } else {
-            Value::Null
         };
-
-        #[allow(clippy::cast_possible_truncation)]
-        let duration_ms = duration.as_millis() as u64;
-
-        let payload = serde_json::json!({
-            "event": "tool_call",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "tool": tool,
-            "success": result.success,
-            "duration_ms": duration_ms,
-            "error": result.error,
-            "args": args_value,
-        });
 
         let client = self.client.clone();
         let url = self.config.url.clone();
@@ -409,15 +436,21 @@ mod tests {
         .expect("valid webhook audit fixture")
     }
 
+    fn hook_context(invocation_id: &str) -> ToolCallHookContext {
+        ToolCallHookContext::new(invocation_id)
+    }
+
     #[tokio::test]
     async fn before_tool_call_captures_args_when_enabled() {
         let hook = make_hook(vec!["Bash", "mcp__*"], true);
         let args = serde_json::json!({"command": "ls"});
-        let result = hook.before_tool_call("Bash".into(), args.clone()).await;
+        let result = hook
+            .before_tool_call_with_context(&hook_context("call-a"), "Bash".into(), args.clone())
+            .await;
         assert!(!result.is_cancel());
 
         let pending = hook.pending_args.lock().unwrap();
-        assert_eq!(pending.get("Bash"), Some(&vec![args]));
+        assert_eq!(pending.peek("call-a"), Some(&args));
     }
 
     #[tokio::test]
@@ -425,21 +458,23 @@ mod tests {
         let hook = make_hook(vec!["Bash"], true);
         let args1 = serde_json::json!({"command": "ls"});
         let args2 = serde_json::json!({"command": "pwd"});
-        hook.before_tool_call("Bash".into(), args1.clone()).await;
-        hook.before_tool_call("Bash".into(), args2.clone()).await;
+        hook.before_tool_call_with_context(&hook_context("call-a"), "Bash".into(), args1.clone())
+            .await;
+        hook.before_tool_call_with_context(&hook_context("call-b"), "Bash".into(), args2.clone())
+            .await;
 
         let pending = hook.pending_args.lock().unwrap();
-        let bash_args = pending.get("Bash").unwrap();
-        assert_eq!(bash_args.len(), 2);
-        assert_eq!(bash_args[0], args1);
-        assert_eq!(bash_args[1], args2);
+        assert_eq!(pending.peek("call-a"), Some(&args1));
+        assert_eq!(pending.peek("call-b"), Some(&args2));
     }
 
     #[tokio::test]
     async fn before_tool_call_skips_non_matching_tools() {
         let hook = make_hook(vec!["Bash"], true);
         let args = serde_json::json!({"path": "/tmp"});
-        let result = hook.before_tool_call("Write".into(), args).await;
+        let result = hook
+            .before_tool_call_with_context(&hook_context("call-a"), "Write".into(), args)
+            .await;
         assert!(!result.is_cancel());
 
         let pending = hook.pending_args.lock().unwrap();
@@ -450,11 +485,158 @@ mod tests {
     async fn before_tool_call_skips_when_include_args_false() {
         let hook = make_hook(vec!["Bash"], false);
         let args = serde_json::json!({"command": "ls"});
-        let result = hook.before_tool_call("Bash".into(), args).await;
+        let result = hook
+            .before_tool_call_with_context(&hook_context("call-a"), "Bash".into(), args)
+            .await;
         assert!(!result.is_cancel());
 
         let pending = hook.pending_args.lock().unwrap();
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_runner_dispatches_webhook_audit_without_capturing_args() {
+        let hook = make_hook(vec!["Bash"], true);
+        let pending_args = Arc::clone(&hook.pending_args);
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(hook));
+
+        let before = runner
+            .run_before_tool_call(
+                "Bash".into(),
+                serde_json::json!({"command": "printf compatibility"}),
+            )
+            .await;
+        assert!(!before.is_cancel());
+        assert!(pending_args.lock().unwrap().is_empty());
+
+        runner
+            .fire_after_tool_call(
+                "Bash",
+                &ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    error: None,
+                },
+                Duration::ZERO,
+            )
+            .await;
+
+        assert!(pending_args.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn uncorrelated_completion_cannot_consume_same_id_args() {
+        let hook = make_hook(vec!["Bash"], true);
+        let exact = hook_context("shared-id");
+        let args = serde_json::json!({"command": "private"});
+        hook.before_tool_call_with_context(&exact, "Bash".into(), args.clone())
+            .await;
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+
+        let uncorrelated = ToolCallHookContext::uncorrelated("shared-id");
+        let uncorrelated_payload = hook
+            .build_payload(&uncorrelated, "Bash", &result, Duration::ZERO)
+            .expect("matching uncorrelated payload");
+        assert_eq!(uncorrelated_payload["args"], Value::Null);
+        assert_eq!(
+            hook.pending_args.lock().unwrap().peek("shared-id"),
+            Some(&args)
+        );
+
+        let exact_payload = hook
+            .build_payload(&exact, "Bash", &result, Duration::ZERO)
+            .expect("matching exact payload");
+        assert_eq!(exact_payload["args"], args);
+        assert!(hook.pending_args.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_args_follow_identity_when_same_tool_completes_in_reverse() {
+        let hook = make_hook(vec!["Bash"], true);
+        let args_a = serde_json::json!({"command": "first"});
+        let args_b = serde_json::json!({"command": "second"});
+        hook.before_tool_call_with_context(&hook_context("call-a"), "Bash".into(), args_a.clone())
+            .await;
+        hook.before_tool_call_with_context(&hook_context("call-b"), "Bash".into(), args_b.clone())
+            .await;
+
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+        let payload_b = hook
+            .build_payload(&hook_context("call-b"), "Bash", &result, Duration::ZERO)
+            .expect("matching call-b payload");
+        let payload_a = hook
+            .build_payload(&hook_context("call-a"), "Bash", &result, Duration::ZERO)
+            .expect("matching call-a payload");
+
+        assert_eq!(payload_b["args"], args_b);
+        assert_eq!(payload_a["args"], args_a);
+        assert!(hook.pending_args.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_with_nonmatching_final_name_clears_matching_identity() {
+        let hook = make_hook(vec!["Bash"], true);
+        let context = hook_context("call-a");
+        hook.before_tool_call_with_context(
+            &context,
+            "Bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )
+        .await;
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+
+        hook.on_after_tool_call_with_context(&context, "renamed_nonmatch", &result, Duration::ZERO)
+            .await;
+
+        let pending = hook.pending_args.lock().unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_args_evict_oldest_identity_without_reassignment() {
+        let hook = make_hook(vec!["Bash"], true);
+        *hook.pending_args.lock().unwrap() = LruCache::new(NonZeroUsize::new(2).unwrap());
+        for (id, value) in [("call-a", "a"), ("call-b", "b"), ("call-c", "c")] {
+            hook.before_tool_call_with_context(
+                &hook_context(id),
+                "Bash".into(),
+                serde_json::json!({"call": value}),
+            )
+            .await;
+        }
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+
+        let evicted = hook
+            .build_payload(&hook_context("call-a"), "Bash", &result, Duration::ZERO)
+            .expect("matching evicted payload");
+        let retained_b = hook
+            .build_payload(&hook_context("call-b"), "Bash", &result, Duration::ZERO)
+            .expect("matching retained payload");
+        let retained_c = hook
+            .build_payload(&hook_context("call-c"), "Bash", &result, Duration::ZERO)
+            .expect("matching retained payload");
+
+        assert_eq!(evicted["args"], Value::Null);
+        assert_eq!(retained_b["args"], serde_json::json!({"call": "b"}));
+        assert_eq!(retained_c["args"], serde_json::json!({"call": "c"}));
+        assert!(hook.pending_args.lock().unwrap().is_empty());
     }
 
     // ── Truncation tests ─────────────────────────────────────────
@@ -555,8 +737,13 @@ mod tests {
             error: None,
         };
         // Call with a non-matching tool — should not panic or do anything.
-        hook.on_after_tool_call("Write", &result, Duration::from_millis(10))
-            .await;
+        hook.on_after_tool_call_with_context(
+            &hook_context("call-a"),
+            "Write",
+            &result,
+            Duration::from_millis(10),
+        )
+        .await;
         // No assertion needed beyond "doesn't panic"; args map stays empty.
         let pending = hook.pending_args.lock().unwrap();
         assert!(pending.is_empty());
