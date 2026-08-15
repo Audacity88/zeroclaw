@@ -406,6 +406,8 @@ impl TtsProvider for GoogleTtsProvider {
 pub struct EdgeTtsProvider {
     alias: String,
     binary_path: String,
+    #[cfg(test)]
+    binary_args: Vec<String>,
     timeout: std::time::Duration,
 }
 
@@ -654,6 +656,8 @@ impl EdgeTtsProvider {
         Ok(Self {
             alias: alias.to_string(),
             binary_path: raw_path,
+            #[cfg(test)]
+            binary_args: Vec::new(),
             timeout: TTS_HTTP_TIMEOUT,
         })
     }
@@ -663,9 +667,20 @@ impl EdgeTtsProvider {
     /// allowlist stays a security boundary; this exists only under `cfg(test)`.
     #[cfg(test)]
     fn new_with_binary(alias: &str, binary_path: &str, timeout: std::time::Duration) -> Self {
+        Self::new_with_command(alias, binary_path, &[], timeout)
+    }
+
+    #[cfg(test)]
+    fn new_with_command(
+        alias: &str,
+        binary_path: &str,
+        binary_args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Self {
         Self {
             alias: alias.to_string(),
             binary_path: binary_path.to_string(),
+            binary_args: binary_args.iter().map(|arg| (*arg).to_string()).collect(),
             timeout,
         }
     }
@@ -692,7 +707,10 @@ impl TtsProvider for EdgeTtsProvider {
         // owns the child through timeout handling AND cancellation: on any path
         // out of synthesize it kills and reaps the child before removing the
         // artifact (see EdgeTtsTempArtifact::drop).
-        let child = tokio::process::Command::new(&self.binary_path)
+        let mut command = tokio::process::Command::new(&self.binary_path);
+        #[cfg(test)]
+        command.args(&self.binary_args);
+        let child = command
             .arg("--text")
             .arg(text)
             .arg("--voice")
@@ -1753,8 +1771,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn edge_tts_cancellation_reaps_child_and_removes_temp_output() {
-        use std::os::unix::fs::PermissionsExt;
-
         // Fake `edge-tts` that writes an artifact then hangs, like the timeout
         // test. The caller aborts synthesis before the provider timeout so the
         // future is dropped while `child.wait()` is pending; the artifact guard
@@ -1771,46 +1787,75 @@ mod tests {
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\n\
-                 out=\n\
+                "out=\n\
                  prev=\n\
                  for a in \"$@\"; do\n\
                    if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
                    prev=\"$a\"\n\
                  done\n\
-                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 [ -n \"$out\" ] || exit 64\n\
                  : > \"$out\"\n\
+                 printf '%s' \"$out\" > \"{sidecar}\"\n\
                  while :; do : > \"$out\"; sleep 0.05; done\n"
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Generous provider timeout: the abort (not the timeout) must drop the
         // waiting future, and the child needs time to start under test load.
-        let provider =
-            EdgeTtsProvider::new_with_binary("test", script, std::time::Duration::from_secs(10));
-        let handle = zeroclaw_spawn::spawn!(async move {
-            let _ = provider.synthesize("hello", "en-US-AriaNeural").await;
-        });
-        // Wait until the child has actually started (sidecar written) so the
-        // abort deterministically drops the future while `child.wait()` is
-        // pending.
-        for _ in 0..200 {
-            if out_path_file.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            out_path_file.exists(),
-            "fake child must record its output path before abort"
+        let provider = EdgeTtsProvider::new_with_command(
+            "test",
+            "/bin/sh",
+            &[script],
+            std::time::Duration::from_secs(10),
         );
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            provider.synthesize("hello", "en-US-AriaNeural").await
+        });
+        // Wait until the child has created the artifact and recorded its path
+        // so the abort deterministically drops the future while `child.wait()`
+        // is pending. If startup fails, report the provider result instead of
+        // reducing the failure to a missing marker.
+        let startup = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(path) = std::fs::read_to_string(&out_path_file) {
+                    if !path.is_empty() && std::path::Path::new(&path).exists() {
+                        break path;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        tokio::pin!(startup);
+        let artifact = tokio::select! {
+            result = &mut handle => {
+                Err(format!("fake child exited before creating its output artifact: {result:?}"))
+            }
+            result = &mut startup => {
+                result.map_err(|error| {
+                    format!("fake child must create and record its output artifact before abort: {error}")
+                })
+            }
+        };
+        let artifact = match artifact {
+            Ok(path) => path,
+            Err(message) => {
+                if !handle.is_finished() {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+                let _ = std::fs::remove_file(&script_path);
+                let _ = std::fs::remove_file(&out_path_file);
+                panic!("{message}");
+            }
+        };
         handle.abort();
-        let _ = handle.await;
+        let cancellation = handle.await;
+        assert!(
+            matches!(cancellation, Err(ref error) if error.is_cancelled()),
+            "provider task must end through cancellation: {cancellation:?}"
+        );
 
-        let artifact =
-            std::fs::read_to_string(&out_path_file).expect("script must record output path");
         // Give a (wrongly) surviving child time to recreate the artifact.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
