@@ -809,6 +809,29 @@ fn is_non_retryable_oauth_refresh_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     let msg_lower = msg.to_lowercase();
 
+    let textual_status = msg.split('(').skip(1).find_map(|segment| {
+        let status_text = segment.split_once(')')?.0;
+        let (code, _) = status_text.split_once(' ')?;
+        let code = code.parse::<u16>().ok()?;
+        let status = reqwest::StatusCode::from_u16(code).ok()?;
+        (status.to_string() == status_text).then_some(code)
+    });
+    let reqwest_error = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>());
+    let response_status = reqwest_error
+        .and_then(reqwest::Error::status)
+        .map(|status| status.as_u16())
+        .or(textual_status);
+
+    if matches!(response_status, Some(408 | 429 | 500..=599)) {
+        return false;
+    }
+
+    if matches!(response_status, Some(401 | 403)) {
+        return true;
+    }
+
     if err
         .chain()
         .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
@@ -835,29 +858,11 @@ fn is_non_retryable_oauth_refresh_error(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    let textual_status = msg
-        .split(|c: char| !c.is_ascii_digit())
-        .filter_map(|word| word.parse::<u16>().ok())
-        .find(|code| (400..600).contains(code));
-
-    if matches!(textual_status, Some(401 | 403)) {
-        return true;
-    }
-
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-        && matches!(
-            reqwest_err.status().map(|status| status.as_u16()),
-            Some(401 | 403)
-        )
-    {
-        return true;
-    }
-
     if msg_lower.contains("temporarily_unavailable") || msg_lower.contains("server_error") {
         return false;
     }
 
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+    if let Some(reqwest_err) = reqwest_error {
         if reqwest_err.is_decode() {
             return true;
         }
@@ -2086,8 +2091,14 @@ mod tests {
         assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             "OAuth refresh failed (500 Internal Server Error): retry later"
         )));
+        assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "OAuth refresh failed (499 <unknown status code>): retry later"
+        )));
         assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             r#"Email OAuth2 token request failed (400 Bad Request): {"error":"temporarily_unavailable"}"#
+        )));
+        assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "OAuth refresh failed after 500 ms: invalid_grant"
         )));
         assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             "Failed to refresh email OAuth2 token: connection reset"
@@ -2116,6 +2127,32 @@ mod tests {
 
         assert_eq!(error.to_string(), "invalid_grant");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_oauth_refresh_policy_retries_mixed_signal_retryable_statuses() {
+        for message in [
+            r#"OAuth refresh failed (408 Request Timeout): {"error":"invalid_grant"}"#,
+            r#"OAuth refresh failed (429 Too Many Requests): {"error":"invalid_grant"}"#,
+            r#"OAuth refresh failed (500 Internal Server Error): {"error":"invalid_grant","error_description":"authentication failed"}"#,
+            r#"OAuth refresh failed (520 <unknown status code>): {"error":"invalid_grant"}"#,
+        ] {
+            let attempts = AtomicUsize::new(0);
+
+            let error = refresh_oauth_access_token_with_retries(
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let message = message.to_string();
+                    async move { anyhow::bail!(message) }
+                },
+                |_| {},
+            )
+            .await
+            .expect_err("mixed-signal retryable errors must exhaust the retry budget");
+
+            assert_eq!(error.to_string(), message);
+            assert_eq!(attempts.load(Ordering::SeqCst), 3, "message: {message}");
+        }
     }
 
     #[tokio::test]
