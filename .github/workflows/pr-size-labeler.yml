@@ -20,12 +20,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Fetch trusted base classifier
+      - name: Fetch trusted workflow classifier
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/contents/scripts/github/pr_size_label.py?ref=$BASE_SHA" \
+          gh api "repos/$GITHUB_REPOSITORY/contents/scripts/github/pr_size_label.py?ref=$WORKFLOW_SHA" \
             --jq .content | base64 --decode > "$RUNNER_TEMP/pr_size_label.py"
 
       - name: Apply size label from PR metadata

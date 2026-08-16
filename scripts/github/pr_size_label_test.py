@@ -349,13 +349,14 @@ class PrSizeLabelTest(unittest.TestCase):
 
         size_labeler.apply_size_plan(FakeClient(), "zeroclaw-labs/zeroclaw", 9, plan)
 
-    def test_workflow_fetches_base_classifier_without_checking_out_pr_code(self) -> None:
+    def test_workflow_fetches_workflow_classifier_without_checking_out_pr_code(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/pr-size-labeler.yml").read_text(encoding="utf-8")
 
         self.assertIn("pull_request_target:", workflow)
         self.assertNotIn("actions/checkout", workflow)
-        self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha }}", workflow)
-        self.assertIn("?ref=$BASE_SHA", workflow)
+        self.assertIn("WORKFLOW_SHA: ${{ github.sha }}", workflow)
+        self.assertIn("?ref=$WORKFLOW_SHA", workflow)
+        self.assertNotIn("github.event.pull_request.base.sha", workflow)
         self.assertIn('"$RUNNER_TEMP/pr_size_label.py"', workflow)
         self.assertIn("issues: write", workflow)
         self.assertIn("pull-requests: read", workflow)
