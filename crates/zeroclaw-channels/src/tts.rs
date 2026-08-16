@@ -1706,10 +1706,56 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn read_edge_tts_fixture_state(sidecar: &std::path::Path) -> Option<(PathBuf, u32)> {
+        let contents = std::fs::read_to_string(sidecar).ok()?;
+        let contents = contents.strip_suffix('\n')?;
+        let (artifact, pid) = contents.split_once('\n')?;
+        if artifact.is_empty() || pid.is_empty() || pid.contains('\n') {
+            return None;
+        }
+        Some((PathBuf::from(artifact), pid.parse().ok()?))
+    }
+
+    #[cfg(unix)]
+    fn edge_tts_fixture_process_exists(pid: u32) -> std::io::Result<bool> {
+        if unsafe { libc::kill(pid as i32, 0) } == 0 {
+            return Ok(true);
+        }
+
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Ok(true),
+            _ => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_edge_tts_cleanup(path: &std::path::Path, pid: u32, failure: &str) {
+        let deadline =
+            std::time::Instant::now() + EDGE_TTS_REAP_GRACE + std::time::Duration::from_secs(1);
+        loop {
+            let child_exists = edge_tts_fixture_process_exists(pid)
+                .unwrap_or_else(|error| panic!("failed to inspect child {pid}: {error}"));
+            let artifact_exists = path
+                .try_exists()
+                .unwrap_or_else(|error| panic!("failed to inspect {}: {error}", path.display()));
+            if !artifact_exists && !child_exists {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "{failure}: {}; child {pid} alive: {child_exists}",
+                    path.display()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn edge_tts_timeout_kills_child_and_removes_temp_output() {
-        use std::os::unix::fs::PermissionsExt;
-
         // Fake `edge-tts`: records the `--write-media` output path, writes an
         // artifact there, then keeps rewriting it while hanging, so the short
         // test timeout fires while a partial artifact exists. A live child
@@ -1727,24 +1773,27 @@ mod tests {
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\n\
-                 out=\n\
+                "out=\n\
                  prev=\n\
                  for a in \"$@\"; do\n\
                    if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
                    prev=\"$a\"\n\
                  done\n\
-                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 [ -n \"$out\" ] || exit 64\n\
                  : > \"$out\"\n\
+                 printf '%s\\n%s\\n' \"$out\" \"$$\" > \"{sidecar}\"\n\
                  while :; do : > \"$out\"; sleep 0.05; done\n"
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Short timeout so the hanging fake binary trips the timeout path fast.
-        let provider =
-            EdgeTtsProvider::new_with_binary("test", script, std::time::Duration::from_millis(250));
+        let provider = EdgeTtsProvider::new_with_command(
+            "test",
+            "/bin/sh",
+            &[script],
+            std::time::Duration::from_millis(250),
+        );
         let err = provider
             .synthesize("hello", "en-US-AriaNeural")
             .await
@@ -1754,15 +1803,14 @@ mod tests {
             "expected a timeout error, got: {err}"
         );
 
-        let artifact =
-            std::fs::read_to_string(&out_path_file).expect("script must record output path");
-        // Give a (wrongly) still-alive child time to recreate the artifact so
-        // the absence assertion below actually distinguishes killed from leaked.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(
-            !std::path::Path::new(&artifact).exists(),
-            "Edge TTS temp output must be removed after a timeout and the child killed: {artifact}"
-        );
+        let (artifact, pid) = read_edge_tts_fixture_state(&out_path_file)
+            .expect("script must record output path and process ID");
+        wait_for_edge_tts_cleanup(
+            &artifact,
+            pid,
+            "Edge TTS temp output must be removed after a timeout and the child killed",
+        )
+        .await;
 
         let _ = std::fs::remove_file(&script_path);
         let _ = std::fs::remove_file(&out_path_file);
@@ -1795,7 +1843,7 @@ mod tests {
                  done\n\
                  [ -n \"$out\" ] || exit 64\n\
                  : > \"$out\"\n\
-                 printf '%s' \"$out\" > \"{sidecar}\"\n\
+                 printf '%s\\n%s\\n' \"$out\" \"$$\" > \"{sidecar}\"\n\
                  while :; do : > \"$out\"; sleep 0.05; done\n"
             ),
         )
@@ -1818,11 +1866,12 @@ mod tests {
         // reducing the failure to a missing marker.
         let startup = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(path) = std::fs::read_to_string(&out_path_file)
-                    && !path.is_empty()
-                    && std::path::Path::new(&path).exists()
+                if let Some((path, pid)) = read_edge_tts_fixture_state(&out_path_file)
+                    && path.try_exists().unwrap_or_else(|error| {
+                        panic!("failed to inspect {}: {error}", path.display())
+                    })
                 {
-                    break path;
+                    break (path, pid);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -1838,8 +1887,8 @@ mod tests {
                 })
             }
         };
-        let artifact = match artifact {
-            Ok(path) => path,
+        let (artifact, pid) = match artifact {
+            Ok(state) => state,
             Err(message) => {
                 if !handle.is_finished() {
                     handle.abort();
@@ -1857,12 +1906,12 @@ mod tests {
             "provider task must end through cancellation: {cancellation:?}"
         );
 
-        // Give a (wrongly) surviving child time to recreate the artifact.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(
-            !std::path::Path::new(&artifact).exists(),
-            "Edge TTS temp output must be removed after cancellation: {artifact}"
-        );
+        wait_for_edge_tts_cleanup(
+            &artifact,
+            pid,
+            "Edge TTS temp output must be removed after cancellation",
+        )
+        .await;
 
         let _ = std::fs::remove_file(&script_path);
         let _ = std::fs::remove_file(&out_path_file);
