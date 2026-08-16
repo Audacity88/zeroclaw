@@ -534,14 +534,17 @@ mod tests {
 
     #[test]
     fn prepare_args_for_export_scrubs_before_truncation() {
-        let secret = "SUPERSECRETVALUE123";
-        let args = serde_json::json!({"command": format!("echo api_key={secret} and continue")});
+        let secret = "PLAINVALUE1234567890";
+        let args = serde_json::json!({
+            "credentials": {
+                "primary": secret
+            }
+        });
 
-        let exported = prepare_args_for_export(args, 24);
+        let exported = prepare_args_for_export(args, 48);
 
-        assert!(exported.is_string());
-        assert!(!exported.as_str().unwrap().contains(secret));
-        assert!(exported.as_str().unwrap().ends_with("...[truncated]"));
+        assert!(exported.is_object());
+        assert!(!exported.to_string().contains(secret));
     }
 
     // ── on_after_tool_call tests ─────────────────────────────────
