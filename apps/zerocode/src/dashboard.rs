@@ -557,7 +557,7 @@ impl Dashboard {
         code_cwd: Option<&str>,
         chat_cwd: Option<&str>,
     ) {
-        let workspace_lines = workspace_lines(code_cwd, chat_cwd);
+        let workspace_lines = workspace_lines(code_cwd, chat_cwd, overview_status_label_width());
         let status_height = 12 + workspace_lines.len() as u16;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
