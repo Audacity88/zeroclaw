@@ -42,7 +42,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.signal",
     "channel.slack",
     "channel.telegram",
-    "channel.wati",
     "channel.wechat",
     "channel.whatsapp",
     "tool.browser",
@@ -122,6 +121,11 @@ pub struct Config {
     /// section is impossible to miss.
     #[serde(skip)]
     pub degraded_sections: Vec<String>,
+    /// Retired WATI config section roots detected before migration and typed
+    /// deserialization erase them. Never serialized; the CLI surfaces each
+    /// path on stderr so an operator cannot miss the retired channel.
+    #[serde(skip)]
+    pub retired_wati_config_sections: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -602,7 +606,10 @@ pub struct Config {
     #[serde(default)]
     pub locale: Option<String>,
 
-    /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]`).
+    /// Verifiable Intent (VI) credential issuance and constraint checking
+    /// (`[verifiable_intent]`). No credential chain verifier exists yet, so the
+    /// `vi_verify` tool is not registered for the model and this section does not
+    /// currently enable verification of anything.
     #[serde(default)]
     #[nested]
     #[group = "Agent"]
@@ -912,9 +919,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
-    /// in the request body (llama.cpp-specific). Use this to pass model-family
-    /// template variables that control behaviour not exposed by other fields.
+    /// Arbitrary key/value pairs forwarded verbatim as a top-level
+    /// `chat_template_kwargs` object in the request body of OpenAI-compatible
+    /// providers. Consumed by chat-template-aware backends such as vLLM,
+    /// SGLang, and llama.cpp to pass model-family template variables that
+    /// control behaviour not exposed by other fields. Must be a JSON object
+    /// (TOML inline table); non-object values are ignored with a warning.
     /// Example (Qwen3 thinking suppression):
     ///   `chat_template_kwargs = { enable_thinking = false }`
     #[tab(Advanced)]
@@ -2268,6 +2278,33 @@ pub struct CloudflareModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Atlas Cloud ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AtlasCloudEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for AtlasCloudEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://api.atlascloud.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.atlascloud"]
+pub struct AtlasCloudModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3282,6 +3319,7 @@ impl_default_family_endpoint! {
     TelnyxModelProviderConfig,
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
+    AtlasCloudModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
@@ -4036,19 +4074,29 @@ impl Config {
             .unwrap_or(32_000)
     }
 
+    /// The model's context window exactly as configured, or `None` when no
+    /// provider profile declares one.
+    ///
+    /// `None` means *unknown*, not "small". Report it to an operator as unset
+    /// rather than resolving it to [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`],
+    /// which would present a stub as though it were the model's real capacity.
+    /// Use [`Config::effective_model_context_window`] when a number is required
+    /// for budget arithmetic.
+    #[must_use]
+    pub fn configured_model_context_window(&self, agent_alias: &str) -> Option<usize> {
+        // Provider config (config.toml) is the source of truth for this value.
+        self.resolved_model_provider_for_agent(agent_alias)
+            .and_then(|(_, _, provider_config)| provider_config.context_window)
+    }
+
     /// Returns the model's context window size (max input tokens).
-    /// Source: provider config `context_window` → fallback 32,000.
+    /// Source: provider config `context_window` →
+    /// [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`].
     /// Does NOT check runtime profile (that's for output budget).
     #[must_use]
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
-        // 1. Provider config (config.toml) — PRIMARY SOT for model's context window
-        if let Some((_, _, provider_config)) = self.resolved_model_provider_for_agent(agent_alias)
-            && let Some(ctx) = provider_config.context_window
-        {
-            return ctx;
-        }
-        // 2. Hard fallback 32,000 (stub)
-        32_000
+        self.configured_model_context_window(agent_alias)
+            .unwrap_or(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
     }
 
     #[must_use]
@@ -4157,10 +4205,9 @@ impl Config {
         Some(out)
     }
 
-    /// Resolve the effective skills prompt-injection mode for an agent: the
-    /// agent's resolved runtime profile's `prompt_injection_mode` override when
-    /// set, otherwise the global `[skills] prompt_injection_mode`. Agents with
-    /// no runtime profile (or an unknown alias) fall back to the global value.
+    /// Resolve the effective skills prompt-injection mode for an agent: use an
+    /// explicit runtime-profile override when set, otherwise inherit the global
+    /// `[skills] prompt_injection_mode` value.
     ///
     /// Keyed on the resolved runtime profile — the sanctioned surface for
     /// per-agent runtime tunables — so agent-inline knobs stay inert.
@@ -4530,6 +4577,18 @@ fn default_delegate_agentic_timeout_secs() -> u64 {
 
 /// Valid temperature range for all paths (config, CLI, env override).
 pub const TEMPERATURE_RANGE: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// Context window assumed when no provider profile declares one.
+///
+/// Deliberately conservative: it has to be safe for any model, which means it
+/// is almost always *wrong* for the model actually in use — a 1M-context model
+/// on a profile that omits `context_window` runs against this number. It exists
+/// so budget arithmetic has an operand, not because it describes any model.
+///
+/// Anything reporting to an operator must call
+/// [`Config::configured_model_context_window`] and say "not configured" when it
+/// returns `None`, rather than echoing this value as the model's real capacity.
+pub const UNCONFIGURED_CONTEXT_WINDOW_FALLBACK: usize = 32_000;
 
 /// Defaults to 0 so configs without an explicit `schema_version` are recognized
 /// as pre-versioning and get migrated.
@@ -5038,18 +5097,30 @@ impl Default for McpConfig {
     }
 }
 
-/// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section).
+/// Verifiable Intent (VI) credential issuance and constraint checking
+/// (`[verifiable_intent]` section).
+///
+/// ZeroClaw implements issuance, crypto, types and constraint checking, but not
+/// a credential chain verifier. Until one exists the `vi_verify` tool is
+/// withheld from the model-visible registry, so neither key below enables
+/// verification of a credential. The library paths are unaffected.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "verifiable_intent"]
 pub struct VerifiableIntentConfig {
-    /// Enable VI credential verification on commerce tool calls (default: false).
+    /// Opt in to the VI section (default: false).
+    ///
+    /// While the tool is withheld this does not enable credential verification
+    /// on commerce tool calls. It currently causes a warning naming that gap,
+    /// emitted once per config application: at process startup, and again when
+    /// a daemon reload re-reads config from disk.
     #[serde(default)]
     pub enabled: bool,
 
-    /// Strictness mode for constraint evaluation: "strict" (fail-closed on unknown
-    /// constraint types) or "permissive" (skip unknown types with a warning).
-    /// Default: "strict".
+    /// Intended strictness mode for constraint evaluation.
+    ///
+    /// Accepts `"strict"` or `"permissive"`, and defaults to `"strict"`. No
+    /// production code reads it while the tool is withheld.
     #[serde(default = "default_vi_strictness")]
     pub strictness: String,
 }
@@ -5960,10 +6031,12 @@ impl Default for PacingConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
-    /// Inline full skill instructions and tool metadata into the system prompt.
+    /// Default behavior for the v0.8.x line: inline full skill instructions.
     #[default]
     Full,
-    /// Inline only compact skill metadata (name/description/location) and load details on demand.
+    /// Inline compact skill metadata
+    /// (name/description/location + callable tool specs) and load instructions
+    /// on demand via `read_skill`.
     Compact,
 }
 
@@ -6084,8 +6157,9 @@ pub struct SkillsConfig {
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_registries: Vec<ExternalRegistry>,
-    /// Controls how skills are injected into the system prompt.
-    /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
+    /// Controls how skills are injected into the system prompt. Omission
+    /// defaults to `full` throughout the v0.8.x release line; `compact`
+    /// remains available as an explicit global or runtime-profile setting.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Autonomous skill creation from successful multi-step task executions.
@@ -6775,6 +6849,12 @@ impl Default for PeripheralBoardConfig {
 
 // ── Gateway security ─────────────────────────────────────────────
 
+/// Longest supported dashboard WebSocket keepalive interval.
+///
+/// Longer periods do not protect typical intermediary idle deadlines, while
+/// this bound keeps timer construction portable across supported targets.
+pub const GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS: u64 = 86_400;
+
 /// Gateway server configuration (`[gateway]` section).
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
@@ -6853,6 +6933,15 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub session_ttl_hours: u32,
 
+    /// Send WebSocket ping frames every N seconds to keep dashboard chat
+    /// connections alive. Range:
+    /// `0..=GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS`. 0 = disabled. Default: 30.
+    /// The value is read when each WebSocket connection opens; changing it
+    /// requires reconnecting clients (or restarting the gateway) to affect
+    /// existing connections.
+    #[serde(default = "default_gateway_websocket_ping_interval_secs")]
+    pub websocket_ping_interval_secs: u64,
+
     /// Pairing dashboard configuration
     #[serde(default)]
     #[nested]
@@ -6906,6 +6995,10 @@ fn default_gateway_request_timeout_secs() -> u64 {
 
 fn default_gateway_long_running_request_timeout_secs() -> u64 {
     600
+}
+
+fn default_gateway_websocket_ping_interval_secs() -> u64 {
+    30
 }
 
 fn default_gateway_host() -> String {
@@ -6966,6 +7059,7 @@ impl Default for GatewayConfig {
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
             session_ttl_hours: 0,
+            websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -7466,7 +7560,11 @@ impl Default for BrowserConfig {
 ///
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts, which is the default). If `allowed_domains` is empty, all
-/// requests are rejected.
+/// requests are rejected. Requests use direct transport so locally validated DNS
+/// answers remain pinned: an enabled `environment` proxy scope or runtime proxy
+/// that applies to `tool.http_request` is rejected. A process environment proxy
+/// outside that managed scope is warned and ignored; connection failures name
+/// the ignored variable.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "http_request"]
@@ -7483,12 +7581,18 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
-    /// Allow requests to private/LAN hosts (RFC 1918, loopback, link-local, .local).
-    /// Default: false (deny private hosts for SSRF protection).
+    /// Allow requests to private/LAN hosts (RFC 1918, loopback, `.local`).
+    /// Default: false (deny private hosts for SSRF protection). Regardless of
+    /// this setting, all of `169.254.0.0/16`, Azure `168.63.129.16`, Alibaba
+    /// `100.100.100.200`, AWS `fd00:ec2::/64`, GCP `fd20:ce::254`, and their
+    /// recognized IPv4-embedded forms remain blocked.
     #[serde(default)]
     pub allow_private_hosts: bool,
-    /// Private/internal hosts explicitly allowed to bypass SSRF protection.
-    /// Exact and subdomain matches are supported; `*` permits all private/local hosts.
+    /// Private/internal hosts explicitly allowed to relax the public-address check.
+    /// Exact and subdomain matches are supported; `*` permits private/local hosts
+    /// except the unconditional metadata/platform exclusions: `169.254.0.0/16`,
+    /// `168.63.129.16`, `100.100.100.200`, `fd00:ec2::/64`, `fd20:ce::254`, and
+    /// their recognized IPv4-embedded forms.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Named authorization secrets for `auth_secret` requests.
@@ -7533,6 +7637,8 @@ fn default_allowed_domains_star() -> Vec<String> {
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts). `blocked_domains` takes priority over `allowed_domains`.
 /// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
+/// Same-host redirects are followed; cross-host redirects are rejected so the
+/// validated DNS answers remain pinned to the request transport.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web_fetch"]
@@ -7546,14 +7652,22 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
-    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`).
-    /// Exact and subdomain matches are supported. Listing a host skips the
-    /// resolved-IP SSRF check for it; a *literal* private/local host (IP literal,
-    /// localhost, .local) listed here also bypasses `allowed_domains`. The `*`
-    /// wildcard permits any literal private/local host and lets a name already in
-    /// `allowed_domains` resolve to a private IP, but it does NOT widen
+    /// Private/internal hosts allowed to relax the public-address SSRF check
+    /// (e.g. `["192.168.1.10", "internal.local"]`). Exact and subdomain matches
+    /// are supported. Every target still resolves locally, and known cloud
+    /// metadata/platform addresses remain blocked. A *literal* private/local host
+    /// (IP literal, localhost, .local) listed here also bypasses `allowed_domains`.
+    /// The `*` wildcard permits any literal private/local host and lets a name
+    /// already in `allowed_domains` resolve to a private IP, but it does NOT widen
     /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
     /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
+    /// The standard `web_fetch` request requires direct transport for DNS pinning:
+    /// environment proxy discovery is disabled, and an enabled `environment` scope
+    /// or runtime proxy applying to the tool is rejected. A process environment proxy
+    /// outside that managed scope is warned and ignored for the standard request.
+    /// The optional Firecrawl API fallback uses normal environment proxy discovery
+    /// because that separate API request has no locally validated DNS pin. Use
+    /// `proxy.scope = "services"` without `tool.*` to proxy other traffic.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -7712,11 +7826,17 @@ pub struct TextBrowserConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_text_browser_timeout_secs")]
     pub timeout_secs: u64,
-    /// Private/internal hosts allowed to bypass SSRF protection.
-    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
-    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
-    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
-    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
+    /// Private/internal hosts allowed to relax the public-address SSRF check.
+    /// Exact and subdomain matches are supported; `["*"]` permits private/local
+    /// hosts (RFC 1918, loopback, `.local`). Default: empty (deny). All of
+    /// `169.254.0.0/16`, Azure `168.63.129.16`, Alibaba `100.100.100.200`, AWS
+    /// `fd00:ec2::/64`, GCP `fd20:ce::254`, and their recognized IPv4-embedded
+    /// forms remain blocked after resolution regardless of this opt-in.
+    /// The external browser re-resolves DNS and follows redirects without
+    /// revalidation, so these checks are not a DNS-rebinding or redirect boundary.
+    /// Local preflight resolution still applies under this opt-in, which may reject
+    /// names available only through a browser or proxy. Prefer `web_fetch` when
+    /// URLs or DNS are attacker-controlled.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
 }
@@ -9250,6 +9370,13 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
+/// The standard `web_fetch` request and every `http_request` request are direct
+/// so their locally validated DNS answers can be pinned: they bypass environment
+/// proxies and reject a runtime proxy scope that applies to `tool.web_fetch` or
+/// `tool.http_request`, including an enabled `environment` scope. Unmanaged process
+/// proxy variables are warned when ignored. The optional Firecrawl API fallback uses
+/// normal environment proxy discovery. To proxy other traffic, use `services` scope
+/// without those selectors or `tool.*`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]
@@ -9732,6 +9859,112 @@ fn clear_proxy_env_pair(key: &str) {
     unsafe {
         std::env::remove_var(key);
         std::env::remove_var(key.to_ascii_lowercase());
+    }
+}
+
+/// Return the process proxy variable that reqwest would use for `raw_url`,
+/// excluding destinations covered by `NO_PROXY`/`no_proxy`.
+///
+/// DNS-pinned callers use this to surface an intentional environment-proxy
+/// bypass instead of silently changing the operator's egress path.
+pub fn environment_proxy_for_url(raw_url: &str) -> Option<&'static str> {
+    environment_proxy_for_url_with(raw_url, |key| std::env::var(key).ok())
+}
+
+fn environment_proxy_for_url_with(
+    raw_url: &str,
+    mut read_env: impl FnMut(&str) -> Option<String>,
+) -> Option<&'static str> {
+    fn first_nonempty(
+        read_env: &mut impl FnMut(&str) -> Option<String>,
+        keys: &[&'static str],
+    ) -> Option<&'static str> {
+        keys.iter().copied().find(|key| {
+            read_env(key)
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    }
+
+    let parsed = reqwest::Url::parse(raw_url).ok()?;
+    let scheme_keys: &[&str] = match parsed.scheme() {
+        "http" => &["HTTP_PROXY", "http_proxy"],
+        "https" => &["HTTPS_PROXY", "https_proxy"],
+        _ => return None,
+    };
+    let proxy_var = first_nonempty(&mut read_env, scheme_keys)
+        .or_else(|| first_nonempty(&mut read_env, &["ALL_PROXY", "all_proxy"]))?;
+    let host = parsed.host_str()?;
+    let no_proxy = read_env("NO_PROXY")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| read_env("no_proxy").filter(|value| !value.trim().is_empty()));
+
+    if no_proxy
+        .as_deref()
+        .is_some_and(|entries| no_proxy_matches_host(entries, host))
+    {
+        None
+    } else {
+        Some(proxy_var)
+    }
+}
+
+fn no_proxy_matches_host(entries: &str, host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let host_ip = host.parse::<std::net::IpAddr>().ok();
+
+    entries.split(',').map(str::trim).any(|entry| {
+        if entry == "*" {
+            return true;
+        }
+        let entry = entry.trim_end_matches('.');
+        if entry.is_empty() {
+            return false;
+        }
+
+        if let Some(host_ip) = host_ip
+            && let Some((network, prefix)) = entry.split_once('/')
+            && let (Ok(network), Ok(prefix)) =
+                (network.parse::<std::net::IpAddr>(), prefix.parse::<u32>())
+        {
+            return ip_in_prefix(host_ip, network, prefix);
+        }
+
+        if let Ok(entry_ip) = entry.parse::<std::net::IpAddr>() {
+            return host_ip == Some(entry_ip);
+        }
+
+        let domain = entry.trim_start_matches('.').to_ascii_lowercase();
+        host == domain
+            || host
+                .strip_suffix(&domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn ip_in_prefix(host: std::net::IpAddr, network: std::net::IpAddr, prefix: u32) -> bool {
+    match (host, network) {
+        (std::net::IpAddr::V4(host), std::net::IpAddr::V4(network)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(host) & mask == u32::from(network) & mask
+        }
+        (std::net::IpAddr::V6(host), std::net::IpAddr::V6(network)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(host) & mask == u128::from(network) & mask
+        }
+        _ => false,
     }
 }
 
@@ -11943,7 +12176,7 @@ pub struct RuntimeProfileConfig {
     /// How skills are injected into the system prompt for agents on this
     /// profile. `None` inherits the global `[skills] prompt_injection_mode`;
     /// `compact` inlines only compact skill metadata and registers the
-    /// `read_skill` tool, `full` inlines full skill instructions. Resolved
+    /// `read_skill` tool, while `full` inlines full skill instructions. Resolved
     /// through [`Config::effective_skills_prompt_mode`], the single point both
     /// the system-prompt builder and the `read_skill` tool-registration gate
     /// consult so they always agree on the effective mode.
@@ -12104,13 +12337,17 @@ pub struct RuntimeConfig {
     /// Shell binary the native runtime uses for command execution.
     ///
     /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
-    /// When unset or `null`, the system default `sh` is used. The shell is
-    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
-    /// shell binary.
+    /// When unset or `null`, the system default `sh` is used.
     ///
-    /// Accepted forms (Unix):
+    /// **Unix:** POSIX-compatible shells are invoked as
+    /// `<shell> -c "<command>"`. Accepted forms:
     /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
     /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
+    ///
+    /// `powershell` and `pwsh` select the PowerShell policy dialect and run as
+    /// `<interpreter> -NoProfile -NonInteractive -Command <command>` on every
+    /// supported desktop host; other Unix interpreters are treated as
+    /// POSIX-compatible shells.
     ///
     /// The value is validated when the native runtime is constructed, so a bad
     /// value is reported up front rather than failing on the first shell
@@ -12119,15 +12356,33 @@ pub struct RuntimeConfig {
     /// instead); a bare name not found on `PATH`; and a path that does not
     /// exist or is not executable.
     ///
-    /// **Ignored on Windows and Android** (and not validated there): Windows
-    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
-    /// (its shell is not on `PATH` for spawned processes).
+    /// **Windows:** the value selects the interpreter *family* by its file stem
+    /// (case-insensitive), which fixes the invocation convention:
+    /// - `"powershell"` (Windows PowerShell 5.x) or `"pwsh"` (PowerShell 7+),
+    ///   as a bare name resolved via `PATH` or an absolute path (e.g.
+    ///   `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`), run the command as
+    ///   `<interpreter> -NoProfile -NonInteractive -Command <command>`;
+    /// - any other value (including the default `sh` and an explicit `"cmd"`)
+    ///   runs `cmd.exe /C "<command>"`, preserving the historical behaviour.
+    ///
+    /// Only an empty/whitespace value is rejected on Windows; the interpreter is
+    /// located at spawn time.
+    ///
+    /// Command policy uses the selected interpreter's dialect. PowerShell
+    /// accepts a bounded grammar of simple command invocations, arguments,
+    /// variable reads, and pipelines; expression and invocation constructs
+    /// that cannot be safely classified are rejected before execution.
+    ///
+    /// **Ignored on Android** (always `/system/bin/sh`, whose shell is not on
+    /// `PATH` for spawned processes).
     ///
     /// **Examples:**
     /// ```toml
     /// [runtime]
-    /// shell = "bash" # resolves via PATH
-    /// shell = "/bin/zsh" # absolute path
+    /// shell = "bash" # Unix: resolves via PATH
+    /// shell = "/bin/zsh" # Unix: absolute path
+    /// shell = "pwsh" # PowerShell 7+ (Windows, Linux, or macOS)
+    /// shell = "powershell" # Windows: Windows PowerShell 5.x
     /// ```
     #[serde(default)]
     pub shell: Option<String>,
@@ -12169,10 +12424,13 @@ pub struct DockerRuntimeConfig {
     pub read_only_rootfs: bool,
 
     /// Mount configured workspace into `/workspace`.
+    ///
+    /// When enabled, the workspace must exist and canonicalize before Docker
+    /// command construction.
     #[serde(default = "default_true")]
     pub mount_workspace: bool,
 
-    /// Optional workspace root allowlist for Docker mount validation.
+    /// Optional workspace root allowlist for fail-closed Docker mount validation: when `mount_workspace` is enabled, the workspace must exist and canonicalize even when this list is empty; every configured root must also exist and canonicalize; one invalid entry rejects the command before Docker starts; an empty list permits any canonical workspace.
     #[serde(default)]
     pub allowed_workspace_roots: Vec<String>,
 }
@@ -13111,10 +13369,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub linq: HashMap<String, LinqConfig>,
-    /// WATI WhatsApp Business API channel instances (`[channels.wati.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub wati: HashMap<String, WatiConfig>,
     /// Nextcloud Talk bot channel instances (`[channels.nextcloud_talk.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -13327,12 +13581,6 @@ impl ChannelsConfig {
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
-                kind: "wati",
-                name: "WATI",
-                desc: "WhatsApp via WATI Business API",
-                configured: !self.wati.is_empty(),
-            },
-            ChannelInfo {
                 kind: "nextcloud",
                 name: "NextCloud Talk",
                 desc: "NextCloud Talk platform",
@@ -13501,7 +13749,6 @@ impl ChannelsConfig {
             || self.signal.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
-            || self.wati.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
@@ -13536,7 +13783,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -13548,7 +13795,6 @@ impl ChannelsConfig {
             ("signal", !self.signal.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
             ("linq", !self.linq.is_empty(), true),
-            ("wati", !self.wati.is_empty(), true),
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
             ("email", !self.email.is_empty(), true),
             ("gmail_push", !self.gmail_push.is_empty(), true),
@@ -13634,7 +13880,6 @@ impl Default for ChannelsConfig {
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -14444,8 +14689,10 @@ pub struct WebhookConfig {
     pub retry_max_delay_ms: Option<u64>,
 }
 
+pub const DEFAULT_WEBHOOK_CHANNEL_PORT: u16 = 8090;
+
 fn default_webhook_channel_port() -> u16 {
-    8090
+    DEFAULT_WEBHOOK_CHANNEL_PORT
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -14761,7 +15008,13 @@ pub enum WhatsAppChatPolicy {
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.whatsapp"]
 pub struct WhatsAppConfig {
@@ -14790,8 +15043,13 @@ pub struct WhatsAppConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub verify_token: Option<String>,
     /// App secret from Meta Business Suite (for webhook signature verification)
-    /// Can also be set via `ZEROCLAW_WHATSAPP_APP_SECRET` environment variable
-    /// Only used in Cloud API mode
+    /// Can also be set with the alias-qualified generic environment override:
+    /// `ZEROCLAW_channels__whatsapp__<alias>__app_secret`.
+    /// Only used in Cloud API mode.
+    ///
+    /// Required to receive webhooks. Inbound requests are signature-verified,
+    /// and with no secret configured the gateway cannot verify them, so it
+    /// refuses them with `401` rather than accepting them unverified.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -14910,6 +15168,24 @@ pub struct WhatsAppConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for WhatsAppConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree.
+    ///
+    /// A hand-written field list was the other option and was rejected: this
+    /// struct carries two dozen fields, so such a list silently goes stale the
+    /// first time one is added, which is the same class of defect this exists
+    /// to remove. Every field here either declares a serde default or is an
+    /// `Option`, which is what makes the empty object total. The unwrap is
+    /// covered by `whatsapp_rust_default_matches_serde_default` below, so a
+    /// field added without a default fails that test rather than reaching a
+    /// caller.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every WhatsAppConfig field declares a serde default or is Option")
+    }
+}
+
 impl ChannelConfig for WhatsAppConfig {
     fn name() -> &'static str {
         "WhatsApp"
@@ -14950,7 +15226,11 @@ pub struct LinqConfig {
     /// Phone number to send from (E.164 format)
     #[tab(Advanced)]
     pub from_phone: String,
-    /// Webhook signing secret for signature verification
+    /// Webhook signing secret for signature verification.
+    ///
+    /// Required to receive webhooks. Inbound requests are signature-verified,
+    /// and with no secret configured the gateway cannot verify them, so it
+    /// refuses them with `401` rather than accepting them unverified.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -14970,57 +15250,6 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
-    }
-}
-
-/// WATI WhatsApp Business API channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.wati"]
-pub struct WatiConfig {
-    /// Whether this channel is active. The runtime only loads channels whose
-    /// `enabled = true`. Default: `false` so an operator who pastes a partial
-    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
-    /// live before the rest of its config is filled in.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub enabled: bool,
-    /// WATI API token (Bearer auth).
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_token: String,
-    /// WATI API base URL (default: <https://live-mt-server.wati.io>).
-    #[tab(Advanced)]
-    #[serde(default = "default_wati_api_url")]
-    pub api_url: String,
-    /// Tenant ID for multi-channel setups (optional).
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// Per-channel proxy URL (http, https, socks5, socks5h).
-    /// Overrides the global `[proxy]` setting for this channel only.
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-
-    /// Tools excluded from this channel's tool spec. When set, these tools
-    /// are not exposed to the model when responding via this channel.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub excluded_tools: Vec<String>,
-}
-
-fn default_wati_api_url() -> String {
-    "https://live-mt-server.wati.io".to_string()
-}
-
-impl ChannelConfig for WatiConfig {
-    fn name() -> &'static str {
-        "WATI"
-    }
-    fn desc() -> &'static str {
-        "WhatsApp via WATI Business API"
     }
 }
 
@@ -16040,7 +16269,8 @@ impl ChannelConfig for LineConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
-/// Security configuration for audit logging, OTP, e-stop, IAM/SSO, and WebAuthn.
+/// Security configuration for audit logging, OTP, e-stop, IAM/SSO, WebAuthn,
+/// and the host's NAT64 egress boundary.
 ///
 /// Sandbox backend and resource limits live on per-agent risk profiles
 /// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
@@ -16049,6 +16279,41 @@ impl ChannelConfig for LineConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
 pub struct SecurityConfig {
+    /// Network-specific RFC 6052 NAT64 prefixes deployed on this host's
+    /// network, for example
+    /// `[security] nat64_prefixes = ["2001:db8:122:344::/96"]`. Default: `[]`.
+    ///
+    /// A NAT64 translator delivers any IPv6 destination inside one of these
+    /// prefixes to the IPv4 address embedded in it. The prefix is an
+    /// organization's own choice and nothing in the address reveals it, so
+    /// without this list an attacker-controlled hostname can resolve to an
+    /// apparently-global IPv6 address that the local translator maps to
+    /// `10.0.0.1` or `169.254.169.254`, and the outbound SSRF checks accept
+    /// it. Declaring the prefixes in use makes the address they translate to
+    /// part of the validation boundary for `http_request`, `web_fetch`, and
+    /// `text_browser`.
+    ///
+    /// Each entry is `<ipv6>/<length>` with one of RFC 6052 §2.2's lengths —
+    /// 32, 40, 48, 56, 64, or 96 — and no bits set beyond that length. A
+    /// malformed entry fails construction of the tools that read this list
+    /// rather than being skipped, so a typo cannot silently narrow the
+    /// boundary.
+    ///
+    /// The default is correct for deployments that run no NAT64 translator and
+    /// for those that use only the well-known `64:ff9b::/96` prefix, which is
+    /// classified without configuration.
+    ///
+    /// Declared prefixes may overlap, and an address inside several of them
+    /// decodes to a *different* IPv4 destination under each. Validation is
+    /// conservative: an address is accepted only when every declared
+    /// translation it matches lands somewhere acceptable, so a nested prefix
+    /// that decodes an address to a private or metadata destination denies it
+    /// even when a broader prefix decodes the same address globally. If that
+    /// refuses destinations you consider legitimate, narrow the declared
+    /// prefixes to the translations actually deployed.
+    #[serde(default)]
+    pub nat64_prefixes: Vec<String>,
+
     /// Audit logging configuration
     #[serde(default)]
     #[nested]
@@ -17748,6 +18013,7 @@ impl Default for Config {
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -18609,6 +18875,26 @@ impl Config {
             .collect()
     }
 
+    /// Return retired WATI section roots before migration and typed
+    /// deserialization erase them. V1 used `[channels_config.wati]`; V2/V3
+    /// channel aliases use `[channels.wati.<alias>]`.
+    fn retired_wati_config_sections(raw_toml: &str) -> Vec<String> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+
+        ["channels", "channels_config"]
+            .into_iter()
+            .filter(|root| {
+                raw.get(*root)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|channels| channels.contains_key("wati"))
+            })
+            .map(|root| format!("{root}.wati"))
+            .collect()
+    }
+
     /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
     /// whose family is not a known typed slot (kinds: models, tts,
     /// transcription). Serde silently drops these sections at deserialize
@@ -18857,6 +19143,24 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
+            let retired_wati_config_sections = Self::retired_wati_config_sections(&contents);
+            for path in &retired_wati_config_sections {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "channel": "wati",
+                            "retired_config": path,
+                        })),
+                    &format!(
+                        "Retired WATI channel config section `{path}` is ignored because WATI \
+                         support was removed. Migrate to `[channels.whatsapp.<alias>]` using \
+                         the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
+                    )
+                );
+            }
+
             // Deserialize the config with the standard TOML parser.
             //
             // Previously this used `serde_ignored::deserialize` for both
@@ -18892,6 +19196,7 @@ impl Config {
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
             config.degraded_sections = salvage.dropped;
+            config.retired_wati_config_sections = retired_wati_config_sections;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -19052,6 +19357,10 @@ impl Config {
                      can fix them via /config or `zeroclaw config set`"
                 );
             }
+            // Publish the effective post-decryption, post-env-override proxy
+            // configuration before any runtime client or tool is constructed.
+            // Interactive proxy_config updates use the same live state.
+            set_runtime_proxy_config(config.proxy.clone());
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         } else {
@@ -19089,6 +19398,7 @@ impl Config {
                      booting anyway so you can fix them via /config"
                 );
             }
+            set_runtime_proxy_config(config.proxy.clone());
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         }
@@ -19112,6 +19422,7 @@ impl Config {
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        self.collect_dns_pinned_proxy_warnings(&mut warnings);
         self.collect_peer_groups_warnings(&mut warnings);
         // Must run after `collect_cross_provider_summary_model_warnings`: it
         // scans `warnings` to suppress its generic inert `summary_model`
@@ -19141,6 +19452,50 @@ impl Config {
             }
         }
         warnings
+    }
+
+    fn collect_dns_pinned_proxy_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !self.proxy.enabled {
+            return;
+        }
+        if self.proxy.scope != ProxyScope::Environment && !self.proxy.has_any_proxy_url() {
+            return;
+        }
+
+        let (http_request_blocked, web_fetch_blocked) = match self.proxy.scope {
+            ProxyScope::Environment | ProxyScope::Zeroclaw => (true, true),
+            ProxyScope::Services => (
+                self.proxy.should_apply_to_service("tool.http_request"),
+                self.proxy.should_apply_to_service("tool.web_fetch"),
+            ),
+        };
+        if !http_request_blocked && !web_fetch_blocked {
+            return;
+        }
+
+        let affected = match (http_request_blocked, web_fetch_blocked) {
+            (true, true) => "http_request and web_fetch",
+            (true, false) => "http_request",
+            (false, true) => "web_fetch",
+            (false, false) => unreachable!(),
+        };
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            "proxy_conflicts_with_dns_pinned_tools",
+            format!(
+                "The configured proxy scope applies to DNS-pinned tool calls ({affected}), so \
+                 those calls will fail instead of using an unpinned proxy connection. Use \
+                 proxy.scope = \"services\" and omit tool.http_request and tool.* from \
+                 proxy.services; tool.* also selects web_fetch."
+            ),
+            if self.proxy.scope == ProxyScope::Services {
+                "proxy.services"
+            } else {
+                "proxy.scope"
+            },
+        ));
     }
 
     /// Surface sqlite semantic/hybrid search with no effective embedder. The
@@ -19748,6 +20103,16 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+
+        let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
+        if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
+            let path = "gateway.websocket_ping_interval_secs";
+            validation_bail!(
+                InvalidNumericRange,
+                path,
+                "{path} = {websocket_ping_interval_secs} is out of range; must be 0..={GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS}"
+            );
+        }
 
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
@@ -23228,6 +23593,54 @@ max_height = 8
         assert_eq!(cfg.max_height, 8);
     }
 
+    /// The whole point of splitting the accessor: an operator-facing caller
+    /// must be able to tell "unconfigured" from a real 32,000, which a bare
+    /// `usize` cannot express.
+    #[::core::prelude::v1::test]
+    fn configured_context_window_reports_unset_distinctly_from_the_fallback() {
+        let mut cfg = super::Config::default();
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .model = Some("qwen3".to_string());
+        cfg.agents.insert(
+            "coder".to_string(),
+            super::AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                ..Default::default()
+            },
+        );
+
+        // A real referenced profile without a declaration is honestly
+        // unknown, while budget arithmetic retains its historical operand.
+        assert_eq!(cfg.configured_model_context_window("coder"), None);
+        // Budget arithmetic still gets an operand, unchanged from before.
+        assert_eq!(
+            cfg.effective_model_context_window("coder"),
+            super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+
+        // Explicitly configuring the same numeric value remains distinguishable
+        // from the fallback.
+        cfg.providers
+            .models
+            .ensure("ollama", "local")
+            .expect("known model provider type")
+            .context_window = Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK);
+        assert_eq!(
+            cfg.configured_model_context_window("coder"),
+            Some(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn unconfigured_context_window_fallback_is_documented_stub_value() {
+        // Pinned so a change to the stub is a deliberate, reviewed edit — the
+        // value is load-bearing for trim budgets on unconfigured profiles.
+        assert_eq!(super::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK, 32_000);
+    }
+
     #[::core::prelude::v1::test]
     fn mcp_server_config_pinned_resources_defaults_empty_and_round_trips() {
         // Absent field defaults to empty.
@@ -24140,7 +24553,15 @@ api_token = "Bearer test-token"
         assert!(!c.skills.allow_scripts);
         assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
+            SkillsPromptInjectionMode::default(),
+            SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
             c.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
+            c.effective_skills_prompt_mode("missing"),
             SkillsPromptInjectionMode::Full
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
@@ -24148,9 +24569,23 @@ api_token = "Bearer test-token"
     }
 
     #[test]
+    async fn skills_table_without_prompt_mode_keeps_full_default() {
+        let config = parse_test_config(
+            r#"
+[skills]
+open_skills_enabled = false
+"#,
+        );
+
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
     async fn runtime_profile_prompt_injection_mode_overrides_global() {
         let mut config = Config::default();
-        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
         // A runtime profile that pins compact, and an agent pointing at it.
         config.runtime_profiles.insert(
             "compact_profile".to_string(),
@@ -24182,29 +24617,48 @@ api_token = "Bearer test-token"
             .agents
             .insert("inherit".to_string(), AliasedAgentConfig::default());
 
-        // Profile override beats the global value.
+        // Profile override to Compact beats the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
         );
-        // Profile present but mode unset → inherit the global value.
+        // An unset profile, an agent with no profile, and an unknown alias all
+        // inherit the global Full value.
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
             SkillsPromptInjectionMode::Full
         );
-        // No runtime profile → inherit the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("inherit"),
             SkillsPromptInjectionMode::Full
         );
-        // Unknown alias also falls back to the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("missing"),
             SkillsPromptInjectionMode::Full
         );
 
-        // Flipping the global moves only the inheriting/unset/unknown agents;
-        // the profile override is unaffected.
+        // A runtime profile that explicitly pins Full is also honored.
+        config.runtime_profiles.insert(
+            "full_profile".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "pinned_full".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "full_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("pinned_full"),
+            SkillsPromptInjectionMode::Full
+        );
+
+        // Flipping the global to Compact updates inheriting agents while both
+        // explicit profile overrides remain authoritative.
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
@@ -24221,6 +24675,10 @@ api_token = "Bearer test-token"
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("pinned_full"),
+            SkillsPromptInjectionMode::Full
         );
     }
 
@@ -24278,13 +24736,37 @@ runtime_profile = "fast"
             SkillsPromptInjectionMode::Compact
         );
 
-        // Profile-less agent: resolved value falls back to the global default.
+        // Profile-less agent: explicit global `full` remains effective.
         let plain = parsed
             .resolved_agent_config("plain")
             .expect("agent plain resolves");
         assert_eq!(
             plain.resolved.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
+            parsed.effective_skills_prompt_mode("plain"),
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
+    async fn full_modes_do_not_emit_deprecation_warning_before_v09() {
+        let mut config = Config::default();
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
+        config.runtime_profiles.insert(
+            "full".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        assert!(
+            config
+                .collect_warnings()
+                .into_iter()
+                .all(|warning| warning.code != "skills_prompt_injection_mode_full_deprecated")
         );
     }
 
@@ -24413,6 +24895,32 @@ enabled = true
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_websocket_ping_interval_above_upper_bound() {
+        let mut config = Config::default();
+        config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1;
+
+        let err = config
+            .validate()
+            .expect_err("over-bound WebSocket ping interval must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("gateway.websocket_ping_interval_secs"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_websocket_ping_interval_upper_bound() {
+        let mut config = Config::default();
+        config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS;
+
+        config
+            .validate()
+            .expect("WebSocket ping interval upper bound must validate");
     }
 
     #[test]
@@ -25637,6 +26145,7 @@ auto_save = true
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -25742,7 +26251,6 @@ auto_save = true
                 signal: HashMap::new(),
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
-                wati: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
@@ -26623,6 +27131,7 @@ default_temperature = 0.7
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -27487,7 +27996,6 @@ allowed_users = ["@u:matrix.org"]
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -28053,7 +28561,6 @@ allowed_numbers = ["+1", "+2"]
                 },
             )]),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -28174,6 +28681,7 @@ allowed_numbers = ["+1", "+2"]
             idempotency_max_keys: 4096,
             session_persistence: true,
             session_ttl_hours: 0,
+            websocket_ping_interval_secs: 30,
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -29118,6 +29626,38 @@ wire_api = "ws"
     }
 
     #[test]
+    async fn load_or_init_seeds_runtime_proxy_from_config_file() {
+        let _env_guard = env_override_lock().await;
+        let config_dir = TempDir::new().unwrap();
+        let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", config_dir.path());
+        fs::write(
+            config_dir.path().join("config.toml"),
+            r#"
+schema_version = 3
+
+[proxy]
+enabled = true
+http_proxy = "http://boot-proxy.example:3128"
+scope = "zeroclaw"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+        let runtime = runtime_proxy_config();
+
+        assert_eq!(loaded.proxy.http_proxy, runtime.http_proxy);
+        assert!(runtime.enabled);
+        assert_eq!(
+            runtime.http_proxy.as_deref(),
+            Some("http://boot-proxy.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
+    }
+
+    #[test]
     async fn load_or_init_workspace_override_uses_workspace_root_for_config() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -29368,6 +29908,78 @@ default_model = "persisted-profile"
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::remove_var("HOME") };
         }
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_warns_for_current_and_legacy_wati_config() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let _home_guard = EnvValueGuard::set("HOME", &temp_home);
+        let _config_guard = EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+
+        let cases = [
+            (
+                "current",
+                r#"schema_version = 3
+
+[channels.wati.production]
+enabled = true
+api_token = "current-placeholder-token"
+"#,
+                "channels.wati",
+                "current-placeholder-token",
+            ),
+            (
+                "legacy",
+                r#"[channels_config.wati]
+enabled = true
+api_token = "legacy-placeholder-token"
+"#,
+                "channels_config.wati",
+                "legacy-placeholder-token",
+            ),
+        ];
+
+        for (case, raw, expected_path, secret_value) in cases {
+            let install = temp_home.join(case);
+            fs::create_dir_all(&install).await.unwrap();
+            fs::write(install.join("config.toml"), raw).await.unwrap();
+            let _workspace_guard = EnvValueGuard::set("ZEROCLAW_WORKSPACE", &install);
+            let mut rx = capture_log_events();
+
+            let config = Box::pin(Config::load_or_init()).await.unwrap();
+            let logs = drain_captured(&mut rx);
+
+            assert!(
+                config
+                    .channels_by_alias()
+                    .iter()
+                    .all(|entry| entry.channel_type != "wati"),
+                "retired WATI config must not re-enable a live channel"
+            );
+            assert_eq!(
+                config.retired_wati_config_sections,
+                vec![expected_path.to_string()],
+                "load-time diagnostics must preserve the retired section path"
+            );
+            assert!(
+                logs.contains("Retired WATI channel config section"),
+                "missing WATI retirement warning for {case}: {logs}"
+            );
+            assert!(
+                logs.contains(expected_path),
+                "warning must name {expected_path}: {logs}"
+            );
+            assert!(
+                !logs.contains(secret_value),
+                "warning must never copy retired WATI credentials into logs: {logs}"
+            );
+        }
+
         let _ = fs::remove_dir_all(temp_home).await;
     }
 
@@ -29936,6 +30548,73 @@ api_token = "tok"
     }
 
     #[test]
+    async fn collect_warnings_surfaces_dns_pinned_proxy_conflicts() {
+        let proxy_url = Some("http://proxy.example:3128".to_string());
+
+        for (scope, http_proxy) in [
+            (ProxyScope::Environment, None),
+            (ProxyScope::Environment, proxy_url.clone()),
+            (ProxyScope::Zeroclaw, proxy_url.clone()),
+        ] {
+            let config = Config {
+                proxy: ProxyConfig {
+                    enabled: true,
+                    http_proxy,
+                    scope,
+                    ..ProxyConfig::default()
+                },
+                ..Config::default()
+            };
+            let warning = config
+                .collect_warnings()
+                .into_iter()
+                .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+                .expect("broad proxy scopes must warn about DNS-pinned tools");
+            assert_eq!(warning.path, "proxy.scope");
+            assert!(warning.message.contains("http_request and web_fetch"));
+            assert!(warning.message.contains("proxy.scope = \"services\""));
+        }
+
+        let services_config = |services: Vec<&str>| Config {
+            proxy: ProxyConfig {
+                enabled: true,
+                http_proxy: proxy_url.clone(),
+                scope: ProxyScope::Services,
+                services: services.into_iter().map(ToOwned::to_owned).collect(),
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let http_warning = services_config(vec!["tool.http_request"])
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+            .expect("the explicit http_request selector must warn");
+        assert_eq!(http_warning.path, "proxy.services");
+        assert!(http_warning.message.contains("tool calls (http_request)"));
+        assert!(!http_warning.message.contains("tool calls (web_fetch)"));
+
+        let wildcard_warning = services_config(vec!["tool.*"])
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+            .expect("the tool wildcard must warn");
+        assert!(
+            wildcard_warning
+                .message
+                .contains("http_request and web_fetch")
+        );
+
+        assert!(
+            services_config(vec!["model_provider.openai"])
+                .collect_warnings()
+                .iter()
+                .all(|warning| warning.code != "proxy_conflicts_with_dns_pinned_tools")
+        );
+    }
+
+    #[test]
     async fn google_workspace_allowed_operations_require_methods() {
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -30053,7 +30732,40 @@ api_token = "tok"
     }
 
     #[test]
+    async fn environment_proxy_detection_respects_scheme_and_no_proxy() {
+        let values = HashMap::from([
+            ("HTTP_PROXY", "http://http-proxy.example:3128"),
+            ("HTTPS_PROXY", "http://https-proxy.example:3128"),
+            ("ALL_PROXY", "socks5://all-proxy.example:1080"),
+            ("NO_PROXY", "example.com,10.0.0.0/8,2001:db8::/32,localhost"),
+        ]);
+        let read = |key: &str| values.get(key).map(ToString::to_string);
+
+        assert_eq!(
+            environment_proxy_for_url_with("https://public.invalid/", read),
+            Some("HTTPS_PROXY")
+        );
+        assert_eq!(
+            environment_proxy_for_url_with("http://public.invalid/", read),
+            Some("HTTP_PROXY")
+        );
+        for bypassed in [
+            "https://api.example.com/",
+            "http://10.2.3.4/",
+            "https://[2001:db8::1]/",
+            "http://localhost/",
+        ] {
+            assert_eq!(
+                environment_proxy_for_url_with(bypassed, read),
+                None,
+                "NO_PROXY should bypass {bypassed}"
+            );
+        }
+    }
+
+    #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        let _env_guard = env_override_lock().await;
         let service_key = format!(
             "model_provider.cache_test.{}",
             std::time::SystemTime::now()
@@ -30075,6 +30787,7 @@ api_token = "tok"
 
     #[test]
     async fn proxy_reload_applies_new_config_through_rwlock() {
+        let _env_guard = env_override_lock().await;
         set_runtime_proxy_config(ProxyConfig {
             enabled: true,
             http_proxy: Some("http://boot.example:3128".to_string()),
@@ -30101,6 +30814,7 @@ api_token = "tok"
 
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        let _env_guard = env_override_lock().await;
         let service_key = format!(
             "model_provider.cache_timeout_test.{}",
             std::time::SystemTime::now()
@@ -30129,6 +30843,7 @@ api_token = "tok"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert_eq!(g.websocket_ping_interval_secs, 30);
     }
 
     // ── Peripherals config ───────────────────────────────────────
@@ -33929,7 +34644,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
             &bin_dir,
             r#"#!/bin/sh
 if [ "$1" = "read" ] && [ "$2" = "op://zeroclaw/provider/openai-api-key" ]; then
-  sleep 1
+  sleep 3
   printf '%s\n' 'sk-proj-from-onepassword'
   exit 0
 fi
@@ -33963,8 +34678,11 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let load_task = tokio::spawn(Config::load_or_init());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // Threshold sized against the 3s fake-op sleep: a blocked worker pins
+        // elapsed at >=3s, while scheduler latency under full-suite CI load
+        // stays well under 1.5s.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
+            started.elapsed() < std::time::Duration::from_millis(1500),
             "op:// config load should not block the async runtime worker"
         );
 
@@ -34633,6 +35351,29 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let mut tr_slots = crate::providers::TranscriptionProviders::slot_names().to_vec();
         tr_slots.sort_unstable();
         assert_eq!(tr_fields, tr_slots);
+    }
+
+    #[test]
+    async fn retired_wati_config_sections_cover_current_and_legacy_shapes() {
+        assert_eq!(
+            Config::retired_wati_config_sections(
+                "schema_version = 3\n[channels.wati.production]\nenabled = true\n",
+            ),
+            vec!["channels.wati".to_string()]
+        );
+        assert_eq!(
+            Config::retired_wati_config_sections(
+                "[channels_config.wati]\nenabled = true\napi_token = \"placeholder\"\n",
+            ),
+            vec!["channels_config.wati".to_string()]
+        );
+        assert!(
+            Config::retired_wati_config_sections(
+                "schema_version = 3\n[channels.whatsapp.production]\nenabled = true\n",
+            )
+            .is_empty()
+        );
+        assert!(Config::retired_wati_config_sections("not toml {{{").is_empty());
     }
 
     #[test]
@@ -35970,6 +36711,121 @@ allowed_users = []
 
         let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 300);
+    }
+
+    /// The test above proves the SERDE path. It says nothing about the RUST
+    /// path, and the two used to disagree: a derived `Default` zeroed the
+    /// field while serde supplied 300.
+    ///
+    /// That gap is not cosmetic. An alias created through a surface that
+    /// constructs the struct in Rust, rather than parsing a file, got `0`,
+    /// and `Duration::from_secs(0)` is an already-elapsed deadline, so every
+    /// approval on that alias denied at once with nothing in the operator's
+    /// config looking wrong.
+    #[test]
+    async fn whatsapp_rust_default_waits_rather_than_denying() {
+        assert_eq!(
+            WhatsAppConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs(),
+            "a constructed alias must wait the documented timeout, not deny at once"
+        );
+    }
+
+    /// Pins the whole struct rather than the one field, so a field added later
+    /// with a serde default but no matching Rust default fails here instead of
+    /// reaching an operator. This is also what makes the `expect` in
+    /// `Default::default` safe: if any field stopped being defaultable, the
+    /// deserialize would fail and this test would panic first.
+    #[test]
+    async fn whatsapp_rust_default_matches_serde_default() {
+        let from_rust = serde_json::to_value(WhatsAppConfig::default()).unwrap();
+        let from_serde =
+            serde_json::to_value(serde_json::from_str::<WhatsAppConfig>("{}").unwrap()).unwrap();
+        assert_eq!(
+            from_rust, from_serde,
+            "Default::default() and the serde defaults disagree; every field must match"
+        );
+    }
+
+    /// A zero is still honoured when an operator writes it. The fix above
+    /// changes what an UNSET field means, and must not take away the ability
+    /// to refuse every gated tool deliberately.
+    #[test]
+    async fn whatsapp_explicit_zero_timeout_is_preserved() {
+        let whatsapp: WhatsAppConfig =
+            serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(whatsapp.approval_timeout_secs, 0);
+    }
+
+    /// The whole lifecycle that persisted the accidental zero: create an alias
+    /// through the supported map-key surface, save, reload.
+    ///
+    /// The two tests above compare `Default::default()` against the serde
+    /// defaults, which pins the TYPE. That is where the fix lives, and it is
+    /// not where the defect was felt. An operator never calls
+    /// `WhatsAppConfig::default()`; they add an alias, and the generated
+    /// `create_map_key` inserts `<T>::default()` on their behalf. The field
+    /// carries no `skip_serializing_if` and the struct sets no global skip, so
+    /// whatever that default held is written out EXPLICITLY, and a serde
+    /// default only fires on an ABSENT key. The zero therefore reached the file
+    /// and survived every reload after it, with nothing in the operator's
+    /// config looking wrong.
+    ///
+    /// So this drives the surface rather than the type, and asserts on the
+    /// bytes as well as the reparse: the on-disk assert names the mechanism
+    /// (an explicit `= 0` was persisted) while the reparse asserts what the
+    /// operator gets back. Nothing here sets `approval_timeout_secs`; it is
+    /// omitted throughout, which is the case that broke.
+    #[test]
+    async fn whatsapp_alias_created_through_the_map_key_surface_reloads_waiting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+
+        // The same wire sequence the create dispatch runs: create_map_key,
+        // then mark the new alias dirty.
+        let created = config
+            .create_map_key("channels.whatsapp", "shop")
+            .expect("channels.whatsapp must be a map-keyed section");
+        assert!(
+            created,
+            "a fresh alias must be created, not silently reused"
+        );
+        config.mark_dirty("channels.whatsapp.shop");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("approval_timeout_secs = 0"),
+            "creating an alias must not persist an already-elapsed approval deadline; \
+             got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        let shop = reparsed
+            .channels
+            .whatsapp
+            .get("shop")
+            .expect("the created alias must survive save and reload");
+        assert_eq!(
+            shop.approval_timeout_secs,
+            default_channel_approval_timeout_secs(),
+            "an alias whose approval_timeout_secs was never set must reload waiting the \
+             documented timeout, not denying at once"
+        );
     }
 
     #[test]
