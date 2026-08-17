@@ -5986,9 +5986,7 @@ impl ChatState {
     }
 
     fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
-        let Some(menu) = self.context_menu.take() else {
-            return None;
-        };
+        let menu = self.context_menu.take()?;
         let action = menu.selected_action()?;
         match (menu.target, action) {
             (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
