@@ -1,5 +1,7 @@
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 use zeroclaw_api::channel::ProgressEvent;
 
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static str {
     match event {
         ProgressEvent::Received => "channel-runtime-progress-received",
@@ -11,6 +13,7 @@ pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static st
     }
 }
 
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 pub(crate) fn localized_lifecycle_progress(event: ProgressEvent) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string(lifecycle_progress_fluent_key(event))
 }
@@ -474,6 +477,7 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 mod tests {
     use super::*;
 
+    #[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
     #[test]
     fn lifecycle_progress_maps_typed_events_to_fluent_keys() {
         assert_eq!(
@@ -822,6 +826,7 @@ mod tests {
             include_str!("matrix.rs"),
             include_str!("signal.rs"),
             include_str!("whatsapp.rs"),
+            include_str!("whatsapp_web.rs"),
             include_str!("acp_channel.rs"),
             include_str!("util.rs"),
         ];
