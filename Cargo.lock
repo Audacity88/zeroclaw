@@ -13557,6 +13557,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "url",
  "zeroclaw-api",
  "zeroclaw-log",
  "zeroclaw-spawn",
@@ -13833,6 +13834,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "zeroclaw-api",
  "zeroclaw-log",
 ]
 
