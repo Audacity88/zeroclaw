@@ -2537,6 +2537,11 @@ impl Chat {
                                     CopyHitKind::Message => {}
                                 }
                             }
+                        } else if (mouse.modifiers.contains(KM::SHIFT)
+                            || mouse.modifiers.contains(KM::ALT))
+                            && state.transcript_selection.is_some()
+                        {
+                            state.update_transcript_drag(col, row);
                         } else {
                             state.clear_mouse_highlight();
                             state.begin_transcript_drag(col, row);
@@ -3855,6 +3860,42 @@ fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
         .line_count(width) as u16
 }
 
+fn row_breaks_for_line(line: &Line<'static>, width: u16) -> Vec<TranscriptRowBreak> {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let visual_lines = crate::input_bar::wrap_visual_lines(&text, width);
+    let expected_rows = usize::from(wrapped_rows(line, width));
+    if visual_lines.len() != expected_rows {
+        return vec![TranscriptRowBreak::Hard; expected_rows];
+    }
+
+    visual_lines
+        .iter()
+        .enumerate()
+        .map(|(index, current)| {
+            let Some(previous) = index.checked_sub(1).and_then(|i| visual_lines.get(i)) else {
+                return TranscriptRowBreak::Hard;
+            };
+            let gap = &text[previous.end..current.start];
+            if !gap.is_empty() && !gap.chars().all(|ch| ch == '\u{200b}') {
+                TranscriptRowBreak::SoftSpace
+            } else {
+                TranscriptRowBreak::SoftConcat
+            }
+        })
+        .collect()
+}
+
+fn row_breaks_for_lines(lines: &[Line<'static>], width: u16) -> Vec<TranscriptRowBreak> {
+    lines
+        .iter()
+        .flat_map(|line| row_breaks_for_line(line, width))
+        .collect()
+}
+
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
 fn copy_region(
     global_row: u16,
@@ -4023,6 +4064,11 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     } else {
         Vec::new()
     };
+    let transient_row_breaks = if transient {
+        row_breaks_for_lines(&transient_lines[state.cached_lines.len()..], inner_width)
+    } else {
+        Vec::new()
+    };
 
     let total_rows = if transient {
         Paragraph::new(transient_lines.clone())
@@ -4048,11 +4094,22 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.visible_line_slice(scroll, inner_height)
     };
 
+    let row_breaks = state
+        .cached_row_breaks
+        .iter()
+        .chain(&transient_row_breaks)
+        .copied()
+        .skip(usize::from(scroll))
+        .take(usize::from(body_area.height))
+        .chain(std::iter::repeat(TranscriptRowBreak::Hard))
+        .take(usize::from(body_area.height))
+        .collect();
+
     let p = Paragraph::new(render_lines)
         .wrap(Wrap { trim: false })
         .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
-    capture_transcript_snapshot(f, state, body_area);
+    capture_transcript_snapshot(f, state, body_area, row_breaks);
     render_transcript_selection(f, state);
 
     state.last_total_rows = total_rows;
@@ -4117,7 +4174,12 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
 }
 
-fn capture_transcript_snapshot(f: &mut Frame, state: &mut ChatState, body: Rect) {
+fn capture_transcript_snapshot(
+    f: &mut Frame,
+    state: &mut ChatState,
+    body: Rect,
+    row_breaks: Vec<TranscriptRowBreak>,
+) {
     use unicode_width::UnicodeWidthStr;
 
     let cells = {
@@ -4145,7 +4207,11 @@ fn capture_transcript_snapshot(f: &mut Frame, state: &mut ChatState, body: Rect)
         }
         cells
     };
-    state.set_transcript_snapshot(TranscriptSnapshot { area: body, cells });
+    state.set_transcript_snapshot(TranscriptSnapshot {
+        area: body,
+        cells,
+        row_breaks,
+    });
 }
 
 fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
@@ -5336,10 +5402,19 @@ struct TranscriptCell {
     span_start: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptRowBreak {
+    Hard,
+    SoftSpace,
+    SoftConcat,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TranscriptSnapshot {
     area: Rect,
     cells: Vec<TranscriptCell>,
+    /// Separator before each visible row, derived from source wrap ranges.
+    row_breaks: Vec<TranscriptRowBreak>,
 }
 
 impl TranscriptSnapshot {
@@ -5426,7 +5501,7 @@ impl TranscriptSnapshot {
         let (start, end) = self.selection_bounds(selection)?;
         let start_row = usize::from(start.row);
         let end_row = usize::from(end.row);
-        let mut selected_rows = Vec::with_capacity(end_row.saturating_sub(start_row) + 1);
+        let mut text = String::new();
 
         for row_idx in start_row..=end_row {
             let first_col = if row_idx == start_row {
@@ -5453,10 +5528,22 @@ impl TranscriptSnapshot {
                     row_text.push_str(&cell.symbol);
                 }
             }
-            selected_rows.push(row_text.trim_end_matches(char::is_whitespace).to_string());
+            let row_text = row_text.trim_end_matches(' ');
+            if row_idx > start_row {
+                match self
+                    .row_breaks
+                    .get(row_idx)
+                    .copied()
+                    .unwrap_or(TranscriptRowBreak::Hard)
+                {
+                    TranscriptRowBreak::Hard => text.push('\n'),
+                    TranscriptRowBreak::SoftSpace => text.push(' '),
+                    TranscriptRowBreak::SoftConcat => {}
+                }
+            }
+            text.push_str(row_text);
         }
 
-        let text = selected_rows.join("\n");
         text.chars().any(|ch| !ch.is_whitespace()).then_some(text)
     }
 
@@ -5571,6 +5658,8 @@ pub struct ChatState {
     last_inner_height: u16,
     /// Cached rendered lines from committed entries.
     cached_lines: Vec<Line<'static>>,
+    /// Source-derived separator before each wrapped screen row in `cached_lines`.
+    cached_row_breaks: Vec<TranscriptRowBreak>,
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
@@ -5689,6 +5778,7 @@ impl ChatState {
             last_total_rows: 0,
             last_inner_height: 0,
             cached_lines: Vec::new(),
+            cached_row_breaks: Vec::new(),
             cached_line_ranges: Vec::new(),
             cached_screen_ranges: Vec::new(),
             dirty: LinesDirty::Full,
@@ -6194,6 +6284,8 @@ impl ChatState {
                 Paragraph::new(new_lines.iter().map(borrow_line).collect::<Vec<_>>())
                     .wrap(Wrap { trim: false })
                     .line_count(width) as u16;
+            self.cached_row_breaks
+                .extend(row_breaks_for_lines(&new_lines, width));
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
             self.cached_entry_count = total - start;
@@ -6222,6 +6314,7 @@ impl ChatState {
                 ranges.push((abs_idx, before, after));
             }
         }
+        self.cached_row_breaks = row_breaks_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
         self.cached_entry_count = total - start;
@@ -7266,6 +7359,7 @@ impl ChatState {
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.cached_lines.clear();
+        self.cached_row_breaks.clear();
         self.entry_rects.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
@@ -7507,7 +7601,21 @@ mod tests {
                 column += 1;
             }
         }
-        TranscriptSnapshot { area, cells }
+        TranscriptSnapshot {
+            area,
+            cells,
+            row_breaks: vec![TranscriptRowBreak::Hard; usize::from(area.height)],
+        }
+    }
+
+    fn transcript_snapshot_with_row_breaks(
+        area: Rect,
+        rows: &[&str],
+        row_breaks: &[TranscriptRowBreak],
+    ) -> TranscriptSnapshot {
+        let mut snapshot = transcript_snapshot(area, rows);
+        snapshot.row_breaks = row_breaks.to_vec();
+        snapshot
     }
 
     #[test]
@@ -7532,6 +7640,166 @@ mod tests {
         assert_eq!(snapshot.selected_text(forward).as_deref(), Some("be\nta"));
         assert_eq!(snapshot.selected_text(reverse).as_deref(), Some("be\nta"));
         assert_eq!(snapshot.selected_text(click), None);
+    }
+
+    #[test]
+    fn copy_transcript_selection_rejoins_soft_wrapped_prose() {
+        let snapshot = transcript_snapshot_with_row_breaks(
+            Rect::new(0, 0, 12, 4),
+            &["The drain", "keeps going", "1. First", "item wraps"],
+            &[
+                TranscriptRowBreak::Hard,
+                TranscriptRowBreak::SoftSpace,
+                TranscriptRowBreak::Hard,
+                TranscriptRowBreak::SoftSpace,
+            ],
+        );
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 9, row: 3 },
+            dragged: true,
+        };
+
+        assert_eq!(
+            snapshot.selected_text(selection).as_deref(),
+            Some("The drain keeps going\n1. First item wraps")
+        );
+    }
+
+    #[test]
+    fn copy_transcript_selection_rejoins_split_long_tokens_without_spaces() {
+        let snapshot = transcript_snapshot_with_row_breaks(
+            Rect::new(0, 0, 8, 2),
+            &["abcdefgh", "ijkl"],
+            &[TranscriptRowBreak::Hard, TranscriptRowBreak::SoftConcat],
+        );
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 3, row: 1 },
+            dragged: true,
+        };
+
+        assert_eq!(
+            snapshot.selected_text(selection).as_deref(),
+            Some("abcdefghijkl")
+        );
+    }
+
+    #[test]
+    fn copy_transcript_selection_restores_space_after_full_width_prose_row() {
+        let snapshot = transcript_snapshot_with_row_breaks(
+            Rect::new(0, 0, 10, 2),
+            &["12345 6789", "abc"],
+            &[TranscriptRowBreak::Hard, TranscriptRowBreak::SoftSpace],
+        );
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 2, row: 1 },
+            dragged: true,
+        };
+
+        assert_eq!(
+            snapshot.selected_text(selection).as_deref(),
+            Some("12345 6789 abc")
+        );
+    }
+
+    #[test]
+    fn copy_row_breaks_distinguish_spaces_tokens_and_logical_lines() {
+        let lines = vec![Line::from("alpha beta"), Line::from("second")];
+
+        assert_eq!(
+            row_breaks_for_lines(&lines, 6),
+            vec![
+                TranscriptRowBreak::Hard,
+                TranscriptRowBreak::SoftSpace,
+                TranscriptRowBreak::Hard,
+            ]
+        );
+        assert_eq!(
+            row_breaks_for_line(&Line::from("abcdefghijkl"), 8),
+            vec![TranscriptRowBreak::Hard, TranscriptRowBreak::SoftConcat,]
+        );
+        assert_eq!(
+            row_breaks_for_line(&Line::from("abcdefgh ijkl"), 8),
+            vec![TranscriptRowBreak::Hard, TranscriptRowBreak::SoftSpace,]
+        );
+        assert_eq!(
+            row_breaks_for_line(&Line::from("界界界界界"), 8),
+            vec![TranscriptRowBreak::Hard, TranscriptRowBreak::SoftConcat,]
+        );
+        assert_eq!(
+            row_breaks_for_line(
+                &Line::from(vec![Span::raw("abcdefgh"), Span::raw(" ijkl")]),
+                8,
+            ),
+            vec![TranscriptRowBreak::Hard, TranscriptRowBreak::SoftSpace,]
+        );
+    }
+
+    #[test]
+    fn copy_rendered_selection_uses_source_derived_wrap_separators() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        fn selected_text(message: &str) -> String {
+            let mut state = state();
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(message)));
+            state.mark_dirty_full();
+
+            let area = Rect::new(0, 0, 10, 8);
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|frame| render_conversation(frame, &mut state, area))
+                .expect("draw conversation");
+
+            let snapshot = state
+                .transcript_snapshot
+                .as_ref()
+                .expect("render captures transcript cells");
+            let rows = snapshot
+                .cells
+                .chunks(usize::from(snapshot.area.width))
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(|cell| cell.symbol.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let start_row = rows
+                .iter()
+                .position(|row| row.starts_with("abcdefgh"))
+                .expect("first wrapped row") as u16;
+            let end_row = start_row + 1;
+            let end_column = snapshot
+                .row_text_bounds(end_row)
+                .expect("second wrapped row")
+                .1;
+            snapshot
+                .selected_text(TranscriptSelection {
+                    anchor: CellPoint {
+                        column: 0,
+                        row: start_row,
+                    },
+                    head: CellPoint {
+                        column: end_column,
+                        row: end_row,
+                    },
+                    dragged: true,
+                })
+                .expect("rendered selection text")
+        }
+
+        assert_eq!(selected_text("abcdefgh ijkl"), "abcdefgh ijkl");
+        assert_eq!(selected_text("abcdefghijkl"), "abcdefghijkl");
+        assert_eq!(
+            selected_text("abcdefgh\u{00a0}ijkl"),
+            "abcdefgh\u{00a0}ijkl"
+        );
+        assert_eq!(selected_text("abcdefgh\u{200b}ijkl"), "abcdefghijkl");
     }
 
     #[test]
@@ -8144,6 +8412,160 @@ mod tests {
             })
         ));
         assert!(state.info_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn copy_shift_or_option_click_extends_character_selection_from_original_anchor() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 12, 2),
+            &["alpha beta", "gamma"],
+        ));
+        assert!(state.begin_transcript_drag(16, 5));
+        assert!(state.update_transcript_drag(19, 5));
+        state.finish_transcript_drag();
+
+        chat.phase = ChatPhase::Active(Box::new(state));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            chat.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: 21,
+                    row: 6,
+                    modifiers: KeyModifiers::ALT,
+                },
+                Rect::new(0, 0, 80, 20),
+            )
+            .await;
+        }
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.transcript_selection,
+            Some(TranscriptSelection {
+                anchor: CellPoint { column: 6, row: 0 },
+                head: CellPoint { column: 11, row: 1 },
+                dragged: true,
+            })
+        );
+        assert_eq!(
+            state.transcript_selected_text().as_deref(),
+            Some("beta\ngamma")
+        );
+
+        for (column, row, expected) in [
+            (
+                11,
+                5,
+                Some(TranscriptSelection {
+                    anchor: CellPoint { column: 6, row: 0 },
+                    head: CellPoint { column: 1, row: 0 },
+                    dragged: true,
+                }),
+            ),
+            (16, 5, None),
+        ] {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                chat.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::SHIFT,
+                    },
+                    Rect::new(0, 0, 80, 20),
+                )
+                .await;
+            }
+
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert_eq!(state.transcript_selection, expected);
+        }
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.transcript_selection,
+            Some(TranscriptSelection {
+                anchor: CellPoint { column: 0, row: 0 },
+                head: CellPoint { column: 0, row: 0 },
+                dragged: false,
+            })
+        );
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[tokio::test]
+    async fn copy_shift_click_keeps_browse_mode_message_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("first")));
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("second")));
+        state.browse_cursor = Some(0);
+        state.entry_rects = vec![(0, Rect::new(2, 3, 20, 1)), (1, Rect::new(2, 4, 20, 1))];
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.browse_anchor, Some(0));
+        assert_eq!(state.browse_cursor, Some(1));
+        assert_eq!(state.transcript_selection, None);
     }
 
     #[tokio::test]
@@ -9974,7 +10396,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_total_rows_matches_full_line_count() {
+    fn copy_cached_total_rows_and_breaks_match_full_line_count() {
         let width: u16 = 40;
         let mut s = state();
 
@@ -9986,6 +10408,11 @@ mod tests {
             s.cached_total_rows,
             authoritative_rows(&s, width),
             "full-rebuild row total must match line_count"
+        );
+        assert_eq!(
+            s.cached_row_breaks.len(),
+            usize::from(s.cached_total_rows),
+            "full rebuild must cache one separator per rendered row"
         );
 
         for i in 50..60 {
@@ -10002,6 +10429,11 @@ mod tests {
             authoritative_rows(&s, width),
             "incremental-append row total must match line_count"
         );
+        assert_eq!(
+            s.cached_row_breaks.len(),
+            usize::from(s.cached_total_rows),
+            "incremental append must preserve separator alignment"
+        );
 
         let narrower: u16 = 20;
         s.rebuild_lines(narrower);
@@ -10009,6 +10441,11 @@ mod tests {
             s.cached_total_rows,
             authoritative_rows(&s, narrower),
             "width change must force a recompute that still matches line_count"
+        );
+        assert_eq!(
+            s.cached_row_breaks.len(),
+            usize::from(s.cached_total_rows),
+            "width rebuild must realign cached separators"
         );
     }
 
