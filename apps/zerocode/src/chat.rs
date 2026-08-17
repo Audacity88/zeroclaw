@@ -3758,6 +3758,7 @@ fn message_copied_label() -> String {
     crate::i18n::t("zc-chat-copy-message-copied")
 }
 
+#[cfg(test)]
 fn context_menu_copy_label() -> String {
     crate::i18n::t("zc-chat-context-menu-copy")
 }
@@ -7163,6 +7164,7 @@ impl ChatState {
         true
     }
 
+    #[cfg(test)]
     pub fn delete_selected_queued(&mut self) {
         if let Some(id) = self.selected_queue_id() {
             self.delete_queued_by_id(id);
@@ -7180,6 +7182,7 @@ impl ChatState {
         Some((message.text, message.attachments))
     }
 
+    #[cfg(test)]
     pub fn take_selected_for_edit(&mut self) -> Option<(String, Vec<PendingAttachment>)> {
         self.take_queued_for_edit(self.selected_queue_id()?)
     }
