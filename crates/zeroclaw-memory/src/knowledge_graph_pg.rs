@@ -400,7 +400,8 @@ mod tests {
         let (first_started_tx, first_started_rx) = oneshot::channel();
         let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
 
-        let first = tokio::spawn(run_bounded(gate.clone(), move || {
+        let first_gate = Arc::clone(&gate);
+        let first = zeroclaw_spawn::spawn!(run_bounded(first_gate, move || {
             first_started_tx.send(()).unwrap();
             release_first_rx.recv().unwrap();
             Ok(())
@@ -409,7 +410,8 @@ mod tests {
         assert_eq!(gate.available_permits(), 0);
 
         let second_entered_in_task = second_entered.clone();
-        let second = tokio::spawn(run_bounded(gate.clone(), move || {
+        let second_gate = Arc::clone(&gate);
+        let second = zeroclaw_spawn::spawn!(run_bounded(second_gate, move || {
             second_entered_in_task.store(true, Ordering::SeqCst);
             Ok(())
         }));
@@ -443,7 +445,8 @@ mod tests {
         let (first_started_tx, first_started_rx) = oneshot::channel();
         let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
 
-        let first = tokio::spawn(run_bounded(gate.clone(), move || {
+        let first_gate = Arc::clone(&gate);
+        let first = zeroclaw_spawn::spawn!(run_bounded(first_gate, move || {
             first_started_tx.send(()).unwrap();
             release_first_rx.recv().unwrap();
             Ok(())
@@ -455,7 +458,8 @@ mod tests {
 
         let second_entered = Arc::new(AtomicBool::new(false));
         let second_entered_in_task = second_entered.clone();
-        let second = tokio::spawn(run_bounded(gate.clone(), move || {
+        let second_gate = Arc::clone(&gate);
+        let second = zeroclaw_spawn::spawn!(run_bounded(second_gate, move || {
             second_entered_in_task.store(true, Ordering::SeqCst);
             Ok(())
         }));
