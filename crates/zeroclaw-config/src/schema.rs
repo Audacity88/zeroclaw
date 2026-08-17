@@ -24107,7 +24107,7 @@ max_height = 8
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
-    use tokio::sync::{Mutex, MutexGuard};
+    use tokio::sync::MutexGuard;
     use tokio::test;
 
     struct EnvValueGuard {
