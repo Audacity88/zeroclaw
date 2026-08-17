@@ -2445,7 +2445,8 @@ impl Chat {
                                     CopyHitKind::Message => {}
                                 }
                             }
-                        } else if mouse.modifiers.contains(KM::SHIFT)
+                        } else if (mouse.modifiers.contains(KM::SHIFT)
+                            || mouse.modifiers.contains(KM::ALT))
                             && state.transcript_selection.is_some()
                         {
                             state.update_transcript_drag(col, row);
@@ -8101,7 +8102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_shift_click_extends_character_selection_from_original_anchor() {
+    async fn copy_shift_or_option_click_extends_character_selection_from_original_anchor() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
         let (mut chat, _rx) = test_chat();
@@ -8124,7 +8125,7 @@ mod tests {
                     kind,
                     column: 21,
                     row: 6,
-                    modifiers: KeyModifiers::SHIFT,
+                    modifiers: KeyModifiers::ALT,
                 },
                 Rect::new(0, 0, 80, 20),
             )
