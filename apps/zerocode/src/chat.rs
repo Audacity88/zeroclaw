@@ -2445,6 +2445,10 @@ impl Chat {
                                     CopyHitKind::Message => {}
                                 }
                             }
+                        } else if mouse.modifiers.contains(KM::SHIFT)
+                            && state.transcript_selection.is_some()
+                        {
+                            state.update_transcript_drag(col, row);
                         } else {
                             state.clear_mouse_highlight();
                             state.begin_transcript_drag(col, row);
@@ -8094,6 +8098,160 @@ mod tests {
             })
         ));
         assert!(state.info_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn copy_shift_click_extends_character_selection_from_original_anchor() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 12, 2),
+            &["alpha beta", "gamma"],
+        ));
+        assert!(state.begin_transcript_drag(16, 5));
+        assert!(state.update_transcript_drag(19, 5));
+        state.finish_transcript_drag();
+
+        chat.phase = ChatPhase::Active(Box::new(state));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            chat.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: 21,
+                    row: 6,
+                    modifiers: KeyModifiers::SHIFT,
+                },
+                Rect::new(0, 0, 80, 20),
+            )
+            .await;
+        }
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.transcript_selection,
+            Some(TranscriptSelection {
+                anchor: CellPoint { column: 6, row: 0 },
+                head: CellPoint { column: 11, row: 1 },
+                dragged: true,
+            })
+        );
+        assert_eq!(
+            state.transcript_selected_text().as_deref(),
+            Some("beta\ngamma")
+        );
+
+        for (column, row, expected) in [
+            (
+                11,
+                5,
+                Some(TranscriptSelection {
+                    anchor: CellPoint { column: 6, row: 0 },
+                    head: CellPoint { column: 1, row: 0 },
+                    dragged: true,
+                }),
+            ),
+            (16, 5, None),
+        ] {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                chat.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::SHIFT,
+                    },
+                    Rect::new(0, 0, 80, 20),
+                )
+                .await;
+            }
+
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert_eq!(state.transcript_selection, expected);
+        }
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.transcript_selection,
+            Some(TranscriptSelection {
+                anchor: CellPoint { column: 0, row: 0 },
+                head: CellPoint { column: 0, row: 0 },
+                dragged: false,
+            })
+        );
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[tokio::test]
+    async fn copy_shift_click_keeps_browse_mode_message_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("first")));
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("second")));
+        state.browse_cursor = Some(0);
+        state.entry_rects = vec![(0, Rect::new(2, 3, 20, 1)), (1, Rect::new(2, 4, 20, 1))];
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.browse_anchor, Some(0));
+        assert_eq!(state.browse_cursor, Some(1));
+        assert_eq!(state.transcript_selection, None);
     }
 
     #[tokio::test]
