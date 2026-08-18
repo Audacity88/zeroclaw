@@ -392,6 +392,7 @@ Applied manually to make cross-artifact coordination visible. These labels do no
 
 | Label | Purpose |
 |---|---|
+| `do-not-merge` | Explicit maintainer or governance hold on a PR. A maintainer comment, review, or linked issue must state the reason and removal condition; companion labels and milestones may supplement that record. Pair it with `needs-maintainer-review` when a high-risk PR is explicitly routed for another independent Core Team approval. Use it for future-line work that must not land on the active release line. Do not apply it merely for pending CI, draft state, a behind branch, ordinary review, or active `CHANGES_REQUESTED`. Remove it only after the recorded condition clears and a maintainer rechecks the current native review state, required checks, mergeability, [Definition of Done](./pr-workflow.md#definition-of-done-dod), and [merge checklist](./pr-workflow.md#maintainer-merge-checklist). |
 | `follow-up` | Scope deliberately carved out from a parent issue or PR; link the parent so the relationship is visible |
 | `release-gate` | Finding or work item that must be reconciled for the named release gate |
 | `stacked` | PR depends on another PR; include an explicit `Depends on #...` reference and merge it after its base |
