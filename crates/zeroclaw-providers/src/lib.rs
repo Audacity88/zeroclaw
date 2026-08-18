@@ -30,7 +30,8 @@ pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
 
-pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
+pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 
 mod request_payload;
 
@@ -1146,22 +1147,16 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
-/// Apply the config `vision` capability override to a freshly-constructed
-/// provider. Called at every exit of `create_model_provider_inner`, the single
-/// construction choke point every subsystem funnels through, so the override
-/// lands once and `supports_vision()` stays consistent across the
-/// vision-routing gate, the channel media pipeline, and the model router
-/// without per-family or per-consumer re-derivation.
-fn apply_vision_override(
+/// Mark a freshly constructed provider as a known leaf and apply its optional
+/// config `vision` capability override. Called at every exit of
+/// `create_model_provider_inner`, before Reliable/Router composition.
+fn apply_factory_leaf_metadata(
     provider: Box<dyn ModelProvider>,
     vision: Option<bool>,
 ) -> Box<dyn ModelProvider> {
-    match vision {
-        Some(vision) => Box::new(vision_override::VisionOverrideProvider::new(
-            provider, vision,
-        )),
-        None => provider,
-    }
+    Box::new(vision_override::VisionOverrideProvider::factory_leaf(
+        provider, vision,
+    ))
 }
 
 /// Factory: create model_provider with optional base URL and runtime options.
@@ -1203,7 +1198,7 @@ fn create_model_provider_inner(
     // factory callers that pass the legacy spelling expect a working
     // construction here.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
-        return Ok(apply_vision_override(
+        return Ok(apply_factory_leaf_metadata(
             Box::new(openai_codex::OpenAiCodexModelProvider::new(
                 alias, options, api_key,
             )?),
@@ -1254,7 +1249,7 @@ fn create_model_provider_inner(
             Some(url) => url,
             None => moonshot_code_base_url(),
         };
-        return Ok(apply_vision_override(
+        return Ok(apply_factory_leaf_metadata(
             factory::apply_compat_options(
                 factory::build_kimi_code_compat(alias, key, base_url),
                 options,
@@ -1264,7 +1259,7 @@ fn create_model_provider_inner(
     }
 
     factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
-        .map(|provider| apply_vision_override(provider, options.vision))
+        .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
 
 pub fn create_resilient_model_provider_with_options(
@@ -1377,7 +1372,12 @@ fn push_pinned_entries(
     let cooldown_key = format!("{family}.{alias}");
 
     let Some(primary_model) = primary_model else {
-        out.push(ReliableModelProviderEntry::new(family, cooldown_key, built));
+        out.push(ReliableModelProviderEntry::new_with_candidate(
+            family,
+            cooldown_key.clone(),
+            cooldown_key,
+            built,
+        ));
         return;
     };
 
@@ -2544,7 +2544,6 @@ mod tests {
                 !provider.capabilities().vision,
                 "{name}: capabilities().vision must stay consistent with supports_vision()"
             );
-
             // `None` preserves the family default (vision-capable here).
             let provider = create_model_provider_inner(
                 None,
@@ -2559,6 +2558,25 @@ mod tests {
                 provider.supports_vision(),
                 "{name}: no override should keep the family default"
             );
+        }
+    }
+
+    #[test]
+    fn factory_leaves_have_stable_request_identity() {
+        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
+            for vision in [None, Some(false)] {
+                let options = ModelProviderRuntimeOptions {
+                    vision,
+                    ..Default::default()
+                };
+                let provider =
+                    create_model_provider_inner(None, name, "default", None, None, &options)
+                        .unwrap();
+                assert!(
+                    provider.has_stable_request_identity("model"),
+                    "{name}: factory-created leaves must attest to a stable request identity"
+                );
+            }
         }
     }
 
@@ -4658,6 +4676,75 @@ mod tests {
         assert!(
             result.is_ok(),
             "a fallback cycle must be pruned, never loop or abort the build"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_cross_family_no_leak() {
+        // Two different provider families (openai and anthropic) each with
+        // distinct max_tokens. Each agent resolves only its own provider's
+        // options, so a different provider's max_tokens cannot leak across
+        // agent boundaries.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+
+        // OpenAI alias with max_tokens = 16384.
+        config.providers.models.openai.insert(
+            "gpt".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("fake-openai-key-not-real".to_string()),
+                    max_tokens: Some(16_384),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        // Anthropic alias with a different max_tokens.
+        config.providers.models.anthropic.insert(
+            "sonnet".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4".to_string()),
+                    api_key: Some("fake-anthropic-key-not-real".to_string()),
+                    max_tokens: Some(8_192),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        config.agents.insert(
+            "openai_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.gpt".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "anthropic_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.sonnet".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let openai_opts = provider_runtime_options_for_agent(&config, "openai_agent");
+        let anthropic_opts = provider_runtime_options_for_agent(&config, "anthropic_agent");
+
+        assert_eq!(
+            openai_opts.provider_max_tokens,
+            Some(16_384),
+            "openai agent must get its own max_tokens, not the anthropic provider's"
+        );
+        assert_eq!(
+            anthropic_opts.provider_max_tokens,
+            Some(8_192),
+            "anthropic agent must get its own max_tokens, not the openai provider's"
         );
     }
 
