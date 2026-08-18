@@ -670,7 +670,7 @@ impl EdgeTtsProvider {
         Self::new_with_command(alias, binary_path, &[], timeout)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn new_with_command(
         alias: &str,
         binary_path: &str,
