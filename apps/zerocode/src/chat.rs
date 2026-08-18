@@ -26,12 +26,12 @@ use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{InputBarAction, InputBarState};
 use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
-use crate::text_selection::{
-    CellPoint, TextRowBreak as TranscriptRowBreak, TextSelection as TranscriptSelection,
-    TextSnapshot as TranscriptSnapshot, row_breaks_for_lines, wrapped_rows,
-};
 #[cfg(test)]
-use crate::text_selection::{TextCell as TranscriptCell, borrow_line, row_breaks_for_line};
+use crate::text_selection::{CellPoint, TextCell as TranscriptCell, row_breaks_for_line};
+use crate::text_selection::{
+    TextRowBreak as TranscriptRowBreak, TextSelection as TranscriptSelection,
+    TextSnapshot as TranscriptSnapshot, borrow_line, row_breaks_for_lines, wrapped_rows,
+};
 use crate::theme;
 use crate::turn_status::TurnStatus;
 

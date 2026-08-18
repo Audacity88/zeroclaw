@@ -1572,23 +1572,23 @@ impl Logs {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if in_list {
-                    if let Some(idx) = mouse::list_click_index(
+                if in_list
+                    && let Some(idx) = mouse::list_click_index(
                         row,
                         self.last_list_area,
                         self.list_state.offset(),
                         filtered_len,
-                    ) {
-                        self.follow = false;
-                        self.list_state.select(Some(idx));
-                        if self.detail_open {
-                            self.detail_scroll = 0;
-                        }
-                        if self.double_click.click(col, row) {
-                            self.detail_open = true;
-                            self.detail_scroll = 0;
-                            self.detail_pct = 50;
-                        }
+                    )
+                {
+                    self.follow = false;
+                    self.list_state.select(Some(idx));
+                    if self.detail_open {
+                        self.detail_scroll = 0;
+                    }
+                    if self.double_click.click(col, row) {
+                        self.detail_open = true;
+                        self.detail_scroll = 0;
+                        self.detail_pct = 50;
                     }
                 }
                 if in_list || in_detail {
