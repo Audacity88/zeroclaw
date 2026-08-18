@@ -176,17 +176,27 @@ impl Tool for SubprocessTool {
         })?;
 
         let Some(stdout) = child.stdout.take() else {
-            terminate_and_reap(&mut child).await;
-            return Ok(failed_tool_result(format!(
-                "plugin '{}': could not attach stdout pipe",
-                self.manifest.tool.name
+            let cleanup_error = terminate_and_reap(child, self.process_exit_timeout)
+                .await
+                .into_diagnostic();
+            return Ok(failed_tool_result(append_cleanup_diagnostic(
+                format!(
+                    "plugin '{}': could not attach stdout pipe",
+                    self.manifest.tool.name
+                ),
+                cleanup_error.as_deref(),
             )));
         };
         let Some(stderr) = child.stderr.take() else {
-            terminate_and_reap(&mut child).await;
-            return Ok(failed_tool_result(format!(
-                "plugin '{}': could not attach stderr pipe",
-                self.manifest.tool.name
+            let cleanup_error = terminate_and_reap(child, self.process_exit_timeout)
+                .await
+                .into_diagnostic();
+            return Ok(failed_tool_result(append_cleanup_diagnostic(
+                format!(
+                    "plugin '{}': could not attach stderr pipe",
+                    self.manifest.tool.name
+                ),
+                cleanup_error.as_deref(),
             )));
         };
         let (first_stdout, readers) = spawn_output_readers(stdout, stderr);
@@ -219,7 +229,7 @@ impl Tool for SubprocessTool {
         let line = match timeout(self.first_output_timeout, pre_result).await {
             Err(_) => {
                 return Ok(fail_and_cleanup(
-                    &mut child,
+                    child,
                     readers,
                     self.process_exit_timeout,
                     format!(
@@ -241,7 +251,7 @@ impl Tool for SubprocessTool {
                     "subprocess plugin failed before producing a result"
                 );
                 return Ok(fail_and_cleanup(
-                    &mut child,
+                    child,
                     readers,
                     self.process_exit_timeout,
                     format!("plugin '{}': {}", self.manifest.tool.name, error),
@@ -254,7 +264,7 @@ impl Tool for SubprocessTool {
         let child_status = match timeout(self.process_exit_timeout, child.wait()).await {
             Err(_) => {
                 return Ok(fail_and_cleanup(
-                    &mut child,
+                    child,
                     readers,
                     self.process_exit_timeout,
                     format!(
@@ -266,7 +276,7 @@ impl Tool for SubprocessTool {
             }
             Ok(Err(wait_error)) => {
                 return Ok(fail_and_cleanup(
-                    &mut child,
+                    child,
                     readers,
                     self.process_exit_timeout,
                     format!(
@@ -346,23 +356,100 @@ fn failed_tool_result(error: String) -> ToolResult {
     }
 }
 
-async fn terminate_and_reap(child: &mut Child) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
+struct CleanupReport {
+    diagnostic: Option<String>,
+    reaper: Option<JoinHandle<()>>,
+}
+
+impl CleanupReport {
+    fn into_diagnostic(mut self) -> Option<String> {
+        drop(self.reaper.take());
+        self.diagnostic
     }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+}
+
+async fn terminate_and_reap(child: Child, deadline: Duration) -> CleanupReport {
+    terminate_and_reap_after(child, deadline, std::future::ready(())).await
+}
+
+async fn terminate_and_reap_after<F>(
+    mut child: Child,
+    deadline: Duration,
+    before_wait: F,
+) -> CleanupReport
+where
+    F: std::future::Future<Output = ()>,
+{
+    let mut errors = Vec::new();
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            return CleanupReport {
+                diagnostic: None,
+                reaper: None,
+            };
+        }
+        Ok(None) => {}
+        Err(error) => errors.push(format!("failed to inspect child before cleanup: {error}")),
+    }
+
+    if let Err(error) = child.start_kill() {
+        errors.push(format!("failed to terminate child: {error}"));
+    }
+    let wait_result = timeout(deadline, async {
+        before_wait.await;
+        child.wait().await
+    })
+    .await;
+    let reaper = match wait_result {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => {
+            errors.push(format!("failed to reap child: {error}"));
+            Some(spawn_background_reaper(child))
+        }
+        Err(_) => {
+            errors.push(format!("child cleanup timed out after {deadline:?}"));
+            Some(spawn_background_reaper(child))
+        }
+    };
+
+    CleanupReport {
+        diagnostic: (!errors.is_empty()).then(|| errors.join("; ")),
+        reaper,
+    }
+}
+
+fn spawn_background_reaper(mut child: Child) -> JoinHandle<()> {
+    let pid = child.id();
+    zeroclaw_spawn::spawn!(async move {
+        if let Err(error) = child.wait().await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "pid": pid,
+                        "error": format!("{}", error),
+                    })),
+                "subprocess plugin background reap failed"
+            );
+        }
+    })
 }
 
 async fn fail_and_cleanup(
-    child: &mut Child,
+    child: Child,
     readers: OutputReaderTasks,
     reader_deadline: Duration,
     message: String,
 ) -> ToolResult {
-    terminate_and_reap(child).await;
+    let cleanup_error = terminate_and_reap(child, reader_deadline)
+        .await
+        .into_diagnostic();
     let report = readers.finish(reader_deadline).await;
-    failed_tool_result(append_reader_diagnostics(message, &report))
+    failed_tool_result(append_reader_diagnostics(
+        append_cleanup_diagnostic(message, cleanup_error.as_deref()),
+        &report,
+    ))
 }
 
 fn spawn_output_readers(
@@ -489,6 +576,14 @@ fn append_reader_diagnostics(mut message: String, report: &OutputReaderReport) -
     }
     if let Some(error) = &report.error {
         message.push_str("; reader: ");
+        message.push_str(error);
+    }
+    message
+}
+
+fn append_cleanup_diagnostic(mut message: String, cleanup_error: Option<&str>) -> String {
+    if let Some(error) = cleanup_error {
+        message.push_str("; cleanup: ");
         message.push_str(error);
     }
     message
@@ -848,5 +943,38 @@ mod tests {
             .status()
             .unwrap();
         assert!(!status.success(), "exit-timeout plugin must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_timeout_transfers_child_to_background_reaper() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().expect("spawned child must have a PID");
+
+        let CleanupReport { diagnostic, reaper } =
+            terminate_and_reap_after(child, Duration::from_millis(10), std::future::pending())
+                .await;
+
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some("child cleanup timed out after 10ms")
+        );
+        timeout(
+            Duration::from_secs(1),
+            reaper.expect("timed-out cleanup must retain a background reaper"),
+        )
+        .await
+        .expect("background reaper must finish promptly")
+        .expect("background reaper task must not panic");
+
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(!status.success(), "background reaper must reap the child");
     }
 }
