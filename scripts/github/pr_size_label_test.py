@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +22,21 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def change(filename: str, additions: int, deletions: int = 0) -> size_labeler.FileChange:
     return size_labeler.FileChange(filename=filename, additions=additions, deletions=deletions)
+
+
+def workflow_step_run(step_name: str) -> str:
+    workflow = (REPO_ROOT / ".github/workflows/pr-size-labeler.yml").read_text(encoding="utf-8")
+    lines = workflow.splitlines()
+    step_index = lines.index(f"      - name: {step_name}")
+    run_index = next(
+        index for index in range(step_index + 1, len(lines)) if lines[index] == "        run: |"
+    )
+    body: list[str] = []
+    for line in lines[run_index + 1 :]:
+        if line and not line.startswith("          "):
+            break
+        body.append(line[10:] if line else "")
+    return "\n".join(body).rstrip() + "\n"
 
 
 class PrSizeLabelTest(unittest.TestCase):
@@ -357,9 +375,78 @@ class PrSizeLabelTest(unittest.TestCase):
         self.assertIn("WORKFLOW_SHA: ${{ github.sha }}", workflow)
         self.assertIn("?ref=$WORKFLOW_SHA", workflow)
         self.assertNotIn("github.event.pull_request.base.sha", workflow)
+        self.assertIn("set -euo pipefail", workflow)
+        self.assertIn('test -s "$RUNNER_TEMP/pr_size_label.py"', workflow)
         self.assertIn('"$RUNNER_TEMP/pr_size_label.py"', workflow)
+        self.assertLess(
+            workflow.index("- name: Fetch trusted workflow classifier"),
+            workflow.index("- name: Apply size label from PR metadata"),
+        )
         self.assertIn("issues: write", workflow)
         self.assertIn("pull-requests: read", workflow)
+
+    def test_workflow_fetch_step_fails_closed(self) -> None:
+        fetch_step = workflow_step_run("Fetch trusted workflow classifier")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            bin_path = temp_path / "bin"
+            bin_path.mkdir()
+            gh_stub = bin_path / "gh"
+            gh_stub.write_text(
+                "#!/bin/sh\n"
+                'if [ "$FETCH_CASE" = empty ]; then exit 0; fi\n'
+                "printf '%s' \"$ENCODED_CLASSIFIER\"\n"
+                'if [ "$FETCH_CASE" = api-failure ]; then exit 42; fi\n',
+                encoding="utf-8",
+            )
+            base64_stub = bin_path / "base64"
+            base64_stub.write_text(
+                "#!/bin/sh\n"
+                '[ "$1" = --decode ] || exit 44\n'
+                '[ "$FETCH_CASE" = decode-failure ] && exit 43\n'
+                "python3 -c 'import base64, sys; "
+                "sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read(), validate=True))'\n",
+                encoding="utf-8",
+            )
+            gh_stub.chmod(0o755)
+            base64_stub.chmod(0o755)
+
+            for fetch_case in ("api-failure", "decode-failure", "empty", "success"):
+                with self.subTest(fetch_case=fetch_case):
+                    classifier_path = temp_path / "pr_size_label.py"
+                    classifier_path.unlink(missing_ok=True)
+                    env = {
+                        **os.environ,
+                        "ENCODED_CLASSIFIER": base64.b64encode(b'print("ok")\n').decode("ascii"),
+                        "FETCH_CASE": fetch_case,
+                        "GH_TOKEN": "test-token",
+                        "GITHUB_REPOSITORY": "zeroclaw-labs/zeroclaw",
+                        "RUNNER_TEMP": str(temp_path),
+                        "WORKFLOW_SHA": "trusted-workflow-sha",
+                        "PATH": f"{bin_path}{os.pathsep}{os.environ['PATH']}",
+                    }
+                    result = subprocess.run(
+                        ["bash", "--noprofile", "--norc", "-c", fetch_step],
+                        check=False,
+                        capture_output=True,
+                        env=env,
+                        text=True,
+                    )
+
+                    if fetch_case == "success":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(classifier_path.read_text(encoding="utf-8"), 'print("ok")\n')
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        if fetch_case == "api-failure":
+                            self.assertEqual(
+                                classifier_path.read_text(encoding="utf-8"), 'print("ok")\n'
+                            )
+                        else:
+                            self.assertFalse(classifier_path.exists() and classifier_path.stat().st_size)
+                    if fetch_case == "empty":
+                        self.assertIn("trusted classifier fetch produced an empty file", result.stderr)
 
     def test_default_docs_contract_matches_repository_docs(self) -> None:
         size_labeler.validate_docs_contract()

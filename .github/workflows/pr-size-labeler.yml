@@ -25,8 +25,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           WORKFLOW_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/contents/scripts/github/pr_size_label.py?ref=$WORKFLOW_SHA" \
             --jq .content | base64 --decode > "$RUNNER_TEMP/pr_size_label.py"
+          test -s "$RUNNER_TEMP/pr_size_label.py" || {
+            echo "trusted classifier fetch produced an empty file" >&2
+            exit 1
+          }
 
       - name: Apply size label from PR metadata
         env:
