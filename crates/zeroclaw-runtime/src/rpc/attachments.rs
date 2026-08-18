@@ -683,7 +683,9 @@ mod tests {
         assert!(Path::new(&result.workspace_path).exists());
 
         let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
-            &[zeroclaw_api::model_provider::ChatMessage::user(result.marker)],
+            &[zeroclaw_api::model_provider::ChatMessage::user(
+                result.marker,
+            )],
             &zeroclaw_config::schema::MultimodalConfig::default(),
         )
         .await

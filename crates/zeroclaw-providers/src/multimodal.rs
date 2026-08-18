@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
+use sha2::{Digest as _, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -17,7 +18,7 @@ pub struct LocalImageCache {
     entries: HashMap<String, (u64, i64, String)>,
     order: std::collections::VecDeque<String>,
     bytes: usize,
-    reported_failures: std::collections::VecDeque<(String, &'static str)>,
+    reported_failures: std::collections::VecDeque<([u8; 32], &'static str)>,
 }
 
 const LOCAL_IMAGE_CACHE_MAX_ENTRIES: usize = 32;
@@ -66,12 +67,13 @@ impl LocalImageCache {
     }
 
     fn should_report_failure(&mut self, reference: &str, failure_kind: &'static str) -> bool {
-        if let Some(position) = self
-            .reported_failures
-            .iter()
-            .position(|(reported_reference, reported_kind)| {
-                reported_reference == reference && *reported_kind == failure_kind
-            })
+        let reference_key = image_failure_reference_key(reference);
+        if let Some(position) =
+            self.reported_failures
+                .iter()
+                .position(|(reported_reference, reported_kind)| {
+                    *reported_reference == reference_key && *reported_kind == failure_kind
+                })
         {
             if let Some(key) = self.reported_failures.remove(position) {
                 self.reported_failures.push_back(key);
@@ -79,7 +81,7 @@ impl LocalImageCache {
             return false;
         }
 
-        let key = (reference.to_string(), failure_kind);
+        let key = (reference_key, failure_kind);
         self.reported_failures.push_back(key);
         while self.reported_failures.len() > REPORTED_IMAGE_FAILURE_MAX_ENTRIES {
             self.reported_failures.pop_front();
@@ -88,8 +90,12 @@ impl LocalImageCache {
     }
 
     fn clear_reported_failures(&mut self, reference: &str) {
+        if self.reported_failures.is_empty() {
+            return;
+        }
+        let reference_key = image_failure_reference_key(reference);
         self.reported_failures
-            .retain(|(reported_reference, _)| reported_reference != reference);
+            .retain(|(reported_reference, _)| *reported_reference != reference_key);
     }
 
     pub fn len(&self) -> usize {
@@ -99,6 +105,10 @@ impl LocalImageCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+fn image_failure_reference_key(reference: &str) -> [u8; 32] {
+    Sha256::digest(reference.as_bytes()).into()
 }
 
 #[derive(Debug, Clone)]
@@ -1057,9 +1067,9 @@ async fn normalize_image_references(
             Err(error) => {
                 skipped_count += 1;
                 let error_kind = multimodal_error_kind(&error);
-                let should_report = cache.as_deref_mut().is_none_or(|cache| {
-                    cache.should_report_failure(reference, error_kind)
-                });
+                let should_report = cache
+                    .as_deref_mut()
+                    .is_none_or(|cache| cache.should_report_failure(reference, error_kind));
                 if !should_report {
                     continue;
                 }
@@ -1537,24 +1547,28 @@ mod tests {
                 &format!("/tmp/missing-{index}.png"),
                 "image_source_not_found"
             ));
-            assert!(!cache.should_report_failure(
-                active_reference,
-                "image_source_not_found"
-            ));
+            assert!(!cache.should_report_failure(active_reference, "image_source_not_found"));
         }
 
         assert_eq!(
             cache.reported_failures.len(),
             REPORTED_IMAGE_FAILURE_MAX_ENTRIES
         );
-        assert!(!cache.should_report_failure(
-            active_reference,
-            "image_source_not_found"
-        ));
-        assert!(cache.should_report_failure(
-            "/tmp/missing-0.png",
-            "image_source_not_found"
-        ));
+        assert!(!cache.should_report_failure(active_reference, "image_source_not_found"));
+        assert!(cache.should_report_failure("/tmp/missing-0.png", "image_source_not_found"));
+    }
+
+    #[test]
+    fn image_failure_reporting_does_not_retain_large_references() {
+        let mut cache = LocalImageCache::new();
+        let reference = format!("data:image/png;base64,{}", "x".repeat(1024 * 1024));
+
+        assert!(cache.should_report_failure(&reference, "invalid_marker"));
+
+        let (stored_reference, stored_kind) = cache.reported_failures.front().unwrap();
+        assert_eq!(stored_reference, &image_failure_reference_key(&reference));
+        assert_eq!(stored_reference.len(), 32);
+        assert_eq!(*stored_kind, "invalid_marker");
     }
 
     #[tokio::test]
@@ -1588,7 +1602,11 @@ mod tests {
             .await
             .unwrap();
         assert!(restored.contains_images);
-        assert!(restored.messages[0].content.contains("data:image/png;base64,"));
+        assert!(
+            restored.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
         assert!(cache.reported_failures.is_empty());
 
         std::fs::remove_file(&image_path).unwrap();
