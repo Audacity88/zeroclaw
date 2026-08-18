@@ -4,14 +4,14 @@
 //! `zeroclaw-config::providers::ModelProviders` declares its own construction
 //! via one of two traits:
 //!
-//! - [`CompatFamilySpec`] for OpenAI-compatible families. Declare
+//! - `CompatFamilySpec` for OpenAI-compatible families. Declare
 //!   `DISPLAY` / `DEFAULT_URL` / `AUTH`; the blanket
 //!   `impl<T: CompatFamilySpec> FamilyProviderFactory for T` produces the
 //!   provider. Families with minor modifiers (`.without_native_tools()`,
 //!   `.models_dev_key(...)`, multi-endpoint URI fallback) override
 //!   `build_compat` — still one place per family, no flat dispatch arm.
 //!
-//! - [`FamilyProviderFactory`] directly for bespoke families that wrap a
+//! - `FamilyProviderFactory` directly for bespoke families that wrap a
 //!   non-compat runtime provider (`azure`, `gemini`, `openrouter`,
 //!   `bedrock`, `anthropic`, …).
 //!
