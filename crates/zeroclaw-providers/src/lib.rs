@@ -30,7 +30,8 @@ pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
 
-pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
+pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 
 mod request_payload;
 
@@ -793,11 +794,55 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
+/// Remove complete query strings from HTTP(S) URLs embedded in error text.
+///
+/// Query-value punctuation cannot safely identify where a credential ends:
+/// commas, apostrophes, and parentheses are all legal query data. Treat the
+/// URL's entire non-whitespace query tail as sensitive instead. This also
+/// covers credential parameter names that the sanitizer does not know about.
+fn scrub_url_queries(input: &str) -> String {
+    let lowercase = input.to_ascii_lowercase();
+    let mut scrubbed = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while cursor < input.len() {
+        let remaining = &input[cursor..];
+        let remaining_lowercase = &lowercase[cursor..];
+        let next_http = remaining_lowercase.find("http://");
+        let next_https = remaining_lowercase.find("https://");
+        let Some(relative_url_start) = (match (next_http, next_https) {
+            (Some(http), Some(https)) => Some(http.min(https)),
+            (Some(http), None) => Some(http),
+            (None, Some(https)) => Some(https),
+            (None, None) => None,
+        }) else {
+            scrubbed.push_str(remaining);
+            break;
+        };
+        let url_start = cursor + relative_url_start;
+        scrubbed.push_str(&input[cursor..url_start]);
+
+        let url_tail = &input[url_start..];
+        let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
+        let url_token = &input[url_start..url_end];
+        if let Some(query_start) = url_token.find('?') {
+            scrubbed.push_str(&url_token[..query_start]);
+        } else {
+            scrubbed.push_str(url_token);
+        }
+        cursor = url_end;
+    }
+
+    scrubbed
+}
+
 /// Scrub known secret-like token prefixes from model_provider error strings.
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, and `github_pat_`.
+/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys. Complete query strings
+/// are removed from embedded HTTP(S) URLs because query parameters may carry
+/// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 7] = [
+    const PREFIXES: [&str; 8] = [
         "sk-",
         "xoxb-",
         "xoxp-",
@@ -805,9 +850,10 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "gho_",
         "ghu_",
         "github_pat_",
+        "AIza",
     ];
 
-    let mut scrubbed = input.to_string();
+    let mut scrubbed = scrub_url_queries(input);
 
     for prefix in PREFIXES {
         let mut search_from = 0;
@@ -1101,22 +1147,16 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
-/// Apply the config `vision` capability override to a freshly-constructed
-/// provider. Called at every exit of `create_model_provider_inner`, the single
-/// construction choke point every subsystem funnels through, so the override
-/// lands once and `supports_vision()` stays consistent across the
-/// vision-routing gate, the channel media pipeline, and the model router
-/// without per-family or per-consumer re-derivation.
-fn apply_vision_override(
+/// Mark a freshly constructed provider as a known leaf and apply its optional
+/// config `vision` capability override. Called at every exit of
+/// `create_model_provider_inner`, before Reliable/Router composition.
+fn apply_factory_leaf_metadata(
     provider: Box<dyn ModelProvider>,
     vision: Option<bool>,
 ) -> Box<dyn ModelProvider> {
-    match vision {
-        Some(vision) => Box::new(vision_override::VisionOverrideProvider::new(
-            provider, vision,
-        )),
-        None => provider,
-    }
+    Box::new(vision_override::VisionOverrideProvider::factory_leaf(
+        provider, vision,
+    ))
 }
 
 /// Factory: create model_provider with optional base URL and runtime options.
@@ -1158,7 +1198,7 @@ fn create_model_provider_inner(
     // factory callers that pass the legacy spelling expect a working
     // construction here.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
-        return Ok(apply_vision_override(
+        return Ok(apply_factory_leaf_metadata(
             Box::new(openai_codex::OpenAiCodexModelProvider::new(
                 alias, options, api_key,
             )?),
@@ -1209,7 +1249,7 @@ fn create_model_provider_inner(
             Some(url) => url,
             None => moonshot_code_base_url(),
         };
-        return Ok(apply_vision_override(
+        return Ok(apply_factory_leaf_metadata(
             factory::apply_compat_options(
                 factory::build_kimi_code_compat(alias, key, base_url),
                 options,
@@ -1219,7 +1259,7 @@ fn create_model_provider_inner(
     }
 
     factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
-        .map(|provider| apply_vision_override(provider, options.vision))
+        .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
 
 pub fn create_resilient_model_provider_with_options(
@@ -1332,7 +1372,12 @@ fn push_pinned_entries(
     let cooldown_key = format!("{family}.{alias}");
 
     let Some(primary_model) = primary_model else {
-        out.push(ReliableModelProviderEntry::new(family, cooldown_key, built));
+        out.push(ReliableModelProviderEntry::new_with_candidate(
+            family,
+            cooldown_key.clone(),
+            cooldown_key,
+            built,
+        ));
         return;
     };
 
@@ -2431,7 +2476,6 @@ mod tests {
                 !provider.capabilities().vision,
                 "{name}: capabilities().vision must stay consistent with supports_vision()"
             );
-
             // `None` preserves the family default (vision-capable here).
             let provider = create_model_provider_inner(
                 None,
@@ -2446,6 +2490,25 @@ mod tests {
                 provider.supports_vision(),
                 "{name}: no override should keep the family default"
             );
+        }
+    }
+
+    #[test]
+    fn factory_leaves_have_stable_request_identity() {
+        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
+            for vision in [None, Some(false)] {
+                let options = ModelProviderRuntimeOptions {
+                    vision,
+                    ..Default::default()
+                };
+                let provider =
+                    create_model_provider_inner(None, name, "default", None, None, &options)
+                        .unwrap();
+                assert!(
+                    provider.has_stable_request_identity("model"),
+                    "{name}: factory-created leaves must attest to a stable request identity"
+                );
+            }
         }
     }
 
@@ -3565,6 +3628,56 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_scrubs_gemini_key_in_reqwest_url() {
+        let key = "AIzaSyDUMMYKEYFORTESTINGONLY1234567890";
+        let input = format!(
+            "error sending request for url (https://127.0.0.1:1/v1beta/models/x:generateContent?key={key})"
+        );
+        let result = sanitize_api_error(&input);
+        assert!(!result.contains(key), "key leaked: {result}");
+        assert!(result.contains("generateContent"));
+        assert!(!result.contains("?key="));
+    }
+
+    #[test]
+    fn sanitize_scrubs_bare_gemini_key_prefix() {
+        // An `AIza` key that appears outside a query string (e.g. a JSON body)
+        // is still redacted by the prefix rule.
+        let input = r#"{"error":"invalid api key AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"}"#;
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_removes_complete_url_query_regardless_of_parameter_name() {
+        let input =
+            "GET HTTPS://api.example.com/v1/thing?region=us&access_token=hunter2secret failed";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("hunter2secret"), "{result}");
+        assert!(!result.contains("region=us"), "{result}");
+        assert!(result.contains("HTTPS://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_removes_query_values_containing_url_punctuation() {
+        let secret = "abc,def'ghi(jkl)";
+        let input = format!("GET https://api.example.com/v1/thing?api_key={secret} failed");
+        let result = sanitize_api_error(&input);
+
+        assert!(!result.contains(secret), "{result}");
+        assert!(!result.contains("def'ghi(jkl)"), "{result}");
+        assert!(result.contains("https://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_leaves_non_url_key_value_text_unchanged() {
+        let input = "playing monkey=banana in the query";
+        let result = sanitize_api_error(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
     fn sanitize_no_secret_no_change() {
         let input = "simple upstream timeout";
         let result = sanitize_api_error(input);
@@ -4540,6 +4653,75 @@ mod tests {
         assert!(
             result.is_ok(),
             "a fallback cycle must be pruned, never loop or abort the build"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_cross_family_no_leak() {
+        // Two different provider families (openai and anthropic) each with
+        // distinct max_tokens. Each agent resolves only its own provider's
+        // options, so a different provider's max_tokens cannot leak across
+        // agent boundaries.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+
+        // OpenAI alias with max_tokens = 16384.
+        config.providers.models.openai.insert(
+            "gpt".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("fake-openai-key-not-real".to_string()),
+                    max_tokens: Some(16_384),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        // Anthropic alias with a different max_tokens.
+        config.providers.models.anthropic.insert(
+            "sonnet".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4".to_string()),
+                    api_key: Some("fake-anthropic-key-not-real".to_string()),
+                    max_tokens: Some(8_192),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        config.agents.insert(
+            "openai_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.gpt".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "anthropic_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.sonnet".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let openai_opts = provider_runtime_options_for_agent(&config, "openai_agent");
+        let anthropic_opts = provider_runtime_options_for_agent(&config, "anthropic_agent");
+
+        assert_eq!(
+            openai_opts.provider_max_tokens,
+            Some(16_384),
+            "openai agent must get its own max_tokens, not the anthropic provider's"
+        );
+        assert_eq!(
+            anthropic_opts.provider_max_tokens,
+            Some(8_192),
+            "anthropic agent must get its own max_tokens, not the openai provider's"
         );
     }
 
