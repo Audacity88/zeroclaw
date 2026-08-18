@@ -47,7 +47,7 @@ Docs-only changes: replace with markdown lint (`scripts/ci/docs_quality_gate.sh`
 - **Known CI coverage gap, if any:** (for example, `None after the docs and links gates`)
 - **Commands run and tail output:**
 - **Beyond CI, what did you manually verify?** (functional scenarios, edge cases, and any security-relevant behavior; also what you did NOT verify)
-- **Visual interface changed?** (`Yes` / `N/A`; if `Yes`, provide the remaining fields)
+- **Visual interface changed?** (`Yes` / `N/A`; if `Yes`, provide the remaining fields; if `N/A`, remove them)
 - **Tested revision, interface, and terminal or viewport dimensions:**
 - **Screenshot evidence:** (attach or link one or more screenshots showing the changed state and enough surrounding layout to judge it)
 - **Action or changed state and observed result:**
