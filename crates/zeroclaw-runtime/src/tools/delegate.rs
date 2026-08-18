@@ -5873,7 +5873,7 @@ mod tests {
             .expect("background task id")
             .trim_start_matches("task_id: ")
             .trim();
-        let background = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        let background = wait_for_terminal_background_result(&fixture.tool, task_id).await;
 
         assert_eq!(
             background.status,
@@ -10191,7 +10191,7 @@ command = "echo hi"
             .lines()
             .find_map(|line| line.strip_prefix("task_id: "))
             .expect("background start includes task id");
-        let result = wait_for_terminal_background_result(workspace.path(), task_id).await;
+        let result = wait_for_terminal_background_result(&tool, task_id).await;
 
         assert_eq!(result.status, BackgroundTaskStatus::Completed, "{result:?}");
         assert_eq!(
@@ -10362,7 +10362,7 @@ command = "echo hi"
             .lines()
             .find_map(|line| line.strip_prefix("task_id: "))
             .expect("background start includes task id");
-        let persisted = wait_for_terminal_background_result(workspace.path(), task_id).await;
+        let persisted = wait_for_terminal_background_result(&tool, task_id).await;
 
         assert_eq!(
             persisted.status,
