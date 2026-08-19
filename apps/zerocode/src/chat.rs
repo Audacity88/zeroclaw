@@ -3785,7 +3785,7 @@ fn copy_region(
     cells: u16,
     scroll: u16,
     body: Rect,
-    text: &str,
+    text: &Arc<str>,
     group: usize,
 ) -> Option<CopyHitRegion> {
     if global_row < scroll || global_row >= scroll + body.height {
@@ -3793,7 +3793,7 @@ fn copy_region(
     }
     Some(CopyHitRegion {
         rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
-        text: text.to_string(),
+        text: Arc::clone(text),
         kind: CopyHitKind::Code,
         group,
     })
@@ -3804,7 +3804,7 @@ fn code_context_region(
     global_end: u16,
     scroll: u16,
     body: Rect,
-    text: &str,
+    text: &Arc<str>,
     group: usize,
 ) -> Option<CopyHitRegion> {
     let visible_start = global_start.max(scroll);
@@ -3819,7 +3819,7 @@ fn code_context_region(
             body.width,
             visible_end - visible_start,
         ),
-        text: text.to_string(),
+        text: Arc::clone(text),
         kind: CopyHitKind::Code,
         group,
     })
@@ -3874,8 +3874,16 @@ fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
 struct ConversationRenderWork {
     visible_cached_entries: usize,
     transcript_cached_lines: usize,
-    copy_cached_lines: usize,
+    copy_cached_lines_scanned: usize,
+    copy_cached_blocks: usize,
     entry_rect_candidates: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisibleCachedWindow {
+    entries: Range<usize>,
+    lines: Range<usize>,
+    screen_lo: u16,
 }
 
 #[cfg(test)]
@@ -3968,23 +3976,21 @@ fn render_conversation(
     } else {
         state.scroll_offset.min(max_scroll)
     };
-    // Resolve the ordered cached-entry window once. Every committed-history
-    // consumer below receives this same range; overlays remain a separate
-    // on-demand segment and never create a second transcript source.
-    let visible_cached_entries = state.visible_cached_entry_range(scroll, inner_height);
+    // Resolve the ordered cached window once at both entry and line
+    // granularity. Overlays remain a separate on-demand segment and never
+    // create a second transcript source.
+    let visible_cached_window = state.visible_cached_window(scroll, inner_height);
     #[cfg(test)]
-    let transcript_cached_lines = state
-        .cached_line_window(&visible_cached_entries)
-        .map_or(0, |(lines, _)| lines.len());
+    let transcript_cached_lines = visible_cached_window.lines.len();
 
     // Both branches now render only the viewport slice, so cached-history
     // work stays O(log history + visible) instead of O(history), including
     // on transient frames (live streaming, approval overlay) where only the
     // small overlay buffer above is materialized in full.
     let (render_lines, render_scroll) = if transient {
-        state.visible_transient_slice(scroll, inner_height, &visible_cached_entries, overlay_lines)
+        state.visible_transient_slice(scroll, inner_height, &visible_cached_window, overlay_lines)
     } else {
-        state.visible_line_slice(scroll, &visible_cached_entries)
+        state.visible_line_slice(scroll, &visible_cached_window)
     };
 
     let row_breaks = state
@@ -4017,7 +4023,7 @@ fn render_conversation(
     let body_h = inner_height;
     state.entry_rects.clear();
     for &(entry_idx, screen_lo, screen_hi, content_width) in
-        &state.cached_screen_ranges[visible_cached_entries.clone()]
+        &state.cached_screen_ranges[visible_cached_window.entries.clone()]
     {
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll.saturating_add(body_h));
@@ -4035,8 +4041,8 @@ fn render_conversation(
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
-    let copy_cached_lines =
-        state.rebuild_copy_regions(inner_width, scroll, body_rect, &visible_cached_entries);
+    let (copy_cached_lines_scanned, copy_cached_blocks) =
+        state.rebuild_copy_regions(scroll, body_rect);
     if state.in_browse_mode() {
         state.rebuild_message_copy_region(body_rect);
     } else {
@@ -4070,15 +4076,16 @@ fn render_conversation(
     #[cfg(test)]
     {
         ConversationRenderWork {
-            visible_cached_entries: visible_cached_entries.len(),
+            visible_cached_entries: visible_cached_window.entries.len(),
             transcript_cached_lines,
-            copy_cached_lines,
-            entry_rect_candidates: visible_cached_entries.len(),
+            copy_cached_lines_scanned,
+            copy_cached_blocks,
+            entry_rect_candidates: visible_cached_window.entries.len(),
         }
     }
     #[cfg(not(test))]
     {
-        let _ = copy_cached_lines;
+        let _ = (copy_cached_lines_scanned, copy_cached_blocks);
     }
 }
 
@@ -4167,7 +4174,7 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
 
     state.copy_hit_regions.push(CopyHitRegion {
         rect,
-        text,
+        text: text.into(),
         kind: CopyHitKind::Transcript,
         group: 0,
     });
@@ -5178,8 +5185,19 @@ enum CopyHitKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CopyHitRegion {
     rect: Rect,
-    text: String,
+    text: Arc<str>,
     kind: CopyHitKind,
+    group: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedCodeBlock {
+    header_row: u16,
+    block_end: u16,
+    header_label: (u16, u16),
+    footer_row: u16,
+    footer_label: Option<(u16, u16)>,
+    text: Arc<str>,
     group: usize,
 }
 
@@ -5503,6 +5521,10 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
+    /// Per-line wrapped screen-row spans derived from `cached_lines` at
+    /// `cached_render_width`. This is the line-level index for viewport
+    /// slicing; it is rebuilt atomically with the rendered-line cache.
+    cached_line_screen_ranges: Vec<(u16, u16)>,
     /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end,
     /// content_width)`. Unlike `cached_line_ranges` (unwrapped line indices),
     /// these account for markdown wrapping so mouse hit-testing (`entry_rects`)
@@ -5512,6 +5534,10 @@ pub struct ChatState {
     /// beside short messages — a click there dismisses the highlight instead of
     /// re-selecting the entry.
     cached_screen_ranges: Vec<(usize, u16, u16, u16)>,
+    /// Copy projections derived from fenced regions in `cached_lines`.
+    /// Keeping their full copy text in the render cache avoids rescanning a
+    /// large visible fence on every steady-state draw.
+    cached_code_blocks: Vec<CachedCodeBlock>,
     /// Fine-grained dirty tracking — see [`LinesDirty`].
     dirty: LinesDirty,
     /// How many entries from `entries[cached_render_start..]` are represented in
@@ -5620,7 +5646,9 @@ impl ChatState {
             cached_lines: Vec::new(),
             cached_row_breaks: Vec::new(),
             cached_line_ranges: Vec::new(),
+            cached_line_screen_ranges: Vec::new(),
             cached_screen_ranges: Vec::new(),
+            cached_code_blocks: Vec::new(),
             dirty: LinesDirty::Full,
             cached_entry_count: 0,
             cached_render_start: 0,
@@ -5829,7 +5857,7 @@ impl ChatState {
                 };
                 Some(CopyHitRegion {
                     rect,
-                    text,
+                    text: text.into(),
                     kind: CopyHitKind::Transcript,
                     group: 0,
                 })
@@ -5852,7 +5880,7 @@ impl ChatState {
                             let text = self.yank_single_entry(*idx);
                             (!text.is_empty()).then_some(CopyHitRegion {
                                 rect: *rect,
-                                text,
+                                text: text.into(),
                                 kind: CopyHitKind::Message,
                                 group: *idx,
                             })
@@ -6080,17 +6108,12 @@ impl ChatState {
                     new_ranges.push((abs_idx, base + before, base + after));
                 }
             }
-            let appended_rows =
-                Paragraph::new(new_lines.iter().map(borrow_line).collect::<Vec<_>>())
-                    .wrap(Wrap { trim: false })
-                    .line_count(width) as u16;
             self.cached_row_breaks
                 .extend(row_breaks_for_lines(&new_lines, width));
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
             self.cached_entry_count = total - start;
             self.dirty = LinesDirty::Clean;
-            self.cached_total_rows = self.cached_total_rows.saturating_add(appended_rows);
             self.rebuild_screen_ranges(width);
             return;
         }
@@ -6120,13 +6143,11 @@ impl ChatState {
         self.cached_entry_count = total - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
-        self.cached_total_rows = self.compute_cached_rows(width);
         self.rebuild_screen_ranges(width);
     }
 
     /// Resolve the ordered cached-entry indices whose screen rows overlap the
-    /// viewport. This is the sole per-frame lookup; callers pass its result to
-    /// transcript slicing, copy projection, and entry hit rectangles.
+    /// viewport.
     fn visible_cached_entry_range(&self, scroll: u16, height: u16) -> Range<usize> {
         if height == 0 {
             return 0..0;
@@ -6141,26 +6162,51 @@ impl ChatState {
         first.min(end)..end
     }
 
-    /// Convert an already-resolved cached-entry range into the corresponding
-    /// unwrapped line range and its global screen-row origin.
-    fn cached_line_window(&self, entries: &Range<usize>) -> Option<(Range<usize>, u16)> {
-        if entries.is_empty() {
-            return None;
+    /// Resolve the complete cached viewport once at entry and line granularity.
+    /// Both indexes are generated from `cached_lines` during cache rebuilds;
+    /// steady-state draws only perform ordered lookups plus visible work.
+    fn visible_cached_window(&self, scroll: u16, height: u16) -> VisibleCachedWindow {
+        let entries = self.visible_cached_entry_range(scroll, height);
+        if height == 0 {
+            return VisibleCachedWindow {
+                entries,
+                lines: 0..0,
+                screen_lo: 0,
+            };
         }
-        let first = entries.start;
-        let last = entries.end.checked_sub(1)?;
-        let line_lo = self.cached_line_ranges.get(first)?.1;
-        let line_hi = self.cached_line_ranges.get(last)?.2;
-        let screen_lo = self.cached_screen_ranges.get(first)?.1;
-        Some((line_lo..line_hi, screen_lo))
+
+        let view_end = scroll.saturating_add(height);
+        let first = self
+            .cached_line_screen_ranges
+            .partition_point(|&(_, screen_hi)| screen_hi <= scroll);
+        let end = self
+            .cached_line_screen_ranges
+            .partition_point(|&(screen_lo, _)| screen_lo < view_end);
+        let lines = first.min(end)..end;
+        let screen_lo = self
+            .cached_line_screen_ranges
+            .get(lines.start)
+            .map_or(0, |&(screen_lo, _)| screen_lo);
+        VisibleCachedWindow {
+            entries,
+            lines,
+            screen_lo,
+        }
     }
 
-    fn visible_line_slice(&self, scroll: u16, entries: &Range<usize>) -> (Vec<Line<'static>>, u16) {
-        let Some((lines, screen_lo)) = self.cached_line_window(entries) else {
+    fn visible_line_slice(
+        &self,
+        scroll: u16,
+        window: &VisibleCachedWindow,
+    ) -> (Vec<Line<'static>>, u16) {
+        if window.lines.is_empty() {
             return (Vec::new(), 0);
-        };
-        let local_scroll = scroll.saturating_sub(screen_lo);
-        (self.cached_lines[lines].to_vec(), local_scroll)
+        }
+        let local_scroll = scroll.saturating_sub(window.screen_lo);
+        (
+            self.cached_lines[window.lines.clone()].to_vec(),
+            local_scroll,
+        )
     }
 
     /// Builds the transient overlay lines — the live streaming text (with
@@ -6201,7 +6247,7 @@ impl ChatState {
         &self,
         scroll: u16,
         height: u16,
-        entries: &Range<usize>,
+        window: &VisibleCachedWindow,
         overlay: Vec<Line<'static>>,
     ) -> (Vec<Line<'static>>, u16) {
         let cached_total_rows = self.cached_total_rows;
@@ -6210,30 +6256,69 @@ impl ChatState {
             // history case, where cached_total_rows is 0).
             return (overlay, scroll - cached_total_rows);
         }
-        let (mut lines, local_scroll) = self.visible_line_slice(scroll, entries);
+        let (mut lines, local_scroll) = self.visible_line_slice(scroll, window);
         if scroll.saturating_add(height) > cached_total_rows {
             lines.extend(overlay);
         }
         (lines, local_scroll)
     }
 
-    fn visible_copy_scan(&self, entries: &Range<usize>) -> (Range<usize>, u16) {
-        self.cached_line_window(entries).unwrap_or((0..0, 0))
-    }
-
-    /// Recompute `cached_screen_ranges` from `cached_line_ranges` by wrapping
-    /// each entry's `Line`s individually, so screen row positions reflect
-    /// markdown wrapping (code blocks, tables, etc.). Called after every
-    /// cache rebuild so mouse hit-testing in `entry_rects` stays accurate.
+    /// Recompute every screen-space index derived from `cached_lines`.
+    /// Cache rebuilds may remain history-sized; steady-state frames use these
+    /// ordered indexes without rescanning committed entries or lines.
     fn rebuild_screen_ranges(&mut self, width: u16) {
+        self.cached_line_screen_ranges.clear();
         self.cached_screen_ranges.clear();
+        self.cached_code_blocks.clear();
         let mut screen_cursor = 0u16;
+        let mut pending_fence: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
+
+        for line in &self.cached_lines {
+            let line_start = screen_cursor;
+            screen_cursor = screen_cursor.saturating_add(wrapped_rows(line, width));
+            self.cached_line_screen_ranges
+                .push((line_start, screen_cursor));
+
+            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            if first.starts_with('\u{250c}') {
+                let lang = header_fence_lang(line);
+                pending_fence = label_cells(line, " [Copy] ").map(|(col, cells)| {
+                    (
+                        line_start,
+                        col,
+                        cells,
+                        line_start as usize,
+                        lang,
+                        String::new(),
+                    )
+                });
+            } else if first.starts_with('\u{2514}') {
+                if let Some((header_row, header_col, header_cells, group, lang, body)) =
+                    pending_fence.take()
+                {
+                    self.cached_code_blocks.push(CachedCodeBlock {
+                        header_row,
+                        block_end: screen_cursor,
+                        header_label: (header_col, header_cells),
+                        footer_row: line_start,
+                        footer_label: label_cells(line, " [Copy] "),
+                        text: Arc::<str>::from(fenced_text(lang.as_deref(), &body)),
+                        group,
+                    });
+                }
+            } else if let Some((_, _, _, _, _, body)) = pending_fence.as_mut() {
+                let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let body_text = full.strip_prefix("  ").unwrap_or(&full);
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(body_text);
+            }
+        }
+
+        self.cached_total_rows = screen_cursor;
         for &(entry_idx, lo, hi) in &self.cached_line_ranges {
-            let entry_lines = self.cached_lines[lo..hi]
-                .iter()
-                .map(borrow_line)
-                .collect::<Vec<_>>();
-            if entry_lines.is_empty() {
+            if lo >= hi {
                 continue;
             }
             // Widest rendered column extent of the entry, clamped to the
@@ -6241,99 +6326,74 @@ impl ChatState {
             // clamp yields the true on-screen extent. Hit-testing uses this so
             // the blank space beside a short message is treated as outside the
             // entry.
-            let content_width = entry_lines
+            let content_width = self.cached_lines[lo..hi]
                 .iter()
                 .map(|l| l.width() as u16)
                 .max()
                 .unwrap_or(0)
                 .min(width);
-            let wrapped = Paragraph::new(entry_lines)
-                .wrap(Wrap { trim: false })
-                .line_count(width) as u16;
-            let screen_lo = screen_cursor;
-            screen_cursor += wrapped;
+            let Some(&(screen_lo, _)) = self.cached_line_screen_ranges.get(lo) else {
+                continue;
+            };
+            let Some(&(_, screen_hi)) = self.cached_line_screen_ranges.get(hi - 1) else {
+                continue;
+            };
             self.cached_screen_ranges
-                .push((entry_idx, screen_lo, screen_cursor, content_width));
+                .push((entry_idx, screen_lo, screen_hi, content_width));
         }
     }
 
-    fn rebuild_copy_regions(
-        &mut self,
-        width: u16,
-        scroll: u16,
-        body: Rect,
-        entries: &Range<usize>,
-    ) -> usize {
-        let copy_lbl = " [Copy] ";
+    fn rebuild_copy_regions(&mut self, scroll: u16, body: Rect) -> (usize, usize) {
         let mut regions: Vec<CopyHitRegion> = Vec::new();
         let mut context_regions: Vec<CopyHitRegion> = Vec::new();
-        let (lines, mut screen_cursor) = self.visible_copy_scan(entries);
-        let visited_lines = lines.len();
-        let mut pending: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
-        for line in &self.cached_lines[lines] {
-            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-            if first.starts_with('\u{250c}') {
-                let lang = header_fence_lang(line);
-                pending = label_cells(line, copy_lbl).map(|(col, cells)| {
-                    (
-                        screen_cursor,
-                        col,
-                        cells,
-                        screen_cursor as usize,
-                        lang,
-                        String::new(),
-                    )
-                });
-            } else if first.starts_with('\u{2514}') {
-                if let Some((header_row, header_col, header_cells, group, lang, acc)) =
-                    pending.take()
-                {
-                    let text = fenced_text(lang.as_deref(), &acc);
-                    let block_end = screen_cursor.saturating_add(wrapped_rows(line, width));
-                    if let Some(region) =
-                        code_context_region(header_row, block_end, scroll, body, &text, group)
-                    {
-                        context_regions.push(region);
-                    }
-                    if let Some(r) = copy_region(
-                        header_row,
-                        header_col,
-                        header_cells,
-                        scroll,
-                        body,
-                        &text,
-                        group,
-                    ) {
-                        regions.push(r);
-                    }
-                    if let Some((footer_col, footer_cells)) = label_cells(line, copy_lbl)
-                        && let Some(r) = copy_region(
-                            screen_cursor,
-                            footer_col,
-                            footer_cells,
-                            scroll,
-                            body,
-                            &text,
-                            group,
-                        )
-                    {
-                        regions.push(r);
-                    }
-                }
-            } else if let Some((_, _, _, _, _, acc)) = pending.as_mut() {
-                let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                let body_text = full.strip_prefix("  ").unwrap_or(&full).to_string();
-                if !acc.is_empty() {
-                    acc.push('\n');
-                }
-                acc.push_str(&body_text);
+        let view_end = scroll.saturating_add(body.height);
+        let first = self
+            .cached_code_blocks
+            .partition_point(|block| block.block_end <= scroll);
+        let visible_blocks = self.cached_code_blocks[first..]
+            .iter()
+            .take_while(|block| block.header_row < view_end);
+        let mut visited_blocks = 0;
+        for block in visible_blocks {
+            visited_blocks += 1;
+            if let Some(region) = code_context_region(
+                block.header_row,
+                block.block_end,
+                scroll,
+                body,
+                &block.text,
+                block.group,
+            ) {
+                context_regions.push(region);
             }
-
-            screen_cursor += wrapped_rows(line, width);
+            if let Some(region) = copy_region(
+                block.header_row,
+                block.header_label.0,
+                block.header_label.1,
+                scroll,
+                body,
+                &block.text,
+                block.group,
+            ) {
+                regions.push(region);
+            }
+            if let Some((footer_col, footer_cells)) = block.footer_label
+                && let Some(region) = copy_region(
+                    block.footer_row,
+                    footer_col,
+                    footer_cells,
+                    scroll,
+                    body,
+                    &block.text,
+                    block.group,
+                )
+            {
+                regions.push(region);
+            }
         }
         self.copy_hit_regions = regions;
         self.context_copy_regions = context_regions;
-        visited_lines
+        (0, visited_blocks)
     }
 
     fn message_copy_region(&self, body: Rect) -> Option<CopyHitRegion> {
@@ -6357,7 +6417,7 @@ impl ChatState {
         let label = message_copy_label();
         Some(CopyHitRegion {
             rect: centered_message_copy_rect(&label, *rect, body)?,
-            text,
+            text: text.into(),
             kind: CopyHitKind::Message,
             group: idx,
         })
@@ -6367,17 +6427,6 @@ impl ChatState {
         if let Some(region) = self.message_copy_region(body) {
             self.copy_hit_regions.push(region);
         }
-    }
-
-    fn compute_cached_rows(&self, width: u16) -> u16 {
-        Paragraph::new(
-            self.cached_lines
-                .iter()
-                .map(borrow_line)
-                .collect::<Vec<_>>(),
-        )
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
@@ -7153,6 +7202,10 @@ impl ChatState {
         self.streaming_thought.clear();
         self.cached_lines.clear();
         self.cached_row_breaks.clear();
+        self.cached_line_ranges.clear();
+        self.cached_line_screen_ranges.clear();
+        self.cached_screen_ranges.clear();
+        self.cached_code_blocks.clear();
         self.entry_rects.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
@@ -7631,7 +7684,7 @@ mod tests {
         assert!(state.open_copy_context_menu(35, 5));
         let menu = state.copy_context_menu.as_ref().expect("menu opens");
         assert_eq!(menu.target.kind, CopyHitKind::Message);
-        assert_eq!(menu.target.text, "hello");
+        assert_eq!(menu.target.text.as_ref(), "hello");
     }
 
     #[test]
@@ -7651,20 +7704,20 @@ mod tests {
         assert!(state.open_copy_context_menu(12, 5));
         let menu = state.copy_context_menu.as_ref().expect("menu opens");
         assert_eq!(menu.target.kind, CopyHitKind::Transcript);
-        assert_eq!(menu.target.text, "ell");
+        assert_eq!(menu.target.text.as_ref(), "ell");
 
         state.dismiss_copy_context_menu();
         assert!(state.open_copy_context_menu(10, 5));
         let menu = state.copy_context_menu.as_ref().expect("menu opens");
         assert_eq!(menu.target.kind, CopyHitKind::Transcript);
-        assert_eq!(menu.target.text, "ell");
+        assert_eq!(menu.target.text.as_ref(), "ell");
 
         state.dismiss_copy_context_menu();
         state.clear_transcript_selection();
         assert!(state.open_copy_context_menu(10, 5));
         let menu = state.copy_context_menu.as_ref().expect("menu opens");
         assert_eq!(menu.target.kind, CopyHitKind::Message);
-        assert_eq!(menu.target.text, "hello");
+        assert_eq!(menu.target.text.as_ref(), "hello");
     }
 
     #[test]
@@ -7703,7 +7756,7 @@ mod tests {
         state.entry_rects.push((0, Rect::new(0, 0, 20, 5)));
         state.context_copy_regions.push(CopyHitRegion {
             rect: Rect::new(0, 1, 40, 3),
-            text: "echo hi".to_string(),
+            text: Arc::<str>::from("echo hi"),
             kind: CopyHitKind::Code,
             group: 7,
         });
@@ -7711,7 +7764,7 @@ mod tests {
         assert!(state.open_copy_context_menu(2, 2));
         let menu = state.copy_context_menu.as_ref().expect("menu opens");
         assert_eq!(menu.target.kind, CopyHitKind::Code);
-        assert_eq!(menu.target.text, "echo hi");
+        assert_eq!(menu.target.text.as_ref(), "echo hi");
         assert_eq!(menu.target.group, 7);
     }
 
@@ -7757,7 +7810,7 @@ mod tests {
             rect: Rect::new(0, 0, 8, 3),
             target: CopyHitRegion {
                 rect: Rect::new(0, 0, 5, 1),
-                text: "hello".to_string(),
+                text: Arc::<str>::from("hello"),
                 kind: CopyHitKind::Message,
                 group: 0,
             },
@@ -7835,7 +7888,7 @@ mod tests {
         state.dirty = LinesDirty::Clean;
         state.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(0, 0, 8, 1),
-            text: "whole message".to_string(),
+            text: Arc::<str>::from("whole message"),
             kind: CopyHitKind::Message,
             group: 0,
         });
@@ -8038,7 +8091,7 @@ mod tests {
             assert!(state.update_transcript_drag(1, 0));
             state.copy_hit_regions.push(CopyHitRegion {
                 rect: Rect::new(0, 0, 2, 1),
-                text: "he".to_string(),
+                text: Arc::<str>::from("he"),
                 kind: CopyHitKind::Transcript,
                 group: 0,
             });
@@ -8156,7 +8209,7 @@ mod tests {
             .find(|region| region.kind == CopyHitKind::Transcript)
             .cloned()
             .expect("selection exposes transcript copy action");
-        assert_eq!(region.text, "he");
+        assert_eq!(region.text.as_ref(), "he");
         assert_eq!(state.copy_feedback, None);
 
         chat.phase = ChatPhase::Active(Box::new(state));
@@ -8478,9 +8531,9 @@ mod tests {
     /// anchoring, copy targets and `entry_rects` all read:
     ///   1. the resolved entry range covers the whole viewport window, so no
     ///      visible row is projected from outside the range;
-    ///   2. the returned `local_scroll` indexes a real row of the slice;
-    ///   3. `visible_copy_scan` agrees exactly with the slice the renderer
-    ///      draws, so copy/hit-test coordinates cannot drift from the pixels.
+    ///   2. the line-level window covers the viewport and `local_scroll`
+    ///      indexes a real row of the slice;
+    ///   3. the materialized line count is exactly the resolved line window.
     #[test]
     fn visible_range_coordinate_invariants_hold_at_every_scroll_offset() {
         let mut s = state();
@@ -8515,10 +8568,10 @@ mod tests {
 
         for height in [1u16, 7, 20, 41] {
             for scroll in 0..=total_rows {
-                let visible = s.visible_cached_entry_range(scroll, height);
-                let (slice, local_scroll) = s.visible_line_slice(scroll, &visible);
+                let window = s.visible_cached_window(scroll, height);
+                let (slice, local_scroll) = s.visible_line_slice(scroll, &window);
 
-                if visible.is_empty() {
+                if window.entries.is_empty() {
                     assert!(
                         slice.is_empty(),
                         "empty entry range must project no lines \
@@ -8528,8 +8581,8 @@ mod tests {
                 }
 
                 // 1. The range must cover the viewport window it was resolved for.
-                let screen_lo = s.cached_screen_ranges[visible.start].1;
-                let screen_hi = s.cached_screen_ranges[visible.end - 1].2;
+                let screen_lo = s.cached_screen_ranges[window.entries.start].1;
+                let screen_hi = s.cached_screen_ranges[window.entries.end - 1].2;
                 let view_end = scroll.saturating_add(height).min(total_rows);
                 assert!(
                     screen_lo <= scroll,
@@ -8542,7 +8595,11 @@ mod tests {
                      view_end={view_end} (height={height}, scroll={scroll})"
                 );
 
-                // 2. local_scroll must index a real row of the returned slice.
+                // 2. The line-level range and local scroll must cover the same
+                // viewport without materializing the complete boundary entry.
+                let line_screen_hi = s.cached_line_screen_ranges[window.lines.end - 1].1;
+                assert!(window.screen_lo <= scroll);
+                assert!(line_screen_hi >= view_end);
                 assert!(
                     (local_scroll as usize) <= slice.len(),
                     "local_scroll={local_scroll} outside slice of {} rows \
@@ -8551,24 +8608,18 @@ mod tests {
                 );
                 assert_eq!(
                     local_scroll,
-                    scroll - screen_lo,
-                    "local_scroll must be the offset of the viewport into the first visible entry \
+                    scroll - window.screen_lo,
+                    "local_scroll must be the offset of the viewport into the first visible line \
                      (height={height}, scroll={scroll})"
                 );
 
-                // 3. Copy projection must agree with the drawn slice exactly.
-                let (copy_lines, copy_screen_lo) = s.visible_copy_scan(&visible);
+                // 3. Materialization must match the resolved line range.
                 assert_eq!(
-                    copy_screen_lo, screen_lo,
-                    "copy projection origin drifted from the rendered slice origin \
-                     (height={height}, scroll={scroll})"
-                );
-                assert_eq!(
-                    copy_lines.len(),
+                    window.lines.len(),
                     slice.len(),
-                    "copy projection spans {} lines but the renderer drew {} \
+                    "line window spans {} lines but the renderer drew {} \
                      (height={height}, scroll={scroll})",
-                    copy_lines.len(),
+                    window.lines.len(),
                     slice.len()
                 );
             }
@@ -8595,8 +8646,8 @@ mod tests {
         let max_scroll = s.cached_total_rows.saturating_sub(height);
         let mid_scroll = max_scroll / 2;
 
-        let visible = s.visible_cached_entry_range(mid_scroll, height);
-        let (slice, local_scroll) = s.visible_line_slice(mid_scroll, &visible);
+        let window = s.visible_cached_window(mid_scroll, height);
+        let (slice, local_scroll) = s.visible_line_slice(mid_scroll, &window);
 
         assert!(
             slice.len() < total,
@@ -8627,14 +8678,14 @@ mod tests {
         s.rebuild_lines(80);
         let height = 12u16;
 
-        let top_visible = s.visible_cached_entry_range(0, height);
-        let (top, top_local) = s.visible_line_slice(0, &top_visible);
+        let top_window = s.visible_cached_window(0, height);
+        let (top, top_local) = s.visible_line_slice(0, &top_window);
         assert_eq!(top_local, 0, "scroll 0 keeps the first entry aligned");
         assert!(!top.is_empty());
 
         let max_scroll = s.cached_total_rows.saturating_sub(height);
-        let bottom_visible = s.visible_cached_entry_range(max_scroll, height);
-        let (bottom, _) = s.visible_line_slice(max_scroll, &bottom_visible);
+        let bottom_window = s.visible_cached_window(max_scroll, height);
+        let (bottom, _) = s.visible_line_slice(max_scroll, &bottom_window);
         assert!(!bottom.is_empty(), "bottom extent must still yield lines");
     }
 
@@ -8678,9 +8729,8 @@ mod tests {
         let max_scroll = total_rows.saturating_sub(height);
         let mid_scroll = max_scroll / 2;
 
-        let visible = s.visible_cached_entry_range(mid_scroll, height);
-        let (slice, local_scroll) =
-            s.visible_transient_slice(mid_scroll, height, &visible, overlay);
+        let window = s.visible_cached_window(mid_scroll, height);
+        let (slice, local_scroll) = s.visible_transient_slice(mid_scroll, height, &window, overlay);
 
         assert!(
             slice.len() <= (height as usize) + 8,
@@ -8713,9 +8763,8 @@ mod tests {
         let height = 12u16;
         let max_scroll = total_rows.saturating_sub(height);
 
-        let visible = s.visible_cached_entry_range(max_scroll, height);
-        let (slice, local_scroll) =
-            s.visible_transient_slice(max_scroll, height, &visible, overlay);
+        let window = s.visible_cached_window(max_scroll, height);
+        let (slice, local_scroll) = s.visible_transient_slice(max_scroll, height, &window, overlay);
 
         let joined: String = slice
             .iter()
@@ -8752,10 +8801,10 @@ mod tests {
         // Scroll far above the bottom so the window sits entirely in history.
         let scroll = 10u16;
 
-        let visible = s.visible_cached_entry_range(scroll, height);
+        let window = s.visible_cached_window(scroll, height);
         let (transient_slice, transient_local) =
-            s.visible_transient_slice(scroll, height, &visible, overlay);
-        let (idle_slice, idle_local) = s.visible_line_slice(scroll, &visible);
+            s.visible_transient_slice(scroll, height, &window, overlay);
+        let (idle_slice, idle_local) = s.visible_line_slice(scroll, &window);
 
         assert_eq!(
             transient_slice, idle_slice,
@@ -8832,8 +8881,8 @@ mod tests {
         let total_rows = transient_total_rows(&s, &overlay, width);
         let height = 5u16;
 
-        let visible = s.visible_cached_entry_range(0, height);
-        let (slice, local_scroll) = s.visible_transient_slice(0, height, &visible, overlay.clone());
+        let window = s.visible_cached_window(0, height);
+        let (slice, local_scroll) = s.visible_transient_slice(0, height, &window, overlay.clone());
         assert_eq!(
             slice, overlay,
             "overlay-only history renders the overlay verbatim"
@@ -8863,8 +8912,8 @@ mod tests {
         // Window starting past the tiny history sits entirely in the overlay.
         let height = 6u16;
         let scroll = s.cached_total_rows;
-        let visible = s.visible_cached_entry_range(scroll, height);
-        let (slice, local_scroll) = s.visible_transient_slice(scroll, height, &visible, overlay);
+        let window = s.visible_cached_window(scroll, height);
+        let (slice, local_scroll) = s.visible_transient_slice(scroll, height, &window, overlay);
         assert_eq!(local_scroll, 0);
         let joined: String = slice
             .iter()
@@ -8951,8 +9000,8 @@ mod tests {
                 "{case:?} entry rectangles must reuse the single resolved range"
             );
             assert_eq!(
-                large.transcript_cached_lines, large.copy_cached_lines,
-                "{case:?} transcript and copy projection must consume the same cached line window"
+                large.copy_cached_lines_scanned, 0,
+                "{case:?} copy projection must use the derived fence cache"
             );
             assert!(
                 large.visible_cached_entries <= 24,
@@ -8966,11 +9015,67 @@ mod tests {
             ConversationRenderWork {
                 visible_cached_entries: 0,
                 transcript_cached_lines: 0,
-                copy_cached_lines: 0,
+                copy_cached_lines_scanned: 0,
+                copy_cached_blocks: 0,
                 entry_rect_candidates: 0,
             },
             "an overlay-only viewport must not visit, clone, or wrap committed history"
         );
+    }
+
+    #[test]
+    fn complete_frame_slices_one_large_committed_fence_by_visible_lines() {
+        use std::fmt::Write as _;
+
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut response = String::from("```rust\n");
+        for line in 0..2_000 {
+            writeln!(&mut response, "let line_{line} = {line};").expect("write fixture line");
+        }
+        response.push_str("```\n");
+
+        let mut s = state();
+        s.entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from(response)));
+        s.mark_dirty_full();
+        s.streaming_text = "streaming reply in progress".to_string();
+        s.pinned_to_bottom = false;
+
+        let area = Rect::new(0, 0, 80, 24);
+        s.rebuild_lines(area.width.saturating_sub(2));
+        s.scroll_offset = s.cached_total_rows / 2;
+        let cached_copy_text = Arc::clone(&s.cached_code_blocks[0].text);
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut work = None;
+        terminal
+            .draw(|frame| {
+                work = Some(render_conversation(frame, &mut s, area));
+            })
+            .expect("render large committed entry");
+
+        let work = work.expect("render work");
+        assert_eq!(work.visible_cached_entries, 1);
+        assert!(
+            work.transcript_cached_lines <= usize::from(area.height.saturating_sub(2)),
+            "one large entry must materialize only viewport lines: {work:?}"
+        );
+        assert_eq!(work.copy_cached_lines_scanned, 0);
+        assert_eq!(work.copy_cached_blocks, 1);
+        assert_eq!(work.entry_rect_candidates, 1);
+
+        let context = s
+            .context_copy_regions
+            .first()
+            .expect("visible fence keeps its context-copy target");
+        assert!(
+            Arc::ptr_eq(&cached_copy_text, &context.text),
+            "steady-state copy projection must share cached text"
+        );
+        assert!(context.text.contains("let line_0 = 0;"));
+        assert!(context.text.contains("let line_1999 = 1999;"));
     }
 
     #[test]
@@ -10237,7 +10342,7 @@ mod tests {
         let copy_rect = state
             .copy_hit_regions
             .iter()
-            .find(|region| region.text == "hello")
+            .find(|region| region.text.as_ref() == "hello")
             .expect("browse-mode selected message copy action should be rendered")
             .rect;
         assert_eq!(
@@ -10519,7 +10624,7 @@ mod tests {
         let code_regions: Vec<CopyHitRegion> = state
             .copy_hit_regions
             .iter()
-            .filter(|region| region.text == "echo hello")
+            .filter(|region| region.text.as_ref() == "echo hello")
             .cloned()
             .collect();
         assert_eq!(
@@ -10573,7 +10678,7 @@ mod tests {
         state.browse_cursor = Some(0);
         state.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(2, 2, 6, 1),
-            text: "echo hi".to_string(),
+            text: Arc::<str>::from("echo hi"),
             kind: CopyHitKind::Code,
             group: 0,
         });
@@ -11578,14 +11683,14 @@ mod tests {
         state.mark_dirty_full();
         state.rebuild_lines(60);
         let body = Rect::new(0, 0, 60, 20);
-        let visible = state.visible_cached_entry_range(0, body.height);
-        state.rebuild_copy_regions(60, 0, body, &visible);
+        state.rebuild_copy_regions(0, body);
         assert!(
             !state.copy_hit_regions.is_empty(),
             "a highlighted fence must still register copy regions"
         );
         assert_eq!(
-            state.copy_hit_regions[0].text, "fn main() {}\nlet y = 2;",
+            state.copy_hit_regions[0].text.as_ref(),
+            "fn main() {}\nlet y = 2;",
             "copy text contains only the code body without markdown fences"
         );
     }
@@ -11603,10 +11708,10 @@ mod tests {
         state.mark_dirty_full();
         state.rebuild_lines(60);
         let body = Rect::new(0, 0, 60, 20);
-        let visible = state.visible_cached_entry_range(0, body.height);
-        state.rebuild_copy_regions(60, 0, body, &visible);
+        state.rebuild_copy_regions(0, body);
         assert_eq!(
-            state.copy_hit_regions[0].text, "plain text",
+            state.copy_hit_regions[0].text.as_ref(),
+            "plain text",
             "copy text contains only the code body without fences"
         );
     }
@@ -11634,15 +11739,14 @@ mod tests {
         let fence_entry = state.cached_screen_ranges.last().copied().expect("fence");
         let body = Rect::new(0, 0, 60, 20);
 
-        let fence_visible = state.visible_cached_entry_range(fence_entry.1, body.height);
-        state.rebuild_copy_regions(60, fence_entry.1, body, &fence_visible);
+        state.rebuild_copy_regions(fence_entry.1, body);
         assert_eq!(
-            state.copy_hit_regions[0].text, "fn main() {}",
+            state.copy_hit_regions[0].text.as_ref(),
+            "fn main() {}",
             "scrolled-to fence registers a copy region with body only"
         );
 
-        let top_visible = state.visible_cached_entry_range(0, body.height);
-        state.rebuild_copy_regions(60, 0, body, &top_visible);
+        state.rebuild_copy_regions(0, body);
         assert!(
             state.copy_hit_regions.is_empty(),
             "fence far below the viewport registers nothing"
@@ -12151,7 +12255,7 @@ mod tests {
         s.queue_paused = true;
         s.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(1, 1, 6, 1),
-            text: "stale".to_string(),
+            text: Arc::<str>::from("stale"),
             kind: CopyHitKind::Message,
             group: 0,
         });
