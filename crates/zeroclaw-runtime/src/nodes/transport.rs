@@ -137,7 +137,7 @@ fn verify_canonical_request_at(
     now: i64,
 ) -> Result<bool> {
     let max_age_secs = u64::try_from(max_age_secs)
-        .map_err(|_| anyhow::anyhow!("Maximum request age must be non-negative"))?;
+        .map_err(|_| anyhow::Error::msg("Maximum request age must be non-negative"))?;
     if now.abs_diff(timestamp) > max_age_secs {
         bail!("Request timestamp too old or too far in future");
     }
@@ -147,7 +147,7 @@ fn verify_canonical_request_at(
 
 fn parse_canonical_nonce(nonce: &str) -> Result<Uuid> {
     let parsed = Uuid::parse_str(nonce)
-        .map_err(|_| anyhow::anyhow!("Invalid nonce: expected a canonical UUID"))?;
+        .map_err(|_| anyhow::Error::msg("Invalid nonce: expected a canonical UUID"))?;
     if parsed.hyphenated().to_string() != nonce {
         bail!("Invalid nonce: expected a lowercase hyphenated UUID");
     }
