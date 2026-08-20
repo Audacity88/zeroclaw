@@ -21,14 +21,12 @@ fi
 
 node - "$repo_root" "$today" "$expires" <<'NODE'
 const fs = require("node:fs");
-const { builtinModules } = require("node:module");
 const path = require("node:path");
 
 const repoRoot = path.resolve(process.argv[2]);
 const today = process.argv[3];
 const expires = process.argv[4];
 const webRoot = path.join(repoRoot, "web");
-const webSourceRoot = path.join(webRoot, "src");
 const ciWorkflowPath = path.join(
   repoRoot,
   ".github",
@@ -168,6 +166,7 @@ const ciLines = ciWorkflow.split(/\r?\n/);
 if (ciLines.some((line) => /^defaults:\s*(?:#.*)?$/.test(line))) {
   fail("required CI cannot set workflow-wide run defaults");
 }
+
 const reviewJob = workflowJob(ciLines, "npm-dependency-review");
 const reviewKeys = reviewJob.lines
   .slice(1)
@@ -186,6 +185,7 @@ if (
 ) {
   fail("npm-dependency-review must run only on pull requests and fail closed");
 }
+
 const actionSteps = workflowSteps(ciLines, reviewJob).filter((step) =>
   stepFieldValues(ciLines, step, "uses").some(({ value }) =>
     value.startsWith("actions/dependency-review-action@"),
@@ -244,6 +244,47 @@ if (
   fail(`dependency-review action must allow exactly ${expectedGhsa}`);
 }
 
+const semanticJob = workflowJob(ciLines, "web-permission-tests");
+const semanticJobKeys = semanticJob.lines
+  .slice(1)
+  .map((line) => line.match(/^ {4}([^ :#][^:#]*):/))
+  .filter(Boolean)
+  .map((match) => match[1].trim());
+requireAllowedKeys(
+  "web semantic guard job",
+  semanticJobKeys,
+  new Set(["name", "needs", "if", "runs-on", "timeout-minutes", "steps"]),
+);
+const semanticNeeds = semanticJob.lines.filter((line) => /^    needs:/.test(line));
+if (semanticNeeds.length !== 1 || semanticNeeds[0].trim() !== "needs: [path-changes]") {
+  fail("web semantic guard job must depend on path-changes");
+}
+const semanticIf = semanticJob.lines.filter((line) => /^    if:/.test(line));
+if (
+  semanticIf.length !== 1 ||
+  semanticIf[0].trim() !== "if: needs.path-changes.outputs.web == 'true'"
+) {
+  fail("web semantic guard job must run for every classified web change");
+}
+const semanticSteps = workflowSteps(ciLines, semanticJob).filter(
+  (step) =>
+    stepFieldValues(ciLines, step, "run").length === 1 &&
+    stepFieldValues(ciLines, step, "run")[0].value === "npm run test:rsc-guard",
+);
+if (semanticSteps.length !== 1) {
+  fail("web semantic guard job must run npm run test:rsc-guard exactly once");
+}
+requireAllowedKeys(
+  "web semantic guard step",
+  directStepKeys(ciLines, semanticSteps[0]),
+  new Set(["name", "working-directory", "run"]),
+);
+if (
+  requireSingleStepField(ciLines, semanticSteps[0], "working-directory").value !== "web"
+) {
+  fail("web semantic guard step must run from web");
+}
+
 const gateJob = workflowJob(ciLines, "gate");
 const gateKeys = gateJob.lines
   .slice(1)
@@ -256,10 +297,7 @@ requireAllowedKeys(
   new Set(["name", "if", "needs", "runs-on", "timeout-minutes", "steps"]),
 );
 const gateIf = gateJob.lines.filter((line) => /^    if:/.test(line));
-if (
-  gateIf.length !== 1 ||
-  gateIf[0].trim() !== "if: always()"
-) {
+if (gateIf.length !== 1 || gateIf[0].trim() !== "if: always()") {
   fail("CI Required Gate must always run and fail closed");
 }
 const gateNeeds = gateJob.lines.find((line) => /^    needs:\s*\[/.test(line));
@@ -270,9 +308,10 @@ const gateNeedNames = gateNeeds
   .filter(Boolean);
 if (
   !gateNeedNames ||
-  gateNeedNames.filter((name) => name === "npm-dependency-review").length !== 1
+  gateNeedNames.filter((name) => name === "npm-dependency-review").length !== 1 ||
+  gateNeedNames.filter((name) => name === "web-permission-tests").length !== 1
 ) {
-  fail("CI Required Gate must depend on npm-dependency-review");
+  fail("CI Required Gate must depend on npm-dependency-review and web-permission-tests");
 }
 const gateSteps = workflowSteps(ciLines, gateJob);
 const gateStepMatches = gateSteps.filter(
@@ -297,17 +336,13 @@ const gateScriptLines = ciLines
   .slice(gateRun.index + 1, gateStep.end)
   .filter((line) => line.trim())
   .map((line) => line.trim());
-const requiredReviewResult =
-  `if [[ "\${{ github.event_name }}" == "pull_request" && "\${{ needs.npm-dependency-review.result }}" != "success" ]]; then`;
 const requiredReviewPrefix = [
-  requiredReviewResult,
+  `if [[ "\${{ github.event_name }}" == "pull_request" && "\${{ needs.npm-dependency-review.result }}" != "success" ]]; then`,
   'echo "::error::npm dependency review did not complete successfully"',
   "exit 1",
   "fi",
 ];
-if (
-  requiredReviewPrefix.some((line, index) => gateScriptLines[index] !== line)
-) {
+if (requiredReviewPrefix.some((line, index) => gateScriptLines[index] !== line)) {
   fail("CI Required Gate must require successful npm dependency review on pull requests");
 }
 
@@ -327,11 +362,21 @@ const dependencySections = [
   "optionalDependencies",
   "peerDependencies",
 ];
-const declaredPackages = new Set();
 const forbiddenPackages = [];
+
+function forbiddenSpecifier(specifier) {
+  return (
+    specifier === "react-router" ||
+    specifier.startsWith("react-router/") ||
+    specifier.startsWith("react-router-dom/") ||
+    specifier.startsWith("@react-router/") ||
+    specifier === "@vitejs/plugin-rsc" ||
+    specifier.startsWith("react-server-dom-")
+  );
+}
+
 for (const section of dependencySections) {
   for (const [name, version] of Object.entries(pkg[section] ?? {})) {
-    declaredPackages.add(name);
     if (
       name === "react-router" ||
       name.startsWith("react-router/") ||
@@ -347,269 +392,20 @@ for (const section of dependencySections) {
         forbiddenPackages.push(`${section}:${name}->${version}`);
       }
     }
+    if (
+      typeof version === "string" &&
+      ["file:", "link:", "workspace:"].some((protocol) => version.startsWith(protocol))
+    ) {
+      forbiddenPackages.push(`${section}:${name}->${version}`);
+    }
   }
 }
 
 if (forbiddenPackages.length > 0) {
   fail(
-    `RSC-capable dependencies require removing the advisory exception: ${forbiddenPackages.join(", ")}`,
+    `dependencies violate the client-only advisory policy: ${forbiddenPackages.join(", ")}`,
   );
 }
-
-const scannedExtensions = new Set([
-  ".html",
-  ".js",
-  ".jsx",
-  ".mjs",
-  ".cjs",
-  ".ts",
-  ".tsx",
-  ".mts",
-  ".cts",
-  ".mdx",
-]);
-const ignoredPaths = new Set([
-  path.join(webRoot, "dist"),
-  path.join(webRoot, "node_modules"),
-]);
-const nodeModulesRoot = path.join(webRoot, "node_modules");
-const nodeBuiltins = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
-const allowedTransitiveImports = new Set(["@codemirror/theme-one-dark"]);
-const forbiddenRscApi = /\b(?:unstable_)?(?:RSCHydratedRouter|RSCStaticRouter|createCallServer|getRSCStream|matchRSCServerRequest|routeRSCServerRequest|reactRouterRSC)\b/;
-
-function forbiddenSpecifier(specifier) {
-  return (
-    specifier === "react-router" ||
-    specifier.startsWith("react-router/") ||
-    specifier.startsWith("react-router-dom/") ||
-    specifier.startsWith("@react-router/") ||
-    specifier === "@vitejs/plugin-rsc" ||
-    specifier.startsWith("react-server-dom-")
-  );
-}
-
-function packageName(specifier) {
-  if (specifier.startsWith("@")) {
-    return specifier.split("/").slice(0, 2).join("/");
-  }
-  return specifier.split("/", 1)[0];
-}
-
-function requireInsideWebRoot(resolved, relative, specifier) {
-  if (resolved !== webRoot && !resolved.startsWith(`${webRoot}${path.sep}`)) {
-    fail(`${relative} imports outside the guarded web root: ${specifier}`);
-  }
-  if (resolved === nodeModulesRoot || resolved.startsWith(`${nodeModulesRoot}${path.sep}`)) {
-    fail(`${relative} imports into skipped node_modules: ${specifier}`);
-  }
-}
-
-function inspectViteAliases(source, relative) {
-  if (/\[\s*["'](?:resolve|alias)["']\s*\]\s*:/.test(source)) {
-    fail(`${relative} uses a computed resolve or alias property`);
-  }
-  if (/\.\.\./.test(source)) {
-    fail(`${relative} uses an unsupported object spread`);
-  }
-  const aliasTokens = [...source.matchAll(/\balias\b/g)];
-  const aliasBlocks = [...source.matchAll(/\balias\s*:\s*\{([\s\S]*?)\n\s*\},/g)];
-  if (aliasTokens.length !== 1 || aliasBlocks.length !== 1) {
-    fail(`${relative} uses an unsupported alias declaration`);
-  }
-
-  const compact = aliasBlocks[0][1].replace(/\s+/g, "");
-  if (!/^["']@["']:path\.resolve\(__dirname,["']\.\/src["']\),?$/.test(compact)) {
-    fail(`${relative} must keep the sole @ alias rooted at web/src`);
-  }
-}
-
-function stripJavaScriptComments(source) {
-  const output = [...source];
-  const stack = [{ state: "code", templateDepth: null }];
-  let index = 0;
-
-  while (index < source.length) {
-    const frame = stack[stack.length - 1];
-    const char = source[index];
-    const next = source[index + 1];
-
-    if (frame.state === "line-comment") {
-      if (char === "\n") {
-        stack.pop();
-      } else {
-        output[index] = " ";
-      }
-      index += 1;
-      continue;
-    }
-    if (frame.state === "block-comment") {
-      if (char === "*" && next === "/") {
-        output[index] = " ";
-        output[index + 1] = " ";
-        stack.pop();
-        index += 2;
-      } else {
-        if (char !== "\n") {
-          output[index] = " ";
-        }
-        index += 1;
-      }
-      continue;
-    }
-    if (frame.state === "single-quote" || frame.state === "double-quote") {
-      const quote = frame.state === "single-quote" ? "'" : '"';
-      if (char === "\\") {
-        index += 2;
-      } else {
-        if (char === quote) {
-          stack.pop();
-        }
-        index += 1;
-      }
-      continue;
-    }
-    if (frame.state === "template") {
-      if (char === "\\") {
-        index += 2;
-      } else if (char === "`") {
-        stack.pop();
-        index += 1;
-      } else if (char === "$" && next === "{") {
-        stack.push({ state: "code", templateDepth: 1 });
-        index += 2;
-      } else {
-        index += 1;
-      }
-      continue;
-    }
-
-    if (char === "/" && next === "/") {
-      output[index] = " ";
-      output[index + 1] = " ";
-      stack.push({ state: "line-comment", templateDepth: null });
-      index += 2;
-    } else if (char === "/" && next === "*") {
-      output[index] = " ";
-      output[index + 1] = " ";
-      stack.push({ state: "block-comment", templateDepth: null });
-      index += 2;
-    } else if (char === "'") {
-      stack.push({ state: "single-quote", templateDepth: null });
-      index += 1;
-    } else if (char === '"') {
-      stack.push({ state: "double-quote", templateDepth: null });
-      index += 1;
-    } else if (char === "`") {
-      stack.push({ state: "template", templateDepth: null });
-      index += 1;
-    } else if (frame.templateDepth !== null && char === "{") {
-      frame.templateDepth += 1;
-      index += 1;
-    } else if (frame.templateDepth !== null && char === "}") {
-      frame.templateDepth -= 1;
-      if (frame.templateDepth === 0) {
-        stack.pop();
-      }
-      index += 1;
-    } else {
-      index += 1;
-    }
-  }
-
-  return output.join("");
-}
-
-function inspectFile(filePath) {
-  const relative = path.relative(webRoot, filePath).split(path.sep).join("/");
-  const basename = path.basename(filePath);
-  if (
-    /^react-router\.config\./.test(basename) ||
-    /^entry\.(?:server|rsc)\./.test(basename) ||
-    /\.(?:server|rsc)\.[^.]+$/.test(basename)
-  ) {
-    fail(`${relative} is a server/RSC entry surface`);
-  }
-
-  const source = fs.readFileSync(filePath, "utf8");
-  const importSource = stripJavaScriptComments(source);
-  for (const match of importSource.matchAll(/["'`]([^"'`]+)["'`]/g)) {
-    if (forbiddenSpecifier(match[1])) {
-      fail(`${relative} contains RSC/server-capable module literal ${match[1]}`);
-    }
-  }
-  const moduleCallPattern = /\b(?:import|require)\s*\(([^)]*)\)/g;
-  for (const match of importSource.matchAll(moduleCallPattern)) {
-    const argument = match[1].trim();
-    if (!/^(?:"[^"]+"|'[^']+'|`[^`$]+`)$/.test(argument)) {
-      fail(`${relative} uses a non-literal dynamic module specifier`);
-    }
-  }
-  const specifierPatterns = [
-    /(?:^|[;\n])\s*(?:import|export)\b[^;]*?\sfrom\s*["']([^"']+)["']/g,
-    /(?:^|[;\n])\s*import\s*["']([^"']+)["']/g,
-    /\bimport\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g,
-    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
-  ];
-  for (const pattern of specifierPatterns) {
-    for (const match of importSource.matchAll(pattern)) {
-      const specifier = match[1];
-      if (forbiddenSpecifier(specifier)) {
-        fail(`${relative} imports RSC/server-capable module ${specifier}`);
-      }
-      if (specifier.startsWith("@/")) {
-        const resolved = path.resolve(webSourceRoot, specifier.slice(2));
-        requireInsideWebRoot(resolved, relative, specifier);
-      } else if (specifier.startsWith(".")) {
-        const resolved = path.resolve(path.dirname(filePath), specifier);
-        requireInsideWebRoot(resolved, relative, specifier);
-      } else if (
-        !specifier.startsWith("node:") &&
-        !nodeBuiltins.has(specifier) &&
-        !declaredPackages.has(packageName(specifier)) &&
-        !allowedTransitiveImports.has(packageName(specifier))
-      ) {
-        fail(`${relative} imports undeclared package or local alias ${specifier}`);
-      }
-    }
-  }
-
-  if (/\bimport\s*\*\s+as\s+\w+\s+from\s*["']react-router-dom["']/.test(source)) {
-    fail(`${relative} uses a namespace import from react-router-dom`);
-  }
-  if (/\b(?:import|require)\s*\(\s*["'`]react-router-dom["'`]\s*\)/.test(source)) {
-    fail(`${relative} dynamically imports react-router-dom`);
-  }
-  if (/\bexport\s*\*\s*from\s*["']react-router-dom["']/.test(source)) {
-    fail(`${relative} re-exports the full react-router-dom namespace`);
-  }
-  if (forbiddenRscApi.test(source) || /["']use server["']|["']react-server["']/.test(source)) {
-    fail(`${relative} contains an unstable RSC API or server directive`);
-  }
-  if (/^vite\.config\./.test(basename)) {
-    inspectViteAliases(importSource, relative);
-  }
-}
-
-function walk(directory) {
-  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    const entryPath = path.join(directory, entry.name);
-    if (entry.isDirectory() && ignoredPaths.has(entryPath)) {
-      continue;
-    }
-    if (entry.isSymbolicLink()) {
-      fail(`${path.relative(webRoot, entryPath)} is a symbolic link outside the scanned file contract`);
-    } else if (entry.isDirectory()) {
-      walk(entryPath);
-    } else if (entry.isFile() && scannedExtensions.has(path.extname(entry.name))) {
-      inspectFile(entryPath);
-    }
-  }
-}
-
-if (!fs.existsSync(webRoot)) {
-  fail("missing web directory");
-}
-walk(webRoot);
 NODE
 
-echo "web-rsc-mode-guard: client-only React Router boundary verified through $expires"
+echo "web-rsc-mode-guard: client-only React Router policy verified through $expires"

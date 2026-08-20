@@ -964,6 +964,9 @@ jobs:
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions
+      - name: Run RSC semantic guard
+        working-directory: web
+        run: npm run test:rsc-guard
       - name: Run turn-stream regressions
         working-directory: web
         run: npm run test:contexts

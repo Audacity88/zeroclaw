@@ -8,7 +8,7 @@ trap 'rm -rf "$fixture"' EXIT
 
 reset_fixture() {
   rm -rf "$fixture/web" "$fixture/.github"
-  mkdir -p "$fixture/web/src" "$fixture/.github/workflows"
+  mkdir -p "$fixture/web" "$fixture/.github/workflows"
   cat >"$fixture/.github/workflows/ci.yml" <<'YAML'
 jobs:
   npm-dependency-review:
@@ -18,9 +18,16 @@ jobs:
         with:
           fail-on-severity: high
           allow-ghsas: GHSA-qwww-vcr4-c8h2
+  web-permission-tests:
+    needs: [path-changes]
+    if: needs.path-changes.outputs.web == 'true'
+    steps:
+      - name: Run RSC semantic guard
+        working-directory: web
+        run: npm run test:rsc-guard
   gate:
     if: always()
-    needs: [npm-dependency-review]
+    needs: [npm-dependency-review, web-permission-tests]
     steps:
       - name: Check results
         run: |
@@ -35,31 +42,10 @@ YAML
     "react-router-dom": "7.18.2"
   },
   "devDependencies": {
-    "vite": "7.0.0"
+    "vite": "8.0.16"
   }
 }
 JSON
-  cat >"$fixture/web/src/main.tsx" <<'TSX'
-import { BrowserRouter } from "react-router-dom";
-
-export { BrowserRouter };
-TSX
-  cat >"$fixture/web/index.html" <<'HTML'
-<div id="root"></div>
-<script type="module" src="/src/main.tsx"></script>
-HTML
-  cat >"$fixture/web/vite.config.ts" <<'TS'
-import { defineConfig } from "vite";
-import path from "path";
-
-export default defineConfig({
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "./src"),
-    },
-  },
-});
-TS
 }
 
 run_guard() {
@@ -85,10 +71,7 @@ node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
 const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
-fs.writeFileSync(
-  workflowPath,
-  workflow.replace("GHSA-qwww-vcr4-c8h2", "GHSA-xxxx-yyyy-zzzz"),
-);
+fs.writeFileSync(workflowPath, workflow.replace("GHSA-qwww-vcr4-c8h2", "GHSA-xxxx-yyyy-zzzz"));
 NODE
 expect_failure "different advisory exception"
 
@@ -99,10 +82,7 @@ const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
-  workflow.replace(
-    "GHSA-qwww-vcr4-c8h2",
-    "GHSA-qwww-vcr4-c8h2, GHSA-xxxx-yyyy-zzzz",
-  ),
+  workflow.replace("GHSA-qwww-vcr4-c8h2", "GHSA-qwww-vcr4-c8h2, GHSA-xxxx-yyyy-zzzz"),
 );
 NODE
 expect_failure "additional advisory exception"
@@ -177,7 +157,10 @@ const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
-  workflow.replace("needs: [npm-dependency-review]", "needs: []"),
+  workflow.replace(
+    "needs: [npm-dependency-review, web-permission-tests]",
+    "needs: [web-permission-tests]",
+  ),
 );
 NODE
 expect_failure "dependency-review action detached from required gate"
@@ -187,10 +170,7 @@ node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
 const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
-fs.writeFileSync(
-  workflowPath,
-  workflow.replace("3b139cfc5fae8b618d3eae3675e383bb1769c019", "main"),
-);
+fs.writeFileSync(workflowPath, workflow.replace("3b139cfc5fae8b618d3eae3675e383bb1769c019", "main"));
 NODE
 expect_failure "unpinned dependency-review action"
 
@@ -199,10 +179,7 @@ node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
 const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
-fs.writeFileSync(
-  workflowPath,
-  workflow.replace("if: github.event_name == 'pull_request'", "if: false"),
-);
+fs.writeFileSync(workflowPath, workflow.replace("if: github.event_name == 'pull_request'", "if: false"));
 NODE
 expect_failure "skipped dependency-review job"
 
@@ -226,10 +203,7 @@ node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
 const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
-fs.writeFileSync(
-  workflowPath,
-  workflow.replace("fail-on-severity: high", "fail-on-severity: critical"),
-);
+fs.writeFileSync(workflowPath, workflow.replace("fail-on-severity: high", "fail-on-severity: critical"));
 NODE
 expect_failure "weakened dependency-review severity"
 
@@ -241,8 +215,8 @@ const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
   workflow.replace(
-    "needs: [npm-dependency-review]",
-    "needs: [npm-dependency-review-shadow]",
+    "needs: [npm-dependency-review, web-permission-tests]",
+    "needs: [npm-dependency-review-shadow, web-permission-tests]",
   ),
 );
 NODE
@@ -253,10 +227,7 @@ node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
 const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
-fs.writeFileSync(
-  workflowPath,
-  workflow.replace('!= "success"', '== "success"'),
-);
+fs.writeFileSync(workflowPath, workflow.replace('!= "success"', '== "success"'));
 NODE
 expect_failure "required gate without dependency-review success check"
 
@@ -276,10 +247,7 @@ const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
-  workflow.replace(
-    "      - name: Check results",
-    "      - name: Check results\n        continue-on-error: true",
-  ),
+  workflow.replace("      - name: Check results", "      - name: Check results\n        continue-on-error: true"),
 );
 NODE
 expect_failure "failure-tolerant required gate step"
@@ -291,10 +259,7 @@ const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
-  workflow.replace(
-    "      - name: Check results",
-    "      - name: Check results\n        if: false",
-  ),
+  workflow.replace("      - name: Check results", "      - name: Check results\n        if: false"),
 );
 NODE
 expect_failure "skipped required gate step"
@@ -306,10 +271,7 @@ const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
-  workflow.replace(
-    "        run: |\n          if [[",
-    "        run: |\n          exit 0\n          if [[",
-  ),
+  workflow.replace("        run: |\n          if [[", "        run: |\n          exit 0\n          if [["),
 );
 NODE
 expect_failure "unreachable required gate assertion"
@@ -347,10 +309,7 @@ const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
-  workflow.replace(
-    "      - name: Check results",
-    "      - name: Check results\n        shell: bash -n {0}",
-  ),
+  workflow.replace("      - name: Check results", "      - name: Check results\n        shell: bash -n {0}"),
 );
 NODE
 expect_failure "required gate shell override"
@@ -360,12 +319,18 @@ node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
 const workflowPath = process.argv[2];
 const workflow = fs.readFileSync(workflowPath, "utf8");
-fs.writeFileSync(
-  workflowPath,
-  `defaults:\n  run:\n    shell: bash -n {0}\n${workflow}`,
-);
+fs.writeFileSync(workflowPath, `defaults:\n  run:\n    shell: bash -n {0}\n${workflow}`);
 NODE
 expect_failure "workflow-wide shell override"
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(workflowPath, workflow.replace("run: npm run test:rsc-guard", "run: npm run test:contexts"));
+NODE
+expect_failure "missing web semantic guard step"
 
 reset_fixture
 node - "$fixture/.github/workflows/ci.yml" <<'NODE'
@@ -375,20 +340,24 @@ const workflow = fs.readFileSync(workflowPath, "utf8");
 fs.writeFileSync(
   workflowPath,
   workflow.replace(
-    "      - name: Check results",
-    '      - name: Check results\n        "continue-on-error": true',
+    "needs: [npm-dependency-review, web-permission-tests]",
+    "needs: [npm-dependency-review]",
   ),
 );
 NODE
-expect_failure "quoted failure-tolerant required gate field"
+expect_failure "web semantic guard detached from required gate"
 
 reset_fixture
-cat >"$fixture/web/src/node-test.ts" <<'TS'
-import test from "node:test";
-
-export { test };
-TS
-run_guard >/dev/null
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+fs.writeFileSync(
+  workflowPath,
+  workflow.replace("      - name: Check results", "      - name: Check results\n        \"continue-on-error\": true"),
+);
+NODE
+expect_failure "quoted failure-tolerant required gate field"
 
 reset_fixture
 for section in dependencies devDependencies optionalDependencies peerDependencies; do
@@ -422,11 +391,6 @@ const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
 pkg.dependencies.rr = "npm:react-router@7.18.2";
 fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
 NODE
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-import * as router from "rr";
-
-export { router };
-TSX
 expect_failure "npm alias for react-router"
 
 reset_fixture
@@ -437,227 +401,30 @@ const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
 pkg.dependencies.rr = "npm:react-router-dom@7.18.2";
 fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
 NODE
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-import * as router from "rr";
-
-export { router };
-TSX
 expect_failure "npm alias for react-router-dom"
 
-reset_fixture
-cat >"$fixture/web/src/server.ts" <<'TS'
-import { reactRouter } from "@react-router/dev/vite";
-
-export { reactRouter };
-TS
-expect_failure "server-capable React Router import"
-
-reset_fixture
-cat >"$fixture/web/src/server.ts" <<'TS'
-import { StaticRouter } from "react-router-dom/server";
-
-export { StaticRouter };
-TS
-expect_failure "React Router DOM server subpath import"
+for protocol in file link workspace; do
+  reset_fixture
+  node - "$fixture/web/package.json" "$protocol" <<'NODE'
+const fs = require("node:fs");
+const packagePath = process.argv[2];
+const protocol = process.argv[3];
+const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+pkg.dependencies["local-page"] = `${protocol}:../local-page`;
+fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
+NODE
+  expect_failure "$protocol dependency protocol"
+done
 
 reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-const marker = "/*";
-import { StaticRouter } from "react-router-dom/server";
-const end = "*/";
-
-export { StaticRouter };
-TSX
-expect_failure "comment delimiters in literals hiding a server import"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-import { StaticRouter } from /* comment */ "react-router-dom/server";
-
-export { StaticRouter };
-TSX
-expect_failure "comment-separated static server import"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-const router = import/* comment */("react-router");
-
-export { router };
-TSX
-expect_failure "comment-separated dynamic server import"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-const router = require/* comment */("react-router-dom/server");
-
-export { router };
-TSX
-expect_failure "comment-separated require server import"
-
-reset_fixture
-cat >"$fixture/web/src/server.ts" <<'TS'
-import { unstable_createCallServer } from "react-router-dom";
-
-export { unstable_createCallServer };
-TS
-expect_failure "RSC API re-exported by react-router-dom"
-
-reset_fixture
-cat >"$fixture/web/src/server.jsx" <<'JSX'
-import rsc from "@vitejs/plugin-rsc";
-
-export default rsc;
-JSX
-expect_failure "RSC import in JSX source"
-
-reset_fixture
-mkdir -p "$fixture/web/src/dist"
-cat >"$fixture/web/src/dist/server.ts" <<'TS'
-import { reactRouter } from "@react-router/dev/vite";
-
-export { reactRouter };
-TS
-expect_failure "RSC import in nested dist directory"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-import { BrowserRouter } from "react-router-dom"; import { ServerRouter } from "react-router";
-
-export { BrowserRouter, ServerRouter };
-TSX
-expect_failure "same-line forbidden import"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-const router = await import("react-" + "router");
-
-export { router };
-TSX
-expect_failure "computed dynamic import"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-const packageName = "react-router";
-const router = require(packageName);
-
-export { router };
-TSX
-expect_failure "computed require"
-
-reset_fixture
-mkdir -p "$fixture/web/node_modules/local-rsc"
-cat >"$fixture/web/node_modules/local-rsc/index.ts" <<'TS'
-export const server = true;
-TS
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-import { server } from "../node_modules/local-rsc/index";
-
-export { server };
-TSX
-expect_failure "relative import into skipped node_modules"
-
-reset_fixture
-cat >"$fixture/web/entry.rsc.mjs" <<'JS'
-export default {};
-JS
-expect_failure "RSC entry filename"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-// RSCStaticRouter is mentioned here only to verify that the conservative guard fails closed.
-import { BrowserRouter } from "react-router-dom";
-
-export { BrowserRouter };
-TSX
-expect_failure "RSC API marker in executable source"
-
-reset_fixture
-mkdir -p "$fixture/outside"
-cat >"$fixture/outside/bridge.ts" <<'TS'
-import { unstable_createCallServer } from "react-router-dom";
-
-export { unstable_createCallServer };
-TS
-ln -s "$fixture/outside/bridge.ts" "$fixture/web/src/bridge.ts"
-expect_failure "symbolic link escaping the web root"
-
-reset_fixture
-cat >"$fixture/web/vite.config.ts" <<'TS'
-import { defineConfig } from "vite";
-import path from "path";
-
-export default defineConfig({
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "../outside"),
-    },
-  },
-});
-TS
-expect_failure "Vite alias escaping the web root"
-
-reset_fixture
-cat >"$fixture/web/vite.config.ts" <<'TS'
-import { defineConfig } from "vite";
-import path from "path";
-
-export default defineConfig({
-  resolve: {
-    ["alias"]: {
-      "@": path.resolve(__dirname, "./node_modules"),
-    },
-  },
-});
-TS
-expect_failure "computed Vite alias property"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-import { page } from "local-page";
-
-export { page };
-TSX
-expect_failure "undeclared local alias"
-
-reset_fixture
-mkdir -p "$fixture/outside"
-cat >"$fixture/outside/bridge.ts" <<'TS'
-export const bridge = true;
-TS
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-import { bridge } from "../../outside/bridge";
-
-export { bridge };
-TSX
-expect_failure "relative import escaping the web root"
-
-reset_fixture
-mkdir -p "$fixture/outside"
-cat >"$fixture/outside/bridge.ts" <<'TS'
-export const bridge = true;
-TS
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-import { bridge } from "@/../../outside/bridge";
-
-export { bridge };
-TSX
-expect_failure "alias import escaping the web root"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-const router = await import(`react-router-dom`);
-
-export { router };
-TSX
-expect_failure "template-literal dynamic react-router-dom namespace"
-
-reset_fixture
-cat >"$fixture/web/src/main.tsx" <<'TSX'
-"use server";
-
-export const action = () => true;
-TSX
-expect_failure "server directive"
+node - "$fixture/web/package.json" <<'NODE'
+const fs = require("node:fs");
+const packagePath = process.argv[2];
+const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+delete pkg.dependencies["react-router-dom"];
+fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
+NODE
+expect_failure "missing direct react-router-dom dependency"
 
 reset_fixture
 if ZEROCLAW_RSC_GUARD_ROOT="$fixture" \
@@ -682,4 +449,4 @@ if ZEROCLAW_RSC_GUARD_TODAY="2026-08-02" bash "$guard" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "web-rsc-mode-guard tests passed"
+echo "web-rsc-mode-guard policy tests passed"
