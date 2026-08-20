@@ -429,7 +429,7 @@ cli-sop-ws-invalid-approval = sop approval_response には run_id と approve �
 cli-sop-ws-resolve-failed = SOP の解決に失敗しました: {$error}
 cli-sop-ws-engine-lock-poisoned = SOP エンジンロックがポイズンされました
 cli-sop-ws-subsystem-disabled = SOP サブシステムは有効ではありません
-cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}作成: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
 cli-sop-loaded-header = 読み込み済みの SOP ({$count}):
 cli-sop-none-to-validate = 検証する SOP が見つかりません。
@@ -717,8 +717,8 @@ cli-plugin-install-resolving = プラグインレジストリから '{$source}' 
 cli-plugin-installed-from = プラグインを {$source} からインストールしました
 cli-plugin-installed-name-version = プラグイン {$name} v{$version} をインストールしました
 cli-plugin-config-entry-seeded = '{$name}' の [[plugins.entries]] を作成しました。プラグイン設定値は `zeroclaw config set plugins.entries.{$name}.config.<key>` で設定してください。
+cli-plugin-config-entry-key = 設定エントリキー ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = 警告: '{$name}' の設定エントリ作成をスキップしました: ディスク上の [plugins] セクションが不正です。修復し、`name = "{$name}"` を含む [[plugins.entries]] ブロックを追加してから、`zeroclaw config set plugins.entries.{$name}.config.<key>` で値を設定してください。
-cli-plugin-config-entry-seed-unaddressable = 警告: '{$name}' の設定エントリ作成をスキップしました: '.' を含むプラグイン名はドット区切りの設定パスで指定できません (`config set` は '.' で分割します)。設定ファイルに `name = "{$name}"` を含む [[plugins.entries]] ブロックを手動で追加してください。
 cli-config-section-degraded = 警告: {$path} の設定セクション `{$section}` は不正なため、この実行ではデフォルト値にリセットされました。そのセクションの値は有効ではありません。`zeroclaw config migrate` を実行して解析エラーを確認し、ファイルを修復してください。
 cli-plugin-removed = プラグイン '{$name}' を削除しました。
 cli-plugin-not-found = プラグイン '{$name}' が見つかりません。
