@@ -41,14 +41,14 @@ uname -m
 if curl -fLO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-linux-android.tar.gz; then
   tar xzf zeroclaw-aarch64-linux-android.tar.gz
 else
-  echo "No Android binary is available for this release. Build from source below."
+  echo "Download failed. If GitHub reported 404, build from source below. Otherwise, check the error and retry."
 fi
 ```
 
 </div>
 
 Continue to the next step only after the archive extracts successfully. Otherwise,
-skip to [Building from Source](#building-from-source).
+build from source when the asset is missing, or resolve the download error and retry.
 
 ### 3. Install and Run
 
