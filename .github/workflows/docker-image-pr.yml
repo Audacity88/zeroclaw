@@ -154,8 +154,8 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max,ignore-error=true
 
-      - name: Verify default production image runs as non-root
-        if: matrix.dockerfile == 'Dockerfile' && matrix.platform == 'linux/amd64'
+      - name: Verify loaded production image runs as non-root
+        if: matrix.platform == 'linux/amd64' && (matrix.dockerfile == 'Dockerfile' || matrix.dockerfile == 'Dockerfile.alpine')
         run: |
           actual_user=$(docker inspect --format='{{.Config.User}}' "${{ matrix.tag }}")
           if [ "$actual_user" != "65534:65534" ]; then
