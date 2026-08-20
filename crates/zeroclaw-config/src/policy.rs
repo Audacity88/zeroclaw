@@ -1256,6 +1256,75 @@ fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
     None
 }
 
+fn git_subcommand_is_policy_modeled(subcommand: &str) -> bool {
+    if subcommand.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return false;
+    }
+
+    is_git_write_verb(subcommand)
+        || matches!(
+            subcommand,
+            "add"
+                | "am"
+                | "apply"
+                | "archive"
+                | "bisect"
+                | "blame"
+                | "bundle"
+                | "cat-file"
+                | "check-attr"
+                | "check-ignore"
+                | "check-mailmap"
+                | "check-ref-format"
+                | "clone"
+                | "count-objects"
+                | "describe"
+                | "diff"
+                | "diff-files"
+                | "diff-index"
+                | "diff-tree"
+                | "fetch"
+                | "for-each-ref"
+                | "format-patch"
+                | "fsck"
+                | "gc"
+                | "grep"
+                | "help"
+                | "init"
+                | "log"
+                | "ls-files"
+                | "ls-remote"
+                | "ls-tree"
+                | "maintenance"
+                | "merge-base"
+                | "merge-tree"
+                | "mv"
+                | "name-rev"
+                | "notes"
+                | "pull"
+                | "range-diff"
+                | "reflog"
+                | "remote"
+                | "restore"
+                | "rev-list"
+                | "rev-parse"
+                | "rm"
+                | "shortlog"
+                | "show"
+                | "show-branch"
+                | "show-ref"
+                | "sparse-checkout"
+                | "stash"
+                | "status"
+                | "submodule"
+                | "verify-commit"
+                | "verify-tag"
+                | "version"
+                | "whatchanged"
+                | "worktree"
+        )
+}
+
 fn git_delegates_to_external_command(args: &[String]) -> bool {
     let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
         return args
@@ -1273,6 +1342,22 @@ fn git_delegates_to_external_command(args: &[String]) -> bool {
     }
 
     let subcommand = args[subcommand_idx].as_str();
+    if !git_subcommand_is_policy_modeled(subcommand) {
+        return true;
+    }
+
+    if git_subcommand_selects_remote_helper(args, subcommand_idx, subcommand) {
+        return true;
+    }
+    if git_subcommand_selects_transfer_program(args, subcommand_idx, subcommand) {
+        return true;
+    }
+    if git_arg_eq(subcommand, "clone")
+        && git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_is_clone_process_control)
+    {
+        return true;
+    }
+
     if git_arg_eq(subcommand, "difftool")
         || git_arg_eq(subcommand, "difftool--helper")
         || git_arg_eq(subcommand, "mergetool")
@@ -1328,6 +1413,158 @@ fn git_arg_is_external_diff_option(arg: &str) -> bool {
     git_arg_eq(arg, "--ext-diff")
         || git_arg_eq(arg, "--extcmd")
         || git_arg_starts_with(arg, "--extcmd=")
+}
+
+fn git_subcommand_selects_transfer_program(
+    args: &[String],
+    subcommand_idx: usize,
+    subcommand: &str,
+) -> bool {
+    let args = || git_args_before_pathspec(args, subcommand_idx + 1);
+    match subcommand {
+        "clone" | "fetch" | "ls-remote" | "pull" => {
+            args().any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--upload-pack"))
+        }
+        "push" => args().any(|arg| {
+            git_arg_is_long_option_or_abbreviation(arg, "--receive-pack")
+                || git_arg_is_long_option_or_abbreviation(arg, "--exec")
+        }),
+        "archive" => args().any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--exec")),
+        _ => false,
+    }
+}
+
+fn git_arg_is_clone_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--config")
+        || git_arg_eq(arg, "-u")
+        || git_arg_starts_with(arg, "-u")
+}
+
+fn git_arg_is_long_option_or_abbreviation(arg: &str, option: &str) -> bool {
+    let supplied_name = arg.split_once('=').map_or(arg, |(name, _)| name);
+    supplied_name.len() > 2 && option.starts_with(supplied_name)
+}
+
+fn git_arg_selects_remote_helper(arg: &str) -> bool {
+    let endpoint = arg
+        .split_once('=')
+        .filter(|(name, _)| git_arg_is_long_option_or_abbreviation(name, "--remote"))
+        .map_or(arg, |(_, value)| value);
+    if endpoint
+        .split_once("::")
+        .is_some_and(|(transport, address)| {
+            git_remote_helper_transport_is_valid(transport) && !address.is_empty()
+        })
+    {
+        return true;
+    }
+
+    let Some((scheme, address)) = endpoint.split_once("://") else {
+        return false;
+    };
+    git_remote_helper_transport_is_valid(scheme)
+        && !address.is_empty()
+        && ![
+            "file", "ftp", "ftps", "git", "git+ssh", "http", "https", "rsync", "ssh", "ssh+git",
+        ]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+}
+
+fn git_remote_helper_transport_is_valid(transport: &str) -> bool {
+    let mut chars = transport.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn git_subcommand_selects_remote_helper(
+    args: &[String],
+    subcommand_idx: usize,
+    subcommand: &str,
+) -> bool {
+    let command_args = &args[subcommand_idx + 1..];
+    if subcommand == "archive" {
+        return git_archive_remote_selects_helper(command_args);
+    }
+
+    let scans_remote = match subcommand {
+        "clone" | "fetch" | "ls-remote" | "pull" | "push" => true,
+        "remote" | "submodule" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|action| git_arg_eq(action, "add") || git_arg_eq(action, "set-url")),
+        _ => false,
+    };
+    scans_remote
+        && command_args.iter().enumerate().any(|(idx, arg)| {
+            git_arg_selects_remote_helper(arg)
+                && !git_helper_like_arg_is_inert_value(command_args, idx, subcommand)
+        })
+}
+
+fn git_helper_like_arg_is_inert_value(args: &[String], idx: usize, subcommand: &str) -> bool {
+    match (subcommand, args) {
+        ("clone", [source, _]) if idx == 1 => git_arg_is_known_safe_remote_url(source),
+        ("submodule", [action, source, _]) if idx == 2 && git_arg_eq(action, "add") => {
+            git_arg_is_known_safe_remote_url(source)
+        }
+        _ => false,
+    }
+}
+
+fn git_arg_is_known_safe_remote_url(arg: &str) -> bool {
+    let Some((scheme, address)) = arg.split_once("://") else {
+        return false;
+    };
+    !address.is_empty()
+        && [
+            "file", "ftp", "ftps", "git", "git+ssh", "http", "https", "rsync", "ssh", "ssh+git",
+        ]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+}
+
+fn git_archive_remote_selects_helper(args: &[String]) -> bool {
+    let mut idx = 0;
+    while let Some(arg) = args.get(idx).map(String::as_str) {
+        if arg == "--" {
+            return false;
+        }
+        if let Some((name, value)) = arg.split_once('=') {
+            if git_arg_is_long_option_or_abbreviation(name, "--remote") {
+                return git_arg_selects_remote_helper(value);
+            }
+        } else if git_arg_is_long_option_or_abbreviation(arg, "--remote") {
+            return args
+                .get(idx + 1)
+                .is_some_and(|value| git_arg_selects_remote_helper(value));
+        }
+        idx += if !arg.contains('=')
+            && [
+                "--add-file",
+                "--add-virtual-file",
+                "--format",
+                "--output",
+                "--prefix",
+                "-o",
+            ]
+            .iter()
+            .any(|option| git_arg_is_option_or_abbreviation(arg, option))
+        {
+            2
+        } else {
+            1
+        };
+    }
+    false
+}
+
+fn git_arg_is_option_or_abbreviation(arg: &str, option: &str) -> bool {
+    if option.starts_with("--") {
+        git_arg_is_long_option_or_abbreviation(arg, option)
+    } else {
+        git_arg_eq(arg, option)
+    }
 }
 
 fn git_arg_opens_files_in_pager(arg: &str) -> bool {
@@ -5066,6 +5303,51 @@ mod tests {
             "git --no-pager bisect run ./helper",
             "git -C . submodule --quiet foreach './helper'",
             "git submodule--helper foreach -- './helper'",
+            "git zcprobe",
+            "git fetch --upload-pack=./helper origin main",
+            "git fetch --upload-pack ./helper origin main",
+            "git ls-remote --upload-pack=./helper origin",
+            "git push --receive-pack=./helper origin main",
+            "git push --exec ./helper origin main",
+            "git clone --config core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --config=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone -u ./helper ssh://example.invalid/repo ./dst",
+            "git clone -u./helper ssh://example.invalid/repo ./dst",
+            "git STATUS",
+            "git COMMIT -m test",
+            "git fetch --upl=./helper origin main",
+            "git push --rece=./helper origin main",
+            "git push --exe=./helper origin main",
+            "git clone --conf=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git ls-remote 'ext::sh -c true'",
+            "git fetch helper::payload",
+            "git clone ext::helper ./dst",
+            "git push ext::helper main",
+            "git remote add origin ext::helper",
+            "git ls-remote evil://host/repo",
+            "git fetch evil://host/repo",
+            "git clone evil://host/repo ./dst",
+            "git push evil://host/repo main",
+            "git clone -- ext::helper ./dst",
+            "git fetch -- ext::helper main",
+            "git ls-remote -- ext::helper",
+            "git push -- ext::helper main",
+            "git ls-remote 'evil://host/repo?x=y'",
+            "git clone 'ext::helper arg=value' ./dst",
+            "git ls-remote 1foo::payload",
+            "git ls-remote 1foo://host/repo",
+            "git clone --depth 1 ext::helper ./dst",
+            "git fetch --dep 1 ext::helper",
+            "git clone --bra main ext::helper ./dst",
+            "git remote add --mas main origin ext::helper",
+            "git submodule add --na origin ext::helper ./dst",
+            "git pull -s ours ext::helper",
+            "git pull --strategy ours ext::helper",
+            "git pull --jobs ext::helper",
+            "git pull -j ext::helper",
+            "git archive --format=tar --remote=ext::helper HEAD",
+            "git archive --for=tar --rem=ext::helper HEAD",
+            "git clone --server-option --remote=ext::helper https://example.invalid/repo dst",
         ] {
             assert!(!p.is_command_allowed(command), "{command}");
             let err = p
@@ -5110,6 +5392,22 @@ mod tests {
             "git --no-pager status",
             "git log -p -1",
             "git grep -o pattern",
+            "git fetch origin main",
+            "git ls-remote origin",
+            "git clone https://example.invalid/repo ./dst",
+            "git clone git+ssh://example.invalid/repo ./dst",
+            "git clone ssh+git://example.invalid/repo ./dst",
+            "git diff -- ext::helper",
+            "git diff ext::helper",
+            "git status ext::helper",
+            "git log -- --upload-pack=./helper",
+            "git clone https://example.invalid/repo ./dst::name",
+            "git clone https://example.invalid/repo ./evil://dst",
+            "git clone https://example.invalid/repo evil://dst",
+            "git submodule status ./evil://path",
+            "git submodule add https://example.invalid/repo evil://path",
+            "git archive --format --remote=ext::helper HEAD",
+            "git archive -- --remote=ext::helper",
         ] {
             let allowed = p
                 .validate_command_execution(command, false)
@@ -5154,6 +5452,11 @@ mod tests {
             .validate_command_execution("git commit -m test", true)
             .expect("runtime-approved Git write verb should remain allowed");
         assert_eq!(commit_allowed, CommandRiskLevel::Medium);
+
+        let push_allowed = p
+            .validate_command_execution("git push origin main", true)
+            .expect("runtime-approved Git push to a configured remote should remain allowed");
+        assert_eq!(push_allowed, CommandRiskLevel::Medium);
 
         let global_option_commit_denied = p
             .validate_command_execution("git -C . commit -m test", false)
