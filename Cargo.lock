@@ -3,14 +3,6 @@
 version = 4
 
 [[package]]
-name = "aardvark-sys"
-version = "0.1.0"
-dependencies = [
- "libloading 0.8.9",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "accessory"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5205,7 +5197,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e9ec52138abedcc58dc17a7c6c0c00a2bdb4f3427c7f63fa97fd0d859155caf"
 dependencies = [
  "gtk-sys",
- "libloading 0.7.4",
+ "libloading",
  "once_cell",
 ]
 
@@ -5232,16 +5224,6 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
-]
-
-[[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -13144,76 +13126,43 @@ name = "zeroclaw"
 version = "0.8.4"
 dependencies = [
  "anyhow",
- "async-imap",
  "async-trait",
  "axum",
  "base64 0.22.1",
- "chacha20poly1305",
  "chrono",
- "chrono-tz",
  "clap",
  "clap-markdown",
  "clap_complete",
  "console",
  "criterion",
- "cron",
- "crossterm",
  "dialoguer",
  "directories",
  "flate2",
  "futures-util",
- "glob",
  "hex",
  "hmac 0.12.1",
- "hostname",
- "http-body-util",
- "hyper",
- "hyper-util",
- "image",
- "indicatif",
- "lettre",
- "libc",
- "lru 0.18.2",
- "mail-parser",
- "mime_guess",
- "nanohtml2text",
- "nostr-sdk",
  "parking_lot",
- "portable-atomic",
  "proc-macro2",
- "rand 0.10.1",
- "ratatui",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
- "ring",
  "rusqlite",
  "rustls",
- "rustls-pemfile",
- "rustls-pki-types",
  "schemars 1.2.1",
  "scopeguard",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "shellexpand",
  "syn 2.0.117",
  "tar",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
- "tokio-rustls",
- "tokio-socks",
- "tokio-stream",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
- "toml_edit 0.25.12+spec-1.1.0",
  "tower",
- "tower-http",
  "urlencoding",
  "uuid",
- "webpki-roots 1.0.7",
  "which",
  "wiremock",
  "zeroclaw-api",
@@ -13367,6 +13316,7 @@ dependencies = [
  "directories",
  "hex",
  "hostname",
+ "libc",
  "parking_lot",
  "postgres",
  "rand 0.10.1",
@@ -13392,7 +13342,9 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots 1.0.7",
+ "windows 0.61.3",
  "zeroclaw-api",
+ "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",
 ]
@@ -13494,7 +13446,6 @@ dependencies = [
 name = "zeroclaw-hardware"
 version = "0.8.4"
 dependencies = [
- "aardvark-sys",
  "anyhow",
  "async-trait",
  "axum",
@@ -13675,28 +13626,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zeroclaw-robot-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "directories",
- "portable-atomic",
- "reqwest 0.12.28",
- "rppal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 1.1.2+spec-1.1.0",
- "zeroclaw-log",
-]
-
-[[package]]
 name = "zeroclaw-runtime"
 version = "0.8.4"
 dependencies = [
@@ -13710,6 +13639,7 @@ dependencies = [
  "chrono-tz",
  "console",
  "cron",
+ "crossterm",
  "dialoguer",
  "directories",
  "encoding_rs",
