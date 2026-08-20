@@ -137,12 +137,11 @@ fn release_targets(root: &Path) -> Result<Vec<String>> {
 
     for line in workflow.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("- os:") {
-            if let Some((target, experimental)) = matrix_entry.take()
-                && !experimental
-            {
-                targets.push(target);
-            }
+        if trimmed.starts_with("- os:")
+            && let Some((target, experimental)) = matrix_entry.take()
+            && !experimental
+        {
+            targets.push(target);
         }
         if let Some(target) = trimmed.strip_prefix("target:") {
             matrix_entry = Some((target.trim().to_string(), false));
