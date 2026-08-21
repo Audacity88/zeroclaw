@@ -2551,7 +2551,6 @@ impl RpcDispatcher {
                     {
                         *checkpoint_error.lock().await = Some(error);
                         checkpoint_cancel.cancel();
-                        return;
                     }
                 }
             },
@@ -7630,7 +7629,7 @@ mod tests {
             Ok::<(), String>(())
         };
 
-        let task = tokio::spawn(send_after_checkpoint_write(
+        let task = zeroclaw_spawn::spawn!(send_after_checkpoint_write(
             checkpoint_write,
             Some(r#"{"type":"ready"}"#.into()),
             Arc::clone(&rpc),
