@@ -2540,25 +2540,24 @@ impl RpcDispatcher {
                         .await;
                     if let (Some(store), Some(turn_id)) =
                         (acp_token_store.as_ref(), checkpoint_turn_id.as_ref())
+                        && let Some(fragment) = checkpoint_fragment_for_event(&event)
                     {
-                        if let Some(fragment) = checkpoint_fragment_for_event(&event) {
-                            let store = Arc::clone(store);
-                            let sid_for_store = sid.clone();
-                            let turn_id = turn_id.clone();
-                            let persisted = tokio::task::spawn_blocking(move || {
-                                store.append_turn_checkpoint(&sid_for_store, &turn_id, &[fragment])
-                            })
-                            .await;
-                            let error = match persisted {
-                                Ok(Ok(())) => None,
-                                Ok(Err(error)) => Some(error.to_string()),
-                                Err(join) => Some(join.to_string()),
-                            };
-                            if let Some(error) = error {
-                                *checkpoint_error.lock().await = Some(error);
-                                checkpoint_cancel.cancel();
-                                return;
-                            }
+                        let store = Arc::clone(store);
+                        let sid_for_store = sid.clone();
+                        let turn_id = turn_id.clone();
+                        let persisted = tokio::task::spawn_blocking(move || {
+                            store.append_turn_checkpoint(&sid_for_store, &turn_id, &[fragment])
+                        })
+                        .await;
+                        let error = match persisted {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(error.to_string()),
+                            Err(join) => Some(join.to_string()),
+                        };
+                        if let Some(error) = error {
+                            *checkpoint_error.lock().await = Some(error);
+                            checkpoint_cancel.cancel();
+                            return;
                         }
                     }
                     if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
@@ -3101,41 +3100,41 @@ impl RpcDispatcher {
         let req: SessionMessagesParams = parse_params(params)?;
         let mut messages: Vec<MessageEntry> = Vec::new();
         let mut acp_session_found = false;
-        if let Some(store) = self.ctx.acp_session_store.clone() {
-            if store.contains_session(&req.session_id).map_err(|error| {
+        if let Some(store) = self.ctx.acp_session_store.clone()
+            && store.contains_session(&req.session_id).map_err(|error| {
                 rpc_err(
                     INTERNAL_ERROR,
                     format!("Failed to identify ACP session: {error}"),
                 )
-            })? {
-                acp_session_found = true;
-                let _guard = self
-                    .ctx
-                    .sessions
-                    .session_queue
-                    .acquire(&req.session_id)
+            })?
+        {
+            acp_session_found = true;
+            let _guard = self
+                .ctx
+                .sessions
+                .session_queue
+                .acquire(&req.session_id)
+                .await
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
+            if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
+                && !self.ctx.sessions.has_inflight_turn(&req.session_id)
+            {
+                recover_acp_checkpoint(Arc::clone(&store), &req.session_id)
                     .await
-                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
-                if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
-                    && !self.ctx.sessions.has_inflight_turn(&req.session_id)
-                {
-                    recover_acp_checkpoint(Arc::clone(&store), &req.session_id)
-                        .await
-                        .map_err(|error| {
-                            rpc_err(
-                                INTERNAL_ERROR,
-                                format!("Failed to recover interrupted ACP turn: {error}"),
-                            )
-                        })?;
-                }
-                if let Some(data) = store.load_session(&req.session_id).map_err(|error| {
-                    rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to load ACP session messages: {error}"),
-                    )
-                })? {
-                    messages = conversation_message_entries(&data.messages);
-                }
+                    .map_err(|error| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to recover interrupted ACP turn: {error}"),
+                        )
+                    })?;
+            }
+            if let Some(data) = store.load_session(&req.session_id).map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to load ACP session messages: {error}"),
+                )
+            })? {
+                messages = conversation_message_entries(&data.messages);
             }
         }
 
