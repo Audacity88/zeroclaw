@@ -2538,34 +2538,20 @@ impl RpcDispatcher {
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    if let (Some(store), Some(turn_id)) =
-                        (acp_token_store.as_ref(), checkpoint_turn_id.as_ref())
-                        && let Some(fragment) = checkpoint_fragment_for_event(&event)
+                    if let Err(error) = persist_checkpoint_event_before_notification(
+                        acp_token_store.as_ref(),
+                        checkpoint_turn_id.as_deref(),
+                        &sid,
+                        &event,
+                        &rpc,
+                        connection_cancel.clone(),
+                        max_ctx,
+                    )
+                    .await
                     {
-                        let store = Arc::clone(store);
-                        let sid_for_store = sid.clone();
-                        let turn_id = turn_id.clone();
-                        let persisted = tokio::task::spawn_blocking(move || {
-                            store.append_turn_checkpoint(&sid_for_store, &turn_id, &[fragment])
-                        })
-                        .await;
-                        let error = match persisted {
-                            Ok(Ok(())) => None,
-                            Ok(Err(error)) => Some(error.to_string()),
-                            Err(join) => Some(join.to_string()),
-                        };
-                        if let Some(error) = error {
-                            *checkpoint_error.lock().await = Some(error);
-                            checkpoint_cancel.cancel();
-                            return;
-                        }
-                    }
-                    if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
-                        tokio::select! {
-                            biased;
-                            _ = connection_cancel.cancelled() => {}
-                            _ = rpc.send_raw(n) => {}
-                        }
+                        *checkpoint_error.lock().await = Some(error);
+                        checkpoint_cancel.cancel();
+                        return;
                     }
                 }
             },
@@ -5734,6 +5720,64 @@ async fn finish_acp_checkpoint(
     }
 }
 
+async fn persist_checkpoint_event_before_notification(
+    acp_store: Option<&Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+    turn_id: Option<&str>,
+    session_id: &str,
+    event: &TurnEvent,
+    rpc: &Arc<RpcOutbound>,
+    connection_cancel: tokio_util::sync::CancellationToken,
+    max_context_tokens: Option<u64>,
+) -> Result<(), String> {
+    let notification = notification_for_turn_event(session_id, event, max_context_tokens);
+    let checkpoint_write = async {
+        if let (Some(store), Some(turn_id)) = (acp_store, turn_id)
+            && let Some(fragment) = checkpoint_fragment_for_event(event)
+        {
+            let store = Arc::clone(store);
+            let sid_for_store = session_id.to_string();
+            let turn_id = turn_id.to_string();
+            let persisted = tokio::task::spawn_blocking(move || {
+                store.append_turn_checkpoint(&sid_for_store, &turn_id, &[fragment])
+            })
+            .await;
+            let error = match persisted {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(join) => Some(join.to_string()),
+            };
+            if let Some(error) = error {
+                return Err(error);
+            }
+        }
+        Ok(())
+    };
+    send_after_checkpoint_write(
+        checkpoint_write,
+        notification,
+        Arc::clone(rpc),
+        connection_cancel,
+    )
+    .await
+}
+
+async fn send_after_checkpoint_write(
+    checkpoint_write: impl std::future::Future<Output = Result<(), String>>,
+    notification: Option<String>,
+    rpc: Arc<RpcOutbound>,
+    connection_cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
+    checkpoint_write.await?;
+    if let Some(notification) = notification {
+        tokio::select! {
+            biased;
+            _ = connection_cancel.cancelled() => {}
+            _ = rpc.send_raw(notification) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Persist a `TurnEvent::Plan` before it is emitted, so a racing
 /// reconnect — or a later `session/resume` — reads a consistent plan.
 /// Writes both the in-memory live cache (`sessions`) and, when an ACP
@@ -7571,6 +7615,208 @@ mod tests {
                     && results[0].content.len()
                         <= 16 * 1024 + "…[truncated]".len()
         ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_notification_waits_for_write() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let connection_cancel = tokio_util::sync::CancellationToken::new();
+        let checkpoint_write = async move {
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            Ok::<(), String>(())
+        };
+
+        let task = tokio::spawn(send_after_checkpoint_write(
+            checkpoint_write,
+            Some(r#"{"type":"ready"}"#.into()),
+            Arc::clone(&rpc),
+            connection_cancel,
+        ));
+        started_rx.await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "notification must wait for the write"
+        );
+
+        release_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(rx.try_recv().unwrap(), r#"{"type":"ready"}"#);
+    }
+
+    #[tokio::test]
+    async fn connection_cancel_suppresses_checkpoint_notification() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let connection_cancel = tokio_util::sync::CancellationToken::new();
+        connection_cancel.cancel();
+
+        send_after_checkpoint_write(
+            async { Ok::<(), String>(()) },
+            Some(r#"{"type":"ready"}"#.into()),
+            rpc,
+            connection_cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled connections must not receive notifications"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_events_restore_transcript_and_provider_safe_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let connection_cancel = tokio_util::sync::CancellationToken::new();
+        let session_id = "checkpoint-safe-history";
+        let turn_id = "turn-safe-history";
+        let initial = [ConversationMessage::Chat(ChatMessage::user("question"))];
+        store.create_session(session_id, "agent", "/tmp").unwrap();
+        store
+            .begin_turn_checkpoint(session_id, turn_id, &initial)
+            .unwrap();
+
+        let events = [
+            (
+                TurnEvent::Chunk {
+                    delta: "partial".into(),
+                },
+                "agent_message_chunk",
+            ),
+            (
+                TurnEvent::ToolCall {
+                    id: "paired".into(),
+                    name: "shell".into(),
+                    args: json!({"command": "pwd"}),
+                },
+                "tool_call",
+            ),
+            (
+                TurnEvent::ToolResult {
+                    id: "paired".into(),
+                    name: "shell".into(),
+                    output: "/tmp".into(),
+                    artifact: None,
+                },
+                "tool_result",
+            ),
+            (
+                TurnEvent::ToolCall {
+                    id: "orphan".into(),
+                    name: "shell".into(),
+                    args: json!({"command": "whoami"}),
+                },
+                "tool_call",
+            ),
+        ];
+        for (event, wire_type) in events {
+            persist_checkpoint_event_before_notification(
+                Some(&store),
+                Some(turn_id),
+                session_id,
+                &event,
+                &rpc,
+                connection_cancel.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let notification: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(notification["params"]["type"], wire_type);
+        }
+
+        assert!(
+            store
+                .recover_turn_checkpoint(session_id, "interrupted")
+                .unwrap()
+        );
+        let restored = store.load_session(session_id).unwrap().unwrap();
+        assert!(restored.messages.iter().any(|message| matches!(
+            message,
+            ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.iter().any(|call| call.id == "orphan")
+        )));
+        assert!(restored.messages.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat)
+                if chat.role == "system" && chat.content == "interrupted"
+        )));
+
+        let safe = zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+            &restored.messages,
+        );
+        assert_eq!(safe.len(), 3);
+        assert!(matches!(
+            &safe[0],
+            ConversationMessage::Chat(chat)
+                if chat.role == "user" && chat.content == "question"
+        ));
+        assert!(matches!(
+            &safe[1],
+            ConversationMessage::AssistantToolCalls { text, tool_calls, .. }
+                if text.as_deref() == Some("partial")
+                    && tool_calls.len() == 1
+                    && tool_calls[0].id == "paired"
+        ));
+        assert!(matches!(
+            &safe[2],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1
+                    && results[0].tool_call_id == "paired"
+                    && results[0].content == "/tmp"
+        ));
+        assert!(!safe.iter().any(|message| matches!(
+            message,
+            ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.iter().any(|call| call.id == "orphan")
+        )));
+        assert!(!safe.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.role == "system"
+        )));
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_write_does_not_notify() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let connection_cancel = tokio_util::sync::CancellationToken::new();
+        let session_id = "checkpoint-write-failure";
+        store.create_session(session_id, "agent", "/tmp").unwrap();
+        store
+            .begin_turn_checkpoint(session_id, "turn-live", &[])
+            .unwrap();
+
+        let error = persist_checkpoint_event_before_notification(
+            Some(&store),
+            Some("stale-turn"),
+            session_id,
+            &TurnEvent::Chunk {
+                delta: "must-not-emit".into(),
+            },
+            &rpc,
+            connection_cancel,
+            None,
+        )
+        .await
+        .expect_err("a stale turn ID must fail the checkpoint append");
+        assert_eq!(error, "ACP turn checkpoint identity mismatch");
+        assert!(
+            rx.try_recv().is_err(),
+            "failed writes must not notify clients"
+        );
     }
 
     #[test]
