@@ -12,10 +12,26 @@ const objectHasOwn = Object.hasOwn;
 const mapHas = Map.prototype.has.call.bind(Map.prototype.has);
 const setHas = Set.prototype.has.call.bind(Set.prototype.has);
 const weakSetHas = WeakSet.prototype.has.call.bind(WeakSet.prototype.has);
+const {
+  basename: pathBasename,
+  dirname: pathDirname,
+  extname: pathExtname,
+  isAbsolute: pathIsAbsolute,
+  join: pathJoin,
+  relative: pathRelative,
+  resolve: pathResolve,
+  sep: pathSep,
+} = path;
+const fsExistsSync = fs.existsSync;
+const fsLstatSync = fs.lstatSync;
+const fsReadFileSync = fs.readFileSync;
+const fsReaddirSync = fs.readdirSync;
+const fsRealpathSync = fs.realpathSync;
+const fsStatSync = fs.statSync;
 
 const errorPrefix = "web-rsc-mode-guard:";
 const scriptPath = fileURLToPath(import.meta.url);
-const defaultRepoRoot = path.resolve(path.dirname(scriptPath), "../..");
+const defaultRepoRoot = pathResolve(pathDirname(scriptPath), "../..");
 const scannedExtensions = new Set([
   ".js",
   ".jsx",
@@ -124,16 +140,16 @@ function fail(message) {
 }
 
 function relativePath(webRoot, filePath) {
-  return path.relative(webRoot, filePath).split(path.sep).join("/");
+  return pathRelative(webRoot, filePath).split(pathSep).join("/");
 }
 
 function isInside(root, candidate) {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  const relative = pathRelative(root, candidate);
+  return relative === "" || (!relative.startsWith(`..${pathSep}`) && !pathIsAbsolute(relative));
 }
 
 function assertInsideWebRoot(candidate, webRoot, nodeModulesRoot, context, rejectNodeModules) {
-  const resolved = path.resolve(candidate);
+  const resolved = pathResolve(candidate);
   if (!isInside(webRoot, resolved)) {
     fail(`${context} escapes the guarded web root: ${resolved}`);
   }
@@ -143,14 +159,14 @@ function assertInsideWebRoot(candidate, webRoot, nodeModulesRoot, context, rejec
 }
 
 function assertOutsideSkippedDist(candidate, distRoot, context) {
-  const resolved = path.resolve(candidate);
+  const resolved = pathResolve(candidate);
   if (isInside(distRoot, resolved)) {
     fail(`${context} reaches skipped web/dist: ${resolved}`);
   }
 }
 
 function assertSupportedResolvedFormat(filePath, context) {
-  const extension = path.extname(filePath).toLowerCase();
+  const extension = pathExtname(filePath).toLowerCase();
   if (
     scannedExtensions.has(extension) ||
     extension === ".html" ||
@@ -202,7 +218,7 @@ function importedName(node) {
 }
 
 function scriptKind(filePath) {
-  switch (path.extname(filePath).toLowerCase()) {
+  switch (pathExtname(filePath).toLowerCase()) {
     case ".tsx":
       return ts.ScriptKind.TSX;
     case ".jsx":
@@ -225,7 +241,7 @@ function parseSource(filePath, source) {
     scriptKind(filePath),
   );
   if (sourceFile.parseDiagnostics?.length) {
-    fail(`${relativePath(path.dirname(filePath), filePath)} has a syntax error`);
+    fail(`${relativePath(pathDirname(filePath), filePath)} has a syntax error`);
   }
   return sourceFile;
 }
@@ -246,7 +262,7 @@ function unwrapTimerHandler(node) {
 }
 
 function isServerEntry(filePath) {
-  const basename = path.basename(filePath);
+  const basename = pathBasename(filePath);
   return (
     /^react-router\.config\./.test(basename) ||
     /^entry\.(?:server|rsc)\./.test(basename) ||
@@ -257,14 +273,14 @@ function isServerEntry(filePath) {
 function moduleSpecifier(node, filePath, description) {
   const specifier = literalText(node);
   if (specifier === null) {
-    fail(`${relativePath(path.dirname(filePath), filePath)} uses a nonliteral ${description}`);
+    fail(`${relativePath(pathDirname(filePath), filePath)} uses a nonliteral ${description}`);
   }
   return specifier;
 }
 
 function addModuleRecord(records, node, filePath, kind) {
   const specifier = moduleSpecifier(node, filePath, `${kind} module specifier`);
-  const relative = relativePath(path.dirname(filePath), filePath);
+  const relative = relativePath(pathDirname(filePath), filePath);
   if (forbiddenSpecifier(specifier)) {
     fail(`${relative} imports RSC/server-capable module ${specifier}`);
   }
@@ -273,7 +289,7 @@ function addModuleRecord(records, node, filePath, kind) {
 
 function inspectSource(filePath, source, records) {
   const sourceFile = parseSource(filePath, source);
-  const relative = path.basename(filePath);
+  const relative = pathBasename(filePath);
 
   function isScopeNode(node) {
     return (
@@ -895,7 +911,7 @@ function parseScriptAttributes(filePath, attributeText) {
 
     const name = attributeText.slice(index).match(/^[A-Za-z_:][A-Za-z0-9_.:-]*/)?.[0];
     if (!name) {
-      fail(`${relativePath(path.dirname(filePath), filePath)} has malformed script tag attributes`);
+      fail(`${relativePath(pathDirname(filePath), filePath)} has malformed script tag attributes`);
     }
     index += name.length;
     while (/\s/.test(attributeText[index] ?? "")) {
@@ -913,7 +929,7 @@ function parseScriptAttributes(filePath, attributeText) {
         index += 1;
         const end = attributeText.indexOf(quote, index);
         if (end === -1) {
-          fail(`${relativePath(path.dirname(filePath), filePath)} has malformed script src`);
+          fail(`${relativePath(pathDirname(filePath), filePath)} has malformed script src`);
         }
         value = attributeText.slice(index, end);
         index = end + 1;
@@ -924,7 +940,7 @@ function parseScriptAttributes(filePath, attributeText) {
         }
         value = attributeText.slice(start, index);
         if (name.toLowerCase() === "src") {
-          fail(`${relativePath(path.dirname(filePath), filePath)} has an unquoted script src`);
+          fail(`${relativePath(pathDirname(filePath), filePath)} has an unquoted script src`);
         }
       }
     }
@@ -954,17 +970,17 @@ function verifyHtmlScriptTarget(filePath, src, webRoot, nodeModulesRoot, distRoo
     fail(`${relativePath(webRoot, filePath)} has an external script src`);
   }
   const candidate = decodedPath.startsWith("/")
-    ? path.resolve(webRoot, decodedPath.slice(1))
-    : path.resolve(path.dirname(filePath), decodedPath);
+    ? pathResolve(webRoot, decodedPath.slice(1))
+    : pathResolve(pathDirname(filePath), decodedPath);
   assertInsideWebRoot(candidate, webRoot, nodeModulesRoot, "HTML script src", true);
   assertOutsideSkippedDist(candidate, distRoot, "HTML script src");
-  if (!fs.existsSync(candidate)) {
+  if (!fsExistsSync(candidate)) {
     fail(`${relativePath(webRoot, filePath)} references a missing script src: ${src}`);
   }
-  const canonical = fs.realpathSync(candidate);
+  const canonical = fsRealpathSync(candidate);
   assertInsideWebRoot(canonical, webRoot, nodeModulesRoot, "HTML script src", true);
   assertOutsideSkippedDist(canonical, distRoot, "HTML script src");
-  if (!fs.statSync(canonical).isFile()) {
+  if (!fsStatSync(canonical).isFile()) {
     fail(`${relativePath(webRoot, filePath)} references a non-file script src: ${src}`);
   }
   assertSupportedResolvedFormat(canonical, `${relativePath(webRoot, filePath)} script src ${src}`);
@@ -1038,15 +1054,15 @@ function inspectHtml(filePath, source, records, webRoot, nodeModulesRoot, distRo
 function collectSourceFiles(webRoot, webSourceRoot) {
   const files = [];
   const ignoredPaths = new Set([
-    path.join(webRoot, "dist"),
-    path.join(webRoot, "node_modules"),
+    pathJoin(webRoot, "dist"),
+    pathJoin(webRoot, "node_modules"),
   ]);
 
   function walk(directory) {
-    const entries = fs.readdirSync(directory, { withFileTypes: true });
+    const entries = fsReaddirSync(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
-      const entryPath = path.join(directory, entry.name);
+      const entryPath = pathJoin(directory, entry.name);
       if (entry.isSymbolicLink()) {
         fail(`${relativePath(webRoot, entryPath)} is a symbolic link`);
       }
@@ -1057,19 +1073,19 @@ function collectSourceFiles(webRoot, webSourceRoot) {
         walk(entryPath);
         continue;
       }
-      if (entry.isFile() && scannedExtensions.has(path.extname(entry.name).toLowerCase())) {
+      if (entry.isFile() && scannedExtensions.has(pathExtname(entry.name).toLowerCase())) {
         files.push(entryPath);
       } else if (
         entry.isFile() &&
-        unsupportedExecutableExtensions.has(path.extname(entry.name).toLowerCase())
+        unsupportedExecutableExtensions.has(pathExtname(entry.name).toLowerCase())
       ) {
         fail(`${relativePath(webRoot, entryPath)} uses an unsupported executable source format`);
-      } else if (entry.isFile() && path.extname(entry.name).toLowerCase() === ".html") {
+      } else if (entry.isFile() && pathExtname(entry.name).toLowerCase() === ".html") {
         files.push(entryPath);
       } else if (
         entry.isFile() &&
         isInside(webSourceRoot, entryPath) &&
-        !inertSourceExtensions.has(path.extname(entry.name).toLowerCase())
+        !inertSourceExtensions.has(pathExtname(entry.name).toLowerCase())
       ) {
         fail(`${relativePath(webRoot, entryPath)} uses an unrecognized source format`);
       }
@@ -1081,10 +1097,10 @@ function collectSourceFiles(webRoot, webSourceRoot) {
 }
 
 function declaredPackageNames(packagePath) {
-  if (!fs.existsSync(packagePath)) {
+  if (!fsExistsSync(packagePath)) {
     fail("missing web/package.json");
   }
-  const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+  const packageJson = JSON.parse(fsReadFileSync(packagePath, "utf8"));
   if (!packageJson.dependencies?.["react-router-dom"]) {
     fail("react-router-dom must remain a direct runtime dependency");
   }
@@ -1102,6 +1118,59 @@ function declaredPackageNames(packagePath) {
   return declared;
 }
 
+function captureGuardedInputSnapshot(packagePath, configFile) {
+  return new Map([
+    [packagePath, fsReadFileSync(packagePath, "utf8")],
+    [configFile, fsReadFileSync(configFile, "utf8")],
+  ]);
+}
+
+function verifyGuardedInputSnapshot(
+  snapshot,
+  packagePath,
+  configFile,
+  webRoot,
+  webSourceRoot,
+  phase,
+) {
+  const currentPaths = new Set(collectSourceFiles(webRoot, webSourceRoot));
+  if (fsExistsSync(packagePath)) {
+    currentPaths.add(packagePath);
+  }
+  if (fsExistsSync(configFile)) {
+    currentPaths.add(configFile);
+  }
+  for (const filePath of snapshot.keys()) {
+    if (!setHas(currentPaths, filePath)) {
+      fail(
+        `guarded input snapshot changed after ${phase}: removed ${relativePath(webRoot, filePath)}`,
+      );
+    }
+  }
+  for (const filePath of currentPaths) {
+    if (!mapHas(snapshot, filePath)) {
+      fail(
+        `guarded input snapshot changed after ${phase}: added ${relativePath(webRoot, filePath)}`,
+      );
+    }
+  }
+  for (const [filePath, content] of snapshot) {
+    let currentContent;
+    try {
+      currentContent = fsReadFileSync(filePath, "utf8");
+    } catch {
+      fail(
+        `guarded input snapshot changed after ${phase}: modified ${relativePath(webRoot, filePath)}`,
+      );
+    }
+    if (currentContent !== content) {
+      fail(
+        `guarded input snapshot changed after ${phase}: modified ${relativePath(webRoot, filePath)}`,
+      );
+    }
+  }
+}
+
 function rawResolvedId(id) {
   return typeof id === "string" ? id : id?.id;
 }
@@ -1111,7 +1180,7 @@ function resolvedIdPath(rawId) {
   if (withoutQuery.startsWith("file://")) {
     return fileURLToPath(withoutQuery);
   }
-  return path.resolve(withoutQuery);
+  return pathResolve(withoutQuery);
 }
 
 function aliasEntries(alias) {
@@ -1207,8 +1276,8 @@ function verifyAliasEntries(
   if (typeof entry.replacement !== "string") {
     fail(`${context} @ alias must have a string replacement`);
   }
-  const aliasRoot = path.resolve(webRoot, entry.replacement);
-  const checkedAliasRoot = fs.existsSync(aliasRoot) ? fs.realpathSync(aliasRoot) : aliasRoot;
+  const aliasRoot = pathResolve(webRoot, entry.replacement);
+  const checkedAliasRoot = fsExistsSync(aliasRoot) ? fsRealpathSync(aliasRoot) : aliasRoot;
   assertInsideWebRoot(
     checkedAliasRoot,
     webRoot,
@@ -1317,8 +1386,8 @@ async function verifyImportBoundary(
   if (local) {
     if (!rawId) {
       const lexicalPath = record.specifier.startsWith("@/")
-        ? path.resolve(webSourceRoot, record.specifier.slice(2))
-        : path.resolve(path.dirname(record.filePath), record.specifier);
+        ? pathResolve(webSourceRoot, record.specifier.slice(2))
+        : pathResolve(pathDirname(record.filePath), record.specifier);
       assertInsideWebRoot(
         lexicalPath,
         webRoot,
@@ -1342,8 +1411,8 @@ async function verifyImportBoundary(
       distRoot,
       `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
     );
-    const canonicalPath = fs.existsSync(resolvedPath)
-      ? fs.realpathSync(resolvedPath)
+    const canonicalPath = fsExistsSync(resolvedPath)
+      ? fsRealpathSync(resolvedPath)
       : resolvedPath;
     assertInsideWebRoot(
       canonicalPath,
@@ -1371,8 +1440,8 @@ async function verifyImportBoundary(
     fail(`${relativePath(webRoot, record.filePath)} resolves to a virtual module: ${record.specifier}`);
   }
   const resolvedPath = resolvedIdPath(rawId);
-  const canonicalPath = fs.existsSync(resolvedPath)
-    ? fs.realpathSync(resolvedPath)
+  const canonicalPath = fsExistsSync(resolvedPath)
+    ? fsRealpathSync(resolvedPath)
     : resolvedPath;
   if (!isInside(webRoot, canonicalPath)) {
     fail(`${relativePath(webRoot, record.filePath)} resolves outside the guarded web root: ${record.specifier}`);
@@ -1467,7 +1536,7 @@ function unwrapParentheses(node) {
 }
 
 function verifyViteConfigHasNoPrototypeMutation(configFile) {
-  const sourceFile = parseSource(configFile, fs.readFileSync(configFile, "utf8"));
+  const sourceFile = parseSource(configFile, fsReadFileSync(configFile, "utf8"));
   const allowedImports = new Set([
     "vite",
     "@vitejs/plugin-react",
@@ -1484,6 +1553,20 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
     "Set",
     "WeakSet",
   ]);
+  const allowedProcessEnv = new Set([
+    "ZEROCLAW_GATEWAY_HOST",
+    "ZEROCLAW_GATEWAY_PORT",
+    "ZEROCLAW_WEB_ALLOWED_HOSTS",
+  ]);
+  const restrictedRuntimeRoots = new Set([
+    ...intrinsicRoots,
+    "global",
+    "globalThis",
+    "module",
+    "process",
+    "require",
+  ]);
+  const importedBindings = new Set();
   const aliases = new Map();
 
   function resolvedChain(node) {
@@ -1504,25 +1587,93 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
       if (!statement.importClause || !moduleName || !setHas(allowedImports, moduleName)) {
         fail("Vite config cannot import side-effect or unapproved modules");
       }
+      if (statement.importClause.name) {
+        importedBindings.add(statement.importClause.name.text);
+      }
+      const bindings = statement.importClause.namedBindings;
+      if (bindings && ts.isNamespaceImport(bindings)) {
+        importedBindings.add(bindings.name.text);
+      } else if (bindings && ts.isNamedImports(bindings)) {
+        for (const element of bindings.elements) {
+          importedBindings.add(element.name.text);
+        }
+      }
     }
   }
 
-  function collectIntrinsicAliases(node) {
+  function collectRestrictedAliases(node) {
     if (ts.isVariableDeclaration(node) && node.initializer) {
       const chain = resolvedChain(node.initializer);
-      if (chain && setHas(intrinsicRoots, chain[0])) {
+      if (
+        chain &&
+        (setHas(intrinsicRoots, chain[0]) || setHas(importedBindings, chain[0]))
+      ) {
         if (!ts.isIdentifier(node.name)) {
-          fail("Vite config cannot destructure mutable global intrinsics");
+          fail("Vite config cannot destructure restricted bindings");
         }
         aliases.set(node.name.text, chain);
       }
     }
-    ts.forEachChild(node, collectIntrinsicAliases);
+    ts.forEachChild(node, collectRestrictedAliases);
   }
-  collectIntrinsicAliases(sourceFile);
+  collectRestrictedAliases(sourceFile);
+
+  function outerMemberChain(node) {
+    let current = node;
+    while (
+      current.parent &&
+      (ts.isPropertyAccessExpression(current.parent) ||
+        ts.isElementAccessExpression(current.parent)) &&
+      current.parent.expression === current
+    ) {
+      current = current.parent;
+    }
+    return memberChain(current);
+  }
+
+  function isApprovedRuntimeRootAccess(node) {
+    const chain = outerMemberChain(node);
+    if (node.text === "process") {
+      return (
+        chain?.length >= 3 &&
+        chain[1] === "env" &&
+        setHas(allowedProcessEnv, chain[2])
+      );
+    }
+    return false;
+  }
 
   function rejectPrototypeMutation(node) {
+    if (
+      ts.isIdentifier(node) &&
+      setHas(restrictedRuntimeRoots, node.text) &&
+      !isApprovedRuntimeRootAccess(node)
+    ) {
+      fail(
+        "Vite config cannot use reflective or unrestricted runtime globals, mutable object prototypes, or prototype mutation primitives",
+      );
+    }
     const chain = resolvedChain(node);
+    const parentUsesNodeAsReceiver = node.parent &&
+      ((ts.isPropertyAccessExpression(node.parent) ||
+        ts.isElementAccessExpression(node.parent)) &&
+        node.parent.expression === node);
+    const isImportDeclarationBinding =
+      ts.isIdentifier(node) &&
+      (ts.isImportClause(node.parent) ||
+        ts.isImportSpecifier(node.parent) ||
+        ts.isNamespaceImport(node.parent));
+    const isDirectCallTarget = node.parent &&
+      (ts.isCallExpression(node.parent) || ts.isNewExpression(node.parent)) &&
+      node.parent.expression === node;
+    if (
+      !parentUsesNodeAsReceiver &&
+      !isImportDeclarationBinding &&
+      !isDirectCallTarget &&
+      setHas(importedBindings, chain?.[0])
+    ) {
+      fail("Vite config cannot mutate imported modules through aliases or arguments");
+    }
     if (chain?.includes("__proto__")) {
       fail("Vite config cannot use __proto__ properties");
     }
@@ -1540,7 +1691,28 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
       fail("Vite config cannot dynamically access mutable global intrinsics");
     }
     if (ts.isCallExpression(node)) {
+      if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        fail("Vite config cannot use dynamic imports");
+      }
       const callee = resolvedChain(node.expression)?.join(".");
+      if (
+        [
+          "fetch",
+          "globalThis.fetch",
+          "globalThis.queueMicrotask",
+          "globalThis.setImmediate",
+          "globalThis.setInterval",
+          "globalThis.setTimeout",
+          "process.getBuiltinModule",
+          "process.nextTick",
+          "queueMicrotask",
+          "setImmediate",
+          "setInterval",
+          "setTimeout",
+        ].includes(callee)
+      ) {
+        fail("Vite config cannot schedule or start external work");
+      }
       if (
         [
           "Object.defineProperty",
@@ -1555,21 +1727,45 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
       }
       if (
         callee === "Object.assign" &&
-        setHas(intrinsicRoots, resolvedChain(node.arguments[0])?.[0])
+        (setHas(intrinsicRoots, resolvedChain(node.arguments[0])?.[0]) ||
+          setHas(importedBindings, resolvedChain(node.arguments[0])?.[0]))
       ) {
-        fail("Vite config cannot mutate global intrinsics with Object.assign");
+        fail("Vite config cannot mutate restricted bindings with Object.assign");
       }
       if (["eval", "Function", "globalThis.eval"].includes(callee)) {
         fail("Vite config cannot use dynamic code execution");
       }
     }
+    const processChain =
+      (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+      !parentUsesNodeAsReceiver
+        ? memberChain(node)
+        : null;
+    if (
+      processChain?.[0] === "process" &&
+      !(
+        processChain.length >= 3 &&
+        processChain[1] === "env" &&
+        setHas(allowedProcessEnv, processChain[2])
+      )
+    ) {
+      fail("Vite config can only read approved process environment fields");
+    }
     if (
       ts.isBinaryExpression(node) &&
       node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
-      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
-      setHas(intrinsicRoots, resolvedChain(node.left)?.[0])
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
     ) {
-      fail("Vite config cannot reassign mutable global intrinsics");
+      const root = resolvedChain(node.left)?.[0];
+      if (setHas(intrinsicRoots, root)) {
+        fail("Vite config cannot reassign mutable global intrinsics");
+      }
+      if (setHas(importedBindings, root)) {
+        fail("Vite config cannot mutate imported modules");
+      }
+      if (root === "process") {
+        fail("Vite config cannot mutate process environment fields");
+      }
     }
     if (
       ts.isDeleteExpression(node) &&
@@ -1577,13 +1773,33 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
     ) {
       fail("Vite config cannot delete mutable global intrinsics");
     }
+    if (
+      ts.isDeleteExpression(node) &&
+      setHas(importedBindings, resolvedChain(node.expression)?.[0])
+    ) {
+      fail("Vite config cannot mutate imported modules");
+    }
+    if (
+      ts.isDeleteExpression(node) &&
+      resolvedChain(node.expression)?.[0] === "process"
+    ) {
+      fail("Vite config cannot mutate process environment fields");
+    }
+    if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      (node.operator === ts.SyntaxKind.PlusPlusToken ||
+        node.operator === ts.SyntaxKind.MinusMinusToken) &&
+      resolvedChain(node.operand)?.[0] === "process"
+    ) {
+      fail("Vite config cannot mutate process environment fields");
+    }
     ts.forEachChild(node, rejectPrototypeMutation);
   }
   rejectPrototypeMutation(sourceFile);
 }
 
 function verifyViteConfigPluginSource(configFile) {
-  const sourceFile = parseSource(configFile, fs.readFileSync(configFile, "utf8"));
+  const sourceFile = parseSource(configFile, fsReadFileSync(configFile, "utf8"));
   const defineConfigName = importedBinding(sourceFile, "vite", "defineConfig");
   const reactName = importedBinding(sourceFile, "@vitejs/plugin-react", "default");
   const tailwindName = importedBinding(sourceFile, "@tailwindcss/vite", "default");
@@ -1804,51 +2020,62 @@ async function verifyVitePlugins(config) {
 }
 
 export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ?? defaultRepoRoot) {
-  const resolvedRepoRoot = path.resolve(repoRoot);
-  const webPath = path.join(resolvedRepoRoot, "web");
-  if (!fs.existsSync(webPath) || !fs.lstatSync(webPath).isDirectory()) {
+  const resolvedRepoRoot = pathResolve(repoRoot);
+  const webPath = pathJoin(resolvedRepoRoot, "web");
+  if (!fsExistsSync(webPath) || !fsLstatSync(webPath).isDirectory()) {
     fail("missing web directory");
   }
-  if (fs.lstatSync(webPath).isSymbolicLink()) {
+  if (fsLstatSync(webPath).isSymbolicLink()) {
     fail("web directory is a symbolic link");
   }
-  const webRoot = fs.realpathSync(webPath);
-  const webSourceRoot = fs.realpathSync(path.join(webRoot, "src"));
-  const nodeModulesRoot = path.join(webRoot, "node_modules");
-  const distRoot = path.join(webRoot, "dist");
+  const webRoot = fsRealpathSync(webPath);
+  const webSourceRoot = fsRealpathSync(pathJoin(webRoot, "src"));
+  const nodeModulesRoot = pathJoin(webRoot, "node_modules");
+  const distRoot = pathJoin(webRoot, "dist");
   const configCandidates = ["js", "mjs", "cjs", "ts", "mts", "cts"]
-    .map((extension) => path.join(webRoot, `vite.config.${extension}`))
-    .filter((candidate) => fs.existsSync(candidate));
+    .map((extension) => pathJoin(webRoot, `vite.config.${extension}`))
+    .filter((candidate) => fsExistsSync(candidate));
   if (configCandidates.length !== 1) {
     fail("guarded web root must contain exactly one Vite config file");
   }
-  const configFile = fs.realpathSync(configCandidates[0]);
+  const configFile = fsRealpathSync(configCandidates[0]);
   assertInsideWebRoot(configFile, webRoot, nodeModulesRoot, "Vite config", true);
   verifyViteConfigHasNoPrototypeMutation(configFile);
-  const declared = declaredPackageNames(path.join(webRoot, "package.json"));
+  const packagePath = pathJoin(webRoot, "package.json");
+  const declared = declaredPackageNames(packagePath);
+  const guardedSourceFiles = collectSourceFiles(webRoot, webSourceRoot);
+  const guardedInputSnapshot = captureGuardedInputSnapshot(packagePath, configFile);
   const records = [];
-  for (const filePath of collectSourceFiles(webRoot, webSourceRoot)) {
+  for (const filePath of guardedSourceFiles) {
     if (isServerEntry(filePath)) {
       fail(`${relativePath(webRoot, filePath)} is a server/RSC entry surface`);
     }
-    const source = fs.readFileSync(filePath, "utf8");
-    if (path.extname(filePath).toLowerCase() === ".html") {
+    const source = fsReadFileSync(filePath, "utf8");
+    guardedInputSnapshot.set(filePath, source);
+    if (pathExtname(filePath).toLowerCase() === ".html") {
       inspectHtml(filePath, source, records, webRoot, nodeModulesRoot, distRoot);
     } else {
       inspectSource(filePath, source, records);
     }
   }
-
   let server;
   try {
     server = await loadViteServer(webRoot, configFile);
-    if (path.resolve(server.config.root) !== webRoot) {
+    verifyGuardedInputSnapshot(
+      guardedInputSnapshot,
+      packagePath,
+      configFile,
+      webRoot,
+      webSourceRoot,
+      "Vite server config execution",
+    );
+    if (pathResolve(server.config.root) !== webRoot) {
       fail("effective Vite root escapes the guarded web root");
     }
     if (typeof server.config.configFile !== "string") {
       fail("effective Vite configuration must use one config file");
     }
-    if (fs.realpathSync(server.config.configFile) !== configFile) {
+    if (fsRealpathSync(server.config.configFile) !== configFile) {
       fail("effective Vite configuration does not match the prechecked config file");
     }
     for (const record of records) {
@@ -1866,7 +2093,23 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
     verifyEffectiveAlias(server, webRoot, webSourceRoot, nodeModulesRoot);
     verifyViteConfigPluginSource(configFile);
     const serveConfig = await loadViteUserConfig(webRoot, configFile, "serve");
+    verifyGuardedInputSnapshot(
+      guardedInputSnapshot,
+      packagePath,
+      configFile,
+      webRoot,
+      webSourceRoot,
+      "Vite serve config execution",
+    );
     const buildConfig = await loadViteUserConfig(webRoot, configFile, "build");
+    verifyGuardedInputSnapshot(
+      guardedInputSnapshot,
+      packagePath,
+      configFile,
+      webRoot,
+      webSourceRoot,
+      "Vite build config execution",
+    );
     verifyViteConfigShape(serveConfig, webRoot, webSourceRoot, nodeModulesRoot);
     verifyViteConfigShape(buildConfig, webRoot, webSourceRoot, nodeModulesRoot);
     await verifyVitePlugins(serveConfig);
@@ -1876,9 +2119,17 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
       await server.close();
     }
   }
+  verifyGuardedInputSnapshot(
+    guardedInputSnapshot,
+    packagePath,
+    configFile,
+    webRoot,
+    webSourceRoot,
+    "successful guard completion",
+  );
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === scriptPath;
+const isMain = process.argv[1] && pathResolve(process.argv[1]) === scriptPath;
 if (isMain) {
   try {
     await runGuard();

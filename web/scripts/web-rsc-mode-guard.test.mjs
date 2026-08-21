@@ -168,6 +168,83 @@ export { page };
   await runGuard(repoRoot);
 });
 
+test("dynamic and deferred Vite config mutation is rejected before execution", async (t) => {
+  const mutations = [
+    `writeFileSync(target, forbidden);`,
+    `setTimeout(() => writeFileSync(target, forbidden), 50);`,
+  ];
+  for (const mutation of mutations) {
+    const { repoRoot, webRoot } = createFixture(t, {
+      config: validConfig.replace(
+        "export default",
+        `
+const { writeFileSync } = await import("node:fs");
+const target = new URL("./src/main.tsx", import.meta.url);
+const forbidden = 'import { StaticRouter } from "react-router-dom/server";\\n';
+${mutation}
+export default`,
+      ),
+    });
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*cannot use dynamic imports/);
+    assert.equal(fs.readFileSync(path.join(webRoot, "src", "main.tsx"), "utf8"), validSource);
+  }
+});
+
+test("reflective Vite config mutation is rejected before execution", async (t) => {
+  const reflections = [
+    `
+const getBuiltinModule = Reflect.get(process, "getBuiltinModule");
+const { writeFileSync } = getBuiltinModule("node:fs");
+const defer = Reflect.get(globalThis, "setTimeout");
+const target = new URL("./src/main.tsx", import.meta.url);
+defer(() => writeFileSync(target, 'import "react-router-dom/server";\\n'), 50);`,
+    `
+const Execute = globalThis["Reflect"].get(globalThis["Object"], "constructor");
+Execute('import("node:fs").then(({ writeFileSync }) => writeFileSync(new URL("./src/main.tsx", import.meta.url), "forbidden"))')();`,
+    `
+const descriptor = globalThis["Object"]["getOwnPropertyDescriptor"];
+const functionPrototype = globalThis["Object"]["getPrototypeOf"](globalThis["Object"]);
+const execute = descriptor(functionPrototype, "constructor").value;
+execute("return 1")();`,
+  ];
+  for (const reflection of reflections) {
+    const { repoRoot, webRoot } = createFixture(t, {
+      config: validConfig.replace("export default", `${reflection}\nexport default`),
+    });
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*reflective or unrestricted runtime globals/);
+    assert.equal(fs.readFileSync(path.join(webRoot, "src", "main.tsx"), "utf8"), validSource);
+  }
+});
+
+test("aliased imported-module mutation is rejected before execution", async (t) => {
+  const cases = [
+    `const mutate = fileURLToPath; mutate.extra = true;`,
+    `const mutate = fileURLToPath; Object.assign(mutate, { extra: true });`,
+    `let mutate; mutate = fileURLToPath; mutate.extra = true;`,
+    `function mutate(value) { value.extra = true; } mutate(fileURLToPath);`,
+  ];
+  for (const mutation of cases) {
+    const { repoRoot } = createFixture(t, {
+      config: validConfig.replace("export default", `${mutation}\nexport default`),
+    });
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*mutate (?:imported modules|restricted bindings)/);
+  }
+});
+
+test("approved Vite environment fields remain read-only", async (t) => {
+  const cases = [
+    `process.env.ZEROCLAW_GATEWAY_PORT = "9999";`,
+    `delete process.env.ZEROCLAW_GATEWAY_PORT;`,
+    `process.env.ZEROCLAW_GATEWAY_PORT++;`,
+  ];
+  for (const mutation of cases) {
+    const { repoRoot } = createFixture(t, {
+      config: validConfig.replace("export default", `${mutation}\nexport default`),
+    });
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*cannot mutate process environment fields/);
+  }
+});
+
 test("an absent generated local module remains bounded by its lexical path", async (t) => {
   const { repoRoot } = createFixture(t, {
     source: `import type { components } from "./api-generated";\nexport const ready = true;`,
@@ -919,5 +996,5 @@ test("function-valued config containers cannot carry build plugins", async (t) =
     },
   },`),
   });
-  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*function-valued container/);
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*reflective or unrestricted runtime globals/);
 });
