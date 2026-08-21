@@ -3,7 +3,7 @@ import { builtinModules } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { createServer } from "vite";
+import { createServer, loadConfigFromFile } from "vite";
 
 const errorPrefix = "web-rsc-mode-guard:";
 const scriptPath = fileURLToPath(import.meta.url);
@@ -48,6 +48,20 @@ const nodeBuiltins = new Set(
   builtinModules.flatMap((name) => [name, `node:${name}`]),
 );
 const allowedTransitiveImports = new Set(["@codemirror/theme-one-dark"]);
+const allowedReactRouterDomValueExports = new Set([
+  "BrowserRouter",
+  "Link",
+  "MemoryRouter",
+  "NavLink",
+  "Navigate",
+  "Outlet",
+  "Route",
+  "Routes",
+  "useLocation",
+  "useNavigate",
+  "useParams",
+  "useSearchParams",
+]);
 const forbiddenRscIdentifiers = new Set([
   "RSCHydratedRouter",
   "unstable_RSCHydratedRouter",
@@ -64,6 +78,20 @@ const forbiddenRscIdentifiers = new Set([
   "reactRouterRSC",
   "unstable_reactRouterRSC",
 ]);
+const forbiddenCodeGenerationIdentifiers = new Set(["eval", "Function"]);
+const expectedVitePluginNames = [
+  "vite:react-babel",
+  "vite:react:refresh-wrapper",
+  "vite:react:config-post",
+  "vite:react-refresh-fbm",
+  "vite:react-refresh",
+  "vite:react-virtual-preamble",
+  "@tailwindcss/vite:scan",
+  "@tailwindcss/vite:generate:serve",
+  "@tailwindcss/vite:generate:build",
+  "zeroclaw-dev-app-prefix",
+];
+const serveOnlyVitePluginName = "zeroclaw-dev-app-prefix";
 
 export class GuardError extends Error {}
 
@@ -202,8 +230,24 @@ function inspectSource(filePath, source, records) {
   const relative = path.basename(filePath);
 
   function visit(node) {
-    if (ts.isIdentifier(node) && forbiddenRscIdentifiers.has(node.text)) {
-      fail(`${relative} contains an unstable RSC API identifier: ${node.text}`);
+    if (ts.isIdentifier(node)) {
+      if (forbiddenCodeGenerationIdentifiers.has(node.text)) {
+        fail(`${relative} contains a forbidden code-generation identifier: ${node.text}`);
+      }
+      if (forbiddenRscIdentifiers.has(node.text)) {
+        fail(`${relative} contains an unstable RSC API identifier: ${node.text}`);
+      }
+    }
+
+    if (
+      ts.isElementAccessExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      ["globalThis", "self", "window"].includes(node.expression.text)
+    ) {
+      const key = ts.isStringLiteralLike(node.argumentExpression)
+        ? node.argumentExpression.text
+        : "computed property";
+      fail(`${relative} uses forbidden computed global access: ${key}`);
     }
 
     if (
@@ -228,11 +272,17 @@ function inspectSource(filePath, source, records) {
       }
       if (specifier === "react-router-dom" && bindings && ts.isNamedImports(bindings)) {
         for (const element of bindings.elements) {
+          if (node.importClause?.isTypeOnly || element.isTypeOnly) {
+            continue;
+          }
           const name = importedName(element.propertyName ?? element.name);
-          if (name && forbiddenRscIdentifiers.has(name)) {
-            fail(`${relative} imports unstable RSC API ${name} from react-router-dom`);
+          if (!name || !allowedReactRouterDomValueExports.has(name)) {
+            fail(`${relative} imports an unapproved React Router value export: ${name ?? "unknown"}`);
           }
         }
+      }
+      if (specifier === "react-router-dom" && node.importClause?.name) {
+        fail(`${relative} uses a default import from react-router-dom`);
       }
     }
 
@@ -250,9 +300,12 @@ function inspectSource(filePath, source, records) {
         ts.isNamedExports(node.exportClause)
       ) {
         for (const element of node.exportClause.elements) {
+          if (node.isTypeOnly || element.isTypeOnly) {
+            continue;
+          }
           const name = importedName(element.propertyName ?? element.name);
-          if (name && forbiddenRscIdentifiers.has(name)) {
-            fail(`${relative} re-exports unstable RSC API ${name} from react-router-dom`);
+          if (!name || !allowedReactRouterDomValueExports.has(name)) {
+            fail(`${relative} re-exports an unapproved React Router value export: ${name ?? "unknown"}`);
           }
         }
       }
@@ -300,10 +353,147 @@ function inspectSource(filePath, source, records) {
   visit(sourceFile);
 }
 
-function inspectHtml(filePath, source, records) {
-  const scriptPattern = /<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi;
-  for (const match of source.matchAll(scriptPattern)) {
-    inspectSource(filePath, match[1], records);
+function parseScriptAttributes(filePath, attributeText) {
+  const attributes = [];
+  let index = 0;
+  while (index < attributeText.length) {
+    while (/\s/.test(attributeText[index] ?? "")) {
+      index += 1;
+    }
+    if (index >= attributeText.length) {
+      break;
+    }
+    if (attributeText[index] === "/" && /^[\s/]*$/.test(attributeText.slice(index))) {
+      break;
+    }
+
+    const name = attributeText.slice(index).match(/^[A-Za-z_:][A-Za-z0-9_.:-]*/)?.[0];
+    if (!name) {
+      fail(`${relativePath(path.dirname(filePath), filePath)} has malformed script tag attributes`);
+    }
+    index += name.length;
+    while (/\s/.test(attributeText[index] ?? "")) {
+      index += 1;
+    }
+
+    let value = null;
+    if (attributeText[index] === "=") {
+      index += 1;
+      while (/\s/.test(attributeText[index] ?? "")) {
+        index += 1;
+      }
+      const quote = attributeText[index];
+      if (quote === '"' || quote === "'") {
+        index += 1;
+        const end = attributeText.indexOf(quote, index);
+        if (end === -1) {
+          fail(`${relativePath(path.dirname(filePath), filePath)} has malformed script src`);
+        }
+        value = attributeText.slice(index, end);
+        index = end + 1;
+      } else {
+        const start = index;
+        while (index < attributeText.length && !/\s/.test(attributeText[index])) {
+          index += 1;
+        }
+        value = attributeText.slice(start, index);
+        if (name.toLowerCase() === "src") {
+          fail(`${relativePath(path.dirname(filePath), filePath)} has an unquoted script src`);
+        }
+      }
+    }
+    attributes.push({ name: name.toLowerCase(), value });
+  }
+  return attributes;
+}
+
+function verifyHtmlScriptTarget(filePath, src, webRoot, nodeModulesRoot) {
+  if (/[&\s]/.test(src)) {
+    fail(`${relativePath(webRoot, filePath)} has an ambiguous script src`);
+  }
+  const rawPath = src.split(/[?#]/, 1)[0];
+  if (!rawPath || rawPath.includes("\\")) {
+    fail(`${relativePath(webRoot, filePath)} has an invalid local script src`);
+  }
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(rawPath);
+  } catch {
+    fail(`${relativePath(webRoot, filePath)} has malformed script src encoding`);
+  }
+  if (
+    decodedPath.startsWith("//") ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:/.test(decodedPath)
+  ) {
+    fail(`${relativePath(webRoot, filePath)} has an external script src`);
+  }
+  const candidate = decodedPath.startsWith("/")
+    ? path.resolve(webRoot, decodedPath.slice(1))
+    : path.resolve(path.dirname(filePath), decodedPath);
+  assertInsideWebRoot(candidate, webRoot, nodeModulesRoot, "HTML script src", true);
+  if (!fs.existsSync(candidate)) {
+    fail(`${relativePath(webRoot, filePath)} references a missing script src: ${src}`);
+  }
+  const canonical = fs.realpathSync(candidate);
+  assertInsideWebRoot(canonical, webRoot, nodeModulesRoot, "HTML script src", true);
+  if (!fs.statSync(canonical).isFile()) {
+    fail(`${relativePath(webRoot, filePath)} references a non-file script src: ${src}`);
+  }
+  assertSupportedResolvedFormat(canonical, `${relativePath(webRoot, filePath)} script src ${src}`);
+}
+
+function inspectHtml(filePath, source, records, webRoot, nodeModulesRoot) {
+  const openingPattern = /<script\b/gi;
+  while (true) {
+    const opening = openingPattern.exec(source);
+    if (!opening) {
+      break;
+    }
+    let tagEnd = opening.index + opening[0].length;
+    let quote = null;
+    for (; tagEnd < source.length; tagEnd += 1) {
+      const character = source[tagEnd];
+      if (quote) {
+        if (character === quote) {
+          quote = null;
+        }
+      } else if (character === '"' || character === "'") {
+        quote = character;
+      } else if (character === ">") {
+        break;
+      }
+    }
+    if (tagEnd >= source.length || quote) {
+      fail(`${relativePath(webRoot, filePath)} has a malformed script tag`);
+    }
+    const attributes = parseScriptAttributes(
+      filePath,
+      source.slice(opening.index + opening[0].length, tagEnd),
+    );
+    const srcAttributes = attributes.filter(({ name }) => name === "src");
+    if (srcAttributes.length > 1) {
+      fail(`${relativePath(webRoot, filePath)} has multiple script src attributes`);
+    }
+    if (srcAttributes.length === 1) {
+      if (!srcAttributes[0].value) {
+        fail(`${relativePath(webRoot, filePath)} has a malformed script src`);
+      }
+      verifyHtmlScriptTarget(
+        filePath,
+        srcAttributes[0].value,
+        webRoot,
+        nodeModulesRoot,
+      );
+    }
+
+    const closePattern = /<\/script\s*>/gi;
+    closePattern.lastIndex = tagEnd + 1;
+    const closing = closePattern.exec(source);
+    if (!closing) {
+      fail(`${relativePath(webRoot, filePath)} has an unclosed script tag`);
+    }
+    inspectSource(filePath, source.slice(tagEnd + 1, closing.index), records);
+    openingPattern.lastIndex = closing.index + closing[0].length;
   }
 }
 
@@ -511,6 +701,271 @@ async function loadViteServer(webRoot) {
   });
 }
 
+function propertyName(node) {
+  if (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) {
+    return node.text;
+  }
+  return null;
+}
+
+function importedBinding(sourceFile, moduleName, imported) {
+  const matches = [];
+  for (const statement of sourceFile.statements) {
+    if (
+      !ts.isImportDeclaration(statement) ||
+      literalText(statement.moduleSpecifier) !== moduleName ||
+      !statement.importClause
+    ) {
+      continue;
+    }
+    if (imported === "default" && statement.importClause.name) {
+      matches.push(statement.importClause.name.text);
+    }
+    const bindings = statement.importClause.namedBindings;
+    if (imported !== "default" && bindings && ts.isNamedImports(bindings)) {
+      for (const element of bindings.elements) {
+        if (importedName(element.propertyName ?? element.name) === imported) {
+          matches.push(element.name.text);
+        }
+      }
+    }
+  }
+  if (matches.length !== 1) {
+    fail(`Vite config must import ${imported} exactly once from ${moduleName}`);
+  }
+  return matches[0];
+}
+
+function unwrapParentheses(node) {
+  let current = node;
+  while (ts.isParenthesizedExpression(current)) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function verifyViteConfigPluginSource(configFile) {
+  const sourceFile = parseSource(configFile, fs.readFileSync(configFile, "utf8"));
+  const defineConfigName = importedBinding(sourceFile, "vite", "defineConfig");
+  const reactName = importedBinding(sourceFile, "@vitejs/plugin-react", "default");
+  const tailwindName = importedBinding(sourceFile, "@tailwindcss/vite", "default");
+  const exports = sourceFile.statements.filter(
+    (statement) => ts.isExportAssignment(statement) && !statement.isExportEquals,
+  );
+  if (exports.length !== 1) {
+    fail("Vite config must contain exactly one default export");
+  }
+  const defineCall = unwrapParentheses(exports[0].expression);
+  if (
+    !ts.isCallExpression(defineCall) ||
+    !ts.isIdentifier(defineCall.expression) ||
+    defineCall.expression.text !== defineConfigName ||
+    defineCall.arguments.length !== 1
+  ) {
+    fail("Vite config must export one direct defineConfig factory");
+  }
+  const factory = unwrapParentheses(defineCall.arguments[0]);
+  if (!ts.isArrowFunction(factory) || ts.isBlock(factory.body)) {
+    fail("Vite config must use an expression-bodied defineConfig factory");
+  }
+  const config = unwrapParentheses(factory.body);
+  if (!ts.isObjectLiteralExpression(config)) {
+    fail("Vite config factory must return one object literal");
+  }
+  if (
+    config.properties.some(
+      (property) =>
+        ts.isSpreadAssignment(property) ||
+        (property.name && ts.isComputedPropertyName(property.name)),
+    )
+  ) {
+    fail("Vite config cannot use spread or computed top-level properties");
+  }
+  function rejectPrototypeProperties(node) {
+    if (
+      ts.isPropertyAssignment(node) &&
+      node.name &&
+      propertyName(node.name) === "__proto__"
+    ) {
+      fail("Vite config cannot use __proto__ properties");
+    }
+    ts.forEachChild(node, rejectPrototypeProperties);
+  }
+  rejectPrototypeProperties(config);
+  const pluginProperties = config.properties.filter(
+    (property) => property.name && propertyName(property.name) === "plugins",
+  );
+  if (
+    pluginProperties.length !== 1 ||
+    !ts.isPropertyAssignment(pluginProperties[0]) ||
+    !ts.isArrayLiteralExpression(pluginProperties[0].initializer)
+  ) {
+    fail("Vite config must contain one literal plugins array");
+  }
+  const plugins = pluginProperties[0].initializer.elements;
+  const expectedFactories = [reactName, tailwindName];
+  if (plugins.length !== 3) {
+    fail("Vite config must contain exactly the approved React, Tailwind, and serve-prefix plugins");
+  }
+  for (let index = 0; index < expectedFactories.length; index += 1) {
+    const plugin = unwrapParentheses(plugins[index]);
+    if (
+      !ts.isCallExpression(plugin) ||
+      !ts.isIdentifier(plugin.expression) ||
+      plugin.expression.text !== expectedFactories[index] ||
+      plugin.arguments.length !== 0
+    ) {
+      fail("Vite config must instantiate the approved React and Tailwind plugin factories directly");
+    }
+  }
+  const localPlugin = unwrapParentheses(plugins[2]);
+  if (!ts.isObjectLiteralExpression(localPlugin)) {
+    fail("Vite config serve-prefix plugin must be an object literal");
+  }
+  const localProperties = new Map();
+  for (const property of localPlugin.properties) {
+    const name = property.name ? propertyName(property.name) : null;
+    if (!name || localProperties.has(name)) {
+      fail("Vite config serve-prefix plugin has an unsupported property");
+    }
+    localProperties.set(name, property);
+  }
+  if (
+    localProperties.size !== 3 ||
+    !localProperties.has("name") ||
+    !localProperties.has("apply") ||
+    !localProperties.has("configureServer")
+  ) {
+    fail("Vite config serve-prefix plugin must contain only name, apply, and configureServer");
+  }
+  const nameProperty = localProperties.get("name");
+  const applyProperty = localProperties.get("apply");
+  if (
+    !ts.isPropertyAssignment(nameProperty) ||
+    literalText(nameProperty.initializer) !== serveOnlyVitePluginName ||
+    !ts.isPropertyAssignment(applyProperty) ||
+    literalText(applyProperty.initializer) !== "serve" ||
+    !ts.isMethodDeclaration(localProperties.get("configureServer"))
+  ) {
+    fail("Vite config serve-prefix plugin must retain its fixed name and serve-only hook");
+  }
+}
+
+function verifyNoNestedVitePluginOptions(config) {
+  const seen = new WeakSet();
+
+  function visit(value, location, root) {
+    if (typeof value === "function") {
+      fail(`Vite configuration contains a function-valued container at ${location || "root"}`);
+    }
+    if (typeof value !== "object" || value === null) {
+      return;
+    }
+    if (seen.has(value)) {
+      return;
+    }
+    seen.add(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (
+      (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) ||
+      (Array.isArray(value) && prototype !== Array.prototype)
+    ) {
+      fail(`Vite configuration contains a non-plain object at ${location || "root"}`);
+    }
+    for (const key of Object.keys(value)) {
+      if (root && key === "plugins") {
+        continue;
+      }
+      const child = value[key];
+      const childLocation = location ? `${location}.${key}` : key;
+      if (key === "plugins" && child != null && child !== false) {
+        fail(`Vite configuration contains nested plugin options at ${childLocation}`);
+      }
+      visit(child, childLocation, false);
+    }
+  }
+
+  visit(config, "", true);
+}
+
+function verifyServePrefixBehavior(plugin) {
+  const middleware = [];
+  plugin.configureServer({
+    middlewares: {
+      use(handler) {
+        middleware.push(handler);
+      },
+    },
+  });
+  if (middleware.length !== 1 || typeof middleware[0] !== "function") {
+    fail("Vite serve-prefix plugin must install exactly one middleware");
+  }
+  for (const [initial, expected] of [
+    ["/_app/probe.js?mode=guard", "/probe.js?mode=guard"],
+    ["/api/probe", "/api/probe"],
+  ]) {
+    const request = { url: initial };
+    let nextCalls = 0;
+    middleware[0](request, {}, () => {
+      nextCalls += 1;
+    });
+    if (request.url !== expected || nextCalls !== 1) {
+      fail("Vite serve-prefix middleware no longer mirrors the gateway strip-prefix behavior");
+    }
+  }
+}
+
+async function flattenUserPluginOptions(options, flattened = []) {
+  const resolved = await options;
+  if (resolved == null || resolved === false) {
+    return flattened;
+  }
+  if (Array.isArray(resolved)) {
+    for (const option of resolved) {
+      await flattenUserPluginOptions(option, flattened);
+    }
+    return flattened;
+  }
+  flattened.push(resolved);
+  return flattened;
+}
+
+async function loadViteUserConfig(webRoot, configFile, command) {
+  const loaded = await loadConfigFromFile(
+    { command, mode: command === "build" ? "production" : "development" },
+    configFile,
+    webRoot,
+    "silent",
+  );
+  if (!loaded?.config) {
+    fail("Vite build configuration could not be loaded");
+  }
+  return loaded.config;
+}
+
+async function verifyVitePlugins(config) {
+  verifyNoNestedVitePluginOptions(config);
+  const plugins = await flattenUserPluginOptions(config.plugins);
+  const names = plugins.map((plugin) => plugin?.name);
+  if (
+    names.length !== expectedVitePluginNames.length ||
+    names.some((name, index) => name !== expectedVitePluginNames[index])
+  ) {
+    fail("Vite configuration must resolve exactly the approved user plugin sequence");
+  }
+  for (const plugin of plugins) {
+    if (!plugin || typeof plugin !== "object" || typeof plugin.name !== "string") {
+      fail("Vite configuration contains an unnamed plugin option");
+    }
+    if (plugin.name === serveOnlyVitePluginName) {
+      if (plugin.apply !== "serve") {
+        fail(`${serveOnlyVitePluginName} must be serve-only`);
+      }
+      verifyServePrefixBehavior(plugin);
+    }
+  }
+}
+
 export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ?? defaultRepoRoot) {
   const resolvedRepoRoot = path.resolve(repoRoot);
   const webPath = path.join(resolvedRepoRoot, "web");
@@ -531,7 +986,7 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
     }
     const source = fs.readFileSync(filePath, "utf8");
     if (path.extname(filePath).toLowerCase() === ".html") {
-      inspectHtml(filePath, source, records);
+      inspectHtml(filePath, source, records, webRoot, nodeModulesRoot);
     } else {
       inspectSource(filePath, source, records);
     }
@@ -543,6 +998,11 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
     if (path.resolve(server.config.root) !== webRoot) {
       fail("effective Vite root escapes the guarded web root");
     }
+    if (typeof server.config.configFile !== "string") {
+      fail("effective Vite configuration must use one config file");
+    }
+    const configFile = fs.realpathSync(server.config.configFile);
+    assertInsideWebRoot(configFile, webRoot, nodeModulesRoot, "Vite config", true);
     verifyEffectiveAlias(server, webRoot, webSourceRoot, nodeModulesRoot);
     for (const record of records) {
       await verifyImportBoundary(
@@ -554,6 +1014,12 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
         declared,
       );
     }
+
+    verifyViteConfigPluginSource(configFile);
+    const serveConfig = await loadViteUserConfig(webRoot, configFile, "serve");
+    const buildConfig = await loadViteUserConfig(webRoot, configFile, "build");
+    await verifyVitePlugins(serveConfig);
+    await verifyVitePlugins(buildConfig);
   } finally {
     if (server) {
       await server.close();

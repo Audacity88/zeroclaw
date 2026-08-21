@@ -8,17 +8,44 @@ import { runGuard } from "./web-rsc-mode-guard.mjs";
 
 const fixtureRoots = [];
 const fixtureParent = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const validConfig = `
+const approvedPlugins = `
+    react(),
+    tailwindcss(),
+    {
+      name: "zeroclaw-dev-app-prefix",
+      apply: "serve",
+      configureServer(server) {
+        server.middlewares.use((req, _res, next) => {
+          if (req.url?.startsWith("/_app/")) {
+            req.url = req.url.slice("/_app".length);
+          }
+          next();
+        });
+      },
+    },`;
+
+function configWith(properties, plugins = approvedPlugins) {
+  return `
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { fileURLToPath } from "node:url";
 
-export default {
+export default defineConfig(() => ({
+  plugins: [${plugins}
+  ],
+${properties}
+}));
+`;
+}
+
+const validConfig = configWith(`
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
-};
-`;
+`);
 const validSource = `
 import { BrowserRouter } from "react-router-dom";
 
@@ -34,7 +61,11 @@ function createFixture(testContext, { source = validSource, config = validConfig
     `${JSON.stringify(
       {
         dependencies: { "react-router-dom": "7.18.2" },
-        devDependencies: { vite: "8.0.16" },
+        devDependencies: {
+          "@tailwindcss/vite": "4.2.1",
+          "@vitejs/plugin-react": "6.0.1",
+          vite: "8.0.16",
+        },
       },
       null,
       2,
@@ -171,6 +202,48 @@ test("react-router-dom namespace, dynamic, and full re-export use are rejected",
   }
 });
 
+test("renamed non-client react-router-dom value exports are rejected", async (t) => {
+  const nonClientExports = [
+    "ServerRouter",
+    "StaticRouter",
+    "StaticRouterProvider",
+    "createStaticHandler",
+    "createStaticRouter",
+    "createRequestHandler",
+    "createCookie",
+    "createCookieSessionStorage",
+    "createMemorySessionStorage",
+    "createSession",
+    "createSessionStorage",
+    "UNSAFE_ServerMode",
+    "unstable_getRequest",
+    "unstable_matchRSCServerRequest",
+    "unstable_routeRSCServerRequest",
+    "unstable_RSCStaticRouter",
+    "UNSAFE_RSCDefaultRootErrorBoundary",
+    "UNSAFE_decodeViaTurboStream",
+    "UNSAFE_getHydrationData",
+    "UNSAFE_getPatchRoutesOnNavigationFunction",
+    "UNSAFE_getTurboStreamSingleFetchDataStrategy",
+  ];
+  for (const name of nonClientExports) {
+    const imported = createFixture(t, {
+      source: `import { ${name} as ClientExport } from "react-router-dom";\nexport { ClientExport };`,
+    });
+    await expectFailure(t, imported.repoRoot, /web-rsc-mode-guard: /);
+
+    const reExported = createFixture(t, {
+      source: `export { ${name} as ClientExport } from "react-router-dom";`,
+    });
+    await expectFailure(t, reExported.repoRoot, /web-rsc-mode-guard: /);
+  }
+
+  const defaultImport = createFixture(t, {
+    source: `import Router from "react-router-dom";\nexport { Router };`,
+  });
+  await expectFailure(t, defaultImport.repoRoot, /default import from react-router-dom/);
+});
+
 test("unstable RSC identifiers and server directives are rejected", async (t) => {
   const sources = [
     `const router = RSCStaticRouter;\nexport { router };`,
@@ -183,6 +256,71 @@ test("unstable RSC identifiers and server directives are rejected", async (t) =>
     const { repoRoot } = createFixture(t, { source });
     await expectFailure(t, repoRoot, /web-rsc-mode-guard: /);
   }
+});
+
+test("code-generation identifiers are rejected without lexical false positives", async (t) => {
+  for (const source of [
+    "eval();",
+    "Function();",
+    "new Function();",
+    `globalThis["Function"]("return 1")();`,
+    `window["eval"]("1")`,
+    `globalThis["e" + "val"]("1")`,
+    `self[["Function"].join("")]("return 1")()`,
+  ]) {
+    const { repoRoot } = createFixture(t, { source });
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*(?:forbidden code-generation identifier|forbidden computed global access)/);
+  }
+
+  const safe = createFixture(t, {
+    source: `const note = "eval Function"; // eval() and Function() are text only\nexport { note };`,
+  });
+  await runGuard(safe.repoRoot);
+});
+
+test("HTML script bodies and local root-relative sources are inspected", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t);
+  fs.writeFileSync(
+    path.join(webRoot, "index.html"),
+    `<script>const note = "eval Function"; // eval() and Function() are text only</script>\n<script type="module" src="/src/main.tsx"></script>\n`,
+  );
+  await runGuard(repoRoot);
+});
+
+test("HTML script sources fail closed for nonlocal, malformed, and missing paths", async (t) => {
+  const cases = [
+    [`<script src="https://example.com/app.js"></script>`, /external script src/],
+    [`<script src="//example.com/app.js"></script>`, /external script src/],
+    [`<script src="data:text/javascript,alert(1)"></script>`, /external script src/],
+    [`<script src="javascript:alert(1)"></script>`, /external script src/],
+    [`<script src="&#x68;ttps://example.com/app.js"></script>`, /ambiguous script src/],
+    [`<script src="/src/main.tsx app.js"></script>`, /ambiguous script src/],
+    [`<script src=/src/main.tsx></script>`, /unquoted script src/],
+    [`<script src=""></script>`, /malformed script src/],
+    [`<script src="/src/missing.tsx"></script>`, /missing script src/],
+  ];
+  for (const [html, pattern] of cases) {
+    const { repoRoot, webRoot } = createFixture(t);
+    fs.writeFileSync(path.join(webRoot, "index.html"), html);
+    await expectFailure(t, repoRoot, new RegExp(`web-rsc-mode-guard: .*${pattern.source}`));
+  }
+
+  const outside = createFixture(t);
+  fs.writeFileSync(path.join(outside.repoRoot, "outside.js"), "export const outside = true;\n");
+  fs.writeFileSync(
+    path.join(outside.webRoot, "index.html"),
+    `<script src="../outside.js"></script>`,
+  );
+  await expectFailure(t, outside.repoRoot, /web-rsc-mode-guard: .*escapes the guarded web root/);
+
+  const nodeModules = createFixture(t);
+  fs.mkdirSync(path.join(nodeModules.webRoot, "node_modules"), { recursive: true });
+  fs.writeFileSync(path.join(nodeModules.webRoot, "node_modules", "local.js"), "export {};\n");
+  fs.writeFileSync(
+    path.join(nodeModules.webRoot, "index.html"),
+    `<script src="/node_modules/local.js"></script>`,
+  );
+  await expectFailure(t, nodeModules.repoRoot, /web-rsc-mode-guard: .*node_modules/);
 });
 
 test("server and RSC entry filenames are rejected", async (t) => {
@@ -341,4 +479,164 @@ export default {
     `${JSON.stringify(packageJson, null, 2)}\n`,
   );
   await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*virtual module/);
+});
+
+test("unknown build-only Vite transforms are rejected", async (t) => {
+  const { repoRoot } = createFixture(t, {
+    config: configWith(
+      `
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },`,
+      `${approvedPlugins}
+    {
+    name: "fixture-build-transform",
+    apply: "build",
+    transform() {
+      return null;
+    },
+  },`,
+    ),
+  });
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*exactly the approved React/);
+});
+
+test("approved Vite plugin names cannot be spoofed", async (t) => {
+  const { repoRoot } = createFixture(t, {
+    config: configWith(
+      `
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },`,
+      `${approvedPlugins}
+    {
+      name: "vite:react-babel",
+      apply: "build",
+      transform() {
+        return "import { ServerRouter } from 'react-router-dom/server'";
+      },
+    },`,
+    ),
+  });
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*exactly the approved React/);
+});
+
+test("required Vite plugins cannot be removed", async (t) => {
+  const { repoRoot } = createFixture(t, {
+    config: configWith(
+      `
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },`,
+      `
+    react(),
+    tailwindcss(),`,
+    ),
+  });
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*exactly the approved React/);
+});
+
+test("nested build and worker plugin options are rejected", async (t) => {
+  const nestedOptions = [
+    `
+  build: {
+    rollupOptions: {
+      plugins: [{ name: "fixture-rollup-transform", transform() { return null; } }],
+    },
+  },`,
+    `
+  worker: {
+    plugins: () => [{ name: "fixture-worker-transform", transform() { return null; } }],
+  },`,
+  ];
+  for (const nested of nestedOptions) {
+    const { repoRoot } = createFixture(t, {
+      config: configWith(`
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },
+${nested}`),
+    });
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*nested plugin options/);
+  }
+});
+
+test("serve-prefix middleware behavior is required", async (t) => {
+  const noOpPrefix = `
+    react(),
+    tailwindcss(),
+    {
+      name: "zeroclaw-dev-app-prefix",
+      apply: "serve",
+      configureServer() {},
+    },`;
+  const { repoRoot } = createFixture(t, {
+    config: configWith(
+      `
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },`,
+      noOpPrefix,
+    ),
+  });
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*install exactly one middleware/);
+});
+
+test("Vite config cannot obscure plugin ownership through a top-level spread", async (t) => {
+  const { repoRoot } = createFixture(t, {
+    config: configWith(`
+  ...{ base: "/" },
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },`),
+  });
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*spread or computed/);
+});
+
+test("Vite config cannot inherit nested build plugins through __proto__", async (t) => {
+  const { repoRoot } = createFixture(t, {
+    config: configWith(`
+  __proto__: {
+    build: {
+      rollupOptions: {
+        plugins: [{ name: "prototype-build-transform", transform() { return null; } }],
+      },
+    },
+  },
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },`),
+  });
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*__proto__/);
+});
+
+test("function-valued config containers cannot carry build plugins", async (t) => {
+  const { repoRoot } = createFixture(t, {
+    config: configWith(`
+  build: Object.assign(() => {}, {
+    rollupOptions: {
+      plugins: [{ name: "function-build-transform", transform() { return null; } }],
+    },
+  }),
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },`),
+  });
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*function-valued container/);
 });

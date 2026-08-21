@@ -222,6 +222,27 @@ for (let index = withStart + 1; index < actionStep.end; index += 1) {
   }
 }
 const withLines = ciLines.slice(withStart + 1, withEnd);
+const withEntryLines = withLines.filter(
+  (line) => line.trim() && !line.trimStart().startsWith("#"),
+);
+const withKeys = withEntryLines.map((line) => {
+  const match = line.match(/^ {10}([A-Za-z0-9-]+):/);
+  if (!match) {
+    fail("dependency-review action with block contains unsupported YAML syntax");
+  }
+  return match[1];
+});
+const expectedWithKeys = ["fail-on-severity", "allow-ghsas"];
+if (
+  withEntryLines.length !== expectedWithKeys.length ||
+  withKeys.length !== expectedWithKeys.length ||
+  withKeys.some((key) => !expectedWithKeys.includes(key)) ||
+  new Set(withKeys).size !== expectedWithKeys.length
+) {
+  fail(
+    "dependency-review action with mapping must contain exactly fail-on-severity and allow-ghsas",
+  );
+}
 const allowGhsas = withLines
   .map((line) => line.match(/^ {10}allow-ghsas:\s*([^#\r\n]+?)\s*(?:#.*)?$/))
   .filter(Boolean)

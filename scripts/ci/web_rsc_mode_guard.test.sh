@@ -66,6 +66,34 @@ expect_failure() {
 reset_fixture
 run_guard >/dev/null
 
+for key in warn-only vulnerability-check config-file; do
+  reset_fixture
+  node - "$fixture/.github/workflows/ci.yml" "$key" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const key = process.argv[3];
+const values = {
+  "warn-only": "true",
+  "vulnerability-check": "true",
+  "config-file": ".github/dependency-review.yml",
+};
+const workflow = fs.readFileSync(workflowPath, "utf8");
+const marker = "          allow-ghsas: GHSA-qwww-vcr4-c8h2";
+fs.writeFileSync(workflowPath, workflow.replace(marker, `${marker}\n          ${key}: ${values[key]}`));
+NODE
+  expect_failure "additional dependency-review with key: $key"
+done
+
+reset_fixture
+node - "$fixture/.github/workflows/ci.yml" <<'NODE'
+const fs = require("node:fs");
+const workflowPath = process.argv[2];
+const workflow = fs.readFileSync(workflowPath, "utf8");
+const marker = "          allow-ghsas: GHSA-qwww-vcr4-c8h2";
+fs.writeFileSync(workflowPath, workflow.replace(marker, `${marker}\n          "warn-only": true`));
+NODE
+expect_failure "quoted additional dependency-review with key"
+
 reset_fixture
 node - "$fixture/.github/workflows/ci.yml" <<'NODE'
 const fs = require("node:fs");
