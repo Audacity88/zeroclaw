@@ -1531,25 +1531,32 @@ fn git_archive_remote_selects_helper(args: &[String]) -> bool {
             return false;
         }
         if let Some((name, value)) = arg.split_once('=') {
-            if git_arg_is_long_option_or_abbreviation(name, "--remote") {
-                return git_arg_selects_remote_helper(value);
+            if git_arg_is_long_option_or_abbreviation(name, "--remote")
+                && git_arg_selects_remote_helper(value)
+            {
+                return true;
             }
-        } else if git_arg_is_long_option_or_abbreviation(arg, "--remote") {
-            return args
-                .get(idx + 1)
-                .is_some_and(|value| git_arg_selects_remote_helper(value));
         }
-        idx += if !arg.contains('=')
-            && [
-                "--add-file",
-                "--add-virtual-file",
-                "--format",
-                "--output",
-                "--prefix",
-                "-o",
-            ]
-            .iter()
-            .any(|option| git_arg_is_option_or_abbreviation(arg, option))
+        let separated_remote =
+            !arg.contains('=') && git_arg_is_long_option_or_abbreviation(arg, "--remote");
+        if separated_remote {
+            match args.get(idx + 1).map(String::as_str) {
+                Some(value) if git_arg_selects_remote_helper(value) => return true,
+                _ => {}
+            }
+        }
+        idx += if separated_remote
+            || (!arg.contains('=')
+                && [
+                    "--add-file",
+                    "--add-virtual-file",
+                    "--format",
+                    "--output",
+                    "--prefix",
+                    "-o",
+                ]
+                .iter()
+                .any(|option| git_arg_is_option_or_abbreviation(arg, option)))
         {
             2
         } else {
@@ -5353,6 +5360,9 @@ mod tests {
             "git pull -j ext::helper",
             "git archive --format=tar --remote=ext::helper HEAD",
             "git archive --for=tar --rem=ext::helper HEAD",
+            "git archive --remote=https://example.invalid/repo --remote=ext::helper HEAD",
+            "git archive --remote https://example.invalid/repo --remote ext::helper HEAD",
+            "git archive --remote -- --remote=ext::helper HEAD",
             "git clone --server-option --remote=ext::helper https://example.invalid/repo dst",
         ] {
             assert!(!p.is_command_allowed(command), "{command}");
@@ -5414,6 +5424,7 @@ mod tests {
             "git submodule add https://example.invalid/repo evil://path",
             "git archive --format --remote=ext::helper HEAD",
             "git archive -- --remote=ext::helper",
+            "git archive --remote=https://example.invalid/repo --remote=ssh://example.invalid/repo HEAD",
         ] {
             let allowed = p
                 .validate_command_execution(command, false)
