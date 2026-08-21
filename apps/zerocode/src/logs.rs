@@ -555,7 +555,9 @@ pub(crate) struct Logs {
     last_detail_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
     list_snapshot: Option<TextSnapshot>,
+    list_snapshot_event_ids: Vec<String>,
     detail_snapshot: Option<TextSnapshot>,
+    detail_snapshot_event_id: Option<String>,
     text_selection: Option<LogsTextSelection>,
     copy_menu: Option<LogsCopyMenu>,
     copy_feedback: Option<LogsCopyFeedback>,
@@ -589,7 +591,9 @@ impl Logs {
             last_detail_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
             list_snapshot: None,
+            list_snapshot_event_ids: Vec::new(),
             detail_snapshot: None,
+            detail_snapshot_event_id: None,
             text_selection: None,
             copy_menu: None,
             copy_feedback: None,
@@ -691,6 +695,10 @@ impl Logs {
         if filtered.is_empty() {
             self.follow = false;
             self.list_state.select(None);
+            self.detail = DetailState::Loading;
+            self.detail_request_id = None;
+            self.detail_scroll = 0;
+            self.clear_surface_transients(LogsTextSurface::Detail);
             return;
         }
 
@@ -924,9 +932,15 @@ impl Logs {
 
         frame.render_stateful_widget(list, area, &mut self.list_state);
         let row_breaks = vec![TextRowBreak::Hard; usize::from(inner.height)];
-        self.set_snapshot(
-            LogsTextSurface::List,
+        let visible_event_ids = filtered
+            .iter()
+            .skip(self.list_state.offset())
+            .take(usize::from(inner.height))
+            .map(|&idx| self.events[idx].id.clone())
+            .collect();
+        self.set_list_snapshot(
             TextSnapshot::capture(frame, inner, row_breaks),
+            visible_event_ids,
         );
         self.render_text_selection(frame, LogsTextSurface::List);
     }
@@ -945,16 +959,13 @@ impl Logs {
                 crate::i18n::t("zc-logs-no-event-selected"),
                 theme::dim_style(),
             ))]
+        } else if let Some(detail) = self.current_resolved_detail() {
+            detail.detail_lines()
         } else {
-            match &self.detail {
-                DetailState::Ready(d) => d.detail_lines(),
-                DetailState::Loading => {
-                    vec![Line::from(Span::styled(
-                        crate::i18n::t("zc-logs-loading"),
-                        theme::dim_style(),
-                    ))]
-                }
-            }
+            vec![Line::from(Span::styled(
+                crate::i18n::t("zc-logs-loading"),
+                theme::dim_style(),
+            ))]
         };
         let row_breaks = row_breaks_for_lines(&lines, inner.width)
             .into_iter()
@@ -967,9 +978,12 @@ impl Logs {
             .wrap(Wrap { trim: false })
             .scroll((self.detail_scroll, 0));
         frame.render_widget(para, inner);
-        self.set_snapshot(
-            LogsTextSurface::Detail,
+        let selected_event_id = self
+            .selected_event_idx()
+            .map(|idx| self.events[idx].id.clone());
+        self.set_detail_snapshot(
             TextSnapshot::capture(frame, inner, row_breaks),
+            selected_event_id,
         );
         self.render_text_selection(frame, LogsTextSurface::Detail);
     }
@@ -981,23 +995,38 @@ impl Logs {
         }
     }
 
-    fn set_snapshot(&mut self, surface: LogsTextSurface, snapshot: TextSnapshot) {
-        let changed = self
-            .snapshot(surface)
-            .is_some_and(|current| current != &snapshot);
+    fn set_list_snapshot(&mut self, snapshot: TextSnapshot, event_ids: Vec<String>) {
+        let changed = self.list_snapshot.as_ref().is_some_and(|current| {
+            current != &snapshot || self.list_snapshot_event_ids != event_ids
+        });
         if changed {
-            self.clear_surface_transients(surface);
+            self.clear_surface_transients(LogsTextSurface::List);
         }
-        match surface {
-            LogsTextSurface::List => self.list_snapshot = Some(snapshot),
-            LogsTextSurface::Detail => self.detail_snapshot = Some(snapshot),
+        self.list_snapshot = Some(snapshot);
+        self.list_snapshot_event_ids = event_ids;
+    }
+
+    fn set_detail_snapshot(&mut self, snapshot: TextSnapshot, event_id: Option<String>) {
+        let changed = self.detail_snapshot.as_ref().is_some_and(|current| {
+            current != &snapshot || self.detail_snapshot_event_id != event_id
+        });
+        if changed {
+            self.clear_surface_transients(LogsTextSurface::Detail);
         }
+        self.detail_snapshot = Some(snapshot);
+        self.detail_snapshot_event_id = event_id;
     }
 
     fn clear_snapshot(&mut self, surface: LogsTextSurface) {
         match surface {
-            LogsTextSurface::List => self.list_snapshot = None,
-            LogsTextSurface::Detail => self.detail_snapshot = None,
+            LogsTextSurface::List => {
+                self.list_snapshot = None;
+                self.list_snapshot_event_ids.clear();
+            }
+            LogsTextSurface::Detail => {
+                self.detail_snapshot = None;
+                self.detail_snapshot_event_id = None;
+            }
         }
         self.clear_surface_transients(surface);
     }
@@ -1096,6 +1125,9 @@ impl Logs {
 
     fn selected_text_target(&self) -> Option<LogsCopyTarget> {
         let current = self.text_selection?;
+        if current.surface == LogsTextSurface::Detail {
+            self.current_resolved_detail()?;
+        }
         let snapshot = self.snapshot(current.surface)?;
         Some(LogsCopyTarget {
             text: snapshot.selected_text(current.selection)?,
@@ -1148,20 +1180,22 @@ impl Logs {
     }
 
     fn copy_current_selection_or_row(&mut self) -> bool {
-        let Some(target) = self
-            .selected_text_target()
-            .or_else(|| self.selected_list_row_target())
-        else {
+        let target = if self.text_selection.is_some() {
+            self.selected_text_target()
+        } else {
+            self.selected_list_row_target()
+        };
+        let Some(target) = target else {
             return false;
         };
         self.copy_target(target)
     }
 
     fn copy_detail(&mut self) -> bool {
-        let text = match &self.detail {
-            DetailState::Ready(detail) => detail.clipboard_text(),
-            DetailState::Loading => return false,
+        let Some(detail) = self.current_resolved_detail() else {
+            return false;
         };
+        let text = detail.clipboard_text();
         let anchor = self
             .detail_snapshot
             .as_ref()
@@ -1187,7 +1221,10 @@ impl Logs {
             LogsTextSurface::List => self.last_list_area,
             LogsTextSurface::Detail => self.last_detail_area.unwrap_or(clicked_snapshot.area),
         };
-        let target = if let Some(selected) = self.selected_text_target() {
+        let target = if self.text_selection.is_some() {
+            let Some(selected) = self.selected_text_target() else {
+                return false;
+            };
             selected
         } else {
             let Some(point) = clicked_snapshot.point_at(column, row) else {
@@ -1211,7 +1248,7 @@ impl Logs {
                     }
                 }
                 LogsTextSurface::Detail => {
-                    let DetailState::Ready(detail) = &self.detail else {
+                    let Some(detail) = self.current_resolved_detail() else {
                         return false;
                     };
                     LogsCopyTarget {
@@ -1232,6 +1269,18 @@ impl Logs {
             surface: clicked_surface,
         });
         true
+    }
+
+    fn current_resolved_detail(&self) -> Option<&LogDetail> {
+        let selected_idx = self.selected_event_idx()?;
+        let selected_id = self.events.get(selected_idx)?.id.as_str();
+        if self.detail_request_id.as_deref() != Some(selected_id) {
+            return None;
+        }
+        match &self.detail {
+            DetailState::Ready(detail) => Some(detail),
+            DetailState::Loading => None,
+        }
     }
 
     fn activate_copy_menu(&mut self) -> bool {
@@ -1930,9 +1979,11 @@ mod tests {
     #[tokio::test]
     async fn active_detail_selection_wins_over_right_clicked_list_row() {
         let mut logs = test_logs();
-        logs.events.push(sample_entry());
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
         logs.detail_open = true;
-        logs.detail = DetailState::Ready(LogDetail::from_preview(&sample_entry()));
         draw(&mut logs, 100, 18);
 
         let detail = logs.detail_snapshot.as_ref().expect("detail snapshot");
@@ -1960,9 +2011,11 @@ mod tests {
     #[tokio::test]
     async fn copy_shortcut_prefers_selection_and_whole_detail_y_still_works() {
         let mut logs = test_logs();
-        logs.events.push(sample_entry());
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
         logs.detail_open = true;
-        logs.detail = DetailState::Ready(LogDetail::from_preview(&sample_entry()));
         draw(&mut logs, 100, 18);
 
         let detail_area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
@@ -2098,9 +2151,11 @@ mod tests {
     #[tokio::test]
     async fn detail_scroll_snapshot_change_dismisses_selection_and_menu() {
         let mut logs = test_logs();
-        logs.events.push(sample_entry());
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
         logs.detail_open = true;
-        logs.detail = DetailState::Ready(LogDetail::from_preview(&sample_entry()));
         draw(&mut logs, 100, 12);
 
         let area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
@@ -2113,5 +2168,83 @@ mod tests {
         draw(&mut logs, 100, 12);
         assert!(logs.text_selection.is_none());
         assert!(logs.copy_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn filtering_to_no_rows_clears_stale_detail_copy_state() {
+        let mut logs = test_logs();
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
+        logs.detail_open = true;
+        draw(&mut logs, 100, 12);
+
+        let detail_area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
+        assert!(logs.open_copy_menu(detail_area.x, detail_area.y));
+
+        let anchor = logs.cursor_anchor();
+        logs.search_query = "does-not-match".into();
+        logs.refilter(anchor);
+
+        assert!(logs.list_state.selected().is_none());
+        assert!(matches!(logs.detail, DetailState::Loading));
+        assert!(logs.detail_request_id.is_none());
+        assert!(logs.copy_menu.is_none());
+        assert!(!logs.copy_detail());
+
+        draw(&mut logs, 100, 12);
+        let detail_area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
+        assert!(!logs.open_copy_menu(detail_area.x, detail_area.y));
+    }
+
+    #[tokio::test]
+    async fn identical_list_cells_with_new_event_id_dismiss_copy_menu() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        draw(&mut logs, 100, 12);
+
+        let list_area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+        assert!(logs.open_copy_menu(list_area.x, list_area.y));
+
+        logs.events[0].id = "replacement-event-id".into();
+        draw(&mut logs, 100, 12);
+
+        assert!(logs.copy_menu.is_none());
+        assert_eq!(logs.list_snapshot_event_ids, ["replacement-event-id"]);
+    }
+
+    #[tokio::test]
+    async fn changed_detail_event_id_rejects_stale_resolved_payload() {
+        let mut logs = test_logs();
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
+        logs.detail_open = true;
+        draw(&mut logs, 100, 12);
+
+        let detail_area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
+        assert!(logs.open_copy_menu(detail_area.x, detail_area.y));
+
+        logs.events[0].id = "replacement-event-id".into();
+        draw(&mut logs, 100, 12);
+
+        assert!(logs.copy_menu.is_none());
+        assert_eq!(
+            logs.detail_snapshot_event_id.as_deref(),
+            Some("replacement-event-id")
+        );
+        assert!(!logs.copy_detail());
+
+        assert!(logs.begin_text_drag(detail_area.x, detail_area.y));
+        assert!(logs.update_text_drag(detail_area.x + 5, detail_area.y));
+        logs.finish_text_drag();
+        assert!(logs.selected_text_target().is_none());
+        assert!(!logs.copy_current_selection_or_row());
+
+        let list_area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+        assert!(!logs.open_copy_menu(list_area.x, list_area.y));
+        assert!(!logs.open_copy_menu(detail_area.x, detail_area.y));
     }
 }
