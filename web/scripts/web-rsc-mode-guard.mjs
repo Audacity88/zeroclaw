@@ -79,6 +79,8 @@ const forbiddenRscIdentifiers = new Set([
   "unstable_reactRouterRSC",
 ]);
 const forbiddenCodeGenerationIdentifiers = new Set(["eval", "Function"]);
+const timerNames = new Set(["setTimeout", "setInterval"]);
+const globalObjectNames = new Set(["globalThis", "self", "window"]);
 const expectedVitePluginNames = [
   "vite:react-babel",
   "vite:react:refresh-wrapper",
@@ -115,6 +117,13 @@ function assertInsideWebRoot(candidate, webRoot, nodeModulesRoot, context, rejec
   }
   if (rejectNodeModules && isInside(nodeModulesRoot, resolved)) {
     fail(`${context} reaches skipped node_modules: ${resolved}`);
+  }
+}
+
+function assertOutsideSkippedDist(candidate, distRoot, context) {
+  const resolved = path.resolve(candidate);
+  if (isInside(distRoot, resolved)) {
+    fail(`${context} reaches skipped web/dist: ${resolved}`);
   }
 }
 
@@ -199,6 +208,21 @@ function parseSource(filePath, source) {
   return sourceFile;
 }
 
+function unwrapTimerHandler(node) {
+  let current = node;
+  while (
+    current &&
+    (ts.isParenthesizedExpression(current) ||
+      ts.isAsExpression(current) ||
+      ts.isTypeAssertionExpression(current) ||
+      ts.isNonNullExpression(current) ||
+      current.kind === ts.SyntaxKind.SatisfiesExpression)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
 function isServerEntry(filePath) {
   const basename = path.basename(filePath);
   return (
@@ -229,6 +253,427 @@ function inspectSource(filePath, source, records) {
   const sourceFile = parseSource(filePath, source);
   const relative = path.basename(filePath);
 
+  function isScopeNode(node) {
+    return (
+      ts.isSourceFile(node) ||
+      ts.isBlock(node) ||
+      ts.isModuleBlock(node) ||
+      ts.isClassLike(node) ||
+      ts.isFunctionLike(node) ||
+      ts.isForStatement(node) ||
+      ts.isForInStatement(node) ||
+      ts.isForOfStatement(node) ||
+      ts.isCatchClause(node)
+    );
+  }
+
+  function nearestScope(node) {
+    let current = node;
+    while (current && !isScopeNode(current)) {
+      current = current.parent;
+    }
+    return current ?? sourceFile;
+  }
+
+  function outerScope(scope) {
+    return scope === sourceFile ? null : nearestScope(scope.parent);
+  }
+
+  const bindingsByScope = new Map();
+  const promiseResolverCandidates = [];
+
+  function addBinding(scope, name, callable) {
+    if (!name) {
+      return;
+    }
+    let bindings = bindingsByScope.get(scope);
+    if (!bindings) {
+      bindings = new Map();
+      bindingsByScope.set(scope, bindings);
+    }
+    if (bindings.has(name)) {
+      const binding = bindings.get(name);
+      binding.callable &&= callable;
+      return binding;
+    }
+    const binding = { callable, mutated: false };
+    bindings.set(name, binding);
+    return binding;
+  }
+
+  function addBindingNames(scope, name, callable = false) {
+    if (ts.isIdentifier(name)) {
+      return [addBinding(scope, name.text, callable)];
+    }
+    const bindings = [];
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) {
+        bindings.push(...addBindingNames(scope, element.name, callable));
+      }
+    }
+    return bindings;
+  }
+
+  function resolveBindingFromScope(scope, name) {
+    let current = scope;
+    while (current) {
+      const binding = bindingsByScope.get(current)?.get(name);
+      if (binding) {
+        return binding;
+      }
+      current = outerScope(current);
+    }
+    return null;
+  }
+
+  function variableScope(declaration) {
+    const declarationList = declaration.parent;
+    if (declarationList.flags & ts.NodeFlags.Var) {
+      let current = declaration.parent;
+      while (current && !ts.isSourceFile(current) && !ts.isFunctionLike(current)) {
+        current = current.parent;
+      }
+      return current ?? sourceFile;
+    }
+    return nearestScope(declaration);
+  }
+
+  function isPromiseResolverParameter(parameter) {
+    const functionLike = parameter.parent;
+    if (
+      !ts.isFunctionLike(functionLike) ||
+      functionLike.parameters[0] !== parameter
+    ) {
+      return false;
+    }
+    let promiseConstructor = functionLike.parent;
+    while (promiseConstructor && ts.isParenthesizedExpression(promiseConstructor)) {
+      promiseConstructor = promiseConstructor.parent;
+    }
+    return (
+      ts.isNewExpression(promiseConstructor) &&
+      ts.isIdentifier(promiseConstructor.expression) &&
+      promiseConstructor.expression.text === "Promise" &&
+      promiseConstructor.arguments?.[0] &&
+      unwrapTimerHandler(promiseConstructor.arguments[0]) === functionLike
+    );
+  }
+
+  function collectBindings(node) {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      addBinding(nearestScope(node.parent), node.name.text, true);
+    }
+    if (ts.isFunctionExpression(node) && node.name) {
+      addBinding(node, node.name.text, false);
+    }
+    if (ts.isClassDeclaration(node) && node.name) {
+      addBinding(nearestScope(node.parent), node.name.text, false);
+    }
+    if (ts.isClassExpression(node) && node.name) {
+      addBinding(node, node.name.text, false);
+    }
+    if (ts.isImportClause(node)) {
+      if (node.name) {
+        addBinding(sourceFile, node.name.text, false);
+      }
+      const named = node.namedBindings;
+      if (named && ts.isNamespaceImport(named)) {
+        addBinding(sourceFile, named.name.text, false);
+      } else if (named && ts.isNamedImports(named)) {
+        for (const element of named.elements) {
+          addBinding(sourceFile, element.name.text, false);
+        }
+      }
+    }
+    if (ts.isParameter(node)) {
+      const bindings = addBindingNames(node.parent, node.name);
+      if (isPromiseResolverParameter(node)) {
+        promiseResolverCandidates.push({ binding: bindings[0], functionLike: node.parent });
+      }
+    }
+    if (ts.isVariableDeclaration(node)) {
+      const initializer = node.initializer && unwrapTimerHandler(node.initializer);
+      const declarationList = node.parent;
+      addBindingNames(
+        variableScope(node),
+        node.name,
+        ts.isIdentifier(node.name) &&
+          Boolean(
+            declarationList.flags & ts.NodeFlags.Const &&
+              initializer &&
+              (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)),
+          ),
+      );
+    }
+    ts.forEachChild(node, collectBindings);
+  }
+
+  function markAssignedBindings(node, scope) {
+    const target = unwrapTimerHandler(node);
+    if (ts.isIdentifier(target)) {
+      const binding = resolveBindingFromScope(scope, target.text);
+      if (binding) {
+        binding.mutated = true;
+      }
+      return;
+    }
+    if (ts.isArrayLiteralExpression(target)) {
+      for (const element of target.elements) {
+        if (!ts.isOmittedExpression(element)) {
+          markAssignedBindings(element, scope);
+        }
+      }
+      return;
+    }
+    if (ts.isObjectLiteralExpression(target)) {
+      for (const property of target.properties) {
+        if (ts.isShorthandPropertyAssignment(property)) {
+          markAssignedBindings(property.name, scope);
+        } else if (ts.isPropertyAssignment(property)) {
+          markAssignedBindings(property.initializer, scope);
+        } else if (ts.isSpreadAssignment(property)) {
+          markAssignedBindings(property.expression, scope);
+        }
+      }
+      return;
+    }
+    if (ts.isSpreadElement(target)) {
+      markAssignedBindings(target.expression, scope);
+    }
+  }
+
+  function collectAssignedNames(node) {
+    if (ts.isIdentifier(node)) {
+      const binding = resolveBindingFromScope(nearestScope(node.parent), node.text);
+      if (binding) {
+        binding.mutated = true;
+      }
+      return;
+    }
+    markAssignedBindings(node, nearestScope(node.parent));
+  }
+
+  function collectMutations(node) {
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    ) {
+      collectAssignedNames(node.left);
+    } else if (
+      (ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
+      !ts.isVariableDeclarationList(node.initializer)
+    ) {
+      markAssignedBindings(node.initializer, nearestScope(node.initializer));
+    } else if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      (node.operator === ts.SyntaxKind.PlusPlusToken ||
+        node.operator === ts.SyntaxKind.MinusMinusToken)
+    ) {
+      collectAssignedNames(node.operand);
+    }
+    ts.forEachChild(node, collectMutations);
+  }
+
+  function isCallableIdentifier(node) {
+    let scope = nearestScope(node.parent);
+    while (scope) {
+      const bindings = bindingsByScope.get(scope);
+      if (bindings?.has(node.text)) {
+        const binding = bindings.get(node.text);
+        return binding.callable && !binding.mutated;
+      }
+      scope = outerScope(scope);
+    }
+    return false;
+  }
+
+  function isCallableTimerHandler(node) {
+    const handler = unwrapTimerHandler(node);
+    return (
+      ts.isArrowFunction(handler) ||
+      ts.isFunctionExpression(handler) ||
+      (ts.isIdentifier(handler) && isCallableIdentifier(handler))
+    );
+  }
+
+  function timerName(expression) {
+    const timerExpression = unwrapTimerHandler(expression);
+    if (
+      ts.isIdentifier(timerExpression) &&
+      timerNames.has(timerExpression.text) &&
+      !resolveBindingFromScope(nearestScope(timerExpression.parent), timerExpression.text)
+    ) {
+      return timerExpression.text;
+    }
+    if (
+      ts.isPropertyAccessExpression(timerExpression) &&
+      ts.isIdentifier(timerExpression.expression) &&
+      globalObjectNames.has(timerExpression.expression.text) &&
+      !resolveBindingFromScope(
+        nearestScope(timerExpression.expression.parent),
+        timerExpression.expression.text,
+      ) &&
+      timerNames.has(timerExpression.name.text)
+    ) {
+      return timerExpression.name.text;
+    }
+    return null;
+  }
+
+  function isInsideTypeNode(node) {
+    let current = node.parent;
+    while (current && current !== sourceFile) {
+      if (ts.isTypeNode(current)) {
+        return true;
+      }
+      current = current.parent;
+    }
+    return false;
+  }
+
+  function isDirectCallCallee(node) {
+    let current = node;
+    while (
+      current.parent &&
+      (ts.isParenthesizedExpression(current.parent) ||
+        ts.isAsExpression(current.parent) ||
+        ts.isTypeAssertionExpression(current.parent) ||
+        ts.isNonNullExpression(current.parent) ||
+        current.parent.kind === ts.SyntaxKind.SatisfiesExpression)
+    ) {
+      current = current.parent;
+    }
+    return ts.isCallExpression(current.parent) && current.parent.expression === current;
+  }
+
+  function isUnshadowedGlobalIdentifier(node) {
+    return (
+      ts.isIdentifier(node) &&
+      globalObjectNames.has(node.text) &&
+      !resolveBindingFromScope(nearestScope(node.parent), node.text)
+    );
+  }
+
+  function isReflectiveGlobalAccess(node) {
+    return (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === "Reflect" &&
+      !resolveBindingFromScope(nearestScope(node.expression.parent), "Reflect") &&
+      node.arguments[0] &&
+      isUnshadowedGlobalIdentifier(unwrapTimerHandler(node.arguments[0]))
+    );
+  }
+
+  function objectGlobalPropertyAccess(node) {
+    if (
+      !ts.isCallExpression(node) ||
+      !ts.isPropertyAccessExpression(node.expression) ||
+      !ts.isIdentifier(node.expression.expression) ||
+      node.expression.expression.text !== "Object" ||
+      resolveBindingFromScope(nearestScope(node.expression.parent), "Object") ||
+      !node.arguments[0] ||
+      !isUnshadowedGlobalIdentifier(unwrapTimerHandler(node.arguments[0]))
+    ) {
+      return null;
+    }
+    return node.expression.name.text;
+  }
+
+  function isPropertyNameIdentifier(node) {
+    const parent = node.parent;
+    if (
+      (ts.isImportSpecifier(parent) ||
+        ts.isExportSpecifier(parent) ||
+        ts.isBindingElement(parent)) &&
+      parent.propertyName === node
+    ) {
+      return true;
+    }
+    return (
+      (ts.isMethodDeclaration(parent) ||
+        ts.isPropertyAccessExpression(parent) ||
+        ts.isPropertyDeclaration(parent) ||
+        ts.isGetAccessorDeclaration(parent) ||
+        ts.isSetAccessorDeclaration(parent) ||
+        ts.isMethodSignature(parent) ||
+        ts.isPropertySignature(parent) ||
+        ts.isPropertyAssignment(parent) ||
+        ts.isJsxAttribute(parent)) &&
+      parent.name === node
+    );
+  }
+
+  function isAllowedGlobalObjectUse(node) {
+    let current = node;
+    while (
+      current.parent &&
+      (ts.isParenthesizedExpression(current.parent) ||
+        ts.isAsExpression(current.parent) ||
+        ts.isTypeAssertionExpression(current.parent) ||
+        ts.isNonNullExpression(current.parent) ||
+        current.parent.kind === ts.SyntaxKind.SatisfiesExpression)
+    ) {
+      current = current.parent;
+    }
+    const parent = current.parent;
+    if (
+      (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+      parent.expression === current
+    ) {
+      return true;
+    }
+    if (ts.isTypeOfExpression(parent)) {
+      return true;
+    }
+    if (
+      ts.isBinaryExpression(parent) &&
+      parent.operatorToken.kind === ts.SyntaxKind.InKeyword &&
+      parent.right === current
+    ) {
+      return true;
+    }
+    if (ts.isCallExpression(parent) && parent.arguments[0] === current) {
+      const access = objectGlobalPropertyAccess(parent);
+      return access === "defineProperty" && isSafeWindowDataDescriptor(parent);
+    }
+    return false;
+  }
+
+  function isSafeWindowDataDescriptor(node) {
+    if (
+      literalText(node.arguments[1]) !== "window" ||
+      !node.arguments[2] ||
+      !ts.isObjectLiteralExpression(node.arguments[2])
+    ) {
+      return false;
+    }
+    const allowedKeys = new Set(["value", "configurable", "enumerable", "writable"]);
+    return node.arguments[2].properties.every(
+      (property) =>
+        ts.isPropertyAssignment(property) &&
+        ts.isIdentifier(property.name) &&
+        allowedKeys.has(property.name.text),
+    );
+  }
+
+  function verifyTimerHandler(node, name) {
+    if (!node.arguments[0] || !isCallableTimerHandler(node.arguments[0])) {
+      fail(`${relative} ${name} handler is not syntactically proven callable`);
+    }
+  }
+
+  collectBindings(sourceFile);
+  for (const { binding, functionLike } of promiseResolverCandidates) {
+    const scope = nearestScope(functionLike.parent);
+    if (binding && !resolveBindingFromScope(scope, "Promise")) {
+      binding.callable = true;
+    }
+  }
+  collectMutations(sourceFile);
+
   function visit(node) {
     if (ts.isIdentifier(node)) {
       if (forbiddenCodeGenerationIdentifiers.has(node.text)) {
@@ -237,12 +682,67 @@ function inspectSource(filePath, source, records) {
       if (forbiddenRscIdentifiers.has(node.text)) {
         fail(`${relative} contains an unstable RSC API identifier: ${node.text}`);
       }
+      if (
+        timerNames.has(node.text) &&
+        !resolveBindingFromScope(nearestScope(node.parent), node.text) &&
+        !isInsideTypeNode(node) &&
+        !isPropertyNameIdentifier(node) &&
+        !isDirectCallCallee(node)
+      ) {
+        fail(`${relative} uses an indirect global timer reference: ${node.text}`);
+      }
+      if (
+        isUnshadowedGlobalIdentifier(node) &&
+        !isInsideTypeNode(node) &&
+        !isPropertyNameIdentifier(node) &&
+        !isAllowedGlobalObjectUse(node)
+      ) {
+        fail(`${relative} uses an indirect global object reference: ${node.text}`);
+      }
+    }
+
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      timerName(node) &&
+      !isInsideTypeNode(node) &&
+      !isDirectCallCallee(node)
+    ) {
+      fail(`${relative} uses an indirect global timer reference: ${node.name.text}`);
+    }
+
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      isUnshadowedGlobalIdentifier(node.expression) &&
+      node.name.text === "Promise"
+    ) {
+      fail(`${relative} accesses replaceable global Promise state`);
+    }
+
+    if (isReflectiveGlobalAccess(node)) {
+      fail(`${relative} uses forbidden reflective global access`);
+    }
+
+    const objectGlobalAccess = objectGlobalPropertyAccess(node);
+    if (objectGlobalAccess) {
+      if (objectGlobalAccess === "defineProperty") {
+        if (!isSafeWindowDataDescriptor(node)) {
+          fail(`${relative} uses forbidden Object global property access`);
+        }
+      } else if (
+        [
+          "assign",
+          "defineProperties",
+          "getOwnPropertyDescriptor",
+          "getOwnPropertyDescriptors",
+        ].includes(objectGlobalAccess)
+      ) {
+        fail(`${relative} uses forbidden Object global property access`);
+      }
     }
 
     if (
       ts.isElementAccessExpression(node) &&
-      ts.isIdentifier(node.expression) &&
-      ["globalThis", "self", "window"].includes(node.expression.text)
+      isUnshadowedGlobalIdentifier(node.expression)
     ) {
       const key = ts.isStringLiteralLike(node.argumentExpression)
         ? node.argumentExpression.text
@@ -324,6 +824,10 @@ function inspectSource(filePath, source, records) {
     }
 
     if (ts.isCallExpression(node)) {
+      const timer = timerName(node.expression);
+      if (timer) {
+        verifyTimerHandler(node, timer);
+      }
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
       const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
       if (isDynamicImport || isRequire) {
@@ -407,7 +911,7 @@ function parseScriptAttributes(filePath, attributeText) {
   return attributes;
 }
 
-function verifyHtmlScriptTarget(filePath, src, webRoot, nodeModulesRoot) {
+function verifyHtmlScriptTarget(filePath, src, webRoot, nodeModulesRoot, distRoot) {
   if (/[&\s]/.test(src)) {
     fail(`${relativePath(webRoot, filePath)} has an ambiguous script src`);
   }
@@ -431,28 +935,38 @@ function verifyHtmlScriptTarget(filePath, src, webRoot, nodeModulesRoot) {
     ? path.resolve(webRoot, decodedPath.slice(1))
     : path.resolve(path.dirname(filePath), decodedPath);
   assertInsideWebRoot(candidate, webRoot, nodeModulesRoot, "HTML script src", true);
+  assertOutsideSkippedDist(candidate, distRoot, "HTML script src");
   if (!fs.existsSync(candidate)) {
     fail(`${relativePath(webRoot, filePath)} references a missing script src: ${src}`);
   }
   const canonical = fs.realpathSync(candidate);
   assertInsideWebRoot(canonical, webRoot, nodeModulesRoot, "HTML script src", true);
+  assertOutsideSkippedDist(canonical, distRoot, "HTML script src");
   if (!fs.statSync(canonical).isFile()) {
     fail(`${relativePath(webRoot, filePath)} references a non-file script src: ${src}`);
   }
   assertSupportedResolvedFormat(canonical, `${relativePath(webRoot, filePath)} script src ${src}`);
 }
 
-function inspectHtml(filePath, source, records, webRoot, nodeModulesRoot) {
+function inspectHtml(filePath, source, records, webRoot, nodeModulesRoot, distRoot) {
+  const markupSource = source.replace(/<!--[\s\S]*?-->/g, (comment) => " ".repeat(comment.length));
   const openingPattern = /<script\b/gi;
+  let markupStart = 0;
   while (true) {
-    const opening = openingPattern.exec(source);
+    const opening = openingPattern.exec(markupSource);
     if (!opening) {
+      if (/<base(?=[\s/>])/i.test(markupSource.slice(markupStart))) {
+        fail(`${relativePath(webRoot, filePath)} contains a base element`);
+      }
       break;
+    }
+    if (/<base(?=[\s/>])/i.test(markupSource.slice(markupStart, opening.index))) {
+      fail(`${relativePath(webRoot, filePath)} contains a base element`);
     }
     let tagEnd = opening.index + opening[0].length;
     let quote = null;
-    for (; tagEnd < source.length; tagEnd += 1) {
-      const character = source[tagEnd];
+    for (; tagEnd < markupSource.length; tagEnd += 1) {
+      const character = markupSource[tagEnd];
       if (quote) {
         if (character === quote) {
           quote = null;
@@ -463,12 +977,12 @@ function inspectHtml(filePath, source, records, webRoot, nodeModulesRoot) {
         break;
       }
     }
-    if (tagEnd >= source.length || quote) {
+    if (tagEnd >= markupSource.length || quote) {
       fail(`${relativePath(webRoot, filePath)} has a malformed script tag`);
     }
     const attributes = parseScriptAttributes(
       filePath,
-      source.slice(opening.index + opening[0].length, tagEnd),
+      markupSource.slice(opening.index + opening[0].length, tagEnd),
     );
     const srcAttributes = attributes.filter(({ name }) => name === "src");
     if (srcAttributes.length > 1) {
@@ -483,17 +997,19 @@ function inspectHtml(filePath, source, records, webRoot, nodeModulesRoot) {
         srcAttributes[0].value,
         webRoot,
         nodeModulesRoot,
+        distRoot,
       );
     }
 
     const closePattern = /<\/script\s*>/gi;
     closePattern.lastIndex = tagEnd + 1;
-    const closing = closePattern.exec(source);
+    const closing = closePattern.exec(markupSource);
     if (!closing) {
       fail(`${relativePath(webRoot, filePath)} has an unclosed script tag`);
     }
     inspectSource(filePath, source.slice(tagEnd + 1, closing.index), records);
     openingPattern.lastIndex = closing.index + closing[0].length;
+    markupStart = openingPattern.lastIndex;
   }
 }
 
@@ -627,6 +1143,7 @@ async function verifyImportBoundary(
   webRoot,
   webSourceRoot,
   nodeModulesRoot,
+  distRoot,
   declared,
 ) {
   const packageNameValue = packageName(record.specifier);
@@ -657,18 +1174,36 @@ async function verifyImportBoundary(
         `${relativePath(webRoot, record.filePath)} unresolved import ${record.specifier}`,
         true,
       );
+      assertOutsideSkippedDist(
+        lexicalPath,
+        distRoot,
+        `${relativePath(webRoot, record.filePath)} unresolved import ${record.specifier}`,
+      );
       return;
     }
     if (rawId.startsWith("\0")) {
       fail(`${relativePath(webRoot, record.filePath)} resolves to a virtual module: ${record.specifier}`);
     }
     const resolvedPath = resolvedIdPath(rawId);
+    assertOutsideSkippedDist(
+      resolvedPath,
+      distRoot,
+      `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
+    );
+    const canonicalPath = fs.existsSync(resolvedPath)
+      ? fs.realpathSync(resolvedPath)
+      : resolvedPath;
     assertInsideWebRoot(
-      fs.existsSync(resolvedPath) ? fs.realpathSync(resolvedPath) : resolvedPath,
+      canonicalPath,
       webRoot,
       nodeModulesRoot,
       `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
       true,
+    );
+    assertOutsideSkippedDist(
+      canonicalPath,
+      distRoot,
+      `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
     );
     assertSupportedResolvedFormat(
       resolvedPath,
@@ -690,6 +1225,11 @@ async function verifyImportBoundary(
   if (!isInside(webRoot, canonicalPath)) {
     fail(`${relativePath(webRoot, record.filePath)} resolves outside the guarded web root: ${record.specifier}`);
   }
+  assertOutsideSkippedDist(
+    canonicalPath,
+    distRoot,
+    `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
+  );
 }
 
 async function loadViteServer(webRoot) {
@@ -978,6 +1518,7 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
   const webRoot = fs.realpathSync(webPath);
   const webSourceRoot = fs.realpathSync(path.join(webRoot, "src"));
   const nodeModulesRoot = path.join(webRoot, "node_modules");
+  const distRoot = path.join(webRoot, "dist");
   const declared = declaredPackageNames(path.join(webRoot, "package.json"));
   const records = [];
   for (const filePath of collectSourceFiles(webRoot, webSourceRoot)) {
@@ -986,7 +1527,7 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
     }
     const source = fs.readFileSync(filePath, "utf8");
     if (path.extname(filePath).toLowerCase() === ".html") {
-      inspectHtml(filePath, source, records, webRoot, nodeModulesRoot);
+      inspectHtml(filePath, source, records, webRoot, nodeModulesRoot, distRoot);
     } else {
       inspectSource(filePath, source, records);
     }
@@ -1011,6 +1552,7 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
         webRoot,
         webSourceRoot,
         nodeModulesRoot,
+        distRoot,
         declared,
       );
     }

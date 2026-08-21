@@ -278,6 +278,94 @@ test("code-generation identifiers are rejected without lexical false positives",
   await runGuard(safe.repoRoot);
 });
 
+test("timer handlers must be callable across global timer forms", async (t) => {
+  const cases = [
+    [`setTimeout("import('react-router-dom/server')", 0);`, /handler/],
+    ["setInterval(`import('react-router-dom/server')`, 0);", /handler/],
+    [`setTimeout("import('react-router-dom/" + "server')", 0);`, /handler/],
+    [`window.setTimeout("import('react-router-dom/server')", 0);`, /handler/],
+    ["self.setInterval(`import('react-router-dom/server')`, 0);", /handler/],
+    [`globalThis.setTimeout("import('react-router-dom/server')", 0);`, /handler/],
+    [`const handler = "import('react-router-dom/server')";\nglobalThis.setInterval(handler, 0);`, /handler/],
+    [`function handler() {}\nhandler = "import('react-router-dom/server')";\nsetTimeout(handler, 0);`, /handler/],
+    [`let handler = () => {};\nsetTimeout(handler, 0);`, /handler/],
+    [`setTimeout(unresolved, 0);`, /handler/],
+    [`const defer = globalThis.setInterval;\ndefer("import('react-router-dom/server')", 0);`, /indirect global timer/],
+    [`window.setTimeout.call(window, "import('react-router-dom/server')", 0);`, /indirect global timer/],
+    [`globalThis.setInterval.apply(globalThis, ["import('react-router-dom/server')", 0]);`, /indirect global timer/],
+    [`const defer = self.setTimeout.bind(self);\ndefer("import('react-router-dom/server')", 0);`, /indirect global timer/],
+    [`(0, setTimeout)("import('react-router-dom/server')", 0);`, /indirect global timer/],
+    [`function handler() {}\nfor (handler of ["import('react-router-dom/server')"]) {}\nsetTimeout(handler, 0);`, /handler/],
+    [`function handler() {}\nfor (handler in { "import('react-router-dom/server')": true }) {}\nsetTimeout(handler, 0);`, /handler/],
+    [`class Promise { constructor(executor) { executor("import('react-router-dom/server')"); } }\nnew Promise((resolve) => setTimeout(resolve, 0));`, /handler/],
+    [`globalThis.Promise = class { constructor(executor) { executor("import('react-router-dom/server')"); } };\nnew Promise((resolve) => setTimeout(resolve, 0));`, /global Promise/],
+    [`Reflect.apply(Reflect.get(globalThis, "setTimeout"), globalThis, ["import('react-router-dom/server')", 0]);`, /reflective global access/],
+    [`Object.defineProperty(globalThis, "Promise", { value: class { constructor(executor) { executor("import('react-router-dom/server')"); } } });\nnew Promise((resolve) => setTimeout(resolve, 0));`, /Object global property access/],
+    [`Object.getOwnPropertyDescriptor(globalThis, "setTimeout").value.call(globalThis, "import('react-router-dom/server')", 0);`, /Object global property access/],
+    [`const Factory = class Promise { method() { new Promise((resolve) => setTimeout(resolve, 0)); } };`, /handler/],
+    [`const timers = globalThis;\ntimers.setTimeout("import('react-router-dom/server')", 0);`, /indirect global object/],
+    [`function expose() { return window; }\nexpose().setInterval("import('react-router-dom/server')", 0);`, /indirect global object/],
+    [`Object.defineProperty(globalThis, "timerRoot", { get() { return this; } });\nglobalThis.timerRoot.setTimeout("import('react-router-dom/server')", 0);`, /Object global property access/],
+  ];
+  for (const [source, pattern] of cases) {
+    const { repoRoot } = createFixture(t, { source });
+    await expectFailure(t, repoRoot, new RegExp(`web-rsc-mode-guard: .*${pattern.source}`));
+  }
+
+  const safe = createFixture(t, {
+    source: `
+function direct() {}
+const local = () => {};
+const asserted = (() => {}) as () => void;
+const nonNull = (() => {})!;
+const satisfied = (() => {}) satisfies () => void;
+const Local = class Promise {};
+
+setTimeout(direct, 0);
+window.setInterval(local, 0);
+self.setTimeout(asserted, 0);
+globalThis.setInterval(nonNull, 0);
+setTimeout(satisfied, 0);
+setTimeout(() => {}, 0);
+window.setInterval(function () {}, 0);
+new Promise((resolve) => setTimeout(resolve, 0));
+(setTimeout)(() => {}, 0);
+`,
+  });
+  await runGuard(safe.repoRoot);
+
+  const shadowedMutation = createFixture(t, {
+    source: `
+const handler = () => {};
+const state = {};
+state.handler = "not a binding mutation";
+function unrelated() {
+  let handler;
+  handler = "not the outer handler";
+}
+setTimeout(handler, 0);
+`,
+  });
+  await runGuard(shadowedMutation.repoRoot);
+
+  const localGlobals = createFixture(t, {
+    source: `
+function setTimeout(value) { return value; }
+const window = { setInterval(value) { return value; } };
+const api = { setTimeout() {} };
+class Adapter { setInterval() {} }
+setTimeout("ordinary data");
+window.setInterval("ordinary data");
+api.setTimeout();
+new Adapter().setInterval();
+Object.defineProperty(globalThis, "window", { value: {}, configurable: true });
+const hasCrypto = "crypto" in (globalThis as object);
+delete (globalThis as { window?: unknown }).window;
+`,
+  });
+  await runGuard(localGlobals.repoRoot);
+});
+
 test("HTML script bodies and local root-relative sources are inspected", async (t) => {
   const { repoRoot, webRoot } = createFixture(t);
   fs.writeFileSync(
@@ -285,6 +373,50 @@ test("HTML script bodies and local root-relative sources are inspected", async (
     `<script>const note = "eval Function"; // eval() and Function() are text only</script>\n<script type="module" src="/src/main.tsx"></script>\n`,
   );
   await runGuard(repoRoot);
+});
+
+test("local imports cannot resolve into skipped web/dist", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { distValue } from "../dist/fixture";\nexport { distValue };`,
+  });
+  fs.mkdirSync(path.join(webRoot, "dist"), { recursive: true });
+  fs.writeFileSync(
+    path.join(webRoot, "dist", "fixture.ts"),
+    "export const distValue = true;\n",
+  );
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*dist/);
+});
+
+test("HTML script sources cannot resolve into skipped web/dist", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t);
+  fs.mkdirSync(path.join(webRoot, "dist"), { recursive: true });
+  fs.writeFileSync(path.join(webRoot, "dist", "fixture.js"), "export const distValue = true;\n");
+  // nosemgrep: javascript.lang.security.audit.unknown-value-with-script-tag.unknown-value-with-script-tag -- controlled negative-test fixture
+  fs.writeFileSync(
+    path.join(webRoot, "index.html"),
+    `<script src="/dist/fixture.js"></script>`,
+  );
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*dist/);
+});
+
+test("HTML base elements cannot redirect checked script sources", async (t) => {
+  const cases = [
+    `<base href="/dist/"><script src="fixture.js"></script>`,
+    `<base href="https://example.com/"><script src="fixture.js"></script>`,
+  ];
+  for (const html of cases) {
+    const { repoRoot, webRoot } = createFixture(t);
+    fs.writeFileSync(path.join(webRoot, "fixture.js"), "export {};\n");
+    fs.writeFileSync(path.join(webRoot, "index.html"), html);
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*base element/);
+  }
+
+  const commented = createFixture(t);
+  fs.writeFileSync(
+    path.join(commented.webRoot, "index.html"),
+    `<!-- <base href="/dist/"> --><script>const text = "<base href='/dist/'>";</script>`,
+  );
+  await runGuard(commented.repoRoot);
 });
 
 test("HTML script sources fail closed for nonlocal, malformed, and missing paths", async (t) => {
