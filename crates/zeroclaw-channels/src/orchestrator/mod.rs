@@ -9744,10 +9744,13 @@ pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
     }
 }
 
-fn configured_channel_map(configured: &[ConfiguredChannel]) -> HashMap<String, Arc<dyn Channel>> {
+fn configured_channel_map<'a>(
+    configured: impl IntoIterator<Item = &'a ConfiguredChannel>,
+) -> HashMap<String, Arc<dyn Channel>> {
+    let configured: Vec<_> = configured.into_iter().collect();
     let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
-    for cc in configured {
+    for cc in &configured {
         *name_counts.entry(cc.channel.name()).or_insert(0) += 1;
     }
     for cc in configured {
@@ -9884,11 +9887,11 @@ impl ActiveChannelAliases {
 
     /// Computes the canonical channel-binding view used by collection and
     /// startup checks. Disabled owners never activate channels, while an
-    /// explicit SOP approval route keeps its delivery channel live without
-    /// assigning it to an agent.
+    /// explicit SOP or risk-profile approval route keeps its delivery channel
+    /// live without assigning it to an agent.
     fn compute(config: &Config) -> Self {
         let configured_channel_aliases = config.channels_by_alias();
-        let approval_route_bindings = config
+        let sop_approval_channels = config
             .sop
             .approval
             .policies
@@ -9902,7 +9905,17 @@ impl ActiveChannelAliases {
             .filter_map(|route| {
                 route.and_then(zeroclaw_runtime::sop::approval::channel_route::parse_approval_route)
             })
-            .flat_map(|(channel_key, _)| {
+            .map(|(channel_key, _)| channel_key);
+        let risk_profile_approval_channels = config
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.enabled)
+            .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
+            .filter_map(|profile| profile.approval_route.as_ref())
+            .map(|route| route.approver_channel.as_str());
+        let approval_route_bindings = sop_approval_channels
+            .chain(risk_profile_approval_channels)
+            .flat_map(|channel_key| {
                 if channel_key.contains('.') {
                     return vec![channel_key.to_string()];
                 }
@@ -9941,6 +9954,43 @@ pub fn build_channel_map(
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
     configured_channel_map(&configured)
+}
+
+fn configured_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+    configured: &[ConfiguredChannel],
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let Some(agent) = config.agents.get(agent_alias).filter(|agent| agent.enabled) else {
+        return HashMap::new();
+    };
+    if config
+        .agents
+        .values()
+        .all(|agent| agent.channels.is_empty())
+    {
+        return configured_channel_map(configured);
+    }
+    configured_channel_map(configured.iter().filter(|channel| {
+        let name = channel.channel.name();
+        let composite = composite_channel_key(name, channel.alias.as_deref());
+        agent
+            .channels
+            .iter()
+            .any(|binding| binding.as_str() == composite || binding.as_str() == name)
+    }))
+}
+
+/// Build the configured channel registry visible to one agent's tools.
+/// Explicit bindings are an authorization boundary; the legacy all-channel
+/// fallback applies only when no agent declares any channel binding.
+pub fn build_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    configured_channel_map_for_agent(config, agent_alias, &configured)
 }
 
 pub fn register_channels_for_tools(
@@ -14492,6 +14542,94 @@ temperature = 0.3
         assert!(
             !map.contains_key("discord"),
             "bare key would be ambiguous for multiple aliases"
+        );
+    }
+
+    #[test]
+    fn configured_channel_map_for_agent_enforces_explicit_bindings() {
+        let alpha = mock_channel("discord");
+        let beta = mock_channel("discord");
+        let configured = vec![
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("alpha".to_string()),
+                channel: Arc::clone(&alpha),
+            },
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("beta".to_string()),
+                channel: Arc::clone(&beta),
+            },
+        ];
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.alpha".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.beta".into()],
+                ..Default::default()
+            },
+        );
+
+        let map = configured_channel_map_for_agent(&config, "alpha", &configured);
+
+        assert!(Arc::ptr_eq(map.get("discord.alpha").unwrap(), &alpha));
+        assert!(Arc::ptr_eq(map.get("discord").unwrap(), &alpha));
+        assert!(!map.contains_key("discord.beta"));
+    }
+
+    #[test]
+    fn configured_channel_map_for_agent_preserves_legacy_fallback() {
+        let alpha = mock_channel("discord");
+        let beta = mock_channel("discord");
+        let configured = vec![
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("alpha".to_string()),
+                channel: Arc::clone(&alpha),
+            },
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("beta".to_string()),
+                channel: Arc::clone(&beta),
+            },
+        ];
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "disabled".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let map = configured_channel_map_for_agent(&config, "legacy", &configured);
+
+        assert!(Arc::ptr_eq(map.get("discord.alpha").unwrap(), &alpha));
+        assert!(Arc::ptr_eq(map.get("discord.beta").unwrap(), &beta));
+        assert!(!map.contains_key("discord"));
+        assert!(
+            configured_channel_map_for_agent(&config, "disabled", &configured).is_empty(),
+            "legacy fallback must not grant channels to a disabled agent"
         );
     }
 
@@ -28726,6 +28864,61 @@ This is an example JSON object for profile settings."#;
                 .resolve(&channel_message("discord", Some("ops")))
                 .is_none(),
             "ordinary traffic on the approval-only alias must not reach the worker"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn risk_profile_approval_route_is_live_only_in_approval_map() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                risk_profile: "worker-risk".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "worker-risk".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                    approver_channel: "discord.ops".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let approval_map = build_channel_map(&config);
+        let worker_tool_map = build_channel_map_for_agent(&config, "worker");
+
+        assert!(
+            approval_map.contains_key("discord.ops"),
+            "the worker risk profile's distinct approver must be live"
+        );
+        assert!(worker_tool_map.contains_key("discord.worker"));
+        assert!(
+            !worker_tool_map.contains_key("discord.ops"),
+            "approval-only channel must not become an ordinary worker tool capability"
         );
     }
 

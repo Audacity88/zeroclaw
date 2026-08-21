@@ -3864,8 +3864,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
             // Register channel map factory for late-bound tool handle population.
             zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
-                let config_clone = config.clone();
-                move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::build_channel_map_for_agent(
+                        config,
+                        agent_alias,
+                    )
+                }
+            }));
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|config| {
+                zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
             Box::pin(agent::run(
@@ -4220,6 +4227,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
             #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
+            }));
+
+            // Register the channel map factory for RPC sessions. The factory
+            // receives each session's current config snapshot so daemon reloads
+            // do not retain the startup channel map.
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::build_channel_map_for_agent(
+                        config,
+                        agent_alias,
+                    )
+                },
+            ));
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|config| {
+                zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
             // Wire peripheral tools from zeroclaw-hardware
