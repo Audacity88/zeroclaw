@@ -428,7 +428,7 @@ cli-sop-ws-invalid-approval = sop approval_response 需要 run_id，以及 appro
 cli-sop-ws-resolve-failed = SOP 解析失败：{$error}
 cli-sop-ws-engine-lock-poisoned = SOP 引擎锁已中毒
 cli-sop-ws-subsystem-disabled = SOP 子系统未启用
-cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}创建一个: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
 cli-sop-loaded-header = 已加载的 SOP ({$count}):
 cli-sop-none-to-validate = 未找到可验证的 SOP。
@@ -716,8 +716,8 @@ cli-plugin-install-resolving = 正在从插件注册表解析 '{$source}'...
 cli-plugin-installed-from = 已从 {$source} 安装插件
 cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
 cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
+cli-plugin-config-entry-key = 配置条目键（{$capability}）：{$key}
 cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
-cli-plugin-config-entry-seed-unaddressable = 警告：已跳过为 '{$name}' 创建配置条目：包含 '.' 的插件名称无法通过点分配置路径寻址（`config set` 会按 '.' 分割）。请手动向配置文件添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块。
 cli-config-section-degraded = 警告：{$path} 中的配置部分 `{$section}` 格式不正确，本次运行已重置为默认值。该部分中的值不会生效。请运行 `zeroclaw config migrate` 查看解析错误，然后修复文件。
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。
