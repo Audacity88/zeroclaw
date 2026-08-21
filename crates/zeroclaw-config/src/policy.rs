@@ -1530,12 +1530,11 @@ fn git_archive_remote_selects_helper(args: &[String]) -> bool {
         if arg == "--" {
             return false;
         }
-        if let Some((name, value)) = arg.split_once('=') {
-            if git_arg_is_long_option_or_abbreviation(name, "--remote")
-                && git_arg_selects_remote_helper(value)
-            {
-                return true;
-            }
+        if let Some((name, value)) = arg.split_once('=')
+            && git_arg_is_long_option_or_abbreviation(name, "--remote")
+            && git_arg_selects_remote_helper(value)
+        {
+            return true;
         }
         let separated_remote =
             !arg.contains('=') && git_arg_is_long_option_or_abbreviation(arg, "--remote");
