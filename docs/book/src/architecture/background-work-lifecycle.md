@@ -45,12 +45,11 @@ Current readers remain compatible with legacy status-bearing artifacts and legac
 
 A live cancellation registry maps task IDs to process-local tokens. Cancellation signals the running task when that token is still available and uses a compare-and-set terminal transition in the task store. Completion, failure, cancellation, and recovery therefore cannot overwrite one another after one terminal outcome wins.
 
-After a worker publishes its output, a process-local settlement supervisor keeps
-retrying the terminal compare-and-set with capped backoff until the task store
-recovers or another terminal transition wins. The live cancellation entry is
-retained while settlement is pending. This supervision is durable in state, not
-in execution: if the process exits first, restart recovery marks the abandoned
-row terminal rather than recreating the finished worker.
+Before a background delegate publishes a terminal output artifact, it serializes the exact bytes, computes their SHA-256 digest, and persists a terminal-settlement intent containing the task id, current owner PID and boot identity, desired terminal status, artifact path/reference, digest, and terminal error. The intent is an unapplied transition; `TaskRecord.status` remains the sole persisted lifecycle authority.
+
+The delegate then atomically writes and syncs those exact bytes. A single SQLite transaction compares the still-nonterminal, owner-matched task row to the intent, records the desired terminal status and payload, and deletes the unchanged intent. Store failures before intent persistence retry without publishing the artifact; failures after publication retry promotion in-process. A competing cancellation or other terminal winner is preserved and removes the stale intent.
+
+Startup and periodic recovery process settlement intents before ordinary Lost reconciliation. Recovery acts only after proving the recorded owner is absent or its PID has been reused, validates the artifact bytes against the recorded digest, and resolves a missing or corrupt artifact conservatively as Failed with a persistence/recovery error rather than producing Completed. The random process nonce is not observable through OS process APIs, so PID plus OS start time remains conservative for same-second PID reuse: recovery treats that case as the same owner.
 
 Current delegate and subagent rows populate agent, status, owner PID and process identity, depth, and timestamps. Delegate rows also record the originating agent alias so result, wait, list, and cancellation actions cannot consume another agent's task; subagent rows still leave route absent. Both leave heartbeat, parent task, and principal absent. Startup recovery marks a running row `lost` only when the recorded owner process is provably gone or its PID has been reused; uncertain ownership fails closed. Windows recovery distinguishes a missing PID from access-denied or otherwise ambiguous probes and retains the row when absence cannot be proved. `timed_out` applies only to producers that emit stale heartbeats, which these producers do not currently do. The task row makes an interrupted child visible but does not recreate its execution.
 

@@ -30,10 +30,11 @@ impl ControlPlaneHandle {
     }
 }
 
-/// Daemon-only capability for startup recovery and the periodic reaper.
+/// Runtime-owned capability for startup recovery and the periodic reaper.
 ///
-/// Producers receive [`ControlPlaneHandle`] instead, so opening the shared store
-/// cannot accidentally reclaim work or start another supervisor.
+/// Bare producers receive [`ControlPlaneHandle`] instead, so opening the shared
+/// store cannot accidentally reclaim work or start another supervisor. The daemon
+/// and the isolated non-daemon fallback retain this owner for their process lifetime.
 pub(crate) struct ControlPlaneRecoveryOwner {
     handle: ControlPlaneHandle,
 }
@@ -53,9 +54,9 @@ impl ControlPlaneRecoveryOwner {
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(
-                        ::serde_json::json!({ "reclaimed": reclaimed, "boot_id": boot_id })
+                        ::serde_json::json!({ "reconciled": reclaimed, "boot_id": boot_id })
                     ),
-                "control-plane: reclaimed prior-boot orphan tasks at startup"
+                "control-plane: reconciled prior-boot tasks at startup"
             );
         }
         Ok(Self {
@@ -89,6 +90,10 @@ fn process_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
     IDENTITY.get_or_init(|| {
         let pid = std::process::id();
+        // The nonce makes this process identity unique in persisted records, but
+        // recovery cannot observe it through OS process APIs. Authority therefore
+        // uses PID plus OS start time and conservatively treats same-second reuse
+        // as the same owner.
         let started_at = current_process_started_at()
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".into());

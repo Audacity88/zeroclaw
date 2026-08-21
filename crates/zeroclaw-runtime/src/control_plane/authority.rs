@@ -6,6 +6,13 @@ pub fn is_authoritative(rec: &TaskRecord) -> bool {
     is_authoritative_with_process_probe(rec, process_state)
 }
 
+/// Check the recorded owner independently of the current task row. Recovery uses
+/// this when an intent outlives a stale owner claim or the task row has already
+/// been removed.
+pub(crate) fn is_authoritative_owner(owner_pid: u32, owner_boot_id: &str) -> bool {
+    is_authoritative_owner_with_process_probe(owner_pid, owner_boot_id, process_state)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessState {
     SameProcessAlive,
@@ -17,19 +24,27 @@ fn is_authoritative_with_process_probe(
     rec: &TaskRecord,
     probe: impl Fn(u32, Option<u64>) -> ProcessState,
 ) -> bool {
-    if rec.owner_pid == 0 {
+    is_authoritative_owner_with_process_probe(rec.owner_pid, &rec.owner_boot_id, probe)
+}
+
+fn is_authoritative_owner_with_process_probe(
+    owner_pid: u32,
+    owner_boot_id: &str,
+    probe: impl Fn(u32, Option<u64>) -> ProcessState,
+) -> bool {
+    if owner_pid == 0 {
         return false;
     }
 
-    let expected_started_at = match parse_process_identity(&rec.owner_boot_id) {
-        ProcessIdentity::Structured { pid, started_at } if pid == rec.owner_pid => started_at,
+    let expected_started_at = match parse_process_identity(owner_boot_id) {
+        ProcessIdentity::Structured { pid, started_at } if pid == owner_pid => started_at,
         ProcessIdentity::Structured { .. } => return false,
         ProcessIdentity::Legacy => None,
         ProcessIdentity::Malformed => return false,
     };
 
     matches!(
-        probe(rec.owner_pid, expected_started_at),
+        probe(owner_pid, expected_started_at),
         ProcessState::AbsentOrReused
     )
 }
@@ -61,6 +76,9 @@ fn parse_process_identity(boot_id: &str) -> ProcessIdentity {
         };
         Some(started_at)
     };
+    // The nonce is persisted for uniqueness but is not observable through OS
+    // process APIs. Authority therefore remains conservative when PID and the
+    // OS start time identify the same second.
     if nonce.is_empty() {
         return ProcessIdentity::Malformed;
     }
@@ -225,6 +243,21 @@ mod tests {
             |pid, started_at| {
                 assert_eq!(pid, 42);
                 assert_eq!(started_at, Some(123));
+                ProcessState::SameProcessAlive
+            },
+        ));
+    }
+
+    #[test]
+    fn same_second_pid_reuse_is_conservatively_treated_as_live() {
+        let rec = rec(42, "zc-process-v1:42:123:owner");
+        assert!(!is_authoritative_with_process_probe(
+            &rec,
+            |pid, started_at| {
+                assert_eq!(pid, 42);
+                assert_eq!(started_at, Some(123));
+                // The OS probe exposes PID plus second-resolution start time, not
+                // the random process nonce. Same-second reuse therefore fails closed.
                 ProcessState::SameProcessAlive
             },
         ));

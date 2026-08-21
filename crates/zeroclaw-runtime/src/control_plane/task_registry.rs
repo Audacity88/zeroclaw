@@ -113,6 +113,21 @@ pub struct TaskSnapshot {
     pub error: Option<String>,
 }
 
+/// A durably recorded terminal transition that has not yet been applied to the
+/// canonical [`TaskRecord`]. The intent is recovery metadata, not a second
+/// lifecycle authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSettlementIntent {
+    pub task_id: String,
+    pub owner_pid: u32,
+    pub owner_boot_id: String,
+    pub desired_status: TaskStatus,
+    pub artifact_path: String,
+    pub artifact_ref: Option<String>,
+    pub artifact_sha256: String,
+    pub terminal_error: Option<String>,
+}
+
 /// THE stable seam. One trait, backed once by SQLite. The ACP session store and the
 /// delegate/subagent/peer producers all converge here (CROSS-CUTTING epic-A D1).
 #[async_trait::async_trait]
@@ -140,6 +155,42 @@ pub trait TaskRegistry: Send + Sync {
     ) -> anyhow::Result<bool> {
         let _ = (id, status, output, error);
         anyhow::bail!("task registry does not support atomic terminal transitions")
+    }
+    /// Record an unapplied terminal transition before its artifact is published.
+    /// Returns `false` when the task is no longer non-terminal or owner-matched.
+    async fn persist_terminal_settlement_intent(
+        &self,
+        intent: TerminalSettlementIntent,
+    ) -> anyhow::Result<bool> {
+        let _ = intent;
+        anyhow::bail!("task registry does not support terminal settlement intents")
+    }
+    /// List terminal transitions that still need recovery.
+    async fn list_terminal_settlement_intents(
+        &self,
+    ) -> anyhow::Result<Vec<TerminalSettlementIntent>> {
+        anyhow::bail!("task registry does not support terminal settlement intents")
+    }
+    /// Apply a settlement intent and delete that unchanged intent in one SQLite
+    /// transaction. `resolved_status` is normally the intent's desired status;
+    /// recovery may conservatively resolve a corrupt artifact as `Failed`.
+    async fn promote_terminal_settlement(
+        &self,
+        intent: &TerminalSettlementIntent,
+        resolved_status: TaskStatus,
+        output: Option<String>,
+        error: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let _ = (intent, resolved_status, output, error);
+        anyhow::bail!("task registry does not support terminal settlement intents")
+    }
+    /// Remove an unchanged stale intent without changing the canonical task row.
+    async fn discard_terminal_settlement_intent(
+        &self,
+        intent: &TerminalSettlementIntent,
+    ) -> anyhow::Result<bool> {
+        let _ = intent;
+        anyhow::bail!("task registry does not support terminal settlement intents")
     }
     async fn claim_owner(
         &self,

@@ -10,6 +10,7 @@ use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -1082,7 +1083,8 @@ impl DelegateTool {
                 "background delegation requires a durable task store; root config is unavailable",
             ));
         };
-        type ControlPlaneCell = tokio::sync::OnceCell<crate::control_plane::ControlPlaneHandle>;
+        type ControlPlaneCell =
+            tokio::sync::OnceCell<crate::control_plane::ControlPlaneRecoveryOwner>;
         static CONTROL_PLANES: std::sync::OnceLock<
             parking_lot::Mutex<HashMap<PathBuf, Arc<ControlPlaneCell>>>,
         > = std::sync::OnceLock::new();
@@ -1092,16 +1094,23 @@ impl DelegateTool {
             .entry(data_dir.clone())
             .or_insert_with(|| Arc::new(ControlPlaneCell::new()))
             .clone();
-        cell.get_or_try_init(|| async { crate::control_plane::ControlPlaneHandle::open(&data_dir) })
-            .await
-            .cloned()
+        cell.get_or_try_init(|| async {
+            let owner = crate::control_plane::ControlPlaneRecoveryOwner::start(&data_dir).await?;
+            let _ = owner.spawn_reaper(
+                crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
+                CancellationToken::new(),
+            );
+            Ok::<_, anyhow::Error>(owner)
+        })
+        .await
+        .map(|owner| owner.handle().clone())
     }
 
-    async fn write_result_atomic<T: serde::Serialize>(
-        result_path: &Path,
-        result: &T,
-    ) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec_pretty(result)?;
+    fn serialize_result<T: serde::Serialize>(result: &T) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec_pretty(result)?)
+    }
+
+    async fn write_bytes_atomic(result_path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let tmp_path = result_path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
         let write_result = async {
             let mut file = tokio::fs::OpenOptions::new()
@@ -1109,7 +1118,7 @@ impl DelegateTool {
                 .create_new(true)
                 .open(&tmp_path)
                 .await?;
-            file.write_all(&bytes).await?;
+            file.write_all(bytes).await?;
             file.sync_all().await?;
             drop(file);
             tokio::fs::rename(&tmp_path, result_path).await?;
@@ -1121,6 +1130,21 @@ impl DelegateTool {
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn write_result_atomic<T: serde::Serialize>(
+        result_path: &Path,
+        result: &T,
+    ) -> anyhow::Result<()> {
+        let bytes = Self::serialize_result(result)?;
+        Self::write_bytes_atomic(result_path, &bytes).await
+    }
+
+    fn durable_artifact_path(result_path: &Path) -> anyhow::Result<PathBuf> {
+        if result_path.is_absolute() {
+            return Ok(result_path.to_path_buf());
+        }
+        Ok(std::env::current_dir()?.join(result_path))
     }
 
     #[allow(clippy::unused_async)]
@@ -1153,40 +1177,116 @@ impl DelegateTool {
         result: BackgroundDelegateOutput,
         terminal_status: crate::control_plane::TaskStatus,
         terminal_error: Option<String>,
+        owner_pid: u32,
+        owner_boot_id: String,
     ) -> anyhow::Result<bool> {
         let task_id = result.task_id.clone();
-        let (settled_status, output_ref, settled_error) =
-            match Self::write_result_atomic(result_path, &result).await {
-                Ok(()) => (
-                    terminal_status,
-                    (terminal_status == crate::control_plane::TaskStatus::Completed).then(|| {
-                        format!(
-                            "{}{}",
-                            Self::OUTPUT_ARTIFACT_PREFIX,
-                            result_path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                        )
-                    }),
-                    terminal_error,
-                ),
-                Err(error) => (
+        let bytes = Self::serialize_result(&result)?;
+        let artifact_path = Self::durable_artifact_path(result_path)?;
+        let file_name = result_path
+            .file_name()
+            .ok_or_else(|| anyhow::Error::msg("delegate output path has no file name"))?
+            .to_string_lossy();
+        let output_ref = (terminal_status == crate::control_plane::TaskStatus::Completed)
+            .then(|| format!("{}{}", Self::OUTPUT_ARTIFACT_PREFIX, file_name));
+        let intent = crate::control_plane::task_registry::TerminalSettlementIntent {
+            task_id: task_id.clone(),
+            owner_pid,
+            owner_boot_id,
+            desired_status: terminal_status,
+            artifact_path: artifact_path.to_string_lossy().into_owned(),
+            artifact_ref: output_ref,
+            artifact_sha256: hex::encode(Sha256::digest(&bytes)),
+            terminal_error,
+        };
+
+        if !Self::supervise_settlement_intent(store, &task_id, &intent).await {
+            return Ok(false);
+        }
+
+        if let Err(error) = Self::write_bytes_atomic(&artifact_path, &bytes).await {
+            let persistence_error = format!("failed to persist delegate output: {error:#}");
+            return Ok(Self::supervise_terminal_transition(&task_id, || {
+                store.promote_terminal_settlement(
+                    &intent,
                     crate::control_plane::TaskStatus::Failed,
                     None,
-                    Some(format!("failed to persist delegate output: {error:#}")),
-                ),
-            };
-        drop(result);
+                    Some(persistence_error.clone()),
+                )
+            })
+            .await);
+        }
+
+        let settled_error = intent.terminal_error.clone();
+        let output_ref = intent.artifact_ref.clone();
         Ok(Self::supervise_terminal_transition(&task_id, || {
-            store.transition_terminal(
-                &task_id,
-                settled_status,
+            store.promote_terminal_settlement(
+                &intent,
+                intent.desired_status,
                 output_ref.clone(),
                 settled_error.clone(),
             )
         })
         .await)
+    }
+
+    async fn supervise_settlement_intent(
+        store: &dyn crate::control_plane::TaskRegistry,
+        task_id: &str,
+        intent: &crate::control_plane::task_registry::TerminalSettlementIntent,
+    ) -> bool {
+        let mut failures = 0_u32;
+        loop {
+            match store
+                .persist_terminal_settlement_intent(intent.clone())
+                .await
+            {
+                Ok(ready) => {
+                    if failures > 0 {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Write
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": task_id,
+                                "attempts": failures + 1,
+                                "intent_persisted": ready,
+                            })),
+                            "background delegate settlement intent recovered"
+                        );
+                    }
+                    return ready;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures.is_power_of_two() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Write
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": task_id,
+                                "attempt": failures,
+                                "error": format!("{error:#}"),
+                            })),
+                            "background delegate settlement intent will retry"
+                        );
+                    }
+                }
+            }
+
+            let multiplier = 1_u32 << failures.saturating_sub(1).min(8);
+            let delay = Self::TERMINAL_TRANSITION_RETRY_DELAY
+                .saturating_mul(multiplier)
+                .min(Self::TERMINAL_SETTLEMENT_MAX_RETRY_DELAY);
+            tokio::time::sleep(delay).await;
+        }
     }
 
     async fn supervise_terminal_transition<F, Fut>(task_id: &str, mut transition: F) -> bool
@@ -1970,6 +2070,8 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let nested_task_control_plane = Arc::clone(&self.task_control_plane);
         let terminal_store = Arc::clone(&task_control_plane.store);
+        let terminal_owner_pid = std::process::id();
+        let terminal_owner_boot_id = task_control_plane.boot_id.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
@@ -2067,6 +2169,8 @@ impl DelegateTool {
                     final_result,
                     terminal_status,
                     terminal_error,
+                    terminal_owner_pid,
+                    terminal_owner_boot_id,
                 )
                 .await
                 .expect("output persistence failures are converted into terminal task failures");
@@ -3786,6 +3890,8 @@ mod tests {
                 result,
                 TaskStatus::Completed,
                 None,
+                0,
+                "test-boot".into(),
             )
             .await
             .unwrap()
@@ -3799,6 +3905,236 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.starts_with("failed to persist delegate output:"))
         );
+    }
+
+    #[tokio::test]
+    async fn successful_in_process_settlement_removes_its_intent() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "settlement-success";
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        let temp = TempDir::new().unwrap();
+        let result_path = temp.path().join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("done".into()),
+        };
+
+        assert!(
+            DelegateTool::settle_background_task(
+                &store,
+                &result_path,
+                result,
+                TaskStatus::Completed,
+                None,
+                0,
+                "test-boot".into(),
+            )
+            .await
+            .unwrap()
+        );
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Completed);
+        assert_eq!(
+            snapshot.output.as_deref(),
+            Some("artifact:settlement-success.json")
+        );
+        assert!(
+            store
+                .list_terminal_settlement_intents()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_settlement_is_readable_through_the_background_view() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "settlement-recovered";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.owner_pid = 999_999;
+        task.owner_boot_id = "boot-old".into();
+        store.create(task).await.unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let results_dir = temp.path().join("delegate_results");
+        tokio::fs::create_dir_all(&results_dir).await.unwrap();
+        let result_path = results_dir.join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("done".into()),
+        };
+        let bytes = DelegateTool::serialize_result(&result).unwrap();
+        tokio::fs::write(&result_path, &bytes).await.unwrap();
+        store
+            .persist_terminal_settlement_intent(
+                crate::control_plane::task_registry::TerminalSettlementIntent {
+                    task_id: task_id.into(),
+                    owner_pid: 999_999,
+                    owner_boot_id: "boot-old".into(),
+                    desired_status: TaskStatus::Completed,
+                    artifact_path: result_path.display().to_string(),
+                    artifact_ref: Some(format!(
+                        "{}{task_id}.json",
+                        DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                    )),
+                    artifact_sha256: hex::encode(Sha256::digest(&bytes)),
+                    terminal_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::control_plane::reaper::recovery_pass(store.as_ref(), "boot-new")
+                .await
+                .unwrap(),
+            1
+        );
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+        let (state, view, error) = tool
+            .read_background_view(task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(state, BackgroundResultState::Completed);
+        assert_eq!(view["output"], "done");
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "real child process and production 60-second recovery interval"]
+    async fn non_daemon_reaper_recovers_exited_child_settlement_for_await_sessions() {
+        struct ChildGuard(std::process::Child);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut child = ChildGuard(
+            std::process::Command::new(current_exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "control_plane::boot::tests::live_owner_process_helper",
+                ])
+                .env("ZEROCLAW_LIVE_OWNER_TEST_HELPER", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let child_pid = child.0.id();
+        let pid = sysinfo::Pid::from_u32(child_pid);
+        let mut child_started_at = None;
+        for _ in 0..50 {
+            let mut system = sysinfo::System::new();
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            child_started_at = system
+                .process(pid)
+                .map(sysinfo::Process::start_time)
+                .filter(|value| *value > 0);
+            if child_started_at.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_started_at = child_started_at.expect("child process should be visible");
+        let child_identity = format!("zc-process-v1:{child_pid}:{child_started_at}:test-owner");
+
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let workspace_dir = temp.path().join("workspace");
+        let root_config = Arc::new(Config {
+            data_dir,
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_root_config(root_config)
+            .with_workspace_dir(workspace_dir)
+            .with_caller_alias("caller");
+        let control_plane = tool.background_control_plane().await.unwrap();
+        let task_id = "66666666-6666-4666-8666-666666666666";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.owner_pid = child_pid;
+        task.owner_boot_id = child_identity.clone();
+        control_plane.store.create(task).await.unwrap();
+
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        let result_path = tool.results_dir().join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("recovered child output".into()),
+        };
+        let bytes = DelegateTool::serialize_result(&result).unwrap();
+        DelegateTool::write_bytes_atomic(&result_path, &bytes)
+            .await
+            .unwrap();
+        control_plane
+            .store
+            .persist_terminal_settlement_intent(
+                crate::control_plane::task_registry::TerminalSettlementIntent {
+                    task_id: task_id.into(),
+                    owner_pid: child_pid,
+                    owner_boot_id: child_identity,
+                    desired_status: TaskStatus::Completed,
+                    artifact_path: result_path.display().to_string(),
+                    artifact_ref: Some(format!(
+                        "{}{task_id}.json",
+                        DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                    )),
+                    artifact_sha256: hex::encode(Sha256::digest(&bytes)),
+                    terminal_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Let the reaper's immediate first tick observe the still-live owner. The
+        // next production interval must recover only after that process exits.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            control_plane
+                .store
+                .get(task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Running
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+
+        let awaited = tool
+            .handle_await_sessions(&json!({
+                "task_ids": [task_id],
+                "timeout_ms": 65_000,
+            }))
+            .await
+            .unwrap();
+        assert!(awaited.success, "await failed: {:?}", awaited.error);
+        let payload: serde_json::Value = serde_json::from_str(&awaited.output).unwrap();
+        assert_eq!(payload["status"], "complete");
+        assert_eq!(payload["completed"], 1);
+        assert_eq!(payload["results"][0]["status"], "completed");
+        assert_eq!(payload["results"][0]["output"], "recovered child output");
     }
 
     #[tokio::test]
@@ -3834,6 +4170,8 @@ mod tests {
                 result,
                 TaskStatus::Completed,
                 None,
+                0,
+                "test-boot".into(),
             )
             .await
             .unwrap()
