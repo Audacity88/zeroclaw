@@ -1436,6 +1436,7 @@ fn git_subcommand_selects_transfer_program(
 
 fn git_arg_is_clone_process_control(arg: &str) -> bool {
     git_arg_is_long_option_or_abbreviation(arg, "--config")
+        || git_arg_is_long_option_or_abbreviation(arg, "--template")
         || git_arg_eq(arg, "-u")
         || git_arg_starts_with(arg, "-u")
 }
@@ -5321,6 +5322,8 @@ mod tests {
             "git archive --exec ./helper HEAD",
             "git clone --config core.sshCommand=./helper ssh://example.invalid/repo ./dst",
             "git clone --config=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --template=./hooks https://example.invalid/repo ./dst",
+            "git clone --template ./hooks https://example.invalid/repo ./dst",
             "git clone -u ./helper ssh://example.invalid/repo ./dst",
             "git clone -u./helper ssh://example.invalid/repo ./dst",
             "git STATUS",
@@ -5331,6 +5334,7 @@ mod tests {
             "git push --exe=./helper origin main",
             "git archive --exe=./helper HEAD",
             "git clone --conf=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --temp=./hooks https://example.invalid/repo ./dst",
             "git ls-remote 'ext::sh -c true'",
             "git fetch helper::payload",
             "git clone ext::helper ./dst",
