@@ -5,6 +5,14 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { createServer, loadConfigFromFile } from "vite";
 
+const arrayIsArray = Array.isArray;
+const objectEntries = Object.entries;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectHasOwn = Object.hasOwn;
+const mapHas = Map.prototype.has.call.bind(Map.prototype.has);
+const setHas = Set.prototype.has.call.bind(Set.prototype.has);
+const weakSetHas = WeakSet.prototype.has.call.bind(WeakSet.prototype.has);
+
 const errorPrefix = "web-rsc-mode-guard:";
 const scriptPath = fileURLToPath(import.meta.url);
 const defaultRepoRoot = path.resolve(path.dirname(scriptPath), "../..");
@@ -94,6 +102,20 @@ const expectedVitePluginNames = [
   "zeroclaw-dev-app-prefix",
 ];
 const serveOnlyVitePluginName = "zeroclaw-dev-app-prefix";
+const allowedViteConfigProperties = new Set([
+  "base",
+  "plugins",
+  "resolve",
+  "build",
+  "server",
+]);
+const allowedViteResolveProperties = new Set(["alias"]);
+const allowedViteBuildProperties = new Set(["outDir", "target"]);
+const allowedViteServerProperties = new Set(["allowedHosts", "proxy"]);
+const viteInternalAliasSources = new Set([
+  "^\\/?@vite\\/env",
+  "^\\/?@vite\\/client",
+]);
 
 export class GuardError extends Error {}
 
@@ -1093,47 +1115,177 @@ function resolvedIdPath(rawId) {
 }
 
 function aliasEntries(alias) {
-  if (Array.isArray(alias)) {
+  if (arrayIsArray(alias)) {
     return alias;
   }
   if (alias && typeof alias === "object") {
-    return Object.entries(alias).map(([find, replacement]) => ({ find, replacement }));
+    return objectEntries(alias).map(([find, replacement]) => ({ find, replacement }));
   }
   return [];
 }
 
-function aliasMatchesAt(entry) {
-  if (entry.find === "@") {
-    return true;
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object" || arrayIsArray(value)) {
+    return false;
+  }
+  const prototype = objectGetPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function enumerableOwnKeys(value, location) {
+  const keys = [];
+  for (const key in value) {
+    if (!objectHasOwn(value, key)) {
+      fail(`Vite configuration contains an inherited property at ${location || "root"}: ${key}`);
+    }
+    keys.push(key);
+  }
+  return keys;
+}
+
+function isViteInternalAlias(entry) {
+  const normalizedReplacement =
+    typeof entry?.replacement === "string"
+      ? entry.replacement.replaceAll("\\", "/")
+      : null;
+  return (
+    entry?.find instanceof RegExp &&
+    entry.find.flags === "" &&
+    setHas(viteInternalAliasSources, entry.find.source) &&
+    typeof entry.replacement === "string" &&
+    normalizedReplacement.includes("/vite/dist/client/")
+  );
+}
+
+function aliasMatchesSpecifier(entry, specifier) {
+  if (!isPlainObject(entry)) {
+    return false;
+  }
+  if (typeof entry.find === "string") {
+    return specifier === entry.find || specifier.startsWith(`${entry.find}/`);
   }
   if (entry.find instanceof RegExp) {
     entry.find.lastIndex = 0;
-    return entry.find.test("@");
+    return entry.find.test(specifier);
   }
   return false;
 }
 
-function verifyEffectiveAlias(server, webRoot, webSourceRoot, nodeModulesRoot) {
-  const entries = aliasEntries(server.config.resolve?.alias);
-  const matching = entries.filter(aliasMatchesAt);
-  if (matching.length !== 1) {
-    fail("effective Vite configuration must contain exactly one @ alias");
+function hasNonApprovedAliasForSpecifier(server, specifier) {
+  return aliasEntries(server.config.resolve?.alias).some(
+    (entry) =>
+      isPlainObject(entry) &&
+      !isViteInternalAlias(entry) &&
+      entry.find !== "@" &&
+      aliasMatchesSpecifier(entry, specifier),
+  );
+}
+
+function verifyAliasEntries(
+  alias,
+  webRoot,
+  webSourceRoot,
+  nodeModulesRoot,
+  context,
+) {
+  const entries = aliasEntries(alias);
+  if (
+    entries.length !== 1 ||
+    !isPlainObject(entries[0]) ||
+    entries[0].find !== "@"
+  ) {
+    fail(`${context} configuration must contain exactly one @ alias`);
   }
-  const replacement = matching[0].replacement;
-  if (typeof replacement !== "string") {
-    fail("effective Vite @ alias must have a string replacement");
+  const entry = entries[0];
+  if (
+    enumerableOwnKeys(entry, `${context} @ alias`).some(
+      (key) => !["find", "replacement"].includes(key),
+    )
+  ) {
+    fail(`${context} @ alias has unsupported properties`);
   }
-  const aliasRoot = path.resolve(webRoot, replacement);
+  if (typeof entry.replacement !== "string") {
+    fail(`${context} @ alias must have a string replacement`);
+  }
+  const aliasRoot = path.resolve(webRoot, entry.replacement);
   const checkedAliasRoot = fs.existsSync(aliasRoot) ? fs.realpathSync(aliasRoot) : aliasRoot;
   assertInsideWebRoot(
     checkedAliasRoot,
     webRoot,
     nodeModulesRoot,
-    "effective Vite @ alias",
+    `${context} @ alias`,
     true,
   );
   if (checkedAliasRoot !== webSourceRoot) {
-    fail("effective Vite @ alias must be rooted at web/src");
+    fail(`${context} @ alias must be rooted at web/src`);
+  }
+}
+
+function verifyEffectiveAlias(server, webRoot, webSourceRoot, nodeModulesRoot) {
+  // Vite adds its two client aliases after loading user config; the raw user
+  // configuration is checked separately below, so only these known aliases are exempt.
+  const entries = aliasEntries(server.config.resolve?.alias).filter(
+    (entry) => !isViteInternalAlias(entry),
+  );
+  verifyAliasEntries(
+    entries,
+    webRoot,
+    webSourceRoot,
+    nodeModulesRoot,
+    "effective Vite",
+  );
+}
+
+function verifyAllowedViteProperties(value, allowed, location) {
+  if (!isPlainObject(value)) {
+    fail(`Vite configuration ${location} must be a plain object`);
+  }
+  for (const key of enumerableOwnKeys(value, location)) {
+    if (!setHas(allowed, key)) {
+      fail(`Vite configuration ${location} contains an unapproved property: ${key}`);
+    }
+  }
+}
+
+function verifyViteConfigShape(config, webRoot, webSourceRoot, nodeModulesRoot) {
+  if (!isPlainObject(config)) {
+    fail("Vite configuration must be a plain object");
+  }
+  verifyNoNestedVitePluginOptions(config);
+  for (const key of enumerableOwnKeys(config, "root")) {
+    if (!setHas(allowedViteConfigProperties, key)) {
+      fail(`Vite configuration contains an unapproved top-level property: ${key}`);
+    }
+  }
+  if (config.base !== undefined && typeof config.base !== "string") {
+    fail("Vite configuration base must be a string");
+  }
+  if (config.resolve !== undefined) {
+    verifyAllowedViteProperties(config.resolve, allowedViteResolveProperties, "resolve");
+    verifyAliasEntries(
+      config.resolve.alias,
+      webRoot,
+      webSourceRoot,
+      nodeModulesRoot,
+      "user Vite",
+    );
+  }
+  if (config.build !== undefined) {
+    verifyAllowedViteProperties(config.build, allowedViteBuildProperties, "build");
+    if (config.build.outDir !== undefined && typeof config.build.outDir !== "string") {
+      fail("Vite configuration build.outDir must be a string");
+    }
+    const target = config.build.target;
+    if (
+      target !== undefined &&
+      typeof target !== "string" &&
+      (!arrayIsArray(target) || target.some((entry) => typeof entry !== "string"))
+    ) {
+      fail("Vite configuration build.target must be a string or string array");
+    }
+  }
+  if (config.server !== undefined) {
+    verifyAllowedViteProperties(config.server, allowedViteServerProperties, "server");
   }
 }
 
@@ -1151,8 +1303,8 @@ async function verifyImportBoundary(
   if (
     !local &&
     !isBuiltinSpecifier(record.specifier) &&
-    !declared.has(packageNameValue) &&
-    !allowedTransitiveImports.has(packageNameValue)
+    !setHas(declared, packageNameValue) &&
+    !setHas(allowedTransitiveImports, packageNameValue)
   ) {
     fail(`${relativePath(webRoot, record.filePath)} imports undeclared package or local alias ${record.specifier}`);
   }
@@ -1225,6 +1377,16 @@ async function verifyImportBoundary(
   if (!isInside(webRoot, canonicalPath)) {
     fail(`${relativePath(webRoot, record.filePath)} resolves outside the guarded web root: ${record.specifier}`);
   }
+  if (
+    isInside(nodeModulesRoot, canonicalPath) &&
+    hasNonApprovedAliasForSpecifier(server, record.specifier)
+  ) {
+    // Direct declared dependencies may resolve into node_modules; an alias
+    // redirect there would hide an unchecked source module from this guard.
+    fail(
+      `${relativePath(webRoot, record.filePath)} bare package import ${record.specifier} is redirected into skipped node_modules: ${canonicalPath}`,
+    );
+  }
   assertOutsideSkippedDist(
     canonicalPath,
     distRoot,
@@ -1232,9 +1394,10 @@ async function verifyImportBoundary(
   );
 }
 
-async function loadViteServer(webRoot) {
+async function loadViteServer(webRoot, configFile) {
   return createServer({
     root: webRoot,
+    configFile,
     appType: "custom",
     logLevel: "silent",
     server: { middlewareMode: true },
@@ -1244,6 +1407,25 @@ async function loadViteServer(webRoot) {
 function propertyName(node) {
   if (ts.isIdentifier(node) || ts.isStringLiteralLike(node)) {
     return node.text;
+  }
+  return null;
+}
+
+function memberChain(node) {
+  if (ts.isIdentifier(node)) {
+    return [node.text];
+  }
+  if (ts.isPropertyAccessExpression(node)) {
+    const parent = memberChain(node.expression);
+    return parent ? [...parent, node.name.text] : null;
+  }
+  if (
+    ts.isElementAccessExpression(node) &&
+    node.argumentExpression &&
+    ts.isStringLiteralLike(node.argumentExpression)
+  ) {
+    const parent = memberChain(node.expression);
+    return parent ? [...parent, node.argumentExpression.text] : null;
   }
   return null;
 }
@@ -1282,6 +1464,122 @@ function unwrapParentheses(node) {
     current = current.expression;
   }
   return current;
+}
+
+function verifyViteConfigHasNoPrototypeMutation(configFile) {
+  const sourceFile = parseSource(configFile, fs.readFileSync(configFile, "utf8"));
+  const allowedImports = new Set([
+    "vite",
+    "@vitejs/plugin-react",
+    "@tailwindcss/vite",
+    "node:url",
+    "path",
+  ]);
+  const intrinsicRoots = new Set([
+    "Array",
+    "Function",
+    "Map",
+    "Object",
+    "Reflect",
+    "Set",
+    "WeakSet",
+  ]);
+  const aliases = new Map();
+
+  function resolvedChain(node) {
+    const raw = memberChain(node);
+    if (!raw) {
+      return null;
+    }
+    const chain = raw[0] === "globalThis" && setHas(intrinsicRoots, raw[1])
+      ? raw.slice(1)
+      : raw;
+    const alias = aliases.get(chain[0]);
+    return alias ? [...alias, ...chain.slice(1)] : chain;
+  }
+
+  for (const statement of sourceFile.statements) {
+    if (ts.isImportDeclaration(statement)) {
+      const moduleName = literalText(statement.moduleSpecifier);
+      if (!statement.importClause || !moduleName || !setHas(allowedImports, moduleName)) {
+        fail("Vite config cannot import side-effect or unapproved modules");
+      }
+    }
+  }
+
+  function collectIntrinsicAliases(node) {
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      const chain = resolvedChain(node.initializer);
+      if (chain && setHas(intrinsicRoots, chain[0])) {
+        if (!ts.isIdentifier(node.name)) {
+          fail("Vite config cannot destructure mutable global intrinsics");
+        }
+        aliases.set(node.name.text, chain);
+      }
+    }
+    ts.forEachChild(node, collectIntrinsicAliases);
+  }
+  collectIntrinsicAliases(sourceFile);
+
+  function rejectPrototypeMutation(node) {
+    const chain = resolvedChain(node);
+    if (chain?.includes("__proto__")) {
+      fail("Vite config cannot use __proto__ properties");
+    }
+    if (chain?.includes("prototype")) {
+      fail("Vite config cannot access mutable object prototypes");
+    }
+    if (chain?.includes("constructor")) {
+      fail("Vite config cannot access dynamic code constructors");
+    }
+    if (
+      ts.isElementAccessExpression(node) &&
+      !ts.isStringLiteralLike(node.argumentExpression) &&
+      setHas(intrinsicRoots, resolvedChain(node.expression)?.[0])
+    ) {
+      fail("Vite config cannot dynamically access mutable global intrinsics");
+    }
+    if (ts.isCallExpression(node)) {
+      const callee = resolvedChain(node.expression)?.join(".");
+      if (
+        [
+          "Object.defineProperty",
+          "Object.defineProperties",
+          "Object.setPrototypeOf",
+          "Reflect.deleteProperty",
+          "Reflect.defineProperty",
+          "Reflect.setPrototypeOf",
+        ].includes(callee)
+      ) {
+        fail("Vite config cannot use prototype mutation primitives");
+      }
+      if (
+        callee === "Object.assign" &&
+        setHas(intrinsicRoots, resolvedChain(node.arguments[0])?.[0])
+      ) {
+        fail("Vite config cannot mutate global intrinsics with Object.assign");
+      }
+      if (["eval", "Function", "globalThis.eval"].includes(callee)) {
+        fail("Vite config cannot use dynamic code execution");
+      }
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      setHas(intrinsicRoots, resolvedChain(node.left)?.[0])
+    ) {
+      fail("Vite config cannot reassign mutable global intrinsics");
+    }
+    if (
+      ts.isDeleteExpression(node) &&
+      setHas(intrinsicRoots, resolvedChain(node.expression)?.[0])
+    ) {
+      fail("Vite config cannot delete mutable global intrinsics");
+    }
+    ts.forEachChild(node, rejectPrototypeMutation);
+  }
+  rejectPrototypeMutation(sourceFile);
 }
 
 function verifyViteConfigPluginSource(configFile) {
@@ -1365,16 +1663,16 @@ function verifyViteConfigPluginSource(configFile) {
   const localProperties = new Map();
   for (const property of localPlugin.properties) {
     const name = property.name ? propertyName(property.name) : null;
-    if (!name || localProperties.has(name)) {
+    if (!name || mapHas(localProperties, name)) {
       fail("Vite config serve-prefix plugin has an unsupported property");
     }
     localProperties.set(name, property);
   }
   if (
     localProperties.size !== 3 ||
-    !localProperties.has("name") ||
-    !localProperties.has("apply") ||
-    !localProperties.has("configureServer")
+    !mapHas(localProperties, "name") ||
+    !mapHas(localProperties, "apply") ||
+    !mapHas(localProperties, "configureServer")
   ) {
     fail("Vite config serve-prefix plugin must contain only name, apply, and configureServer");
   }
@@ -1401,18 +1699,18 @@ function verifyNoNestedVitePluginOptions(config) {
     if (typeof value !== "object" || value === null) {
       return;
     }
-    if (seen.has(value)) {
+    if (weakSetHas(seen, value)) {
       return;
     }
     seen.add(value);
-    const prototype = Object.getPrototypeOf(value);
+    const prototype = objectGetPrototypeOf(value);
     if (
-      (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) ||
-      (Array.isArray(value) && prototype !== Array.prototype)
+      (!arrayIsArray(value) && prototype !== Object.prototype && prototype !== null) ||
+      (arrayIsArray(value) && prototype !== Array.prototype)
     ) {
       fail(`Vite configuration contains a non-plain object at ${location || "root"}`);
     }
-    for (const key of Object.keys(value)) {
+    for (const key of enumerableOwnKeys(value, location)) {
       if (root && key === "plugins") {
         continue;
       }
@@ -1460,7 +1758,7 @@ async function flattenUserPluginOptions(options, flattened = []) {
   if (resolved == null || resolved === false) {
     return flattened;
   }
-  if (Array.isArray(resolved)) {
+  if (arrayIsArray(resolved)) {
     for (const option of resolved) {
       await flattenUserPluginOptions(option, flattened);
     }
@@ -1484,7 +1782,6 @@ async function loadViteUserConfig(webRoot, configFile, command) {
 }
 
 async function verifyVitePlugins(config) {
-  verifyNoNestedVitePluginOptions(config);
   const plugins = await flattenUserPluginOptions(config.plugins);
   const names = plugins.map((plugin) => plugin?.name);
   if (
@@ -1519,6 +1816,15 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
   const webSourceRoot = fs.realpathSync(path.join(webRoot, "src"));
   const nodeModulesRoot = path.join(webRoot, "node_modules");
   const distRoot = path.join(webRoot, "dist");
+  const configCandidates = ["js", "mjs", "cjs", "ts", "mts", "cts"]
+    .map((extension) => path.join(webRoot, `vite.config.${extension}`))
+    .filter((candidate) => fs.existsSync(candidate));
+  if (configCandidates.length !== 1) {
+    fail("guarded web root must contain exactly one Vite config file");
+  }
+  const configFile = fs.realpathSync(configCandidates[0]);
+  assertInsideWebRoot(configFile, webRoot, nodeModulesRoot, "Vite config", true);
+  verifyViteConfigHasNoPrototypeMutation(configFile);
   const declared = declaredPackageNames(path.join(webRoot, "package.json"));
   const records = [];
   for (const filePath of collectSourceFiles(webRoot, webSourceRoot)) {
@@ -1535,16 +1841,16 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
 
   let server;
   try {
-    server = await loadViteServer(webRoot);
+    server = await loadViteServer(webRoot, configFile);
     if (path.resolve(server.config.root) !== webRoot) {
       fail("effective Vite root escapes the guarded web root");
     }
     if (typeof server.config.configFile !== "string") {
       fail("effective Vite configuration must use one config file");
     }
-    const configFile = fs.realpathSync(server.config.configFile);
-    assertInsideWebRoot(configFile, webRoot, nodeModulesRoot, "Vite config", true);
-    verifyEffectiveAlias(server, webRoot, webSourceRoot, nodeModulesRoot);
+    if (fs.realpathSync(server.config.configFile) !== configFile) {
+      fail("effective Vite configuration does not match the prechecked config file");
+    }
     for (const record of records) {
       await verifyImportBoundary(
         server,
@@ -1557,9 +1863,12 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
       );
     }
 
+    verifyEffectiveAlias(server, webRoot, webSourceRoot, nodeModulesRoot);
     verifyViteConfigPluginSource(configFile);
     const serveConfig = await loadViteUserConfig(webRoot, configFile, "serve");
     const buildConfig = await loadViteUserConfig(webRoot, configFile, "build");
+    verifyViteConfigShape(serveConfig, webRoot, webSourceRoot, nodeModulesRoot);
+    verifyViteConfigShape(buildConfig, webRoot, webSourceRoot, nodeModulesRoot);
     await verifyVitePlugins(serveConfig);
     await verifyVitePlugins(buildConfig);
   } finally {

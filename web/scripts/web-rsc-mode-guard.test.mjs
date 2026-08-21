@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
@@ -40,9 +41,20 @@ ${properties}
 }
 
 const validConfig = configWith(`
+  base: "/_app/",
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },
+  build: {
+    outDir: "dist",
+    target: ["chrome111", "edge111", "firefox113", "safari16.2"],
+  },
+  server: {
+    allowedHosts: undefined,
+    proxy: {
+      "/api": { target: "http://127.0.0.1:42617", changeOrigin: true },
     },
   },
 `);
@@ -585,6 +597,31 @@ test("declared packages must resolve to real modules inside web", async (t) => {
   await expectFailure(t, linked.repoRoot, /web-rsc-mode-guard: .*outside the guarded web root/);
 });
 
+test("bare package aliases cannot redirect into skipped web/node_modules", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { hidden } from "foo";\nexport { hidden };`,
+    config: configWith(`
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+      foo: fileURLToPath(new URL("./node_modules/hidden.js", import.meta.url)),
+    },
+  },`),
+  });
+  const packageJson = JSON.parse(fs.readFileSync(path.join(webRoot, "package.json"), "utf8"));
+  packageJson.dependencies.foo = "1.0.0";
+  fs.writeFileSync(
+    path.join(webRoot, "package.json"),
+    `${JSON.stringify(packageJson, null, 2)}\n`,
+  );
+  fs.mkdirSync(path.join(webRoot, "node_modules"), { recursive: true });
+  fs.writeFileSync(
+    path.join(webRoot, "node_modules", "hidden.js"),
+    `import { StaticRouter } from "react-router-dom";\nexport { StaticRouter as hidden };\n`,
+  );
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*node_modules/);
+});
+
 test("virtual package modules fail closed", async (t) => {
   const { repoRoot, webRoot } = createFixture(t, {
     source: `import { page } from "virtual-page";\nexport { page };`,
@@ -701,6 +738,116 @@ ${nested}`),
     });
     await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*nested plugin options/);
   }
+});
+
+test("Vite code-generation configuration options are rejected", async (t) => {
+  const cases = [
+    [
+      `
+  define: {
+    __RSC_INJECT__: "import(\\"react-router-dom\\").then((m) => m.StaticRouter)",
+  },`,
+      /unapproved top-level property: define/,
+      `console.log(__RSC_INJECT__);\n`,
+    ],
+    [
+      `
+  esbuild: {
+    jsxInject: 'import React from "react";',
+  },`,
+      /unapproved top-level property: esbuild/,
+    ],
+    [
+      `
+  worker: {
+    format: "es",
+  },`,
+      /unapproved top-level property: worker/,
+    ],
+    [
+      `
+  ssr: {
+    noExternal: ["react-router-dom"],
+  },`,
+      /unapproved top-level property: ssr/,
+    ],
+    [
+      `
+  build: {
+    rollupOptions: {
+      input: "./src/main.tsx",
+    },
+  },`,
+      /build contains an unapproved property: rollupOptions/,
+    ],
+  ];
+  for (const [properties, pattern, source = validSource] of cases) {
+    const { repoRoot } = createFixture(t, {
+      source,
+      config: configWith(
+        `${properties}
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },`,
+      ),
+    });
+    await expectFailure(t, repoRoot, new RegExp(`web-rsc-mode-guard: .*${pattern.source}`));
+  }
+});
+
+test("inherited enumerable Vite define options are rejected before config execution", async (t) => {
+  const inheritedDefine = `
+Object.defineProperty(Object.prototype, "define", {
+  configurable: true,
+  enumerable: true,
+  value: {
+    __RSC_INJECT__: "import(\\"react-router-dom\\").then((m) => m.StaticRouter)",
+  },
+});
+`;
+  const { repoRoot } = createFixture(t, {
+    source: `console.log(__RSC_INJECT__);\n`,
+    config: validConfig.replace("export default", `${inheritedDefine}\nexport default`),
+  });
+  assert.equal(Object.hasOwn(Object.prototype, "define"), false);
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*prototype mutation primitives/);
+  assert.equal(Object.hasOwn(Object.prototype, "define"), false);
+});
+
+test("aliased intrinsic corruption is rejected in an isolated guard process", (t) => {
+  const intrinsicCorruption = `
+const O = globalThis.Object;
+const originalHasOwn = O.hasOwn;
+const originalSetHas = globalThis.Set.prototype.has;
+O.defineProperty(O.prototype, "define", {
+  configurable: true,
+  enumerable: true,
+  value: {
+    __RSC_INJECT__: "import(\\"react-router-dom\\").then((m) => m.StaticRouter)",
+  },
+});
+O.hasOwn = (value, key) => key === "define" || originalHasOwn(value, key);
+globalThis.Set.prototype.has = function has(value) {
+  return value === "define" || originalSetHas.call(this, value);
+};
+`;
+  const { repoRoot } = createFixture(t, {
+    source: `console.log(__RSC_INJECT__);\n`,
+    config: validConfig.replace("export default", `${intrinsicCorruption}\nexport default`),
+  });
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL("./web-rsc-mode-guard.mjs", import.meta.url))],
+    {
+      encoding: "utf8",
+      env: { ...process.env, ZEROCLAW_RSC_GUARD_ROOT: repoRoot },
+    },
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /web-rsc-mode-guard: .*mutable object prototypes/);
+  assert.equal(Object.hasOwn(Object.prototype, "define"), false);
 });
 
 test("serve-prefix middleware behavior is required", async (t) => {
