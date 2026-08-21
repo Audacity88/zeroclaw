@@ -34,7 +34,7 @@ jobs:
       matrix:
         include:
           - name: Linux cross
-            os: ubuntu-latest
+            os: ubuntu-22.04
             tool: cross
           - name: Windows Tauri CLI
             os: windows-latest

@@ -178,7 +178,7 @@ if grep -Eq '^    (if|needs):' <<<"$smoke_job"; then
   exit 1
 fi
 
-assert_smoke_matrix_entry "Linux cross" "ubuntu-latest" "cross"
+assert_smoke_matrix_entry "Linux cross" "ubuntu-22.04" "cross"
 assert_smoke_matrix_entry "Windows Tauri CLI" "windows-latest" "tauri-cli"
 
 if [[ "$(grep -c '^          - name:' <<<"$smoke_job")" -ne 2 ]]; then
