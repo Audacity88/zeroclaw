@@ -1096,10 +1096,10 @@ impl DelegateTool {
             .clone();
         cell.get_or_try_init(|| async {
             let owner = crate::control_plane::ControlPlaneRecoveryOwner::start(&data_dir).await?;
-            let _ = owner.spawn_reaper(
+            std::mem::drop(owner.spawn_reaper(
                 crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
                 CancellationToken::new(),
-            );
+            ));
             Ok::<_, anyhow::Error>(owner)
         })
         .await
