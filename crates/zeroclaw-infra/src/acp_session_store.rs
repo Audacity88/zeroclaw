@@ -1468,6 +1468,169 @@ mod tests {
     }
 
     #[test]
+    fn interruption_boundaries_restore_transcript_and_provider_safe_history() {
+        struct Case {
+            name: &'static str,
+            fragments: Vec<ConversationMessage>,
+            expected_transcript_tool_counts: (usize, usize),
+            expected_tool_exchange: bool,
+        }
+
+        let tool_call = || ToolCall {
+            id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+            extra_content: None,
+        };
+        let assistant = ConversationMessage::Chat(ChatMessage::assistant("checking"));
+        let call = ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![tool_call()],
+            reasoning_content: None,
+        };
+        let result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "shell".to_string(),
+            content: "/tmp/workspace".to_string(),
+        }]);
+        let cases = [
+            Case {
+                name: "assistant-text",
+                fragments: vec![assistant.clone()],
+                expected_transcript_tool_counts: (0, 0),
+                expected_tool_exchange: false,
+            },
+            Case {
+                name: "tool-call",
+                fragments: vec![assistant.clone(), call.clone()],
+                expected_transcript_tool_counts: (1, 0),
+                expected_tool_exchange: false,
+            },
+            Case {
+                name: "tool-result",
+                fragments: vec![assistant, call, result],
+                expected_transcript_tool_counts: (1, 1),
+                expected_tool_exchange: true,
+            },
+        ];
+
+        for case in cases {
+            let (_tmp, store) = open_store();
+            let session_id = format!("checkpoint-{}", case.name);
+            store
+                .create_session(&session_id, "default", "/tmp/workspace")
+                .unwrap();
+            store
+                .begin_turn_checkpoint(
+                    &session_id,
+                    "turn-1",
+                    &[ConversationMessage::Chat(ChatMessage::user("question"))],
+                )
+                .unwrap();
+            for fragment in case.fragments {
+                store
+                    .append_turn_checkpoint(&session_id, "turn-1", &[fragment])
+                    .unwrap();
+            }
+
+            assert!(
+                store
+                    .recover_turn_checkpoint(&session_id, "stream interrupted")
+                    .unwrap(),
+                "{} checkpoint should recover",
+                case.name
+            );
+            let restored = store.load_session(&session_id).unwrap().unwrap();
+            assert!(
+                matches!(
+                    restored.messages.last(),
+                    Some(ConversationMessage::Chat(marker))
+                        if marker.role == "system" && marker.content == "stream interrupted"
+                ),
+                "{} transcript should end with the interruption marker",
+                case.name
+            );
+            assert!(
+                restored.messages.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat)
+                        if chat.role == "assistant" && chat.content == "checking"
+                ) || matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls { text: Some(text), .. }
+                        if text == "checking"
+                )),
+                "{} transcript should retain visible assistant text",
+                case.name
+            );
+            let transcript_tool_counts =
+                restored
+                    .messages
+                    .iter()
+                    .fold((0, 0), |(calls, results), message| match message {
+                        ConversationMessage::AssistantToolCalls { .. } => (calls + 1, results),
+                        ConversationMessage::ToolResults(_) => (calls, results + 1),
+                        ConversationMessage::Chat(_) => (calls, results),
+                    });
+            assert_eq!(
+                transcript_tool_counts, case.expected_transcript_tool_counts,
+                "{} transcript should retain every visible tool boundary",
+                case.name
+            );
+
+            let provider_history = AcpSessionStore::provider_safe_history(&restored.messages);
+            assert!(
+                provider_history.iter().all(|message| !matches!(
+                    message,
+                    ConversationMessage::Chat(chat) if chat.role == "system"
+                )),
+                "{} provider history should exclude the interruption marker",
+                case.name
+            );
+            assert!(
+                matches!(
+                    provider_history.first(),
+                    Some(ConversationMessage::Chat(user))
+                        if user.role == "user" && user.content == "question"
+                ),
+                "{} provider history should retain the accepted prompt",
+                case.name
+            );
+            assert!(
+                provider_history.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat)
+                        if chat.role == "assistant" && chat.content == "checking"
+                ) || matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls { text: Some(text), .. }
+                        if text == "checking"
+                )),
+                "{} provider history should retain visible assistant text",
+                case.name
+            );
+            let tool_call_count = provider_history
+                .iter()
+                .filter(|message| matches!(message, ConversationMessage::AssistantToolCalls { .. }))
+                .count();
+            let tool_result_count = provider_history
+                .iter()
+                .filter(|message| matches!(message, ConversationMessage::ToolResults(_)))
+                .count();
+            assert_eq!(
+                (tool_call_count, tool_result_count),
+                if case.expected_tool_exchange {
+                    (1, 1)
+                } else {
+                    (0, 0)
+                },
+                "{} provider history should contain only a complete tool exchange",
+                case.name
+            );
+        }
+    }
+
+    #[test]
     fn missing_session_has_no_checkpoint_to_recover() {
         let (_tmp, store) = open_store();
 
