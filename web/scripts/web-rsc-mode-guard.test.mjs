@@ -307,6 +307,7 @@ test("HTML script sources fail closed for nonlocal, malformed, and missing paths
 
   const outside = createFixture(t);
   fs.writeFileSync(path.join(outside.repoRoot, "outside.js"), "export const outside = true;\n");
+  // nosemgrep: javascript.lang.security.audit.unknown-value-with-script-tag.unknown-value-with-script-tag -- controlled negative-test fixture
   fs.writeFileSync(
     path.join(outside.webRoot, "index.html"),
     `<script src="../outside.js"></script>`,
@@ -316,6 +317,7 @@ test("HTML script sources fail closed for nonlocal, malformed, and missing paths
   const nodeModules = createFixture(t);
   fs.mkdirSync(path.join(nodeModules.webRoot, "node_modules"), { recursive: true });
   fs.writeFileSync(path.join(nodeModules.webRoot, "node_modules", "local.js"), "export {};\n");
+  // nosemgrep: javascript.lang.security.audit.unknown-value-with-script-tag.unknown-value-with-script-tag -- controlled negative-test fixture
   fs.writeFileSync(
     path.join(nodeModules.webRoot, "index.html"),
     `<script src="/node_modules/local.js"></script>`,
