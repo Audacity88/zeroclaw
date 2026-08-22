@@ -35,7 +35,7 @@ Do not mirror native PR review state into manual board lanes. GitHub PR state ow
 
 This keeps the board useful without asking maintainers to update it after every push, review, or CI run.
 
-Risk and size auto-labeling is a separate workflow question. #9345 may recalculate labels on PR updates only after its risk classifier has completed report-only review and maintainers separately enable mutation. Risk automation must honor `risk:manual` until a maintainer removes that override. The issue-dashboard planner does not apply or recalculate PR risk, size, or type labels.
+Size and risk auto-labeling are separate workflow questions. #9345 may recalculate deterministic size labels on PR updates. Its risk classifier remains report-only until maintainers review the evidence and separately enable risk-label mutation. Risk automation must honor `risk:manual` until a maintainer removes that override. The issue-dashboard planner does not apply or recalculate PR risk, size, or type labels.
 
 ### Issue routing evidence
 
