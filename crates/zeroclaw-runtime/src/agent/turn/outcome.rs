@@ -414,6 +414,66 @@ mod tests {
     }
 
     #[test]
+    fn reliable_provider_failure_kinds_use_their_fluent_messages() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let cases = [
+            (
+                ReliableProviderTerminalFailureKind::ContextWindow,
+                "cli-agent-error-provider-context-window",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Authentication,
+                "cli-agent-error-provider-authentication",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::RateLimited,
+                "cli-agent-error-provider-rate-limited",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ProviderServer,
+                "cli-agent-error-provider-server",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ModelNotFound,
+                "cli-agent-error-provider-model-not-found",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ClientRequest,
+                "cli-agent-error-provider-client-request",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Connection,
+                "cli-agent-error-provider-connection",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Timeout,
+                "cli-agent-error-provider-timeout",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Other,
+                "cli-agent-error-provider-generic",
+            ),
+        ];
+
+        for (kind, key) in cases {
+            let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+                kind,
+                None,
+                "All model providers/models failed after 1 failure event(s).".to_string(),
+            ));
+
+            assert_eq!(
+                terminal_completion_error_message(&error, None),
+                Some(crate::i18n::get_english_cli_string_with_args(key, &[])),
+                "{kind:?} must use its dedicated Fluent message"
+            );
+        }
+    }
+
+    #[test]
     fn disk_catalog_override_changes_delivery_not_the_diagnostic() {
         let error =
             anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
