@@ -1,5 +1,5 @@
 ---
-id: ADR-014
+id: ADR-015
 title: Unified capability catalog is a read-only projection over canonical owners
 date: 2026-08-22
 status: proposed
@@ -13,7 +13,7 @@ relates-to:
   - crates/zeroclaw-plugins/src/config.rs
 ---
 
-# ADR-014: Unified Capability Catalog Is a Read-Only Projection Over Canonical Owners
+# ADR-015: Unified Capability Catalog Is a Read-Only Projection Over Canonical Owners
 
 ## Context
 
