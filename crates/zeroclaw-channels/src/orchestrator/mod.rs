@@ -14772,7 +14772,7 @@ temperature = 0.3
         let cancelled = CancellationToken::new();
         let cancelled_wait = {
             let cancelled = cancelled.clone();
-            tokio::spawn(async move { wait_for_live_channel_registry(&cancelled).await })
+            zeroclaw_spawn::spawn!(async move { wait_for_live_channel_registry(&cancelled).await })
         };
         tokio::task::yield_now().await;
         cancelled.cancel();
@@ -14802,7 +14802,7 @@ temperature = 0.3
 
         let cancel = CancellationToken::new();
         let factory_config = config.clone();
-        let factory = tokio::spawn(async move {
+        let factory = zeroclaw_spawn::spawn!(async move {
             assert!(wait_for_live_channel_registry(&cancel).await);
             (
                 live_channel_map_for_agent(&factory_config, "worker"),
