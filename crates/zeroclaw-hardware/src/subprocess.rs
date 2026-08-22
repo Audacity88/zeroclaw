@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -289,7 +289,48 @@ impl Tool for SubprocessTool {
             Ok(Ok(status)) => status,
         };
 
-        let report = readers.finish(self.process_exit_timeout).await;
+        let line = line.trim();
+        if line.is_empty() {
+            let report = readers.finish(self.process_exit_timeout).await;
+            return Ok(failed_tool_result(append_reader_diagnostics(
+                format!("plugin '{}': empty stdout", self.manifest.tool.name),
+                &report,
+            )));
+        }
+
+        let result = match serde_json::from_str::<ToolResult>(line) {
+            Ok(result) => result,
+            Err(parse_err) => {
+                let report = readers.finish(self.process_exit_timeout).await;
+                return Ok(failed_tool_result(append_reader_diagnostics(
+                    format!(
+                        "plugin '{}': failed to parse output as ToolResult: {} (got: {:?})",
+                        self.manifest.tool.name,
+                        parse_err,
+                        if line.chars().count() > 200 {
+                            let truncated: String = line.chars().take(200).collect();
+                            format!("{}...", truncated)
+                        } else {
+                            line.to_string()
+                        }
+                    ),
+                    &report,
+                )));
+            }
+        };
+
+        if !child_status.success() {
+            let report = readers.finish(self.process_exit_timeout).await;
+            return Ok(failed_tool_result(append_reader_diagnostics(
+                format!(
+                    "plugin '{}' exited with {}",
+                    self.manifest.tool.name, child_status
+                ),
+                &report,
+            )));
+        }
+
+        let report = readers.finish_success().await;
         if report.error.is_some() {
             return Ok(failed_tool_result(append_reader_diagnostics(
                 format!(
@@ -299,43 +340,7 @@ impl Tool for SubprocessTool {
                 &report,
             )));
         }
-
-        let line = line.trim();
-        if line.is_empty() {
-            return Ok(failed_tool_result(append_reader_diagnostics(
-                format!("plugin '{}': empty stdout", self.manifest.tool.name),
-                &report,
-            )));
-        }
-
-        match serde_json::from_str::<ToolResult>(line) {
-            Ok(result) => {
-                if !child_status.success() {
-                    return Ok(failed_tool_result(append_reader_diagnostics(
-                        format!(
-                            "plugin '{}' exited with {}",
-                            self.manifest.tool.name, child_status
-                        ),
-                        &report,
-                    )));
-                }
-                Ok(result)
-            }
-            Err(parse_err) => Ok(failed_tool_result(append_reader_diagnostics(
-                format!(
-                    "plugin '{}': failed to parse output as ToolResult: {} (got: {:?})",
-                    self.manifest.tool.name,
-                    parse_err,
-                    if line.chars().count() > 200 {
-                        let truncated: String = line.chars().take(200).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        line.to_string()
-                    }
-                ),
-                &report,
-            ))),
-        }
+        Ok(result)
     }
 }
 
@@ -516,7 +521,68 @@ struct OutputReaderReport {
     error: Option<String>,
 }
 
+impl OutputReaderReport {
+    fn from_reader_results(
+        stdout_result: Option<Result<std::io::Result<()>, JoinError>>,
+        stderr_result: Option<Result<std::io::Result<Vec<u8>>, JoinError>>,
+    ) -> Self {
+        let mut errors = Vec::new();
+        if let Some(stdout_result) = stdout_result {
+            match stdout_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(format!("stdout: {error}")),
+                Err(error) => errors.push(format!("stdout task: {error}")),
+            }
+        }
+        let stderr = match stderr_result {
+            None => String::new(),
+            Some(Ok(Ok(bytes))) => String::from_utf8_lossy(&bytes).trim().to_string(),
+            Some(Ok(Err(error))) => {
+                errors.push(format!("stderr: {error}"));
+                String::new()
+            }
+            Some(Err(error)) => {
+                errors.push(format!("stderr task: {error}"));
+                String::new()
+            }
+        };
+
+        Self {
+            stderr,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        }
+    }
+}
+
+fn classify_reader_result<T>(
+    abort_requested: bool,
+    result: Result<std::io::Result<T>, JoinError>,
+) -> Option<Result<std::io::Result<T>, JoinError>> {
+    match result {
+        Err(error) if abort_requested && error.is_cancelled() => None,
+        result => Some(result),
+    }
+}
+
 impl OutputReaderTasks {
+    async fn finish_success(mut self) -> OutputReaderReport {
+        let stdout_abort_requested = !self.stdout_task.is_finished();
+        if stdout_abort_requested {
+            self.stdout_task.abort();
+        }
+        let stderr_abort_requested = !self.stderr_task.is_finished();
+        if stderr_abort_requested {
+            self.stderr_task.abort();
+        }
+
+        let stdout_result =
+            classify_reader_result(stdout_abort_requested, (&mut self.stdout_task).await);
+        let stderr_result =
+            classify_reader_result(stderr_abort_requested, (&mut self.stderr_task).await);
+
+        OutputReaderReport::from_reader_results(stdout_result, stderr_result)
+    }
+
     async fn finish(mut self, deadline: Duration) -> OutputReaderReport {
         let drain_deadline = Instant::now() + deadline;
         let stdout_result = match timeout_at(drain_deadline, &mut self.stdout_task).await {
@@ -544,28 +610,7 @@ impl OutputReaderTasks {
             }
         };
 
-        let mut errors = Vec::new();
-        match stdout_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => errors.push(format!("stdout: {error}")),
-            Err(error) => errors.push(format!("stdout task: {error}")),
-        }
-        let stderr = match stderr_result {
-            Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).trim().to_string(),
-            Ok(Err(error)) => {
-                errors.push(format!("stderr: {error}"));
-                String::new()
-            }
-            Err(error) => {
-                errors.push(format!("stderr task: {error}"));
-                String::new()
-            }
-        };
-
-        OutputReaderReport {
-            stderr,
-            error: (!errors.is_empty()).then(|| errors.join("; ")),
-        }
+        OutputReaderReport::from_reader_results(Some(stdout_result), Some(stderr_result))
     }
 }
 
@@ -708,6 +753,39 @@ mod tests {
             .expect("execute should not return Err");
 
         assert!(result.success, "expected success=true, got: {:?}", result);
+        assert_eq!(result.output, "ok");
+        assert!(result.error.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_returns_success_before_descendant_closes_output_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("descendant-pid");
+        let result_json = r#"{"success":true,"output":"ok","error":null}"#;
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\nsleep 60 &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > \"{}\"\nprintf '%s\\n' '{}'\nexit 0\n",
+            pid_path.display(),
+            result_json
+        );
+        let script_path = write_protocol_helper(dir.path(), &script);
+        let tool = SubprocessTool::new(make_manifest("pipe_holder_tool", vec![]), script_path)
+            .with_timeouts(Duration::from_secs(1), Duration::from_millis(100));
+        let execution_result =
+            timeout(Duration::from_secs(1), tool.execute(serde_json::json!({}))).await;
+        let descendant_pid = wait_for_pid_file(&pid_path).await;
+
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", descendant_pid.trim()])
+            .status();
+
+        let result = execution_result
+            .expect("pipe-holding plugin must return before the test deadline")
+            .expect("execute should not return Err");
+        assert!(
+            result.success,
+            "expected the direct child's ToolResult: {result:?}"
+        );
         assert_eq!(result.output, "ok");
         assert!(result.error.is_none());
     }
@@ -905,6 +983,29 @@ mod tests {
 
         assert!(stdout_cancelled.load(Ordering::SeqCst));
         assert!(stderr_cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reader_result_classification_preserves_race_winner_and_suppresses_cancellation() {
+        let retained = classify_reader_result(
+            true,
+            Ok::<std::io::Result<()>, JoinError>(Err(std::io::Error::other(
+                "completed reader I/O error",
+            ))),
+        );
+        let retained_error = match retained {
+            Some(Ok(Err(error))) => error,
+            other => panic!("race-winning reader error must be retained: {other:?}"),
+        };
+        assert_eq!(retained_error.to_string(), "completed reader I/O error");
+
+        let pending_task =
+            zeroclaw_spawn::spawn!(async { std::future::pending::<std::io::Result<()>>().await });
+        pending_task.abort();
+        let cancelled = pending_task.await;
+
+        assert!(matches!(&cancelled, Err(error) if error.is_cancelled()));
+        assert!(classify_reader_result(true, cancelled).is_none());
     }
 
     #[tokio::test]
