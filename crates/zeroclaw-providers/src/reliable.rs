@@ -81,6 +81,7 @@ pub(crate) struct ReliableCallAccounting {
     pending_stream_attempt: Option<ReliableRejectedAttempt>,
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
+    stream_recovery_failure: Option<ProviderErrorDiagnostic>,
 }
 
 impl ReliableCallAccounting {
@@ -317,10 +318,25 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
     });
 }
 
+/// Preserve the classified stream failure while runtime recovers through the
+/// remaining candidates without replaying the failed stream entry.
+pub(crate) fn record_stream_recovery_failure(error: &anyhow::Error) {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting.lock().stream_recovery_failure = Some(provider_error_diagnostic(error));
+    });
+}
+
 fn stream_recovery_was_semantic_empty() -> bool {
     RELIABLE_CALL_ACCOUNTING
         .try_with(|accounting| accounting.lock().stream_recovery_semantic_empty)
         .unwrap_or(false)
+}
+
+fn stream_recovery_failure_diagnostic() -> Option<ProviderErrorDiagnostic> {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().stream_recovery_failure.clone())
+        .ok()
+        .flatten()
 }
 
 /// Take (consume) the last model_provider fallback info, if any.
@@ -1452,6 +1468,22 @@ fn reliable_terminal_error_with_cause(
             provider_error_diagnostic(&cause),
             failure_aggregate(&failures),
             cause,
+        ));
+        if let Some(usage) = rejected_attempt_usage {
+            return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
+                usage,
+                failures,
+                terminal_failure,
+            ));
+        }
+        return terminal_failure;
+    }
+    if !final_cause_is_semantic_empty && let Some(diagnostic) = stream_recovery_failure_diagnostic()
+    {
+        let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            diagnostic.endpoint,
+            failure_aggregate(&failures),
         ));
         if let Some(usage) = rejected_attempt_usage {
             return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
