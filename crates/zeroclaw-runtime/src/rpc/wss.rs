@@ -391,6 +391,7 @@ mod connection_tests {
     }
 
     fn test_tls_acceptor(tmp: &std::path::Path) -> TlsAcceptor {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let CertifiedKey { cert, key_pair } =
             generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_path = tmp.join("cert.pem");

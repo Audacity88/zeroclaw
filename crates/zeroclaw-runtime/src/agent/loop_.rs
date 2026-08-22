@@ -59,24 +59,13 @@ pub async fn load_peripheral_tools(
 /// Channel map factory type — builds `channel_key → Arc<dyn Channel>` map.
 /// Injected by the binary so `zeroclaw-runtime` doesn't depend on
 /// `zeroclaw-channels`.
-type ChannelMapFn = Box<
-    dyn Fn(
-            &zeroclaw_config::schema::Config,
-            &str,
-        )
-            -> std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>
-        + Send
-        + Sync,
->;
-
-type ApprovalChannelMapFn = Box<
-    dyn Fn(
-            &zeroclaw_config::schema::Config,
-        )
-            -> std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>
-        + Send
-        + Sync,
->;
+type ChannelMap =
+    std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>;
+type ChannelMapFactory = dyn Fn(&zeroclaw_config::schema::Config, &str) -> ChannelMap + Send + Sync;
+type ChannelMapFn = Box<ChannelMapFactory>;
+type ApprovalChannelMapFactory =
+    dyn Fn(&zeroclaw_config::schema::Config) -> ChannelMap + Send + Sync;
+type ApprovalChannelMapFn = Box<ApprovalChannelMapFactory>;
 
 /// Channel map factory, injected by the binary.
 static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
@@ -96,13 +85,7 @@ pub fn register_approval_channel_map_fn(f: ApprovalChannelMapFn) {
 }
 
 pub(crate) fn seed_channel_handles_with_factory(
-    factory: &dyn Fn(
-        &zeroclaw_config::schema::Config,
-        &str,
-    ) -> std::collections::HashMap<
-        String,
-        std::sync::Arc<dyn zeroclaw_api::channel::Channel>,
-    >,
+    factory: &ChannelMapFactory,
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
     ask_user_handle: &Option<tools::PerToolChannelHandle>,
@@ -161,12 +144,7 @@ pub(crate) fn seed_channel_handles(
 }
 
 pub(crate) fn approval_channel_registry_with_factory(
-    factory: &dyn Fn(
-        &zeroclaw_config::schema::Config,
-    ) -> std::collections::HashMap<
-        String,
-        std::sync::Arc<dyn zeroclaw_api::channel::Channel>,
-    >,
+    factory: &ApprovalChannelMapFactory,
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tools::PerToolChannelHandle> {
     let map = factory(config);
@@ -3623,7 +3601,10 @@ mod tests {
     #[test]
     fn seed_channel_handles_populates_channel_room_handle() {
         let channel = Arc::new(SeedMockChannel) as Arc<dyn Channel>;
-        let factory = move |_: &zeroclaw_config::schema::Config, _: &str| {
+        let selected_agent = Arc::new(RwLock::new(None));
+        let observed_agent = Arc::clone(&selected_agent);
+        let factory = move |_: &zeroclaw_config::schema::Config, agent_alias: &str| {
+            *observed_agent.write() = Some(agent_alias.to_string());
             let mut map = HashMap::new();
             map.insert("matrix.default".to_string(), Arc::clone(&channel));
             map
@@ -3648,6 +3629,7 @@ mod tests {
         );
 
         assert_eq!(count, 1);
+        assert_eq!(selected_agent.read().as_deref(), Some("test-agent"));
         assert!(ask_user_handle.read().contains_key("matrix.default"));
         assert!(channel_room_handle.read().contains_key("matrix.default"));
         assert!(reaction.read().contains_key("matrix.default"));
