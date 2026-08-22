@@ -587,7 +587,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73 # 17.11-alpine3.24
         env:
           POSTGRES_USER: zeroclaw_test
           POSTGRES_PASSWORD: zeroclaw_test
