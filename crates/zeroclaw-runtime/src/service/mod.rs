@@ -235,6 +235,7 @@ struct ServiceLogWriters {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 impl ServiceLogWriters {
+    #[cfg(any(target_os = "macos", test))]
     fn open_split(stdout_path: &Path, stderr_path: &Path) -> Result<Self> {
         let stdout_log = BoundedServiceLog::open(stdout_path)?;
         let stderr_log = BoundedServiceLog::open(stderr_path)?;
