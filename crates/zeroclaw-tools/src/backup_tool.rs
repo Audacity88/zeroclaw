@@ -17,6 +17,7 @@ use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 /// with SHA-256 manifest integrity checking.
 #[derive(Clone)]
 pub struct BackupTool {
+    data_root: PathBuf,
     include_dirs: Vec<String>,
     max_keep: usize,
     security: Arc<SecurityPolicy>,
@@ -25,10 +26,10 @@ pub struct BackupTool {
 impl BackupTool {
     pub fn new(workspace_dir: PathBuf, include_dirs: Vec<String>, max_keep: usize) -> Self {
         let security = Arc::new(SecurityPolicy {
-            workspace_dir,
+            workspace_dir: workspace_dir.clone(),
             ..SecurityPolicy::default()
         });
-        Self::new_with_security(include_dirs, max_keep, security)
+        Self::new_with_data_root_and_security(workspace_dir, include_dirs, max_keep, security)
     }
 
     pub fn new_with_security(
@@ -36,10 +37,31 @@ impl BackupTool {
         max_keep: usize,
         security: Arc<SecurityPolicy>,
     ) -> Self {
-        Self {
+        Self::new_with_data_root_and_security(
+            security.workspace_dir.clone(),
             include_dirs,
             max_keep,
             security,
+        )
+    }
+
+    pub fn new_with_data_root_and_security(
+        data_root: PathBuf,
+        include_dirs: Vec<String>,
+        max_keep: usize,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
+        // Extend only this tool's policy view; the shared per-agent policy
+        // remains unchanged for every other tool.
+        let mut scoped_security = (*security).clone();
+        if !scoped_security.allowed_roots.contains(&data_root) {
+            scoped_security.allowed_roots.push(data_root.clone());
+        }
+        Self {
+            data_root,
+            include_dirs,
+            max_keep,
+            security: Arc::new(scoped_security),
         }
     }
 
@@ -139,7 +161,7 @@ impl BackupTool {
     }
 
     fn open_workspace(&self) -> anyhow::Result<(PathBuf, Dir)> {
-        let canonical = std::fs::canonicalize(&self.security.workspace_dir)?;
+        let canonical = std::fs::canonicalize(&self.data_root)?;
         if !self.security.is_resolved_path_readable(&canonical) {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-read-blocked",
@@ -152,7 +174,9 @@ impl BackupTool {
     }
 
     fn authorize_write(&self, path: &Path) -> anyhow::Result<()> {
-        if !self.security.is_resolved_path_allowed(path) {
+        if self.security.is_runtime_config_path(path)
+            || !self.security.is_resolved_path_allowed(path)
+        {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-write-blocked",
                 "path",
@@ -277,6 +301,14 @@ impl BackupTool {
         if let Err(error) = validate_backup_name(backup_name) {
             return Ok(rejected(error.to_string()));
         }
+        if confirm
+            && self
+                .security
+                .enforce_tool_operation(ToolOperation::Act, "backup restore")
+                .is_err()
+        {
+            return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
+        }
         let (workspace_path, workspace) = self.open_workspace()?;
         let Some(backups) = open_dir_no_symlinks(&workspace, Path::new("backups"))? else {
             return Ok(rejected(tool_text_arg(
@@ -348,14 +380,6 @@ impl BackupTool {
                 .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
             let destination = open_dir_no_symlinks(&workspace, Path::new(sub))?;
             validate_copy_destination(&src, destination.as_ref(), Path::new(sub))?;
-        }
-
-        if self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "backup restore")
-            .is_err()
-        {
-            return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
         }
 
         for sub in &restore_items {
@@ -1102,6 +1126,8 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
+        let action_blocked = tool_text("tool-backup-error-action-blocked");
+        assert_eq!(result.error.as_deref(), Some(action_blocked.as_str()));
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("config/value.txt")).unwrap(),
             "current-config"
@@ -1110,6 +1136,66 @@ mod tests {
             std::fs::read_to_string(workspace.path().join("memory/value.txt")).unwrap(),
             "current-memory"
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_confirmed_restore_blocks_before_missing_root_access() {
+        let tmp = TempDir::new().unwrap();
+        let shared_data_root = tmp.path().join("missing-shared-data");
+        let agent_workspace = tmp.path().join("missing-agent-workspace");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: agent_workspace,
+            ..SecurityPolicy::default()
+        });
+        let tool = BackupTool::new_with_data_root_and_security(
+            shared_data_root,
+            vec!["config".into()],
+            10,
+            security,
+        );
+
+        let result = tool
+            .execute(json!({
+                "command": "restore",
+                "backup_name": "backup-missing",
+                "confirm": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let action_blocked = tool_text("tool-backup-error-action-blocked");
+        assert_eq!(result.error.as_deref(), Some(action_blocked.as_str()));
+    }
+
+    #[tokio::test]
+    async fn scoped_policy_shares_action_budget_with_original_policy() {
+        let tmp = TempDir::new().unwrap();
+        let agent_workspace = tmp.path().join("agent-workspace");
+        std::fs::create_dir_all(&agent_workspace).unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: agent_workspace,
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let tool = BackupTool::new_with_data_root_and_security(
+            tmp.path().to_path_buf(),
+            vec!["config".into()],
+            10,
+            security.clone(),
+        );
+        security
+            .enforce_tool_operation(ToolOperation::Act, "test setup")
+            .unwrap();
+
+        let result = tool.execute(json!({"command": "create"})).await.unwrap();
+
+        assert!(!result.success);
+        let action_blocked = tool_text("tool-backup-error-action-blocked");
+        assert_eq!(result.error.as_deref(), Some(action_blocked.as_str()));
+        assert!(!tmp.path().join("backups").exists());
     }
 
     #[cfg(unix)]
@@ -1288,7 +1374,8 @@ mod tests {
         let name = parsed["backup"].as_str().unwrap();
 
         // Without confirm: dry-run.
-        let res = tool
+        let read_only = make_tool_with_autonomy(&tmp, AutonomyLevel::ReadOnly);
+        let res = read_only
             .execute(json!({"command": "restore", "backup_name": name}))
             .await
             .unwrap();

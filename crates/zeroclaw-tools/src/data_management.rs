@@ -13,6 +13,7 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// statistics. Confirmed purge is currently unavailable.
 #[derive(Clone)]
 pub struct DataManagementTool {
+    data_root: PathBuf,
     retention_days: u64,
     security: Arc<SecurityPolicy>,
 }
@@ -20,21 +21,40 @@ pub struct DataManagementTool {
 impl DataManagementTool {
     pub fn new(workspace_dir: PathBuf, retention_days: u64) -> Self {
         let security = Arc::new(SecurityPolicy {
-            workspace_dir,
+            workspace_dir: workspace_dir.clone(),
             ..SecurityPolicy::default()
         });
-        Self::new_with_security(retention_days, security)
+        Self::new_with_data_root_and_security(workspace_dir, retention_days, security)
     }
 
     pub fn new_with_security(retention_days: u64, security: Arc<SecurityPolicy>) -> Self {
-        Self {
+        Self::new_with_data_root_and_security(
+            security.workspace_dir.clone(),
             retention_days,
             security,
+        )
+    }
+
+    pub fn new_with_data_root_and_security(
+        data_root: PathBuf,
+        retention_days: u64,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
+        // Extend only this tool's policy view; the shared per-agent policy
+        // remains unchanged for every other tool.
+        let mut scoped_security = (*security).clone();
+        if !scoped_security.allowed_roots.contains(&data_root) {
+            scoped_security.allowed_roots.push(data_root.clone());
+        }
+        Self {
+            data_root,
+            retention_days,
+            security: Arc::new(scoped_security),
         }
     }
 
     fn open_workspace(&self) -> anyhow::Result<Dir> {
-        let canonical = std::fs::canonicalize(&self.security.workspace_dir)?;
+        let canonical = std::fs::canonicalize(&self.data_root)?;
         if !self.security.is_resolved_path_readable(&canonical) {
             return Err(data_boundary_violation(tool_text_arg(
                 "tool-data-management-error-read-blocked",
