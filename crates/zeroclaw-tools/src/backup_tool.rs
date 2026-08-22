@@ -1036,6 +1036,8 @@ mod tests {
         std::fs::write(outside.join("manifest.json"), "{}").unwrap();
 
         let tool = make_tool_at(&workspace, AutonomyLevel::Supervised);
+        let expected_error =
+            tool_text_arg("tool-backup-error-contained", "path", "../backup-escape");
         for command in ["verify", "restore"] {
             let result = tool
                 .execute(json!({
@@ -1046,7 +1048,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!result.success);
-            assert!(result.error.as_deref().unwrap_or("").contains("workspace"));
+            assert_eq!(result.error.as_deref(), Some(expected_error.as_str()));
         }
 
         assert!(outside.join("manifest.json").exists());
