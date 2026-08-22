@@ -497,16 +497,8 @@ async fn supervise_desktop_child(
         .context("desktop daemon stderr pipe unavailable")?;
     let stdout_sink = writers.stdout.clone();
     let stderr_sink = writers.stderr.clone();
-    let stdout_task = zeroclaw_spawn::spawn!(drain_service_pipe(
-        stdout,
-        stdout_sink,
-        "desktop"
-    ));
-    let stderr_task = zeroclaw_spawn::spawn!(drain_service_pipe(
-        stderr,
-        stderr_sink,
-        "desktop"
-    ));
+    let stdout_task = zeroclaw_spawn::spawn!(drain_service_pipe(stdout, stdout_sink, "desktop"));
+    let stderr_task = zeroclaw_spawn::spawn!(drain_service_pipe(stderr, stderr_sink, "desktop"));
     #[cfg(unix)]
     let outcome = wait_for_service_child(&mut child, &mut signals).await;
     #[cfg(not(unix))]
@@ -2390,6 +2382,56 @@ mod macos_plist_tests {
 mod bounded_service_log_tests {
     use super::*;
 
+    const DESKTOP_CAPTURE_TEST_CHILD_ENV: &str = "ZEROCLAW_DESKTOP_CAPTURE_TEST_CHILD";
+
+    fn desktop_capture_test_command(mode: &str) -> TokioCommand {
+        let executable = std::env::current_exe().expect("resolve current test binary");
+        let mut command = TokioCommand::new(executable);
+        command
+            .arg("desktop_capture_subprocess_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(DESKTOP_CAPTURE_TEST_CHILD_ENV, mode);
+        command
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for desktop capture tests"]
+    fn desktop_capture_subprocess_helper() {
+        use std::io::Write as _;
+
+        match std::env::var(DESKTOP_CAPTURE_TEST_CHILD_ENV).as_deref() {
+            Ok("streams") => {
+                std::io::stdout()
+                    .write_all(b"stdout-value")
+                    .expect("write stdout fixture");
+                std::io::stderr()
+                    .write_all(b"stderr-value")
+                    .expect("write stderr fixture");
+                std::process::exit(0);
+            }
+            Ok("compact") => {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(&vec![b'x'; 9 * 1024 * 1024])
+                    .expect("write compaction fixture");
+                stdout
+                    .write_all(b"desktop-newest-output")
+                    .expect("write newest output fixture");
+                stdout.flush().expect("flush compaction fixture");
+                std::process::exit(0);
+            }
+            Ok("nonzero") => {
+                std::io::stderr()
+                    .write_all(b"child-output")
+                    .expect("write nonzero fixture");
+                std::process::exit(7);
+            }
+            mode => panic!("unexpected desktop capture helper mode: {mode:?}"),
+        }
+    }
+
     #[test]
     fn opening_oversized_log_keeps_newest_bytes() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2562,18 +2604,13 @@ mod bounded_service_log_tests {
         assert!(stderr.contains("daemon child exited with status"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn desktop_capture_combines_both_child_streams() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("desktop-daemon.log");
-        run_with_desktop_capture(path.clone(), || {
-            let mut command = TokioCommand::new("/bin/sh");
-            command.args(["-c", "printf stdout-value; printf stderr-value >&2"]);
-            Ok(command)
-        })
-        .await
-        .expect("capture child output");
+        run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("streams")))
+            .await
+            .expect("capture child output");
 
         let log = fs::read(path).expect("read combined desktop log");
         assert!(
@@ -2586,21 +2623,13 @@ mod bounded_service_log_tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn desktop_capture_compacts_continuous_output_and_preserves_newest() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("desktop-daemon.log");
-        run_with_desktop_capture(path.clone(), || {
-            let mut command = TokioCommand::new("/bin/sh");
-            command.args([
-                "-c",
-                "dd if=/dev/zero bs=1048576 count=9 2>/dev/null | tr '\\000' x; printf desktop-newest-output",
-            ]);
-            Ok(command)
-        })
-        .await
-        .expect("capture continuous child output");
+        run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("compact")))
+            .await
+            .expect("capture continuous child output");
 
         let log = fs::read(&path).expect("read compacted desktop log");
         assert!(log.len() as u64 <= SERVICE_LOG_MAX_BYTES);
@@ -2626,18 +2655,14 @@ mod bounded_service_log_tests {
         assert!(log.contains("Failed to start desktop daemon child"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn desktop_capture_records_nonzero_child_exit() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("desktop-daemon.log");
-        let error = run_with_desktop_capture(path.clone(), || {
-            let mut command = TokioCommand::new("/bin/sh");
-            command.args(["-c", "printf child-output >&2; exit 7"]);
-            Ok(command)
-        })
-        .await
-        .expect_err("child should fail");
+        let error =
+            run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("nonzero")))
+                .await
+                .expect_err("child should fail");
 
         assert!(error.to_string().contains("status"));
         let log = fs::read_to_string(path).expect("read nonzero-exit diagnostics");
