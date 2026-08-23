@@ -11643,9 +11643,7 @@ mod approval_route_tests {
             &self,
             recipient: &str,
             request: &ChannelApprovalRequest,
-        ) -> anyhow::Result<
-            Option<zeroclaw_api::channel::AttributedApprovalResponse>,
-        > {
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
             if matches!(&self.behavior, StubBehavior::RuntimeTimeout) {
                 return Ok(Some(
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
@@ -11655,9 +11653,11 @@ mod approval_route_tests {
                 ));
             }
 
-            self.request_approval(recipient, request).await.map(|response| {
-                response.map(zeroclaw_api::channel::AttributedApprovalResponse::operator)
-            })
+            self.request_approval(recipient, request)
+                .await
+                .map(|response| {
+                    response.map(zeroclaw_api::channel::AttributedApprovalResponse::operator)
+                })
         }
     }
 
@@ -11864,9 +11864,7 @@ mod approval_route_tests {
                 decider: Some(decider),
                 source: zeroclaw_api::channel::ApprovalSource::Operator,
             } => assert_eq!(decider, "ops"),
-            _ => panic!(
-                "an operator denial must remain final under inherit-originator: {out:?}"
-            ),
+            _ => panic!("an operator denial must remain final under inherit-originator: {out:?}"),
         }
     }
 
