@@ -3606,54 +3606,51 @@ fn render_tool_entry(
         }
     };
 
-    let parsed: Option<serde_json::Value> = match name {
-        "file_edit" | "file_write" => serde_json::from_str(input_json).ok(),
-        _ => None,
-    };
-
     let body_start = lines.len();
     match name {
         "file_edit" => {
-            let input = parsed.as_ref();
-            let old = input
-                .and_then(|v| v.get("old_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let new = input
-                .and_then(|v| v.get("new_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             if expanded {
+                let input: Option<serde_json::Value> = serde_json::from_str(input_json).ok();
+                let input = input.as_ref();
+                let old = input
+                    .and_then(|v| v.get("old_string"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new = input
+                    .and_then(|v| v.get("new_string"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 push_text(lines, "input", &terminal_safe_tool_text(input_json));
+                let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
+                let ext = input.and_then(|v| file_ext(v));
+                let start_line = path
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|content| {
+                        content
+                            .find(old)
+                            .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
+                    })
+                    .unwrap_or(1);
+                lines.extend(diff::diff_lines(
+                    &terminal_safe_tool_text(old),
+                    &terminal_safe_tool_text(new),
+                    ext,
+                    start_line,
+                ));
             }
-            let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
-            let ext = input.and_then(|v| file_ext(v));
-            let start_line = path
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|content| {
-                    content
-                        .find(old)
-                        .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
-                })
-                .unwrap_or(1);
-            lines.extend(diff::diff_lines(
-                &terminal_safe_tool_text(old),
-                &terminal_safe_tool_text(new),
-                ext,
-                start_line,
-            ));
         }
         "file_write" => {
-            let input = parsed.as_ref();
-            let content = input
-                .and_then(|v| v.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             if expanded {
+                let input: Option<serde_json::Value> = serde_json::from_str(input_json).ok();
+                let input = input.as_ref();
+                let content = input
+                    .and_then(|v| v.get("content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 push_text(lines, "input", &terminal_safe_tool_text(input_json));
+                let ext = input.and_then(|v| file_ext(v));
+                lines.extend(diff::write_lines(&terminal_safe_tool_text(content), ext));
             }
-            let ext = input.and_then(|v| file_ext(v));
-            lines.extend(diff::write_lines(&terminal_safe_tool_text(content), ext));
         }
         _ => {
             let input = if expanded {
@@ -10811,7 +10808,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_file_tools_keep_specialized_preview_and_complete_raw_input() {
+    fn file_tool_disclosure_controls_raw_input_and_specialized_preview() {
         let edit_input = serde_json::json!({
             "path": "/tmp/example.rs",
             "old_string": "fn old() {}",
@@ -10842,9 +10839,11 @@ mod tests {
             false,
         );
         let collapsed_edit_text = rendered_text(&collapsed_edit_lines);
-        assert!(collapsed_edit_text.contains("fn old() {}"));
-        assert!(collapsed_edit_text.contains("fn new() {}"));
+        assert!(collapsed_edit_text.starts_with("▶ [tool: file_edit]"));
+        assert!(!collapsed_edit_text.contains("fn old() {}"));
+        assert!(!collapsed_edit_text.contains("fn new() {}"));
         assert!(!collapsed_edit_text.contains(&edit_input));
+        assert!(collapsed_edit_text.contains("result: done"));
 
         let content = (0..70)
             .map(|line| format!("line {line}"))
@@ -10879,8 +10878,9 @@ mod tests {
             false,
         );
         let collapsed_write_text = rendered_text(&collapsed_write_lines);
-        assert!(collapsed_write_text.contains("line 0"));
-        assert!(collapsed_write_text.contains("more lines"));
+        assert!(collapsed_write_text.starts_with("▶ [tool: file_write]"));
+        assert!(!collapsed_write_text.contains("line 0"));
+        assert!(!collapsed_write_text.contains("more lines"));
         assert!(!collapsed_write_text.contains(&write_input));
     }
 
