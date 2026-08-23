@@ -57,6 +57,11 @@ webpki-roots = "1.0.6"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
+# `O_NONBLOCK` for the MCP custom-CA loader, so a special file substituted at a
+# configured `tls_ca_cert_path` cannot block MCP registry startup.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 browser-native = ["dep:fantoccini"]
@@ -71,6 +76,7 @@ test-helpers = []
 
 [dev-dependencies]
 zeroclaw-infra.workspace = true
+rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
