@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2510,6 +2510,13 @@ impl Chat {
                 return;
             }
 
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && mouse.modifiers.is_empty()
+                && state.toggle_tool_header_at(col, row)
+            {
+                return;
+            }
+
             if !state.in_browse_mode() {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_up(3),
@@ -3546,22 +3553,58 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn terminal_safe_tool_text(text: &str) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => safe.push('\n'),
+            ch if ch.is_control() => safe.extend(ch.escape_default()),
+            ch => safe.push(ch),
+        }
+    }
+    safe
+}
+
 fn render_tool_entry(
     lines: &mut Vec<Line<'static>>,
     name: &str,
     input_json: &str,
     result: Option<&str>,
     is_selected: bool,
+    expanded: bool,
 ) {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
         Modifier::empty()
     };
+    let marker = if expanded { "▼" } else { "▶" };
     lines.push(Line::from(vec![Span::styled(
-        format!("[tool: {name}] "),
+        format!("{marker} [tool: {name}] "),
         theme::tool_label_style().add_modifier(sel_mod),
     )]));
+
+    let preview = |text: &str, max_bytes: usize| {
+        let compact = terminal_safe_tool_text(text).replace('\n', "\\n");
+        if compact.len() > max_bytes {
+            format!("{}…", truncate_utf8(&compact, max_bytes))
+        } else {
+            compact
+        }
+    };
+    let push_text = |lines: &mut Vec<Line<'static>>, label: &str, text: &str| {
+        for (line_idx, text_line) in text.split('\n').enumerate() {
+            let prefix = if line_idx == 0 {
+                format!("  {label}: ")
+            } else {
+                "    ".to_string()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{text_line}"),
+                theme::dim_style().add_modifier(sel_mod),
+            )));
+        }
+    };
 
     let parsed: Option<serde_json::Value> = match name {
         "file_edit" | "file_write" => serde_json::from_str(input_json).ok(),
@@ -3580,6 +3623,9 @@ fn render_tool_entry(
                 .and_then(|v| v.get("new_string"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            if expanded {
+                push_text(lines, "input", &terminal_safe_tool_text(input_json));
+            }
             let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
             let ext = input.and_then(|v| file_ext(v));
             let start_line = path
@@ -3590,7 +3636,12 @@ fn render_tool_entry(
                         .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
                 })
                 .unwrap_or(1);
-            lines.extend(diff::diff_lines(old, new, ext, start_line));
+            lines.extend(diff::diff_lines(
+                &terminal_safe_tool_text(old),
+                &terminal_safe_tool_text(new),
+                ext,
+                start_line,
+            ));
         }
         "file_write" => {
             let input = parsed.as_ref();
@@ -3598,32 +3649,29 @@ fn render_tool_entry(
                 .and_then(|v| v.get("content"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            if expanded {
+                push_text(lines, "input", &terminal_safe_tool_text(input_json));
+            }
             let ext = input.and_then(|v| file_ext(v));
-            lines.extend(diff::write_lines(content, ext));
+            lines.extend(diff::write_lines(&terminal_safe_tool_text(content), ext));
         }
         _ => {
-            let truncated = if input_json.len() > 120 {
-                format!("{}…", truncate_utf8(input_json, 120))
+            let input = if expanded {
+                terminal_safe_tool_text(input_json)
             } else {
-                input_json.to_string()
+                preview(input_json, 120)
             };
-            lines.push(Line::from(Span::styled(
-                format!("  {truncated}"),
-                theme::dim_style().add_modifier(sel_mod),
-            )));
+            push_text(lines, "input", &input);
         }
     }
 
     if let Some(res) = result {
-        let truncated = if res.len() > 200 {
-            format!("{}…", truncate_utf8(res, 200))
+        let result = if expanded {
+            terminal_safe_tool_text(res)
         } else {
-            res.to_string()
+            preview(res, 200)
         };
-        lines.push(Line::from(Span::styled(
-            format!("  → {truncated}"),
-            theme::dim_style().add_modifier(sel_mod),
-        )));
+        push_text(lines, "result", &result);
     }
 
     // Apply REVERSED to body lines from diff_lines/write_lines too.
@@ -3645,6 +3693,7 @@ fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
     show_thoughts: bool,
+    tool_expanded: bool,
     width: u16,
     lines: &mut Vec<Line<'static>>,
 ) {
@@ -3735,6 +3784,7 @@ fn render_entry_into(
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
                 is_selected,
+                tool_expanded,
             );
         }
     }
@@ -4126,7 +4176,10 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    for &(entry_idx, screen_lo, screen_hi, content_width) in &state.cached_screen_ranges {
+    state.tool_header_rects.clear();
+    for range_idx in 0..state.cached_screen_ranges.len() {
+        let (entry_idx, screen_lo, screen_hi, content_width) =
+            state.cached_screen_ranges[range_idx];
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll + body_h);
         if visible_hi <= visible_lo {
@@ -4142,6 +4195,28 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
             visible_hi - visible_lo,
         );
         state.entry_rects.push((entry_idx, rect));
+
+        if matches!(state.entries.get(entry_idx), Some(ChatEntry::Tool { .. })) {
+            let (_, line_lo, _) = state.cached_line_ranges[range_idx];
+            let header_line = &state.cached_lines[line_lo];
+            let header_rows = wrapped_rows(header_line, inner_width);
+            let header_lo = screen_lo.max(scroll);
+            let header_hi = screen_lo
+                .saturating_add(header_rows)
+                .min(scroll.saturating_add(body_h));
+            if header_hi > header_lo {
+                let header_width = (header_line.width() as u16).min(body_w);
+                state.tool_header_rects.push((
+                    entry_idx,
+                    Rect::new(
+                        body_x,
+                        body_y + (header_lo - scroll),
+                        header_width,
+                        header_hi - header_lo,
+                    ),
+                ));
+            }
+        }
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
@@ -5640,6 +5715,10 @@ pub struct ChatState {
     transcript_selection: Option<TranscriptSelection>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Visible tool-header hit rects from the last draw.
+    tool_header_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Stable tool-call ids whose transcript cards are expanded.
+    expanded_tool_calls: BTreeSet<Arc<str>>,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
     /// Full code-block targets used by right-click context-menu resolution.
@@ -5768,6 +5847,8 @@ impl ChatState {
             transcript_snapshot: None,
             transcript_selection: None,
             entry_rects: Vec::new(),
+            tool_header_rects: Vec::new(),
+            expanded_tool_calls: BTreeSet::new(),
             copy_hit_regions: Vec::new(),
             context_copy_regions: Vec::new(),
             context_menu: None,
@@ -6092,6 +6173,27 @@ impl ChatState {
         }
     }
 
+    fn toggle_tool_header_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(entry_idx) = self
+            .tool_header_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(idx, _)| *idx)
+        else {
+            return false;
+        };
+        let Some(ChatEntry::Tool { tool_call_id, .. }) = self.entries.get(entry_idx) else {
+            return false;
+        };
+        let tool_call_id = Arc::clone(tool_call_id);
+        if !self.expanded_tool_calls.remove(&tool_call_id) {
+            self.expanded_tool_calls.insert(tool_call_id);
+        }
+        self.clear_transcript_selection();
+        self.mark_dirty_full();
+        true
+    }
+
     /// Yank a single entry's body text for explicit copy actions.
     fn yank_single_entry(&self, idx: usize) -> String {
         self.entries
@@ -6274,6 +6376,7 @@ impl ChatState {
                     entry,
                     self.is_entry_highlighted(abs_idx),
                     show_thoughts,
+                    matches!(entry, ChatEntry::Tool { tool_call_id, .. } if self.expanded_tool_calls.contains(tool_call_id)),
                     width,
                     &mut new_lines,
                 );
@@ -6309,6 +6412,7 @@ impl ChatState {
                 entry,
                 self.is_entry_highlighted(abs_idx),
                 show_thoughts,
+                matches!(entry, ChatEntry::Tool { tool_call_id, .. } if self.expanded_tool_calls.contains(tool_call_id)),
                 width,
                 &mut lines,
             );
@@ -7364,6 +7468,8 @@ impl ChatState {
         self.cached_lines.clear();
         self.cached_row_breaks.clear();
         self.entry_rects.clear();
+        self.tool_header_rects.clear();
+        self.expanded_tool_calls.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.context_menu = None;
@@ -10638,6 +10744,205 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tool_result_retention_truncates_utf8_safely_and_keeps_marker() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-long".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "long-output"}),
+        });
+        let raw_output = format!("{}éé", "a".repeat(16 * 1024 - 1));
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-long".to_string(),
+            raw_output,
+        });
+
+        let ChatEntry::Tool {
+            result: Some(result),
+            ..
+        } = &s.entries()[0]
+        else {
+            panic!("expected retained tool result");
+        };
+        assert!(result.ends_with("…[truncated]"));
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    fn rendered_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tool_entry_disclosure_shows_full_retained_content_only_when_expanded() {
+        let input = format!(r#"{{"command":"{}"}}"#, "x".repeat(180));
+        let result = format!(
+            "first line\n{}\n\u{1b}]52;c;payload\u{7}\n…[truncated]",
+            "y".repeat(240)
+        );
+
+        let mut collapsed = Vec::new();
+        render_tool_entry(&mut collapsed, "shell", &input, Some(&result), false, false);
+        let collapsed_text = rendered_text(&collapsed);
+        assert!(collapsed_text.starts_with("▶ [tool: shell]"));
+        assert!(collapsed_text.contains("input:"));
+        assert!(collapsed_text.contains("result:"));
+        assert!(!collapsed_text.contains(&input));
+        assert!(!collapsed_text.contains("→"));
+
+        let mut expanded = Vec::new();
+        render_tool_entry(&mut expanded, "shell", &input, Some(&result), false, true);
+        let expanded_text = rendered_text(&expanded);
+        assert!(expanded_text.starts_with("▼ [tool: shell]"));
+        assert!(expanded_text.contains(&input));
+        assert!(expanded_text.contains(&"y".repeat(240)));
+        assert!(!expanded_text.contains('\u{1b}'));
+        assert!(!expanded_text.contains('\u{7}'));
+        assert!(expanded_text.contains("\\u{1b}]52;c;payload\\u{7}"));
+        assert!(expanded_text.contains("…[truncated]"));
+    }
+
+    #[test]
+    fn expanded_file_tools_keep_specialized_preview_and_complete_raw_input() {
+        let edit_input = serde_json::json!({
+            "path": "/tmp/example.rs",
+            "old_string": "fn old() {}",
+            "new_string": "fn new() {}",
+        })
+        .to_string();
+        let mut edit_lines = Vec::new();
+        render_tool_entry(
+            &mut edit_lines,
+            "file_edit",
+            &edit_input,
+            Some("done"),
+            false,
+            true,
+        );
+        let edit_text = rendered_text(&edit_lines);
+        assert!(edit_text.contains(&edit_input));
+        assert!(edit_text.contains("fn old() {}"));
+        assert!(edit_text.contains("fn new() {}"));
+
+        let mut collapsed_edit_lines = Vec::new();
+        render_tool_entry(
+            &mut collapsed_edit_lines,
+            "file_edit",
+            &edit_input,
+            Some("done"),
+            false,
+            false,
+        );
+        let collapsed_edit_text = rendered_text(&collapsed_edit_lines);
+        assert!(collapsed_edit_text.contains("fn old() {}"));
+        assert!(collapsed_edit_text.contains("fn new() {}"));
+        assert!(!collapsed_edit_text.contains(&edit_input));
+
+        let content = (0..70)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let write_input = serde_json::json!({
+            "path": "/tmp/example.txt",
+            "content": content,
+        })
+        .to_string();
+        let mut write_lines = Vec::new();
+        render_tool_entry(
+            &mut write_lines,
+            "file_write",
+            &write_input,
+            None,
+            false,
+            true,
+        );
+        let write_text = rendered_text(&write_lines);
+        assert!(write_text.contains(&write_input));
+        assert!(write_text.contains("line 0"));
+        assert!(write_text.contains("more lines"));
+
+        let mut collapsed_write_lines = Vec::new();
+        render_tool_entry(
+            &mut collapsed_write_lines,
+            "file_write",
+            &write_input,
+            None,
+            false,
+            false,
+        );
+        let collapsed_write_text = rendered_text(&collapsed_write_lines);
+        assert!(collapsed_write_text.contains("line 0"));
+        assert!(collapsed_write_text.contains("more lines"));
+        assert!(!collapsed_write_text.contains(&write_input));
+    }
+
+    #[tokio::test]
+    async fn tool_header_click_toggles_only_its_card_and_rebuilds_geometry() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        for (id, command) in [("tc-1", "printf first"), ("tc-2", "printf second")] {
+            state.entries.push(ChatEntry::Tool {
+                tool_call_id: Arc::<str>::from(id),
+                name: Arc::<str>::from("shell"),
+                input_json: Arc::<str>::from(serde_json::json!({"command": command}).to_string()),
+                result: Some(Arc::<str>::from("line one\nline two\nline three")),
+            });
+        }
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+        let first_header = state.tool_header_rects[0].1;
+        let second_before = state.entry_rects[1].1.y;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first_header.x + 1,
+                row: first_header.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.expanded_tool_calls.contains("tc-1"));
+        assert!(!state.expanded_tool_calls.contains("tc-2"));
+        assert_eq!(state.dirty, LinesDirty::Full);
+
+        terminal
+            .draw(|frame| render(frame, state, area, PaneKind::Chat))
+            .expect("redraw expanded chat");
+        let second_after = state
+            .entry_rects
+            .iter()
+            .find(|(idx, _)| *idx == 1)
+            .expect("second entry remains visible")
+            .1
+            .y;
+        assert!(second_after > second_before);
+
+        state.reset_for_session("sess-2".to_string(), None);
+        assert!(state.expanded_tool_calls.is_empty());
+        assert!(state.tool_header_rects.is_empty());
     }
 
     #[test]
