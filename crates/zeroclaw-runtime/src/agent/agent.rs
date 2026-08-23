@@ -144,6 +144,10 @@ pub(crate) async fn resolve_routed_approval(
             match tokio::time::timeout(dur, channel.request_approval_attributed(recipient, request))
                 .await
             {
+                Ok(Ok(Some(attributed))) if attributed.source.is_runtime_fail_closed() => (
+                    "approver returned a runtime fail-closed response",
+                    attributed.source,
+                ),
                 Ok(Ok(Some(attributed))) => {
                     return RoutedApproval::Decided {
                         response: attributed.response,
@@ -11586,6 +11590,7 @@ mod approval_route_tests {
         Answer(ChannelApprovalResponse),
         NoDecision,
         Slow,
+        RuntimeTimeout,
     }
 
     struct StubChannel {
@@ -11630,7 +11635,29 @@ mod approval_route_tests {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                     Ok(Some(ChannelApprovalResponse::Approve))
                 }
+                StubBehavior::RuntimeTimeout => Ok(Some(ChannelApprovalResponse::Deny)),
             }
+        }
+
+        async fn request_approval_attributed(
+            &self,
+            recipient: &str,
+            request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<
+            Option<zeroclaw_api::channel::AttributedApprovalResponse>,
+        > {
+            if matches!(&self.behavior, StubBehavior::RuntimeTimeout) {
+                return Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ),
+                ));
+            }
+
+            self.request_approval(recipient, request).await.map(|response| {
+                response.map(zeroclaw_api::channel::AttributedApprovalResponse::operator)
+            })
         }
     }
 
@@ -11769,6 +11796,78 @@ mod approval_route_tests {
             ),
             "a timed-out approver is a runtime denial, not a user's: {out:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_attributed_timeout_inherits_to_originator() {
+        let origin = Arc::new(StubChannel {
+            name: "origin".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        });
+        let bridge = routed_approval_channel(
+            registry(vec![StubChannel {
+                name: "ops".into(),
+                behavior: StubBehavior::RuntimeTimeout,
+            }]),
+            route("ops", OnNoApprover::InheritOriginator),
+            Some(origin),
+        );
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("runtime timeout should fall through to the originator");
+
+        assert_eq!(out.response, ChannelApprovalResponse::Approve);
+        assert_eq!(out.source, zeroclaw_api::channel::ApprovalSource::Operator);
+        assert!(out.decided_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_attributed_timeout_denies_without_decider() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::RuntimeTimeout,
+        }]);
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+
+        match &out {
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                decider,
+                source: zeroclaw_api::channel::ApprovalSource::TimedOut,
+            } => assert!(
+                decider.is_none(),
+                "a runtime timeout denial must not name a deciding operator"
+            ),
+            _ => panic!("runtime timeout must fail closed without a decider: {out:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_denial_is_final_under_inherit_policy() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Deny),
+        }]);
+        let out = resolve_routed_approval(
+            &h,
+            &route("ops", OnNoApprover::InheritOriginator),
+            "r",
+            &req(),
+        )
+        .await;
+
+        match &out {
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                decider: Some(decider),
+                source: zeroclaw_api::channel::ApprovalSource::Operator,
+            } => assert_eq!(decider, "ops"),
+            _ => panic!(
+                "an operator denial must remain final under inherit-originator: {out:?}"
+            ),
+        }
     }
 
     use zeroclaw_api::channel::Channel as _;
