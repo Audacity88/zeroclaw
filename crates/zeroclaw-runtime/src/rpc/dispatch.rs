@@ -11957,8 +11957,7 @@ mod tests {
         task.await.expect("blocked RPC task must not panic")
     }
 
-    #[tokio::test]
-    async fn config_set_blocks_while_config_write_lock_held() {
+    async fn config_set_blocks_while_config_write_lock_held_body() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         let cfg = make_two_provider_test_config(&tmp);
@@ -11985,6 +11984,11 @@ mod tests {
             on_disk.contains("blocked-value"),
             "config/set must persist once unblocked; on-disk file:\n{on_disk}"
         );
+    }
+
+    #[test]
+    fn config_set_blocks_while_config_write_lock_held() {
+        run_rpc_dispatch_test(config_set_blocks_while_config_write_lock_held_body);
     }
 
     #[tokio::test]

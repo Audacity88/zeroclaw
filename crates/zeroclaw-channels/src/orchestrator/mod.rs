@@ -163,6 +163,31 @@ fn publish_live_channel_registry(registry: Option<LiveChannelRegistry>) {
     LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
 }
 
+/// Ensures an RPC generation cannot wait forever when channel startup fails
+/// before it has a live registry to publish.
+struct LiveChannelRegistryStartupGuard {
+    published: bool,
+}
+
+impl LiveChannelRegistryStartupGuard {
+    const fn new() -> Self {
+        Self { published: false }
+    }
+
+    fn publish(&mut self, registry: Option<LiveChannelRegistry>) {
+        publish_live_channel_registry(registry);
+        self.published = true;
+    }
+}
+
+impl Drop for LiveChannelRegistryStartupGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            publish_live_channel_registry(None);
+        }
+    }
+}
+
 /// Wait until the current daemon generation has either published its channels or
 /// established that no live channels are available.
 pub async fn wait_for_live_channel_registry(cancel: &CancellationToken) -> bool {
@@ -12170,6 +12195,7 @@ pub async fn start_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
+    let mut registry_startup = LiveChannelRegistryStartupGuard::new();
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
@@ -12178,7 +12204,7 @@ pub async fn start_channels(
         .filter(|(_, a)| a.enabled)
         .any(|(_, a)| runtime_defaults_from_config(&config, a.model_provider.as_str()).is_ok());
     if !any_agent_provider_resolves {
-        publish_live_channel_registry(None);
+        registry_startup.publish(None);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -12635,7 +12661,7 @@ pub async fn start_channels(
                 .map(|cc| Arc::clone(&cc.channel))
                 .collect();
             if channels.is_empty() {
-                publish_live_channel_registry(None);
+                registry_startup.publish(None);
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -12692,7 +12718,7 @@ pub async fn start_channels(
 
             // Composite-key registry (see `composite_channel_key`).
             let cbn = Arc::new(configured_channel_map(&configured_channels));
-            publish_live_channel_registry(Some(Arc::clone(&cbn)));
+            registry_startup.publish(Some(Arc::clone(&cbn)));
 
             let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
@@ -14905,6 +14931,69 @@ temperature = 0.3
             replacement_map.get("discord.worker").unwrap(),
             &worker
         ));
+    }
+
+    #[tokio::test]
+    async fn channel_startup_failure_publishes_unavailable_registry_for_rpc_readiness() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
+        let previous_registry = LIVE_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let previous_ready = LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire);
+        let _restore = RestoreLiveRegistry {
+            registry: previous_registry,
+            ready: previous_ready,
+        };
+        prepare_live_channel_registry(true);
+
+        let mut config: Config = toml::from_str(
+            r#"
+[agents.worker]
+model_provider = "openrouter.default"
+risk_profile = "missing"
+channels = ["telegram.default"]
+
+[providers.models.openrouter.default]
+model = "test-model"
+api_key = "test-key"
+"#,
+        )
+        .unwrap();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(config.channels.has_any_enabled());
+
+        let waiter_cancel = CancellationToken::new();
+        let waiter = {
+            let waiter_cancel = waiter_cancel.clone();
+            zeroclaw_spawn::spawn!(
+                async move { wait_for_live_channel_registry(&waiter_cancel).await }
+            )
+        };
+        tokio::task::yield_now().await;
+
+        let startup_error = start_channels(config, None, CancellationToken::new(), None, None)
+            .await
+            .expect_err("missing risk profile must fail before channel registry publication");
+        assert!(
+            startup_error.to_string().contains("risk_profiles"),
+            "startup must fail at the configured pre-publication boundary: {startup_error:#}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("RPC readiness waiter must be released after startup failure")
+                .expect("readiness waiter task must join"),
+            "startup failure must publish an explicit unavailable registry"
+        );
+        assert!(live_channel_map().is_empty());
     }
 
     #[tokio::test]
