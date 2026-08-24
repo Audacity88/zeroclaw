@@ -1,16 +1,42 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-telegram"
+))]
+use std::{collections::HashMap, sync::Arc};
 
 /// Removes a pending approval if its requesting future is cancelled.
 ///
 /// The guard is armed immediately after registration. Normal cleanup removes
 /// the entry before disarming so cancellation while waiting for the map lock
 /// cannot leave a stale token behind.
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-telegram"
+))]
 pub(crate) struct PendingApprovalGuard<V: Send + 'static> {
     pending: Arc<tokio::sync::Mutex<HashMap<String, V>>>,
     token: Option<String>,
 }
 
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-telegram"
+))]
 impl<V: Send + 'static> PendingApprovalGuard<V> {
     pub(crate) fn new(pending: Arc<tokio::sync::Mutex<HashMap<String, V>>>, token: String) -> Self {
         Self {
@@ -34,6 +60,15 @@ impl<V: Send + 'static> PendingApprovalGuard<V> {
     }
 }
 
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-telegram"
+))]
 impl<V: Send + 'static> Drop for PendingApprovalGuard<V> {
     fn drop(&mut self) {
         let Some(token) = self.token.take() else {
