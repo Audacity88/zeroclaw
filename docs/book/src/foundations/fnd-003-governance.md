@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 15
+> Starting v0.7.0 · Type: Governance · Rev. 16
 >
-> **Canonical reference** · Ratified by the team · Rev. 15
+> **Canonical reference** · Ratified by the team · Rev. 16
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -33,6 +33,7 @@
 | 13 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions ([#9136](https://github.com/zeroclaw-labs/zeroclaw/pull/9136)) |
 | 14 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records ([#9388](https://github.com/zeroclaw-labs/zeroclaw/pull/9388)) |
 | 15 | 2026-08-10 | Narrowed the RFC trigger to four project-level categories and named the ordinary work that does not require an RFC; replaced the seven-day discussion period with 48h ordinary / 72h exceptional; defined the 72-hour vote against an immutable snapshot, the 30-day active electorate, two-ballot quorum, silence-as-approval after quorum, non-vetoing `REVISE`, and outcome precedence; made two-thirds the default threshold and reserved unanimity for expensive or irreversible decisions; retired the nonexistent parallel `rfc:*` label family; added the GitHub bridge record for Core meeting decisions ([#9499](https://github.com/zeroclaw-labs/zeroclaw/pull/9499)) |
+| 16 | 2026-08-23 | Clarified that an unchanged deferred RFC vote returns to another 72-hour cycle against the same snapshot while carrying explicit ballots forward until withdrawn or replaced |
 
 ---
 
@@ -575,27 +576,34 @@ Ordinary author revisions and clarifications during discussion do not restart th
      - the assigned active electorate, and inactive Core notified for re-entry
      - the threshold, and why it applies
      - that quorum requires two explicit ballots
+     - any additional prerequisite or closing condition that can defer closure
      - the exact UTC deadline, 72 hours after opening
            |
 4. CORE TEAM BALLOTS, one of:
      APPROVE  accept the snapshot as written
      REVISE   request changes, withhold approval, do not veto
      REJECT   blocking objection, with a specific reason
-   A member's latest ballot before the deadline supersedes their earlier one.
+   A member's latest ballot before the current vote cycle closes supersedes their earlier one.
            |
 5. OUTCOME, applied in this precedence order:
-     a. Fewer than two explicit ballots        -> DEFERRED
+     a. Fewer than two explicit ballots        -> DEFERRED / PENDING
      b. Quorum met and any final ballot REJECT -> REJECTED
-     c. Quorum met, no REJECT, two-thirds
-        approving explicitly or by silence     -> ACCEPTED
-     d. Otherwise                              -> RETURNED TO DISCUSSION
+     c. Quorum met, no REJECT, and the
+        applicable threshold, required explicit
+        approvals, or vote-opening
+        closing condition remain missing       -> DEFERRED / PENDING
+     d. Quorum met, no REJECT, applicable
+        threshold satisfied                    -> ACCEPTED
+     e. Otherwise                              -> RETURNED TO DISCUSSION
 ```
 
-Accepted RFCs carry `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Rejected RFCs are closed with the blocking objection recorded and a link to any issue where the underlying problem continues; rejection ends the current proposal, not necessarily the problem. Deferred proposals stay open with the condition for another vote recorded, and an unchanged deferred proposal may return to a new 72-hour vote without repeating discussion.
+Accepted RFCs carry `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Rejected RFCs are closed with the blocking objection recorded and a link to any issue where the underlying problem continues; rejection ends the current proposal, not necessarily the problem.
+
+Deferred or pending proposals enter another 72-hour cycle against the same immutable snapshot when the vote deadline arrives with fewer than two explicit ballots, with no `REJECT` and the applicable threshold or explicit approvals still missing, or with another vote-opening prerequisite that prevents closure. The closing or status record states the missing condition and the new UTC deadline. Existing explicit ballots carry forward until withdrawn or replaced, so voters do not need to recast unchanged ballots. At the next cycle deadline, the same snapshot can be accepted, rejected, returned to discussion, or deferred again. A material body change creates a new snapshot and uses the applicable discussion or vote handling for that new proposal.
 
 Use the live `type:rfc` and `status:accepted` labels. There is no parallel `rfc:*` status label family.
 
-Rev. 15 applies to RFC votes opened after ratification. It does not automatically invalidate earlier accepted RFCs; historical-process audit and correction work remain tracked separately.
+Rev. 15 and later apply to RFC votes opened after ratification. They do not automatically invalidate earlier accepted RFCs; historical-process audit and correction work remain tracked separately.
 
 A vote may close early only when every member of the final active electorate has explicitly approved and no otherwise inactive Core contributor has asked for the full window. The closing record must say why it closed before the deadline. An exceptional unanimous vote may close early only on explicit approval from every assigned voter.
 
