@@ -541,6 +541,10 @@ mod connection_tests {
 
     #[tokio::test]
     async fn cancel_joins_inflight_wss_prompt_before_releasing_connection() {
+        Box::pin(cancel_joins_inflight_wss_prompt_before_releasing_connection_impl()).await;
+    }
+
+    async fn cancel_joins_inflight_wss_prompt_before_releasing_connection_impl() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
