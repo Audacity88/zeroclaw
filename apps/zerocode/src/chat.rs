@@ -3636,30 +3636,6 @@ fn semantic_tool_metadata(input: &serde_json::Value, bulk_fields: &[&str]) -> St
     serde_json::Value::Object(metadata).to_string()
 }
 
-fn unique_text_offset(content: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    let mut matches = content.match_indices(needle).map(|(offset, _)| offset);
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first)
-}
-
-fn file_edit_start_line(path: Option<&str>, old: &str, new: &str) -> Option<usize> {
-    path.and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|content| {
-            let offset =
-                unique_text_offset(&content, old).or_else(|| unique_text_offset(&content, new))?;
-            Some(
-                content[..offset]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    + 1,
-            )
-        })
-}
-
 fn render_tool_entry(
     lines: &mut Vec<Line<'static>>,
     name: &str,
@@ -3733,12 +3709,11 @@ fn render_tool_entry(
                             &["old_string", "new_string"],
                         )),
                     );
-                    let path = input.get("path").and_then(|value| value.as_str());
                     let rendered = diff::diff_lines_limited(
                         &terminal_safe_tool_text(old),
                         &terminal_safe_tool_text(new),
                         file_ext(input),
-                        file_edit_start_line(path, old, new),
+                        None,
                         matches!(disclosure, ToolDisclosure::Preview)
                             .then_some(FILE_TOOL_PREVIEW_LINES),
                     );
@@ -11224,26 +11199,6 @@ mod tests {
         assert_eq!(
             default_tool_disclosure("file_edit", r#"{"old_string":"a","new_string":"b"}"#),
             ToolDisclosure::Collapsed
-        );
-    }
-
-    #[test]
-    fn file_edit_start_line_prefers_post_edit_content() {
-        let file = tempfile::NamedTempFile::new().expect("temp file");
-        std::fs::write(file.path(), "one\ntwo\nnew value\nfour\n").expect("write fixture");
-        assert_eq!(
-            file_edit_start_line(file.path().to_str(), "old value", "new value"),
-            Some(3)
-        );
-
-        std::fs::write(file.path(), "new value\none\nnew value\n").expect("write duplicate");
-        assert_eq!(
-            file_edit_start_line(file.path().to_str(), "old value", "new value"),
-            None
-        );
-        assert_eq!(
-            file_edit_start_line(file.path().to_str(), "old value", ""),
-            None
         );
     }
 
