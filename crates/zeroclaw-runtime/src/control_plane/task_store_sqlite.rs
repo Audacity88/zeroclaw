@@ -36,6 +36,32 @@ impl SqliteTaskStore {
         Self::init(Connection::open_in_memory().context("open in-memory control-plane DB")?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_malformed_terminal_settlement_intent_for_test(
+        &self,
+        task_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO terminal_settlement_intents
+                (task_id, owner_pid, owner_boot_id, desired_status, artifact_path,
+                 artifact_ref, artifact_sha256, terminal_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                task_id,
+                999_999_i64,
+                "boot-OLD",
+                "unknown-status",
+                "/tmp/malformed-settlement.json",
+                Option::<String>::None,
+                "00".repeat(32),
+                Option::<String>::None,
+            ],
+        )
+        .context("insert malformed terminal settlement intent for test")?;
+        Ok(())
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -469,6 +495,32 @@ fn log_unreadable_task_row(error: rusqlite::Error) {
     );
 }
 
+/// Collect settlement intents while skipping a corrupt persisted row. Recovery
+/// metadata must not keep ordinary task reconciliation from running.
+fn collect_skipping_bad_settlement_intents<I>(rows: I) -> Vec<TerminalSettlementIntent>
+where
+    I: Iterator<Item = rusqlite::Result<TerminalSettlementIntent>>,
+{
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            Ok(intent) => out.push(intent),
+            Err(error) => log_unreadable_terminal_settlement_intent(error),
+        }
+    }
+    out
+}
+
+fn log_unreadable_terminal_settlement_intent(error: rusqlite::Error) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+        "control-plane: skipping unreadable terminal settlement intent"
+    );
+}
+
 fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
     // must be a true no-op, never clobber an already-recorded output/error/terminal
@@ -724,8 +776,7 @@ impl TaskRegistry for SqliteTaskStore {
         let rows = stmt
             .query_map([], row_to_settlement_intent)
             .context("query terminal settlement intents")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("read terminal settlement intents")
+        Ok(collect_skipping_bad_settlement_intents(rows))
     }
 
     async fn promote_terminal_settlement(

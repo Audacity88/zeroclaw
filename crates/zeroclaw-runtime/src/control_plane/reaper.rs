@@ -307,6 +307,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_skips_malformed_settlement_intents_without_starving_other_reconciliation() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let valid_task_id = "settlement-valid";
+        let valid_path = dir.path().join(format!("{valid_task_id}.json"));
+        let valid_bytes = br#"{"task_id":"settlement-valid","output":"done"}"#;
+        tokio::fs::write(&valid_path, valid_bytes).await.unwrap();
+        s.create(rec(valid_task_id, "boot-OLD", 999_999, None))
+            .await
+            .unwrap();
+        assert!(
+            s.persist_terminal_settlement_intent(intent(
+                valid_task_id,
+                &valid_path,
+                TaskStatus::Completed,
+                valid_bytes,
+            ))
+            .await
+            .unwrap()
+        );
+
+        s.create(rec("settlement-malformed", "boot-OLD", 999_999, None))
+            .await
+            .unwrap();
+        s.insert_malformed_terminal_settlement_intent_for_test("settlement-malformed")
+            .unwrap();
+        s.create(rec("ordinary-orphan", "boot-OLD", 999_999, None))
+            .await
+            .unwrap();
+        s.create(rec(
+            "ordinary-timeout",
+            "boot-NEW",
+            std::process::id(),
+            Some(99_999),
+        ))
+        .await
+        .unwrap();
+
+        sweep(&s, "boot-NEW", 600).await.unwrap();
+        assert_eq!(
+            s.get(valid_task_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            s.get("ordinary-orphan").await.unwrap().unwrap().status,
+            TaskStatus::Lost
+        );
+        assert_eq!(
+            s.get("ordinary-timeout").await.unwrap().unwrap().status,
+            TaskStatus::TimedOut
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_never_completes_an_intent_before_artifact_publication() {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
