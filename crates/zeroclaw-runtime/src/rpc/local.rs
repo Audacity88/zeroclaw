@@ -1510,7 +1510,7 @@ mod tests {
 
         let status = rpc_request(Method::Status, &serde_json::json!({}), 3);
         let split = status.len() / 2;
-        writer.write_all(status[..split].as_bytes()).await.unwrap();
+        writer.write_all(&status.as_bytes()[..split]).await.unwrap();
         release.notify_one();
         tokio::time::timeout(Duration::from_secs(2), async {
             while ctx.sessions.has_inflight_turn(session_id) {
@@ -1519,7 +1519,7 @@ mod tests {
         })
         .await
         .expect("the first prompt should complete while the status frame is partial");
-        writer.write_all(status[split..].as_bytes()).await.unwrap();
+        writer.write_all(&status.as_bytes()[split..]).await.unwrap();
 
         let status_response = tokio::time::timeout(Duration::from_secs(2), async {
             loop {

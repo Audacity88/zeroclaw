@@ -9785,13 +9785,13 @@ struct ConfiguredChannel {
 /// `PluginChannelEndpoint`, not from re-reading config — so the registry key is
 /// the same `plugin.<alias>` an agent already routes to.
 ///
-/// Note the deliberate asymmetry with `collect_configured_channels`: plugin
-/// channels are constructed asynchronously, so the synchronous
-/// `build_channel_map` and `register_channels_for_tools` surfaces cannot see
-/// them. Nostr already has this shape. The consequence is that channel-addressed
-/// *tools* cannot target a plugin channel yet; inbound and outbound delivery
-/// through the supervised listener are unaffected. Closing that gap means making
-/// those two surfaces async, which is deliberately not part of this change.
+/// Plugin channels deliberately remain unavailable to ordinary
+/// channel-addressed tools. The synchronous static tool-map builders cannot
+/// construct them, and the daemon's live per-agent tool map filters them to keep
+/// that authorization surface consistent. The full live registry still retains
+/// them for supervised listeners and routed delivery or approval. Supporting
+/// plugin channels in tools requires one deliberate policy across both static
+/// and live tool-map paths, which is outside this change.
 fn append_configured_plugin_channels(
     configured: &mut Vec<ConfiguredChannel>,
     plugin_channels: Vec<Arc<dyn Channel>>,
@@ -10112,7 +10112,11 @@ pub fn live_channel_map_for_agent(
         .clone();
     registry
         .as_deref()
-        .map(|available| channel_map_for_agent(config, agent_alias, available))
+        .map(|available| {
+            let mut selected = channel_map_for_agent(config, agent_alias, available);
+            selected.retain(|key, _| key != "plugin" && !key.starts_with("plugin."));
+            selected
+        })
         .unwrap_or_default()
 }
 
@@ -13458,6 +13462,36 @@ pub(crate) mod tests {
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    struct RestoreLiveRegistry {
+        registry: Option<LiveChannelRegistry>,
+        ready: bool,
+    }
+
+    impl Drop for RestoreLiveRegistry {
+        fn drop(&mut self) {
+            *LIVE_CHANNEL_REGISTRY
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = self.registry.take();
+            LIVE_CHANNEL_REGISTRY_READY.store(self.ready, Ordering::Release);
+            LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
+        }
+    }
+
+    fn replace_live_channel_registry(registry: LiveChannelRegistry) -> RestoreLiveRegistry {
+        let previous_registry = LIVE_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let previous_ready = LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire);
+        let restore = RestoreLiveRegistry {
+            registry: previous_registry,
+            ready: previous_ready,
+        };
+        prepare_live_channel_registry(true);
+        publish_live_channel_registry(Some(registry));
+        restore
+    }
+
     /// Runs a channel-dispatch test on an explicit stack because its async
     /// future can exceed the default test-thread stack on hosted CI.
     pub(crate) fn run_channel_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
@@ -14784,21 +14818,6 @@ temperature = 0.3
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_channel_map_factory_reuses_daemon_registry_on_tokio_worker() {
-        struct RestoreLiveRegistry {
-            registry: Option<LiveChannelRegistry>,
-            ready: bool,
-        }
-
-        impl Drop for RestoreLiveRegistry {
-            fn drop(&mut self) {
-                *LIVE_CHANNEL_REGISTRY
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner()) = self.registry.take();
-                LIVE_CHANNEL_REGISTRY_READY.store(self.ready, Ordering::Release);
-                LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
-            }
-        }
-
         let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         let worker = mock_channel("discord");
         let ops = mock_channel("discord");
@@ -14886,6 +14905,94 @@ temperature = 0.3
             replacement_map.get("discord.worker").unwrap(),
             &worker
         ));
+    }
+
+    #[tokio::test]
+    async fn live_agent_tool_map_excludes_single_plugin_but_full_registry_retains_it() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
+        let plugin = mock_channel("plugin");
+        let registry = Arc::new(HashMap::from([
+            ("plugin.fable".to_string(), Arc::clone(&plugin)),
+            ("plugin".to_string(), Arc::clone(&plugin)),
+        ]));
+        let _restore = replace_live_channel_registry(registry);
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["plugin.fable".into()],
+                ..Default::default()
+            },
+        );
+
+        let tool_map = live_channel_map_for_agent(&config, "worker");
+        let full_map = live_channel_map();
+
+        assert!(!tool_map.contains_key("plugin.fable"));
+        assert!(!tool_map.contains_key("plugin"));
+        assert!(Arc::ptr_eq(full_map.get("plugin.fable").unwrap(), &plugin));
+        assert!(Arc::ptr_eq(full_map.get("plugin").unwrap(), &plugin));
+    }
+
+    #[tokio::test]
+    async fn live_agent_tool_map_excludes_every_plugin_alias() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
+        let fable = mock_channel("plugin");
+        let forge = mock_channel("plugin");
+        let registry = Arc::new(HashMap::from([
+            ("plugin.fable".to_string(), Arc::clone(&fable)),
+            ("plugin.forge".to_string(), Arc::clone(&forge)),
+        ]));
+        let _restore = replace_live_channel_registry(registry);
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["plugin".into()],
+                ..Default::default()
+            },
+        );
+
+        let tool_map = live_channel_map_for_agent(&config, "worker");
+        let full_map = live_channel_map();
+
+        assert!(!tool_map.keys().any(|key| key.starts_with("plugin")));
+        assert!(Arc::ptr_eq(full_map.get("plugin.fable").unwrap(), &fable));
+        assert!(Arc::ptr_eq(full_map.get("plugin.forge").unwrap(), &forge));
+        assert!(!full_map.contains_key("plugin"));
+    }
+
+    #[tokio::test]
+    async fn live_agent_tool_map_legacy_fallback_keeps_builtins_but_excludes_plugins() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
+        let discord = mock_channel("discord");
+        let plugin = mock_channel("plugin");
+        let registry = Arc::new(HashMap::from([
+            ("discord.ops".to_string(), Arc::clone(&discord)),
+            ("plugin.fable".to_string(), Arc::clone(&plugin)),
+            ("plugin".to_string(), Arc::clone(&plugin)),
+        ]));
+        let _restore = replace_live_channel_registry(registry);
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let tool_map = live_channel_map_for_agent(&config, "legacy");
+
+        assert!(Arc::ptr_eq(tool_map.get("discord.ops").unwrap(), &discord));
+        assert!(!tool_map.contains_key("plugin.fable"));
+        assert!(!tool_map.contains_key("plugin"));
     }
 
     #[test]

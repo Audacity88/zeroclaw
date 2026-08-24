@@ -119,6 +119,69 @@ pub(crate) fn seed_channel_handles_with_factory(
     count
 }
 
+pub(crate) struct ConfiguredChannelMaps {
+    old: ChannelMap,
+    new: ChannelMap,
+}
+
+pub(crate) fn configured_channel_maps_with_factory(
+    factory: &ChannelMapFactory,
+    old_config: &zeroclaw_config::schema::Config,
+    new_config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> ConfiguredChannelMaps {
+    ConfiguredChannelMaps {
+        old: factory(old_config, agent_alias),
+        new: factory(new_config, agent_alias),
+    }
+}
+
+pub(crate) fn configured_channel_maps(
+    old_config: &zeroclaw_config::schema::Config,
+    new_config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Option<ConfiguredChannelMaps> {
+    let factory = CHANNEL_MAP_FN.get()?;
+    Some(configured_channel_maps_with_factory(
+        factory.as_ref(),
+        old_config,
+        new_config,
+        agent_alias,
+    ))
+}
+
+/// Replace only the configured-channel entries in the shared per-tool maps.
+/// Synthetic RPC/ACP entries are not in either configured map, and separate
+/// route-only approval registries are not touched, so they remain available.
+pub(crate) fn refresh_channel_handles(
+    configured: &ConfiguredChannelMaps,
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &tools::PerToolChannelHandle,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+) -> usize {
+    let handles = [
+        ask_user_handle.as_ref(),
+        channel_room_handle.as_ref(),
+        Some(reaction_handle),
+        poll_handle.as_ref(),
+        escalate_handle.as_ref(),
+    ];
+
+    for handle in handles.iter().flatten() {
+        let mut map = handle.write();
+        for name in configured.old.keys() {
+            map.remove(name);
+        }
+        for (name, channel) in &configured.new {
+            map.insert(name.clone(), std::sync::Arc::clone(channel));
+        }
+    }
+
+    configured.new.len()
+}
+
 pub(crate) fn seed_channel_handles(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -3449,9 +3512,10 @@ pub async fn process_message(
 mod tests {
     use super::{
         apply_text_tool_prompt_policy, approval_channel_registry_with_factory,
-        estimate_history_tokens, load_interactive_session_history, make_query_summary,
-        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
-        seed_channel_handles_with_factory, truncate_tool_result,
+        configured_channel_maps_with_factory, estimate_history_tokens,
+        load_interactive_session_history, make_query_summary,
+        maybe_inject_channel_delivery_defaults, refresh_channel_handles,
+        save_interactive_session_history, seed_channel_handles_with_factory, truncate_tool_result,
     };
 
     /// One decision, four gates. The origin gate is the load-bearing one:
@@ -3635,6 +3699,83 @@ mod tests {
         assert!(reaction.read().contains_key("matrix.default"));
         assert!(poll_handle.read().contains_key("matrix.default"));
         assert!(escalate_handle.read().contains_key("matrix.default"));
+    }
+
+    #[test]
+    fn refresh_channel_handles_replaces_configured_entries_only() {
+        let old_channel = Arc::new(SeedMockChannel) as Arc<dyn Channel>;
+        let new_channel = Arc::new(SeedMockChannel) as Arc<dyn Channel>;
+        let old_channel_for_factory = Arc::clone(&old_channel);
+        let new_channel_for_factory = Arc::clone(&new_channel);
+        let factory = move |config: &zeroclaw_config::schema::Config, agent_alias: &str| {
+            config
+                .agents
+                .get(agent_alias)
+                .into_iter()
+                .flat_map(|agent| &agent.channels)
+                .map(|channel| {
+                    let channel_ref = channel.to_string();
+                    let client = if channel_ref.ends_with(".old") {
+                        Arc::clone(&old_channel_for_factory)
+                    } else {
+                        Arc::clone(&new_channel_for_factory)
+                    };
+                    (channel_ref, client)
+                })
+                .collect()
+        };
+
+        let mut old_config = zeroclaw_config::schema::Config::default();
+        old_config.agents.insert(
+            "worker".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["matrix.old".into()],
+                ..Default::default()
+            },
+        );
+        let mut new_config = old_config.clone();
+        new_config.agents.get_mut("worker").unwrap().channels = vec!["matrix.new".into()];
+
+        let ask_user = Arc::new(RwLock::new(HashMap::new()));
+        let channel_room = Arc::new(RwLock::new(HashMap::new()));
+        let reaction = Arc::new(RwLock::new(HashMap::new()));
+        let poll = Arc::new(RwLock::new(HashMap::new()));
+        let escalate = Arc::new(RwLock::new(HashMap::new()));
+        let handles = [&ask_user, &channel_room, &reaction, &poll, &escalate];
+        for handle in handles {
+            let mut map = handle.write();
+            map.insert("matrix.old".into(), Arc::clone(&old_channel));
+            map.insert("rpc".into(), Arc::clone(&old_channel));
+            map.insert("acp".into(), Arc::clone(&old_channel));
+            map.insert("approval-only".into(), Arc::clone(&old_channel));
+        }
+
+        let ask_user_opt = Some(Arc::clone(&ask_user));
+        let channel_room_opt = Some(Arc::clone(&channel_room));
+        let poll_opt = Some(Arc::clone(&poll));
+        let escalate_opt = Some(Arc::clone(&escalate));
+        let configured =
+            configured_channel_maps_with_factory(&factory, &old_config, &new_config, "worker");
+        assert_eq!(
+            refresh_channel_handles(
+                &configured,
+                &ask_user_opt,
+                &channel_room_opt,
+                &reaction,
+                &poll_opt,
+                &escalate_opt,
+            ),
+            1
+        );
+
+        for handle in handles {
+            let map = handle.read();
+            assert!(!map.contains_key("matrix.old"));
+            assert!(map.contains_key("matrix.new"));
+            assert!(map.contains_key("rpc"));
+            assert!(map.contains_key("acp"));
+            assert!(map.contains_key("approval-only"));
+        }
     }
 
     #[tokio::test]
