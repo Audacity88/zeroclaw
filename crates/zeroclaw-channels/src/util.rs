@@ -1,3 +1,60 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Removes a pending approval if its requesting future is cancelled.
+///
+/// The guard is armed immediately after registration. Normal cleanup removes
+/// the entry before disarming so cancellation while waiting for the map lock
+/// cannot leave a stale token behind.
+pub(crate) struct PendingApprovalGuard<V: Send + 'static> {
+    pending: Arc<tokio::sync::Mutex<HashMap<String, V>>>,
+    token: Option<String>,
+}
+
+impl<V: Send + 'static> PendingApprovalGuard<V> {
+    pub(crate) fn new(pending: Arc<tokio::sync::Mutex<HashMap<String, V>>>, token: String) -> Self {
+        Self {
+            pending,
+            token: Some(token),
+        }
+    }
+
+    /// The inbound handler removed the entry, or cleanup removed it normally.
+    pub(crate) fn disarm(&mut self) {
+        self.token = None;
+    }
+
+    /// Remove the pending entry before disarming the cancellation guard.
+    pub(crate) async fn remove(&mut self) {
+        let Some(token) = self.token.as_deref() else {
+            return;
+        };
+        self.pending.lock().await.remove(token);
+        self.token = None;
+    }
+}
+
+impl<V: Send + 'static> Drop for PendingApprovalGuard<V> {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        let pending = Arc::clone(&self.pending);
+        let removed = if let Ok(mut entries) = pending.try_lock() {
+            entries.remove(&token);
+            true
+        } else {
+            false
+        };
+        if removed {
+            return;
+        }
+        zeroclaw_spawn::spawn!(async move {
+            pending.lock().await.remove(&token);
+        });
+    }
+}
+
 #[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 use zeroclaw_api::channel::ProgressEvent;
 
@@ -828,6 +885,24 @@ mod tests {
         let token = super::new_approval_token();
         assert_eq!(token.len(), 6);
         assert!(token.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[tokio::test]
+    async fn pending_approval_guard_removes_entry_after_cancellation() {
+        let pending = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        pending.lock().await.insert("cancelled".to_string(), ());
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let task_pending = Arc::clone(&pending);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let _guard = PendingApprovalGuard::new(task_pending, "cancelled".to_string());
+            let _ = armed_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        armed_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        assert!(!pending.lock().await.contains_key("cancelled"));
     }
 
     #[test]

@@ -3867,6 +3867,10 @@ impl Channel for DiscordChannel {
             .lock()
             .await
             .insert(token.clone(), tx);
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
         // Strip thread suffix — approval message goes to the channel root.
         let channel_id = recipient.split(':').next().unwrap_or(recipient);
@@ -3879,7 +3883,7 @@ impl Channel for DiscordChannel {
                 .await
         };
         if let Err(err) = emitted {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(err);
         }
 
@@ -3889,17 +3893,20 @@ impl Channel for DiscordChannel {
         // report it to the model as an operator's refusal.
         let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Ok(resp)) => {
+                    guard.disarm();
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                }
                 Ok(Err(_)) => {
                     // Sender dropped: the gateway task went away without a click.
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::Unreachable,
                     )
                 }
                 Err(_) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::TimedOut,

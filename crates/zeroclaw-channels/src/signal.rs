@@ -920,9 +920,13 @@ impl Channel for SignalChannel {
             .lock()
             .await
             .insert(token.clone(), tx);
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
         if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(err);
         }
 
@@ -930,16 +934,19 @@ impl Channel for SignalChannel {
         // dropped-sender and timeout arms are the runtime denying on its own.
         let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Ok(resp)) => {
+                    guard.disarm();
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                }
                 Ok(Err(_)) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::Unreachable,
                     )
                 }
                 Err(_) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::TimedOut,

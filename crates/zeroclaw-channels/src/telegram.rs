@@ -4522,6 +4522,10 @@ Ensure only one `zeroclaw` process is using this bot token."
             .lock()
             .await
             .insert(approval_id.clone(), tx);
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            approval_id.clone(),
+        );
 
         let resp = self
             .http_client()
@@ -4571,23 +4575,23 @@ Ensure only one `zeroclaw` process is using this bot token."
                     Ok(r) => {
                         let status = r.status();
                         let err = r.text().await.unwrap_or_default();
-                        self.pending_approvals.lock().await.remove(&approval_id);
+                        guard.remove().await;
                         anyhow::bail!("Telegram sendMessage (approval) failed ({status}): {err}");
                     }
                     Err(e) => {
-                        self.pending_approvals.lock().await.remove(&approval_id);
+                        guard.remove().await;
                         return Err(e.into());
                     }
                 }
             }
             Err(e) => {
-                self.pending_approvals.lock().await.remove(&approval_id);
+                guard.remove().await;
                 return Err(e.into());
             }
         };
 
         if !send_ok {
-            self.pending_approvals.lock().await.remove(&approval_id);
+            guard.remove().await;
             anyhow::bail!("Telegram sendMessage (approval) failed after fallback");
         }
 
@@ -4595,12 +4599,15 @@ Ensure only one `zeroclaw` process is using this bot token."
         // `channels.telegram.approval_timeout_secs` (default 120s).
         let result =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(response)) => Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
-                ),
+                Ok(Ok(response)) => {
+                    guard.disarm();
+                    Some(zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                        response,
+                    ))
+                }
                 Ok(Err(_)) => {
                     // Sender dropped — clean up and deny. Nobody tapped.
-                    self.pending_approvals.lock().await.remove(&approval_id);
+                    guard.remove().await;
                     Some(
                         zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                             ChannelApprovalResponse::Deny,
@@ -4611,7 +4618,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                 Err(_) => {
                     // Timeout — clean up and deny. This is the runtime's deny,
                     // not the operator's.
-                    self.pending_approvals.lock().await.remove(&approval_id);
+                    guard.remove().await;
                     Some(
                         zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                             ChannelApprovalResponse::Deny,
