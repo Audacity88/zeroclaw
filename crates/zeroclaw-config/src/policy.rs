@@ -1188,8 +1188,9 @@ fn normalized_shell_command(segment: &str) -> NormalizedShellCommand {
 fn is_git_write_verb(verb: &str) -> bool {
     matches!(
         verb.to_ascii_lowercase().as_str(),
-        "commit"
+        "am" | "commit"
             | "push"
+            | "pull"
             | "reset"
             | "clean"
             | "rebase"
@@ -1203,9 +1204,18 @@ fn is_git_write_verb(verb: &str) -> bool {
     )
 }
 
-fn git_effective_subcommand(args: &[String]) -> Option<&str> {
-    args.get(git_effective_subcommand_index(args)?)
-        .map(String::as_str)
+fn git_command_is_write(args: &[String]) -> bool {
+    let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
+        return false;
+    };
+    let subcommand = args[subcommand_idx].as_str();
+    if is_git_write_verb(subcommand) {
+        return true;
+    }
+
+    git_arg_eq(subcommand, "worktree")
+        && git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|action| !git_arg_eq(action, "list"))
 }
 
 fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
@@ -1265,7 +1275,6 @@ fn git_subcommand_is_policy_modeled(subcommand: &str) -> bool {
         || matches!(
             subcommand,
             "add"
-                | "am"
                 | "apply"
                 | "archive"
                 | "bisect"
@@ -1301,7 +1310,6 @@ fn git_subcommand_is_policy_modeled(subcommand: &str) -> bool {
                 | "mv"
                 | "name-rev"
                 | "notes"
-                | "pull"
                 | "range-diff"
                 | "reflog"
                 | "remote"
@@ -2695,13 +2703,11 @@ fn generic_segment_risk(
     }
 
     match base {
-        "git" => Some(
-            if git_effective_subcommand(args).is_some_and(is_git_write_verb) {
-                CommandRiskLevel::Medium
-            } else {
-                CommandRiskLevel::Low
-            },
-        ),
+        "git" => Some(if git_command_is_write(args) {
+            CommandRiskLevel::Medium
+        } else {
+            CommandRiskLevel::Low
+        }),
         "npm" | "pnpm" | "yarn" => Some(
             if args.first().is_some_and(|verb| {
                 let verb = verb.to_ascii_lowercase();
@@ -5436,6 +5442,8 @@ mod tests {
             "git log -p -1",
             "git grep -o pattern",
             "git fetch origin main",
+            "git worktree list",
+            "git -C . worktree list --porcelain",
             "git ls-remote origin",
             "git clone https://example.invalid/repo ./dst",
             "git clone git+ssh://example.invalid/repo ./dst",
@@ -5516,6 +5524,27 @@ mod tests {
             .validate_command_execution("git rebase main", true)
             .expect("runtime-approved Git rebase without an exec hook should remain allowed");
         assert_eq!(rebase_allowed, CommandRiskLevel::Medium);
+
+        for command in [
+            "git am ./change.mbox",
+            "git pull origin main",
+            "git -C . pull origin main",
+            "git worktree add ./dst HEAD",
+            "git -C . worktree add ./dst HEAD",
+        ] {
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("Git mutations and lifecycle hooks must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+
+            let allowed = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved Git mutations should remain available");
+            assert_eq!(allowed, CommandRiskLevel::Medium, "{command}");
+        }
 
         let global_option_commit_denied = p
             .validate_command_execution("git -C . commit -m test", false)
