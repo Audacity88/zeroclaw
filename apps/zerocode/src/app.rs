@@ -58,6 +58,40 @@ enum QuickstartChatDrain {
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
+
+fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Drag(button) => Some(button),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn coalesce_mouse_drag<F>(mut current: Event, mut read_queued: F) -> Result<(Event, Option<Event>)>
+where
+    F: FnMut() -> Result<Option<Event>>,
+{
+    let Some(button) = mouse_drag_button(&current) else {
+        return Ok((current, None));
+    };
+
+    let mut coalesced = 1;
+    while coalesced < MAX_COALESCED_MOUSE_DRAGS {
+        let Some(next) = read_queued()? else {
+            return Ok((current, None));
+        };
+        if mouse_drag_button(&next) == Some(button) {
+            current = next;
+            coalesced += 1;
+        } else {
+            return Ok((current, Some(next)));
+        }
+    }
+    Ok((current, None))
+}
 
 /// Ephemeral interaction state for the keybinding overlay. Keybinding
 /// metadata itself stays in the action/help registry and is resolved on draw.
@@ -102,10 +136,6 @@ impl HelpOverlayState {
 }
 
 /// Mode bar entries. Shared between drawing and click detection.
-/// SOP authoring is not exposed from any build: the web dashboard ships as the
-/// first experimental release while the TUI pane cooks longer. `Mode::Sop` is
-/// deliberately absent here so the pane is unreachable from navigation
-/// regardless of feature selection.
 const MODES: &[Mode] = &[
     Mode::Dashboard,
     Mode::Config,
@@ -114,6 +144,7 @@ const MODES: &[Mode] = &[
     Mode::Logs,
     Mode::Doctor,
     Mode::Quickstart,
+    Mode::Sop,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -127,8 +158,41 @@ enum Mode {
     Chat,
     Logs,
     Quickstart,
-    #[allow(dead_code)]
     Sop,
+}
+
+#[derive(Debug, Clone)]
+struct ModeBarEntry {
+    mode: Mode,
+    title: String,
+    hit_rect: Rect,
+}
+
+/// Exact geometry produced for the most recently rendered mode bar.
+///
+/// Drawing and mouse dispatch both consume this value, so a clipped or hidden
+/// tab can never retain a larger synthetic click target.
+#[derive(Debug, Clone, Default)]
+struct ModeBarLayout {
+    tab_area: Rect,
+    summary_area: Option<Rect>,
+    entries: Vec<ModeBarEntry>,
+}
+
+impl ModeBarLayout {
+    fn mode_at(&self, column: u16, row: u16) -> Option<Mode> {
+        if self
+            .summary_area
+            .is_some_and(|area| mouse::in_rect(column, row, area))
+            || !mouse::in_rect(column, row, self.tab_area)
+        {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|entry| mouse::in_rect(column, row, entry.hit_rect))
+            .map(|entry| entry.mode)
+    }
 }
 
 #[derive(Default)]
@@ -328,7 +392,7 @@ pub async fn run(
     let mut reload_confirm = false;
     let mut quit_confirm = false;
     let mut reload_status: Option<String> = None;
-    let mut bar_area = Rect::default();
+    let mut mode_bar_layout = ModeBarLayout::default();
     let mut content_area = Rect::default();
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
@@ -402,6 +466,7 @@ pub async fn run(
     )?;
     let mut chrome_status = ChromeStatus::default();
     chrome_status.tick(&rpc);
+    let mut pending_event = None;
 
     loop {
         // Draw
@@ -463,8 +528,7 @@ pub async fn run(
                 .constraints(constraints)
                 .split(frame.area());
 
-            bar_area = chunks[0];
-            draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
+            mode_bar_layout = draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
             content_area = chunks[1];
 
             match mode {
@@ -587,7 +651,8 @@ pub async fn run(
                             acp_pane.current_agent_alias().map(String::from),
                         );
                         match build_panes!(resume_chat, resume_acp) {
-                            Ok(panes) => {
+                            Ok(mut panes) => {
+                                refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
                                 dashboard_pane = panes.0;
                                 config_app = panes.1;
                                 doctor_pane = panes.2;
@@ -620,31 +685,47 @@ pub async fn run(
             }
         }
 
-        // Poll for input with a timeout so live panes refresh periodically.
-        if !event::poll(TICK)? {
-            if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+        let input_event = if let Some(pending) = pending_event.take() {
+            pending
+        } else {
+            // Poll for input with a timeout so live panes refresh periodically.
+            if !event::poll(TICK)? {
+                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                    continue;
+                }
+                if mode == Mode::Dashboard {
+                    dashboard_pane.tick().await;
+                }
+                if mode == Mode::Logs {
+                    logs_pane.tick().await;
+                }
+                if mode == Mode::Quickstart {
+                    quickstart.tick().await;
+                }
+                if mode == Mode::Sop {
+                    sop_pane.tick();
+                }
+                consume_pending_quickstart_chat(
+                    &conn_state,
+                    &reconnect_state,
+                    &mut mode,
+                    &mut chat_pane,
+                )
+                .await;
                 continue;
             }
-            if mode == Mode::Dashboard {
-                dashboard_pane.tick().await;
+            event::read()?
+        };
+        let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
+            if event::poll(Duration::ZERO)? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
             }
-            if mode == Mode::Logs {
-                logs_pane.tick().await;
-            }
-            if mode == Mode::Quickstart {
-                quickstart.tick().await;
-            }
-            consume_pending_quickstart_chat(
-                &conn_state,
-                &reconnect_state,
-                &mut mode,
-                &mut chat_pane,
-            )
-            .await;
-            continue;
-        }
+        })?;
+        pending_event = next_pending;
 
-        match event::read()? {
+        match input_event {
             Event::Key(key) => {
                 if key.kind == KeyEventKind::Release {
                     continue;
@@ -658,7 +739,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.wants_text_input(),
                     Mode::Logs => logs_pane.wants_text_input(),
                     Mode::Quickstart => quickstart.wants_text_input(),
-                    Mode::Sop => false,
+                    Mode::Sop => sop_pane.wants_text_input(),
                 };
                 let global = GlobalAction::from_chord(&key);
 
@@ -745,11 +826,26 @@ pub async fn run(
                     continue;
                 }
 
-                let switch_to: Option<Mode> = match global {
-                    Some(GlobalAction::PaneNavLeft) => Some(mode.cycle(-1)),
-                    Some(GlobalAction::PaneNavRight) => Some(mode.cycle(1)),
-                    _ => None,
+                let editor_claims_pane_navigation = matches!(
+                    global,
+                    Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
+                ) && match mode {
+                    Mode::Config => config_app.claims_pane_navigation(&key),
+                    Mode::Acp => acp_pane.claims_pane_navigation(&key),
+                    Mode::Chat => chat_pane.claims_pane_navigation(&key),
+                    Mode::Sop => sop_pane.claims_pane_navigation(&key),
+                    _ => false,
                 };
+                // Disconnected panes are skipped below to avoid dead-socket RPCs,
+                // so a retained editor cannot consume its local cursor chord.
+                let pane_can_receive_editor_chord =
+                    !matches!(conn_state, ConnectionState::Disconnected { .. });
+                let switch_to = pane_switch_delta(
+                    global,
+                    editor_claims_pane_navigation,
+                    pane_can_receive_editor_chord,
+                )
+                .map(|delta| mode.cycle(delta));
                 if let Some(next) = switch_to {
                     switch_mode(
                         &mut mode,
@@ -838,30 +934,21 @@ pub async fn run(
                     continue;
                 }
                 // Mode bar clicks
-                if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    let labels: Vec<(&str, String)> = MODES
-                        .iter()
-                        .map(|m| ("", format!(" {} ", crate::i18n::t(m.fluent_key()))))
-                        .collect();
-                    let label_refs: Vec<(&str, &str)> =
-                        labels.iter().map(|(k, l)| (*k, l.as_str())).collect();
-                    if let Some(n) =
-                        mouse::mode_bar_click(mouse.column, mouse.row, bar_area, &label_refs)
-                    {
-                        let next = MODES[(n - 1) as usize];
-                        switch_mode(
-                            &mut mode,
-                            next,
-                            &conn_state,
-                            &mut dashboard_pane,
-                            &mut quickstart,
-                            &mut acp_pane,
-                            &mut chat_pane,
-                            &mut sop_pane,
-                        )
-                        .await;
-                        continue;
-                    }
+                if matches!(mouse.kind, MouseEventKind::Down(_))
+                    && let Some(next) = mode_bar_layout.mode_at(mouse.column, mouse.row)
+                {
+                    switch_mode(
+                        &mut mode,
+                        next,
+                        &conn_state,
+                        &mut dashboard_pane,
+                        &mut quickstart,
+                        &mut acp_pane,
+                        &mut chat_pane,
+                        &mut sop_pane,
+                    )
+                    .await;
+                    continue;
                 }
                 // Help-hint click: every pane renders the `?=help` indicator at
                 // the bottom-left of the content area; clicking it opens help,
@@ -926,7 +1013,7 @@ pub async fn run(
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),
                     Mode::Logs => logs_pane.handle_paste(&text),
-                    Mode::Sop => {}
+                    Mode::Sop => sop_pane.handle_paste(&text),
                 }
                 consume_pending_quickstart_chat(
                     &conn_state,
@@ -941,6 +1028,15 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// A reconnect rebuilds every pane around the new RPC client. The SOP list is
+/// loaded on focus rather than at construction, so an already-visible SOP pane
+/// must run that same canonical refresh before replacing the disconnected pane.
+async fn refresh_visible_sop_after_reconnect(mode: Mode, pane: &mut sop_pane::SopPane) {
+    if mode == Mode::Sop {
+        pane.refresh().await;
+    }
 }
 
 fn global_help_entries() -> Vec<HelpEntry> {
@@ -967,6 +1063,21 @@ fn global_help_entries() -> Vec<HelpEntry> {
     ]
 }
 
+fn pane_switch_delta(
+    global: Option<GlobalAction>,
+    editor_claims_chord: bool,
+    pane_can_receive_editor_chord: bool,
+) -> Option<isize> {
+    if editor_claims_chord && pane_can_receive_editor_chord {
+        return None;
+    }
+    match global {
+        Some(GlobalAction::PaneNavLeft) => Some(-1),
+        Some(GlobalAction::PaneNavRight) => Some(1),
+        _ => None,
+    }
+}
+
 fn resolve_agent_overrides(
     config_dir: &std::path::Path,
 ) -> std::collections::HashMap<String, theme::Theme> {
@@ -989,40 +1100,141 @@ fn draw_mode_bar(
     area: Rect,
     active: Mode,
     chrome_summary: Option<&Line<'static>>,
-) {
+) -> ModeBarLayout {
     use ratatui::widgets::Tabs;
 
     let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
-    let titles: Vec<ratatui::text::Line> = MODES
+    let base_titles: Vec<String> = MODES
         .iter()
-        .map(|m| {
-            let label = crate::i18n::t(m.fluent_key());
+        .map(|mode| format!(" {} ", crate::i18n::t(mode.fluent_key())))
+        .collect();
+
+    // Chrome is informative; the selected navigation target is interactive.
+    // Keep the full summary only when it leaves enough room for the active tab.
+    let active_width = crate::display_width::display_width(&base_titles[active_idx]) as u16;
+    let summary_width = chrome_summary
+        .map(Line::width)
+        .filter(|width| usize::from(area.width) >= width.saturating_add(active_width.into()))
+        .map(|width| width.min(usize::from(u16::MAX)) as u16)
+        .unwrap_or(0);
+    let tab_area = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(summary_width),
+        area.height,
+    );
+    let summary_area = (summary_width > 0)
+        .then(|| Rect::new(tab_area.right(), area.y, summary_width, area.height));
+
+    let (start, end, show_overflow_markers) =
+        visible_mode_window(&base_titles, active_idx, usize::from(tab_area.width));
+    let mut visible: Vec<(Mode, String)> = MODES[start..end]
+        .iter()
+        .copied()
+        .zip(base_titles[start..end].iter().cloned())
+        .collect();
+    if show_overflow_markers && start > 0 {
+        visible[0].1.insert(0, '‹');
+    }
+    if show_overflow_markers && end < MODES.len() {
+        visible
+            .last_mut()
+            .expect("active mode is visible")
+            .1
+            .push('›');
+    }
+
+    let mut x = tab_area.x;
+    let mut entries = Vec::with_capacity(visible.len());
+    for (index, (mode, title)) in visible.into_iter().enumerate() {
+        let remaining = tab_area.right().saturating_sub(x);
+        if remaining == 0 {
+            break;
+        }
+        let title_width = crate::display_width::display_width(&title) as u16;
+        let rendered_width = title_width.min(remaining);
+        entries.push(ModeBarEntry {
+            mode,
+            title,
+            hit_rect: Rect::new(x, tab_area.y, rendered_width, tab_area.height),
+        });
+        x = x.saturating_add(rendered_width);
+        if rendered_width < title_width {
+            break;
+        }
+        if index + 1 < end - start && x < tab_area.right() {
+            // Ratatui renders the one-column divider after each non-final title.
+            x = x.saturating_add(1);
+        }
+    }
+
+    let selected = entries.iter().position(|entry| entry.mode == active);
+    let titles: Vec<ratatui::text::Line> = entries
+        .iter()
+        .map(|entry| {
             ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!(" {} ", label),
+                entry.title.clone(),
                 theme::body_style(),
             ))
         })
         .collect();
 
     let tabs = Tabs::new(titles)
-        .select(active_idx)
+        .select(selected)
         .style(theme::bar_style())
         .highlight_style(theme::selected_style().add_modifier(Modifier::BOLD))
         .divider("│")
         .padding("", "");
 
-    if let Some(summary) = chrome_summary {
-        let summary_w = summary.width() as u16;
-        let right_w = summary_w.min(area.width);
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(right_w)])
-            .split(area);
-        frame.render_widget(tabs, chunks[0]);
-        frame.render_widget(Paragraph::new(summary.clone()), chunks[1]);
-    } else {
-        frame.render_widget(tabs, area);
+    frame.render_widget(tabs, tab_area);
+    if let (Some(summary), Some(summary_area)) = (chrome_summary, summary_area) {
+        frame.render_widget(Paragraph::new(summary.clone()), summary_area);
     }
+
+    ModeBarLayout {
+        tab_area,
+        summary_area,
+        entries,
+    }
+}
+
+/// Select a contiguous localized-title window containing `active_idx`.
+/// Hidden neighbors are signaled with edge markers when those markers fit.
+fn visible_mode_window(
+    titles: &[String],
+    active_idx: usize,
+    available_width: usize,
+) -> (usize, usize, bool) {
+    let mut start = active_idx.min(titles.len().saturating_sub(1));
+    let mut end = (start + 1).min(titles.len());
+
+    loop {
+        let mut expanded = false;
+        if start > 0 && mode_window_width(titles, start - 1, end) <= available_width {
+            start -= 1;
+            expanded = true;
+        }
+        if end < titles.len() && mode_window_width(titles, start, end + 1) <= available_width {
+            end += 1;
+            expanded = true;
+        }
+        if !expanded {
+            break;
+        }
+    }
+
+    let markers_fit = mode_window_width(titles, start, end) <= available_width;
+    (start, end, markers_fit)
+}
+
+fn mode_window_width(titles: &[String], start: usize, end: usize) -> usize {
+    let title_width: usize = titles[start..end]
+        .iter()
+        .map(|title| crate::display_width::display_width(title))
+        .sum();
+    let dividers = end.saturating_sub(start + 1);
+    let overflow_markers = usize::from(start > 0) + usize::from(end < titles.len());
+    title_width + dividers + overflow_markers
 }
 
 // ── Status bar ───────────────────────────────────────────────────
@@ -1616,6 +1828,154 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn coalesces_contiguous_mouse_drags_to_latest_position() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            1,
+            2,
+        );
+        let mut queued = VecDeque::from([
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                4,
+                5,
+            ),
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9,
+            ),
+        ]);
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce drag events");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9
+            )
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn coalescing_preserves_first_non_drag_event() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            1,
+            2,
+        );
+        let mouse_up = mouse_event(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            8,
+            9,
+        );
+        let mut queued = VecDeque::from([
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9,
+            ),
+            mouse_up.clone(),
+        ]);
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce drag events");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                8,
+                9
+            )
+        );
+        assert_eq!(pending, Some(mouse_up));
+    }
+
+    #[test]
+    fn coalescing_bounds_each_drag_batch_and_preserves_following_input() {
+        let first = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            0,
+            0,
+        );
+        let mouse_up = mouse_event(
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            MAX_COALESCED_MOUSE_DRAGS as u16,
+            0,
+        );
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut queued: VecDeque<Event> = (1..=MAX_COALESCED_MOUSE_DRAGS)
+            .map(|column| {
+                mouse_event(
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    column as u16,
+                    0,
+                )
+            })
+            .chain([mouse_up.clone(), key.clone()])
+            .collect();
+
+        let (current, pending) =
+            coalesce_mouse_drag(first, || Ok(queued.pop_front())).expect("coalesce first batch");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                MAX_COALESCED_MOUSE_DRAGS.saturating_sub(1) as u16,
+                0,
+            )
+        );
+        assert_eq!(pending, None);
+
+        let next = queued.pop_front().expect("next drag remains queued");
+        let (current, pending) =
+            coalesce_mouse_drag(next, || Ok(queued.pop_front())).expect("coalesce next batch");
+
+        assert_eq!(
+            current,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                MAX_COALESCED_MOUSE_DRAGS as u16,
+                0,
+            )
+        );
+        assert_eq!(pending, Some(mouse_up));
+        assert_eq!(queued.pop_front(), Some(key));
+    }
+
+    #[test]
+    fn non_drag_event_passes_through_without_reading_ahead() {
+        let first = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut read_ahead = false;
+
+        let (current, pending) = coalesce_mouse_drag(first.clone(), || {
+            read_ahead = true;
+            Ok(None)
+        })
+        .expect("leave non-drag event unchanged");
+
+        assert_eq!(current, first);
+        assert_eq!(pending, None);
+        assert!(!read_ahead);
+    }
 
     #[test]
     fn chrome_process_summary_shows_cpu_loading_without_health() {
@@ -1689,6 +2049,86 @@ mod tests {
         assert_eq!(request["method"], crate::client::method::STATUS);
     }
 
+    #[tokio::test]
+    async fn reconnect_refreshes_the_sop_list_when_it_remains_visible() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut pane = sop_pane::SopPane::new(rpc);
+
+        let responder = tokio::spawn(async move {
+            let raw = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("visible reconnect should request the SOP list")
+                .expect("RPC request channel should stay open");
+            let request: serde_json::Value =
+                serde_json::from_str(&raw).expect("RPC request should be JSON");
+            assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+            let id = request["id"]
+                .as_str()
+                .expect("RPC request should carry an id");
+            outbound.dispatch_response(id, Some(serde_json::json!([{ "name": "deploy" }])), None);
+        });
+
+        refresh_visible_sop_after_reconnect(Mode::Sop, &mut pane).await;
+        responder.await.expect("RPC responder should complete");
+
+        assert_eq!(pane.selected_name(), Some("deploy"));
+    }
+
+    #[test]
+    fn narrow_mode_bar_keeps_selected_sop_visible_and_summary_non_clickable() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let summary = Line::from(" status");
+        let backend = TestBackend::new(24, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut layout = ModeBarLayout::default();
+
+        terminal
+            .draw(|frame| {
+                layout = draw_mode_bar(frame, frame.area(), Mode::Sop, Some(&summary));
+            })
+            .expect("draw narrow mode bar");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("SOPs"), "rendered bar: {rendered:?}");
+        assert!(
+            rendered.contains('‹'),
+            "hidden leading modes should be signaled: {rendered:?}"
+        );
+
+        let sop = layout
+            .entries
+            .iter()
+            .find(|entry| entry.mode == Mode::Sop)
+            .expect("selected SOP tab must have rendered geometry");
+        assert_eq!(
+            layout.mode_at(sop.hit_rect.x, sop.hit_rect.y),
+            Some(Mode::Sop)
+        );
+
+        let summary_area = layout.summary_area.expect("full summary should fit");
+        assert_eq!(
+            layout.mode_at(summary_area.x, summary_area.y),
+            None,
+            "chrome summary must not share a tab hit target"
+        );
+        assert!(
+            layout
+                .entries
+                .iter()
+                .all(|entry| entry.hit_rect.right() <= layout.tab_area.right()),
+            "every click target must stay within the rendered tab chunk"
+        );
+    }
+
     #[test]
     fn global_help_entries_include_live_help_binding() {
         use crate::keymap::{GlobalAction, action_key_labels};
@@ -1701,6 +2141,26 @@ mod tests {
         let expected = action_key_labels(GlobalAction::Help);
 
         assert_eq!(help.keys, expected);
+    }
+
+    #[test]
+    fn active_text_editor_can_claim_global_pane_navigation() {
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavLeft), false, true),
+            Some(-1)
+        );
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavRight), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn disconnected_editor_claim_keeps_global_pane_navigation() {
+        assert_eq!(
+            pane_switch_delta(Some(GlobalAction::PaneNavRight), true, false),
+            Some(1)
+        );
     }
 
     #[test]
