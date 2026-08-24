@@ -1337,7 +1337,7 @@ impl RpcDispatcher {
             Method::QuickstartState => self.handle_quickstart_state(),
             Method::QuickstartFields => self.handle_quickstart_fields(&req.params),
             Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
-            Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
+            Method::QuickstartApply => Box::pin(self.handle_quickstart_apply(&req.params)).await,
             Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
 
             Method::SopsList => self.handle_sops_list(),
@@ -7951,11 +7951,37 @@ mod tests {
         assert!(*reload_rx.borrow_and_update());
     }
 
-    #[tokio::test]
-    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
+    fn quickstart_apply_test_submission() -> zeroclaw_config::presets::BuilderSubmission {
         use zeroclaw_config::presets::{
             AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
         };
+
+        BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([(
+                    "api_key".to_string(),
+                    "sk-test".to_string(),
+                )]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7979,28 +8005,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
 
-        let submission = BuilderSubmission {
-            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
-                provider_type: "anthropic".into(),
-                alias: "anthropic".into(),
-                model: "claude-sonnet-4-5".into(),
-                fields: std::collections::HashMap::from([(
-                    "api_key".to_string(),
-                    "sk-test".to_string(),
-                )]),
-            }),
-            risk_profile: SelectorChoice::Fresh("balanced".into()),
-            runtime_profile: SelectorChoice::Fresh("balanced".into()),
-            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
-            channels: vec![],
-            peer_groups: vec![],
-            agent: AgentIdentity {
-                name: "quickstart_bot".into(),
-                system_prompt: "You are helpful.".into(),
-                personality_file: None,
-                personality_files: vec![],
-            },
-        };
+        let submission = quickstart_apply_test_submission();
 
         let result = dispatcher
             .handle_quickstart_apply(&json!({ "submission": submission }))
@@ -8030,6 +8035,76 @@ mod tests {
             .expect("quickstart/apply daemon reload should follow gateway shutdown")
             .expect("reload sender should stay alive");
         assert!(*reload_rx.borrow_and_update());
+    }
+
+    #[test]
+    fn quickstart_apply_rpc_survives_default_worker_stack() {
+        use zeroclaw_config::presets::SelectorChoice;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("default-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let task = tokio::spawn(async {
+                let tmp = tempfile::TempDir::new().expect("temporary config root");
+                let mut config = zeroclaw_config::schema::Config {
+                    data_dir: tmp.path().join("workspace"),
+                    config_path: tmp.path().join("config.toml"),
+                    ..zeroclaw_config::schema::Config::default()
+                };
+                config
+                    .providers
+                    .models
+                    .openrouter
+                    .insert("default".into(), Default::default());
+                std::fs::create_dir_all(&config.data_dir).expect("workspace directory");
+
+                let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+                let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+                let (gateway_shutdown_tx, _gateway_shutdown_rx) =
+                    tokio::sync::watch::channel(false);
+                let (reload_tx, _reload_rx) = tokio::sync::watch::channel(false);
+                let ctx = RpcContext::minimal_with_reload_controls(
+                    config,
+                    sessions,
+                    Some(gateway_shutdown_tx),
+                    Some(reload_tx),
+                );
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let mut dispatcher =
+                    RpcDispatcher::new(ctx, tx, "test-peer-quickstart-stack:pid=1".into());
+                dispatcher.authenticated = true;
+
+                let mut submission = quickstart_apply_test_submission();
+                submission.model_provider = SelectorChoice::Existing("openrouter.default".into());
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "quickstart/apply",
+                    "params": { "submission": submission },
+                })
+                .to_string();
+
+                dispatcher.process_line_for_test(&frame).await;
+
+                let response = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("quickstart/apply response timeout")
+                    .expect("quickstart/apply response");
+                let response: Value =
+                    serde_json::from_str(&response).expect("valid quickstart/apply response");
+                assert_eq!(response["id"], json!(1));
+                assert_eq!(response["result"]["kind"], "applied");
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .expect("quickstart/apply worker task timeout")
+                .expect("quickstart/apply worker task");
+        });
     }
 
     #[test]
