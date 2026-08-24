@@ -33,7 +33,7 @@
 | 13 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions ([#9136](https://github.com/zeroclaw-labs/zeroclaw/pull/9136)) |
 | 14 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records ([#9388](https://github.com/zeroclaw-labs/zeroclaw/pull/9388)) |
 | 15 | 2026-08-10 | Narrowed the RFC trigger to four project-level categories and named the ordinary work that does not require an RFC; replaced the seven-day discussion period with 48h ordinary / 72h exceptional; defined the 72-hour vote against an immutable snapshot, the 30-day active electorate, two-ballot quorum, silence-as-approval after quorum, non-vetoing `REVISE`, and outcome precedence; made two-thirds the default threshold and reserved unanimity for expensive or irreversible decisions; retired the nonexistent parallel `rfc:*` label family; added the GitHub bridge record for Core meeting decisions ([#9499](https://github.com/zeroclaw-labs/zeroclaw/pull/9499)) |
-| 16 | 2026-08-23 | Defined deferred RFC vote handling for unchanged snapshots: vote openings must record conditions that can defer closure, no-quorum and missing-threshold or explicit-unanimity cases enter another recorded 72-hour cycle, and existing explicit ballots carry forward until withdrawn or replaced ([#10288](https://github.com/zeroclaw-labs/zeroclaw/pull/10288)) |
+| 16 | 2026-08-23 | Defined deferred RFC vote handling for unchanged snapshots: no-quorum and missing-threshold or explicit-unanimity cases enter another recorded 72-hour cycle on the same vote, existing explicit ballots count toward quorum and outcome until replaced, and material revisions return the proposal to discussion rather than renewing the unchanged snapshot ([#10288](https://github.com/zeroclaw-labs/zeroclaw/pull/10288)) |
 
 ---
 
@@ -576,30 +576,33 @@ Ordinary author revisions and clarifications during discussion do not restart th
      - the assigned active electorate, and inactive Core notified for re-entry
      - the threshold, and why it applies
      - that quorum requires two explicit ballots
-     - any additional prerequisite or closing condition that can defer closure
      - the exact UTC deadline, 72 hours after opening
            |
 4. CORE TEAM BALLOTS, one of:
      APPROVE  accept the snapshot as written
      REVISE   request changes, withhold approval, do not veto
      REJECT   blocking objection, with a specific reason
-   A member's latest ballot before the current vote cycle closes supersedes their earlier one.
+   A member's latest ballot before the recorded deadline for the current vote cycle supersedes their earlier one.
            |
 5. OUTCOME, applied in this precedence order:
-     a. Fewer than two explicit ballots        -> DEFERRED / PENDING
-     b. Quorum met and any final ballot REJECT -> REJECTED
-     c. Quorum met, no REJECT, and the
+     a. Proposal body materially changed, or
+        vote stopped for revision             -> RETURNED TO DISCUSSION
+     b. Fewer than two explicit ballots        -> DEFERRED
+     c. Quorum met and any final ballot REJECT -> REJECTED
+     d. Quorum met, no REJECT, and the
         applicable threshold, required explicit
-        approvals, or vote-opening
-        closing condition remain missing       -> DEFERRED / PENDING
-     d. Quorum met, no REJECT, applicable
+        approvals remain missing              -> DEFERRED
+     e. Quorum met, no REJECT, applicable
         threshold satisfied                    -> ACCEPTED
-     e. Otherwise                              -> RETURNED TO DISCUSSION
 ```
 
 Accepted RFCs carry `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Rejected RFCs are closed with the blocking objection recorded and a link to any issue where the underlying problem continues; rejection ends the current proposal, not necessarily the problem.
 
-Deferred proposals enter another 72-hour cycle against the same immutable snapshot when the vote deadline arrives with fewer than two explicit ballots, with no `REJECT` and the applicable threshold or explicit approvals still missing, or with another vote-opening prerequisite that prevents closure. The closing or status record states the missing condition and the new UTC deadline. Existing explicit ballots carry forward until withdrawn or replaced, so voters do not need to recast unchanged ballots. At the next cycle deadline, the same snapshot can be accepted, rejected, returned to discussion, or deferred again. A material body change creates a new snapshot and uses the applicable discussion or vote handling for that new proposal.
+Deferred proposals enter another recorded 72-hour cycle against the same immutable snapshot when the vote deadline arrives with fewer than two explicit ballots, or with no `REJECT` and the applicable threshold or explicit approvals still missing. A renewal is the same vote on the same snapshot, not a new vote on a new proposal. It does not recompute the assigned active electorate. The final electorate remains the active electorate assigned when the vote first opened, plus any current Core Team member who ballots in any cycle for that same snapshot. Existing explicit ballots count toward quorum and outcome in the renewed cycle, and carry forward until replaced by a later ballot, so voters do not need to recast unchanged ballots.
+
+The closing or status record for a deferred cycle must state the missing condition and link to a new cycle-opening record. The cycle-opening record names the carried snapshot, carried ballots, electorate so far, threshold, missing condition, `opened_at`, and `deadline = opened_at + 72 hours`. The recorded deadline is the ballot cutoff. At the next cycle deadline, the same snapshot can be accepted, rejected, or deferred again.
+
+A proposal returns to discussion when the body materially changes, the author asks to revise before a decision, or the recorded vote status stops the current snapshot for revision. Returning to discussion creates or awaits a new stable snapshot and uses the applicable discussion or vote handling for that changed proposal.
 
 Use the live `type:rfc` and `status:accepted` labels. There is no parallel `rfc:*` status label family.
 
