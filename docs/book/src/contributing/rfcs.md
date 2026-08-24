@@ -64,9 +64,8 @@ A vote cycle normally stays open for **72 hours** against an immutable proposal 
 
 Outcomes, applied in this order:
 
-- **Deferred / pending**: fewer than two explicit ballots. The proposal may enter another 72-hour cycle against the same immutable snapshot; existing explicit ballots carry forward until withdrawn or replaced. A material proposal change creates a new snapshot and follows the applicable discussion or vote handling.
+- **Deferred / pending**: the vote cannot close because it has fewer than two explicit ballots, or because quorum is met with no `REJECT` but the applicable threshold, explicit approvals, or vote-opening closing condition is not yet satisfied. The proposal may enter another 72-hour cycle against the same immutable snapshot; existing explicit ballots carry forward until withdrawn or replaced. A material proposal change creates a new snapshot and follows the applicable discussion or vote handling.
 - **Rejected**: quorum met and any final ballot is `REJECT`. Issue closed with the blocking objection recorded, linking any issue where the underlying problem continues. This rejects the proposal, not necessarily the problem.
-- **Deferred / pending**: quorum met, no `REJECT`, and the applicable threshold, explicit approvals, or vote-opening closing condition is not yet satisfied. For an exceptional-unanimous vote, this includes any missing explicit `APPROVE` from an assigned voter. The same unchanged-snapshot 72-hour-cycle and carry-forward rule applies.
 - **Accepted**: quorum met, no `REJECT`, and the applicable threshold is satisfied. By default, that means at least two-thirds approve explicitly or by silence; exceptional-unanimous votes require explicit `APPROVE` from every assigned voter. Issue carries `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Implementation PRs can proceed once that handoff is visible.
 - **Returned to discussion**: none of the above. Unresolved revision requests are recorded.
 - **Withdrawn**: the author pulls it. Closed without prejudice.
