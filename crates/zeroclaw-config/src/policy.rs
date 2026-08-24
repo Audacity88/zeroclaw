@@ -1352,8 +1352,12 @@ fn git_delegates_to_external_command(args: &[String]) -> bool {
     if git_subcommand_selects_transfer_program(args, subcommand_idx, subcommand) {
         return true;
     }
-    if git_arg_eq(subcommand, "clone")
-        && git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_is_clone_process_control)
+    let subcommand_args = || git_args_before_pathspec(args, subcommand_idx + 1);
+    if (git_arg_eq(subcommand, "clone") && subcommand_args().any(git_arg_is_clone_process_control))
+        || (git_arg_eq(subcommand, "init")
+            && subcommand_args().any(git_arg_is_template_process_control))
+        || (git_arg_eq(subcommand, "rebase")
+            && subcommand_args().any(git_arg_is_rebase_process_control))
     {
         return true;
     }
@@ -1436,9 +1440,20 @@ fn git_subcommand_selects_transfer_program(
 
 fn git_arg_is_clone_process_control(arg: &str) -> bool {
     git_arg_is_long_option_or_abbreviation(arg, "--config")
-        || git_arg_is_long_option_or_abbreviation(arg, "--template")
+        || git_arg_is_template_process_control(arg)
         || git_arg_eq(arg, "-u")
         || git_arg_starts_with(arg, "-u")
+}
+
+fn git_arg_is_template_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--template")
+}
+
+fn git_arg_is_rebase_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--exec")
+        || arg
+            .strip_prefix('-')
+            .is_some_and(|options| !options.starts_with('-') && options.contains('x'))
 }
 
 fn git_arg_is_long_option_or_abbreviation(arg: &str, option: &str) -> bool {
@@ -5324,6 +5339,13 @@ mod tests {
             "git clone --config=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
             "git clone --template=./hooks https://example.invalid/repo ./dst",
             "git clone --template ./hooks https://example.invalid/repo ./dst",
+            "git init --template=./hooks ./dst",
+            "git init --template ./hooks ./dst",
+            "git rebase --exec=./helper main",
+            "git rebase --exec ./helper main",
+            "git rebase -x ./helper main",
+            "git rebase -x./helper main",
+            "git rebase -ix ./helper main",
             "git clone -u ./helper ssh://example.invalid/repo ./dst",
             "git clone -u./helper ssh://example.invalid/repo ./dst",
             "git STATUS",
@@ -5335,6 +5357,8 @@ mod tests {
             "git archive --exe=./helper HEAD",
             "git clone --conf=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
             "git clone --temp=./hooks https://example.invalid/repo ./dst",
+            "git init --temp=./hooks ./dst",
+            "git rebase --exe=./helper main",
             "git ls-remote 'ext::sh -c true'",
             "git fetch helper::payload",
             "git clone ext::helper ./dst",
@@ -5477,6 +5501,21 @@ mod tests {
             .validate_command_execution("git push origin main", true)
             .expect("runtime-approved Git push to a configured remote should remain allowed");
         assert_eq!(push_allowed, CommandRiskLevel::Medium);
+
+        let init_allowed = p
+            .validate_command_execution("git init ./dst", false)
+            .expect("plain Git init should remain allowed");
+        assert_eq!(init_allowed, CommandRiskLevel::Low);
+
+        let rebase_denied = p
+            .validate_command_execution("git rebase main", false)
+            .expect_err("Git rebase without an exec hook should still require approval");
+        assert!(rebase_denied.contains("medium-risk operation"));
+
+        let rebase_allowed = p
+            .validate_command_execution("git rebase main", true)
+            .expect("runtime-approved Git rebase without an exec hook should remain allowed");
+        assert_eq!(rebase_allowed, CommandRiskLevel::Medium);
 
         let global_option_commit_denied = p
             .validate_command_execution("git -C . commit -m test", false)
