@@ -586,7 +586,7 @@ Ordinary author revisions and clarifications during discussion do not restart th
            |
 5. OUTCOME, applied in this precedence order:
      a. Proposal body materially changed, or
-        vote stopped for revision             -> RETURNED TO DISCUSSION
+        author asks to revise                 -> RETURNED TO DISCUSSION
      b. Fewer than two explicit ballots        -> DEFERRED
      c. Quorum met and any final ballot REJECT -> REJECTED
      d. Quorum met, no REJECT, and the
@@ -602,7 +602,7 @@ Deferred proposals enter another recorded 72-hour cycle against the same immutab
 
 The closing or status record for a deferred cycle must state the missing condition and link to a new cycle-opening record. The cycle-opening record names the carried snapshot, carried ballots, electorate so far, threshold, missing condition, `opened_at`, and `deadline = opened_at + 72 hours`. The recorded deadline is the ballot cutoff. At the next cycle deadline, the same snapshot can be accepted, rejected, or deferred again.
 
-A proposal returns to discussion when the body materially changes, the author asks to revise before a decision, or the recorded vote status stops the current snapshot for revision. Returning to discussion creates or awaits a new stable snapshot and uses the applicable discussion or vote handling for that changed proposal.
+A proposal returns to discussion when the body materially changes or the author asks to revise before a decision. Returning to discussion creates or awaits a new stable snapshot and uses the applicable discussion or vote handling for that changed proposal.
 
 Use the live `type:rfc` and `status:accepted` labels. There is no parallel `rfc:*` status label family.
 
