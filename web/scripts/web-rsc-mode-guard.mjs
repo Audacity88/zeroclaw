@@ -903,11 +903,374 @@ function inspectSource(filePath, source, records) {
   visit(sourceFile);
 }
 
-function inspectDependencySource(filePath, source, records) {
+function inspectDependencySource(filePath, source, records, { recoveredDepth = 0 } = {}) {
   const sourceFile = parseSource(filePath, source);
   const relative = pathBasename(filePath);
+  const bindingsByScope = new Map();
+
+  function isScopeNode(node) {
+    return (
+      ts.isSourceFile(node) ||
+      ts.isBlock(node) ||
+      ts.isModuleBlock(node) ||
+      ts.isClassLike(node) ||
+      ts.isFunctionLike(node) ||
+      ts.isForStatement(node) ||
+      ts.isForInStatement(node) ||
+      ts.isForOfStatement(node) ||
+      ts.isCatchClause(node)
+    );
+  }
+
+  function nearestScope(node) {
+    let current = node;
+    while (current && !isScopeNode(current)) {
+      current = current.parent;
+    }
+    return current ?? sourceFile;
+  }
+
+  function outerScope(scope) {
+    return scope === sourceFile ? null : nearestScope(scope.parent);
+  }
+
+  function addBinding(scope, name, initializer = null) {
+    if (!name) {
+      return;
+    }
+    let bindings = bindingsByScope.get(scope);
+    if (!bindings) {
+      bindings = new Map();
+      bindingsByScope.set(scope, bindings);
+    }
+    if (bindings.has(name)) {
+      const binding = bindings.get(name);
+      binding.initializer = null;
+      binding.mutated = true;
+      return binding;
+    }
+    const binding = { initializer, mutated: false };
+    bindings.set(name, binding);
+    return binding;
+  }
+
+  function addBindingNames(scope, name, initializer = null) {
+    if (ts.isIdentifier(name)) {
+      addBinding(scope, name.text, initializer);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) {
+        addBindingNames(scope, element.name);
+      }
+    }
+  }
+
+  function resolveBinding(scope, name) {
+    let current = scope;
+    while (current) {
+      const binding = bindingsByScope.get(current)?.get(name);
+      if (binding) {
+        return binding;
+      }
+      current = outerScope(current);
+    }
+    return null;
+  }
+
+  function variableScope(declaration) {
+    if (declaration.parent.flags & ts.NodeFlags.Var) {
+      let current = declaration.parent;
+      while (current && !ts.isSourceFile(current) && !ts.isFunctionLike(current)) {
+        current = current.parent;
+      }
+      return current ?? sourceFile;
+    }
+    return nearestScope(declaration.parent);
+  }
+
+  function collectBindings(node) {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      addBinding(nearestScope(node.parent), node.name.text);
+    } else if (ts.isFunctionExpression(node) && node.name) {
+      addBinding(node, node.name.text);
+    } else if (ts.isClassDeclaration(node) && node.name) {
+      addBinding(nearestScope(node.parent), node.name.text);
+    } else if (ts.isClassExpression(node) && node.name) {
+      addBinding(node, node.name.text);
+    } else if (ts.isParameter(node)) {
+      addBindingNames(node.parent, node.name);
+    } else if (ts.isVariableDeclaration(node)) {
+      addBindingNames(variableScope(node), node.name, node.initializer ?? null);
+    } else if (ts.isImportClause(node)) {
+      if (node.name) {
+        addBinding(sourceFile, node.name.text);
+      }
+      const bindings = node.namedBindings;
+      if (bindings && ts.isNamespaceImport(bindings)) {
+        addBinding(sourceFile, bindings.name.text);
+      } else if (bindings && ts.isNamedImports(bindings)) {
+        for (const element of bindings.elements) {
+          addBinding(sourceFile, element.name.text);
+        }
+      }
+    } else if (ts.isCatchClause(node) && node.variableDeclaration) {
+      addBindingNames(node, node.variableDeclaration.name);
+    }
+    ts.forEachChild(node, collectBindings);
+  }
+
+  function markMutated(node, scope) {
+    const target = unwrapTimerHandler(node);
+    if (ts.isIdentifier(target)) {
+      const binding = resolveBinding(scope, target.text);
+      if (binding) {
+        binding.mutated = true;
+      }
+      return;
+    }
+    if (ts.isArrayLiteralExpression(target)) {
+      for (const element of target.elements) {
+        if (!ts.isOmittedExpression(element)) {
+          markMutated(element, scope);
+        }
+      }
+    } else if (ts.isObjectLiteralExpression(target)) {
+      for (const property of target.properties) {
+        if (ts.isShorthandPropertyAssignment(property)) {
+          markMutated(property.name, scope);
+        } else if (ts.isPropertyAssignment(property)) {
+          markMutated(property.initializer, scope);
+        } else if (ts.isSpreadAssignment(property)) {
+          markMutated(property.expression, scope);
+        }
+      }
+    }
+  }
+
+  function collectMutations(node) {
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    ) {
+      markMutated(node.left, nearestScope(node.left.parent));
+    } else if (
+      (ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
+      !ts.isVariableDeclarationList(node.initializer)
+    ) {
+      markMutated(node.initializer, nearestScope(node.initializer.parent));
+    } else if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      (node.operator === ts.SyntaxKind.PlusPlusToken ||
+        node.operator === ts.SyntaxKind.MinusMinusToken)
+    ) {
+      markMutated(node.operand, nearestScope(node.operand.parent));
+    }
+    ts.forEachChild(node, collectMutations);
+  }
+
+  function stableInitializer(expression) {
+    if (!ts.isIdentifier(expression)) {
+      return null;
+    }
+    const binding = resolveBinding(nearestScope(expression.parent), expression.text);
+    if (
+      !binding?.initializer ||
+      binding.mutated ||
+      binding.initializer.pos >= expression.pos
+    ) {
+      return null;
+    }
+    return binding.initializer;
+  }
+
+  function recoverStaticString(node, seen = new Set()) {
+    const expression = unwrapTimerHandler(node);
+    if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
+      return expression.text;
+    }
+    if (ts.isTemplateExpression(expression)) {
+      let value = expression.head.text;
+      for (const span of expression.templateSpans) {
+        const substitution = recoverStaticString(span.expression, seen);
+        if (substitution === null) {
+          return null;
+        }
+        value += substitution + span.literal.text;
+      }
+      return value;
+    }
+    if (
+      ts.isBinaryExpression(expression) &&
+      expression.operatorToken.kind === ts.SyntaxKind.PlusToken
+    ) {
+      const left = recoverStaticString(expression.left, seen);
+      const right = recoverStaticString(expression.right, seen);
+      return left === null || right === null ? null : left + right;
+    }
+    if (ts.isIdentifier(expression)) {
+      const key = `${expression.pos}:${expression.text}`;
+      if (seen.has(key)) {
+        return null;
+      }
+      const initializer = stableInitializer(expression);
+      if (!initializer) {
+        return null;
+      }
+      const nextSeen = new Set(seen);
+      nextSeen.add(key);
+      return recoverStaticString(initializer, nextSeen);
+    }
+    return null;
+  }
+
+  function executionKind(node, seen = new Set()) {
+    const expression = unwrapTimerHandler(node);
+    if (
+      ts.isBinaryExpression(expression) &&
+      expression.operatorToken.kind === ts.SyntaxKind.CommaToken
+    ) {
+      return executionKind(expression.right, seen);
+    }
+    if (ts.isIdentifier(expression)) {
+      const key = `${expression.pos}:${expression.text}`;
+      if (seen.has(key)) {
+        return null;
+      }
+      const binding = resolveBinding(nearestScope(expression.parent), expression.text);
+      if (binding) {
+        const initializer = stableInitializer(expression);
+        if (!initializer) {
+          return null;
+        }
+        const nextSeen = new Set(seen);
+        nextSeen.add(key);
+        return executionKind(initializer, nextSeen);
+      }
+      if (forbiddenCodeGenerationIdentifiers.has(expression.text)) {
+        return { kind: expression.text, invocation: "direct" };
+      }
+      return timerNames.has(expression.text)
+        ? { kind: "timer", invocation: "direct" }
+        : null;
+    }
+    if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+      const propertyName = ts.isPropertyAccessExpression(expression)
+        ? expression.name.text
+        : recoverStaticString(expression.argumentExpression);
+      if (["call", "bind", "apply"].includes(propertyName)) {
+        const target = executionKind(expression.expression, seen);
+        return target ? { ...target, invocation: propertyName } : null;
+      }
+      if (
+        !ts.isIdentifier(expression.expression) ||
+        !globalObjectNames.has(expression.expression.text) ||
+        resolveBinding(nearestScope(expression.expression.parent), expression.expression.text)
+      ) {
+        return null;
+      }
+      if (forbiddenCodeGenerationIdentifiers.has(propertyName)) {
+        return { kind: propertyName, invocation: "direct" };
+      }
+      if (timerNames.has(propertyName)) {
+        return { kind: "timer", invocation: "direct" };
+      }
+    }
+    if (
+      ts.isCallExpression(expression) &&
+      ts.isPropertyAccessExpression(expression.expression) &&
+      expression.expression.name.text === "bind"
+    ) {
+      return executionKind(expression.expression.expression, seen);
+    }
+    return null;
+  }
+
+  function recoveredArguments(node, kind) {
+    if (kind.invocation === "call" || kind.invocation === "bind") {
+      return node.arguments.slice(1);
+    }
+    if (kind.invocation === "apply") {
+      function recoverAppliedArguments(argument, seen = new Set()) {
+        const applied = unwrapTimerHandler(argument);
+        if (ts.isArrayLiteralExpression(applied)) {
+          const recovered = [];
+          for (const element of applied.elements) {
+            if (ts.isSpreadElement(element)) {
+              const spread = recoverAppliedArguments(element.expression, seen);
+              if (!spread) {
+                return null;
+              }
+              recovered.push(...spread);
+            } else {
+              recovered.push(element);
+            }
+          }
+          return recovered;
+        }
+        if (!ts.isIdentifier(applied)) {
+          return null;
+        }
+        const key = `${applied.pos}:${applied.text}`;
+        if (seen.has(key)) {
+          return null;
+        }
+        const initializer = stableInitializer(applied);
+        if (!initializer) {
+          return null;
+        }
+        const nextSeen = new Set(seen);
+        nextSeen.add(key);
+        return recoverAppliedArguments(initializer, nextSeen);
+      }
+
+      const recovered = node.arguments[1]
+        ? recoverAppliedArguments(node.arguments[1])
+        : null;
+      if (!recovered) {
+        fail(`${relative} uses an unanalyzable evaluator or timer apply argument list`);
+      }
+      return recovered;
+    }
+    return kind.kind === "Function" ? [...node.arguments] : node.arguments.slice(0, 1);
+  }
+
+  function inspectRecoveredCode(text, kind) {
+    if (recoveredDepth >= 4) {
+      fail(`${relative} exceeds the statically recoverable code nesting limit`);
+    }
+    const wrapped = `function __zeroclaw_dependency_code__() {\n${text}\n}`;
+    const recoveredFile = ts.createSourceFile(
+      `${filePath}#${kind}`,
+      wrapped,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.JS,
+    );
+    if (recoveredFile.parseDiagnostics?.length) {
+      return;
+    }
+    inspectDependencySource(filePath, wrapped, records, {
+      recoveredDepth: recoveredDepth + 1,
+    });
+  }
+
+  collectBindings(sourceFile);
+  collectMutations(sourceFile);
 
   function visit(node) {
+    if (ts.isIdentifier(node) && forbiddenRscIdentifiers.has(node.text)) {
+      fail(`${relative} contains an unstable RSC API identifier: ${node.text}`);
+    }
+    if (
+      ts.isExpressionStatement(node) &&
+      (ts.isStringLiteral(node.expression) ||
+        ts.isNoSubstitutionTemplateLiteral(node.expression)) &&
+      (node.expression.text === "use server" || node.expression.text === "react-server")
+    ) {
+      fail(`${relative} contains a server directive`);
+    }
     if (ts.isImportDeclaration(node)) {
       addModuleRecord(records, node.moduleSpecifier, filePath, "static import");
       verifyReactRouterImport(node, relative);
@@ -928,10 +1291,11 @@ function inspectDependencySource(filePath, source, records) {
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
       const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
       if (isDynamicImport || isRequire) {
-        if (node.arguments.length !== 1 || literalText(node.arguments[0]) === null) {
+        const specifier = node.arguments[0] && recoverStaticString(node.arguments[0]);
+        if (node.arguments.length !== 1 || specifier === null || specifier === undefined) {
           fail(`${relative} uses a nonliteral dynamic module specifier`);
         }
-        if (literalText(node.arguments[0]) === "react-router-dom") {
+        if (specifier === "react-router-dom") {
           fail(`${relative} dynamically imports react-router-dom`);
         }
         addModuleRecord(
@@ -940,6 +1304,16 @@ function inspectDependencySource(filePath, source, records) {
           filePath,
           isDynamicImport ? "dynamic import" : "require",
         );
+      }
+
+      const kind = executionKind(node.expression);
+      if (kind) {
+        for (const argument of recoveredArguments(node, kind)) {
+          const recoveredSource = recoverStaticString(argument);
+          if (recoveredSource !== null) {
+            inspectRecoveredCode(recoveredSource, kind.kind);
+          }
+        }
       }
     }
     ts.forEachChild(node, visit);
@@ -1685,8 +2059,129 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
     "process",
     "require",
   ]);
+  const prohibitedExternalWorkCallees = new Set([
+    "fetch",
+    "globalThis.fetch",
+    "globalThis.queueMicrotask",
+    "globalThis.setImmediate",
+    "globalThis.setInterval",
+    "globalThis.setTimeout",
+    "process.getBuiltinModule",
+    "process.nextTick",
+    "queueMicrotask",
+    "setImmediate",
+    "setInterval",
+    "setTimeout",
+  ]);
+  const prohibitedExternalWorkRoots = new Set(
+    [...prohibitedExternalWorkCallees].filter((callee) => !callee.includes(".")),
+  );
   const importedBindings = new Set();
   const aliases = new Map();
+  const localBindingsByScope = new Map();
+
+  function isLexicalScope(node) {
+    return (
+      ts.isSourceFile(node) ||
+      ts.isBlock(node) ||
+      ts.isModuleBlock(node) ||
+      ts.isClassLike(node) ||
+      ts.isFunctionLike(node) ||
+      ts.isForStatement(node) ||
+      ts.isForInStatement(node) ||
+      ts.isForOfStatement(node) ||
+      ts.isCatchClause(node)
+    );
+  }
+
+  function nearestLexicalScope(node) {
+    let current = node;
+    while (current && !isLexicalScope(current)) {
+      current = current.parent;
+    }
+    return current ?? sourceFile;
+  }
+
+  function outerLexicalScope(scope) {
+    return scope === sourceFile ? null : nearestLexicalScope(scope.parent);
+  }
+
+  function addLocalBinding(scope, name) {
+    if (!name) {
+      return;
+    }
+    let bindings = localBindingsByScope.get(scope);
+    if (!bindings) {
+      bindings = new Set();
+      localBindingsByScope.set(scope, bindings);
+    }
+    bindings.add(name);
+  }
+
+  function addLocalBindingNames(scope, name) {
+    if (ts.isIdentifier(name)) {
+      addLocalBinding(scope, name.text);
+      return;
+    }
+    for (const element of name.elements) {
+      if (!ts.isOmittedExpression(element)) {
+        addLocalBindingNames(scope, element.name);
+      }
+    }
+  }
+
+  function resolveLocalBinding(scope, name) {
+    let current = scope;
+    while (current) {
+      if (localBindingsByScope.get(current)?.has(name)) {
+        return true;
+      }
+      current = outerLexicalScope(current);
+    }
+    return false;
+  }
+
+  function variableLexicalScope(declaration) {
+    if (declaration.parent.flags & ts.NodeFlags.Var) {
+      let current = declaration.parent;
+      while (current && !ts.isSourceFile(current) && !ts.isFunctionLike(current)) {
+        current = current.parent;
+      }
+      return current ?? sourceFile;
+    }
+    return nearestLexicalScope(declaration);
+  }
+
+  function collectLocalBindings(node) {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      addLocalBinding(nearestLexicalScope(node.parent), node.name.text);
+    } else if (ts.isFunctionExpression(node) && node.name) {
+      addLocalBinding(node, node.name.text);
+    } else if ((ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name) {
+      addLocalBinding(
+        ts.isClassDeclaration(node) ? nearestLexicalScope(node.parent) : node,
+        node.name.text,
+      );
+    } else if (ts.isParameter(node)) {
+      addLocalBindingNames(node.parent, node.name);
+    } else if (ts.isVariableDeclaration(node)) {
+      addLocalBindingNames(variableLexicalScope(node), node.name);
+    } else if (ts.isImportClause(node)) {
+      if (node.name) {
+        addLocalBinding(sourceFile, node.name.text);
+      }
+      const bindings = node.namedBindings;
+      if (bindings && ts.isNamespaceImport(bindings)) {
+        addLocalBinding(sourceFile, bindings.name.text);
+      } else if (bindings && ts.isNamedImports(bindings)) {
+        for (const element of bindings.elements) {
+          addLocalBinding(sourceFile, element.name.text);
+        }
+      }
+    }
+    ts.forEachChild(node, collectLocalBindings);
+  }
+  collectLocalBindings(sourceFile);
 
   function resolvedChain(node) {
     const raw = memberChain(node);
@@ -1725,7 +2220,8 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
       const chain = resolvedChain(node.initializer);
       if (
         chain &&
-        (setHas(intrinsicRoots, chain[0]) || setHas(importedBindings, chain[0]))
+        (setHas(intrinsicRoots, chain[0]) ||
+          setHas(importedBindings, chain[0]))
       ) {
         if (!ts.isIdentifier(node.name)) {
           fail("Vite config cannot destructure restricted bindings");
@@ -1763,6 +2259,22 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
   }
 
   function rejectPrototypeMutation(node) {
+    const isPropertyName = node.parent &&
+      ((ts.isPropertyAccessExpression(node.parent) && node.parent.name === node) ||
+        ((ts.isMethodDeclaration(node.parent) ||
+          ts.isPropertyDeclaration(node.parent) ||
+          ts.isPropertyAssignment(node.parent) ||
+          ts.isGetAccessorDeclaration(node.parent) ||
+          ts.isSetAccessorDeclaration(node.parent)) &&
+          node.parent.name === node));
+    if (
+      ts.isIdentifier(node) &&
+      setHas(prohibitedExternalWorkRoots, node.text) &&
+      !isPropertyName &&
+      !resolveLocalBinding(nearestLexicalScope(node.parent), node.text)
+    ) {
+      fail("Vite config cannot schedule or start external work");
+    }
     if (
       ts.isIdentifier(node) &&
       setHas(restrictedRuntimeRoots, node.text) &&
@@ -1815,20 +2327,9 @@ function verifyViteConfigHasNoPrototypeMutation(configFile) {
       }
       const callee = resolvedChain(node.expression)?.join(".");
       if (
-        [
-          "fetch",
-          "globalThis.fetch",
-          "globalThis.queueMicrotask",
-          "globalThis.setImmediate",
-          "globalThis.setInterval",
-          "globalThis.setTimeout",
-          "process.getBuiltinModule",
-          "process.nextTick",
-          "queueMicrotask",
-          "setImmediate",
-          "setInterval",
-          "setTimeout",
-        ].includes(callee)
+        setHas(prohibitedExternalWorkCallees, callee) &&
+        (callee.includes(".") ||
+          !resolveLocalBinding(nearestLexicalScope(node.expression), callee))
       ) {
         fail("Vite config cannot schedule or start external work");
       }

@@ -223,6 +223,48 @@ export default`,
   }
 });
 
+test("aliased Vite scheduling and network calls are rejected before execution", async (t) => {
+  const marker = "ZEROCLAW_CONFIG_CALLBACK_RAN";
+  const cases = [
+    `const later = queueMicrotask; later(() => console.error("${marker}"));`,
+    `const later = setTimeout; later(() => console.error("${marker}"), 0);`,
+    `const request = fetch; request("data:text/plain,ok").then(() => console.error("${marker}"));`,
+    `let later; later = setTimeout; later(() => console.error("${marker}"), 0);`,
+    `const request = fetch.bind(null); request("data:text/plain,ok").then(() => console.error("${marker}"));`,
+  ];
+  const originalConsoleError = console.error;
+  const observedErrors = [];
+  console.error = (...args) => observedErrors.push(args.join(" "));
+  try {
+    for (const deferredWork of cases) {
+      const { repoRoot } = createFixture(t, {
+        config: validConfig.replace("export default", `${deferredWork}\nexport default`),
+      });
+      await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*cannot schedule or start external work/);
+    }
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(observedErrors.some((message) => message.includes(marker)), false);
+});
+
+test("shadowed Vite scheduling and network names remain local", async (t) => {
+  const { repoRoot } = createFixture(t, {
+    config: validConfig.replace(
+      "export default",
+      `
+const fetch = () => "local";
+function setTimeout() { return "local"; }
+const localFetch = fetch;
+const localTimer = setTimeout;
+localFetch();
+localTimer();
+export default`,
+    ),
+  });
+  await runGuard(repoRoot);
+});
+
 test("reflective Vite config mutation is rejected before execution", async (t) => {
   const reflections = [
     `
@@ -744,12 +786,173 @@ test("reachable declared dependency modules are inspected", async (t) => {
   await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*react-router-dom\/server/);
 });
 
+test("reachable dependency modules enforce the RSC-focused policy", async (t) => {
+  const cases = [
+    [
+      `const make = Function;\nmake("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const payload = "import('react-server-dom-webpack/client')";\neval(payload);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-server-dom-webpack\/client/,
+    ],
+    [
+      `setTimeout("import('react-router-dom/server')", 0);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `eval.call(null, "import('react-router-dom/server')");\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `Function.call(null, "return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `setTimeout.call(null, "import('react-router-dom/server')", 0);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const run = eval.bind(null);\nrun("import('react-router-dom/server')");\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const run = eval.call;\nrun(null, "import('react-router-dom/server')");\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const run = eval.apply;\nrun(null, ["import('react-router-dom/server')"]);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const later = setTimeout.call;\nlater(null, "import('react-router-dom/server')", 0);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const later = setTimeout.apply;\nlater(null, ["import('react-router-dom/server')", 0]);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const args = ["import('react-router-dom/server')"];\neval.apply(null, args);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const args = ["return import('react-router-dom/server')"];\nFunction.apply(null, args)();\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const args = ["import('react-router-dom/server')", 0];\nsetTimeout.apply(null, args);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `eval.apply(null, [...["import('react-router-dom/server')"]]);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const hidden = ["import('react-router-dom/server')"];\nconst args = [...hidden];\nsetTimeout.apply(null, args);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const args = getArguments();\neval.apply(null, args);\nexport const page = true;\n`,
+      /unanalyzable evaluator or timer apply argument list/,
+    ],
+    [
+      `eval["apply"](null, ["import('react-router-dom/server')"]);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `globalThis["setTimeout"]["call"](null, "import('react-router-dom/server')", 0);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `eval["ap" + "ply"](null, ["import('react-router-dom/server')"]);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const method = "call";\nglobalThis["setTimeout"][method](null, "import('react-router-dom/server')", 0);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `(0, eval)("import('react-router-dom/server')");\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `(0, setTimeout)("import('react-router-dom/server')", 0);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `let payload = "import('react-router-dom/server')";\neval(payload);\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `var make = Function;\nmake("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [`"use server";\nexport const page = true;\n`, /server directive/],
+    [`const page = RSCStaticRouter;\nexport { page };\n`, /unstable RSC API identifier/],
+  ];
+  for (const [dependencySource, pattern] of cases) {
+    const { repoRoot, webRoot } = createFixture(t, {
+      source: `import { page } from "foo";\nexport { page };`,
+    });
+    addFixtureDependency(webRoot, "foo", dependencySource);
+    await expectFailure(t, repoRoot, new RegExp(`web-rsc-mode-guard: .*${pattern.source}`));
+  }
+});
+
 test("reachable declared client-only dependency modules pass", async (t) => {
   const { repoRoot, webRoot } = createFixture(t, {
     source: `import { page } from "foo";\nexport { page };`,
   });
   addFixtureDependency(webRoot, "foo", "export const page = true;\n");
   await runGuard(repoRoot);
+});
+
+test("reachable browser dependencies may use ordinary vendor runtime patterns", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  addFixtureDependency(
+    webRoot,
+    "foo",
+    `
+const browserRoot = window;
+const worker = { flush() {} };
+const value = () => true;
+const printed = Function.prototype.toString.call(value);
+setTimeout(worker.flush.bind(worker), 10);
+{
+  const Function = () => "local";
+  const setTimeout = () => "local";
+  const eval = () => "local";
+  Function("return import('react-router-dom/server')");
+  setTimeout("import('react-router-dom/server')", 0);
+  eval("import('react-router-dom/server')");
+}
+export const page = value instanceof Function && Boolean(browserRoot) && printed.length > 0;
+`,
+  );
+  await runGuard(repoRoot);
+});
+
+test("reachable dependency recovery fails closed at its nesting limit", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  let nested = `import("react-router-dom/server")`;
+  for (let depth = 0; depth < 5; depth += 1) {
+    nested = `eval(${JSON.stringify(nested)})`;
+  }
+  addFixtureDependency(
+    webRoot,
+    "foo",
+    `${nested};\nexport const page = true;\n`,
+  );
+  await expectFailure(
+    t,
+    repoRoot,
+    /web-rsc-mode-guard: .*statically recoverable code nesting limit/,
+  );
 });
 
 test("reachable dev-declared dependency modules are inspected", async (t) => {
