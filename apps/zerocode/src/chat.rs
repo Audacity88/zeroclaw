@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -3667,7 +3667,7 @@ fn render_tool_entry(
     result: Option<&str>,
     is_selected: bool,
     disclosure: ToolDisclosure,
-) -> bool {
+) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
@@ -3795,6 +3795,20 @@ fn render_tool_entry(
         _ => render_generic_input(lines),
     }
 
+    let mut footer_line = None;
+    if let Some(omitted) = footer {
+        let text = if matches!(disclosure, ToolDisclosure::Full) {
+            crate::i18n::t("zc-chat-tool-show-less")
+        } else {
+            crate::i18n::t_args("zc-chat-tool-show-all", &[("count", &omitted.to_string())])
+        };
+        footer_line = Some(lines.len());
+        lines.push(Line::from(Span::styled(
+            format!("  {text}"),
+            theme::tool_label_style().add_modifier(sel_mod),
+        )));
+    }
+
     if let Some(res) = result {
         let result = if matches!(disclosure, ToolDisclosure::Full) {
             terminal_safe_tool_text(res)
@@ -3802,18 +3816,6 @@ fn render_tool_entry(
             preview(res, 200)
         };
         push_text(lines, "result", &result);
-    }
-
-    if let Some(omitted) = footer {
-        let text = if matches!(disclosure, ToolDisclosure::Full) {
-            crate::i18n::t("zc-chat-tool-show-less")
-        } else {
-            crate::i18n::t_args("zc-chat-tool-show-all", &[("count", &omitted.to_string())])
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  {text}"),
-            theme::tool_label_style().add_modifier(sel_mod),
-        )));
     }
 
     // Apply REVERSED to body lines from diff_lines/write_lines too.
@@ -3826,7 +3828,7 @@ fn render_tool_entry(
                 .collect();
         }
     }
-    footer.is_some()
+    footer_line
 }
 
 /// Render a single committed entry into `lines`.
@@ -3839,7 +3841,7 @@ fn render_entry_into(
     tool_disclosure: ToolDisclosure,
     width: u16,
     lines: &mut Vec<Line<'static>>,
-) -> bool {
+) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
@@ -3931,7 +3933,7 @@ fn render_entry_into(
             );
         }
     }
-    false
+    None
 }
 
 /// Locate the `[Copy]` label within a code-fence bar line. Returns the label's
@@ -4385,8 +4387,9 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
                 body_area,
             );
 
-            if state.cached_tool_footer_entries.contains(&entry_idx) && line_hi > line_lo {
-                let footer_line = line_hi - 1;
+            if let Some(&footer_line) = state.cached_tool_footer_lines.get(&entry_idx)
+                && (line_lo..line_hi).contains(&footer_line)
+            {
                 let rows_before_footer = state.cached_lines[line_lo..footer_line]
                     .iter()
                     .map(|line| wrapped_rows(line, inner_width))
@@ -5932,8 +5935,8 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
-    /// Entry indices whose cached rendering ends with a disclosure footer.
-    cached_tool_footer_entries: BTreeSet<usize>,
+    /// Per-entry disclosure footer line indices in `cached_lines`.
+    cached_tool_footer_lines: BTreeMap<usize, usize>,
     /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end,
     /// content_width)`. Unlike `cached_line_ranges` (unwrapped line indices),
     /// these account for markdown wrapping so mouse hit-testing (`entry_rects`)
@@ -6054,7 +6057,7 @@ impl ChatState {
             cached_lines: Vec::new(),
             cached_row_breaks: Vec::new(),
             cached_line_ranges: Vec::new(),
-            cached_tool_footer_entries: BTreeSet::new(),
+            cached_tool_footer_lines: BTreeMap::new(),
             cached_screen_ranges: Vec::new(),
             dirty: LinesDirty::Full,
             cached_entry_count: 0,
@@ -6625,7 +6628,7 @@ impl ChatState {
                 let abs_idx = render_from + rel_idx;
                 let before = new_lines.len();
                 let disclosure = self.disclosure_for_entry(entry);
-                let has_footer = render_entry_into(
+                let footer_line = render_entry_into(
                     entry,
                     self.is_entry_highlighted(abs_idx),
                     show_thoughts,
@@ -6638,8 +6641,9 @@ impl ChatState {
                     let base = self.cached_lines.len();
                     new_ranges.push((abs_idx, base + before, base + after));
                 }
-                if has_footer {
-                    self.cached_tool_footer_entries.insert(abs_idx);
+                if let Some(footer_line) = footer_line {
+                    self.cached_tool_footer_lines
+                        .insert(abs_idx, self.cached_lines.len() + footer_line);
                 }
             }
             let appended_rows =
@@ -6660,13 +6664,13 @@ impl ChatState {
         // Full rebuild path.
         let mut lines = Vec::new();
         let mut ranges = Vec::new();
-        let mut footer_entries = BTreeSet::new();
+        let mut footer_lines = BTreeMap::new();
         let show_thoughts = self.show_thoughts;
         for (rel_idx, entry) in self.entries[start..].iter().enumerate() {
             let abs_idx = start + rel_idx;
             let before = lines.len();
             let disclosure = self.disclosure_for_entry(entry);
-            let has_footer = render_entry_into(
+            let footer_line = render_entry_into(
                 entry,
                 self.is_entry_highlighted(abs_idx),
                 show_thoughts,
@@ -6678,14 +6682,14 @@ impl ChatState {
             if after > before {
                 ranges.push((abs_idx, before, after));
             }
-            if has_footer {
-                footer_entries.insert(abs_idx);
+            if let Some(footer_line) = footer_line {
+                footer_lines.insert(abs_idx, footer_line);
             }
         }
         self.cached_row_breaks = row_breaks_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
-        self.cached_tool_footer_entries = footer_entries;
+        self.cached_tool_footer_lines = footer_lines;
         self.cached_entry_count = total - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
@@ -7733,7 +7737,7 @@ impl ChatState {
         self.tool_header_rects.clear();
         self.tool_footer_rects.clear();
         self.tool_disclosures.clear();
-        self.cached_tool_footer_entries.clear();
+        self.cached_tool_footer_lines.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.context_menu = None;
@@ -11123,7 +11127,7 @@ mod tests {
         .to_string();
         let result = format!("first\n{}", "result".repeat(60));
         let mut preview_lines = Vec::new();
-        let has_footer = render_tool_entry(
+        let footer_line = render_tool_entry(
             &mut preview_lines,
             "file_write",
             &write_input,
@@ -11132,7 +11136,7 @@ mod tests {
             ToolDisclosure::Preview,
         );
         let preview_text = rendered_text(&preview_lines);
-        assert!(has_footer);
+        let footer_line = footer_line.expect("long preview has a disclosure footer");
         assert!(preview_text.starts_with("▼ [tool: file_write]"));
         assert!(preview_text.contains(r#"input: {"path":"/tmp/example.txt"}"#));
         assert!(preview_text.contains("line 0"));
@@ -11141,6 +11145,16 @@ mod tests {
         assert!(preview_text.contains("4 more lines"));
         assert!(!preview_text.contains(&write_input));
         assert!(!preview_text.contains(&result));
+        assert!(
+            preview_lines[footer_line]
+                .to_string()
+                .contains("4 more lines")
+        );
+        assert!(preview_text.find("line 5").unwrap() < preview_text.find("4 more lines").unwrap());
+        assert!(
+            preview_text.find("4 more lines").unwrap()
+                < preview_text.find("result: first").unwrap()
+        );
 
         let mut full_lines = Vec::new();
         render_tool_entry(
@@ -11157,6 +11171,8 @@ mod tests {
         assert!(full_text.contains(&"result".repeat(60)));
         assert!(full_text.contains("[Show less]"));
         assert!(!full_text.contains(&write_input));
+        assert!(full_text.find("line 9").unwrap() < full_text.find("[Show less]").unwrap());
+        assert!(full_text.find("[Show less]").unwrap() < full_text.find("result: first").unwrap());
     }
 
     #[test]
@@ -11168,7 +11184,7 @@ mod tests {
         })
         .to_string();
         let mut base64_lines = Vec::new();
-        let has_footer = render_tool_entry(
+        let footer_line = render_tool_entry(
             &mut base64_lines,
             "file_write",
             &base64_input,
@@ -11177,7 +11193,7 @@ mod tests {
             ToolDisclosure::Preview,
         );
         let base64_text = rendered_text(&base64_lines);
-        assert!(!has_footer);
+        assert!(footer_line.is_none());
         assert!(base64_text.contains(r#""encoding":"base64""#));
         assert!(base64_text.contains("content: 4000 encoded characters"));
         assert!(!base64_text.contains(&"A".repeat(200)));
