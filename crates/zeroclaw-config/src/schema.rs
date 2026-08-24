@@ -263,13 +263,6 @@ pub struct Config {
     #[group = "Agent"]
     pub heartbeat: HeartbeatConfig,
 
-    /// ZeroCode live task tracker (`[todotracker]`), the read-only
-    /// TodoWrite visual tracker in the Code pane.
-    #[serde(default)]
-    #[nested]
-    #[group = "Operations"]
-    pub todotracker: TodoTrackerConfig,
-
     /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
     ///
     /// Each entry is a named scheduled job synced into the database at
@@ -8530,12 +8523,23 @@ pub struct PluginsConfig {
     /// Directory where plugins are stored
     #[serde(default = "default_plugins_dir")]
     pub plugins_dir: String,
-    /// Auto-discover and load plugins on startup
+    /// Auto-discover and load plugins on startup (default: false)
+    ///
+    /// This gates the package-bound *tool* and *skill* instances the activation
+    /// plan discovers from installed manifests. Explicit
+    /// `[channels.plugin.<alias>]` declarations are operator-named, not
+    /// discovered, so they activate without it.
     #[serde(default)]
     pub auto_discover: bool,
-    /// Maximum number of plugins that can be loaded
-    #[serde(default = "default_max_plugins")]
-    pub max_plugins: usize,
+    /// Maximum number of logical plugin instances admitted across capabilities.
+    ///
+    /// This counts admitted *instances*, not installed packages: one package
+    /// that provides both a channel binding and a tool consumes two. It
+    /// replaces the never-enforced `plugins.max_plugins` key, which counted
+    /// packages; because the units differ, an old `max_plugins` value is not
+    /// carried over. See the plugin activation docs for the migration note.
+    #[serde(default = "default_max_active_plugin_instances")]
+    pub max_active_instances: usize,
     /// Plugin signature verification security settings
     #[serde(default)]
     #[nested]
@@ -8706,7 +8710,7 @@ fn default_plugins_dir() -> String {
     default_path_under_config_dir("plugins")
 }
 
-fn default_max_plugins() -> usize {
+fn default_max_active_plugin_instances() -> usize {
     50
 }
 
@@ -8716,7 +8720,7 @@ impl Default for PluginsConfig {
             enabled: false,
             plugins_dir: default_plugins_dir(),
             auto_discover: false,
-            max_plugins: default_max_plugins(),
+            max_active_instances: default_max_active_plugin_instances(),
             security: PluginSecurityConfig::default(),
             limits: PluginLimitsConfig::default(),
             entries: Vec::new(),
@@ -10075,6 +10079,33 @@ fn validate_plugin_entries(config: &PluginsConfig) -> Result<()> {
         if !seen.insert(instance_key) {
             anyhow::bail!("plugins.entries contains a duplicate instance key");
         }
+    }
+    Ok(())
+}
+
+/// Reject a `[channels.plugin.<alias>]` declaration the activation loader could
+/// never resolve to an installed package.
+///
+/// The alias uses the shared config alias grammar because it becomes the
+/// channel's registry alias (`plugin.<alias>`); the package uses the shared
+/// plugin package-name grammar so config and manifest admission agree on one
+/// spelling. Aliases are visited in sorted order so the reported failure is
+/// stable across runs regardless of map iteration order.
+fn validate_plugin_channel_instances(config: &ChannelsConfig) -> Result<()> {
+    let mut aliases: Vec<_> = config.plugin.keys().collect();
+    aliases.sort_unstable();
+    for alias in aliases {
+        crate::helpers::validate_alias_key(alias)
+            .map_err(|error| anyhow::Error::msg(format!("channels.plugin.{alias}: {error}")))?;
+        let declaration = &config.plugin[alias];
+        if declaration.package.trim() != declaration.package {
+            anyhow::bail!(
+                "channels.plugin.{alias}.package must not have leading or trailing whitespace"
+            );
+        }
+        zeroclaw_api::plugin::validate_plugin_package_name(&declaration.package).map_err(
+            |error| anyhow::Error::msg(format!("channels.plugin.{alias}.package: {error}")),
+        )?;
     }
     Ok(())
 }
@@ -13315,74 +13346,6 @@ impl Default for HeartbeatConfig {
     }
 }
 
-// ── TodoTracker ──────────────────────────────────────────────────
-
-/// Location of the ZeroCode TodoWrite tracker panel.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
-)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum TodoTrackerLocation {
-    /// Horizontal strip between the transcript and the input bar (Claude Code style).
-    Bottom,
-    /// Vertical side panel on the left.
-    Left,
-    /// Vertical side panel on the right (OpenCode style). Default.
-    #[default]
-    Right,
-}
-
-/// ZeroCode live task tracker configuration (`[todotracker]` section).
-///
-/// Read-only visual tracker driven by the model's `TodoWrite` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "todotracker"]
-pub struct TodoTrackerConfig {
-    /// Master switch. When `false` the tracker never renders and never
-    /// auto-pops. Default: `true`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Whether the panel is visible at launch (when `enabled`). When
-    /// `false` it stays hidden until toggled or auto-popped by the first
-    /// plan. Default: `false`.
-    #[serde(default)]
-    pub enabled_at_start: bool,
-    /// Panel location: `bottom` (between transcript and input), `left`,
-    /// or `right` (default).
-    #[serde(default)]
-    pub location: TodoTrackerLocation,
-    /// Side-panel target column width (left/right). Runtime-clamped to at
-    /// most half the terminal width. Ignored for `bottom`. Default: `32`.
-    #[serde(default = "default_todotracker_width")]
-    pub width: u16,
-    /// Bottom-strip maximum height in rows (grows up to this). Ignored for
-    /// left/right. Default: `5`.
-    #[serde(default = "default_todotracker_max_height")]
-    pub max_height: u16,
-}
-
-fn default_todotracker_width() -> u16 {
-    32
-}
-
-fn default_todotracker_max_height() -> u16 {
-    5
-}
-
-impl Default for TodoTrackerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            enabled_at_start: false,
-            location: TodoTrackerLocation::Right,
-            width: default_todotracker_width(),
-            max_height: default_todotracker_max_height(),
-        }
-    }
-}
-
 // ── Cron ────────────────────────────────────────────────────────
 
 /// A declarative cron job definition (`[cron.<alias>]`).
@@ -13922,6 +13885,12 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub filesystem: HashMap<String, FilesystemConfig>,
+    /// WASM channel plugin instances (`[channels.plugin.<alias>]`).
+    /// The declaration selects a package and logical binding only; operator
+    /// values remain in the instance-keyed `plugins.entries` store.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub plugin: HashMap<String, PluginChannelConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -14183,6 +14152,12 @@ impl ChannelsConfig {
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
+            ChannelInfo {
+                kind: "plugin",
+                name: "Plugin",
+                desc: "installed WASM channel plugin",
+                configured: !self.plugin.is_empty(),
+            },
         ]
     }
 
@@ -14227,6 +14202,7 @@ impl ChannelsConfig {
             || self.amqp.values().any(|c| c.enabled)
             || self.filesystem.values().any(|c| c.enabled)
             || self.git.values().any(|c| c.enabled)
+            || self.plugin.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -14236,7 +14212,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -14273,6 +14249,7 @@ impl ChannelsConfig {
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
             ("filesystem", !self.filesystem.is_empty(), false),
+            ("plugin", !self.plugin.is_empty(), true),
         ]
     }
 
@@ -14358,6 +14335,7 @@ impl Default for ChannelsConfig {
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -14366,6 +14344,34 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+        }
+    }
+}
+
+/// Host-owned declaration of one installed channel-plugin binding.
+///
+/// This declaration is the complete operator-facing surface for a logical
+/// channel instance: it names the installed package and whether the binding may
+/// be admitted. It deliberately carries no plugin values — those stay in the
+/// instance-keyed `plugins.entries` store so one plugin's secrets are never
+/// reachable from another instance's declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.plugin"]
+pub struct PluginChannelConfig {
+    /// Canonical package name from the installed plugin manifest.
+    #[serde(default)]
+    pub package: String,
+    /// Whether this logical instance may be admitted at channel startup.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PluginChannelConfig {
+    fn default() -> Self {
+        Self {
+            package: String::new(),
+            enabled: true,
         }
     }
 }
@@ -15830,6 +15836,12 @@ pub struct WhatsAppConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub ws_url: Option<String>,
+    /// Display name announced to contacts (Web mode, optional)
+    /// Applied on connect when it differs from the name the linked device
+    /// already carries; leave unset to keep the account's own name
+    #[tab(Connection)]
+    #[serde(default)]
+    pub push_name: Option<String>,
     /// When true, only respond to messages that @-mention the bot in groups (Web mode only).
     /// Direct messages are always processed.
     /// Bot identity is resolved from the wa-rs device at runtime; `pair_phone` seeds it on first connect.
@@ -18821,7 +18833,6 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -21778,6 +21789,7 @@ impl Config {
         }
 
         validate_plugin_entries(&self.plugins)?;
+        validate_plugin_channel_instances(&self.channels)?;
 
         // MCP
         if self.mcp.enabled {
@@ -22548,6 +22560,13 @@ impl Config {
             }
         }
 
+        if self.plugins.max_active_instances == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.max_active_instances",
+                "plugins.max_active_instances must be greater than 0; a zero ceiling rejects every logical plugin instance"
+            );
+        }
         if self.plugins.limits.call_fuel == 0 {
             validation_bail!(
                 InvalidNumericRange,
@@ -24691,31 +24710,6 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn todotracker_config_defaults() {
-        let cfg = super::TodoTrackerConfig::default();
-        assert!(cfg.enabled);
-        assert!(!cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Right);
-        assert_eq!(cfg.width, 32);
-        assert_eq!(cfg.max_height, 5);
-    }
-
-    #[::core::prelude::v1::test]
-    fn todotracker_config_parses_from_toml() {
-        let toml = r#"
-enabled = true
-enabled_at_start = true
-location = "bottom"
-width = 40
-max_height = 8
-"#;
-        let cfg: super::TodoTrackerConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
-        assert_eq!(cfg.width, 40);
-        assert_eq!(cfg.max_height, 8);
-    }
-
     /// The whole point of splitting the accessor: an operator-facing caller
     /// must be able to tell "unconfigured" from a real 32,000, which a bare
     /// `usize` cannot express.
@@ -27683,7 +27677,6 @@ auto_save = true
                 to: Some("123456".into()),
                 ..HeartbeatConfig::default()
             },
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
@@ -27741,6 +27734,7 @@ auto_save = true
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
                 filesystem: HashMap::new(),
+                plugin: HashMap::new(),
                 message_timeout_secs: 300,
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
@@ -28702,7 +28696,6 @@ default_temperature = 0.7
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -29652,6 +29645,7 @@ allowed_users = ["@u:matrix.org"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -29913,6 +29907,7 @@ bot_token = "xoxb-tok"
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29948,6 +29943,7 @@ bot_token = "xoxb-tok"
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29980,6 +29976,30 @@ bot_token = "xoxb-tok"
         let parsed: WhatsAppConfig =
             serde_json::from_str(r#"{"passive_group_context":true}"#).unwrap();
         assert!(parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn whatsapp_config_push_name_absent_stays_none_and_round_trips_non_ascii() {
+        let parsed: WhatsAppConfig = serde_json::from_str("{}").unwrap();
+        assert!(parsed.push_name.is_none());
+
+        let name = "סוכן – שירות";
+        let wc = WhatsAppConfig {
+            push_name: Some(name.into()),
+            ..Default::default()
+        };
+        let parsed: WhatsAppConfig = toml::from_str(&toml::to_string(&wc).unwrap()).unwrap();
+        assert_eq!(parsed.push_name.as_deref(), Some(name));
+    }
+
+    #[test]
+    async fn whatsapp_config_push_name_is_not_a_web_selector() {
+        let wc = WhatsAppConfig {
+            push_name: Some("ZeroClawAgent".into()),
+            ..Default::default()
+        };
+        assert!(!wc.has_web_selector());
+        assert_eq!(wc.backend_type(), "cloud");
     }
 
     #[test]
@@ -30019,6 +30039,7 @@ allowed_numbers = ["+1", "+2"]
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -30051,6 +30072,7 @@ allowed_numbers = ["+1", "+2"]
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -30130,6 +30152,7 @@ allowed_numbers = ["+1", "+2"]
                     pair_phone: None,
                     pair_code: None,
                     ws_url: None,
+                    push_name: None,
                     mention_only: false,
                     passive_group_context: false,
                     interrupt_on_new_message: false,
@@ -30173,6 +30196,7 @@ allowed_numbers = ["+1", "+2"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -39439,6 +39463,164 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    #[test]
+    async fn plugin_channel_instance_uses_ordinary_agent_channel_reference() {
+        let mut config = multi_agent_test_config();
+        config.channels.plugin.insert(
+            "operations".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+        config.agents.get_mut("alpha").unwrap().channels =
+            vec![crate::providers::ChannelRef::new("plugin.operations")];
+
+        config
+            .validate()
+            .expect("plugin channel aliases use the shared dotted reference validator");
+        assert_eq!(config.agent_for_channel("plugin.operations"), Some("alpha"));
+    }
+
+    #[test]
+    async fn plugin_channel_instances_allow_two_aliases_for_one_package() {
+        let mut config = multi_agent_test_config();
+        for alias in ["primary", "backup"] {
+            config.channels.plugin.insert(
+                alias.to_string(),
+                PluginChannelConfig {
+                    package: "acme.chat".to_string(),
+                    enabled: true,
+                },
+            );
+        }
+
+        config
+            .validate()
+            .expect("one package may back isolated logical instances");
+        assert!(config.channels.has_any_enabled());
+    }
+
+    #[test]
+    async fn plugin_channel_instance_rejects_invalid_alias_or_package() {
+        let mut config = multi_agent_test_config();
+        config.channels.plugin.insert(
+            "bad-alias".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+        let error = config
+            .validate()
+            .expect_err("plugin aliases use canonical config-key grammar");
+        assert!(
+            error.to_string().contains("channels.plugin.bad-alias"),
+            "{error}"
+        );
+
+        config.channels.plugin.clear();
+        config.channels.plugin.insert(
+            "primary".to_string(),
+            PluginChannelConfig {
+                package: "Acme Chat".to_string(),
+                enabled: true,
+            },
+        );
+        let error = config
+            .validate()
+            .expect_err("plugin packages use canonical manifest grammar");
+        assert!(
+            error
+                .to_string()
+                .contains("channels.plugin.primary.package"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    async fn plugin_channel_instance_rejects_an_empty_package() {
+        let mut config = multi_agent_test_config();
+        config
+            .channels
+            .plugin
+            .insert("primary".to_string(), PluginChannelConfig::default());
+
+        let error = config
+            .validate()
+            .expect_err("a declaration with no package can never resolve to an installed plugin");
+        assert!(
+            error
+                .to_string()
+                .contains("channels.plugin.primary.package"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    async fn disabled_plugin_channel_instance_does_not_start_the_supervisor() {
+        let mut channels = ChannelsConfig {
+            cli: false,
+            ..ChannelsConfig::default()
+        };
+        channels.plugin.insert(
+            "paused".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: false,
+            },
+        );
+
+        assert!(!channels.has_any_enabled());
+    }
+
+    #[test]
+    async fn plugin_channel_is_a_known_configured_and_deliverable_channel() {
+        let mut channels = ChannelsConfig::default();
+        assert!(
+            !channels
+                .channel_presence()
+                .iter()
+                .any(|(name, configured, _)| *name == "plugin" && *configured)
+        );
+
+        channels.plugin.insert(
+            "operations".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+
+        let row = channels
+            .channel_presence()
+            .into_iter()
+            .find(|(name, _, _)| *name == "plugin")
+            .expect("plugin must appear in the canonical channel registry");
+        assert_eq!(row, ("plugin", true, true));
+        assert!(
+            channels
+                .channels()
+                .iter()
+                .any(|info| info.kind == "plugin" && info.configured)
+        );
+        assert!(crate::schema::v2::V3_CHANNEL_TYPES.contains(&"plugin"));
+    }
+
+    #[test]
+    async fn zero_active_plugin_instance_ceiling_is_rejected() {
+        let mut config = multi_agent_test_config();
+        config.plugins.max_active_instances = 0;
+
+        let error = config
+            .validate()
+            .expect_err("a zero ceiling admits nothing and is always an operator mistake");
+        assert!(
+            error.to_string().contains("plugins.max_active_instances"),
+            "{error}"
+        );
     }
 
     #[test]
