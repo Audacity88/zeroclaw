@@ -966,9 +966,21 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
 }
 
 fn http_status_from_error_text(text: &str) -> Option<u16> {
-    let start = text.find("api error (")? + "api error (".len();
-    let code = text.get(start..start + 3)?.parse().ok()?;
-    (400..600).contains(&code).then_some(code)
+    for marker in ["api error (", "http "] {
+        let mut remainder = text;
+        while let Some(start) = remainder.find(marker) {
+            let after_marker = &remainder[start + marker.len()..];
+            if let Some(code) = after_marker
+                .get(..3)
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|code| (400..600).contains(code))
+            {
+                return Some(code);
+            }
+            remainder = after_marker;
+        }
+    }
+    None
 }
 
 fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorDiagnostic {
@@ -1009,6 +1021,15 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         .downcast_ref::<reqwest::Error>()
         .and_then(|reqwest_err| reqwest_err.url().cloned().map(sanitized_url_endpoint))
         .or_else(|| endpoint_from_error_text(&error_detail));
+    let structured_status = err
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        .map(|status| status.as_u16());
+    let text_status = http_status_from_error_text(&lower);
+
+    if let Some(status) = structured_status.or(text_status) {
+        return http_status_diagnostic(status, endpoint);
+    }
 
     if is_context_window_exceeded(err) {
         return ProviderErrorDiagnostic {
@@ -1047,10 +1068,6 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
     }
 
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
-        if let Some(status) = reqwest_err.status() {
-            return http_status_diagnostic(status.as_u16(), endpoint);
-        }
-
         if reqwest_err.is_timeout() && reqwest_err.is_connect() {
             return ProviderErrorDiagnostic {
                 kind: "connect_timeout",
@@ -1131,10 +1148,6 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             hint: "check the configured model id for this provider",
             endpoint,
         };
-    }
-
-    if let Some(status) = http_status_from_error_text(&lower) {
-        return http_status_diagnostic(status, endpoint);
     }
 
     ProviderErrorDiagnostic {
@@ -5742,6 +5755,18 @@ mod tests {
                 "configure provider credentials",
             ),
             (
+                "API error (401): missing API key",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "API error (403): API key not set",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
                 "401 Unauthorized: invalid api key",
                 "auth",
                 "http_response",
@@ -5785,6 +5810,30 @@ mod tests {
                 "request shape",
             ),
             (
+                "HTTP 503 Service Unavailable",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "HTTP 404 Not Found",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "HTTP 400 Bad Request",
+                "client_error",
+                "http_response",
+                "request shape",
+            ),
+            (
+                "HTTP request failed: HTTP 503 Service Unavailable",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
                 "compatible API error (401 Unauthorized): invalid credentials",
                 "auth",
                 "http_response",
@@ -5816,6 +5865,32 @@ mod tests {
             assert_eq!(diagnostic.kind, expected_kind, "{message}");
             assert_eq!(diagnostic.phase, expected_phase, "{message}");
             assert!(diagnostic.hint.contains(expected_hint), "{message}");
+        }
+    }
+
+    #[test]
+    fn provider_error_diagnostic_prioritizes_wrapped_structured_http_status() {
+        for (status, expected_kind) in [
+            (reqwest::StatusCode::UNAUTHORIZED, "auth"),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        ] {
+            let response = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .body(reqwest::Body::default())
+                    .expect("test response should build"),
+            );
+            let error = anyhow::Error::new(
+                response
+                    .error_for_status()
+                    .expect_err("error status should produce an error"),
+            )
+            .context("missing API key");
+
+            let diagnostic = provider_error_diagnostic(&error);
+
+            assert_eq!(diagnostic.kind, expected_kind, "{status}");
+            assert_eq!(diagnostic.phase, "http_response", "{status}");
         }
     }
 

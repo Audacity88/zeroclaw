@@ -1478,6 +1478,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_credential_messages_are_owned_by_each_locale() {
+        for (source, locale) in committed_locale_sources() {
+            let missing = format_ftl_message(
+                source,
+                locale,
+                "cli-agent-error-provider-credentials-missing",
+                &[],
+            )
+            .unwrap_or_else(|| panic!("{locale}: missing-credentials message should format"));
+            assert!(!missing.is_empty(), "{locale}: missing-credentials message");
+
+            for key in [
+                "cli-agent-error-provider-credentials-missing-named",
+                "cli-agent-error-provider-authentication-named",
+            ] {
+                let formatted =
+                    format_ftl_message(source, locale, key, &[("provider", "custom.test")])
+                        .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("custom.test"),
+                    "{locale}: {key} must include the configured provider: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$provider}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
     /// Argless `channel-approval-*` keys must be defined and non-empty in
     /// every committed locale.
     const CHANNEL_APPROVAL_ARGLESS_KEYS: &[&str] = &[
@@ -1502,7 +1533,7 @@ mod tests {
         "channel-approval-opt-reject-with-edit",
     ];
 
-    fn channel_approval_locale_sources() -> [(&'static str, &'static str); 5] {
+    fn committed_locale_sources() -> [(&'static str, &'static str); 5] {
         [
             (include_str!("../locales/en/cli.ftl"), "en"),
             (include_str!("../locales/es/cli.ftl"), "es"),
@@ -1518,7 +1549,7 @@ mod tests {
         // `channel-approval-*` key must be defined in all 5 committed
         // locales, and the complete Rust-built reply commands — plus the
         // tool arg — must survive translation verbatim.
-        for (source, locale) in channel_approval_locale_sources() {
+        for (source, locale) in committed_locale_sources() {
             for key in CHANNEL_APPROVAL_ARGLESS_KEYS {
                 let value = format_ftl_message(source, locale, key, &[])
                     .unwrap_or_else(|| panic!("{locale}: {key} should be defined"));
