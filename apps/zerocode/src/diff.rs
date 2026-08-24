@@ -14,7 +14,12 @@ const DEL_BG: Color = Color::Rgb(55, 0, 0);
 const SEP_FG: Color = Color::Rgb(70, 70, 70);
 
 const DIFF_CONTEXT: usize = 3;
-const MAX_WRITE_LINES: usize = 60;
+#[derive(Debug)]
+pub struct RenderedLines {
+    pub lines: Vec<Line<'static>>,
+    pub omitted: usize,
+    pub total: usize,
+}
 
 /// Decimal digit count of the largest line number in a diff, used to size
 /// the gutter so the `|` separator aligns on every row.
@@ -252,11 +257,21 @@ pub fn diff_lines(
     lang: Option<&str>,
     start_line: usize,
 ) -> Vec<Line<'static>> {
-    let start_line = start_line.max(1);
+    diff_lines_limited(old, new, lang, Some(start_line), None).lines
+}
+
+pub fn diff_lines_limited(
+    old: &str,
+    new: &str,
+    lang: Option<&str>,
+    start_line: Option<usize>,
+    limit: Option<usize>,
+) -> RenderedLines {
+    let start_line = start_line.map(|line| line.max(1));
     let diff = TextDiff::from_lines(old, new);
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    let max_lineno = start_line.saturating_add(
+    let max_lineno = start_line.unwrap_or(1).saturating_add(
         old.lines()
             .count()
             .max(new.lines().count())
@@ -293,9 +308,9 @@ pub fn diff_lines(
                             .unwrap_or_else(|| {
                                 vec![Span::styled(text, Style::default().bg(DEL_BG).fg(del_fg))]
                             });
-                        let lineno = change
-                            .old_index()
-                            .map(|n| gutter(n + start_line, width))
+                        let lineno = start_line
+                            .zip(change.old_index())
+                            .map(|(start, n)| gutter(n + start, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         let mut spans = vec![Span::styled(
                             lineno + "- ",
@@ -315,9 +330,9 @@ pub fn diff_lines(
                             .unwrap_or_else(|| {
                                 vec![Span::styled(text, Style::default().bg(ADD_BG).fg(add_fg))]
                             });
-                        let lineno = change
-                            .new_index()
-                            .map(|n| gutter(n + start_line, width))
+                        let lineno = start_line
+                            .zip(change.new_index())
+                            .map(|(start, n)| gutter(n + start, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         let mut spans = vec![Span::styled(
                             lineno + "+ ",
@@ -330,9 +345,9 @@ pub fn diff_lines(
                         Line::from(spans).style(Style::default().bg(ADD_BG))
                     }
                     ChangeTag::Equal => {
-                        let lineno = change
-                            .old_index()
-                            .map(|n| gutter(n + start_line, width))
+                        let lineno = start_line
+                            .zip(change.old_index())
+                            .map(|(start, n)| gutter(n + start, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         Line::from(Span::styled(
                             format!("{lineno}  {text}"),
@@ -352,21 +367,39 @@ pub fn diff_lines(
         )));
     }
 
-    out
+    let total = out.len();
+    let omitted = limit.map_or(0, |limit| total.saturating_sub(limit));
+    if let Some(limit) = limit {
+        out.truncate(limit);
+    }
+    RenderedLines {
+        lines: out,
+        omitted,
+        total,
+    }
 }
 
 pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
-    let all: Vec<&str> = content.lines().collect();
-    let show = all.len().min(MAX_WRITE_LINES);
+    write_lines_limited(content, lang, None).lines
+}
+
+pub fn write_lines_limited(
+    content: &str,
+    lang: Option<&str>,
+    limit: Option<usize>,
+) -> RenderedLines {
+    let total = content.lines().count();
+    let show = limit.map_or(total, |limit| total.min(limit));
     let width = gutter_width(show);
+    let preview = content.lines().take(show).collect::<Vec<_>>().join("\n");
 
     let add_fg = add_fg();
     let hl = lang
         .and_then(ext_to_language)
-        .map(|language| highlight_all(content, language, ADD_BG, add_fg));
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(show + 1);
+        .map(|language| highlight_all(&preview, language, ADD_BG, add_fg));
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(show);
 
-    for (i, item) in all.iter().enumerate().take(show) {
+    for (i, item) in content.lines().take(show).enumerate() {
         let content_spans = hl
             .as_ref()
             .and_then(|v| v.get(i))
@@ -388,14 +421,11 @@ pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
         out.push(Line::from(spans).style(Style::default().bg(ADD_BG)));
     }
 
-    if all.len() > MAX_WRITE_LINES {
-        out.push(Line::from(Span::styled(
-            format!("  \u{22ef} {} more lines", all.len() - MAX_WRITE_LINES),
-            Style::default().fg(SEP_FG),
-        )));
+    RenderedLines {
+        lines: out,
+        omitted: total.saturating_sub(show),
+        total,
     }
-
-    out
 }
 
 #[cfg(test)]
@@ -432,18 +462,12 @@ mod tests {
     }
 
     #[test]
-    fn write_lines_caps_at_max() {
+    fn write_lines_limit_reports_omitted_rows() {
         let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
-        let lines = write_lines(&content, None);
-        let last: String = lines
-            .last()
-            .unwrap()
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(last.contains("more lines"), "expected trailer, got: {last}");
-        assert_eq!(lines.len(), MAX_WRITE_LINES + 1);
+        let rendered = write_lines_limited(&content, None, Some(6));
+        assert_eq!(rendered.lines.len(), 6);
+        assert_eq!(rendered.omitted, 94);
+        assert_eq!(write_lines(&content, None).len(), 100);
     }
 
     #[test]
