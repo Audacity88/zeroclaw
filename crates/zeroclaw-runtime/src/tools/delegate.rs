@@ -1181,12 +1181,32 @@ impl DelegateTool {
         owner_boot_id: String,
     ) -> anyhow::Result<bool> {
         let task_id = result.task_id.clone();
-        let bytes = Self::serialize_result(&result)?;
-        let artifact_path = Self::durable_artifact_path(result_path)?;
-        let file_name = result_path
-            .file_name()
-            .ok_or_else(|| anyhow::Error::msg("delegate output path has no file name"))?
-            .to_string_lossy();
+        let bytes = match Self::serialize_result(&result) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let error = format!("failed to prepare delegate settlement: {error:#}");
+                return Ok(Self::supervise_pre_intent_failure(store, &task_id, error).await);
+            }
+        };
+        if !result_path.is_absolute() {
+            let error = format!(
+                "failed to prepare delegate settlement: output path is not absolute: {}",
+                result_path.display()
+            );
+            return Ok(Self::supervise_pre_intent_failure(store, &task_id, error).await);
+        }
+        let file_name = match result_path.file_name() {
+            Some(file_name) => file_name.to_string_lossy(),
+            None => {
+                let error = format!(
+                    "failed to prepare delegate settlement: delegate output path has no file \
+                     name: {}",
+                    result_path.display()
+                );
+                return Ok(Self::supervise_pre_intent_failure(store, &task_id, error).await);
+            }
+        };
+        let artifact_path = result_path.to_path_buf();
         let output_ref = (terminal_status == crate::control_plane::TaskStatus::Completed)
             .then(|| format!("{}{}", Self::OUTPUT_ARTIFACT_PREFIX, file_name));
         let intent = crate::control_plane::task_registry::TerminalSettlementIntent {
@@ -1228,6 +1248,54 @@ impl DelegateTool {
             )
         })
         .await)
+    }
+
+    async fn supervise_pre_intent_failure(
+        store: &dyn crate::control_plane::TaskRegistry,
+        task_id: &str,
+        error: String,
+    ) -> bool {
+        Self::supervise_terminal_transition(task_id, || {
+            store.transition_terminal(
+                task_id,
+                crate::control_plane::TaskStatus::Failed,
+                None,
+                Some(error.clone()),
+            )
+        })
+        .await
+    }
+
+    async fn complete_background_task(
+        store: &dyn crate::control_plane::TaskRegistry,
+        result_path: &Path,
+        result: BackgroundDelegateOutput,
+        terminal_status: crate::control_plane::TaskStatus,
+        terminal_error: Option<String>,
+        owner_pid: u32,
+        owner_boot_id: String,
+    ) -> bool {
+        let task_id = result.task_id.clone();
+        let settled = Self::settle_background_task(
+            store,
+            result_path,
+            result,
+            terminal_status,
+            terminal_error,
+            owner_pid,
+            owner_boot_id,
+        )
+        .await;
+        let won = match settled {
+            Ok(won) => won,
+            Err(error) => {
+                let error = format!("failed to settle background delegate task: {error:#}");
+                Self::supervise_pre_intent_failure(store, &task_id, error).await
+            }
+        };
+
+        Self::background_task_cancels().lock().remove(&task_id);
+        won
     }
 
     async fn supervise_settlement_intent(
@@ -2004,7 +2072,8 @@ impl DelegateTool {
             task_id: task_id.clone(),
             output: None,
         };
-        let result_path = results_dir.join(format!("{task_id}.json"));
+        let result_path =
+            Self::durable_artifact_path(&results_dir.join(format!("{task_id}.json")))?;
         Self::write_result_atomic(&result_path, &initial_result).await?;
 
         if let Err(error) = task_control_plane
@@ -2162,8 +2231,7 @@ impl DelegateTool {
                     }
                 };
 
-                let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                let _won = DelegateTool::settle_background_task(
+                let _won = DelegateTool::complete_background_task(
                     terminal_store.as_ref(),
                     &result_path,
                     final_result,
@@ -2172,13 +2240,7 @@ impl DelegateTool {
                     terminal_owner_pid,
                     terminal_owner_boot_id,
                 )
-                .await
-                .expect("output persistence failures are converted into terminal task failures");
-
-                // Drop the live cancel token now the task has settled.
-                Self::background_task_cancels()
-                    .lock()
-                    .remove(&task_id_clone);
+                .await;
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -3905,6 +3967,77 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.starts_with("failed to persist delegate output:"))
         );
+    }
+
+    #[test]
+    fn background_result_path_is_resolved_before_registration() {
+        let result_path =
+            DelegateTool::durable_artifact_path(Path::new("delegate_results/task.json")).unwrap();
+        assert!(result_path.is_absolute());
+        assert_eq!(
+            result_path.file_name().and_then(|name| name.to_str()),
+            Some("task.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_intent_settlement_failure_is_terminal_and_cleans_token() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "45454545-4545-4545-4545-454545454545";
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+
+        let won = DelegateTool::complete_background_task(
+            store.as_ref(),
+            Path::new("relative-delegate-results/task.json"),
+            BackgroundDelegateOutput {
+                task_id: task_id.into(),
+                output: Some("done".into()),
+            },
+            TaskStatus::Completed,
+            None,
+            0,
+            "test-boot".into(),
+        )
+        .await;
+
+        assert!(won);
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert!(snapshot.error.as_deref().is_some_and(|error| {
+            error.contains("failed to prepare delegate settlement")
+                && error.contains("not absolute")
+        }));
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_none(),
+            "the live cancellation token is removed only after terminal settlement"
+        );
+        assert!(!token.is_cancelled());
+
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(!checked.success);
+        let checked_value: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+        assert_eq!(checked_value["status"], "failed");
+        assert!(!checked.output.contains("pending"));
+        assert!(checked.error.as_deref().is_some_and(|error| {
+            error.contains("failed to prepare delegate settlement")
+                && error.contains("not absolute")
+        }));
     }
 
     #[tokio::test]
