@@ -251,15 +251,6 @@ fn plain_line_spans_no_bg(text: &str, fg: Color) -> Vec<Vec<Span<'static>>> {
 
 // ── Public diff API ──────────────────────────────────────────────
 
-pub fn diff_lines(
-    old: &str,
-    new: &str,
-    lang: Option<&str>,
-    start_line: usize,
-) -> Vec<Line<'static>> {
-    diff_lines_limited(old, new, lang, Some(start_line), None).lines
-}
-
 pub fn diff_lines_limited(
     old: &str,
     new: &str,
@@ -379,10 +370,6 @@ pub fn diff_lines_limited(
     }
 }
 
-pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
-    write_lines_limited(content, lang, None).lines
-}
-
 pub fn write_lines_limited(
     content: &str,
     lang: Option<&str>,
@@ -431,6 +418,19 @@ pub fn write_lines_limited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diff_lines(
+        old: &str,
+        new: &str,
+        lang: Option<&str>,
+        start_line: usize,
+    ) -> Vec<Line<'static>> {
+        diff_lines_limited(old, new, lang, Some(start_line), None).lines
+    }
+
+    fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+        write_lines_limited(content, lang, None).lines
+    }
 
     #[test]
     fn diff_produces_add_and_delete_lines() {
