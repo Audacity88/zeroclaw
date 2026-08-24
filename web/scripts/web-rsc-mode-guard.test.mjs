@@ -90,6 +90,39 @@ function createFixture(testContext, { source = validSource, config = validConfig
   return { repoRoot, webRoot };
 }
 
+function addFixtureDependency(
+  webRoot,
+  name,
+  source,
+  { dependencies = {}, rootDependency = true, rootSection = "dependencies" } = {},
+) {
+  const packageRoot = path.join(webRoot, "node_modules", name);
+  fs.mkdirSync(packageRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(packageRoot, "package.json"),
+    `${JSON.stringify(
+      {
+        name,
+        version: "1.0.0",
+        type: "module",
+        main: "index.js",
+        dependencies,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  fs.writeFileSync(path.join(packageRoot, "index.js"), source);
+
+  if (rootDependency) {
+    const packagePath = path.join(webRoot, "package.json");
+    const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+    packageJson[rootSection] ??= {};
+    packageJson[rootSection][name] = "1.0.0";
+    fs.writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+  }
+}
+
 async function expectFailure(testContext, repoRoot, pattern) {
   await assert.rejects(() => runGuard(repoRoot), pattern);
 }
@@ -697,6 +730,82 @@ test("bare package aliases cannot redirect into skipped web/node_modules", async
     `import { StaticRouter } from "react-router-dom";\nexport { StaticRouter as hidden };\n`,
   );
   await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*node_modules/);
+});
+
+test("reachable declared dependency modules are inspected", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  addFixtureDependency(
+    webRoot,
+    "foo",
+    `export { StaticRouter } from "react-router-dom/server";\n`,
+  );
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*react-router-dom\/server/);
+});
+
+test("reachable declared client-only dependency modules pass", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  addFixtureDependency(webRoot, "foo", "export const page = true;\n");
+  await runGuard(repoRoot);
+});
+
+test("reachable dev-declared dependency modules are inspected", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  addFixtureDependency(
+    webRoot,
+    "foo",
+    `export { StaticRouter } from "react-router-dom/server";\n`,
+    { rootSection: "devDependencies" },
+  );
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*react-router-dom\/server/);
+});
+
+test("dependency re-exports obey the React Router client-value allowlist", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  addFixtureDependency(
+    webRoot,
+    "foo",
+    `export { StaticRouter as page } from "react-router-dom";\n`,
+  );
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*unapproved React Router value export/);
+});
+
+test("unresolved local imports in dependencies fail closed", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  addFixtureDependency(
+    webRoot,
+    "foo",
+    `import { missing } from "./missing.js";\nexport { missing as page };\n`,
+  );
+  await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*cannot resolve dependency import/);
+});
+
+test("reachable dependency cycles terminate", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  addFixtureDependency(
+    webRoot,
+    "foo",
+    `import { page } from "bar";\nexport { page };\n`,
+    { dependencies: { bar: "1.0.0" } },
+  );
+  addFixtureDependency(
+    webRoot,
+    "bar",
+    `import { page } from "foo";\nexport { page };\n`,
+    { dependencies: { foo: "1.0.0" }, rootDependency: false },
+  );
+  await runGuard(repoRoot);
 });
 
 test("virtual package modules fail closed", async (t) => {

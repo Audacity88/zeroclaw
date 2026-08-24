@@ -287,6 +287,57 @@ function addModuleRecord(records, node, filePath, kind) {
   records.push({ filePath, specifier, kind });
 }
 
+function verifyReactRouterImport(node, relative) {
+  const specifier = literalText(node.moduleSpecifier);
+  const bindings = node.importClause?.namedBindings;
+  if (
+    bindings &&
+    ts.isNamespaceImport(bindings) &&
+    specifier === "react-router-dom"
+  ) {
+    fail(`${relative} uses a namespace import from react-router-dom`);
+  }
+  if (specifier === "react-router-dom" && bindings && ts.isNamedImports(bindings)) {
+    for (const element of bindings.elements) {
+      if (node.importClause?.isTypeOnly || element.isTypeOnly) {
+        continue;
+      }
+      const name = importedName(element.propertyName ?? element.name);
+      if (!name || !allowedReactRouterDomValueExports.has(name)) {
+        fail(`${relative} imports an unapproved React Router value export: ${name ?? "unknown"}`);
+      }
+    }
+  }
+  if (specifier === "react-router-dom" && node.importClause?.name) {
+    fail(`${relative} uses a default import from react-router-dom`);
+  }
+}
+
+function verifyReactRouterExport(node, filePath, relative) {
+  const specifier = moduleSpecifier(node.moduleSpecifier, filePath, "export module specifier");
+  if (
+    specifier === "react-router-dom" &&
+    (!node.exportClause || ts.isNamespaceExport(node.exportClause))
+  ) {
+    fail(`${relative} re-exports the full react-router-dom namespace`);
+  }
+  if (
+    specifier === "react-router-dom" &&
+    node.exportClause &&
+    ts.isNamedExports(node.exportClause)
+  ) {
+    for (const element of node.exportClause.elements) {
+      if (node.isTypeOnly || element.isTypeOnly) {
+        continue;
+      }
+      const name = importedName(element.propertyName ?? element.name);
+      if (!name || !allowedReactRouterDomValueExports.has(name)) {
+        fail(`${relative} re-exports an unapproved React Router value export: ${name ?? "unknown"}`);
+      }
+    }
+  }
+}
+
 function inspectSource(filePath, source, records) {
   const sourceFile = parseSource(filePath, source);
   const relative = pathBasename(filePath);
@@ -799,54 +850,11 @@ function inspectSource(filePath, source, records) {
 
     if (ts.isImportDeclaration(node)) {
       addModuleRecord(records, node.moduleSpecifier, filePath, "static import");
-      const specifier = literalText(node.moduleSpecifier);
-      const bindings = node.importClause?.namedBindings;
-      if (
-        bindings &&
-        ts.isNamespaceImport(bindings) &&
-        specifier === "react-router-dom"
-      ) {
-        fail(`${relative} uses a namespace import from react-router-dom`);
-      }
-      if (specifier === "react-router-dom" && bindings && ts.isNamedImports(bindings)) {
-        for (const element of bindings.elements) {
-          if (node.importClause?.isTypeOnly || element.isTypeOnly) {
-            continue;
-          }
-          const name = importedName(element.propertyName ?? element.name);
-          if (!name || !allowedReactRouterDomValueExports.has(name)) {
-            fail(`${relative} imports an unapproved React Router value export: ${name ?? "unknown"}`);
-          }
-        }
-      }
-      if (specifier === "react-router-dom" && node.importClause?.name) {
-        fail(`${relative} uses a default import from react-router-dom`);
-      }
+      verifyReactRouterImport(node, relative);
     }
 
     if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
-      const specifier = moduleSpecifier(node.moduleSpecifier, filePath, "export module specifier");
-      if (
-        specifier === "react-router-dom" &&
-        (!node.exportClause || ts.isNamespaceExport(node.exportClause))
-      ) {
-        fail(`${relative} re-exports the full react-router-dom namespace`);
-      }
-      if (
-        specifier === "react-router-dom" &&
-        node.exportClause &&
-        ts.isNamedExports(node.exportClause)
-      ) {
-        for (const element of node.exportClause.elements) {
-          if (node.isTypeOnly || element.isTypeOnly) {
-            continue;
-          }
-          const name = importedName(element.propertyName ?? element.name);
-          if (!name || !allowedReactRouterDomValueExports.has(name)) {
-            fail(`${relative} re-exports an unapproved React Router value export: ${name ?? "unknown"}`);
-          }
-        }
-      }
+      verifyReactRouterExport(node, filePath, relative);
       addModuleRecord(records, node.moduleSpecifier, filePath, "export");
     }
 
@@ -889,6 +897,51 @@ function inspectSource(filePath, source, records) {
       }
     }
 
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+}
+
+function inspectDependencySource(filePath, source, records) {
+  const sourceFile = parseSource(filePath, source);
+  const relative = pathBasename(filePath);
+
+  function visit(node) {
+    if (ts.isImportDeclaration(node)) {
+      addModuleRecord(records, node.moduleSpecifier, filePath, "static import");
+      verifyReactRouterImport(node, relative);
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
+      verifyReactRouterExport(node, filePath, relative);
+      addModuleRecord(records, node.moduleSpecifier, filePath, "export");
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      ts.isExternalModuleReference(node.moduleReference)
+    ) {
+      addModuleRecord(records, node.moduleReference.expression, filePath, "import-equals");
+    } else if (ts.isImportTypeNode(node)) {
+      const argument = ts.isLiteralTypeNode(node.argument)
+        ? node.argument.literal
+        : node.argument;
+      addModuleRecord(records, argument, filePath, "import type");
+    } else if (ts.isCallExpression(node)) {
+      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
+      if (isDynamicImport || isRequire) {
+        if (node.arguments.length !== 1 || literalText(node.arguments[0]) === null) {
+          fail(`${relative} uses a nonliteral dynamic module specifier`);
+        }
+        if (literalText(node.arguments[0]) === "react-router-dom") {
+          fail(`${relative} dynamically imports react-router-dom`);
+        }
+        addModuleRecord(
+          records,
+          node.arguments[0],
+          filePath,
+          isDynamicImport ? "dynamic import" : "require",
+        );
+      }
+    }
     ts.forEachChild(node, visit);
   }
 
@@ -1366,10 +1419,12 @@ async function verifyImportBoundary(
   nodeModulesRoot,
   distRoot,
   declared,
+  { dependencySource = false } = {},
 ) {
   const packageNameValue = packageName(record.specifier);
   const local = isLocalSpecifier(record.specifier);
   if (
+    !dependencySource &&
     !local &&
     !isBuiltinSpecifier(record.specifier) &&
     !setHas(declared, packageNameValue) &&
@@ -1385,6 +1440,11 @@ async function verifyImportBoundary(
   const rawId = rawResolvedId(resolved);
   if (local) {
     if (!rawId) {
+      if (dependencySource) {
+        fail(
+          `${relativePath(webRoot, record.filePath)} cannot resolve dependency import ${record.specifier}`,
+        );
+      }
       const lexicalPath = record.specifier.startsWith("@/")
         ? pathResolve(webSourceRoot, record.specifier.slice(2))
         : pathResolve(pathDirname(record.filePath), record.specifier);
@@ -1393,7 +1453,7 @@ async function verifyImportBoundary(
         webRoot,
         nodeModulesRoot,
         `${relativePath(webRoot, record.filePath)} unresolved import ${record.specifier}`,
-        true,
+        !dependencySource,
       );
       assertOutsideSkippedDist(
         lexicalPath,
@@ -1419,7 +1479,7 @@ async function verifyImportBoundary(
       webRoot,
       nodeModulesRoot,
       `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
-      true,
+      !dependencySource,
     );
     assertOutsideSkippedDist(
       canonicalPath,
@@ -1427,10 +1487,15 @@ async function verifyImportBoundary(
       `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
     );
     assertSupportedResolvedFormat(
-      resolvedPath,
+      canonicalPath,
       `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
     );
-    return;
+    if (dependencySource && !isInside(nodeModulesRoot, canonicalPath)) {
+      fail(
+        `${relativePath(webRoot, record.filePath)} dependency import ${record.specifier} escapes the guarded dependency tree`,
+      );
+    }
+    return canonicalPath;
   }
 
   if (!rawId) {
@@ -1461,6 +1526,60 @@ async function verifyImportBoundary(
     distRoot,
     `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
   );
+  assertSupportedResolvedFormat(
+    canonicalPath,
+    `${relativePath(webRoot, record.filePath)} import ${record.specifier}`,
+  );
+  if (dependencySource && !isInside(nodeModulesRoot, canonicalPath)) {
+    fail(
+      `${relativePath(webRoot, record.filePath)} dependency import ${record.specifier} escapes the guarded dependency tree`,
+    );
+  }
+  return canonicalPath;
+}
+
+function isExecutableModule(filePath) {
+  return scannedExtensions.has(pathExtname(filePath).toLowerCase());
+}
+
+function shouldTraverseDependency(record, resolvedPath, nodeModulesRoot) {
+  return (
+    resolvedPath &&
+    isInside(nodeModulesRoot, resolvedPath) &&
+    packageName(record.specifier) !== "react-router-dom" &&
+    isExecutableModule(resolvedPath)
+  );
+}
+
+async function resolveDependencySource(server, record, nodeModulesRoot) {
+  const resolved = await server.pluginContainer.resolveId(
+    record.specifier,
+    record.filePath,
+    { ssr: true },
+  );
+  const rawId = rawResolvedId(resolved);
+  if (!rawId || rawId.startsWith("\0")) {
+    fail(
+      `${relativePath(pathDirname(nodeModulesRoot), record.filePath)} cannot resolve dependency source ${record.specifier}`,
+    );
+  }
+  const resolvedPath = resolvedIdPath(rawId);
+  if (!fsExistsSync(resolvedPath)) {
+    fail(
+      `${relativePath(pathDirname(nodeModulesRoot), record.filePath)} dependency source does not exist: ${record.specifier}`,
+    );
+  }
+  const canonicalPath = fsRealpathSync(resolvedPath);
+  if (!isInside(nodeModulesRoot, canonicalPath)) {
+    fail(
+      `${relativePath(pathDirname(nodeModulesRoot), record.filePath)} dependency source escapes the guarded dependency tree: ${record.specifier}`,
+    );
+  }
+  assertSupportedResolvedFormat(
+    canonicalPath,
+    `${relativePath(pathDirname(nodeModulesRoot), record.filePath)} dependency source ${record.specifier}`,
+  );
+  return canonicalPath;
 }
 
 async function loadViteServer(webRoot, configFile) {
@@ -2078,8 +2197,30 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
     if (fsRealpathSync(server.config.configFile) !== configFile) {
       fail("effective Vite configuration does not match the prechecked config file");
     }
-    for (const record of records) {
-      await verifyImportBoundary(
+    const dependencyQueue = [];
+    const visitedDependencyModules = new Set();
+    const enqueueDependencyModule = async (record, resolvedPath, dependencySource) => {
+      if (
+        isBuiltinSpecifier(record.specifier) ||
+        packageName(record.specifier) === "react-router-dom" ||
+        (!dependencySource && !isInside(webSourceRoot, record.filePath))
+      ) {
+        return;
+      }
+      const sourcePath = isLocalSpecifier(record.specifier)
+        ? resolvedPath
+        : await resolveDependencySource(server, record, nodeModulesRoot);
+      if (
+        shouldTraverseDependency(record, sourcePath, nodeModulesRoot) &&
+        !setHas(visitedDependencyModules, sourcePath)
+      ) {
+        visitedDependencyModules.add(sourcePath);
+        dependencyQueue.push(sourcePath);
+      }
+    };
+
+    const verifyRecord = async (record, options) => {
+      const resolvedPath = await verifyImportBoundary(
         server,
         record,
         webRoot,
@@ -2087,7 +2228,28 @@ export async function runGuard(repoRoot = process.env.ZEROCLAW_RSC_GUARD_ROOT ??
         nodeModulesRoot,
         distRoot,
         declared,
+        options,
       );
+      await enqueueDependencyModule(record, resolvedPath, options?.dependencySource === true);
+    };
+
+    for (const record of records) {
+      await verifyRecord(record);
+    }
+    for (let dependencyIndex = 0; dependencyIndex < dependencyQueue.length; dependencyIndex += 1) {
+      const filePath = dependencyQueue[dependencyIndex];
+      if (isServerEntry(filePath)) {
+        fail(`${relativePath(webRoot, filePath)} is a server/RSC entry surface`);
+      }
+      const dependencyRecords = [];
+      inspectDependencySource(
+        filePath,
+        fsReadFileSync(filePath, "utf8"),
+        dependencyRecords,
+      );
+      for (const record of dependencyRecords) {
+        await verifyRecord(record, { dependencySource: true });
+      }
     }
 
     verifyEffectiveAlias(server, webRoot, webSourceRoot, nodeModulesRoot);
