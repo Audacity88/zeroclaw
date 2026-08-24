@@ -76,7 +76,7 @@ pub fn build_session_model_provider(
         &model_provider_runtime_options,
     )?;
 
-    Ok((model_provider, model_provider_name, model_name))
+    Ok((model_provider, model_provider_ref.to_string(), model_name))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -401,6 +401,20 @@ pub struct Agent {
     channel_name: String,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    /// The `DelegateTool` this Agent's registry registered, in its concrete
+    /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
+    /// otherwise cannot drive the *constructed* delegate's nested-registry
+    /// build and can only re-derive the wiring by hand - which is precisely
+    /// what must not be trusted for live-config threading. `None` when the
+    /// agent has no configured delegation targets.
+    ///
+    /// `allow(dead_code)`: its only reader is the delegated live-config
+    /// regression, which additionally needs `plugins-wasm-cranelift` to have a
+    /// plugin tool to execute at all. Under a narrower test feature set the
+    /// field is written and never read.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Drop for Agent {
@@ -532,6 +546,8 @@ pub struct AgentBuilder {
     provider_switch_config: Option<ProviderSwitchConfig>,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Default for AgentBuilder {
@@ -583,6 +599,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(test)]
             turn_datetime: None,
+            #[cfg(test)]
+            delegate_tool: None,
         }
     }
 
@@ -810,6 +828,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Retain the concrete `DelegateTool` the registry built, for regressions
+    /// that must drive the *constructed* delegate rather than a hand-rolled one.
+    #[cfg(test)]
+    fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
+        self.delegate_tool = delegate_tool;
+        self
+    }
+
     #[cfg(test)]
     fn turn_datetime<F>(mut self, provider: F) -> Self
     where
@@ -961,6 +987,8 @@ impl AgentBuilder {
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
+            #[cfg(test)]
+            delegate_tool: self.delegate_tool,
         })
     }
 }
@@ -1612,12 +1640,23 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            // Daemon-backed constructors supply the shared handle; tools that
+            // resolve config per call (plugin tools, `send_via` authority) must
+            // follow reloads rather than this call's `config` snapshot. `None`
+            // here would silently pin them to startup state for the Agent's
+            // whole lifetime. One-shot callers pass `None` and keep the
+            // documented snapshot fallback.
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        // Captured before `assemble` consumes the result: the concrete delegate
+        // instance this registry built, so live-config regressions can drive its
+        // nested-registry construction instead of re-deriving the wiring.
+        #[cfg(test)]
+        let built_delegate_tool = all_tools_result.delegate_tool.clone();
         // Capture before `runtime` is moved into `ScopedAssembly`.
         let shell_profile = runtime.shell_profile();
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
@@ -1740,7 +1779,10 @@ impl Agent {
                 Arc::new(move || max)
             };
 
-        let mut agent = Agent::builder()
+        let builder = Agent::builder();
+        #[cfg(test)]
+        let builder = builder.delegate_tool(built_delegate_tool);
+        let mut agent = builder
             .model_provider(model_provider)
             .tools(tools)
             .memory(memory.clone())
@@ -1764,7 +1806,7 @@ impl Agent {
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
-            .model_provider_name(provider_name.to_string())
+            .model_provider_name(provider_ref.clone())
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
@@ -1925,6 +1967,22 @@ impl Agent {
         fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
         event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> String {
+        let with_notice = Self::format_model_fallback_notice(response.clone(), fallback);
+        if with_notice == response {
+            return response;
+        }
+        let Some(delta) = with_notice.strip_prefix(&response) else {
+            return response;
+        };
+        let delta = delta.to_string();
+        let _ = event_tx.send(TurnEvent::Chunk { delta }).await;
+        with_notice
+    }
+
+    fn format_model_fallback_notice(
+        response: String,
+        fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+    ) -> String {
         let Some(fallback) = fallback else {
             return response;
         };
@@ -1944,16 +2002,10 @@ impl Agent {
                 ("actual_provider", fallback.actual_provider.as_str()),
             ],
         );
-        let delta = format!("\n\n{notice}");
-        let _ = event_tx
-            .send(TurnEvent::Chunk {
-                delta: delta.clone(),
-            })
-            .await;
         if response.is_empty() {
             notice
         } else {
-            format!("{response}{delta}")
+            format!("{response}\n\n{notice}")
         }
     }
 
@@ -2429,6 +2481,7 @@ impl Agent {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -2578,6 +2631,8 @@ impl Agent {
         };
 
         let response = self.append_receipts_block(response, receipt_scope.as_ref());
+        let response =
+            Self::format_model_fallback_notice(response, turn_provider_recovery.as_ref());
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
@@ -2688,8 +2743,7 @@ impl Agent {
         // task-local record inside `zeroclaw_providers::reliable`, consumed
         // once per round below; this is a per-turn transient resolved at
         // use-time, never stored on the agent.
-        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo> =
-            None;
+        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo>;
         let mut turn_provider_context_truncated = false;
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
@@ -2802,6 +2856,7 @@ impl Agent {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -2991,9 +3046,10 @@ impl Agent {
                     )
                 })
                 .await;
-            if round_fallback.is_some() {
-                turn_provider_recovery = round_fallback;
-            }
+            // Each accepted round owns the recovery presentation state. A
+            // later primary/direct response must clear an earlier fallback,
+            // rather than leaving its notice attached to the final answer.
+            turn_provider_recovery = round_fallback;
             turn_provider_context_truncated |= round_context_truncated;
 
             // Feed cumulative usage into the AgentEnd guard before any return
@@ -3269,6 +3325,14 @@ mod safety_net;
 #[path = "parity.rs"]
 mod parity;
 
+// Live-config plugin regression (child module so it can read the constructed
+// Agent's tool registry the same way `mod tests` does). Needs a WASM compiler
+// on the host: `WasmTool::from_wasm` refuses to register a tool it cannot load,
+// so a runtime-only plugin backend has no plugin tool to execute.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+#[path = "plugin_live_config.rs"]
+mod plugin_live_config;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3301,6 +3365,29 @@ mod tests {
             err.to_string().contains("no `model` configured"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn build_session_model_provider_returns_full_canonical_ref() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let (_provider, provider_ref, model) =
+            build_session_model_provider(&config, "openai.fast", None).unwrap();
+
+        assert_eq!(provider_ref, "openai.fast");
+        assert_eq!(model, "gpt-4o-mini");
     }
 
     zeroclaw_api::mock_tool_attribution!(
@@ -3471,10 +3558,38 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[test]
+    fn fallback_notice_fluent_key_stays_localized_without_new_keys() {
+        let args = [
+            ("requested_model", "requested-model"),
+            ("requested_provider", "primary"),
+            ("actual_model", "served-model"),
+            ("actual_provider", "fallback"),
+        ];
+        let english =
+            crate::i18n::get_english_cli_string_with_args("turn-model-fallback-notice", &args);
+        let french = crate::i18n::get_disk_override_cli_string_for_test(
+            "fr",
+            include_str!("../../locales/fr/cli.ftl"),
+            "turn-model-fallback-notice",
+            &args,
+        );
+
+        assert_ne!(french, "{turn-model-fallback-notice}");
+        assert_ne!(french, english, "French must not fall back to English");
+        for (_, value) in args {
+            assert!(
+                french.contains(value),
+                "localized fallback notice lost {value}"
+            );
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum RuntimeStreamPlan {
         Unsupported,
         Text(&'static str),
+        EmptyWithUsage,
         Error,
     }
 
@@ -3533,6 +3648,17 @@ mod tests {
                 RuntimeStreamPlan::Text(text) => futures_util::stream::iter(vec![
                     Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
                         zeroclaw_providers::traits::StreamChunk::delta(text),
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed(),
+                RuntimeStreamPlan::EmptyWithUsage => futures_util::stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::Usage(
+                        zeroclaw_providers::traits::TokenUsage {
+                            input_tokens: Some(13),
+                            output_tokens: Some(7),
+                            cached_input_tokens: None,
+                        },
                     )),
                     Ok(zeroclaw_providers::traits::StreamEvent::Final),
                 ])
@@ -3728,6 +3854,225 @@ mod tests {
         assert_eq!(
             outcome.response, "primary final",
             "failed fallback streams must not leave stale fallback notice state"
+        );
+    }
+
+    /// A billed fallback stream is only a transport candidate. If its final
+    /// response is semantically empty and Reliable recovers to primary chat,
+    /// neither the Agent result nor its chunks may retain the fallback notice.
+    #[tokio::test]
+    async fn streamed_empty_fallback_recovery_does_not_leak_a_provider_notice() {
+        let reliable = streaming_probe_reliable_provider(
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Unsupported,
+                chat_text: Some("primary recovery"),
+            },
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::EmptyWithUsage,
+                chat_text: None,
+            },
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("primary recovery must succeed after an empty fallback stream");
+
+        assert_eq!(outcome.response, "primary recovery");
+        let mut chunks = String::new();
+        while let Ok(TurnEvent::Chunk { delta }) = rx.try_recv() {
+            chunks.push_str(&delta);
+        }
+        assert!(
+            !chunks.contains("provider-served") && !chunks.contains("provider-requested"),
+            "rejected fallback must not leak its notice into streamed chunks: {chunks}"
+        );
+    }
+
+    /// A tool-call response is accepted for this iteration, but its recovery
+    /// record must be replaced by the route of the final accepted answer.
+    #[tokio::test]
+    async fn tool_call_then_final_fallback_surfaces_exactly_one_final_notice() {
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(ToolThenFailingModelProvider {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(MockModelProvider {
+                        responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            text: Some("fallback final".to_string()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        }]),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("test memory must initialize"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(vec![Box::new(MockTool)])
+            .memory(memory)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("test agent must initialize");
+
+        let response = agent.turn("run the tool").await.expect("turn must recover");
+        assert_eq!(
+            response.matches("fallback").count(),
+            2,
+            "final text plus one notice"
+        );
+        assert!(
+            response.contains("primary"),
+            "notice identifies the requested route"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_tool_call_then_primary_final_clears_the_stale_notice() {
+        struct PrimaryFailsOnceThenFinal(std::sync::atomic::AtomicUsize);
+        struct FallbackToolCall;
+
+        macro_rules! attributable {
+            ($type:ty, $alias:literal) => {
+                impl ::zeroclaw_api::attribution::Attributable for $type {
+                    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                        ::zeroclaw_api::attribution::Role::Provider(
+                            ::zeroclaw_api::attribution::ProviderKind::Model(
+                                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                            ),
+                        )
+                    }
+                    fn alias(&self) -> &str {
+                        $alias
+                    }
+                }
+            };
+        }
+        attributable!(PrimaryFailsOnceThenFinal, "PrimaryFailsOnceThenFinal");
+        attributable!(FallbackToolCall, "FallbackToolCall");
+
+        #[async_trait]
+        impl ModelProvider for PrimaryFailsOnceThenFinal {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    anyhow::bail!("primary unavailable for first tool request");
+                }
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("primary final".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        #[async_trait]
+        impl ModelProvider for FallbackToolCall {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("tool request".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "fallback-tool".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(PrimaryFailsOnceThenFinal(
+                        std::sync::atomic::AtomicUsize::new(0),
+                    )) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(FallbackToolCall) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(vec![Box::new(MockTool)])
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(
+                    &zeroclaw_config::schema::MemoryConfig {
+                        backend: "none".into(),
+                        ..Default::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("test memory must initialize"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("test agent must initialize");
+
+        assert_eq!(
+            agent.turn("run the tool").await.expect("turn must recover"),
+            "primary final"
         );
     }
 
@@ -5483,6 +5828,97 @@ mod tests {
             "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
             result.err().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn from_config_preserves_alias_for_cost_recording() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext,
+            build_model_provider_pricing, record_tool_loop_cost_usage,
+        };
+        use crate::cost::CostTracker;
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.cost.enabled = true;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o-mini.input".to_string(), 0.15),
+                        ("gpt-4o-mini.output".to_string(), 0.60),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "smart".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o.input".to_string(), 2.50),
+                        ("gpt-4o.output".to_string(), 10.00),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let agent = Agent::from_config(&config, "test-agent").await.unwrap();
+        assert_eq!(agent.model_provider_name, "openai.fast");
+
+        let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(build_model_provider_pricing(&config)),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            cached_input_tokens: Some(0),
+        };
+
+        let (_, cost_usd) = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                record_tool_loop_cost_usage(&agent.model_provider_name, &agent.model_name, &usage)
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            (cost_usd - 0.75).abs() < 1e-12,
+            "selected alias must charge its own rates, not the sibling's $12.50"
+        );
+        let summary = tracker.get_summary().unwrap();
+        assert!((summary.daily_cost_usd - 0.75).abs() < 1e-12);
     }
 
     #[test]
