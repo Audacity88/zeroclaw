@@ -570,6 +570,57 @@ fn transition_task_terminal_record(
     Ok(changed)
 }
 
+fn transition_task_terminal_if_owner_record(
+    conn: &mut Connection,
+    id: &str,
+    owner_pid: u32,
+    owner_boot_id: &str,
+    status: TaskStatus,
+    output: Option<String>,
+    error: Option<String>,
+) -> Result<usize> {
+    anyhow::ensure!(
+        status.is_terminal(),
+        "terminal transition requires a terminal status"
+    );
+    let tx = conn
+        .transaction()
+        .context("begin owner-checked terminal transition")?;
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let changed = tx
+        .execute(
+            "UPDATE tasks
+                SET status = ?1,
+                    output = ?2,
+                    error = ?3,
+                    finished_at = ?4
+              WHERE id = ?5
+                AND owner_pid = ?6
+                AND owner_boot_id = ?7
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+            params![
+                status_to_db(status),
+                output,
+                error,
+                finished_at,
+                id,
+                owner_pid as i64,
+                owner_boot_id,
+            ],
+        )
+        .context("transition owner-checked task terminal")?;
+    if changed == 1 {
+        tx.execute(
+            "DELETE FROM terminal_settlement_intents WHERE task_id = ?1",
+            params![id],
+        )
+        .context("delete stale terminal settlement intent")?;
+    }
+    tx.commit()
+        .context("commit owner-checked terminal transition")?;
+    Ok(changed)
+}
+
 fn claim_task_owner_record(
     conn: &Connection,
     id: &str,
@@ -631,6 +682,27 @@ impl TaskRegistry for SqliteTaskStore {
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
         Ok(transition_task_terminal_record(&mut conn, id, status, output, error)? == 1)
+    }
+
+    async fn transition_terminal_if_owner(
+        &self,
+        id: &str,
+        owner_pid: u32,
+        owner_boot_id: &str,
+        status: TaskStatus,
+        output: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        Ok(transition_task_terminal_if_owner_record(
+            &mut conn,
+            id,
+            owner_pid,
+            owner_boot_id,
+            status,
+            output,
+            error,
+        )? == 1)
     }
 
     async fn persist_terminal_settlement_intent(
@@ -925,6 +997,69 @@ mod tests {
         );
         assert!(snapshot.error.is_none());
         assert!(snapshot.task.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn owner_checked_terminal_transition_requires_the_current_owner() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("owner-match", "main", 7, "boot-old"))
+            .await
+            .unwrap();
+
+        assert!(
+            s.transition_terminal_if_owner(
+                "owner-match",
+                7,
+                "boot-old",
+                TaskStatus::Completed,
+                Some("done".into()),
+                None,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            s.get("owner-match").await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+
+        s.create(rec("owner-transfer", "main", 7, "boot-old"))
+            .await
+            .unwrap();
+        s.claim_owner("owner-transfer", 42, "boot-new")
+            .await
+            .unwrap();
+
+        assert!(
+            !s.transition_terminal_if_owner(
+                "owner-transfer",
+                7,
+                "boot-old",
+                TaskStatus::Failed,
+                None,
+                Some("stale owner".into()),
+            )
+            .await
+            .unwrap()
+        );
+        let transferred = s.get("owner-transfer").await.unwrap().unwrap();
+        assert_eq!(transferred.status, TaskStatus::Running);
+        assert_eq!(
+            (transferred.owner_pid, transferred.owner_boot_id.as_str()),
+            (42, "boot-new")
+        );
+        assert!(
+            s.transition_terminal_if_owner(
+                "owner-transfer",
+                42,
+                "boot-new",
+                TaskStatus::Completed,
+                Some("resumed".into()),
+                None,
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[tokio::test]

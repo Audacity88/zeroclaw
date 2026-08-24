@@ -156,6 +156,21 @@ pub trait TaskRegistry: Send + Sync {
         let _ = (id, status, output, error);
         anyhow::bail!("task registry does not support atomic terminal transitions")
     }
+    /// Atomically settle `id` only when the captured owner still matches and
+    /// the task remains non-terminal. Returns `false` when ownership or
+    /// lifecycle changed first.
+    async fn transition_terminal_if_owner(
+        &self,
+        id: &str,
+        owner_pid: u32,
+        owner_boot_id: &str,
+        status: TaskStatus,
+        output: Option<String>,
+        error: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let _ = (id, owner_pid, owner_boot_id, status, output, error);
+        anyhow::bail!("task registry does not support owner-checked terminal transitions")
+    }
     /// Record an unapplied terminal transition before its artifact is published.
     /// Returns `false` when the task is no longer non-terminal or owner-matched.
     async fn persist_terminal_settlement_intent(

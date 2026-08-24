@@ -1185,7 +1185,14 @@ impl DelegateTool {
             Ok(bytes) => bytes,
             Err(error) => {
                 let error = format!("failed to prepare delegate settlement: {error:#}");
-                return Ok(Self::supervise_pre_intent_failure(store, &task_id, error).await);
+                return Ok(Self::supervise_pre_intent_failure(
+                    store,
+                    &task_id,
+                    owner_pid,
+                    &owner_boot_id,
+                    error,
+                )
+                .await);
             }
         };
         if !result_path.is_absolute() {
@@ -1193,7 +1200,14 @@ impl DelegateTool {
                 "failed to prepare delegate settlement: output path is not absolute: {}",
                 result_path.display()
             );
-            return Ok(Self::supervise_pre_intent_failure(store, &task_id, error).await);
+            return Ok(Self::supervise_pre_intent_failure(
+                store,
+                &task_id,
+                owner_pid,
+                &owner_boot_id,
+                error,
+            )
+            .await);
         }
         let file_name = match result_path.file_name() {
             Some(file_name) => file_name.to_string_lossy(),
@@ -1203,7 +1217,14 @@ impl DelegateTool {
                      name: {}",
                     result_path.display()
                 );
-                return Ok(Self::supervise_pre_intent_failure(store, &task_id, error).await);
+                return Ok(Self::supervise_pre_intent_failure(
+                    store,
+                    &task_id,
+                    owner_pid,
+                    &owner_boot_id,
+                    error,
+                )
+                .await);
             }
         };
         let artifact_path = result_path.to_path_buf();
@@ -1253,11 +1274,15 @@ impl DelegateTool {
     async fn supervise_pre_intent_failure(
         store: &dyn crate::control_plane::TaskRegistry,
         task_id: &str,
+        owner_pid: u32,
+        owner_boot_id: &str,
         error: String,
     ) -> bool {
         Self::supervise_terminal_transition(task_id, || {
-            store.transition_terminal(
+            store.transition_terminal_if_owner(
                 task_id,
+                owner_pid,
+                owner_boot_id,
                 crate::control_plane::TaskStatus::Failed,
                 None,
                 Some(error.clone()),
@@ -1276,6 +1301,7 @@ impl DelegateTool {
         owner_boot_id: String,
     ) -> bool {
         let task_id = result.task_id.clone();
+        let fallback_owner_boot_id = owner_boot_id.clone();
         let settled = Self::settle_background_task(
             store,
             result_path,
@@ -1290,7 +1316,14 @@ impl DelegateTool {
             Ok(won) => won,
             Err(error) => {
                 let error = format!("failed to settle background delegate task: {error:#}");
-                Self::supervise_pre_intent_failure(store, &task_id, error).await
+                Self::supervise_pre_intent_failure(
+                    store,
+                    &task_id,
+                    owner_pid,
+                    &fallback_owner_boot_id,
+                    error,
+                )
+                .await
             }
         };
 
@@ -4038,6 +4071,40 @@ mod tests {
             error.contains("failed to prepare delegate settlement")
                 && error.contains("not absolute")
         }));
+    }
+
+    #[tokio::test]
+    async fn stale_owner_pre_intent_failure_does_not_mutate_transferred_task() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "46464646-4646-4646-4646-464646464646";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.owner_pid = 7;
+        task.owner_boot_id = "boot-old".into();
+        store.create(task).await.unwrap();
+        store.claim_owner(task_id, 42, "boot-new").await.unwrap();
+
+        let settled = DelegateTool::settle_background_task(
+            store.as_ref(),
+            Path::new("relative-delegate-results/task.json"),
+            BackgroundDelegateOutput {
+                task_id: task_id.into(),
+                output: Some("stale output".into()),
+            },
+            TaskStatus::Completed,
+            None,
+            7,
+            "boot-old".into(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!settled);
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Running);
+        assert_eq!(snapshot.task.owner_pid, 42);
+        assert_eq!(snapshot.task.owner_boot_id, "boot-new");
+        assert!(snapshot.output.is_none());
+        assert!(snapshot.error.is_none());
     }
 
     #[tokio::test]
