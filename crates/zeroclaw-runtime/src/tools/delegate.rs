@@ -38,12 +38,17 @@ fn invalid_semantic_completion_error(agent_name: &str) -> String {
 }
 
 fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
-    if crate::agent::turn::outcome::is_semantic_empty_terminal_completion(error) {
-        return invalid_semantic_completion_error(agent_name);
+    if error
+        .chain()
+        .any(|source| source.is::<zeroclaw_providers::ReliableProviderTerminalFailure>())
+    {
+        // Reliable's aggregate is the durable retry diagnostic for delegated
+        // task records; other typed terminal failures use the delivery projection.
+        return format!("Agent '{agent_name}' failed: {error}");
     }
 
-    // Delegated task records retain the redacted, ordered retry diagnostic.
-    format!("Agent '{agent_name}' failed: {error}")
+    crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
+        .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -5354,6 +5359,24 @@ mod tests {
             Some(
                 "Agent 'delegate' failed: All model providers/models failed after 3 failure event(s). Events: retry 1/3"
             )
+        );
+    }
+
+    #[test]
+    fn delegate_failure_projects_provider_tools_terminal_category() {
+        let error = anyhow::Error::new(
+            crate::agent::turn::outcome::StreamPreExecutedToolsWithoutFinalResponse { usage: None },
+        );
+        let expected = crate::agent::turn::outcome::terminal_completion_error_message(
+            &error,
+            Some("delegate"),
+        )
+        .expect("provider-tools terminal category must project");
+
+        assert_eq!(delegate_failure_error("delegate", &error), expected);
+        assert_ne!(
+            expected,
+            "Agent 'delegate' failed: provider stream ended after provider-executed tools without a final response"
         );
     }
 

@@ -115,82 +115,97 @@ pub fn is_semantic_empty_terminal_completion(err: &anyhow::Error) -> bool {
 
 /// Render the canonical user-facing failure at a delivery boundary.
 pub fn semantic_empty_terminal_completion_message(agent_name: Option<&str>) -> String {
+    semantic_empty_terminal_completion_message_with_renderer(agent_name, render_cli_string)
+}
+
+type CliStringRenderer = fn(&str, &[(&str, &str)]) -> String;
+
+fn render_cli_string(key: &str, args: &[(&str, &str)]) -> String {
+    if args.is_empty() {
+        crate::i18n::get_required_cli_string(key)
+    } else {
+        crate::i18n::get_required_cli_string_with_args(key, args)
+    }
+}
+
+fn semantic_empty_terminal_completion_message_with_renderer(
+    agent_name: Option<&str>,
+    render: CliStringRenderer,
+) -> String {
     match agent_name {
-        Some(agent_name) => crate::i18n::get_required_cli_string_with_args(
+        Some(agent_name) => render(
             "cli-delegate-error-invalid-semantic-completion",
             &[("agent_name", agent_name)],
         ),
-        None => crate::i18n::get_required_cli_string("cli-agent-error-invalid-semantic-completion"),
+        None => render("cli-agent-error-invalid-semantic-completion", &[]),
     }
 }
 
-fn pre_executed_tools_without_final_response_message(agent_name: Option<&str>) -> String {
+fn pre_executed_tools_without_final_response_message(
+    agent_name: Option<&str>,
+    render: CliStringRenderer,
+) -> String {
     match agent_name {
-        Some(agent_name) => crate::i18n::get_required_cli_string_with_args(
+        Some(agent_name) => render(
             "cli-delegate-error-incomplete-after-provider-tools",
             &[("agent_name", agent_name)],
         ),
-        None => {
-            crate::i18n::get_required_cli_string("cli-agent-error-incomplete-after-provider-tools")
-        }
+        None => render("cli-agent-error-incomplete-after-provider-tools", &[]),
     }
 }
 
-fn reliable_provider_terminal_failure_message(
+fn reliable_provider_terminal_failure_message_with_renderer(
     failure: &zeroclaw_providers::ReliableProviderTerminalFailure,
+    render: CliStringRenderer,
 ) -> String {
     use zeroclaw_providers::ReliableProviderTerminalFailureKind;
 
     match failure.kind() {
         ReliableProviderTerminalFailureKind::ContextWindow => {
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-context-window")
+            render("cli-agent-error-provider-context-window", &[])
         }
         ReliableProviderTerminalFailureKind::CredentialsMissing => match failure.provider() {
-            Some(provider) => crate::i18n::get_required_cli_string_with_args(
+            Some(provider) => render(
                 "cli-agent-error-provider-credentials-missing-named",
                 &[("provider", provider)],
             ),
-            None => {
-                crate::i18n::get_required_cli_string("cli-agent-error-provider-credentials-missing")
-            }
+            None => render("cli-agent-error-provider-credentials-missing", &[]),
         },
         ReliableProviderTerminalFailureKind::Authentication => match failure.provider() {
-            Some(provider) => crate::i18n::get_required_cli_string_with_args(
+            Some(provider) => render(
                 "cli-agent-error-provider-authentication-named",
                 &[("provider", provider)],
             ),
-            None => crate::i18n::get_required_cli_string("cli-agent-error-provider-authentication"),
+            None => render("cli-agent-error-provider-authentication", &[]),
         },
         ReliableProviderTerminalFailureKind::RateLimited => {
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-rate-limited")
+            render("cli-agent-error-provider-rate-limited", &[])
         }
         ReliableProviderTerminalFailureKind::ProviderServer => {
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-server")
+            render("cli-agent-error-provider-server", &[])
         }
         ReliableProviderTerminalFailureKind::ModelNotFound => {
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-model-not-found")
+            render("cli-agent-error-provider-model-not-found", &[])
         }
         ReliableProviderTerminalFailureKind::ClientRequest => {
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-client-request")
+            render("cli-agent-error-provider-client-request", &[])
         }
         ReliableProviderTerminalFailureKind::Connection => match failure.endpoint() {
-            Some(endpoint) if failure.endpoint_is_local() => {
-                crate::i18n::get_required_cli_string_with_args(
-                    "cli-agent-error-provider-connection-local",
-                    &[("endpoint", endpoint)],
-                )
-            }
-            Some(endpoint) => crate::i18n::get_required_cli_string_with_args(
+            Some(endpoint) if failure.endpoint_is_local() => render(
+                "cli-agent-error-provider-connection-local",
+                &[("endpoint", endpoint)],
+            ),
+            Some(endpoint) => render(
                 "cli-agent-error-provider-connection-remote",
                 &[("endpoint", endpoint)],
             ),
-            None => crate::i18n::get_required_cli_string("cli-agent-error-provider-connection"),
+            None => render("cli-agent-error-provider-connection", &[]),
         },
         ReliableProviderTerminalFailureKind::Timeout => {
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-timeout")
+            render("cli-agent-error-provider-timeout", &[])
         }
         ReliableProviderTerminalFailureKind::Other => {
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-generic")
+            render("cli-agent-error-provider-generic", &[])
         }
     }
 }
@@ -200,17 +215,41 @@ pub fn terminal_completion_error_message(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
+    terminal_completion_error_message_with_renderer(err, agent_name, render_cli_string)
+}
+
+fn terminal_completion_error_message_with_renderer(
+    err: &anyhow::Error,
+    agent_name: Option<&str>,
+    render: CliStringRenderer,
+) -> Option<String> {
     if let Some(failure) = err.chain().find_map(|source| {
         source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
     }) {
-        return Some(reliable_provider_terminal_failure_message(failure));
+        return Some(reliable_provider_terminal_failure_message_with_renderer(
+            failure, render,
+        ));
     }
     if is_semantic_empty_terminal_completion(err) {
-        return Some(semantic_empty_terminal_completion_message(agent_name));
+        return Some(semantic_empty_terminal_completion_message_with_renderer(
+            agent_name, render,
+        ));
     }
     err.chain()
         .any(|source| source.is::<StreamPreExecutedToolsWithoutFinalResponse>())
-        .then(|| pre_executed_tools_without_final_response_message(agent_name))
+        .then(|| pre_executed_tools_without_final_response_message(agent_name, render))
+}
+
+#[cfg(test)]
+fn terminal_completion_error_message_in_english(
+    err: &anyhow::Error,
+    agent_name: Option<&str>,
+) -> Option<String> {
+    terminal_completion_error_message_with_renderer(
+        err,
+        agent_name,
+        crate::i18n::get_english_cli_string_with_args,
+    )
 }
 
 #[derive(Debug)]
@@ -347,7 +386,7 @@ mod tests {
             anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
         assert!(is_semantic_empty_terminal_completion(&error));
         assert_eq!(
-            terminal_completion_error_message(&error, None),
+            terminal_completion_error_message_in_english(&error, None),
             Some("The model provider returned an invalid semantic completion.".to_string())
         );
     }
@@ -368,7 +407,7 @@ mod tests {
 
         assert_eq!(error.to_string(), diagnostic);
         assert_eq!(
-            terminal_completion_error_message(&error, None),
+            terminal_completion_error_message_in_english(&error, None),
             Some(
                 "The local model server at http://127.0.0.1:11434/v1/chat/completions is \
                  unavailable. Start it or update the endpoint."
@@ -376,7 +415,7 @@ mod tests {
             )
         );
         assert!(
-            !terminal_completion_error_message(&error, None)
+            !terminal_completion_error_message_in_english(&error, None)
                 .expect("typed provider failure must project")
                 .contains("All model providers/models failed")
         );
@@ -395,7 +434,7 @@ mod tests {
         ));
 
         assert_eq!(
-            terminal_completion_error_message(&error, None),
+            terminal_completion_error_message_in_english(&error, None),
             Some(
                 "Cannot reach the model provider at https://api.example.com/v1/chat/completions. \
                  Check network access or choose another provider."
@@ -417,7 +456,7 @@ mod tests {
         ));
 
         assert_eq!(
-            terminal_completion_error_message(&error, None),
+            terminal_completion_error_message_in_english(&error, None),
             Some(
                 "The request is too large for the selected model. Reduce the conversation or choose \
                  a model with a larger context window."
@@ -483,7 +522,7 @@ mod tests {
             ));
 
             assert_eq!(
-                terminal_completion_error_message(&error, None),
+                terminal_completion_error_message_in_english(&error, None),
                 Some(crate::i18n::get_english_cli_string_with_args(key, &[])),
                 "{kind:?} must use its dedicated Fluent message"
             );
@@ -514,14 +553,14 @@ mod tests {
         );
 
         assert_eq!(
-            terminal_completion_error_message(&missing, None),
+            terminal_completion_error_message_in_english(&missing, None),
             Some(
                 "The model provider custom.truefoundry has no configured credentials. Add its API key or choose another provider."
                     .to_string()
             )
         );
         assert_eq!(
-            terminal_completion_error_message(&rejected, None),
+            terminal_completion_error_message_in_english(&rejected, None),
             Some(
                 "The model provider custom.truefoundry rejected its credentials. Check the configured credentials."
                     .to_string()

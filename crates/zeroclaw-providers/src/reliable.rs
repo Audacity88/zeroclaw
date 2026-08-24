@@ -966,6 +966,21 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
 }
 
 fn http_status_from_error_text(text: &str) -> Option<u16> {
+    if let Some(after_prefix) = text
+        .strip_prefix("modelprovider error:")
+        .map(str::trim_start)
+        && let Some(code) = after_prefix
+            .get(..3)
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|code| (400..600).contains(code))
+        && after_prefix
+            .as_bytes()
+            .get(3)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return Some(code);
+    }
+
     for marker in ["api error (", "http "] {
         let mut remainder = text;
         while let Some(start) = remainder.find(marker) {
@@ -1993,6 +2008,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
+        let mut final_cause_provider = None;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -2133,7 +2149,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
-                                    self.configured_provider_identity(),
+                                    Some(entry.candidate_name()),
                                     failures,
                                     None,
                                     false,
@@ -2189,12 +2205,14 @@ impl ModelProvider for ReliableModelProvider {
                                     "Non-retryable error, moving on"
                                 );
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, current_model, &e);
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -2224,6 +2242,7 @@ impl ModelProvider for ReliableModelProvider {
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                             final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -2248,7 +2267,9 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
-            self.configured_provider_identity(),
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
             failures,
             None,
             final_cause_is_semantic_empty,
@@ -2266,6 +2287,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
+        let mut final_cause_provider = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -2387,6 +2409,7 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 final_cause_is_semantic_empty = true;
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
                             final_cause_is_semantic_empty = false;
@@ -2420,7 +2443,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
-                                    self.configured_provider_identity(),
+                                    Some(entry.candidate_name()),
                                     failures,
                                     None,
                                     false,
@@ -2474,12 +2497,14 @@ impl ModelProvider for ReliableModelProvider {
                                     "Non-retryable error, moving on"
                                 );
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, current_model, &e);
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -2509,6 +2534,7 @@ impl ModelProvider for ReliableModelProvider {
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                             final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -2529,7 +2555,9 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
-            self.configured_provider_identity(),
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
             failures,
             None,
             final_cause_is_semantic_empty,
@@ -2632,10 +2660,12 @@ impl ModelProvider for ReliableModelProvider {
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
+        let mut final_cause_provider = None;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 if is_stream_recovery_skip(model_slot, entry_index) {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 }
                 let provider_name = entry.display_name.as_str();
@@ -2802,7 +2832,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
-                                    self.configured_provider_identity(),
+                                    Some(entry.candidate_name()),
                                     failures,
                                     rejected_attempt_usage,
                                     false,
@@ -2856,12 +2886,14 @@ impl ModelProvider for ReliableModelProvider {
                                     "Non-retryable error, moving on"
                                 );
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, current_model, &e);
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -2891,6 +2923,7 @@ impl ModelProvider for ReliableModelProvider {
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                             final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -2911,7 +2944,9 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
-            self.configured_provider_identity(),
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
             failures,
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
@@ -2932,10 +2967,12 @@ impl ModelProvider for ReliableModelProvider {
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
+        let mut final_cause_provider = None;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 if is_stream_recovery_skip(model_slot, entry_index) {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 }
                 let provider_name = entry.display_name.as_str();
@@ -3107,7 +3144,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
-                                    self.configured_provider_identity(),
+                                    Some(entry.candidate_name()),
                                     failures,
                                     rejected_attempt_usage,
                                     false,
@@ -3161,12 +3198,14 @@ impl ModelProvider for ReliableModelProvider {
                                     "Non-retryable error, moving on"
                                 );
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, current_model, &e);
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -3196,6 +3235,7 @@ impl ModelProvider for ReliableModelProvider {
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                             final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -3220,7 +3260,9 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
-            self.configured_provider_identity(),
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
             failures,
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
@@ -5868,6 +5910,36 @@ mod tests {
                 "quota",
             ),
             (
+                "ModelProvider error: 401 Unauthorized: invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "ModelProvider error: 403 Forbidden: invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "ModelProvider error: 404 Not Found: unknown model",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "ModelProvider error: 429 Too Many Requests: retry later",
+                "rate_limited",
+                "http_response",
+                "quota",
+            ),
+            (
+                "ModelProvider error: 503 Service Unavailable: overload",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
                 "provider returned an opaque transport error",
                 "provider_error",
                 "unknown",
@@ -7300,6 +7372,50 @@ mod tests {
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_provider_failure_names_the_final_fallback_candidate() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "401 Unauthorized",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "401 Unauthorized",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let error = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("all configured candidates should fail");
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("terminal provider failure must retain its typed cause");
+
+        assert_eq!(failure.provider(), Some("fallback"));
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::Authentication
+        );
     }
 
     // ── Context window truncation tests ─────────────────────────

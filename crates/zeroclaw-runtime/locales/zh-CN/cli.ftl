@@ -1017,3 +1017,7 @@ cli-agent-error-provider-connection-remote = 无法连接到 {$endpoint} 上的�
 cli-agent-error-provider-connection = 无法连接到所选模型提供商。请检查网络访问或选择其他提供商。
 cli-agent-error-provider-timeout = 所选模型提供商超时。请重试或选择其他提供商。
 cli-agent-error-provider-generic = 所选模型提供商失败。请检查提供商配置或选择其他提供商。
+cli-delegate-error-invalid-semantic-completion = 代理 '{$agent_name}' 失败：模型提供商返回了无效的语义完成结果。
+cli-agent-error-invalid-semantic-completion = 模型提供商返回了无效的语义完成结果。
+cli-delegate-error-incomplete-after-provider-tools = 代理 '{$agent_name}' 失败：模型提供商执行工具后未返回最终响应便结束了。
+cli-agent-error-incomplete-after-provider-tools = 模型提供商执行工具后未返回最终响应便结束了。

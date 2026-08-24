@@ -1509,6 +1509,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_completion_messages_are_owned_by_each_locale() {
+        for (source, locale) in committed_locale_sources() {
+            for key in [
+                "cli-agent-error-invalid-semantic-completion",
+                "cli-agent-error-incomplete-after-provider-tools",
+            ] {
+                let formatted = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(!formatted.is_empty(), "{locale}: {key} should not be empty");
+            }
+
+            for key in [
+                "cli-delegate-error-invalid-semantic-completion",
+                "cli-delegate-error-incomplete-after-provider-tools",
+            ] {
+                let formatted =
+                    format_ftl_message(source, locale, key, &[("agent_name", "delegate")])
+                        .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("delegate"),
+                    "{locale}: {key} must include the agent name: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$agent_name}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
     /// Argless `channel-approval-*` keys must be defined and non-empty in
     /// every committed locale.
     const CHANNEL_APPROVAL_ARGLESS_KEYS: &[&str] = &[

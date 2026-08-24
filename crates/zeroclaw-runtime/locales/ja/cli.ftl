@@ -1018,3 +1018,7 @@ cli-agent-error-provider-connection-remote = {$endpoint} のモデルプロバ�
 cli-agent-error-provider-connection = 選択したモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
 cli-agent-error-provider-timeout = 選択したモデルプロバイダーがタイムアウトしました。再試行するか、別のプロバイダーを選択してください。
 cli-agent-error-provider-generic = 選択したモデルプロバイダーで失敗しました。プロバイダー設定を確認するか、別のプロバイダーを選択してください。
+cli-delegate-error-invalid-semantic-completion = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-agent-error-invalid-semantic-completion = モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-delegate-error-incomplete-after-provider-tools = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
+cli-agent-error-incomplete-after-provider-tools = モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。

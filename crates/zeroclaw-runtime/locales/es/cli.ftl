@@ -1018,3 +1018,7 @@ cli-agent-error-provider-connection-remote = No se puede alcanzar el proveedor d
 cli-agent-error-provider-connection = No se puede alcanzar el proveedor de modelo seleccionado. Revisa el acceso de red o elige otro proveedor.
 cli-agent-error-provider-timeout = El proveedor de modelo seleccionado agotó el tiempo de espera. Inténtalo de nuevo o elige otro proveedor.
 cli-agent-error-provider-generic = El proveedor de modelo seleccionado falló. Revisa la configuración del proveedor o elige otro proveedor.
+cli-delegate-error-invalid-semantic-completion = El agente '{$agent_name}' falló: el proveedor de modelo devolvió una finalización semántica no válida.
+cli-agent-error-invalid-semantic-completion = El proveedor de modelo devolvió una finalización semántica no válida.
+cli-delegate-error-incomplete-after-provider-tools = El agente '{$agent_name}' falló: el proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.
+cli-agent-error-incomplete-after-provider-tools = El proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.
