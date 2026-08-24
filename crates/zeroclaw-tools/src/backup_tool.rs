@@ -408,7 +408,7 @@ impl Tool for BackupTool {
     }
 
     fn description(&self) -> &str {
-        "Create, list, verify, and restore workspace backups"
+        "Create, list, verify, and restore shared data directory backups"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

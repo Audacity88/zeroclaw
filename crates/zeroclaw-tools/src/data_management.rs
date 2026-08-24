@@ -129,7 +129,7 @@ impl Tool for DataManagementTool {
     }
 
     fn description(&self) -> &str {
-        "Workspace retention preview and storage statistics"
+        "Shared data directory retention preview and storage statistics"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

@@ -9,7 +9,7 @@
 #
 # Literal { and } in values must be escaped as {"{"}  and  {"}"} respectively.
 
-tool-backup = Create, list, verify, and restore workspace backups
+tool-backup = Create, list, verify, and restore shared data directory backups
 
 tool-browser = Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions.
 
@@ -60,7 +60,7 @@ tool-cron-runs = List recent run history for a cron job
 
 tool-cron-update = Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)
 
-tool-data-management = Workspace retention preview and storage statistics
+tool-data-management = Shared data directory retention preview and storage statistics
 
 tool-delegate = Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop.
 
@@ -106,7 +106,7 @@ tool-filesystem-boundary-error-contained = Path must be relative and contained: 
 tool-filesystem-boundary-error-not-directory = Path component is not a directory: '{ $path }'
 tool-filesystem-boundary-error-not-regular = Refusing to open a non-regular file: '{ $path }'
 tool-data-management-error-purge-disabled = Confirmed purge is unavailable; use dry_run to preview eligible files
-tool-data-management-error-read-blocked = Workspace path is not readable under the security policy: '{ $path }'
+tool-data-management-error-read-blocked = Shared data path is not readable under the security policy: '{ $path }'
 tool-backup-error-max-keep = Backup retention max_keep must be at least 1
 tool-backup-error-action-blocked = Backup mutation is blocked by the security policy
 tool-backup-error-source-overlap = Backup source cannot contain the backup output directory: '{ $path }'
@@ -114,13 +114,13 @@ tool-backup-error-rotation-platform = Backup rotation is unavailable on this pla
 tool-backup-error-not-found = Backup not found: '{ $name }'
 tool-backup-error-integrity = Integrity check failed
 tool-backup-error-non-utf8 = Backup contains a non-UTF-8 entry name
-tool-backup-error-contained = Backup path must stay within the workspace: '{ $path }'
+tool-backup-error-contained = Backup path must stay within the shared data directory: '{ $path }'
 tool-backup-error-invalid-name = Invalid backup name: '{ $name }'
 tool-backup-error-symlink = Refusing to traverse a symlink in backup data: '{ $path }'
 tool-backup-error-not-directory = Backup path is not a directory: '{ $path }'
 tool-backup-error-is-directory = Backup file destination is a directory: '{ $path }'
 tool-backup-error-special-file = Refusing to traverse a special file in backup data: '{ $path }'
-tool-backup-error-read-blocked = Workspace path is not readable under the security policy: '{ $path }'
+tool-backup-error-read-blocked = Shared data path is not readable under the security policy: '{ $path }'
 tool-backup-error-write-blocked = Backup destination is not writable under the security policy: '{ $path }'
 
 tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
