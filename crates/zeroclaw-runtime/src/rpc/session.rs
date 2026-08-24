@@ -479,16 +479,15 @@ impl SessionStore {
     }
 
     pub fn cancel_session(&self, id: &str) -> bool {
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, token)) = tokens.get(id) else {
+            return false;
+        };
+        // Keep lookup, attribution, and firing linearized with token
+        // replacement so this call cannot acknowledge a stale generation.
         self.record_cancel_cause(id, CancelCause::ClientRpc);
-        self.cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(id)
-            .map(|(_, t)| {
-                t.cancel();
-                true
-            })
-            .unwrap_or(false)
+        token.cancel();
+        true
     }
 
     /// Returns true if a cancel token is registered — i.e. a turn is in flight.
@@ -518,7 +517,8 @@ impl SessionStore {
         self.cancel_causes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), cause);
+            .entry(id.to_string())
+            .or_insert(cause);
     }
 
     /// Drain the recorded cancel cause for a session. Returns `None` only
@@ -946,6 +946,32 @@ mod tests {
         assert!(!store.cancel_session("s1"));
     }
 
+    #[test]
+    fn cancellation_cause_is_first_writer_wins() {
+        let store = make_store(4);
+        store.record_cancel_cause("s1", CancelCause::AdminKill);
+        store.record_cancel_cause("s1", CancelCause::ClientRpc);
+
+        assert_eq!(
+            store.take_cancel_cause("s1"),
+            Some(CancelCause::AdminKill),
+            "connection teardown must preserve the cause that fired first"
+        );
+    }
+
+    #[test]
+    fn cancel_without_active_turn_does_not_create_or_overwrite_cause() {
+        let store = make_store(4);
+        store.record_cancel_cause("s1", CancelCause::SessionRemoved);
+
+        assert!(!store.cancel_session("s1"));
+        assert_eq!(
+            store.take_cancel_cause("s1"),
+            Some(CancelCause::SessionRemoved),
+            "a late session/cancel must not replace the terminal cause"
+        );
+    }
+
     #[tokio::test]
     async fn reregister_force_cancels_prior_turn() {
         let store = make_store(4);
@@ -1107,6 +1133,28 @@ mod tests {
             store.take_cancel_cause("s"),
             Some(CancelCause::AdminKill),
             "kill_session must preserve AdminKill cause for verdict-site attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_session_preserves_earlier_connection_cause() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        store.register_cancel_token("s", token);
+        store.record_cancel_cause("s", CancelCause::ClientRpc);
+
+        store.kill_session("s").await;
+        assert_eq!(
+            store.take_cancel_cause("s"),
+            Some(CancelCause::ClientRpc),
+            "admin kill must not overwrite an earlier connection cancellation"
         );
     }
 }

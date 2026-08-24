@@ -492,6 +492,8 @@ type TestChannelMapFn = Arc<
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
     rpc: Arc<RpcOutbound>,
+    prompt_tasks: tokio::task::JoinSet<()>,
+    connection_cancel: tokio_util::sync::CancellationToken,
     authenticated: bool,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
@@ -505,9 +507,25 @@ pub struct RpcDispatcher {
 
 impl RpcDispatcher {
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
+        Self::new_with_cancel(
+            ctx,
+            writer_tx,
+            peer_label,
+            tokio_util::sync::CancellationToken::new(),
+        )
+    }
+
+    pub(crate) fn new_with_cancel(
+        ctx: Arc<RpcContext>,
+        writer_tx: mpsc::Sender<String>,
+        peer_label: String,
+        connection_cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
         Self {
             ctx,
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
+            prompt_tasks: tokio::task::JoinSet::new(),
+            connection_cancel,
             authenticated: false,
             tui_id: None,
             peer_label,
@@ -586,6 +604,8 @@ impl RpcDispatcher {
         Self {
             ctx: Arc::clone(&self.ctx),
             rpc: Arc::clone(&self.rpc),
+            prompt_tasks: tokio::task::JoinSet::new(),
+            connection_cancel: self.connection_cancel.clone(),
             authenticated: true,
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
@@ -599,7 +619,7 @@ impl RpcDispatcher {
         if let Some(event) = event
             && let Some(notification) = notification_for_turn_event(session_id, &event, None)
         {
-            let _ = self.rpc.send_raw(notification).await;
+            let _ = self.send_raw_for_connection(notification).await;
         }
     }
 
@@ -704,6 +724,18 @@ impl RpcDispatcher {
         false
     }
 
+    fn log_prompt_task_failure(result: Result<(), tokio::task::JoinError>) {
+        if let Err(error) = result {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("RPC session/prompt task failed: {error}")
+            );
+        }
+    }
+
     /// Read frames from transport, dispatch, repeat.
     pub async fn run(&mut self, transport: &mut (dyn RpcTransport + Send)) {
         while let Some(line) = transport.next_frame().await {
@@ -712,6 +744,26 @@ impl RpcDispatcher {
                 continue;
             }
             self.process_line(trimmed).await;
+            while let Some(result) = self.prompt_tasks.try_join_next() {
+                Self::log_prompt_task_failure(result);
+            }
+        }
+    }
+
+    /// Stop every turn owned by this connection and wait until its prompt
+    /// tasks have released the shared RPC context and channel handles.
+    pub async fn shutdown(&mut self) {
+        self.connection_cancel.cancel();
+        while let Some(result) = self.prompt_tasks.join_next().await {
+            Self::log_prompt_task_failure(result);
+        }
+    }
+
+    async fn send_raw_for_connection(&self, json: String) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.connection_cancel.cancelled() => false,
+            sent = self.rpc.send_raw(json) => sent,
         }
     }
 
@@ -831,7 +883,7 @@ impl RpcDispatcher {
                 let id_clone = req_id.clone();
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
-                zeroclaw_spawn::spawn!(async move {
+                self.prompt_tasks.spawn(async move {
                     let result = handle.handle_session_prompt(&params_clone).await;
                     if !is_notif {
                         match result {
@@ -1911,6 +1963,7 @@ impl RpcDispatcher {
         // the latest TodoWrite plan (store-then-emit) before the plan
         // notification goes out. See `persist_plan_if_any`.
         let sessions_for_plan = self.ctx.sessions.clone();
+        let connection_cancel = self.connection_cancel.clone();
         let acp_token_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             self.ctx.acp_session_store.clone()
         } else {
@@ -1932,10 +1985,10 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
-        let outcome = execute_turn(
+        let turn = execute_turn(
             agent,
             prompt.clone(),
-            cancel,
+            cancel.clone(),
             TurnAttribution {
                 session_key: Some(sid.to_string()),
                 agent_alias,
@@ -1946,6 +1999,7 @@ impl RpcDispatcher {
             cost_context,
             move |event| {
                 let rpc = rpc.clone();
+                let connection_cancel = connection_cancel.clone();
                 let sid = sid_owned.clone();
                 let acp_token_store = acp_token_store.clone();
                 let sessions_for_plan = sessions_for_plan.clone();
@@ -1968,12 +2022,27 @@ impl RpcDispatcher {
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
                     if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
-                        let _ = rpc.send_raw(n).await;
+                        tokio::select! {
+                            biased;
+                            _ = connection_cancel.cancelled() => {}
+                            _ = rpc.send_raw(n) => {}
+                        }
                     }
                 }
             },
-        )
-        .await;
+        );
+        tokio::pin!(turn);
+        let outcome = tokio::select! {
+            biased;
+            outcome = &mut turn => outcome,
+            _ = self.connection_cancel.cancelled() => {
+                self.ctx
+                    .sessions
+                    .record_cancel_cause(sid, crate::rpc::session::CancelCause::ClientRpc);
+                cancel.cancel();
+                turn.await
+            }
+        };
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
@@ -2192,7 +2261,7 @@ impl RpcDispatcher {
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
             if let Ok(s) = serde_json::to_string(&n) {
-                let _ = self.rpc.send_raw(s).await;
+                let _ = self.send_raw_for_connection(s).await;
             }
         }
     }
@@ -4207,7 +4276,7 @@ impl RpcDispatcher {
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
-            let _ = self.rpc.send_raw(json).await;
+            let _ = self.send_raw_for_connection(json).await;
         }
     }
 
@@ -4223,7 +4292,7 @@ impl RpcDispatcher {
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
-            let _ = self.rpc.send_raw(json).await;
+            let _ = self.send_raw_for_connection(json).await;
         }
     }
 
@@ -10351,6 +10420,40 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
         dispatcher.authenticated = true;
         (dispatcher, rx)
+    }
+
+    #[tokio::test]
+    async fn connection_cancel_preempts_full_prompt_outbound_queue() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.send("occupy the only outbound slot".to_string())
+            .await
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let dispatcher =
+            RpcDispatcher::new_with_cancel(ctx, tx, "test-peer-full:pid=1".into(), cancel.clone());
+
+        let blocked = dispatcher.send_raw_for_connection("blocked".to_string());
+        tokio::pin!(blocked);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err(),
+            "the test must first prove the outbound queue is full"
+        );
+
+        cancel.cancel();
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+                .await
+                .expect("connection cancellation should preempt the blocked enqueue")
+        );
     }
 
     #[tokio::test]
