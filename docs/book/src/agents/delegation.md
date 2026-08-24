@@ -195,15 +195,15 @@ them as Fluent keys.
    Use action='check_result' with task_id='<uuid>' to retrieve the result.
    ```
    Lifecycle state is stored in `data/control_plane.db`. The workspace artifact at `<workspace>/delegate_results/<uuid>.json` contains task identity and output only; it is not a second status record.
-5. `action="check_result"` with an unknown task id: error is `No result found for task_id '<uuid>'`.
-6. `action="await_sessions"` with `task_ids: [<uuid>, ...]` waits for multiple background result files at once. The output is a JSON object with `status` (`complete` or `timeout`), `completed`, `pending`, `missing`, `failed`, and `results`. `timeout_ms` defaults to 30000 and is capped at 120000; on timeout the tool returns partial results and an error saying one or more tasks are still pending or missing. Duplicate task IDs are rejected.
-7. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. A recovered target keeps its requested-versus-served attribution and generic fallback warning inside its own block. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
-8. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
-9. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
-10. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
-11. Independent target whose risk profile has `always_ask` entries: error is `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".`
-12. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
-13. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
+6. `action="check_result"` with an unknown task id: error is `No result found for task_id '<uuid>'`.
+7. `action="await_sessions"` with `task_ids: [<uuid>, ...]` waits for multiple background result files at once. The output is a JSON object with `status` (`complete` or `timeout`), `completed`, `pending`, `missing`, `failed`, and `results`. `timeout_ms` defaults to 30000 and is capped at 120000; on timeout the tool returns partial results and an error saying one or more tasks are still pending or missing. Duplicate task IDs are rejected.
+8. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. A recovered target keeps its requested-versus-served attribution and generic fallback warning inside its own block. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
+9. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
+10. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
+11. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
+12. Independent target whose risk profile has `always_ask` entries: error is `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".`
+13. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
+14. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
 
 ### `delegate`: how to verify it actually fired
 
