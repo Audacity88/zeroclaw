@@ -1014,6 +1014,10 @@ fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorD
     }
 }
 
+fn http_status_is_authoritative(code: u16) -> bool {
+    matches!(code, 401 | 403 | 404 | 429) || (500..600).contains(&code)
+}
+
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
@@ -1027,7 +1031,9 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         .map(|status| status.as_u16());
     let text_status = http_status_from_error_text(&lower);
 
-    if let Some(status) = structured_status.or(text_status) {
+    let http_status = structured_status.or(text_status);
+
+    if let Some(status) = http_status.filter(|status| http_status_is_authoritative(*status)) {
         return http_status_diagnostic(status, endpoint);
     }
 
@@ -1065,6 +1071,10 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             hint: "wait, change key/quota, or switch provider",
             endpoint,
         };
+    }
+
+    if let Some(status) = http_status {
+        return http_status_diagnostic(status, endpoint);
     }
 
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
@@ -5810,6 +5820,12 @@ mod tests {
                 "request shape",
             ),
             (
+                "compatible API error (400 Bad Request): input exceeds the context window of this model",
+                "context_window",
+                "request_validation",
+                "larger-context model",
+            ),
+            (
                 "HTTP 503 Service Unavailable",
                 "provider_server",
                 "http_response",
@@ -5892,6 +5908,24 @@ mod tests {
             assert_eq!(diagnostic.kind, expected_kind, "{status}");
             assert_eq!(diagnostic.phase, "http_response", "{status}");
         }
+
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::BAD_REQUEST)
+                .body(reqwest::Body::default())
+                .expect("test response should build"),
+        );
+        let error = anyhow::Error::new(
+            response
+                .error_for_status()
+                .expect_err("error status should produce an error"),
+        )
+        .context("input exceeds the context window of this model");
+
+        let diagnostic = provider_error_diagnostic(&error);
+
+        assert_eq!(diagnostic.kind, "context_window");
+        assert_eq!(diagnostic.phase, "request_validation");
     }
 
     #[test]
