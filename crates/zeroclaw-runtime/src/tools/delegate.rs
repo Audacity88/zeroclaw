@@ -2964,7 +2964,10 @@ mod tests {
         ModelProviderConfig, ModelRouteConfig,
     };
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
-    use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
+    use zeroclaw_providers::{
+        ChatRequest, ChatResponse, ReliableProviderTerminalFailure,
+        ReliableProviderTerminalFailureKind, ToolCall,
+    };
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
 
@@ -5329,6 +5332,29 @@ mod tests {
         assert!(result.output.is_empty());
         let expected = invalid_semantic_completion_error("delegate");
         assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_retains_provider_terminal_diagnostic() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "custom",
+            "model",
+            Err(anyhow::Error::new(ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Connection,
+                None,
+                "All model providers/models failed after 3 failure event(s). Events: retry 1/3"
+                    .to_string(),
+            ))),
+        );
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Agent 'delegate' failed: All model providers/models failed after 3 failure event(s). Events: retry 1/3"
+            )
+        );
     }
 
     #[tokio::test]

@@ -663,6 +663,19 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| msg_lower.contains(hint))
 }
 
+fn is_missing_credential_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    [
+        "missing api key",
+        "api key not set",
+        "api key is required",
+        "missing access token",
+        "token not set",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+}
+
 pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
@@ -810,6 +823,7 @@ struct ProviderErrorDiagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReliableProviderTerminalFailureKind {
     ContextWindow,
+    CredentialsMissing,
     Authentication,
     RateLimited,
     ProviderServer,
@@ -824,6 +838,7 @@ impl ReliableProviderTerminalFailureKind {
     fn from_diagnostic_kind(kind: &str) -> Self {
         match kind {
             "context_window" => Self::ContextWindow,
+            "credentials_missing" => Self::CredentialsMissing,
             "auth" => Self::Authentication,
             "rate_limited" => Self::RateLimited,
             "provider_server" => Self::ProviderServer,
@@ -844,6 +859,7 @@ impl ReliableProviderTerminalFailureKind {
 #[derive(Debug)]
 pub struct ReliableProviderTerminalFailure {
     kind: ReliableProviderTerminalFailureKind,
+    provider: Option<String>,
     endpoint: Option<String>,
     diagnostic: String,
     terminal_cause: Option<anyhow::Error>,
@@ -857,6 +873,7 @@ impl ReliableProviderTerminalFailure {
     ) -> Self {
         Self {
             kind,
+            provider: None,
             endpoint,
             diagnostic,
             terminal_cause: None,
@@ -864,12 +881,16 @@ impl ReliableProviderTerminalFailure {
     }
 
     fn with_cause(
+        provider: Option<&str>,
         diagnostic: ProviderErrorDiagnostic,
         failure_aggregate: String,
         terminal_cause: anyhow::Error,
     ) -> Self {
         Self {
             kind: ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            provider: provider
+                .filter(|provider| !provider.is_empty())
+                .map(str::to_owned),
             endpoint: diagnostic.endpoint,
             diagnostic: failure_aggregate,
             terminal_cause: Some(terminal_cause),
@@ -878,6 +899,17 @@ impl ReliableProviderTerminalFailure {
 
     pub fn kind(&self) -> ReliableProviderTerminalFailureKind {
         self.kind
+    }
+
+    /// Attach the configured provider identity used for safe user-facing text.
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        let provider = provider.into();
+        self.provider = (!provider.is_empty()).then_some(provider);
+        self
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
     }
 
     pub fn endpoint(&self) -> Option<&str> {
@@ -983,6 +1015,15 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             kind: "context_window",
             phase: "request_validation",
             hint: "reduce context or use a larger-context model",
+            endpoint,
+        };
+    }
+
+    if is_missing_credential_error(err) {
+        return ProviderErrorDiagnostic {
+            kind: "credentials_missing",
+            phase: "configuration",
+            hint: "configure provider credentials",
             endpoint,
         };
     }
@@ -1457,6 +1498,7 @@ fn reliable_terminal_error(
 }
 
 fn reliable_terminal_error_with_cause(
+    provider: Option<&str>,
     failures: FailureEvents,
     rejected_attempt_usage: Option<TokenUsage>,
     final_cause_is_semantic_empty: bool,
@@ -1465,6 +1507,7 @@ fn reliable_terminal_error_with_cause(
     let rejected_attempt_usage = rejected_attempt_usage.or_else(accounted_rejected_attempt_usage);
     if !final_cause_is_semantic_empty && let Some(cause) = final_cause {
         let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::with_cause(
+            provider,
             provider_error_diagnostic(&cause),
             failure_aggregate(&failures),
             cause,
@@ -1480,11 +1523,14 @@ fn reliable_terminal_error_with_cause(
     }
     if !final_cause_is_semantic_empty && let Some(diagnostic) = stream_recovery_failure_diagnostic()
     {
-        let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::new(
-            ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
-            diagnostic.endpoint,
-            failure_aggregate(&failures),
-        ));
+        let terminal_failure = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+                diagnostic.endpoint,
+                failure_aggregate(&failures),
+            )
+            .with_provider(provider.unwrap_or_default()),
+        );
         if let Some(usage) = rejected_attempt_usage {
             return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
                 usage,
@@ -1723,6 +1769,13 @@ impl ReliableModelProvider {
         } else {
             base
         }
+    }
+
+    fn configured_provider_identity(&self) -> Option<&str> {
+        self.model_providers
+            .first()
+            .map(ReliableModelProviderEntry::candidate_name)
+            .filter(|provider| !provider.is_empty())
     }
 
     /// Default cooldown after a retryable 429 when Retry-After is absent.
@@ -2057,6 +2110,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
+                                    self.configured_provider_identity(),
                                     failures,
                                     None,
                                     false,
@@ -2171,6 +2225,7 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
+            self.configured_provider_identity(),
             failures,
             None,
             final_cause_is_semantic_empty,
@@ -2342,6 +2397,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
+                                    self.configured_provider_identity(),
                                     failures,
                                     None,
                                     false,
@@ -2450,6 +2506,7 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
+            self.configured_provider_identity(),
             failures,
             None,
             final_cause_is_semantic_empty,
@@ -2722,6 +2779,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
+                                    self.configured_provider_identity(),
                                     failures,
                                     rejected_attempt_usage,
                                     false,
@@ -2830,6 +2888,7 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
+            self.configured_provider_identity(),
             failures,
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
@@ -3025,6 +3084,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
+                                    self.configured_provider_identity(),
                                     failures,
                                     rejected_attempt_usage,
                                     false,
@@ -3137,6 +3197,7 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
+            self.configured_provider_identity(),
             failures,
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
@@ -5675,6 +5736,12 @@ mod tests {
                 "larger-context model",
             ),
             (
+                "missing api key for configured provider",
+                "credentials_missing",
+                "configuration",
+                "configure provider credentials",
+            ),
+            (
                 "401 Unauthorized: invalid api key",
                 "auth",
                 "http_response",
@@ -5757,6 +5824,7 @@ mod tests {
         let mut failures = FailureEvents::default();
         failures.push("event 1 (retry 1/1): retryable; provider detail".to_string());
         let error = reliable_terminal_error_with_cause(
+            Some("custom.truefoundry"),
             failures,
             None,
             false,
@@ -5775,6 +5843,7 @@ mod tests {
             failure.kind(),
             ReliableProviderTerminalFailureKind::Connection
         );
+        assert_eq!(failure.provider(), Some("custom.truefoundry"));
         assert_eq!(
             failure.endpoint(),
             Some("http://127.0.0.1:11434/v1/chat/completions")
@@ -5792,6 +5861,7 @@ mod tests {
         let mut failures = FailureEvents::default();
         failures.push("event 1 (retry 1/1): retryable; provider detail".to_string());
         let error = reliable_terminal_error_with_cause(
+            None,
             failures,
             Some(TokenUsage {
                 input_tokens: Some(10),

@@ -145,9 +145,22 @@ fn reliable_provider_terminal_failure_message(
         ReliableProviderTerminalFailureKind::ContextWindow => {
             crate::i18n::get_required_cli_string("cli-agent-error-provider-context-window")
         }
-        ReliableProviderTerminalFailureKind::Authentication => {
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-authentication")
-        }
+        ReliableProviderTerminalFailureKind::CredentialsMissing => match failure.provider() {
+            Some(provider) => crate::i18n::get_required_cli_string_with_args(
+                "cli-agent-error-provider-credentials-missing-named",
+                &[("provider", provider)],
+            ),
+            None => {
+                crate::i18n::get_required_cli_string("cli-agent-error-provider-credentials-missing")
+            }
+        },
+        ReliableProviderTerminalFailureKind::Authentication => match failure.provider() {
+            Some(provider) => crate::i18n::get_required_cli_string_with_args(
+                "cli-agent-error-provider-authentication-named",
+                &[("provider", provider)],
+            ),
+            None => crate::i18n::get_required_cli_string("cli-agent-error-provider-authentication"),
+        },
         ReliableProviderTerminalFailureKind::RateLimited => {
             crate::i18n::get_required_cli_string("cli-agent-error-provider-rate-limited")
         }
@@ -425,6 +438,10 @@ mod tests {
                 "cli-agent-error-provider-context-window",
             ),
             (
+                ReliableProviderTerminalFailureKind::CredentialsMissing,
+                "cli-agent-error-provider-credentials-missing",
+            ),
+            (
                 ReliableProviderTerminalFailureKind::Authentication,
                 "cli-agent-error-provider-authentication",
             ),
@@ -471,6 +488,45 @@ mod tests {
                 "{kind:?} must use its dedicated Fluent message"
             );
         }
+    }
+
+    #[test]
+    fn reliable_provider_credentials_messages_include_configured_provider() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let missing = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::CredentialsMissing,
+                None,
+                "full retry diagnostic".to_string(),
+            )
+            .with_provider("custom.truefoundry"),
+        );
+        let rejected = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Authentication,
+                None,
+                "full retry diagnostic".to_string(),
+            )
+            .with_provider("custom.truefoundry"),
+        );
+
+        assert_eq!(
+            terminal_completion_error_message(&missing, None),
+            Some(
+                "The model provider custom.truefoundry has no configured credentials. Add its API key or choose another provider."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            terminal_completion_error_message(&rejected, None),
+            Some(
+                "The model provider custom.truefoundry rejected its credentials. Check the configured credentials."
+                    .to_string()
+            )
+        );
     }
 
     #[test]
