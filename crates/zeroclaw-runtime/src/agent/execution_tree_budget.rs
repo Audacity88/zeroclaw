@@ -43,7 +43,7 @@ impl ExecutionTreeBudget {
     pub fn from_limit(limit: Option<usize>) -> Option<Self> {
         limit
             .filter(|&limit| limit > 0)
-            .map(|limit| Self::root(limit))
+            .map(Self::root)
     }
 
     #[must_use]
@@ -189,7 +189,7 @@ mod tests {
                 ExecutionTreeBudget::current().map(|budget| budget.role()),
                 Some(ExecutionTreeBudgetRole::Root)
             );
-            let detached = tokio::spawn(async { ExecutionTreeBudget::current() })
+            let detached = ::zeroclaw_spawn::spawn!(async { ExecutionTreeBudget::current() })
                 .await
                 .expect("detached budget probe should join");
             assert!(detached.is_none());
