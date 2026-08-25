@@ -126,7 +126,7 @@ jobs:
         with:
           fail-on-severity: high
           # The guarded Vite SPA does not use the advisory's unstable RSC APIs.
-          # Remove this exception when the remediation tracked by #9383 upgrades React Router.
+          # Remove this exception when React Router is upgraded past the affected release; #9383 records the original audit.
           allow-ghsas: GHSA-qwww-vcr4-c8h2
 
   lint:
