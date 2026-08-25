@@ -32,6 +32,8 @@ On launch:
 > `503 "no daemon supervisor — running as standalone gateway"`, so the new agent
 > won't go live until the process is restarted. The daemon hot-reloads instead.
 
+The desktop supervisor writes combined daemon stdout and stderr to `<config-dir>/logs/zeroclaw-desktop-daemon.log`, where `<config-dir>` follows `ZEROCLAW_CONFIG_DIR` and otherwise the default home-directory layout. The capture is capped at 8 MiB and retains the newest tail when the cap is crossed.
+
 ## Self-contained build (bundled kernel)
 
 The plain `cargo tauri build` produces an app that *finds* an installed
@@ -107,6 +109,7 @@ open /Applications/ZeroClaw.app
   normal dashboard, not the Quickstart.
 - Quit from the tray → relaunch → splash → dashboard again (tray icon persists
   in the menu bar).
+- Inspect `<config-dir>/logs/zeroclaw-desktop-daemon.log` after startup to verify combined stdout/stderr capture; the file stays at or below 8 MiB and keeps the newest tail during continuous output.
 
 ### Native command boundary
 

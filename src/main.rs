@@ -4471,6 +4471,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
             }
+            if zeroclaw_runtime::restart::desktop_restart_requested() {
+                std::process::exit(zeroclaw_runtime::restart::DESKTOP_RESTART_EXIT_CODE);
+            }
             // Bare-process auto-restart: the daemon has now torn down (the
             // gateway listener is released), so launch the upgraded binary as a
             // detached child before we exit. No-op unless an in-app upgrade
