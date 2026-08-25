@@ -3605,6 +3605,14 @@ mod tests {
     }
 
     async fn delegate_memory_fixture(model_uri: Option<String>) -> DelegateMemoryFixture {
+        delegate_memory_fixture_with_iteration_caps(model_uri, 5, 5).await
+    }
+
+    async fn delegate_memory_fixture_with_iteration_caps(
+        model_uri: Option<String>,
+        caller_max_tool_iterations: usize,
+        target_max_tool_iterations: usize,
+    ) -> DelegateMemoryFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
         let tmp = TempDir::new().unwrap();
@@ -3642,10 +3650,24 @@ mod tests {
             "agentic_test".to_string(),
             RuntimeProfileConfig {
                 agentic: true,
-                max_tool_iterations: 5,
+                max_tool_iterations: target_max_tool_iterations,
                 ..RuntimeProfileConfig::default()
             },
         );
+        root_config.runtime_profiles.insert(
+            "caller_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: caller_max_tool_iterations,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let caller_config = AliasedAgentConfig {
+            model_provider: "custom.local".into(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "caller_test".into(),
+            ..AliasedAgentConfig::default()
+        };
         let target_config = AliasedAgentConfig {
             model_provider: "custom.local".into(),
             risk_profile: "agentic_test".into(),
@@ -3654,7 +3676,7 @@ mod tests {
         };
         root_config
             .agents
-            .insert("caller".to_string(), target_config.clone());
+            .insert("caller".to_string(), caller_config);
         root_config
             .agents
             .insert("target".to_string(), target_config.clone());
@@ -4165,6 +4187,66 @@ mod tests {
 
         let resolved = tool.resolve_loop_runtime("target", &agentic_agent_config());
         assert_eq!(resolved.max_execution_tree_iterations, Some(9));
+    }
+
+    #[tokio::test]
+    async fn foreground_agentic_delegates_share_tree_budget_and_preserve_root_final_slot() {
+        use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
+
+        let server = start_final_chat_server(vec!["first child", "second child"]).await;
+        let fixture =
+            delegate_memory_fixture_with_iteration_caps(Some(server.uri.clone()), 1, 5).await;
+        let root_budget = ExecutionTreeBudget::root(3);
+        let first = fixture.tool.execute(json!({
+            "agent": "target",
+            "prompt": "first foreground child"
+        }));
+        let second = fixture.tool.execute(json!({
+            "agent": "target",
+            "prompt": "second foreground child"
+        }));
+
+        let (first_result, second_result) =
+            ExecutionTreeBudget::scope(root_budget.clone(), async { tokio::join!(first, second) })
+                .await;
+        let first_result = first_result.expect("first delegate should return a tool result");
+        let second_result = second_result.expect("second delegate should return a tool result");
+
+        assert!(
+            first_result.success,
+            "first delegate failed: {first_result:?}"
+        );
+        assert!(
+            second_result.success,
+            "second delegate failed: {second_result:?}"
+        );
+        assert_eq!(root_budget.remaining(), 1);
+
+        let exhausted = ExecutionTreeBudget::scope(
+            root_budget.clone(),
+            fixture.tool.execute(json!({
+                "agent": "target",
+                "prompt": "child after shared allowance is exhausted"
+            })),
+        )
+        .await
+        .expect("budget exhaustion should return a structured tool result");
+
+        assert!(!exhausted.success);
+        assert!(
+            exhausted
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("execution tree iteration budget exhausted")),
+            "delegate should preserve the specific exhaustion cause: {exhausted:?}"
+        );
+        assert!(!fixture.tool.cancellation_token.is_cancelled());
+        assert_eq!(root_budget.remaining(), 1);
+        assert_eq!(
+            root_budget.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        assert_eq!(root_budget.remaining(), 0);
     }
 
     #[test]
