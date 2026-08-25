@@ -288,10 +288,10 @@ fn terminate_supervisor_tree(child: &mut Child) -> std::io::Result<()> {
         }
     }
     let child_running = child_still_running(child);
-    if !child_running || forceful_termination_initiated {
-        if let Err(error) = child.wait() {
-            utility_errors.push(format!("failed to reap supervisor: {error}"));
-        }
+    if (!child_running || forceful_termination_initiated)
+        && let Err(error) = child.wait()
+    {
+        utility_errors.push(format!("failed to reap supervisor: {error}"));
     }
     if child_still_running(child) {
         utility_errors.push("supervisor remained running after cleanup".to_string());
