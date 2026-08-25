@@ -5438,7 +5438,7 @@ mod tests {
             "failed delegate must not emit output"
         );
         let error = result.error.as_deref().unwrap_or_default();
-        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
         assert!(!error.contains("[Empty response]"), "{error}");
     }
 
