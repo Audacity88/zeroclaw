@@ -627,12 +627,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    msg_lower.contains("model")
-        && (msg_lower.contains("not found")
-            || msg_lower.contains("unknown")
-            || msg_lower.contains("unsupported")
-            || msg_lower.contains("does not exist")
-            || msg_lower.contains("invalid"))
+    has_model_not_found_hint(&msg_lower)
 }
 
 /// Check if an error indicates an authentication/authorization failure.
@@ -1051,6 +1046,30 @@ fn http_status_is_authoritative(code: u16) -> bool {
     matches!(code, 401 | 403 | 404 | 429) || (500..600).contains(&code)
 }
 
+fn has_model_not_found_hint(message: &str) -> bool {
+    [
+        "model not found",
+        "unknown model",
+        "unsupported model",
+        "invalid model",
+    ]
+    .iter()
+    .any(|hint| message.contains(hint))
+        || message
+            .split_once("model ")
+            .is_some_and(|(_, model_detail)| {
+                [
+                    " not found",
+                    " does not exist",
+                    " is unsupported",
+                    " is not supported",
+                    " is invalid",
+                ]
+                .iter()
+                .any(|hint| model_detail.contains(hint))
+            })
+}
+
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
@@ -1178,13 +1197,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
-    if lower.contains("model")
-        && (lower.contains("not found")
-            || lower.contains("unknown")
-            || lower.contains("unsupported")
-            || lower.contains("does not exist")
-            || lower.contains("invalid"))
-    {
+    if has_model_not_found_hint(&lower) {
         return ProviderErrorDiagnostic {
             kind: "model_not_found",
             phase: "http_response",
@@ -5964,6 +5977,12 @@ mod tests {
                 "model id",
             ),
             (
+                "model_provider stream error: JSON parse error: invalid type: string \"503 Service Unavailable\", expected a sequence at line 1 column 36",
+                "provider_error",
+                "unknown",
+                "inspect provider error",
+            ),
+            (
                 "provider returned an opaque transport error",
                 "provider_error",
                 "unknown",
@@ -8064,6 +8083,36 @@ mod tests {
         // A regular 400 error (e.g. invalid API key) should still be non-retryable.
         let err = anyhow::Error::msg("400 Bad Request: invalid api key provided");
         assert!(is_non_retryable(&err));
+    }
+
+    #[test]
+    fn malformed_stream_parser_error_is_not_treated_as_a_model_failure() {
+        let err = anyhow::Error::msg(
+            "model_provider stream error: JSON parse error: invalid type: string \"503 Service Unavailable\", expected a sequence at line 1 column 36",
+        );
+
+        assert!(!is_non_retryable(&err));
+        assert_eq!(provider_error_diagnostic(&err).kind, "provider_error");
+    }
+
+    #[test]
+    fn model_first_failure_phrases_remain_non_retryable_and_classified() {
+        for message in [
+            "model \"missing\" not found",
+            "model \"legacy\" is unsupported",
+            "model \"legacy\" is not supported",
+            "model \"bad\" is invalid",
+            "model \"gone\" does not exist",
+        ] {
+            let err = anyhow::Error::msg(message);
+
+            assert!(is_non_retryable(&err), "{message}");
+            assert_eq!(
+                provider_error_diagnostic(&err).kind,
+                "model_not_found",
+                "{message}"
+            );
+        }
     }
 
     struct StreamingToolEventMock {
