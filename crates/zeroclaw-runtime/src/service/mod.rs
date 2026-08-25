@@ -3304,7 +3304,7 @@ mod bounded_service_log_tests {
     #[tokio::test]
     async fn desktop_capture_combines_both_child_streams() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("desktop-daemon.log");
+        let path = dir.path().join("logs/desktop-daemon.log");
         run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("streams")))
             .await
             .expect("capture child output");
@@ -3323,7 +3323,7 @@ mod bounded_service_log_tests {
     #[tokio::test]
     async fn desktop_capture_compacts_continuous_output_and_preserves_newest() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("desktop-daemon.log");
+        let path = dir.path().join("logs/desktop-daemon.log");
         run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("compact")))
             .await
             .expect("capture continuous child output");
@@ -3336,7 +3336,7 @@ mod bounded_service_log_tests {
     #[tokio::test]
     async fn desktop_capture_records_spawn_startup_failure() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("desktop-daemon.log");
+        let path = dir.path().join("logs/desktop-daemon.log");
         let missing_child = dir.path().join("missing-desktop-child");
         let error = run_with_desktop_capture(path.clone(), || {
             Ok(TokioCommand::new(missing_child.clone()))
@@ -3357,7 +3357,7 @@ mod bounded_service_log_tests {
     #[tokio::test]
     async fn desktop_capture_records_nonzero_child_exit() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("desktop-daemon.log");
+        let path = dir.path().join("logs/desktop-daemon.log");
         let mut generations = 0;
         let error = run_with_desktop_capture(path.clone(), || {
             generations += 1;
@@ -3377,7 +3377,7 @@ mod bounded_service_log_tests {
     #[tokio::test]
     async fn desktop_capture_restarts_once_for_dedicated_exit_code() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("desktop-daemon.log");
+        let path = dir.path().join("logs/desktop-daemon.log");
         let mut generations = 0;
         run_with_desktop_capture(path, || {
             generations += 1;
@@ -3398,7 +3398,7 @@ mod bounded_service_log_tests {
         .await
         .expect("desktop supervisor should finish after normal second generation");
         assert_eq!(generations, 2);
-        let log = fs::read_to_string(dir.path().join("desktop-daemon.log"))
+        let log = fs::read_to_string(dir.path().join("logs/desktop-daemon.log"))
             .expect("read two-generation desktop log");
         assert!(log.contains("desktop-generation-one:1"));
         assert!(log.contains("desktop-generation-two:1"));
@@ -3408,7 +3408,7 @@ mod bounded_service_log_tests {
     #[tokio::test]
     async fn desktop_capture_does_not_restart_for_unmarked_dedicated_exit_code() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("desktop-daemon.log");
+        let path = dir.path().join("logs/desktop-daemon.log");
         let mut generations = 0;
         let error = run_with_desktop_capture(path, || {
             generations += 1;
@@ -3428,7 +3428,7 @@ mod bounded_service_log_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("desktop-daemon.log");
+        let path = dir.path().join("logs/desktop-daemon.log");
         let executable = dir.path().join("desktop-child");
         let replacement = dir.path().join("desktop-child.next");
         fs::write(
