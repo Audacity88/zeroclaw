@@ -1,6 +1,9 @@
 pub mod skill_http;
 pub mod skill_tool;
 use anyhow::{Context, Result};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2021,59 +2024,174 @@ fn remove_git_metadata(skill_path: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
-    let src_meta = std::fs::symlink_metadata(src)
+    let source = open_source_dir_nofollow(src)?;
+    let dest_parent = open_parent_dir(dest)?;
+    let dest_name = dest
+        .file_name()
+        .context("Destination path must include a directory name")?;
+    dest_parent.create_dir(dest_name).with_context(|| {
+        format!(
+            "failed to create destination {}",
+            dest.display().to_string()
+        )
+    })?;
+    let destination = dest_parent
+        .open_dir_nofollow(dest_name)
+        .with_context(|| format!("failed to open destination {}", dest.display()))?;
+
+    copy_dir_contents(&source, &destination, src, dest, Path::new(""))
+}
+
+fn open_parent_dir(path: &Path) -> Result<Dir> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Dir::open_ambient_dir(parent, ambient_authority())
+        .with_context(|| format!("failed to open parent directory {}", parent.display()))
+}
+
+fn open_source_dir_nofollow(src: &Path) -> Result<Dir> {
+    let parent = open_parent_dir(src)?;
+    let name = src
+        .file_name()
+        .context("Skill source path must include a directory name")?;
+    let metadata = parent
+        .symlink_metadata(name)
         .with_context(|| format!("failed to read metadata for {}", src.display().to_string()))?;
-    if src_meta.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() {
         anyhow::bail!(
             "Refusing to copy symlinked skill source path: {}",
             src.display()
         );
     }
-    if !src_meta.is_dir() {
+    if !metadata.is_dir() {
         anyhow::bail!(
             "Skill source must be a directory: {}",
             src.display().to_string()
         );
     }
 
-    std::fs::create_dir_all(dest).with_context(|| {
+    parent
+        .open_dir_nofollow(name)
+        .with_context(|| format!("failed to open skill source {}", src.display()))
+}
+
+fn copy_dir_contents(
+    source: &Dir,
+    destination: &Dir,
+    source_path: &Path,
+    destination_path: &Path,
+    relative: &Path,
+) -> Result<()> {
+    for entry in source.entries().with_context(|| {
         format!(
-            "failed to create destination {}",
-            dest.display().to_string()
+            "failed to read skill source directory {}",
+            source_path.display()
         )
-    })?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&src_path).with_context(|| {
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read skill source directory {}",
+                source_path.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let source_entry_path = source_path.join(&name);
+        let destination_entry_path = destination_path.join(&name);
+        let entry_relative = relative.join(&name);
+        let metadata = entry.metadata().with_context(|| {
             format!(
                 "failed to read metadata for {}",
-                src_path.display().to_string()
+                source_entry_path.display().to_string()
             )
         })?;
 
         if metadata.file_type().is_symlink() {
             anyhow::bail!(
                 "Refusing to copy symlink within skill source: {}",
-                src_path.display()
+                source_entry_path.display()
             );
         }
 
         if metadata.is_dir() {
-            copy_dir_recursive_secure(&src_path, &dest_path)?;
-        } else if metadata.is_file() {
-            std::fs::copy(&src_path, &dest_path).with_context(|| {
+            entry_swap_seam(&entry_relative);
+            let child_source = source
+                .open_dir_nofollow(&name)
+                .with_context(|| format!("failed to open {}", source_entry_path.display()))?;
+            destination.create_dir(&name).with_context(|| {
                 format!(
-                    "failed to copy skill file from {} to {}",
-                    src_path.display().to_string(),
-                    dest_path.display()
+                    "failed to create destination {}",
+                    destination_entry_path.display()
                 )
             })?;
+            let child_destination = destination.open_dir_nofollow(&name).with_context(|| {
+                format!(
+                    "failed to open destination {}",
+                    destination_entry_path.display()
+                )
+            })?;
+            copy_dir_contents(
+                &child_source,
+                &child_destination,
+                &source_entry_path,
+                &destination_entry_path,
+                &entry_relative,
+            )?;
+        } else if metadata.is_file() {
+            entry_swap_seam(&entry_relative);
+            let mut reader = entry
+                .open_with(OpenOptions::new().read(true).follow(FollowSymlinks::No))
+                .with_context(|| format!("failed to open {}", source_entry_path.display()))?;
+            let opened_metadata = reader.metadata().with_context(|| {
+                format!(
+                    "failed to read metadata for {}",
+                    source_entry_path.display().to_string()
+                )
+            })?;
+            if !opened_metadata.is_file() {
+                anyhow::bail!(
+                    "opened skill source entry {} is not a regular file",
+                    source_entry_path.display()
+                );
+            }
+
+            let mut writer = destination
+                .open_with(&name, OpenOptions::new().write(true).create_new(true))
+                .with_context(|| {
+                    format!(
+                        "failed to create destination file {}",
+                        destination_entry_path.display()
+                    )
+                })?;
+            std::io::copy(&mut reader, &mut writer).with_context(|| {
+                format!(
+                    "failed to copy skill file from {} to {}",
+                    source_entry_path.display(),
+                    destination_entry_path.display()
+                )
+            })?;
+            writer
+                .set_permissions(opened_metadata.permissions())
+                .with_context(|| {
+                    format!(
+                        "failed to preserve permissions on {}",
+                        destination_entry_path.display()
+                    )
+                })?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(not(test))]
+#[inline]
+fn entry_swap_seam(_relative: &Path) {}
+
+#[cfg(test)]
+fn entry_swap_seam(relative: &Path) {
+    copy_tests::run_entry_swap_seam(relative);
 }
 
 pub fn install_local_skill_source(
@@ -2086,12 +2204,12 @@ pub fn install_local_skill_source(
         anyhow::bail!("Source path does not exist: {source}");
     }
 
-    let source_path = source_path
+    let canonical_source_path = source_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize source path {source}"))?;
-    let _ = enforce_skill_security_audit(&source_path, allow_scripts)?;
+    let _ = enforce_skill_security_audit(&canonical_source_path, allow_scripts)?;
 
-    let name = source_path
+    let name = canonical_source_path
         .file_name()
         .context("Source path must include a directory name")?;
     let dest = skills_path.join(name);
@@ -2102,7 +2220,7 @@ pub fn install_local_skill_source(
         );
     }
 
-    if let Err(err) = copy_dir_recursive_secure(&source_path, &dest) {
+    if let Err(err) = copy_dir_recursive_secure(&canonical_source_path, &dest) {
         let _ = std::fs::remove_dir_all(&dest);
         return Err(err);
     }
@@ -2113,6 +2231,169 @@ pub fn install_local_skill_source(
             let _ = std::fs::remove_dir_all(&dest);
             Err(err)
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    type Swap = Box<dyn Fn(&Path)>;
+
+    thread_local! {
+        static ENTRY_SWAP: RefCell<Option<Swap>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn run_entry_swap_seam(relative: &Path) {
+        ENTRY_SWAP.with(|swap| {
+            if let Some(swap) = swap.borrow().as_ref() {
+                swap(relative);
+            }
+        });
+    }
+
+    struct EntrySwapGuard;
+
+    impl EntrySwapGuard {
+        fn install(swap: impl Fn(&Path) + 'static) -> Self {
+            ENTRY_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    impl Drop for EntrySwapGuard {
+        fn drop(&mut self) {
+            ENTRY_SWAP.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn copies_nested_files_and_preserves_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        std::fs::create_dir_all(source.join("nested/deeper")).unwrap();
+        std::fs::write(source.join("nested/deeper/SKILL.md"), "skill").unwrap();
+        let script = source.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho ok\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        copy_dir_recursive_secure(&source, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("nested/deeper/SKILL.md")).unwrap(),
+            "skill"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(destination.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "mode {mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_a_static_nested_source_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let skills_path = root.path().join("skills");
+        let destination = skills_path.join("source");
+        let outside = root.path().join("outside.txt");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&skills_path).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Safe Skill\n").unwrap();
+        std::fs::write(&outside, "external secret").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("escape.txt")).unwrap();
+
+        let err = install_local_skill_source(source.to_str().unwrap(), &skills_path, false)
+            .expect_err("a static nested source symlink must reject the install");
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "external secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_a_file_swapped_to_an_external_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let skills_path = root.path().join("skills");
+        let destination = skills_path.join("source");
+        let entry = source.join("payload.txt");
+        let outside = root.path().join("outside.txt");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&skills_path).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Safe Skill\n").unwrap();
+        std::fs::write(&entry, "safe").unwrap();
+        std::fs::write(&outside, "external secret").unwrap();
+
+        let entry_for_swap = entry.clone();
+        let outside_for_swap = outside.clone();
+        let swapped = Rc::new(Cell::new(false));
+        let swapped_in_seam = Rc::clone(&swapped);
+        let result = {
+            let _swap = EntrySwapGuard::install(move |relative| {
+                if relative == Path::new("payload.txt") {
+                    std::fs::remove_file(&entry_for_swap).unwrap();
+                    std::os::unix::fs::symlink(&outside_for_swap, &entry_for_swap).unwrap();
+                    swapped_in_seam.set(true);
+                }
+            });
+            install_local_skill_source(source.to_str().unwrap(), &skills_path, false)
+        };
+
+        let err = result.expect_err("a swapped file symlink must fail the install");
+        assert!(swapped.get(), "the pre-copy audit must reach the copy seam");
+        assert!(err.to_string().contains("payload.txt"), "got: {err}");
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "external secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_directory_swapped_to_an_external_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        let entry = source.join("nested");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(entry.join("safe")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "external secret").unwrap();
+
+        let entry_for_swap = entry.clone();
+        let outside_for_swap = outside.clone();
+        let result = {
+            let _swap = EntrySwapGuard::install(move |relative| {
+                if relative == Path::new("nested") {
+                    std::fs::remove_dir_all(&entry_for_swap).unwrap();
+                    std::os::unix::fs::symlink(&outside_for_swap, &entry_for_swap).unwrap();
+                }
+            });
+            copy_dir_recursive_secure(&source, &destination)
+        };
+
+        let err = result.expect_err("a swapped directory symlink must fail the copy");
+        assert!(err.to_string().contains("nested"), "got: {err}");
+        assert!(!destination.join("nested").exists());
+        assert!(outside.join("secret.txt").is_file());
     }
 }
 
