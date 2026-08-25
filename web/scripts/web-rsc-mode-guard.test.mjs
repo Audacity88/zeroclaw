@@ -793,6 +793,26 @@ test("reachable dependency modules enforce the RSC-focused policy", async (t) =>
       /imports RSC\/server-capable module react-router-dom\/server/,
     ],
     [
+      `new Function(["return import('react-router-dom/server')"].join(""))();\nexport const page = true;\n`,
+      /unanalyzable evaluator argument/,
+    ],
+    [
+      `eval(getGeneratedSource());\nexport const page = true;\n`,
+      /unanalyzable evaluator argument/,
+    ],
+    [
+      `const load = require;\nload("react-router-dom/server");\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `module.require("react-router-dom/server");\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `let load = require;\nload = getLoader();\nload("react-router-dom/server");\nexport const page = true;\n`,
+      /unstable CommonJS loader alias/,
+    ],
+    [
       `const payload = "import('react-server-dom-webpack/client')";\neval(payload);\nexport const page = true;\n`,
       /imports RSC\/server-capable module react-server-dom-webpack\/client/,
     ],
@@ -929,6 +949,13 @@ const worker = { flush() {} };
 const value = () => true;
 const printed = Function.prototype.toString.call(value);
 setTimeout(worker.flush.bind(worker), 10);
+{
+  const require = (specifier) => specifier;
+  const module = { require: (specifier) => specifier };
+  const load = require;
+  load("react-router-dom/server");
+  module.require("react-router-dom/server");
+}
 {
   const Function = () => "local";
   const setTimeout = () => "local";

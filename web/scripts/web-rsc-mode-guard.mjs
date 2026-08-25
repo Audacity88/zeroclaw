@@ -1187,45 +1187,100 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
     return null;
   }
 
+  function commonJsLoaderKind(node, seen = new Set()) {
+    const expression = unwrapTimerHandler(node);
+    if (ts.isIdentifier(expression)) {
+      const key = `${expression.pos}:${expression.text}`;
+      if (seen.has(key)) {
+        return null;
+      }
+      const binding = resolveBinding(nearestScope(expression.parent), expression.text);
+      if (binding) {
+        if (!binding.initializer) {
+          return null;
+        }
+        const nextSeen = new Set(seen);
+        nextSeen.add(key);
+        const initializer = stableInitializer(expression);
+        if (!initializer) {
+          const initialKind = commonJsLoaderKind(binding.initializer, nextSeen);
+          if (initialKind) {
+            fail(`${relative} uses an unstable CommonJS loader alias`);
+          }
+          return null;
+        }
+        return commonJsLoaderKind(initializer, nextSeen);
+      }
+      return expression.text === "require"
+        ? { invocation: "direct" }
+        : null;
+    }
+    if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+      const propertyName = ts.isPropertyAccessExpression(expression)
+        ? expression.name.text
+        : recoverStaticString(expression.argumentExpression);
+      if (["call", "bind", "apply"].includes(propertyName)) {
+        const target = commonJsLoaderKind(expression.expression, seen);
+        return target ? { invocation: propertyName } : null;
+      }
+      if (
+        propertyName === "require" &&
+        ts.isIdentifier(expression.expression) &&
+        expression.expression.text === "module" &&
+        !resolveBinding(nearestScope(expression.expression.parent), "module")
+      ) {
+        return { invocation: "direct" };
+      }
+    }
+    if (
+      ts.isCallExpression(expression) &&
+      ts.isPropertyAccessExpression(expression.expression) &&
+      expression.expression.name.text === "bind"
+    ) {
+      return commonJsLoaderKind(expression.expression.expression, seen);
+    }
+    return null;
+  }
+
+  function recoverAppliedArguments(argument, seen = new Set()) {
+    const applied = unwrapTimerHandler(argument);
+    if (ts.isArrayLiteralExpression(applied)) {
+      const recovered = [];
+      for (const element of applied.elements) {
+        if (ts.isSpreadElement(element)) {
+          const spread = recoverAppliedArguments(element.expression, seen);
+          if (!spread) {
+            return null;
+          }
+          recovered.push(...spread);
+        } else {
+          recovered.push(element);
+        }
+      }
+      return recovered;
+    }
+    if (!ts.isIdentifier(applied)) {
+      return null;
+    }
+    const key = `${applied.pos}:${applied.text}`;
+    if (seen.has(key)) {
+      return null;
+    }
+    const initializer = stableInitializer(applied);
+    if (!initializer) {
+      return null;
+    }
+    const nextSeen = new Set(seen);
+    nextSeen.add(key);
+    return recoverAppliedArguments(initializer, nextSeen);
+  }
+
   function recoveredArguments(node, kind) {
     const arguments_ = node.arguments ? [...node.arguments] : [];
     if (kind.invocation === "call" || kind.invocation === "bind") {
       return arguments_.slice(1);
     }
     if (kind.invocation === "apply") {
-      function recoverAppliedArguments(argument, seen = new Set()) {
-        const applied = unwrapTimerHandler(argument);
-        if (ts.isArrayLiteralExpression(applied)) {
-          const recovered = [];
-          for (const element of applied.elements) {
-            if (ts.isSpreadElement(element)) {
-              const spread = recoverAppliedArguments(element.expression, seen);
-              if (!spread) {
-                return null;
-              }
-              recovered.push(...spread);
-            } else {
-              recovered.push(element);
-            }
-          }
-          return recovered;
-        }
-        if (!ts.isIdentifier(applied)) {
-          return null;
-        }
-        const key = `${applied.pos}:${applied.text}`;
-        if (seen.has(key)) {
-          return null;
-        }
-        const initializer = stableInitializer(applied);
-        if (!initializer) {
-          return null;
-        }
-        const nextSeen = new Set(seen);
-        nextSeen.add(key);
-        return recoverAppliedArguments(initializer, nextSeen);
-      }
-
       const recovered = arguments_[1]
         ? recoverAppliedArguments(arguments_[1])
         : null;
@@ -1235,6 +1290,23 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
       return recovered;
     }
     return kind.kind === "Function" ? arguments_ : arguments_.slice(0, 1);
+  }
+
+  function recoveredModuleArguments(node, kind) {
+    const arguments_ = [...node.arguments];
+    if (kind.invocation === "call" || kind.invocation === "bind") {
+      return arguments_.slice(1);
+    }
+    if (kind.invocation === "apply") {
+      const recovered = arguments_[1]
+        ? recoverAppliedArguments(arguments_[1])
+        : null;
+      if (!recovered) {
+        fail(`${relative} uses an unanalyzable CommonJS loader apply argument list`);
+      }
+      return recovered;
+    }
+    return arguments_;
   }
 
   function inspectRecoveredCode(text, kind) {
@@ -1291,11 +1363,13 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
     } else if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
       const isCall = ts.isCallExpression(node);
       const isDynamicImport = isCall && node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const isRequire =
-        isCall && ts.isIdentifier(node.expression) && node.expression.text === "require";
-      if (isDynamicImport || isRequire) {
-        const specifier = node.arguments[0] && recoverStaticString(node.arguments[0]);
-        if (node.arguments.length !== 1 || specifier === null || specifier === undefined) {
+      const loaderKind = isCall ? commonJsLoaderKind(node.expression) : null;
+      if (isDynamicImport || loaderKind) {
+        const moduleArguments = isDynamicImport
+          ? [...node.arguments]
+          : recoveredModuleArguments(node, loaderKind);
+        const specifier = moduleArguments[0] && recoverStaticString(moduleArguments[0]);
+        if (moduleArguments.length !== 1 || specifier === null || specifier === undefined) {
           fail(`${relative} uses a nonliteral dynamic module specifier`);
         }
         if (specifier === "react-router-dom") {
@@ -1303,7 +1377,7 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
         }
         addModuleRecord(
           records,
-          node.arguments[0],
+          moduleArguments[0],
           filePath,
           isDynamicImport ? "dynamic import" : "require",
         );
@@ -1313,9 +1387,13 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
       if (kind) {
         for (const argument of recoveredArguments(node, kind)) {
           const recoveredSource = recoverStaticString(argument);
-          if (recoveredSource !== null) {
-            inspectRecoveredCode(recoveredSource, kind.kind);
+          if (recoveredSource === null) {
+            if (kind.kind !== "timer") {
+              fail(`${relative} uses an unanalyzable evaluator argument`);
+            }
+            continue;
           }
+          inspectRecoveredCode(recoveredSource, kind.kind);
         }
       }
     }
