@@ -72,7 +72,7 @@ For the full field reference, see the [Git channel](./git.md#configure) page.
 The Git channel is included in standard distribution artifacts, but not in the lean Cargo default. For a custom source build, include `channel-git` (and `agent-runtime` when disabling default features):
 
 ```bash
-cargo build --no-default-features --features "agent-runtime,channel-git"
+cargo build --features channel-git
 ```
 
 `channel-git` pulls in every wired forge provider in one build; there is no smaller per-provider subset, and building a bare `provider-*` feature without `channel-git` does not register the channel.
