@@ -1047,27 +1047,34 @@ fn http_status_is_authoritative(code: u16) -> bool {
 }
 
 fn has_model_not_found_hint(message: &str) -> bool {
-    [
-        "model not found",
-        "unknown model",
-        "unsupported model",
-        "invalid model",
-    ]
-    .iter()
-    .any(|hint| message.contains(hint))
-        || message
-            .split_once("model ")
-            .is_some_and(|(_, model_detail)| {
-                [
-                    " not found",
-                    " does not exist",
-                    " is unsupported",
-                    " is not supported",
-                    " is invalid",
-                ]
+    message.split(": ").any(|segment| {
+        let segment = segment.trim_start();
+
+        [
+            "model not found",
+            "unknown model",
+            "unsupported model",
+            "invalid model",
+        ]
+        .iter()
+        .any(|hint| segment.starts_with(hint))
+            || ["model ", "requested model ", "the requested model "]
                 .iter()
-                .any(|hint| model_detail.contains(hint))
-            })
+                .find_map(|prefix| segment.strip_prefix(prefix))
+                .is_some_and(|model_detail| {
+                    [
+                        " not found",
+                        " does not exist",
+                        " is unknown",
+                        " is unsupported",
+                        " is not supported",
+                        " is invalid",
+                    ]
+                    .iter()
+                    .any(|hint| model_detail.contains(hint))
+                        || model_detail == "unknown"
+                })
+    })
 }
 
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
@@ -8087,18 +8094,31 @@ mod tests {
 
     #[test]
     fn malformed_stream_parser_error_is_not_treated_as_a_model_failure() {
-        let err = anyhow::Error::msg(
-            "model_provider stream error: JSON parse error: invalid type: string \"503 Service Unavailable\", expected a sequence at line 1 column 36",
-        );
+        for payload in [
+            "503 Service Unavailable",
+            "model mystery is unknown",
+            "unknown model",
+        ] {
+            let err = anyhow::Error::msg(format!(
+                "model_provider stream error: JSON parse error: invalid type: string \"{payload}\", expected a sequence at line 1 column 36"
+            ));
 
-        assert!(!is_non_retryable(&err));
-        assert_eq!(provider_error_diagnostic(&err).kind, "provider_error");
+            assert!(!is_non_retryable(&err), "{payload}");
+            assert_eq!(
+                provider_error_diagnostic(&err).kind,
+                "provider_error",
+                "{payload}"
+            );
+        }
     }
 
     #[test]
     fn model_first_failure_phrases_remain_non_retryable_and_classified() {
         for message in [
             "model \"missing\" not found",
+            "model \"mystery\" is unknown",
+            "model unknown",
+            "the requested model 'mystery' is unknown",
             "model \"legacy\" is unsupported",
             "model \"legacy\" is not supported",
             "model \"bad\" is invalid",
