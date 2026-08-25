@@ -333,6 +333,19 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     }
 }
 
+async fn run_blocking_rpc<T>(
+    operation: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    failure: &'static str,
+) -> Result<T, JsonRpcError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| rpc_err(INTERNAL_ERROR, format!("{failure}: {error}")))?
+        .map_err(|error| rpc_err(INTERNAL_ERROR, format!("{failure}: {error}")))
+}
+
 fn not_yet_implemented(method: Method) -> RpcResult {
     Err(rpc_err(
         INTERNAL_ERROR,
@@ -3102,41 +3115,45 @@ impl RpcDispatcher {
         let req: SessionMessagesParams = parse_params(params)?;
         let mut messages: Vec<MessageEntry> = Vec::new();
         let mut acp_session_found = false;
-        if let Some(store) = self.ctx.acp_session_store.clone()
-            && store.contains_session(&req.session_id).map_err(|error| {
-                rpc_err(
-                    INTERNAL_ERROR,
-                    format!("Failed to identify ACP session: {error}"),
-                )
-            })?
-        {
-            acp_session_found = true;
-            let _guard = self
-                .ctx
-                .sessions
-                .session_queue
-                .acquire(&req.session_id)
-                .await
-                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
-            if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
-                && !self.ctx.sessions.has_inflight_turn(&req.session_id)
-            {
-                recover_acp_checkpoint(Arc::clone(&store), &req.session_id)
+        if let Some(store) = self.ctx.acp_session_store.clone() {
+            let session_id = req.session_id.clone();
+            let lookup_store = Arc::clone(&store);
+            let contains_session = run_blocking_rpc(
+                move || lookup_store.contains_session(&session_id),
+                "Failed to identify ACP session",
+            )
+            .await?;
+            if contains_session {
+                acp_session_found = true;
+                let _guard = self
+                    .ctx
+                    .sessions
+                    .session_queue
+                    .acquire(&req.session_id)
                     .await
-                    .map_err(|error| {
-                        rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to recover interrupted ACP turn: {error}"),
-                        )
-                    })?;
-            }
-            if let Some(data) = store.load_session(&req.session_id).map_err(|error| {
-                rpc_err(
-                    INTERNAL_ERROR,
-                    format!("Failed to load ACP session messages: {error}"),
+                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
+                if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
+                    && !self.ctx.sessions.has_inflight_turn(&req.session_id)
+                {
+                    recover_acp_checkpoint(Arc::clone(&store), &req.session_id)
+                        .await
+                        .map_err(|error| {
+                            rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Failed to recover interrupted ACP turn: {error}"),
+                            )
+                        })?;
+                }
+                let session_id = req.session_id.clone();
+                let load_store = Arc::clone(&store);
+                let loaded = run_blocking_rpc(
+                    move || load_store.load_session(&session_id),
+                    "Failed to load ACP session messages",
                 )
-            })? {
-                messages = conversation_message_entries(&data.messages);
+                .await?;
+                if let Some(data) = loaded {
+                    messages = conversation_message_entries(&data.messages);
+                }
             }
         }
 
