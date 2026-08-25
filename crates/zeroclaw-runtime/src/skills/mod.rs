@@ -2025,6 +2025,16 @@ fn remove_git_metadata(skill_path: &Path) -> Result<()> {
 
 fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
     let source = open_source_dir_nofollow(src)?;
+    let dest_parent_path = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dest_parent_path).with_context(|| {
+        format!(
+            "failed to create destination parent {}",
+            dest_parent_path.display()
+        )
+    })?;
     let dest_parent = open_parent_dir(dest)?;
     let dest_name = dest
         .file_name()
@@ -2300,6 +2310,22 @@ mod copy_tests {
                 .mode();
             assert_eq!(mode & 0o111, 0o111, "mode {mode:o}");
         }
+    }
+
+    #[test]
+    fn install_creates_a_missing_skills_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let skills_path = root.path().join("skills");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Safe Skill\n").unwrap();
+
+        let (destination, files_scanned) =
+            install_local_skill_source(source.to_str().unwrap(), &skills_path, false).unwrap();
+
+        assert_eq!(destination, skills_path.join("source"));
+        assert!(destination.join("SKILL.md").is_file());
+        assert!(files_scanned >= 1);
     }
 
     #[cfg(unix)]
