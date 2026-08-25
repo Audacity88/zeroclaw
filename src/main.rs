@@ -4734,6 +4734,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 },
             ));
             #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_channel_generation_invalidator(Box::new(
+                || zeroclaw_channels::orchestrator::prepare_live_channel_registry(true),
+            ));
+            #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|_| {
                 zeroclaw_channels::orchestrator::live_channel_map()
             }));

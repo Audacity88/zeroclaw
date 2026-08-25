@@ -66,15 +66,42 @@ type ChannelMapFn = Box<ChannelMapFactory>;
 type ApprovalChannelMapFactory =
     dyn Fn(&zeroclaw_config::schema::Config) -> ChannelMap + Send + Sync;
 type ApprovalChannelMapFn = Box<ApprovalChannelMapFactory>;
+type ChannelGenerationInvalidator = dyn Fn() + Send + Sync;
+type ChannelGenerationInvalidatorFn = Box<ChannelGenerationInvalidator>;
 
 /// Channel map factory, injected by the binary.
 static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
 static APPROVAL_CHANNEL_MAP_FN: std::sync::OnceLock<ApprovalChannelMapFn> =
     std::sync::OnceLock::new();
+static CHANNEL_GENERATION_INVALIDATOR_FN: std::sync::OnceLock<ChannelGenerationInvalidatorFn> =
+    std::sync::OnceLock::new();
 
 /// Register the channel map factory. Called once at startup by the binary.
 pub fn register_channel_map_fn(f: ChannelMapFn) {
     let _ = CHANNEL_MAP_FN.set(f);
+}
+
+/// Register the daemon-owned live-channel generation invalidator. Runtime
+/// config mutation code invokes this before revoking session-local handles so
+/// a racing session cannot seed another handle from the retired generation.
+pub fn register_channel_generation_invalidator(f: ChannelGenerationInvalidatorFn) {
+    let _ = CHANNEL_GENERATION_INVALIDATOR_FN.set(f);
+}
+
+pub(crate) fn invalidate_channel_generation() -> bool {
+    let Some(invalidate) = CHANNEL_GENERATION_INVALIDATOR_FN.get() else {
+        return false;
+    };
+    invalidate();
+    true
+}
+
+pub(crate) fn channel_generation_invalidator_available() -> bool {
+    CHANNEL_GENERATION_INVALIDATOR_FN.get().is_some()
+}
+
+pub(crate) fn channel_generation_map_factory_available() -> bool {
+    APPROVAL_CHANNEL_MAP_FN.get().is_some()
 }
 
 /// Register the route-aware channel factory used only by distinct-approver
@@ -122,6 +149,26 @@ pub(crate) fn seed_channel_handles_with_factory(
 pub(crate) struct ConfiguredChannelMaps {
     old: ChannelMap,
     new: ChannelMap,
+}
+
+pub(crate) fn configured_channel_generation_revocation(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<ConfiguredChannelMaps> {
+    let factory = APPROVAL_CHANNEL_MAP_FN.get()?;
+    Some(configured_channel_generation_revocation_with_factory(
+        factory.as_ref(),
+        config,
+    ))
+}
+
+pub(crate) fn configured_channel_generation_revocation_with_factory(
+    factory: &ApprovalChannelMapFactory,
+    config: &zeroclaw_config::schema::Config,
+) -> ConfiguredChannelMaps {
+    ConfiguredChannelMaps {
+        old: factory(config),
+        new: ChannelMap::new(),
+    }
 }
 
 pub(crate) fn configured_channel_maps_with_factory(
@@ -180,6 +227,29 @@ pub(crate) fn refresh_channel_handles(
     }
 
     configured.new.len()
+}
+
+pub(crate) fn remove_channel_names(
+    names: &[String],
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &tools::PerToolChannelHandle,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+) {
+    let handles = [
+        ask_user_handle.as_ref(),
+        channel_room_handle.as_ref(),
+        Some(reaction_handle),
+        poll_handle.as_ref(),
+        escalate_handle.as_ref(),
+    ];
+    for handle in handles.iter().flatten() {
+        let mut map = handle.write();
+        for name in names {
+            map.remove(name);
+        }
+    }
 }
 
 pub(crate) fn seed_channel_handles(

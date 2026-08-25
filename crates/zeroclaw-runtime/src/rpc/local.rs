@@ -691,6 +691,7 @@ mod tests {
     struct BlockingModelProvider {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        starts: Arc<AtomicUsize>,
     }
 
     #[cfg(unix)]
@@ -703,6 +704,7 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
+            self.starts.fetch_add(1, Ordering::Relaxed);
             self.started.notify_one();
             self.release.notified().await;
             Ok("released".to_string())
@@ -730,9 +732,14 @@ mod tests {
         session_id: &str,
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        starts: Arc<AtomicUsize>,
     ) {
         let agent = crate::agent::agent::Agent::builder()
-            .model_provider(Box::new(BlockingModelProvider { started, release }))
+            .model_provider(Box::new(BlockingModelProvider {
+                started,
+                release,
+                starts,
+            }))
             .tools(vec![])
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
@@ -1422,8 +1429,16 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let starts = Arc::new(AtomicUsize::new(0));
         let session_id = "inflight-local-prompt";
-        insert_blocking_session(&ctx, session_id, Arc::clone(&started), Arc::clone(&release)).await;
+        insert_blocking_session(
+            &ctx,
+            session_id,
+            Arc::clone(&started),
+            Arc::clone(&release),
+            Arc::clone(&starts),
+        )
+        .await;
 
         let server_cancel = cancel.clone();
         let server_ctx = Arc::clone(&ctx);
@@ -1454,7 +1469,33 @@ mod tests {
             .await
             .expect("local prompt should reach the blocking provider");
         assert!(ctx.sessions.has_inflight_turn(session_id));
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "prompt": "remain queued until the connection closes",
+                    }),
+                    3,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ctx.sessions.session_queue.queue_depth(session_id).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second local prompt should register behind the in-flight turn");
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
 
+        // Make permit release and transport teardown ready in the same
+        // scheduler turn. The queued request must resolve the biased
+        // cancellation branch instead of starting a second provider call.
+        release.notify_one();
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(2), server)
             .await
@@ -1464,6 +1505,12 @@ mod tests {
 
         assert_eq!(count.load(Ordering::Relaxed), 0);
         assert!(!ctx.sessions.has_inflight_turn(session_id));
+        assert_eq!(ctx.sessions.session_queue.queue_depth(session_id).await, 0);
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the queued local prompt must not start during teardown"
+        );
         assert!(
             ctx.sessions.get_agent(session_id).await.is_some(),
             "connection teardown must retain the resumable session"
@@ -1479,8 +1526,16 @@ mod tests {
         let cancel = CancellationToken::new();
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
+        let starts = Arc::new(AtomicUsize::new(0));
         let session_id = "partial-frame-after-prompt";
-        insert_blocking_session(&ctx, session_id, Arc::clone(&started), Arc::clone(&release)).await;
+        insert_blocking_session(
+            &ctx,
+            session_id,
+            Arc::clone(&started),
+            Arc::clone(&release),
+            starts,
+        )
+        .await;
 
         let server_cancel = cancel.clone();
         let server_ctx = Arc::clone(&ctx);
