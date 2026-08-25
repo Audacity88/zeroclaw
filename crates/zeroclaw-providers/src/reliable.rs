@@ -966,19 +966,24 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
 }
 
 fn http_status_from_error_text(text: &str) -> Option<u16> {
-    if let Some(after_prefix) = text
-        .strip_prefix("modelprovider error:")
-        .map(str::trim_start)
-        && let Some(code) = after_prefix
-            .get(..3)
-            .and_then(|value| value.parse::<u16>().ok())
-            .filter(|code| (400..600).contains(code))
-        && after_prefix
-            .as_bytes()
-            .get(3)
-            .is_some_and(u8::is_ascii_whitespace)
-    {
-        return Some(code);
+    for prefix in [
+        "model_provider stream error: modelprovider error:",
+        "modelprovider error:",
+    ] {
+        if let Some(after_prefix) = text.strip_prefix(prefix).map(str::trim_start)
+            && let Some(code) = after_prefix
+                .get(..3)
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|code| (400..600).contains(code))
+                .filter(|_| {
+                    after_prefix
+                        .as_bytes()
+                        .get(3)
+                        .is_some_and(u8::is_ascii_whitespace)
+                })
+        {
+            return Some(code);
+        }
     }
 
     for marker in ["api error (", "http "] {
@@ -5938,6 +5943,12 @@ mod tests {
                 "provider_server",
                 "http_response",
                 "server error",
+            ),
+            (
+                "model_provider stream error: ModelProvider error: 404 Not Found: unknown model",
+                "model_not_found",
+                "http_response",
+                "model id",
             ),
             (
                 "provider returned an opaque transport error",

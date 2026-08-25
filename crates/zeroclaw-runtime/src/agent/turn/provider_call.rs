@@ -624,12 +624,15 @@ mod streaming_fallback_tests {
     };
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
+    use axum::{Router, http::StatusCode, routing::post};
     use futures_util::stream::BoxStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::StreamEvent;
     use zeroclaw_config::schema::PacingConfig;
+    use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
     use zeroclaw_providers::{
@@ -1000,6 +1003,116 @@ mod streaming_fallback_tests {
             ReliableProviderTerminalFailureKind::Connection
         );
         assert_eq!(terminal.endpoint(), Some("http://127.0.0.1:9/v1/messages"));
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_failures_recover_to_typed_terminal_kinds_without_replay() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cases = [
+            (
+                StatusCode::UNAUTHORIZED,
+                ReliableProviderTerminalFailureKind::Authentication,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                ReliableProviderTerminalFailureKind::ModelNotFound,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                ReliableProviderTerminalFailureKind::RateLimited,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ReliableProviderTerminalFailureKind::ProviderServer,
+            ),
+        ];
+
+        for (status, expected_kind) in cases {
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let request_count_for_route = Arc::clone(&request_count);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let request_count = Arc::clone(&request_count_for_route);
+                    async move {
+                        request_count.fetch_add(1, Ordering::Relaxed);
+                        (status, "upstream failure")
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind compatible test server");
+            let addr = listener.local_addr().expect("read compatible test address");
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve compatible test response");
+            });
+            let compatible = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("Test Compatible")
+                .base_url(&format!("http://{addr}"))
+                .credential(None)
+                .auth_style(AuthStyle::Bearer)
+                .build();
+            let provider = ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".to_string(),
+                    Box::new(compatible) as Box<dyn ModelProvider>,
+                )],
+                0,
+                1,
+            );
+            let ctx = TurnCtx {
+                observer: &observer,
+                provider_name: "test-provider",
+                model: "test-model",
+                temperature: Some(0.0),
+                approval: None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                event_tx: None,
+                hooks: None,
+                dedup_exempt_tools: &[],
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                channel: None,
+                draft_reasoning: StreamReasoningMode::Status,
+                turn_id: "test-turn",
+                agent_alias: None,
+                parent_agent_alias: None,
+            };
+
+            let error = call_provider(
+                &ctx,
+                &provider,
+                "test-model",
+                &[ChatMessage::user("go")],
+                None,
+                true,
+                0,
+            )
+            .await
+            .expect("stream failure is returned as a provider-call outcome")
+            .chat_result
+            .expect_err("the compatible stream failure must remain terminal");
+            let terminal = error
+                .chain()
+                .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
+                .expect("recovery error must preserve a typed terminal cause");
+
+            assert_eq!(
+                terminal.kind(),
+                expected_kind,
+                "{status} must retain its compatible streaming classification"
+            );
+            assert_eq!(request_count.load(Ordering::Relaxed), 1, "{status}");
+            server.abort();
+        }
     }
 
     #[tokio::test]

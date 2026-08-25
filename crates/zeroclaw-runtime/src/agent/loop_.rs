@@ -4198,13 +4198,14 @@ mod tests {
         let error =
             anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
         let diagnostic = error.to_string();
+        let expected = crate::agent::semantic_empty_terminal_completion_message(None);
 
         let projected = super::project_cli_terminal_completion_error(error);
+        let rendered = projected.to_string();
 
         assert_eq!(
-            projected.to_string(),
-            crate::agent::semantic_empty_terminal_completion_message(None),
-            "both direct CLI boundaries must deliver the Fluent terminal-completion message"
+            rendered, expected,
+            "the CLI boundary must use the canonical localized projection"
         );
         assert_eq!(
             diagnostic, "provider completed without final text or tool calls",
@@ -4225,20 +4226,15 @@ mod tests {
              event 1 (retry 1/3): rate_limited"
                 .to_string(),
         ));
+        let expected = crate::agent::terminal_completion_error_message(&error, None)
+            .expect("provider failures have a canonical localized projection");
 
         let projected = super::project_cli_terminal_completion_error(error);
+        let rendered = projected.to_string();
 
-        assert_eq!(
-            projected.to_string(),
-            "The selected model provider rate-limited the request. Wait, review quota, or choose \
-             another provider."
-        );
-        assert!(!projected.to_string().contains("retry 1/3"));
-        assert!(
-            !projected
-                .to_string()
-                .contains("All model providers/models failed")
-        );
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("retry 1/3"));
+        assert!(!rendered.contains("All model providers/models failed"));
     }
 
     struct NonVisionModelProvider {
