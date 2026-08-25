@@ -41,9 +41,7 @@ task_local! {
 impl ExecutionTreeBudget {
     #[must_use]
     pub fn from_limit(limit: Option<usize>) -> Option<Self> {
-        limit
-            .filter(|&limit| limit > 0)
-            .map(Self::root)
+        limit.filter(|&limit| limit > 0).map(Self::root)
     }
 
     #[must_use]
