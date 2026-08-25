@@ -16,12 +16,13 @@ Composite job with multiple matrix legs:
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
 - **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux, including the config-write isolation and Fluent coverage (no bare user-facing strings) architecture guards
+- **windows-test-scope / windows-test**: advisory PR measurement on `windows-latest`; the selector classifies the PR as `skip`, `scoped`, or `full`, and the Windows job runs pinned-toolchain `cargo nextest` only when appropriate
 - **parallel-runtime-test**: repeated same-process runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh`, run in parallel with the main test job for relevant PR paths and unconditionally on `master` pushes and merge queue runs
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
 - **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`
 
-`fmt` runs first as the cheap serial gate. Every other job declares `needs: [fmt]` directly or transitively and fans out after formatting passes; `CI Required Gate` aggregates every result. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
+`fmt` runs first as the cheap serial gate. Every required job declares `needs: [fmt]` directly or transitively and fans out after formatting passes; `CI Required Gate` aggregates the required results only. The advisory Windows jobs are deliberately absent from that gate and cannot block a PR. Branch protection pins the composite gate job. A PR cannot merge until this is green. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
 Fresh required CI is normally the shared evidence for the Cargo surfaces it actually runs. A local rerun of the same Cargo command on the same head, target, and feature set is duplicate confidence, not a stronger proof. Before asking for extra Cargo or Clippy, compare the changed surface with the current workflow files and the actual checks on the PR. Extra validation belongs where the required gate does not prove the thing under review:
 
@@ -33,15 +34,23 @@ Fresh required CI is normally the shared evidence for the Cargo surfaces it actu
 
 When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. That pass runs `cargo check` without `--all-targets`, so it never compiles test targets: a helper gated on plain `test` whose only callers sit behind a feature is caught by the default-features/all-targets leg instead. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
 
+### Advisory PR Windows Measurement (`ci.yml`)
+
+The first Windows PR rollout is measurement-only and is not a required check. On `pull_request`, `windows-test-scope` compares the base SHA to `HEAD`, generates Cargo workspace metadata from the checkout on the Linux selector runner, and writes `mode`, JSON `packages`, and a concise `reason` to both job outputs and the step summary. The advisory selector and Windows jobs are skipped for `push` and `merge_group`; the nightly full-platform workflow remains the post-merge backstop without adding a second full Windows run to every merge.
+
+`skip` means no changed path affects Rust compilation or tests covered by the current workspace suite. `scoped` maps Rust source, test, benchmark, example, and package-local manifest paths to package roots from Cargo metadata, closes that set over workspace reverse dependents, maps root `src/` and `tests/` to the root package, deduplicates package names, and excludes `zeroclaw-desktop` like the existing workspace suite. `full` is selected for workspace manifests or dependency resolution, `.cargo`, the Rust toolchain, CI or test infrastructure, the selector or workflow, unknown paths, ambiguous metadata, and other changes that cannot be mapped safely. `Cargo.lock` stays scoped only when package-local manifest changes identify every directly changed package; otherwise it selects `full`.
+
+For `scoped`, the Windows job passes explicit `-p` arguments to `cargo nextest`; for `full`, it runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop`. Each job summary records the mode, packages, reason, and measured nextest duration. Pull requests restore the `platform-test` cache seeded by trusted nightly or manual runs on `master` and never write cache entries. A skipped Windows job is intentional and visible beside the selector result.
+
 ### Scheduled Platform Tests (`platform-tests.yml`)
 
-Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` on `macos-14` and `windows-latest` after a cheap Linux formatting check. The matrix runs for:
+Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` on `macos-14` and `windows-latest` after a cheap Linux formatting check. This nightly full-workspace run is the backstop for the advisory PR measurement and inventories failures with `--no-fail-fast`. The matrix runs for:
 
 - pull requests that change `platform-tests.yml` itself;
 - manual dispatches; and
 - the nightly 03:17 UTC schedule.
 
-The jobs use `continue-on-error` and do not feed `CI Required Gate`. They are portability evidence, not merge requirements. Ordinary code PRs do not launch the matrix automatically; maintainers can manually dispatch it against a branch when focused platform proof is useful. The workflow does not run for ordinary `push` or `merge_group` events. Nightly and manually dispatched runs on `master` can write trusted caches; pull-request runs cannot. `--no-fail-fast` keeps every platform failure visible in a single run.
+The jobs use `continue-on-error` and do not feed `CI Required Gate`. They are portability evidence, not merge requirements. Ordinary code PRs do not launch this full matrix automatically because `ci.yml` now measures the affected Windows scope; maintainers can manually dispatch it against a branch when full platform proof is useful. The workflow does not run for ordinary `push` or `merge_group` events. Nightly and manually dispatched runs on `master` can write trusted caches; pull-request runs cannot. `--no-fail-fast` keeps every platform failure visible in a single run.
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
@@ -259,7 +268,7 @@ Most Rust-heavy jobs in `ci.yml` cache through the local `./.github/actions/rust
 - **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
 - **Windows build cache is enabled.** The Windows build leg runs the same pinned Rust cache action as Linux and macOS. If Windows cache behavior flakes or regresses, revert the workflow change and document the failing restore/save evidence in the cache issue.
 - **Incremental compilation is disabled.** `CARGO_INCREMENTAL: 0` at the workflow level. Incremental builds inflate cache size and produce non-reproducible artifacts under partial-stale conditions.
-- **`cargo-deny` and `cargo-nextest` are installed fresh each run.** The `security` job runs `cargo install cargo-deny --locked`; the Linux `test` job and both scheduled `platform-tests.yml` legs pull the appropriate `cargo-nextest` binary from `get.nexte.st`. Neither tool is cached, so each install adds a fixed cost to its job. Switching either to `taiki-e/install-action` would let them be cached, but that action is not in the allowlist today.
+- **`cargo-deny` and `cargo-nextest` are installed fresh each run.** The `security` job runs `cargo install cargo-deny --locked`; the Linux `test` job and both scheduled `platform-tests.yml` legs pull the appropriate `cargo-nextest` binary from `get.nexte.st`. The advisory PR Windows job instead downloads its pinned nextest release archive and verifies a hardcoded SHA-256 before extraction because it runs on a much larger set of untrusted PRs. Neither tool is cached, so each install adds a fixed cost to its job. Switching either to `taiki-e/install-action` would let them be cached, but that action is not in the allowlist today.
 
 ## When the gate goes red
 

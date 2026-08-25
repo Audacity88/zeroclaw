@@ -595,6 +595,156 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
+  windows-test-scope:
+    name: Advisory Windows test selection
+    needs: [fmt]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+      packages: ${{ steps.select.outputs.packages }}
+      reason: ${{ steps.select.outputs.reason }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.96.1
+      - name: Test Windows selector contract
+        run: bash scripts/ci/windows_test_scope.test.sh
+      - name: Select Windows nextest scope
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          changed_files="$RUNNER_TEMP/windows-changed-files"
+          metadata_file="$RUNNER_TEMP/windows-cargo-metadata.json"
+          : > "$changed_files"
+
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            git diff --name-only "$BASE_SHA" HEAD > "$changed_files"
+            cargo metadata --locked --format-version 1 > "$metadata_file"
+          fi
+
+          python3 scripts/ci/windows_test_scope.py \
+            --event "$EVENT_NAME" \
+            --changed-paths-file "$changed_files" \
+            --metadata-file "$metadata_file" \
+            --repo-root "$GITHUB_WORKSPACE" > "$GITHUB_OUTPUT"
+      - name: Report Windows selection
+        shell: bash
+        env:
+          MODE: ${{ steps.select.outputs.mode }}
+          PACKAGES: ${{ steps.select.outputs.packages }}
+          REASON: ${{ steps.select.outputs.reason }}
+        run: |
+          {
+            echo "### Advisory Windows test selection"
+            echo ""
+            printf "| Field | Value |\n"
+            printf "| --- | --- |\n"
+            printf "| Mode | %s |\n" "$MODE"
+            printf "| Packages | %s |\n" "$PACKAGES"
+            printf "| Reason | %s |\n" "$REASON"
+            printf "| Measured nextest duration | not run (selection only) |\n"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows-test:
+    name: Advisory Windows nextest (${{ needs.windows-test-scope.outputs.mode }})
+    needs: [windows-test-scope]
+    if: github.event_name == 'pull_request' && needs.windows-test-scope.outputs.mode != 'skip'
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: platform-test
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install cargo-nextest
+        shell: bash
+        env:
+          NEXTEST_VERSION: 0.9.143
+          NEXTEST_SHA256: c42a1dbde532da06dc9b4a43d44fd0ce668b836c2ab7388410f10ff9834476a2
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-pc-windows-msvc.tar.gz"
+          curl -LsSf --retry 3 --retry-delay 2 -o "$archive" "$url"
+          actual_sha256="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$archive")"
+          if [[ "$actual_sha256" != "$NEXTEST_SHA256" ]]; then
+            echo "::error::cargo-nextest checksum mismatch (expected $NEXTEST_SHA256, got $actual_sha256)"
+            exit 1
+          fi
+          tar zxf "$archive" -C "$HOME/.cargo/bin"
+      - name: Run advisory Windows tests
+        shell: bash
+        env:
+          MODE: ${{ needs.windows-test-scope.outputs.mode }}
+          PACKAGES_JSON: ${{ needs.windows-test-scope.outputs.packages }}
+          REASON: ${{ needs.windows-test-scope.outputs.reason }}
+        run: |
+          set -euo pipefail
+
+          started_at=$(date +%s)
+          case "$MODE" in
+            scoped)
+              package_args_file="$RUNNER_TEMP/windows-package-args"
+              if ! python3 scripts/ci/windows_test_scope.py --package-args-json "$PACKAGES_JSON" > "$package_args_file"; then
+                echo "::error::Invalid scoped Windows package selection"
+                status=2
+              else
+                mapfile -t package_args < "$package_args_file"
+                if (( ${#package_args[@]} == 0 )); then
+                  echo "::error::Scoped Windows package selection is empty"
+                  status=2
+                else
+                  set +e
+                  cargo nextest run --locked "${package_args[@]}"
+                  status=$?
+                  set -e
+                fi
+              fi
+              ;;
+            full)
+              set +e
+              cargo nextest run --locked --workspace --exclude zeroclaw-desktop
+              status=$?
+              set -e
+              ;;
+            *)
+              echo "::error::Unknown Windows test selection mode: $MODE"
+              status=2
+              ;;
+          esac
+          duration_seconds=$(( $(date +%s) - started_at ))
+          {
+            echo "### Advisory Windows nextest"
+            echo ""
+            printf "| Field | Value |\n"
+            printf "| --- | --- |\n"
+            printf "| Mode | %s |\n" "$MODE"
+            printf "| Packages | %s |\n" "$PACKAGES_JSON"
+            printf "| Reason | %s |\n" "$REASON"
+            printf "| Measured nextest duration | %ss |\n" "$duration_seconds"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$status"
+
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
     needs: [fmt]
