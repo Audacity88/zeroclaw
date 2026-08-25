@@ -3740,7 +3740,6 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
-/// Wrapped screen-row count for a single cached line at the given width.
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
 fn copy_region(
     global_row: u16,
