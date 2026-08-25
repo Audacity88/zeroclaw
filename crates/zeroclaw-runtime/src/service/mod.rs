@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::process::{Child, Command as TokioCommand};
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, resolve_runtime_dirs};
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
@@ -650,21 +650,9 @@ fn open_private_desktop_file(path: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
-fn desktop_config_dir() -> Result<PathBuf> {
-    if let Ok(config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
-        let config_dir = config_dir.trim();
-        if !config_dir.is_empty() {
-            return normalize_desktop_config_dir(PathBuf::from(
-                shellexpand::tilde(config_dir).into_owned(),
-            ));
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-        return Ok(PathBuf::from(home).join(".zeroclaw"));
-    }
-    directories::UserDirs::new()
-        .map(|dirs| dirs.home_dir().join(".zeroclaw"))
-        .context("Could not find home directory for desktop log")
+async fn desktop_config_dir() -> Result<PathBuf> {
+    let (config_dir, _) = resolve_runtime_dirs().await?;
+    normalize_desktop_config_dir(config_dir)
 }
 
 fn normalize_desktop_config_dir(config_dir: PathBuf) -> Result<PathBuf> {
@@ -674,8 +662,10 @@ fn normalize_desktop_config_dir(config_dir: PathBuf) -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(config_dir))
 }
 
-fn desktop_log_path() -> Result<PathBuf> {
-    Ok(desktop_config_dir()?.join("logs/zeroclaw-desktop-daemon.log"))
+async fn desktop_log_path() -> Result<PathBuf> {
+    Ok(desktop_config_dir()
+        .await?
+        .join("logs/zeroclaw-desktop-daemon.log"))
 }
 
 fn emit_desktop_handshake(prefix: &str, message: Option<&str>) {
@@ -1002,7 +992,7 @@ async fn supervise_launchd_child(
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub async fn run_desktop_daemon(port: u16) -> Result<()> {
-    let path = desktop_log_path()?;
+    let path = desktop_log_path().await?;
     let executable =
         std::env::current_exe().context("Failed to resolve the desktop daemon executable")?;
     run_desktop_capture_with_executable(path, executable, port).await
@@ -1143,14 +1133,6 @@ async fn supervise_desktop_child(
         let stderr_task =
             zeroclaw_spawn::spawn!(drain_service_pipe(stderr, stderr_sink, "desktop"));
         if first_generation {
-            if let Some(status) = child
-                .try_wait()
-                .context("Failed to inspect desktop daemon child")?
-            {
-                finish_service_pipes(stdout_task, stderr_task, DESKTOP_PIPE_DRAIN_TIMEOUT).await;
-                let _ = consume_desktop_restart_marker(&marker_path);
-                bail!("desktop daemon child exited before readiness with status {status}");
-            }
             emit_desktop_handshake("READY", None);
             first_generation = false;
         }

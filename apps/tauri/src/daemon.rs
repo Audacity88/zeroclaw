@@ -351,6 +351,8 @@ fn desktop_daemon_command(binary: &Path, port: u16) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs;
 
     #[test]
     fn desktop_command_targets_hidden_supervisor_and_port() {
@@ -406,5 +408,85 @@ mod tests {
         assert!(error.to_string().contains("readiness timed out"));
         assert!(error.to_string().contains("supervisor cleanup failed"));
         assert!(error.to_string().contains("process tree still running"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_daemon_cleans_supervisor_tree_after_log_open_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw-desktop-log-open-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create fixture directory");
+        let pid_file = dir.join("descendant.pid");
+        let supervisor_pid_file = dir.join("supervisor.pid");
+        let log_destination = dir.join("zeroclaw-desktop-daemon.log");
+        let binary = dir.join("desktop-supervisor-fixture");
+        let pid_file_literal = pid_file.to_string_lossy().replace('\'', "'\\''");
+        let supervisor_pid_file_literal =
+            supervisor_pid_file.to_string_lossy().replace('\'', "'\\''");
+        let log_destination_literal = log_destination.to_string_lossy().replace('\'', "'\\''");
+        fs::create_dir(&log_destination).expect("make log destination a directory");
+        let fixture = format!(
+            "#!/bin/sh\n\
+             sleep 30 &\n\
+             child=$!\n\
+             printf '%s' \"$$\" > '{supervisor_pid_file_literal}'\n\
+             printf '%s' \"$child\" > '{pid_file_literal}'\n\
+             if open_error=$(printf '%s' 'desktop bootstrap' 2>&1 >> '{log_destination_literal}'); then\n\
+                 printf '%s\\n' 'ERROR desktop log open unexpectedly succeeded'\n\
+             else\n\
+                 printf '%s\\n' \"ERROR failed to open desktop log {log_destination_literal}: $open_error\"\n\
+             fi\n\
+             trap 'kill \"$child\" 2>/dev/null || true; wait \"$child\" 2>/dev/null || true; exit 0' TERM INT\n\
+             while kill -0 \"$child\" 2>/dev/null; do sleep 1; done\n"
+        );
+        fs::write(&binary, fixture).expect("write supervisor fixture");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("make supervisor fixture executable");
+
+        let error = spawn_daemon(&binary, 0).expect_err("log-open failure must reject startup");
+        let error = error.to_string();
+        let detail_prefix = format!("failed to open desktop log {}: ", log_destination.display());
+        let (_, detail) = error
+            .split_once(&detail_prefix)
+            .expect("parent error should identify the failed log destination");
+        assert!(
+            !detail.trim().is_empty(),
+            "log-open detail must not be empty"
+        );
+
+        let supervisor_pid: i32 = fs::read_to_string(&supervisor_pid_file)
+            .expect("fixture should record supervisor pid")
+            .parse()
+            .expect("supervisor pid should be numeric");
+        let descendant_pid: i32 = fs::read_to_string(&pid_file)
+            .expect("fixture should record descendant pid")
+            .parse()
+            .expect("descendant pid should be numeric");
+        for (label, pid) in [
+            ("supervisor", supervisor_pid),
+            ("descendant", descendant_pid),
+        ] {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut exited = false;
+            while Instant::now() < deadline {
+                let result = unsafe { kill(pid, 0) };
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if result == -1 && errno == Some(ESRCH) {
+                    exited = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(exited, "{label} process {pid} remained alive after cleanup");
+        }
+        fs::remove_dir_all(&dir).expect("remove fixture directory");
     }
 }
