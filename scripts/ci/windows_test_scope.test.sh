@@ -178,8 +178,8 @@ normalization = 'archive="$(cygpath -u "$archive")"'
 extraction = 'tar zxf "$archive" -C "$HOME/.cargo/bin"'
 skip_condition = "needs.windows-test-scope.outputs.mode != 'skip'"
 package_conversion = 'scripts/ci/windows_test_scope.py --package-args-json "$PACKAGES_JSON"'
-scoped_command = 'cargo nextest run --locked "${package_args[@]}"'
-full_command = 'cargo nextest run --locked --workspace --exclude zeroclaw-desktop'
+scoped_command = 'cargo nextest run --locked --no-fail-fast "${package_args[@]}"'
+full_command = 'cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop'
 assert "bash scripts/ci/windows_test_scope.test.sh" in scope_job
 assert skip_condition in windows_job
 assert package_conversion in windows_job

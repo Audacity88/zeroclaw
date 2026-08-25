@@ -717,7 +717,7 @@ jobs:
                   status=2
                 else
                   set +e
-                  cargo nextest run --locked "${package_args[@]}"
+                  cargo nextest run --locked --no-fail-fast "${package_args[@]}"
                   status=$?
                   set -e
                 fi
@@ -725,7 +725,7 @@ jobs:
               ;;
             full)
               set +e
-              cargo nextest run --locked --workspace --exclude zeroclaw-desktop
+              cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop
               status=$?
               set -e
               ;;

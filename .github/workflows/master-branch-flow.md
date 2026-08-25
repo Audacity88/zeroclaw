@@ -71,7 +71,7 @@ tag push.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
    - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
-   - `windows-test-scope` and `windows-test`: advisory-only Windows measurement. The selector compares base SHA..`HEAD` and chooses `skip`, `scoped`, or `full` from Cargo metadata; the Windows job records mode, packages, reason, and nextest duration, passes explicit `-p` arguments for `scoped`, and uses the full workspace command for `full`.
+   - `windows-test-scope` and `windows-test`: advisory-only Windows measurement. The selector compares base SHA..`HEAD` and chooses `skip`, `scoped`, or `full` from Cargo metadata; the Windows job records mode, packages, reason, and nextest duration, passes explicit `-p` arguments for `scoped`, and uses the full workspace command for `full`, with `--no-fail-fast` so it inventories every selected failure.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
 3. The advisory Windows job is outside `CI Required Gate`, uses restore-only cache behavior on PRs, and is visibly non-blocking. When the PR changes `platform-tests.yml`, that workflow checks formatting, then runs the same full workspace nextest selection on `macos-14` and `windows-latest` as non-blocking checks. The nightly schedule is the full-platform backstop, and maintainers can manually dispatch the workflow against other platform-sensitive branches. `--no-fail-fast` inventories all platform failures.
