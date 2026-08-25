@@ -45,6 +45,7 @@ pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    pub(crate) cause: zeroclaw_providers::ReliableProviderTerminalFailure,
 }
 
 impl std::fmt::Display for StreamInterruptedAfterOutput {
@@ -53,7 +54,11 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
     }
 }
 
-impl std::error::Error for StreamInterruptedAfterOutput {}
+impl std::error::Error for StreamInterruptedAfterOutput {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
 
 /// A transport stream failure before user-visible output. The cumulative usage
 /// snapshot is retained so Reliable recovery can bill the exact selected

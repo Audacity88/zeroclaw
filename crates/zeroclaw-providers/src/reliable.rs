@@ -880,6 +880,19 @@ impl ReliableProviderTerminalFailure {
         }
     }
 
+    /// Classify a provider error into a safe terminal presentation cause.
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        let diagnostic = provider_error_diagnostic(error);
+        Self::new(
+            ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            diagnostic.endpoint,
+            format!(
+                "provider error: kind={}; phase={}; hint={}",
+                diagnostic.kind, diagnostic.phase, diagnostic.hint
+            ),
+        )
+    }
+
     fn with_cause(
         provider: Option<&str>,
         diagnostic: ProviderErrorDiagnostic,

@@ -655,6 +655,10 @@ mod streaming_fallback_tests {
         non_stream_calls: Arc<AtomicUsize>,
     }
 
+    struct VisibleThenServerStreamFailureProvider {
+        non_stream_calls: Arc<AtomicUsize>,
+    }
+
     impl Attributable for EmptyStreamThenTextProvider {
         fn role(&self) -> Role {
             Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
@@ -692,6 +696,16 @@ mod streaming_fallback_tests {
 
         fn alias(&self) -> &str {
             "StreamFailureNoReplayProvider"
+        }
+    }
+
+    impl Attributable for VisibleThenServerStreamFailureProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "VisibleThenServerStreamFailureProvider"
         }
     }
 
@@ -878,6 +892,55 @@ mod streaming_fallback_tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for VisibleThenServerStreamFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta("visible"),
+                )),
+                Err(zeroclaw_providers::traits::StreamError::ModelProvider(
+                    "503 Service Unavailable".to_string(),
+                )),
+            ]))
+        }
+    }
+
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
         let provider = EmptyStreamThenTextProvider {
@@ -1003,6 +1066,85 @@ mod streaming_fallback_tests {
             ReliableProviderTerminalFailureKind::Connection
         );
         assert_eq!(terminal.endpoint(), Some("http://127.0.0.1:9/v1/messages"));
+    }
+
+    #[tokio::test]
+    async fn visible_stream_failure_preserves_partial_text_and_typed_server_cause_without_replay() {
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = VisibleThenServerStreamFailureProvider {
+            non_stream_calls: Arc::clone(&non_stream_calls),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&event_tx),
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("stream interruption remains a provider-call outcome")
+        .chat_result
+        .expect_err("visible stream failure must remain terminal");
+
+        match event_rx
+            .recv()
+            .await
+            .expect("visible chunk must be delivered")
+        {
+            zeroclaw_api::agent::TurnEvent::Chunk { delta } => assert_eq!(delta, "visible"),
+            other => panic!("expected visible chunk, got {other:?}"),
+        }
+        let interrupted = error
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("visible output must preserve its typed interruption outcome");
+        assert_eq!(interrupted.partial_text, "visible");
+        assert_eq!(
+            interrupted.to_string(),
+            "model_provider stream error: ModelProvider error: 503 Service Unavailable"
+        );
+
+        let terminal = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("stream interruption must expose its typed provider cause");
+        assert_eq!(
+            terminal.kind(),
+            ReliableProviderTerminalFailureKind::ProviderServer
+        );
+        assert_eq!(
+            crate::agent::terminal_completion_error_message(&error, None),
+            Some(crate::i18n::get_required_cli_string(
+                "cli-agent-error-provider-server"
+            ))
+        );
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
