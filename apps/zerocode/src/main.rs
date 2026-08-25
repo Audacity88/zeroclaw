@@ -41,6 +41,8 @@ mod mouse;
 mod quickstart_pane;
 mod sop_pane;
 mod terminal_backend;
+#[cfg(test)]
+mod test_support;
 mod text_navigation;
 mod theme;
 mod todo_tracker;
@@ -1102,6 +1104,8 @@ mod connection_tests {
             std::thread::sleep(Duration::from_millis(10));
         };
 
+        // SAFETY: `owner.id()` is the live child PID returned by `spawn`; this
+        // test sends a standard signal and does not pass pointers across FFI.
         let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, signal) };
         assert_eq!(
             signal_result,
@@ -1111,6 +1115,8 @@ mod connection_tests {
         );
         assert!(owner.wait().expect("wait signal owner").success());
 
+        // SAFETY: signal 0 performs a process-existence probe only; `daemon_pid`
+        // was parsed from the child helper's PID file and no pointers are used.
         let child_probe = unsafe { libc::kill(daemon_pid as libc::pid_t, 0) };
         assert_eq!(child_probe, -1, "spawned daemon pid {daemon_pid} survived");
         assert_eq!(
@@ -1349,24 +1355,19 @@ mod connection_tests {
 
         let restored = terminal_attributes(slave_fd);
         assert_terminal_attributes_equal(&original, &restored);
+        drain_pty_output(&mut master, &mut output);
         unsafe { libc::close(slave_fd) };
 
-        drain_pty_output(&mut master, &mut output);
-        // macOS libtest consumes SIGINT alongside Tokio and can discard the
-        // helper's post-signal PTY bytes even after restore_terminal returns.
-        // The real-binary PTY smoke test covers those escape sequences.
-        if !(cfg!(target_os = "macos") && signal == libc::SIGINT) {
-            for sequence in [
-                b"\x1b[?2004l".as_slice(),
-                b"\x1b[?1006l".as_slice(),
-                b"\x1b[?1000l".as_slice(),
-                b"\x1b[?1049l".as_slice(),
-            ] {
-                assert!(
-                    output_contains(&output, sequence),
-                    "terminal teardown omitted {sequence:?}; output: {output:?}"
-                );
-            }
+        for sequence in [
+            b"\x1b[?2004l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+            b"\x1b[?1000l".as_slice(),
+            b"\x1b[?1049l".as_slice(),
+        ] {
+            assert!(
+                output_contains(&output, sequence),
+                "terminal teardown omitted {sequence:?}; output: {output:?}"
+            );
         }
     }
 
