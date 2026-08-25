@@ -187,6 +187,17 @@ assert scoped_command in windows_job
 assert full_command in windows_job
 assert windows_job.index("scoped)") < windows_job.index(scoped_command)
 assert windows_job.index("full)") < windows_job.index(full_command)
+scoped_case = windows_job.split("\n            scoped)\n", 1)[1].split(
+    "\n              ;;\n", 1
+)[0]
+full_case = windows_job.split("\n            full)\n", 1)[1].split(
+    "\n              ;;\n", 1
+)[0]
+for case, command in ((scoped_case, scoped_command), (full_case, full_command)):
+    assert case.index("set +e") < case.index(command)
+    assert case.index(command) < case.index("status=$?")
+    assert case.index("status=$?") < case.index("set -e")
+assert '\n          exit "$status"' in windows_job
 assert normalization in windows_job
 assert extraction in windows_job
 assert windows_job.index(normalization) < windows_job.index(extraction)
