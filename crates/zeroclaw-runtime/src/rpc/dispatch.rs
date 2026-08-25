@@ -317,6 +317,12 @@ impl Method {
 }
 
 type RpcResult = Result<Value, JsonRpcError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconciledSessionInsertError {
+    Busy,
+    LimitReached,
+}
 type BoxRpcFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RpcResult> + Send + 'a>>;
 
 fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
@@ -910,7 +916,7 @@ impl RpcDispatcher {
         agent_alias: &str,
         cwd: &str,
         chat_mode: crate::rpc::types::ChatMode,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), ReconciledSessionInsertError> {
         // Reconcile the exact local agent before publication. Sharing the
         // mutation lock makes either this insert or mutation enumeration win.
         let _config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
@@ -929,6 +935,11 @@ impl RpcDispatcher {
         {
             Self::refresh_channel_handles_for_agent(&agent, &configured);
         }
+        if self.ctx.sessions.get_agent(&session_id).await.is_some()
+            || self.ctx.sessions.has_inflight_turn(&session_id)
+        {
+            return Err(ReconciledSessionInsertError::Busy);
+        }
         self.ctx
             .sessions
             .insert(
@@ -937,6 +948,7 @@ impl RpcDispatcher {
                     .with_owner(self.tui_id.clone()),
             )
             .await
+            .map_err(|_| ReconciledSessionInsertError::LimitReached)
     }
 
     /// Construct a pre-authenticated dispatcher sharing the same context and
@@ -1583,7 +1595,7 @@ impl RpcDispatcher {
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
-        let _recovery_guard = if resuming && matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+        let _session_guard = if resuming {
             let guard = self
                 .ctx
                 .sessions
@@ -1591,8 +1603,12 @@ impl RpcDispatcher {
                 .acquire(&session_id)
                 .await
                 .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
-            if self.ctx.sessions.get_agent(&session_id).await.is_none()
-                && !self.ctx.sessions.has_inflight_turn(&session_id)
+            if self.ctx.sessions.get_agent(&session_id).await.is_some()
+                || self.ctx.sessions.has_inflight_turn(&session_id)
+            {
+                return Err(rpc_err(SESSION_BUSY, "Session already active"));
+            }
+            if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
                 && let Some(store) = self.ctx.acp_session_store.clone()
             {
                 recover_acp_checkpoint(store, &session_id)
@@ -1724,7 +1740,14 @@ impl RpcDispatcher {
             chat_mode.clone(),
         )
         .await
-        .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+        .map_err(|error| match error {
+            ReconciledSessionInsertError::Busy => {
+                rpc_err(SESSION_BUSY, "Session became active during creation")
+            }
+            ReconciledSessionInsertError::LimitReached => {
+                rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
+            }
+        })?;
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -2215,12 +2238,6 @@ impl RpcDispatcher {
             resume.notified().await;
         }
 
-        if self.ctx.sessions.get_agent(sid).await.is_some()
-            || self.ctx.sessions.has_inflight_turn(sid)
-        {
-            return None;
-        }
-
         let message_count = data.messages.len();
         self.insert_reconciled_session(
             sid.to_string(),
@@ -2556,7 +2573,7 @@ impl RpcDispatcher {
             },
         );
         tokio::pin!(turn);
-        let outcome = tokio::select! {
+        let mut outcome = tokio::select! {
             biased;
             _ = self.connection_cancel.cancelled() => {
                 self.ctx
@@ -7647,7 +7664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_cancel_suppresses_checkpoint_notification() {
+    async fn checkpoint_notification_suppressed_after_connection_cancel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let connection_cancel = tokio_util::sync::CancellationToken::new();
@@ -10118,27 +10135,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_new_reconciles_local_agent_before_duplicate_id_publication() {
+    async fn session_new_reconciles_absent_agent_before_publication() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_channel_refresh_test_config(&tmp);
         let (mut dispatcher, _rx, sessions) = make_channel_refresh_test_dispatcher(config);
         seed_test_channel_factory(&mut dispatcher);
 
         let session_id = "channel-refresh-race";
-        dispatcher
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "sibling",
-                "exclude_memory": true,
-                "chat_mode": "chat",
-                "session_id": session_id,
-            }))
-            .await
-            .expect("preexisting duplicate-ID sibling must be live");
-        let published_sibling = sessions
-            .get_agent(session_id)
-            .await
-            .expect("duplicate-ID sibling agent");
-
         let seeded = Arc::new(tokio::sync::Notify::new());
         let resume = Arc::new(tokio::sync::Notify::new());
         dispatcher
@@ -10157,27 +10160,17 @@ mod tests {
         let session_new = dispatcher.handle_session_new_for_test(&session_params);
         let mutation = async {
             seeded.notified().await;
-            assert_eq!(
-                sessions.get_agent_alias(session_id).await.as_deref(),
-                Some("sibling"),
-                "the paused local test-agent must remain unpublished"
-            );
-            let still_published = sessions
-                .get_agent(session_id)
-                .await
-                .expect("the prior sibling must remain published while paused");
             assert!(
-                Arc::ptr_eq(&published_sibling, &still_published),
-                "the paused session must not replace the duplicate ID before reconciliation"
+                sessions.get_agent(session_id).await.is_none(),
+                "the seeded local agent must remain unpublished before reconciliation"
             );
             dispatcher
                 .handle_config_set(&mutation_params)
                 .await
                 .expect("channel revocation must commit while the session is unpublished");
-            assert_eq!(
-                sessions.get_agent_alias(session_id).await.as_deref(),
-                Some("sibling"),
-                "the prior sibling must remain published through mutation refresh"
+            assert!(
+                sessions.get_agent(session_id).await.is_none(),
+                "the local agent must remain unpublished through mutation refresh"
             );
             resume.notify_one();
         };
@@ -10191,11 +10184,7 @@ mod tests {
         assert_eq!(
             sessions.get_agent_alias(session_id).await.as_deref(),
             Some("test-agent"),
-            "the reconciled local agent must replace the duplicate ID"
-        );
-        assert!(
-            !Arc::ptr_eq(&published_sibling, &agent),
-            "publication must install the local agent rather than mutate the prior sibling"
+            "publication must install the reconciled local agent"
         );
         {
             let agent = agent.lock().await;
@@ -10207,19 +10196,138 @@ mod tests {
             );
         }
         assert_reaction_denied_after_channel_refresh(&agent).await;
-        assert_rpc_and_configured_channels(
-            Arc::clone(&published_sibling),
-            "git.sibling",
-            "git.configured",
-        )
-        .await;
-        assert!(
-            dispatcher.ctx.config.read().agents["sibling"]
-                .channels
-                .iter()
-                .any(|channel| channel == "git.sibling"),
-            "the fixture must retain a sibling binding in explicit-binding mode"
+    }
+
+    #[tokio::test]
+    async fn session_new_reconciles_existing_duplicate_without_replacement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_channel_refresh_test_config(&tmp);
+        let (mut dispatcher, _rx, sessions) = make_channel_refresh_test_dispatcher(config);
+        seed_test_channel_factory(&mut dispatcher);
+
+        let session_id = "channel-refresh-duplicate";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "sibling",
+                "exclude_memory": true,
+                "chat_mode": "chat",
+                "session_id": session_id,
+            }))
+            .await
+            .expect("preexisting duplicate-ID sibling must be live");
+        let published_sibling = sessions
+            .get_agent(session_id)
+            .await
+            .expect("duplicate-ID sibling agent");
+
+        let error = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "chat",
+                "session_id": session_id,
+            }))
+            .await
+            .expect_err("a live explicit session ID must not be replaced");
+        assert_eq!(error.code, SESSION_BUSY);
+
+        let still_published = sessions
+            .get_agent(session_id)
+            .await
+            .expect("the original session must remain published");
+        assert!(Arc::ptr_eq(&published_sibling, &still_published));
+        assert_eq!(
+            sessions.get_agent_alias(session_id).await.as_deref(),
+            Some("sibling")
         );
+    }
+
+    #[tokio::test]
+    async fn session_new_reconciles_inflight_prompt_as_busy() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_channel_refresh_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(1, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::clone(&queue),
+        ));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-inflight".into());
+        dispatcher.authenticated = true;
+        seed_test_channel_factory(&mut dispatcher);
+
+        let session_id = "channel-refresh-active-prompt";
+        let params = json!({
+            "agent_alias": "test-agent",
+            "exclude_memory": true,
+            "chat_mode": "chat",
+            "session_id": session_id,
+        });
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("initial session must be live");
+        let live_agent = sessions.get_agent(session_id).await.unwrap();
+
+        // Mirror the prompt lifecycle after it acquires the actor queue and
+        // publishes its cancellation token.
+        let prompt_guard = queue.acquire(session_id).await.unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let generation = sessions.register_cancel_token(session_id, token.clone());
+
+        let error = dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect_err("an inflight prompt must make duplicate session/new busy");
+        assert_eq!(error.code, SESSION_BUSY);
+        let still_live = sessions.get_agent(session_id).await.unwrap();
+        assert!(Arc::ptr_eq(&live_agent, &still_live));
+        assert!(sessions.has_inflight_turn(session_id));
+        assert!(!token.is_cancelled());
+
+        sessions.remove_cancel_token(session_id, generation);
+        drop(prompt_guard);
+    }
+
+    #[tokio::test]
+    async fn session_new_reconciles_late_inflight_before_publication() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_channel_refresh_test_config(&tmp);
+        let (mut dispatcher, _rx, sessions) = make_channel_refresh_test_dispatcher(config);
+        seed_test_channel_factory(&mut dispatcher);
+
+        let session_id = "channel-refresh-inflight";
+        let seeded = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        dispatcher
+            .set_channel_seed_insert_barrier_for_test(Arc::clone(&seeded), Arc::clone(&resume));
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "exclude_memory": true,
+            "chat_mode": "chat",
+            "session_id": session_id,
+        });
+        let session_new = dispatcher.handle_session_new_for_test(&params);
+        let publish_inflight = async {
+            seeded.notified().await;
+            // Fault-inject the otherwise queue-excluded late state to prove
+            // the final publication fence remains defensive on its own.
+            let generation = sessions
+                .register_cancel_token(session_id, tokio_util::sync::CancellationToken::new());
+            resume.notify_one();
+            generation
+        };
+        let (result, generation) = tokio::join!(session_new, publish_inflight);
+
+        let error = result.expect_err("an inflight owner must block final publication");
+        assert_eq!(error.code, SESSION_BUSY);
+        assert!(sessions.get_agent(session_id).await.is_none());
+        assert!(sessions.has_inflight_turn(session_id));
+        sessions.remove_cancel_token(session_id, generation);
     }
 
     async fn channel_auth_deletes_roll_back_live_state_when_save_fails_body() {
@@ -11269,8 +11377,9 @@ mod tests {
             .unwrap()
             .channels = vec!["git.after-reload".into()];
 
+        let _guard = sessions.session_queue.acquire(sid).await.unwrap();
         let agent = dispatcher
-            .rehydrate_reaped_session(sid)
+            .rehydrate_reaped_session_under_guard(sid)
             .await
             .expect("durable ACP session should rehydrate");
         assert_rpc_and_configured_channels(agent, "git.after-reload", "git.before-reload").await;
@@ -11281,7 +11390,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let (dispatcher, _sessions, _chat_backend, acp_store) =
+        let (dispatcher, sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
 
         let sid = "acp-cwd-resume-001";
@@ -11302,6 +11411,10 @@ mod tests {
         assert_eq!(
             acp_store.load_session(sid).unwrap().unwrap().workspace_dir,
             original_cwd
+        );
+        assert!(
+            sessions.remove(sid).await,
+            "resume must model an absent in-memory owner"
         );
 
         // Resume with NO cwd: the daemon must report the persisted cwd, not the
@@ -11324,10 +11437,12 @@ mod tests {
     #[tokio::test]
     async fn live_acp_resume_leaves_pending_checkpoint_for_later_recovery() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.before-reload".into()];
         let data_dir = config.data_dir.clone();
-        let (dispatcher, sessions, _chat_backend, acp_store) =
+        let (mut dispatcher, sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
+        seed_test_channel_factory(&mut dispatcher);
 
         let sid = "acp-live-checkpoint-001";
         let params = json!({
@@ -11340,6 +11455,10 @@ mod tests {
             .handle_session_new_for_test(&params)
             .await
             .expect("initial session/new should succeed");
+        let live_agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("initial session owner must be live");
         acp_store
             .begin_turn_checkpoint(
                 sid,
@@ -11357,10 +11476,16 @@ mod tests {
             )
             .unwrap();
 
-        dispatcher
+        let error = dispatcher
             .handle_session_new_for_test(&params)
             .await
-            .expect("live session/new should preserve existing resume behavior");
+            .expect_err("a live ACP owner must reject duplicate session/new");
+        assert_eq!(error.code, SESSION_BUSY);
+        let still_live = sessions
+            .get_agent(sid)
+            .await
+            .expect("duplicate rejection must preserve the live owner");
+        assert!(Arc::ptr_eq(&live_agent, &still_live));
         assert!(
             acp_store
                 .load_session(sid)
@@ -11372,13 +11497,21 @@ mod tests {
         );
 
         assert!(sessions.remove(sid).await);
-        assert!(
-            acp_store
-                .recover_turn_checkpoint(sid, "stream interrupted")
-                .unwrap(),
-            "the skipped checkpoint must remain available after the live owner exits"
-        );
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .channels = vec!["git.after-reload".into()];
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("an absent owner must recover and republish the ACP session");
+
         let restored = acp_store.load_session(sid).unwrap().unwrap();
+        let interrupted_marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
         assert!(matches!(
             &restored.messages[..],
             [
@@ -11388,8 +11521,18 @@ mod tests {
             ] if user.role == "user"
                 && assistant.content == "partial answer"
                 && marker.role == "system"
-                && marker.content == "stream interrupted"
+                && marker.content == interrupted_marker
         ));
+        let recovered_agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("recovered ACP session must be published once");
+        assert_rpc_and_configured_channels(
+            recovered_agent,
+            "git.after-reload",
+            "git.before-reload",
+        )
+        .await;
     }
 
     #[tokio::test]
