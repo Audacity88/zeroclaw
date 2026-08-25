@@ -4,6 +4,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 selector="${script_dir}/windows_test_scope.py"
+workflow="${script_dir}/../../.github/workflows/ci.yml"
 fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
 
@@ -157,5 +158,20 @@ if [ -e "$repo_root/unsafe" ]; then
     echo "FAIL: package JSON was executed" >&2
     exit 1
 fi
+
+WORKFLOW="$workflow" python3 - <<'PY'
+import os
+from pathlib import Path
+
+workflow = Path(os.environ["WORKFLOW"]).read_text()
+windows_job = workflow.split("\n  windows-test:\n", 1)[1].split(
+    "\n  parallel-runtime-test-changes:\n", 1
+)[0]
+normalization = 'archive="$(cygpath -u "$archive")"'
+extraction = 'tar zxf "$archive" -C "$HOME/.cargo/bin"'
+assert normalization in windows_job
+assert extraction in windows_job
+assert windows_job.index(normalization) < windows_job.index(extraction)
+PY
 
 echo "windows test scope contract tests: pass"

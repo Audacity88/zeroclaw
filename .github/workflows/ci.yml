@@ -690,6 +690,9 @@ jobs:
             echo "::error::cargo-nextest checksum mismatch (expected $NEXTEST_SHA256, got $actual_sha256)"
             exit 1
           fi
+          if command -v cygpath >/dev/null 2>&1; then
+            archive="$(cygpath -u "$archive")"
+          fi
           tar zxf "$archive" -C "$HOME/.cargo/bin"
       - name: Run advisory Windows tests
         shell: bash
