@@ -3778,20 +3778,10 @@ mod tests {
         let body = format!(r#"{{"error":"{secret} {}"}}"#, "x".repeat(4_000));
         let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body).to_string();
 
-        assert!(error.contains("401 Unauthorized"));
+        assert!(error.starts_with("ModelProvider error: 401 Unauthorized:"));
         assert!(error.contains("[REDACTED]"));
         assert!(!error.contains(secret));
         assert!(error.chars().count() <= 550);
-    }
-
-    #[test]
-    fn streaming_api_error_display_matches_model_provider_stream_contract() {
-        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, "invalid credentials");
-
-        assert_eq!(
-            error.to_string(),
-            "ModelProvider error: 401 Unauthorized: invalid credentials"
-        );
     }
 
     fn make_model_provider(
