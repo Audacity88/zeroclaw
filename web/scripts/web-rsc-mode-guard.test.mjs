@@ -427,17 +427,23 @@ test("code-generation identifiers are rejected without lexical false positives",
     "eval();",
     "Function();",
     "new Function();",
+    `(() => {}).constructor("return import('react-router-dom/server')")();`,
+    `const make = (() => {}).constructor;
+make("return import('react-router-dom/server')")();`,
+    `globalThis.constructor.constructor("return import('react-router-dom/server')")();`,
+    `const make = globalThis.constructor.constructor;
+make("return import('react-router-dom/server')")();`,
     `globalThis["Function"]("return 1")();`,
     `window["eval"]("1")`,
     `globalThis["e" + "val"]("1")`,
     `self[["Function"].join("")]("return 1")()`,
   ]) {
     const { repoRoot } = createFixture(t, { source });
-    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*(?:forbidden code-generation identifier|forbidden computed global access)/);
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*(?:forbidden code-generation identifier|forbidden computed global access|forbidden dynamic code constructor)/);
   }
 
   const safe = createFixture(t, {
-    source: `const note = "eval Function"; // eval() and Function() are text only\nexport { note };`,
+    source: `const note = "eval Function"; // eval() and Function() are text only\nconst constructor = globalThis.constructor;\nconst inspected = globalThis.constructor.constructor;\nexport { note, constructor, inspected };`,
   });
   await runGuard(safe.repoRoot);
 });
@@ -821,6 +827,30 @@ test("reachable dependency modules enforce the RSC-focused policy", async (t) =>
       /imports RSC\/server-capable module react-router-dom\/server/,
     ],
     [
+      `globalThis.constructor.constructor("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /dynamic code constructor/,
+    ],
+    [
+      `(() => {}).constructor("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /dynamic code constructor/,
+    ],
+    [
+      `const make = globalThis.constructor.constructor;\nmake("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /dynamic code constructor/,
+    ],
+    [
+      `Reflect.get(globalThis, "constructor").constructor("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /dynamic code constructor/,
+    ],
+    [
+      `const key = getKey();\nReflect.get(globalThis, key).constructor("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /dynamic code constructor/,
+    ],
+    [
+      `const key = getKey();\nglobalThis[key][key]("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /(?:imports RSC\/server-capable module|unanalyzable evaluator argument)/,
+    ],
+    [
       `eval.call(null, "import('react-router-dom/server')");\nexport const page = true;\n`,
       /imports RSC\/server-capable module react-router-dom\/server/,
     ],
@@ -871,6 +901,38 @@ test("reachable dependency modules enforce the RSC-focused policy", async (t) =>
     [
       `const hidden = ["import('react-router-dom/server')"];\nconst args = [...hidden];\nsetTimeout.apply(null, args);\nexport const page = true;\n`,
       /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `setTimeout(getGeneratedSource(), 0);\nexport const page = true;\n`,
+      /timer handler is not statically recoverable or callable/,
+    ],
+    [
+      `const fake = { bind() { return "import('react-router-dom/server')"; } };\nsetTimeout(fake.bind(), 0);\nexport const page = true;\n`,
+      /timer handler is not statically recoverable or callable/,
+    ],
+    [
+      `const worker = { run() {} };\nworker.run = getGeneratedSource();\nsetTimeout(worker.run, 0);\nexport const page = true;\n`,
+      /timer handler is not statically recoverable or callable/,
+    ],
+    [
+      `class Worker { run() {} schedule() { this.run = getGeneratedSource(); setTimeout(this.run, 0); } }\nnew Worker().schedule();\nexport const page = true;\n`,
+      /timer handler is not statically recoverable or callable/,
+    ],
+    [
+      `const later = setTimeout;\nlater(getGeneratedSource(), 0);\nexport const page = true;\n`,
+      /timer handler is not statically recoverable or callable/,
+    ],
+    [
+      `globalThis.setTimeout(getGeneratedSource(), 0);\nexport const page = true;\n`,
+      /timer handler is not statically recoverable or callable/,
+    ],
+    [
+      `const later = globalThis.setTimeout;\nlater(getGeneratedSource(), 0);\nexport const page = true;\n`,
+      /timer handler is not statically recoverable or callable/,
+    ],
+    [
+      `const args = [getGeneratedSource(), 0];\nsetTimeout(...args);\nexport const page = true;\n`,
+      /timer handler is not statically recoverable or callable/,
     ],
     [
       `const args = getArguments();\neval.apply(null, args);\nexport const page = true;\n`,
@@ -936,6 +998,68 @@ test("reachable declared client-only dependency modules pass", async (t) => {
   await runGuard(repoRoot);
 });
 
+test("reachable dependency timers preserve callable handlers", async (t) => {
+  const { repoRoot, webRoot } = createFixture(t, {
+    source: `import { page } from "foo";\nexport { page };`,
+  });
+  addFixtureDependency(
+    webRoot,
+    "foo",
+    `
+function handler() {}
+const arrow = () => {};
+const bound = handler.bind(null);
+const defer = setTimeout.bind(null);
+const named = function namedHandler() {
+  setTimeout(namedHandler, 0);
+};
+class Scheduler {
+  constructor() {
+    this.run = this.run.bind(this);
+  }
+  run() {}
+  schedule() {
+    setTimeout(this.run, 0);
+  }
+}
+setTimeout(handler, 0);
+setInterval(arrow, 0);
+setTimeout(bound, 0);
+setTimeout(handler.bind(null), 0);
+defer(handler, 0);
+setTimeout(named, 0);
+new Promise((resolve) => setTimeout(resolve, 0));
+new Scheduler().schedule();
+export const page = true;
+`,
+  );
+  await runGuard(repoRoot);
+});
+
+test("reachable dependency timers reject mutated callable proofs", async (t) => {
+  const cases = [
+    `const worker = { run() {} };\nconst alias = worker;\nalias.run = "import('react-router-dom/server')";\nsetTimeout(worker.run, 0);`,
+    `const worker = { run() {} };\nworker["run"] = "import('react-router-dom/server')";\nsetTimeout(worker.run, 0);`,
+    `const worker = { run() {} };\nObject.assign(worker, { run: "import('react-router-dom/server')" });\nsetTimeout(worker.run, 0);`,
+    `const worker = { run() {} };\nReflect.set(worker, "run", "import('react-router-dom/server')");\nsetTimeout(worker.run, 0);`,
+    `const worker = { run() {} };\nconst assign = Object.assign;\nassign(worker, { run: "import('react-router-dom/server')" });\nsetTimeout(worker.run, 0);`,
+    `const worker = { run() {} };\nconst set = Reflect.set;\nset(worker, "run", "import('react-router-dom/server')");\nsetTimeout(worker.run, 0);`,
+    `const worker = { run() {} };\nconst ObjectAlias = Object;\nObjectAlias.assign(worker, { run: "import('react-router-dom/server')" });\nsetTimeout(worker.run, 0);`,
+    `const worker = { run() {} };\nconst ReflectAlias = Reflect;\nReflectAlias.set(worker, "run", "import('react-router-dom/server')");\nsetTimeout(worker.run, 0);`,
+    `const handler = () => {};\nhandler.bind = () => "import('react-router-dom/server')";\nsetTimeout(handler.bind(), 0);`,
+    `Function.prototype.bind = () => "import('react-router-dom/server')";\nconst handler = () => {};\nsetTimeout(handler.bind(), 0);`,
+    `const prototype = Function.prototype;\nObject.defineProperty(prototype, "bind", { value: () => "import('react-router-dom/server')" });\nconst handler = () => {};\nsetTimeout(handler.bind(), 0);`,
+    `const FunctionAlias = Function;\nFunctionAlias.prototype.bind = () => "import('react-router-dom/server')";\nconst handler = () => {};\nsetTimeout(handler.bind(), 0);`,
+  ];
+  for (const dependencySource of cases) {
+    const { repoRoot, webRoot } = createFixture(t, {
+      source: `import { page } from "foo";\nexport { page };`,
+    });
+    addFixtureDependency(webRoot, "foo", `${dependencySource}\nexport const page = true;\n`);
+    await expectFailure(t, repoRoot, /web-rsc-mode-guard: .*handler is not statically recoverable or callable/);
+  }
+});
+
 test("reachable browser dependencies may use ordinary vendor runtime patterns", async (t) => {
   const { repoRoot, webRoot } = createFixture(t, {
     source: `import { page } from "foo";\nexport { page };`,
@@ -948,6 +1072,10 @@ const browserRoot = window;
 const worker = { flush() {} };
 const value = () => true;
 const printed = Function.prototype.toString.call(value);
+const bind = Function.prototype.bind;
+bind.apply(console.error, []);
+const nextBlockedOn = { constructor: class SyntheticEvent {} };
+new nextBlockedOn.constructor(getEvent());
 setTimeout(worker.flush.bind(worker), 10);
 {
   const require = (specifier) => specifier;

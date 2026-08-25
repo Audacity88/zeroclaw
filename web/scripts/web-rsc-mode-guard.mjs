@@ -371,7 +371,7 @@ function inspectSource(filePath, source, records) {
   const bindingsByScope = new Map();
   const promiseResolverCandidates = [];
 
-  function addBinding(scope, name, callable) {
+  function addBinding(scope, name, callable, initializer = null) {
     if (!name) {
       return;
     }
@@ -383,16 +383,18 @@ function inspectSource(filePath, source, records) {
     if (bindings.has(name)) {
       const binding = bindings.get(name);
       binding.callable &&= callable;
+      binding.initializer = null;
+      binding.mutated = true;
       return binding;
     }
-    const binding = { callable, mutated: false };
+    const binding = { callable, initializer, mutated: false };
     bindings.set(name, binding);
     return binding;
   }
 
-  function addBindingNames(scope, name, callable = false) {
+  function addBindingNames(scope, name, callable = false, initializer = null) {
     if (ts.isIdentifier(name)) {
-      return [addBinding(scope, name.text, callable)];
+      return [addBinding(scope, name.text, callable, initializer)];
     }
     const bindings = [];
     for (const element of name.elements) {
@@ -492,6 +494,7 @@ function inspectSource(filePath, source, records) {
               initializer &&
               (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)),
           ),
+        initializer,
       );
     }
     ts.forEachChild(node, collectBindings);
@@ -606,6 +609,89 @@ function inspectSource(filePath, source, records) {
       timerNames.has(timerExpression.name.text)
     ) {
       return timerExpression.name.text;
+    }
+    return null;
+  }
+
+  function stableInitializer(expression) {
+    if (!ts.isIdentifier(expression)) {
+      return null;
+    }
+    const binding = resolveBindingFromScope(nearestScope(expression.parent), expression.text);
+    if (
+      !binding?.initializer ||
+      binding.mutated ||
+      binding.initializer.pos >= expression.pos
+    ) {
+      return null;
+    }
+    return binding.initializer;
+  }
+
+  function executionKind(node, seen = new Set()) {
+    const expression = unwrapTimerHandler(node);
+    if (
+      ts.isBinaryExpression(expression) &&
+      expression.operatorToken.kind === ts.SyntaxKind.CommaToken
+    ) {
+      return executionKind(expression.right, seen);
+    }
+    if (ts.isIdentifier(expression)) {
+      const key = `${expression.pos}:${expression.text}`;
+      if (seen.has(key)) {
+        return null;
+      }
+      const initializer = stableInitializer(expression);
+      if (initializer) {
+        const nextSeen = new Set(seen);
+        nextSeen.add(key);
+        return executionKind(initializer, nextSeen);
+      }
+      return forbiddenCodeGenerationIdentifiers.has(expression.text)
+        ? { kind: expression.text, invocation: "direct" }
+        : null;
+    }
+    if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+      const propertyName = ts.isPropertyAccessExpression(expression)
+        ? expression.name.text
+        : literalText(expression.argumentExpression);
+      if (["call", "bind", "apply"].includes(propertyName)) {
+        const target = executionKind(expression.expression, seen);
+        return target ? { ...target, invocation: propertyName } : null;
+      }
+      const target = executionKind(expression.expression, seen);
+      if (propertyName === "constructor") {
+        return (
+          target?.kind === "constructor" ||
+          target?.kind === "Function" ||
+          target?.kind === "unknown-global" ||
+          isCallableTimerHandler(expression.expression)
+        )
+          ? { kind: "Function", invocation: "direct", constructor: true }
+          : { kind: "constructor", invocation: "direct" };
+      }
+      if (
+        ts.isIdentifier(expression.expression) &&
+        globalObjectNames.has(expression.expression.text) &&
+        !resolveBindingFromScope(
+          nearestScope(expression.expression.parent),
+          expression.expression.text,
+        )
+      ) {
+        if (forbiddenCodeGenerationIdentifiers.has(propertyName)) {
+          return { kind: propertyName, invocation: "direct" };
+        }
+        if (timerNames.has(propertyName)) {
+          return { kind: "timer", invocation: "direct" };
+        }
+      }
+    }
+    if (
+      ts.isCallExpression(expression) &&
+      ts.isPropertyAccessExpression(expression.expression) &&
+      expression.expression.name.text === "bind"
+    ) {
+      return executionKind(expression.expression.expression, seen);
     }
     return null;
   }
@@ -874,6 +960,10 @@ function inspectSource(filePath, source, records) {
       if (timer) {
         verifyTimerHandler(node, timer);
       }
+      const kind = executionKind(node.expression);
+      if (kind?.kind === "Function" || kind?.kind === "constructor") {
+        fail(`${relative} uses a forbidden dynamic code constructor`);
+      }
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
       const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
       if (isDynamicImport || isRequire) {
@@ -896,6 +986,12 @@ function inspectSource(filePath, source, records) {
         );
       }
     }
+    if (
+      ts.isNewExpression(node) &&
+      ["Function", "constructor"].includes(executionKind(node.expression)?.kind)
+    ) {
+      fail(`${relative} uses a forbidden dynamic code constructor`);
+    }
 
     ts.forEachChild(node, visit);
   }
@@ -907,6 +1003,8 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
   const sourceFile = parseSource(filePath, source);
   const relative = pathBasename(filePath);
   const bindingsByScope = new Map();
+  const promiseResolverCandidates = [];
+  const unsafeMemberMutationCache = new Map();
 
   function isScopeNode(node) {
     return (
@@ -934,7 +1032,7 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
     return scope === sourceFile ? null : nearestScope(scope.parent);
   }
 
-  function addBinding(scope, name, initializer = null) {
+  function addBinding(scope, name, initializer = null, callable = false) {
     if (!name) {
       return;
     }
@@ -946,24 +1044,26 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
     if (bindings.has(name)) {
       const binding = bindings.get(name);
       binding.initializer = null;
+      binding.callable = false;
       binding.mutated = true;
       return binding;
     }
-    const binding = { initializer, mutated: false };
+    const binding = { initializer, callable, mutated: false };
     bindings.set(name, binding);
     return binding;
   }
 
-  function addBindingNames(scope, name, initializer = null) {
+  function addBindingNames(scope, name, initializer = null, callable = false) {
     if (ts.isIdentifier(name)) {
-      addBinding(scope, name.text, initializer);
-      return;
+      return [addBinding(scope, name.text, initializer, callable)];
     }
+    const bindings = [];
     for (const element of name.elements) {
       if (!ts.isOmittedExpression(element)) {
-        addBindingNames(scope, element.name);
+        bindings.push(...addBindingNames(scope, element.name));
       }
     }
+    return bindings;
   }
 
   function resolveBinding(scope, name) {
@@ -989,19 +1089,49 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
     return nearestScope(declaration.parent);
   }
 
+  function isPromiseResolverParameter(parameter) {
+    const functionLike = parameter.parent;
+    if (
+      !ts.isFunctionLike(functionLike) ||
+      functionLike.parameters[0] !== parameter
+    ) {
+      return false;
+    }
+    let promiseConstructor = functionLike.parent;
+    while (promiseConstructor && ts.isParenthesizedExpression(promiseConstructor)) {
+      promiseConstructor = promiseConstructor.parent;
+    }
+    return (
+      ts.isNewExpression(promiseConstructor) &&
+      ts.isIdentifier(promiseConstructor.expression) &&
+      promiseConstructor.expression.text === "Promise" &&
+      promiseConstructor.arguments?.[0] &&
+      unwrapTimerHandler(promiseConstructor.arguments[0]) === functionLike
+    );
+  }
+
   function collectBindings(node) {
     if (ts.isFunctionDeclaration(node) && node.name) {
-      addBinding(nearestScope(node.parent), node.name.text);
+      addBinding(nearestScope(node.parent), node.name.text, null, true);
     } else if (ts.isFunctionExpression(node) && node.name) {
-      addBinding(node, node.name.text);
+      addBinding(node, node.name.text, null, true);
     } else if (ts.isClassDeclaration(node) && node.name) {
       addBinding(nearestScope(node.parent), node.name.text);
     } else if (ts.isClassExpression(node) && node.name) {
       addBinding(node, node.name.text);
     } else if (ts.isParameter(node)) {
-      addBindingNames(node.parent, node.name);
+      const bindings = addBindingNames(node.parent, node.name);
+      if (isPromiseResolverParameter(node)) {
+        promiseResolverCandidates.push({ binding: bindings[0], functionLike: node.parent });
+      }
     } else if (ts.isVariableDeclaration(node)) {
-      addBindingNames(variableScope(node), node.name, node.initializer ?? null);
+      const initializer = node.initializer ?? null;
+      addBindingNames(
+        variableScope(node),
+        node.name,
+        initializer,
+        Boolean(initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))),
+      );
     } else if (ts.isImportClause(node)) {
       if (node.name) {
         addBinding(sourceFile, node.name.text);
@@ -1125,6 +1255,30 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
     return null;
   }
 
+  function globalRootKind(node, seen = new Set()) {
+    const expression = unwrapTimerHandler(node);
+    if (!ts.isIdentifier(expression)) {
+      return null;
+    }
+    const binding = resolveBinding(nearestScope(expression.parent), expression.text);
+    if (!binding) {
+      return ["Object", "Reflect", "Function"].includes(expression.text)
+        ? expression.text
+        : null;
+    }
+    const key = `${expression.pos}:${expression.text}`;
+    if (seen.has(key)) {
+      return null;
+    }
+    const initializer = stableInitializer(expression);
+    if (!initializer) {
+      return null;
+    }
+    const nextSeen = new Set(seen);
+    nextSeen.add(key);
+    return globalRootKind(initializer, nextSeen);
+  }
+
   function executionKind(node, seen = new Set()) {
     const expression = unwrapTimerHandler(node);
     if (
@@ -1163,6 +1317,20 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
         const target = executionKind(expression.expression, seen);
         return target ? { ...target, invocation: propertyName } : null;
       }
+      const target = executionKind(expression.expression, seen);
+      if (propertyName === "constructor") {
+        return (
+          target?.kind === "constructor" ||
+          target?.kind === "Function" ||
+          target?.kind === "unknown-global" ||
+          isCallableTimerHandler(expression.expression)
+        )
+          ? { kind: "Function", invocation: "direct", constructor: true }
+          : { kind: "constructor", invocation: "direct" };
+      }
+      if (propertyName === null && target?.kind === "unknown-global") {
+        return target;
+      }
       if (
         !ts.isIdentifier(expression.expression) ||
         !globalObjectNames.has(expression.expression.text) ||
@@ -1176,6 +1344,47 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
       if (timerNames.has(propertyName)) {
         return { kind: "timer", invocation: "direct" };
       }
+      if (ts.isElementAccessExpression(expression) && propertyName === null) {
+        return { kind: "unknown-global", invocation: "direct" };
+      }
+    }
+    if (
+      ts.isCallExpression(expression) &&
+      (ts.isPropertyAccessExpression(expression.expression) ||
+        ts.isElementAccessExpression(expression.expression)) &&
+      (ts.isPropertyAccessExpression(expression.expression)
+        ? expression.expression.name.text
+        : recoverStaticString(expression.expression.argumentExpression)) === "get" &&
+      globalRootKind(expression.expression.expression) === "Reflect" &&
+      expression.arguments.length >= 2 &&
+      ts.isIdentifier(unwrapTimerHandler(expression.arguments[0])) &&
+      globalObjectNames.has(unwrapTimerHandler(expression.arguments[0]).text) &&
+      !resolveBinding(
+        nearestScope(unwrapTimerHandler(expression.arguments[0]).parent),
+        unwrapTimerHandler(expression.arguments[0]).text,
+      ) &&
+      recoverStaticString(expression.arguments[1]) === "constructor"
+    ) {
+      return { kind: "constructor", invocation: "direct" };
+    }
+    if (
+      ts.isCallExpression(expression) &&
+      (ts.isPropertyAccessExpression(expression.expression) ||
+        ts.isElementAccessExpression(expression.expression)) &&
+      (ts.isPropertyAccessExpression(expression.expression)
+        ? expression.expression.name.text
+        : recoverStaticString(expression.expression.argumentExpression)) === "get" &&
+      globalRootKind(expression.expression.expression) === "Reflect" &&
+      expression.arguments.length >= 2 &&
+      ts.isIdentifier(unwrapTimerHandler(expression.arguments[0])) &&
+      globalObjectNames.has(unwrapTimerHandler(expression.arguments[0]).text) &&
+      !resolveBinding(
+        nearestScope(unwrapTimerHandler(expression.arguments[0]).parent),
+        unwrapTimerHandler(expression.arguments[0]).text,
+      ) &&
+      recoverStaticString(expression.arguments[1]) === null
+    ) {
+      return { kind: "unknown-global", invocation: "direct" };
     }
     if (
       ts.isCallExpression(expression) &&
@@ -1185,6 +1394,361 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
       return executionKind(expression.expression.expression, seen);
     }
     return null;
+  }
+
+  function identifierResolvesToReceiver(node, receiver, seen = new Set()) {
+    const expression = unwrapTimerHandler(node);
+    if (!ts.isIdentifier(expression)) {
+      return false;
+    }
+    if (expression.text === receiver) {
+      return true;
+    }
+    const key = `${expression.pos}:${expression.text}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    const initializer = stableInitializer(expression);
+    if (!initializer) {
+      return false;
+    }
+    const nextSeen = new Set(seen);
+    nextSeen.add(key);
+    return identifierResolvesToReceiver(initializer, receiver, nextSeen);
+  }
+
+  function hasReceiverAlias(receiver) {
+    for (const bindings of bindingsByScope.values()) {
+      for (const [name, binding] of bindings) {
+        if (
+          name !== receiver &&
+          binding.initializer &&
+          identifierResolvesToReceiver(binding.initializer, receiver)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function mutationPrimitiveKind(node, seen = new Set()) {
+    const expression = unwrapTimerHandler(node);
+    if (ts.isIdentifier(expression)) {
+      const key = `${expression.pos}:${expression.text}`;
+      if (seen.has(key)) {
+        return null;
+      }
+      const initializer = stableInitializer(expression);
+      if (!initializer) {
+        return null;
+      }
+      const nextSeen = new Set(seen);
+      nextSeen.add(key);
+      return mutationPrimitiveKind(initializer, nextSeen);
+    }
+    if (!ts.isPropertyAccessExpression(expression) && !ts.isElementAccessExpression(expression)) {
+      return null;
+    }
+    const method = ts.isPropertyAccessExpression(expression)
+      ? expression.name.text
+      : recoverStaticString(expression.argumentExpression);
+    const owner = globalRootKind(expression.expression);
+    if (
+      owner === "Object" &&
+      ["assign", "defineProperty", "defineProperties"].includes(method)
+    ) {
+      return `Object.${method}`;
+    }
+    if (
+      owner === "Reflect" &&
+      ["set", "deleteProperty", "defineProperty", "setPrototypeOf"].includes(method)
+    ) {
+      return `Reflect.${method}`;
+    }
+    return null;
+  }
+
+  function resolvesToFunctionPrototype(node, seen = new Set()) {
+    const expression = unwrapTimerHandler(node);
+    if (ts.isIdentifier(expression)) {
+      const key = `${expression.pos}:${expression.text}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      const initializer = stableInitializer(expression);
+      if (!initializer) {
+        return false;
+      }
+      const nextSeen = new Set(seen);
+      nextSeen.add(key);
+      return resolvesToFunctionPrototype(initializer, nextSeen);
+    }
+    return (
+      (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) &&
+      (ts.isPropertyAccessExpression(expression)
+        ? expression.name.text
+        : recoverStaticString(expression.argumentExpression)) === "prototype" &&
+      globalRootKind(expression.expression) === "Function"
+    );
+  }
+
+  let unsafeNativeBindMutation;
+  function hasUnsafeNativeBindMutation() {
+    if (unsafeNativeBindMutation !== undefined) {
+      return unsafeNativeBindMutation;
+    }
+    unsafeNativeBindMutation = false;
+    function inspect(node) {
+      if (unsafeNativeBindMutation) {
+        return;
+      }
+      if (
+        ts.isBinaryExpression(node) &&
+        node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+        node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+        (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left)) &&
+        (ts.isPropertyAccessExpression(node.left)
+          ? node.left.name.text
+          : recoverStaticString(node.left.argumentExpression)) === "bind" &&
+        resolvesToFunctionPrototype(node.left.expression)
+      ) {
+        unsafeNativeBindMutation = true;
+        return;
+      }
+      if (
+        ts.isDeleteExpression(node) &&
+        (ts.isPropertyAccessExpression(node.expression) ||
+          ts.isElementAccessExpression(node.expression)) &&
+        (ts.isPropertyAccessExpression(node.expression)
+          ? node.expression.name.text
+          : recoverStaticString(node.expression.argumentExpression)) === "bind" &&
+        resolvesToFunctionPrototype(node.expression.expression)
+      ) {
+        unsafeNativeBindMutation = true;
+        return;
+      }
+      if (ts.isCallExpression(node)) {
+        const primitive = mutationPrimitiveKind(node.expression);
+        const target = node.arguments[0];
+        if (
+          primitive &&
+          target &&
+          resolvesToFunctionPrototype(target) &&
+          (primitive.endsWith("assign") ||
+            primitive.endsWith("defineProperties") ||
+            recoverStaticString(node.arguments[1]) === "bind")
+        ) {
+          unsafeNativeBindMutation = true;
+          return;
+        }
+      }
+      ts.forEachChild(node, inspect);
+    }
+    inspect(sourceFile);
+    return unsafeNativeBindMutation;
+  }
+
+  function memberAccessMatches(node, receiver, name) {
+    const access = unwrapTimerHandler(node);
+    if (!ts.isPropertyAccessExpression(access) && !ts.isElementAccessExpression(access)) {
+      return false;
+    }
+    const propertyName = ts.isPropertyAccessExpression(access)
+      ? access.name.text
+      : recoverStaticString(access.argumentExpression);
+    if (propertyName !== name) {
+      return false;
+    }
+    if (receiver === "this") {
+      return access.expression.kind === ts.SyntaxKind.ThisKeyword;
+    }
+    return identifierResolvesToReceiver(access.expression, receiver);
+  }
+
+  function hasUnsafeMemberMutation(root, receiver, name) {
+    const cacheKey = `${root.pos}:${root.end}:${receiver}:${name}`;
+    if (unsafeMemberMutationCache.has(cacheKey)) {
+      return unsafeMemberMutationCache.get(cacheKey);
+    }
+    let unsafe = false;
+    function inspect(node) {
+      if (unsafe) {
+        return;
+      }
+      if (
+        ts.isBinaryExpression(node) &&
+        node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+        node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+        memberAccessMatches(node.left, receiver, name)
+      ) {
+        const right = unwrapTimerHandler(node.right);
+        const safeSelfBind =
+          node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          ts.isCallExpression(right) &&
+          ts.isPropertyAccessExpression(right.expression) &&
+          right.expression.name.text === "bind" &&
+          memberAccessMatches(right.expression.expression, receiver, name) &&
+          right.arguments[0] &&
+          (receiver === "this"
+            ? right.arguments[0].kind === ts.SyntaxKind.ThisKeyword
+            : ts.isIdentifier(right.arguments[0]) && right.arguments[0].text === receiver);
+        if (!safeSelfBind) {
+          unsafe = true;
+          return;
+        }
+      }
+      if (
+        (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+        memberAccessMatches(node.operand, receiver, name)
+      ) {
+        unsafe = true;
+        return;
+      }
+      if (ts.isDeleteExpression(node) && memberAccessMatches(node.expression, receiver, name)) {
+        unsafe = true;
+        return;
+      }
+      if (
+        ts.isCallExpression(node)
+      ) {
+        const primitive = mutationPrimitiveKind(node.expression);
+        const target = node.arguments[0];
+        if (
+          primitive &&
+          target &&
+          (receiver === "this"
+            ? unwrapTimerHandler(target).kind === ts.SyntaxKind.ThisKeyword
+            : identifierResolvesToReceiver(target, receiver))
+        ) {
+          unsafe = true;
+          return;
+        }
+      }
+      ts.forEachChild(node, inspect);
+    }
+    inspect(root);
+    unsafeMemberMutationCache.set(cacheKey, unsafe);
+    return unsafe;
+  }
+
+  function isCallableThisMember(node) {
+    if (
+      !ts.isPropertyAccessExpression(node) ||
+      node.expression.kind !== ts.SyntaxKind.ThisKeyword
+    ) {
+      return false;
+    }
+    let classLike = node.parent;
+    while (classLike && !ts.isClassLike(classLike)) {
+      classLike = classLike.parent;
+    }
+    if (!classLike) {
+      return false;
+    }
+    const declaredCallable = classLike.members.some(
+      (member) =>
+        ts.isMethodDeclaration(member) &&
+        member.name &&
+        (ts.isIdentifier(member.name) || ts.isStringLiteralLike(member.name)) &&
+        member.name.text === node.name.text,
+    );
+    return (
+      declaredCallable &&
+      !hasUnsafeMemberMutation(classLike, "this", node.name.text)
+    );
+  }
+
+  function isCallableMemberAccess(node, seen) {
+    if (isCallableThisMember(node)) {
+      return true;
+    }
+    if (!ts.isPropertyAccessExpression(node) || !ts.isIdentifier(node.expression)) {
+      return false;
+    }
+    const receiver = node.expression.text;
+    const initializer = stableInitializer(node.expression);
+    if (!initializer || !ts.isObjectLiteralExpression(initializer)) {
+      return false;
+    }
+    for (const property of initializer.properties) {
+      if (!property.name) {
+        continue;
+      }
+      const propertyName = ts.isIdentifier(property.name)
+        ? property.name.text
+        : literalText(property.name);
+      if (propertyName !== node.name.text) {
+        continue;
+      }
+      if (ts.isMethodDeclaration(property)) {
+        return (
+          !hasReceiverAlias(receiver) &&
+          !hasUnsafeMemberMutation(sourceFile, receiver, node.name.text)
+        );
+      }
+      if (ts.isPropertyAssignment(property)) {
+        return (
+          isCallableTimerHandler(property.initializer, seen) &&
+          !hasReceiverAlias(receiver) &&
+          !hasUnsafeMemberMutation(sourceFile, receiver, node.name.text)
+        );
+      }
+      if (ts.isShorthandPropertyAssignment(property)) {
+        return (
+          isCallableTimerHandler(property.name, seen) &&
+          !hasReceiverAlias(receiver) &&
+          !hasUnsafeMemberMutation(sourceFile, receiver, node.name.text)
+        );
+      }
+    }
+    return false;
+  }
+
+  function isCallableTimerHandler(node, seen = new Set()) {
+    const handler = unwrapTimerHandler(node);
+    if (ts.isArrowFunction(handler) || ts.isFunctionExpression(handler)) {
+      return true;
+    }
+    if (ts.isIdentifier(handler)) {
+      const key = `${handler.pos}:${handler.text}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      const binding = resolveBinding(nearestScope(handler.parent), handler.text);
+      if (!binding || binding.mutated) {
+        return false;
+      }
+      if (binding.callable) {
+        return true;
+      }
+      const initializer = stableInitializer(handler);
+      if (!initializer) {
+        return false;
+      }
+      const nextSeen = new Set(seen);
+      nextSeen.add(key);
+      return isCallableTimerHandler(initializer, nextSeen);
+    }
+    if (
+      ts.isCallExpression(handler) &&
+      ts.isPropertyAccessExpression(handler.expression) &&
+      handler.expression.name.text === "bind"
+    ) {
+      const target = unwrapTimerHandler(handler.expression.expression);
+      if (hasUnsafeNativeBindMutation()) {
+        return false;
+      }
+      if (
+        ts.isIdentifier(target) &&
+        (hasReceiverAlias(target.text) ||
+          hasUnsafeMemberMutation(sourceFile, target.text, "bind"))
+      ) {
+        return false;
+      }
+      return isCallableTimerHandler(handler.expression.expression, seen);
+    }
+    return isCallableMemberAccess(handler, seen);
   }
 
   function commonJsLoaderKind(node, seen = new Set()) {
@@ -1330,6 +1894,12 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
   }
 
   collectBindings(sourceFile);
+  for (const { binding, functionLike } of promiseResolverCandidates) {
+    const scope = nearestScope(functionLike.parent);
+    if (binding && !resolveBinding(scope, "Promise")) {
+      binding.callable = true;
+    }
+  }
   collectMutations(sourceFile);
 
   function visit(node) {
@@ -1385,15 +1955,36 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
 
       const kind = executionKind(node.expression);
       if (kind) {
-        for (const argument of recoveredArguments(node, kind)) {
-          const recoveredSource = recoverStaticString(argument);
-          if (recoveredSource === null) {
-            if (kind.kind !== "timer") {
+        if (kind.constructor === true) {
+          fail(`${relative} uses a forbidden dynamic code constructor`);
+        }
+        if (
+          kind.kind === "timer" &&
+          ts.isPropertyAccessExpression(node.expression) &&
+          node.expression.name.text === "bind"
+        ) {
+          ts.forEachChild(node, visit);
+          return;
+        }
+        const arguments_ = recoveredArguments(node, kind);
+        if (kind.kind === "timer") {
+          const handler = arguments_[0];
+          const recoveredSource = handler && recoverStaticString(handler);
+          if (recoveredSource === null || recoveredSource === undefined) {
+            if (!handler || !isCallableTimerHandler(handler)) {
+              fail(`${relative} timer handler is not statically recoverable or callable`);
+            }
+          } else {
+            inspectRecoveredCode(recoveredSource, kind.kind);
+          }
+        } else if (kind.kind !== "constructor") {
+          for (const argument of arguments_) {
+            const recoveredSource = recoverStaticString(argument);
+            if (recoveredSource === null) {
               fail(`${relative} uses an unanalyzable evaluator argument`);
             }
-            continue;
+            inspectRecoveredCode(recoveredSource, kind.kind);
           }
-          inspectRecoveredCode(recoveredSource, kind.kind);
         }
       }
     }
