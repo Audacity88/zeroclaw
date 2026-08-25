@@ -1377,6 +1377,12 @@ impl Logs {
     pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
         use crate::keymap::LogsTabAction;
 
+        if self.search_active {
+            self.copy_menu = None;
+            self.text_selection = None;
+            self.copy_feedback = None;
+            return self.handle_search_key(key).await;
+        }
         if self.copy_menu.is_some() {
             match key.code {
                 KeyCode::Enter => return self.confirm_copy_menu_key(), // keyguard: transient copy-menu confirmation
@@ -1393,9 +1399,6 @@ impl Logs {
         }
         self.text_selection = None;
         self.copy_feedback = None;
-        if self.search_active {
-            return self.handle_search_key(key).await;
-        }
         if self.detail_open {
             return self.handle_detail_key(key).await;
         }
@@ -1420,7 +1423,9 @@ impl Logs {
             }
             _ => {
                 if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
                 {
                     self.search_buf.push(c);
                 }
@@ -1598,6 +1603,9 @@ impl Logs {
             .last_detail_area
             .is_some_and(|r| mouse::in_rect(col, row, r));
 
+        if self.search_active {
+            self.copy_menu = None;
+        }
         if let Some(menu) = &self.copy_menu
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
@@ -1615,7 +1623,9 @@ impl Logs {
                 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                 && mouse.modifiers.contains(KeyModifiers::CONTROL));
         if opens_context_menu {
-            self.open_copy_menu(col, row);
+            if !self.search_active {
+                self.open_copy_menu(col, row);
+            }
             return;
         }
 
@@ -1856,6 +1866,67 @@ mod tests {
             row,
             modifiers,
         }
+    }
+
+    #[tokio::test]
+    async fn search_input_owns_copy_chords() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        logs.list_state.select(Some(0));
+        draw(&mut logs, 100, 24);
+        logs.search_active = true;
+        logs.search_buf = "needle".into();
+        let list_area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+
+        logs.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                list_area.x,
+                list_area.y,
+                KeyModifiers::NONE,
+            ),
+            Rect::new(0, 0, 100, 24),
+        );
+        assert!(logs.copy_menu.is_none());
+
+        for key in [
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+            KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            logs.handle_key(key).await;
+            assert_eq!(logs.search_buf, "needle");
+            assert!(logs.search_active);
+            assert!(
+                logs.copy_feedback.is_none(),
+                "copy chord must not target the selected row while search owns input"
+            );
+        }
+
+        logs.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(logs.search_buf, "needlex");
+
+        logs.search_active = false;
+        logs.search_buf = logs.search_query.clone();
+        assert!(logs.open_copy_menu(list_area.x, list_area.y));
+        logs.search_active = true;
+        logs.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert!(!logs.search_active);
+        assert!(logs.copy_menu.is_none());
+        assert!(logs.copy_feedback.is_none());
+
+        assert!(logs.open_copy_menu(list_area.x, list_area.y));
+        logs.search_active = true;
+        logs.search_buf = "cancelled".into();
+        logs.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+        assert!(!logs.search_active);
+        assert!(logs.copy_menu.is_none());
+        assert!(logs.copy_feedback.is_none());
     }
 
     #[test]
