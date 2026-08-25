@@ -3578,6 +3578,15 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn bounded_tool_output(raw_output: String) -> String {
+    const MAX_RAW_OUTPUT: usize = 16 * 1024;
+    if raw_output.len() > MAX_RAW_OUTPUT {
+        format!("{}…[truncated]", truncate_utf8(&raw_output, MAX_RAW_OUTPUT))
+    } else {
+        raw_output
+    }
+}
+
 fn render_tool_entry(
     lines: &mut Vec<Line<'static>>,
     name: &str,
@@ -6802,14 +6811,8 @@ impl ChatState {
                 ..
             } => {
                 // Cap stored output so large tool responses (bash, file reads) don't
-                // accumulate unboundedly.  The renderer already truncates to 200 chars
-                // for display; 16 KB gives clipboard users a generous but bounded copy.
-                const MAX_RAW_OUTPUT: usize = 16 * 1024;
-                let raw_output = if raw_output.len() > MAX_RAW_OUTPUT {
-                    format!("{}…[truncated]", truncate_utf8(&raw_output, MAX_RAW_OUTPUT))
-                } else {
-                    raw_output
-                };
+                // accumulate unboundedly. The same bound is applied to restored cards.
+                let raw_output = bounded_tool_output(raw_output);
                 for entry in self.entries.iter_mut().rev() {
                     if let ChatEntry::Tool {
                         tool_call_id: id,
@@ -7370,6 +7373,53 @@ impl ChatState {
         strip_runtime_enrichment: bool,
     ) {
         for m in messages {
+            match m.kind {
+                crate::client::MessageEntryKind::ToolCall => {
+                    let input_json = m
+                        .tool_input
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok())
+                        .unwrap_or_else(|| "null".to_string());
+                    self.entries.push(ChatEntry::Tool {
+                        tool_call_id: Arc::<str>::from(m.tool_call_id.unwrap_or_default()),
+                        name: Arc::<str>::from(
+                            m.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                        ),
+                        input_json: Arc::<str>::from(input_json),
+                        result: m.tool_output.map(bounded_tool_output).map(Arc::<str>::from),
+                    });
+                    continue;
+                }
+                crate::client::MessageEntryKind::ToolResult => {
+                    let tool_call_id = m.tool_call_id.unwrap_or_default();
+                    let output = bounded_tool_output(m.tool_output.unwrap_or(m.content));
+                    if let Some(ChatEntry::Tool { result, .. }) =
+                        self.entries.iter_mut().rev().find(|entry| {
+                            matches!(
+                                entry,
+                                ChatEntry::Tool {
+                                    tool_call_id: id,
+                                    result: None,
+                                    ..
+                                } if id.as_ref() == tool_call_id
+                            )
+                        })
+                    {
+                        *result = Some(Arc::<str>::from(output));
+                    } else {
+                        self.entries.push(ChatEntry::Tool {
+                            tool_call_id: Arc::<str>::from(tool_call_id),
+                            name: Arc::<str>::from(
+                                m.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                            ),
+                            input_json: Arc::<str>::from("null"),
+                            result: Some(Arc::<str>::from(output)),
+                        });
+                    }
+                    continue;
+                }
+                crate::client::MessageEntryKind::Message => {}
+            }
             match m.role() {
                 crate::client::MessageRole::User => {
                     let display = if strip_runtime_enrichment {
@@ -12766,18 +12816,22 @@ mod tests {
                 MessageEntry {
                     role: "user".to_string(),
                     content: "first ask".to_string(),
+                    ..Default::default()
                 },
                 MessageEntry {
                     role: "assistant".to_string(),
                     content: "reply".to_string(),
+                    ..Default::default()
                 },
                 MessageEntry {
                     role: "system".to_string(),
                     content: "ignored".to_string(),
+                    ..Default::default()
                 },
                 MessageEntry {
                     role: "user".to_string(),
                     content: "second ask".to_string(),
+                    ..Default::default()
                 },
             ],
             false,
@@ -12801,6 +12855,7 @@ mod tests {
             vec![MessageEntry {
                 role: "user".to_string(),
                 content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\nfirst ask".to_string(),
+                ..Default::default()
             }],
             true,
         );
@@ -12828,6 +12883,7 @@ mod tests {
             vec![MessageEntry {
                 role: "user".to_string(),
                 content: "[CURRENT DATE & TIME: 2026-03-14 09:30:00 UTC]\n\n".to_string(),
+                ..Default::default()
             }],
             true,
         );
@@ -12838,6 +12894,7 @@ mod tests {
             vec![MessageEntry {
                 role: "user".to_string(),
                 content: "[CURRENT DATE & TIME: 2026-03-14 09:31:00 UTC]\n\nreal ask".to_string(),
+                ..Default::default()
             }],
             true,
         );
@@ -12854,11 +12911,82 @@ mod tests {
             vec![MessageEntry {
                 role: "user".to_string(),
                 content: literal.to_string(),
+                ..Default::default()
             }],
             false,
         );
 
         assert_eq!(s.first_message.as_deref(), Some(literal));
+    }
+
+    #[test]
+    fn load_history_matches_tool_result_to_call_id() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+
+        let mut s = state();
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "Tool call: shell\n{}".to_string(),
+                    kind: MessageEntryKind::ToolCall,
+                    tool_call_id: Some("call-1".to_string()),
+                    tool_name: Some("shell".to_string()),
+                    tool_input: Some(serde_json::json!({"command": "pwd"})),
+                    tool_output: None,
+                },
+                MessageEntry {
+                    role: "tool".to_string(),
+                    content: "Tool result: shell\n/tmp".to_string(),
+                    kind: MessageEntryKind::ToolResult,
+                    tool_call_id: Some("call-1".to_string()),
+                    tool_name: Some("shell".to_string()),
+                    tool_input: None,
+                    tool_output: Some("/tmp".to_string()),
+                },
+            ],
+            false,
+        );
+
+        assert!(matches!(
+            s.entries.as_slice(),
+            [ChatEntry::Tool {
+                tool_call_id,
+                name,
+                result: Some(result),
+                ..
+            }] if tool_call_id.as_ref() == "call-1"
+                && name.as_ref() == "shell"
+                && result.as_ref() == "/tmp"
+        ));
+    }
+
+    #[test]
+    fn load_history_bounds_restored_tool_output_like_live_updates() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+
+        let mut s = state();
+        s.load_history(
+            vec![MessageEntry {
+                role: "assistant".to_string(),
+                content: "tool call".to_string(),
+                kind: MessageEntryKind::ToolCall,
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: Some("shell".to_string()),
+                tool_input: Some(serde_json::json!({})),
+                tool_output: Some("λ".repeat(9_000)),
+            }],
+            false,
+        );
+
+        assert!(matches!(
+            s.entries.as_slice(),
+            [ChatEntry::Tool {
+                result: Some(result),
+                ..
+            }] if result.ends_with("…[truncated]")
+                && result.len() <= 16 * 1024 + "…[truncated]".len()
+        ));
     }
 
     // ── Elicitation modal ────────────────────────────────────────
