@@ -881,6 +881,14 @@ test("reachable dependency modules enforce the RSC-focused policy", async (t) =>
       /imports RSC\/server-capable module react-router-dom\/server/,
     ],
     [
+      `new Function("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
+      `const Make = Function;\nnew Make("return import('react-router-dom/server')")();\nexport const page = true;\n`,
+      /imports RSC\/server-capable module react-router-dom\/server/,
+    ],
+    [
       `let payload = "import('react-router-dom/server')";\neval(payload);\nexport const page = true;\n`,
       /imports RSC\/server-capable module react-router-dom\/server/,
     ],

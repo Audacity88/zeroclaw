@@ -1188,8 +1188,9 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
   }
 
   function recoveredArguments(node, kind) {
+    const arguments_ = node.arguments ? [...node.arguments] : [];
     if (kind.invocation === "call" || kind.invocation === "bind") {
-      return node.arguments.slice(1);
+      return arguments_.slice(1);
     }
     if (kind.invocation === "apply") {
       function recoverAppliedArguments(argument, seen = new Set()) {
@@ -1225,15 +1226,15 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
         return recoverAppliedArguments(initializer, nextSeen);
       }
 
-      const recovered = node.arguments[1]
-        ? recoverAppliedArguments(node.arguments[1])
+      const recovered = arguments_[1]
+        ? recoverAppliedArguments(arguments_[1])
         : null;
       if (!recovered) {
         fail(`${relative} uses an unanalyzable evaluator or timer apply argument list`);
       }
       return recovered;
     }
-    return kind.kind === "Function" ? [...node.arguments] : node.arguments.slice(0, 1);
+    return kind.kind === "Function" ? arguments_ : arguments_.slice(0, 1);
   }
 
   function inspectRecoveredCode(text, kind) {
@@ -1287,9 +1288,11 @@ function inspectDependencySource(filePath, source, records, { recoveredDepth = 0
         ? node.argument.literal
         : node.argument;
       addModuleRecord(records, argument, filePath, "import type");
-    } else if (ts.isCallExpression(node)) {
-      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
+    } else if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const isCall = ts.isCallExpression(node);
+      const isDynamicImport = isCall && node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequire =
+        isCall && ts.isIdentifier(node.expression) && node.expression.text === "require";
       if (isDynamicImport || isRequire) {
         const specifier = node.arguments[0] && recoverStaticString(node.arguments[0]);
         if (node.arguments.length !== 1 || specifier === null || specifier === undefined) {
