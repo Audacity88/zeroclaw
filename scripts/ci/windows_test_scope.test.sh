@@ -137,6 +137,10 @@ for event in push merge_group workflow_dispatch unknown; do
     printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
 done
 
+output="$(python3 "$selector" --event pull_request --repo-root "$repo_root")"
+printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'reason=Changed paths or Cargo metadata are unavailable; selecting full is safer.' >/dev/null
+
 malformed_metadata="$fixture_dir/malformed.json"
 printf '%s\n' '{"packages": []}' > "$malformed_metadata"
 printf '%s\n' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
@@ -164,11 +168,25 @@ import os
 from pathlib import Path
 
 workflow = Path(os.environ["WORKFLOW"]).read_text()
+scope_job = workflow.split("\n  windows-test-scope:\n", 1)[1].split(
+    "\n  windows-test:\n", 1
+)[0]
 windows_job = workflow.split("\n  windows-test:\n", 1)[1].split(
     "\n  parallel-runtime-test-changes:\n", 1
 )[0]
 normalization = 'archive="$(cygpath -u "$archive")"'
 extraction = 'tar zxf "$archive" -C "$HOME/.cargo/bin"'
+skip_condition = "needs.windows-test-scope.outputs.mode != 'skip'"
+package_conversion = 'scripts/ci/windows_test_scope.py --package-args-json "$PACKAGES_JSON"'
+scoped_command = 'cargo nextest run --locked "${package_args[@]}"'
+full_command = 'cargo nextest run --locked --workspace --exclude zeroclaw-desktop'
+assert "bash scripts/ci/windows_test_scope.test.sh" in scope_job
+assert skip_condition in windows_job
+assert package_conversion in windows_job
+assert scoped_command in windows_job
+assert full_command in windows_job
+assert windows_job.index("scoped)") < windows_job.index(scoped_command)
+assert windows_job.index("full)") < windows_job.index(full_command)
 assert normalization in windows_job
 assert extraction in windows_job
 assert windows_job.index(normalization) < windows_job.index(extraction)
