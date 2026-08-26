@@ -7,6 +7,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -2023,9 +2024,15 @@ fn remove_git_metadata(skill_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
     source_open_seam();
     let source = open_source_dir_nofollow(src)?;
+    copy_open_dir_recursive_secure(&source, src, dest)
+}
+
+#[cfg(test)]
+fn copy_open_dir_recursive_secure(source: &Dir, source_path: &Path, dest: &Path) -> Result<()> {
     let dest_parent_path = dest
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2050,9 +2057,10 @@ fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
         .open_dir_nofollow(dest_name)
         .with_context(|| format!("failed to open destination {}", dest.display()))?;
 
-    copy_dir_contents(&source, &destination, src, dest, Path::new(""))
+    copy_dir_contents(source, &destination, source_path, dest, Path::new(""))
 }
 
+#[cfg(test)]
 fn open_parent_dir(path: &Path) -> Result<Dir> {
     let parent = path
         .parent()
@@ -2060,6 +2068,29 @@ fn open_parent_dir(path: &Path) -> Result<Dir> {
         .unwrap_or_else(|| Path::new("."));
     Dir::open_ambient_dir(parent, ambient_authority())
         .with_context(|| format!("failed to open parent directory {}", parent.display()))
+}
+
+fn open_final_dir_nofollow(path: &Path) -> Result<Dir> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = parent.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize parent directory {}",
+            parent.display()
+        )
+    })?;
+    let parent_dir = open_source_dir_nofollow(&canonical_parent)?;
+    let name = path
+        .file_name()
+        .context("Directory path must include a final component")?;
+    parent_dir.open_dir_nofollow(name).with_context(|| {
+        format!(
+            "failed to open directory without following symlinks: {}",
+            path.display()
+        )
+    })
 }
 
 fn open_source_dir_nofollow(src: &Path) -> Result<Dir> {
@@ -2252,6 +2283,82 @@ fn source_open_seam() {
     copy_tests::run_source_open_seam();
 }
 
+#[cfg(not(test))]
+#[inline]
+fn selected_source_seam() {}
+
+#[cfg(test)]
+fn selected_source_seam() {
+    copy_tests::run_selected_source_seam();
+}
+
+fn install_open_skill_source(
+    source: Dir,
+    source_path: &Path,
+    name: &OsStr,
+    skills_path: &Path,
+    allow_scripts: bool,
+) -> Result<(PathBuf, usize)> {
+    std::fs::create_dir_all(skills_path).with_context(|| {
+        format!(
+            "failed to create skills directory {}",
+            skills_path.display()
+        )
+    })?;
+
+    let dest = skills_path.join(name);
+    if dest.exists() {
+        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    }
+
+    // Keep incomplete bytes outside the live skills directory. The temporary
+    // directory is process-private, and publication stays on one filesystem.
+    let staging_parent = skills_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging = tempfile::Builder::new()
+        .prefix(".skill-install-")
+        .tempdir_in(staging_parent)
+        .with_context(|| {
+            format!(
+                "failed to create private skill staging directory in {}",
+                staging_parent.display()
+            )
+        })?;
+    let staging_path = staging.path();
+    let staging_dir =
+        Dir::open_ambient_dir(staging_path, ambient_authority()).with_context(|| {
+            format!(
+                "failed to open private skill staging directory {}",
+                staging_path.display()
+            )
+        })?;
+
+    copy_dir_contents(
+        &source,
+        &staging_dir,
+        source_path,
+        staging_path,
+        Path::new(""),
+    )?;
+    drop(staging_dir);
+
+    let report = enforce_skill_security_audit(staging_path, allow_scripts)?;
+    if dest.exists() {
+        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    }
+    std::fs::rename(staging_path, &dest).with_context(|| {
+        format!(
+            "failed to publish audited skill from {} to {}",
+            staging_path.display(),
+            dest.display()
+        )
+    })?;
+
+    Ok((dest, report.files_scanned))
+}
+
 pub fn install_local_skill_source(
     source: &str,
     skills_path: &Path,
@@ -2265,31 +2372,18 @@ pub fn install_local_skill_source(
     let canonical_source_path = source_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize source path {source}"))?;
-    let _ = enforce_skill_security_audit(&canonical_source_path, allow_scripts)?;
-
     let name = canonical_source_path
         .file_name()
         .context("Source path must include a directory name")?;
-    let dest = skills_path.join(name);
-    if dest.exists() {
-        anyhow::bail!(
-            "Destination skill already exists: {}",
-            dest.display().to_string()
-        );
-    }
-
-    if let Err(err) = copy_dir_recursive_secure(&canonical_source_path, &dest) {
-        let _ = std::fs::remove_dir_all(&dest);
-        return Err(err);
-    }
-
-    match enforce_skill_security_audit(&dest, allow_scripts) {
-        Ok(report) => Ok((dest, report.files_scanned)),
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&dest);
-            Err(err)
-        }
-    }
+    source_open_seam();
+    let source = open_source_dir_nofollow(&canonical_source_path)?;
+    install_open_skill_source(
+        source,
+        &canonical_source_path,
+        name,
+        skills_path,
+        allow_scripts,
+    )
 }
 
 #[cfg(test)]
@@ -2300,10 +2394,12 @@ mod copy_tests {
 
     type Swap = Box<dyn Fn(&Path)>;
     type SourceOpen = Box<dyn Fn()>;
+    type SelectedSource = Box<dyn Fn()>;
 
     thread_local! {
         static ENTRY_SWAP: RefCell<Option<Swap>> = const { RefCell::new(None) };
         static SOURCE_OPEN: RefCell<Option<SourceOpen>> = const { RefCell::new(None) };
+        static SELECTED_SOURCE: RefCell<Option<SelectedSource>> = const { RefCell::new(None) };
     }
 
     pub(super) fn run_entry_swap_seam(relative: &Path) {
@@ -2316,6 +2412,14 @@ mod copy_tests {
 
     pub(super) fn run_source_open_seam() {
         SOURCE_OPEN.with(|swap| {
+            if let Some(swap) = swap.borrow().as_ref() {
+                swap();
+            }
+        });
+    }
+
+    pub(super) fn run_selected_source_seam() {
+        SELECTED_SOURCE.with(|swap| {
             if let Some(swap) = swap.borrow().as_ref() {
                 swap();
             }
@@ -2349,6 +2453,21 @@ mod copy_tests {
     impl Drop for SourceOpenGuard {
         fn drop(&mut self) {
             SOURCE_OPEN.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) struct SelectedSourceGuard;
+
+    impl SelectedSourceGuard {
+        pub(super) fn install(swap: impl Fn() + 'static) -> Self {
+            SELECTED_SOURCE.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    impl Drop for SelectedSourceGuard {
+        fn drop(&mut self) {
+            SELECTED_SOURCE.with(|slot| *slot.borrow_mut() = None);
         }
     }
 
@@ -2420,6 +2539,16 @@ mod copy_tests {
             .expect_err("a static nested source symlink must reject the install");
         assert!(err.to_string().contains("symlink"), "got: {err}");
         assert!(!destination.exists());
+        let staging_leftover = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-install-")
+            });
+        assert!(!staging_leftover, "failed installs must remove staging");
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
             "external secret"
@@ -2733,24 +2862,8 @@ fn ensure_skills_registry(workspace_dir: &Path, registry_url: Option<&str>) -> R
     Ok(registry_dir)
 }
 
-fn list_registry_skill_names(registry_dir: &Path) -> Vec<String> {
-    let skills_parent = registry_dir.join("skills");
-    let Ok(entries) = std::fs::read_dir(&skills_parent) else {
-        return vec![];
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    names.sort();
-    names
-}
-
-/// List real directory entries under an already-contained catalog `skills/`
-/// root without following entry symlinks.
-fn list_contained_catalog_skill_names(skills_root: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(skills_root) else {
+fn list_open_skill_names(skills_root: &Dir) -> Vec<String> {
+    let Ok(entries) = skills_root.entries() else {
         return vec![];
     };
     let mut names: Vec<String> = entries
@@ -2760,6 +2873,22 @@ fn list_contained_catalog_skill_names(skills_root: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+fn open_registry_skills_root(registry_dir: &Path) -> Result<Dir> {
+    source_open_seam();
+    let registry = open_final_dir_nofollow(registry_dir).with_context(|| {
+        format!(
+            "failed to open registry without following symlinks: {}",
+            registry_dir.display()
+        )
+    })?;
+    registry.open_dir_nofollow("skills").with_context(|| {
+        format!(
+            "failed to open registry skills root without following symlinks: {}",
+            registry_dir.join("skills").display()
+        )
+    })
 }
 
 /// Install a single skill by name from a git catalog repository.
@@ -2811,64 +2940,23 @@ pub fn install_git_catalog_skill_source(
     })?;
 
     (|| {
-        // Establish the catalog trust boundary before looking up a selected
-        // name or enumerating available names. A catalog controls `skills/`,
-        // so following it before this check could inspect an arbitrary host
-        // directory even when the requested skill does not exist.
-        let clone_root = clone_dir.canonicalize().with_context(|| {
+        source_open_seam();
+        let clone_root = open_final_dir_nofollow(clone_dir).with_context(|| {
             format!(
-                "failed to canonicalize catalog clone {}",
+                "failed to open catalog clone without following symlinks: {}",
                 clone_dir.display()
             )
         })?;
-        let skills_dir = clone_dir.join("skills");
-        let skills_meta = match std::fs::symlink_metadata(&skills_dir) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                    "cli-skills-install-skill-not-in-catalog-empty",
-                    &[("skill", skill_name), ("url", url)]
-                ));
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to read metadata for catalog skills root {}",
-                        skills_dir.display()
-                    )
-                });
-            }
-        };
-        if skills_meta.file_type().is_symlink() {
-            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+        let skills_root = clone_root.open_dir_nofollow("skills").with_context(|| {
+            crate::i18n::get_required_cli_string_with_args(
                 "cli-skills-install-catalog-root-symlink",
-                &[("url", url)]
-            ));
-        }
-        let skills_root = skills_dir.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize catalog skills root {}",
-                skills_dir.display()
+                &[("url", url)],
             )
         })?;
-        if !skills_root.starts_with(&clone_root) {
-            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                "cli-skills-install-catalog-root-escapes",
-                &[("url", url)]
-            ));
-        }
-        if !skills_root.is_dir() {
-            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                "cli-skills-install-skill-not-in-catalog-empty",
-                &[("skill", skill_name), ("url", url)]
-            ));
-        }
-
-        let skill_dir = skills_root.join(skill_name);
-        let entry_meta = match std::fs::symlink_metadata(&skill_dir) {
-            Ok(metadata) => metadata,
+        let selected = match skills_root.open_dir_nofollow(skill_name) {
+            Ok(selected) => selected,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let available = list_contained_catalog_skill_names(&skills_root);
+                let available = list_open_skill_names(&skills_root);
                 if available.is_empty() {
                     anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
                         "cli-skills-install-skill-not-in-catalog-empty",
@@ -2886,55 +2974,22 @@ pub fn install_git_catalog_skill_source(
             }
             Err(err) => {
                 return Err(err).with_context(|| {
-                    format!(
-                        "failed to read metadata for selected catalog skill {}",
-                        skill_dir.display()
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-skills-install-catalog-skill-symlink",
+                        &[("skill", skill_name), ("url", url)],
                     )
                 });
             }
         };
-        if entry_meta.file_type().is_symlink() {
-            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                "cli-skills-install-catalog-skill-symlink",
-                &[("skill", skill_name), ("url", url)]
-            ));
-        }
-        let selected = skill_dir.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize selected skill {}",
-                skill_dir.display()
-            )
-        })?;
-        if !selected.starts_with(&skills_root) {
-            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                "cli-skills-install-catalog-skill-escapes",
-                &[("skill", skill_name), ("url", url)]
-            ));
-        }
-        if !selected.is_dir() {
-            let available = list_contained_catalog_skill_names(&skills_root);
-            if available.is_empty() {
-                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                    "cli-skills-install-skill-not-in-catalog-empty",
-                    &[("skill", skill_name), ("url", url)]
-                ));
-            }
-            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
-                "cli-skills-install-skill-not-in-catalog",
-                &[
-                    ("skill", skill_name),
-                    ("url", url),
-                    ("available", &available.join(", ")),
-                ]
-            ));
-        }
-        // i18n-exempt: internal invariant — the clone path is our own ASCII
-        // `.skill-catalog-*` scratch dir, so this only fires on a broken
-        // host filesystem; it is a developer diagnostic, not normal CLI output.
-        let skill_dir_str = selected
-            .to_str()
-            .with_context(|| format!("skill path is not valid UTF-8: {}", selected.display()))?;
-        install_local_skill_source(skill_dir_str, skills_path, allow_scripts)
+
+        selected_source_seam();
+        install_open_skill_source(
+            selected,
+            &clone_dir.join("skills").join(skill_name),
+            OsStr::new(skill_name),
+            skills_path,
+            allow_scripts,
+        )
     })()
 }
 
@@ -2948,30 +3003,41 @@ pub fn install_registry_skill_source(
 ) -> Result<(PathBuf, usize)> {
     let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
     let skill_dir = registry_dir.join("skills").join(source);
-
-    if !skill_dir.is_dir() {
-        let available = list_registry_skill_names(&registry_dir);
-        if available.is_empty() {
-            anyhow::bail!("skill '{source}' not found in the registry and no skills are available");
+    let skills_root = open_registry_skills_root(&registry_dir)?;
+    let selected = match skills_root.open_dir_nofollow(source) {
+        Ok(selected) => selected,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let available = list_open_skill_names(&skills_root);
+            if available.is_empty() {
+                anyhow::bail!(
+                    "skill '{source}' not found in the registry and no skills are available"
+                );
+            }
+            anyhow::bail!(
+                "skill '{source}' not found in the registry.\nAvailable skills: {}",
+                available.join(", ")
+            );
         }
-        anyhow::bail!(
-            "skill '{source}' not found in the registry.\nAvailable skills: {}",
-            available.join(", ")
-        );
-    }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to open registry skill without following symlinks: {}",
+                    skill_dir.display()
+                )
+            });
+        }
+    };
 
     if !suppress_tier_banner {
         let (tier, version) = lookup_registry_skill_tier(&registry_dir, source);
         print_install_tier_banner(source, version.as_deref(), tier);
     }
 
-    install_local_skill_source(
-        skill_dir.to_str().with_context(|| {
-            format!(
-                "registry path is not valid UTF-8: {}",
-                skill_dir.display().to_string()
-            )
-        })?,
+    selected_source_seam();
+    install_open_skill_source(
+        selected,
+        &skill_dir,
+        OsStr::new(source),
         skills_path,
         allow_scripts,
     )
@@ -3059,32 +3125,41 @@ pub fn install_extra_registry_skill_source(
 
     let registry_dir = ensure_extra_registry(workspace_dir, &registry_name, &registry.url)?;
     let skill_dir = registry_dir.join("skills").join(&skill_name);
-
-    if !skill_dir.is_dir() {
-        let available = list_registry_skill_names(&registry_dir);
-        if available.is_empty() {
+    let skills_root = open_registry_skills_root(&registry_dir)?;
+    let selected = match skills_root.open_dir_nofollow(&skill_name) {
+        Ok(selected) => selected,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let available = list_open_skill_names(&skills_root);
+            if available.is_empty() {
+                anyhow::bail!(
+                    "skill '{skill_name}' not found in registry '{registry_name}' and no skills are available"
+                );
+            }
             anyhow::bail!(
-                "skill '{skill_name}' not found in registry '{registry_name}' and no skills are available"
+                "skill '{skill_name}' not found in registry '{registry_name}'.\nAvailable skills: {}",
+                available.join(", ")
             );
         }
-        anyhow::bail!(
-            "skill '{skill_name}' not found in registry '{registry_name}'.\nAvailable skills: {}",
-            available.join(", ")
-        );
-    }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to open registry skill without following symlinks: {}",
+                    skill_dir.display()
+                )
+            });
+        }
+    };
 
     if !suppress_tier_banner {
         let (tier, version) = lookup_registry_skill_tier(&registry_dir, &skill_name);
         print_install_tier_banner(&skill_name, version.as_deref(), tier);
     }
 
-    install_local_skill_source(
-        skill_dir.to_str().with_context(|| {
-            format!(
-                "registry path is not valid UTF-8: {}",
-                skill_dir.display().to_string()
-            )
-        })?,
+    selected_source_seam();
+    install_open_skill_source(
+        selected,
+        &skill_dir,
+        OsStr::new(skill_name.as_str()),
         skills_path,
         allow_scripts,
     )
@@ -3369,6 +3444,124 @@ mod registry_tests {
         assert!(err.to_string().contains("nope"), "got: {err}");
     }
 
+    #[cfg(unix)]
+    fn write_clean_skill(path: &Path, name: &str, body: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mark_test_registry_fresh(registry_dir: &Path) {
+        std::fs::write(registry_dir.join(SKILLS_REGISTRY_SYNC_MARKER), b"synced").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_no_install_staging(parent: &Path) {
+        let leftover = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-install-")
+            });
+        assert!(!leftover, "private install staging must be cleaned up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_registry_rejects_symlinked_skills_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let registry = workspace.join(SKILLS_REGISTRY_DIR_NAME);
+        let external_skills = tmp.path().join("external-skills");
+        let skills_path = tmp.path().join("installed-skills");
+        std::fs::create_dir_all(&registry).unwrap();
+        write_clean_skill(&external_skills.join("victim"), "victim", "external secret");
+        std::os::unix::fs::symlink(&external_skills, registry.join("skills")).unwrap();
+        mark_test_registry_fresh(&registry);
+
+        let err =
+            install_registry_skill_source("victim", &skills_path, false, &workspace, None, true)
+                .expect_err("a symlinked default-registry skills root must be rejected");
+
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert!(!skills_path.join("victim").exists());
+        assert_no_install_staging(tmp.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_registry_rejects_symlinked_selected_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let registry = workspace.join(SKILLS_REGISTRY_DIR_NAME);
+        let external = tmp.path().join("external-victim");
+        let skills_path = tmp.path().join("installed-skills");
+        std::fs::create_dir_all(registry.join("skills")).unwrap();
+        write_clean_skill(&external, "victim", "external secret");
+        std::os::unix::fs::symlink(&external, registry.join("skills/victim")).unwrap();
+        mark_test_registry_fresh(&registry);
+
+        let err =
+            install_registry_skill_source("victim", &skills_path, false, &workspace, None, true)
+                .expect_err("a symlinked default-registry skill must be rejected");
+
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert!(!skills_path.join("victim").exists());
+        assert_no_install_staging(tmp.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extra_registry_rejects_symlinked_root_and_selected_skill() {
+        for symlink_root in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let workspace = tmp.path().join("workspace");
+            let registry = workspace.join(format!("{EXTRA_REGISTRY_DIR_PREFIX}custom"));
+            let external_skills = tmp.path().join("external-skills");
+            let skills_path = tmp.path().join("installed-skills");
+            std::fs::create_dir_all(&registry).unwrap();
+            write_clean_skill(&external_skills.join("victim"), "victim", "external secret");
+            if symlink_root {
+                std::os::unix::fs::symlink(&external_skills, registry.join("skills")).unwrap();
+            } else {
+                std::fs::create_dir(registry.join("skills")).unwrap();
+                std::os::unix::fs::symlink(
+                    external_skills.join("victim"),
+                    registry.join("skills/victim"),
+                )
+                .unwrap();
+            }
+            mark_test_registry_fresh(&registry);
+            let configured = [zeroclaw_config::schema::ExternalRegistry {
+                name: "custom".to_string(),
+                url: "unused".to_string(),
+                kind: zeroclaw_config::schema::ExternalRegistryKind::Git,
+                enabled: true,
+            }];
+
+            let err = install_extra_registry_skill_source(
+                "registry:custom/victim",
+                &skills_path,
+                false,
+                &workspace,
+                &configured,
+                true,
+            )
+            .expect_err("extra registries must reject symlinked roots and selected skills");
+
+            assert!(err.to_string().contains("symlink"), "got: {err}");
+            assert!(!skills_path.join("victim").exists());
+            assert_no_install_staging(tmp.path());
+        }
+    }
+
     #[test]
     fn test_install_git_catalog_rejects_non_bare_skill_name() {
         // The bare-name guard must reject anything with a path separator before
@@ -3494,6 +3687,59 @@ mod registry_tests {
                     .starts_with(".skill-catalog-")
             });
         assert!(!leftover, "clone scratch dir must be removed after install");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_catalog_ordinary_ancestor_swap_cannot_redirect_selected_handle() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = init_git_skill_catalog(tmp.path(), &["demo-skill"]);
+        let skills_path = tmp.path().join("installed-skills");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let workspace_for_swap = workspace.clone();
+        let _swap = super::copy_tests::SelectedSourceGuard::install(move || {
+            let clone_dir = std::fs::read_dir(&workspace_for_swap)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".skill-catalog-"))
+                })
+                .expect("catalog clone must exist at the selected-source seam");
+            std::fs::rename(clone_dir.join("skills"), clone_dir.join("skills-original")).unwrap();
+            write_clean_skill(
+                &clone_dir.join("skills/demo-skill"),
+                "demo-skill",
+                "replacement external secret",
+            );
+        });
+
+        let (dest, _) = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "demo-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect("the retained selected handle must survive an ancestor path swap");
+
+        let installed = std::fs::read_to_string(dest.join("SKILL.md")).unwrap();
+        assert!(installed.contains("hermetic git-catalog fixture"));
+        assert!(!installed.contains("external secret"));
+        assert_no_install_staging(tmp.path());
     }
 
     #[test]
