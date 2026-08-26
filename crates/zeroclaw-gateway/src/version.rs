@@ -41,7 +41,9 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // ── Restart classification (advisory) ────────────────────────────
 
 /// How a post-upgrade restart is achieved in this environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
 pub enum RestartMode {
     /// A supervisor (systemd/launchd) relaunches us after a clean exit.
     Supervised,
