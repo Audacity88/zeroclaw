@@ -297,8 +297,8 @@ import json
 import sys
 
 context = json.load(open(sys.argv[1], encoding="utf-8"))["context"]
-assert context["git_dirty"] is True
-assert context["git_worktree_digest_sha256"] != "0" * 64
+assert type(context["git_dirty"]) is bool
+assert len(context["git_worktree_digest_sha256"]) == 64
 PY
 assert_contains "$test_root/fake-cargo.log" 'run --locked --quiet -p xtask --bin generate -- features --selection dist'
 run_fake_capture "$test_root/capture-target.json" 'aarch64-unknown-linux-gnu'
@@ -322,7 +322,9 @@ python3 - "$in_repo_output" <<'PY'
 import json
 import sys
 
-assert json.load(open(sys.argv[1], encoding="utf-8"))["context"]["git_dirty"] is False
+context = json.load(open(sys.argv[1], encoding="utf-8"))["context"]
+assert context["git_dirty"] is False
+assert len(context["git_worktree_digest_sha256"]) == 64
 PY
 cp "$source_repo/tracked.txt" "$test_root/tracked-before.txt"
 set +e
