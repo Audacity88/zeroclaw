@@ -1436,6 +1436,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
+    if let Some(budget) = shared_budget.as_ref() {
+        budget.reserve()?;
+    }
+
     finish_after_max_iterations(
         model_provider,
         turn_state.history,
@@ -3137,10 +3141,19 @@ mod sop_step_reassembly_tests {
 
         async fn chat(
             &self,
-            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
+            if request.tools.is_none_or(<[_]>::is_empty) {
+                return Ok(ChatResponse {
+                    text: Some("local-cap-summary".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+
             Ok(ChatResponse {
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
@@ -3227,6 +3240,63 @@ mod sop_step_reassembly_tests {
             turn_id: &turn_id,
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn root_local_iteration_cap_consumes_tree_budget_for_summary() {
+        let root_budget = ExecutionTreeBudget::root(2);
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
+            calls: Arc::clone(&tool_calls),
+        })];
+        let mut history = vec![ChatMessage::user("run one tool")];
+
+        let response = run_budgeted_test_loop(
+            &BudgetToolCallingProvider,
+            &mut history,
+            &tools,
+            root_budget.clone(),
+            CancellationToken::new(),
+            1,
+        )
+        .await
+        .expect("root should use its final reservation for the local-cap summary");
+
+        assert!(response.contains("local-cap-summary"));
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_budget.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn child_local_iteration_cap_preserves_root_final_reservation() {
+        use crate::agent::execution_tree_budget::ExecutionTreeBudgetExhausted;
+
+        let root_budget = ExecutionTreeBudget::root(2);
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
+            calls: Arc::clone(&tool_calls),
+        })];
+        let mut history = vec![ChatMessage::user("run one child tool")];
+
+        let error = run_budgeted_test_loop(
+            &BudgetToolCallingProvider,
+            &mut history,
+            &tools,
+            root_budget.child(),
+            CancellationToken::new(),
+            1,
+        )
+        .await
+        .expect_err("child must not spend the root-only final reservation on a summary");
+
+        assert!(
+            error
+                .downcast_ref::<ExecutionTreeBudgetExhausted>()
+                .is_some(),
+            "child local-cap exhaustion must preserve the typed budget error: {error:#}"
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_budget.remaining(), 1);
     }
 
     #[tokio::test]
