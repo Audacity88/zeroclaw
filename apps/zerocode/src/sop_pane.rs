@@ -66,6 +66,7 @@ pub(crate) struct SopPane {
     /// run-status receiver so list refreshes cannot affect poll freshness or
     /// later run-control conflict resolution.
     list_refresh_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<Vec<String>, String>>>,
+    list_refresh_task: Option<tokio::task::JoinHandle<()>>,
     /// A successful mutation projects locally first, then asks for one
     /// authoritative replacement after any older list response is discarded.
     list_refresh_follow_up: bool,
@@ -548,6 +549,7 @@ impl SopPane {
             runs_poll_rx: None,
             runs_poll_stale: false,
             list_refresh_rx: None,
+            list_refresh_task: None,
             list_refresh_follow_up: false,
             list_refresh_error: None,
         }
@@ -671,14 +673,14 @@ impl SopPane {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.list_refresh_rx = Some(rx);
         let rpc = Arc::clone(&self.rpc);
-        tokio::spawn(async move {
+        self.list_refresh_task = Some(tokio::spawn(async move {
             let result = rpc
                 .sops_list()
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(parse_sop_names);
             let _ = tx.send(result);
-        });
+        }));
     }
 
     fn drain_list_refresh(&mut self) {
@@ -694,6 +696,7 @@ impl SopPane {
         };
 
         self.list_refresh_rx = None;
+        self.reap_list_refresh_task();
         if self.list_refresh_follow_up {
             self.list_refresh_follow_up = false;
             self.start_list_refresh();
@@ -710,16 +713,26 @@ impl SopPane {
     }
 
     fn replace_names(&mut self, names: Vec<String>) {
-        let selected_name = self.selected_name().map(String::from);
+        let previous_selected_name = self.selected_name().map(String::from);
         let selected_index = self.list_state.selected();
         self.names = names;
-        let selected = selected_name
-            .and_then(|name| self.names.iter().position(|candidate| candidate == &name))
+        let selected = previous_selected_name
+            .as_ref()
+            .and_then(|name| self.names.iter().position(|candidate| candidate == name))
             .or_else(|| {
                 (!self.names.is_empty())
                     .then(|| selected_index.unwrap_or(0).min(self.names.len() - 1))
             });
         self.list_state.select(selected);
+        if previous_selected_name.as_deref() != self.selected_name() {
+            self.clear_selected_sop_state();
+        }
+    }
+
+    fn clear_selected_sop_state(&mut self) {
+        self.graph = SopGraphView::default();
+        self.overlay = None;
+        self.current_run_id = None;
     }
 
     fn project_saved_name(&mut self, name: &str) {
@@ -735,9 +748,13 @@ impl SopPane {
         self.names.retain(|candidate| candidate != name);
         self.list_state
             .select((!self.names.is_empty()).then_some(0));
-        self.graph = SopGraphView::default();
-        self.overlay = None;
-        self.current_run_id = None;
+        self.clear_selected_sop_state();
+    }
+
+    fn reap_list_refresh_task(&mut self) {
+        if let Some(task) = self.list_refresh_task.take() {
+            task.abort();
+        }
     }
 
     pub(crate) async fn load_selected_graph(&mut self) {
@@ -2154,6 +2171,14 @@ impl SopPane {
     }
 }
 
+impl Drop for SopPane {
+    fn drop(&mut self) {
+        if let Some(task) = self.list_refresh_task.take() {
+            task.abort();
+        }
+    }
+}
+
 const ACTIVE_SPINNER: [&str; 4] = ["|>", "/>", "->", "\\>"];
 
 fn state_marker(state: NodeRunState, active_frame: &str) -> String {
@@ -2777,6 +2802,28 @@ mod list_refresh_tests {
     }
 
     #[tokio::test]
+    async fn dropping_pane_aborts_pending_list_refresh() {
+        let (mut pane, outbound, mut rx) = list_pane();
+
+        pane.refresh();
+        let _request_id = receive_list_request(&mut rx).await;
+        assert_eq!(outbound.pending_count(), 1);
+
+        drop(pane);
+        for _ in 0..100 {
+            if outbound.pending_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            outbound.pending_count(),
+            0,
+            "dropping SopPane must cancel its pending list refresh RPC"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_refresh_retains_names_and_does_not_clobber_action_error() {
         let (mut pane, outbound, mut rx) = list_pane();
         pane.names = vec!["deploy".to_string()];
@@ -2805,6 +2852,35 @@ mod list_refresh_tests {
         let visible = pane.visible_error().expect("both errors should be visible");
         assert!(visible.contains("save failed"));
         assert!(visible.contains("list unavailable"));
+    }
+
+    #[tokio::test]
+    async fn authoritative_refresh_clears_state_when_selected_sop_is_replaced() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["alpha".to_string(), "beta".to_string()];
+        pane.list_state.select(Some(0));
+        pane.graph.nodes.push(GraphNode {
+            step: 1,
+            title: "alpha step".to_string(),
+            kind: NodeKind::default(),
+            subtitle: None,
+            trigger_index: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+        pane.overlay = Some(Default::default());
+        pane.current_run_id = Some("run-alpha".to_string());
+
+        pane.refresh();
+        let request_id = receive_list_request(&mut rx).await;
+        outbound.dispatch_response(&request_id, Some(json!([{ "name": "beta" }])), None);
+        drain_list_response(&mut pane).await;
+
+        assert_eq!(pane.names, vec!["beta".to_string()]);
+        assert_eq!(pane.selected_name(), Some("beta"));
+        assert!(pane.graph.nodes.is_empty());
+        assert!(pane.overlay.is_none());
+        assert!(pane.current_run_id.is_none());
     }
 
     #[tokio::test]
