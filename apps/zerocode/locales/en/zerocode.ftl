@@ -495,6 +495,7 @@ zc-chat-copied-clipboard = Copied to clipboard
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
 zc-chat-context-menu-copy = Copy
+zc-chat-context-menu-copy-selection = Copy selection
 zc-chat-context-menu-open-link = Open link
 zc-chat-context-menu-copy-link = Copy link
 zc-chat-open-link-failed = Could not open link: { $error }

@@ -415,6 +415,7 @@ zc-chat-clipboard-you = 你：{ $text }
 zc-chat-clipboard-agent = Agent：{ $text }
 zc-chat-copied-clipboard = 已复制到剪贴板
 zc-chat-context-menu-copy = 复制
+zc-chat-context-menu-copy-selection = 复制所选内容
 zc-chat-context-menu-open-link = 打开链接
 zc-chat-context-menu-copy-link = 复制链接
 zc-chat-open-link-failed = 无法打开链接：{ $error }

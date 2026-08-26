@@ -415,6 +415,7 @@ zc-chat-clipboard-you = Vous : { $text }
 zc-chat-clipboard-agent = Agent : { $text }
 zc-chat-copied-clipboard = Copié dans le presse-papiers
 zc-chat-context-menu-copy = Copier
+zc-chat-context-menu-copy-selection = Copier la sélection
 zc-chat-context-menu-open-link = Ouvrir le lien
 zc-chat-context-menu-copy-link = Copier le lien
 zc-chat-open-link-failed = Impossible d’ouvrir le lien : { $error }

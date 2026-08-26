@@ -415,6 +415,7 @@ zc-chat-clipboard-you = あなた: { $text }
 zc-chat-clipboard-agent = エージェント: { $text }
 zc-chat-copied-clipboard = クリップボードにコピーしました
 zc-chat-context-menu-copy = コピー
+zc-chat-context-menu-copy-selection = 選択範囲をコピー
 zc-chat-context-menu-open-link = リンクを開く
 zc-chat-context-menu-copy-link = リンクをコピー
 zc-chat-open-link-failed = リンクを開けませんでした: { $error }

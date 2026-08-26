@@ -415,6 +415,7 @@ zc-chat-clipboard-you = Tú: { $text }
 zc-chat-clipboard-agent = Agente: { $text }
 zc-chat-copied-clipboard = Copiado al portapapeles
 zc-chat-context-menu-copy = Copiar
+zc-chat-context-menu-copy-selection = Copiar selección
 zc-chat-context-menu-open-link = Abrir enlace
 zc-chat-context-menu-copy-link = Copiar enlace
 zc-chat-open-link-failed = No se pudo abrir el enlace: { $error }

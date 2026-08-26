@@ -3753,7 +3753,9 @@ fn render_entry_into(
                     spans.push(label_span.clone());
                 }
                 spans.push(Span::styled((*line_text).to_string(), body_style));
-                lines.push(Line::from(spans));
+                let mut line = Line::from(spans);
+                style_recognized_urls(std::slice::from_mut(&mut line));
+                lines.push(line);
             }
             if !attachments.is_empty() {
                 let label = attachments
@@ -3847,13 +3849,19 @@ fn message_copied_label() -> String {
 }
 
 #[cfg(test)]
-fn context_menu_copy_label() -> String {
-    crate::i18n::t("zc-chat-context-menu-copy")
+fn context_menu_copy_selection_label() -> String {
+    crate::i18n::t("zc-chat-context-menu-copy-selection")
 }
 
-fn context_menu_action_label(action: ChatContextMenuAction) -> String {
+fn context_menu_action_label(
+    action: ChatContextMenuAction,
+    copy_kind: Option<CopyHitKind>,
+) -> String {
     let key = match action {
         ChatContextMenuAction::SendNow => "zc-chat-context-menu-send-now",
+        ChatContextMenuAction::Copy if copy_kind == Some(CopyHitKind::Transcript) => {
+            "zc-chat-context-menu-copy-selection"
+        }
         ChatContextMenuAction::Copy => "zc-chat-context-menu-copy",
         ChatContextMenuAction::OpenLink => "zc-chat-context-menu-open-link",
         ChatContextMenuAction::CopyLink => "zc-chat-context-menu-copy-link",
@@ -3891,19 +3899,23 @@ fn context_menu_rect(
     row: u16,
     bounds: Rect,
     actions: &[ChatContextMenuAction],
+    copy_kind: Option<CopyHitKind>,
 ) -> Option<Rect> {
     use unicode_width::UnicodeWidthStr;
 
-    if bounds.width < 3 || bounds.height < 3 || actions.is_empty() {
+    let required_height = actions.len() as u16 + 2;
+    if bounds.width < 3 || bounds.height < required_height || actions.is_empty() {
         return None;
     }
     let label_width = actions
         .iter()
-        .map(|action| UnicodeWidthStr::width(context_menu_action_label(*action).as_str()) as u16)
+        .map(|action| {
+            UnicodeWidthStr::width(context_menu_action_label(*action, copy_kind).as_str()) as u16
+        })
         .max()
         .unwrap_or(0);
     let width = (label_width + 4).min(bounds.width).max(3);
-    let height = (actions.len() as u16 + 2).min(bounds.height);
+    let height = required_height;
     let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
     let max_y = bounds
         .y
@@ -4513,7 +4525,10 @@ fn render_context_menu(f: &mut Frame, state: &ChatState) {
             } else {
                 theme::body_style()
             };
-            Line::from(Span::styled(context_menu_action_label(*action), style))
+            Line::from(Span::styled(
+                context_menu_action_label(*action, menu.target.copy_kind()),
+                style,
+            ))
         })
         .collect::<Vec<_>>();
     f.render_widget(
@@ -5236,7 +5251,9 @@ fn style_recognized_urls(lines: &mut [Line<'static>]) {
                 }
                 styled.push(Span::styled(
                     content[local_start..local_end].to_string(),
-                    span.style.add_modifier(Modifier::UNDERLINED),
+                    span.style
+                        .fg(theme::active().accent)
+                        .add_modifier(Modifier::UNDERLINED),
                 ));
                 cursor = local_end;
             }
@@ -5656,6 +5673,13 @@ impl ChatContextMenuTarget {
             Self::Url(_) => URL_CONTEXT_ACTIONS,
             Self::UrlWithCopy { .. } => URL_WITH_COPY_CONTEXT_ACTIONS,
             Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
+        }
+    }
+
+    fn copy_kind(&self) -> Option<CopyHitKind> {
+        match self {
+            Self::Transcript(copy) | Self::UrlWithCopy { copy, .. } => Some(copy.kind),
+            Self::Url(_) | Self::Queue(_) => None,
         }
     }
 }
@@ -6454,7 +6478,9 @@ impl ChatState {
             };
             ChatContextMenuTarget::Transcript(copy)
         };
-        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+        let Some(rect) =
+            context_menu_rect(column, row, bounds, target.actions(), target.copy_kind())
+        else {
             return false;
         };
         self.context_menu = Some(ChatContextMenu {
@@ -6476,7 +6502,9 @@ impl ChatState {
         };
         self.select_queued_by_id(id);
         let target = ChatContextMenuTarget::Queue(id);
-        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+        let Some(rect) =
+            context_menu_rect(column, row, bounds, target.actions(), target.copy_kind())
+        else {
             return false;
         };
         self.context_menu = Some(ChatContextMenu {
@@ -8049,6 +8077,12 @@ mod tests {
                 .iter()
                 .all(|span| span.style.add_modifier(Modifier::UNDERLINED) == span.style)
         );
+        assert!(
+            split[0]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme::active().accent))
+        );
     }
 
     #[test]
@@ -8066,6 +8100,28 @@ mod tests {
                 "recognized {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn user_message_urls_receive_the_same_link_style() {
+        let mut lines = Vec::new();
+        render_entry_into(
+            &ChatEntry::UserMessage {
+                text: Some(Arc::from("visit https://example.com")),
+                attachments: Vec::new(),
+            },
+            false,
+            false,
+            80,
+            &mut lines,
+        );
+        let url_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("https://example.com"))
+            .expect("styled URL span");
+        assert_eq!(url_span.style.fg, Some(theme::active().accent));
+        assert!(url_span.style.add_modifier(Modifier::UNDERLINED) == url_span.style);
     }
 
     #[test]
@@ -8131,6 +8187,27 @@ mod tests {
         assert_eq!(
             menu.selected_action(),
             Some(ChatContextMenuAction::OpenLink)
+        );
+        assert_eq!(menu.target.copy_kind(), Some(CopyHitKind::Message));
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, menu.target.copy_kind()),
+            crate::i18n::t("zc-chat-context-menu-copy")
+        );
+    }
+
+    #[test]
+    fn context_menu_names_only_transcript_selection_copy_explicitly() {
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, Some(CopyHitKind::Transcript)),
+            crate::i18n::t("zc-chat-context-menu-copy-selection")
+        );
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, Some(CopyHitKind::Code)),
+            crate::i18n::t("zc-chat-context-menu-copy")
+        );
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, None),
+            crate::i18n::t("zc-chat-context-menu-copy")
         );
     }
 
@@ -8520,12 +8597,19 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
 
         let bounds = Rect::new(10, 5, 20, 8);
-        let menu_width = (UnicodeWidthStr::width(context_menu_copy_label().as_str()) as u16 + 4)
-            .min(bounds.width)
-            .max(3);
+        let menu_width =
+            (UnicodeWidthStr::width(context_menu_copy_selection_label().as_str()) as u16 + 4)
+                .min(bounds.width)
+                .max(3);
 
         assert_eq!(
-            context_menu_rect(29, 12, bounds, TRANSCRIPT_CONTEXT_ACTIONS),
+            context_menu_rect(
+                29,
+                12,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            ),
             Some(Rect::new(
                 bounds.x + bounds.width - menu_width,
                 bounds.y + bounds.height - 3,
@@ -8534,16 +8618,56 @@ mod tests {
             ))
         );
         assert_eq!(
-            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
-                .unwrap()
-                .x,
+            context_menu_rect(
+                0,
+                0,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .unwrap()
+            .x,
             bounds.x
         );
         assert_eq!(
-            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
-                .unwrap()
-                .y,
+            context_menu_rect(
+                0,
+                0,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .unwrap()
+            .y,
             bounds.y
+        );
+    }
+
+    #[test]
+    fn url_context_menu_requires_room_for_every_action() {
+        let too_short = Rect::new(0, 0, 30, 4);
+        assert_eq!(
+            context_menu_rect(
+                2,
+                1,
+                too_short,
+                URL_WITH_COPY_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            ),
+            None
+        );
+
+        let enough_room = Rect::new(0, 0, 30, 5);
+        assert_eq!(
+            context_menu_rect(
+                2,
+                1,
+                enough_room,
+                URL_WITH_COPY_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .map(|rect| rect.height),
+            Some(5)
         );
     }
 
