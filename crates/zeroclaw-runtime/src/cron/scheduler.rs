@@ -2219,6 +2219,11 @@ mod tests {
                         }))
                         .into_response();
                     }
+                    let shell_command = if cfg!(windows) {
+                        "type .cron-workspace-marker"
+                    } else {
+                        "cat .cron-workspace-marker"
+                    };
                     Json(serde_json::json!({
                         "choices": [{
                             "message": {
@@ -2228,7 +2233,10 @@ mod tests {
                                     "type": "function",
                                     "function": {
                                         "name": "shell",
-                                        "arguments": "{\"command\":\"cat .cron-workspace-marker\"}"
+                                        "arguments": serde_json::json!({
+                                            "command": shell_command
+                                        })
+                                        .to_string()
                                     }
                                 }]
                             }
