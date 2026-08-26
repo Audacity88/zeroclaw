@@ -8472,11 +8472,27 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
+#[cfg(test)]
 async fn run_message_dispatch_loop(
-    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
 ) {
+    run_message_dispatch_loop_with_cancel(
+        rx,
+        router,
+        max_in_flight_messages,
+        CancellationToken::new(),
+    )
+    .await;
+}
+
+async fn run_message_dispatch_loop_with_cancel(
+    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    router: AgentRouter,
+    max_in_flight_messages: usize,
+    cancel: CancellationToken,
+) -> tokio::time::Instant {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
     let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
@@ -8485,7 +8501,11 @@ async fn run_message_dispatch_loop(
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
-    while let Some(msg) = rx.recv().await {
+    while let Some(msg) = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        msg = rx.recv() => msg,
+    } {
         // Gate answers (button-click markers / `approve <ref>` text replies)
         // resolve a PARKED run and must never start one, so they are consumed
         // BEFORE agent ownership lookup. A configured approval route may be
@@ -8589,11 +8609,16 @@ async fn run_message_dispatch_loop(
                 &ctx.prompt_config.channels.telegram,
             );
 
-            match ctx
-                .debouncer
-                .debounce_with_window(&debounce_key, &msg.content, debounce_window)
-                .await
-            {
+            let debounce_result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = ctx.debouncer.debounce_with_window(
+                    &debounce_key,
+                    &msg.content,
+                    debounce_window,
+                ) => result,
+            };
+            match debounce_result {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
                     // Spawn a lightweight task that waits for the debounce window
                     // to expire, then feeds the combined message through the normal
@@ -8602,19 +8627,25 @@ async fn run_message_dispatch_loop(
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
+                    let debounce_cancel = cancel.clone();
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
-                        let combined = match rx.await {
-                            Ok(combined) => combined,
-                            Err(_) => {
-                                // Receiver dropped — a newer message superseded this one.
-                                return;
-                            }
+                        let combined = match tokio::select! {
+                            biased;
+                            _ = debounce_cancel.cancelled() => return,
+                            combined = rx => combined.ok(),
+                        } {
+                            Some(combined) => combined,
+                            None => return,
                         };
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
 
-                        let permit = match debounce_semaphore.acquire_owned().await {
+                        let permit = match tokio::select! {
+                            biased;
+                            _ = debounce_cancel.cancelled() => return,
+                            permit = debounce_semaphore.acquire_owned() => permit,
+                        } {
                             Ok(permit) => permit,
                             Err(_) => return,
                         };
@@ -8640,7 +8671,11 @@ async fn run_message_dispatch_loop(
             msg
         };
 
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
+        let permit = match tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            permit = Arc::clone(&semaphore).acquire_owned() => permit,
+        } {
             Ok(permit) => permit,
             Err(_) => break,
         };
@@ -8657,9 +8692,28 @@ async fn run_message_dispatch_loop(
         }
     }
 
-    while let Some(result) = workers.join_next().await {
-        log_worker_join_result(result);
+    {
+        let active = in_flight_by_sender.lock().await;
+        for state in active.values() {
+            state.cancellation.cancel();
+        }
     }
+    let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let drain_workers = async {
+        while let Some(result) = workers.join_next().await {
+            log_worker_join_result(result);
+        }
+    };
+    if tokio::time::timeout_at(shutdown_deadline, drain_workers)
+        .await
+        .is_err()
+    {
+        workers.abort_all();
+        while let Some(result) = workers.join_next().await {
+            log_worker_join_result(result);
+        }
+    }
+    shutdown_deadline
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -12960,10 +13014,15 @@ pub async fn start_channels(
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
-    run_message_dispatch_loop(rx, router, max_in_flight).await;
+    let shutdown_deadline =
+        run_message_dispatch_loop_with_cancel(rx, router, max_in_flight, cancel.clone()).await;
 
-    for h in listener_handles {
-        let _ = h.await;
+    for mut h in listener_handles {
+        let remaining = shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if tokio::time::timeout(remaining, &mut h).await.is_err() {
+            h.abort();
+            let _ = h.await;
+        }
     }
 
     Ok(())
@@ -22462,6 +22521,14 @@ BTC is currently around $65,000 based on latest tool output."#
         peak_in_flight: Arc<AtomicUsize>,
     }
 
+    struct InFlightGuard(Arc<AtomicUsize>);
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     #[async_trait::async_trait]
     impl ModelProvider for ConcurrencyTrackingProvider {
         async fn chat_with_system(
@@ -22472,9 +22539,9 @@ BTC is currently around $65,000 based on latest tool output."#
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _in_flight = InFlightGuard(Arc::clone(&self.in_flight));
             self.peak_in_flight.fetch_max(current, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(format!("echo: {message}"))
         }
     }
@@ -22493,7 +22560,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn message_dispatch_processes_messages_in_parallel() {
+    async fn message_dispatch_generation_cancel_drains_parallel_workers() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -22618,9 +22685,28 @@ BTC is currently around $65,000 based on latest tool output."#
         })
         .await
         .unwrap();
-        drop(tx);
+        let cancel = CancellationToken::new();
+        let dispatch_cancel = cancel.clone();
+        let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2,
+            dispatch_cancel,
+        ));
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peak_in_flight.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both channel workers should enter the provider");
+        cancel.cancel();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), dispatch)
+            .await
+            .expect("generation cancellation should drain channel workers promptly")
+            .expect("dispatch task should join cleanly");
 
         let peak = peak_in_flight.load(Ordering::SeqCst);
         assert!(
@@ -22628,14 +22714,13 @@ BTC is currently around $65,000 based on latest tool output."#
             "expected at least 2 concurrent in-flight dispatches, got peak {}",
             peak
         );
-        assert_eq!(
-            in_flight.load(Ordering::SeqCst),
-            0,
-            "all in-flight dispatches should have completed",
-        );
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0, "all workers drained");
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 2);
+        assert!(
+            sent_messages.is_empty(),
+            "cancelled generation workers must not publish old-channel replies"
+        );
     }
 
     #[tokio::test]

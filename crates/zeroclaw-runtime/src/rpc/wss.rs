@@ -295,11 +295,12 @@ pub async fn run_wss_listener(
                     let mut transport = WssTransport::new(ws_stream, remote_addr);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new_with_cancel(
+                    let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
                         ctx.clone(),
                         writer_tx,
                         peer,
                         connection_cancel.child_token(),
+                        false,
                     );
                     tokio::select! {
                         _ = connection_cancel.cancelled() => {}

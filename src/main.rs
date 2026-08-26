@@ -4724,18 +4724,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
-            // RPC sessions reuse the channel clients owned by the daemon. The
+            // Local RPC sessions reuse channel clients owned by the daemon. The
             // current config snapshot still filters each agent's capabilities,
-            // while channel reloads replace the shared live registry.
+            // while channel reloads replace the shared live registry; WSS is
+            // explicitly denied configured-channel seeding at its transport boundary.
             #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
                 |config, agent_alias| {
                     zeroclaw_channels::orchestrator::live_channel_map_for_agent(config, agent_alias)
                 },
-            ));
-            #[cfg(feature = "agent-runtime")]
-            zeroclaw_runtime::agent::loop_::register_channel_generation_invalidator(Box::new(
-                || zeroclaw_channels::orchestrator::prepare_live_channel_registry(true),
             ));
             #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|_| {
@@ -4789,6 +4786,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "agent-runtime")]
+                registry.register_channel_registry_clearer(std::sync::Arc::new(|| {
+                    zeroclaw_channels::orchestrator::prepare_live_channel_registry(true)
+                }));
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an

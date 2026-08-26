@@ -12,6 +12,8 @@ use super::{GatewayReadinessReporter, SocketReadinessReporter};
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
+pub type ChannelRegistryClearer = Arc<dyn Fn() + Send + Sync>;
+
 pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 #[derive(Clone)]
@@ -61,6 +63,7 @@ pub type MqttStarter = Box<dyn Fn(MqttConfig) -> StarterFuture + Send + Sync>;
 pub struct DaemonRegistry {
     gateway_start: Option<GatewayStarter>,
     channels_start: Option<ChannelsStarter>,
+    channel_registry_clearer: Option<ChannelRegistryClearer>,
     socket_start: Option<SocketStarter>,
     wss_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
@@ -89,6 +92,14 @@ impl DaemonRegistry {
 
     pub fn register_channels(&mut self, starter: ChannelsStarter) -> &mut Self {
         self.channels_start = Some(starter);
+        self
+    }
+
+    pub fn register_channel_registry_clearer(
+        &mut self,
+        clearer: ChannelRegistryClearer,
+    ) -> &mut Self {
+        self.channel_registry_clearer = Some(clearer);
         self
     }
 
@@ -131,6 +142,10 @@ impl DaemonRegistry {
 
     pub(crate) fn take_channels_start(&mut self) -> Option<ChannelsStarter> {
         self.channels_start.take()
+    }
+
+    pub(crate) fn take_channel_registry_clearer(&mut self) -> Option<ChannelRegistryClearer> {
+        self.channel_registry_clearer.take()
     }
 
     pub(crate) fn take_socket_start(&mut self) -> Option<SocketStarter> {

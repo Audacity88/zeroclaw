@@ -66,42 +66,15 @@ type ChannelMapFn = Box<ChannelMapFactory>;
 type ApprovalChannelMapFactory =
     dyn Fn(&zeroclaw_config::schema::Config) -> ChannelMap + Send + Sync;
 type ApprovalChannelMapFn = Box<ApprovalChannelMapFactory>;
-type ChannelGenerationInvalidator = dyn Fn() + Send + Sync;
-type ChannelGenerationInvalidatorFn = Box<ChannelGenerationInvalidator>;
 
 /// Channel map factory, injected by the binary.
 static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
 static APPROVAL_CHANNEL_MAP_FN: std::sync::OnceLock<ApprovalChannelMapFn> =
     std::sync::OnceLock::new();
-static CHANNEL_GENERATION_INVALIDATOR_FN: std::sync::OnceLock<ChannelGenerationInvalidatorFn> =
-    std::sync::OnceLock::new();
 
 /// Register the channel map factory. Called once at startup by the binary.
 pub fn register_channel_map_fn(f: ChannelMapFn) {
     let _ = CHANNEL_MAP_FN.set(f);
-}
-
-/// Register the daemon-owned live-channel generation invalidator. Runtime
-/// config mutation code invokes this before revoking session-local handles so
-/// a racing session cannot seed another handle from the retired generation.
-pub fn register_channel_generation_invalidator(f: ChannelGenerationInvalidatorFn) {
-    let _ = CHANNEL_GENERATION_INVALIDATOR_FN.set(f);
-}
-
-pub(crate) fn invalidate_channel_generation() -> bool {
-    let Some(invalidate) = CHANNEL_GENERATION_INVALIDATOR_FN.get() else {
-        return false;
-    };
-    invalidate();
-    true
-}
-
-pub(crate) fn channel_generation_invalidator_available() -> bool {
-    CHANNEL_GENERATION_INVALIDATOR_FN.get().is_some()
-}
-
-pub(crate) fn channel_generation_map_factory_available() -> bool {
-    APPROVAL_CHANNEL_MAP_FN.get().is_some()
 }
 
 /// Register the route-aware channel factory used only by distinct-approver

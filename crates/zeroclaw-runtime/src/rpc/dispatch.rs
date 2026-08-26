@@ -514,6 +514,11 @@ type TestChannelGenerationMapFn = Arc<
         + Sync,
 >;
 
+struct PreparedChannelGenerationMutation {
+    configured: crate::agent::loop_::ConfiguredChannelMaps,
+    drain: Option<crate::daemon::PreparedChannelGenerationDrain>,
+}
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -521,6 +526,9 @@ pub struct RpcDispatcher {
     prompt_tasks: tokio::task::JoinSet<()>,
     connection_cancel: tokio_util::sync::CancellationToken,
     authenticated: bool,
+    /// Whether this transport may seed configured channel clients into RPC
+    /// sessions. Local IPC allows this; WSS deliberately does not.
+    configured_channel_access: bool,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
@@ -555,12 +563,29 @@ impl RpcDispatcher {
         peer_label: String,
         connection_cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
+        Self::new_with_cancel_and_channel_access(
+            ctx,
+            writer_tx,
+            peer_label,
+            connection_cancel,
+            true,
+        )
+    }
+
+    pub(crate) fn new_with_cancel_and_channel_access(
+        ctx: Arc<RpcContext>,
+        writer_tx: mpsc::Sender<String>,
+        peer_label: String,
+        connection_cancel: tokio_util::sync::CancellationToken,
+        configured_channel_access: bool,
+    ) -> Self {
         Self {
             ctx,
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             prompt_tasks: tokio::task::JoinSet::new(),
             connection_cancel,
             authenticated: false,
+            configured_channel_access,
             tui_id: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
@@ -648,6 +673,9 @@ impl RpcDispatcher {
         agent_alias: &str,
     ) -> Vec<String> {
         let handles = agent.channel_handles();
+        if !self.configured_channel_access {
+            return Vec::new();
+        }
         #[cfg(test)]
         if let Some(factory) = self.channel_map_factory.as_deref() {
             crate::agent::loop_::seed_channel_handles_with_factory(
@@ -709,28 +737,14 @@ impl RpcDispatcher {
         crate::agent::loop_::configured_channel_generation_revocation(config)
     }
 
-    fn channel_generation_controls_available(&self) -> bool {
-        #[cfg(test)]
-        if self.channel_generation_map_factory.is_some()
-            && self.channel_generation_invalidator.is_some()
-            && self.ctx.reload_tx.is_some()
-        {
-            return true;
-        }
-
-        self.ctx.reload_tx.is_some()
-            && crate::agent::loop_::channel_generation_invalidator_available()
-            && crate::agent::loop_::channel_generation_map_factory_available()
-    }
-
-    fn invalidate_channel_generation(&self) -> bool {
+    fn invalidate_channel_generation_for_test(&self) -> bool {
         #[cfg(test)]
         if let Some(invalidate) = self.channel_generation_invalidator.as_deref() {
             invalidate();
             return true;
         }
 
-        crate::agent::loop_::invalidate_channel_generation()
+        false
     }
 
     async fn revoke_live_channel_generation(
@@ -750,7 +764,7 @@ impl RpcDispatcher {
         &self,
         mutation: bool,
         config: Option<&Config>,
-    ) -> Result<Option<crate::agent::loop_::ConfiguredChannelMaps>, JsonRpcError> {
+    ) -> Result<Option<PreparedChannelGenerationMutation>, JsonRpcError> {
         if !mutation {
             return Ok(None);
         }
@@ -760,14 +774,44 @@ impl RpcDispatcher {
                 "Channel mutation is missing its pre-commit config snapshot",
             )
         })?;
-        if !self.channel_generation_controls_available() {
+        if self.ctx.reload_tx.is_none() {
             return Err(rpc_err(
                 INTERNAL_ERROR,
-                "Channel generation controls are unavailable; refusing a live channel mutation",
+                "Channel generation reload controls are unavailable; refusing a live channel mutation",
             ));
         }
+        let drain = match self.ctx.channel_generation_control.as_ref() {
+            Some(control) => Some(control.prepare().ok_or_else(|| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    "Channel registry clearer is unavailable; refusing a live channel mutation",
+                )
+            })?),
+            None => {
+                #[cfg(test)]
+                {
+                    if self.channel_generation_map_factory.is_some()
+                        && self.channel_generation_invalidator.is_some()
+                    {
+                        None
+                    } else {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            "Channel generation controls are unavailable; refusing a live channel mutation",
+                        ));
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        "Channel generation controls are unavailable; refusing a live channel mutation",
+                    ));
+                }
+            }
+        };
         self.configured_channel_generation_revocation(config)
-            .map(Some)
+            .map(|configured| Some(PreparedChannelGenerationMutation { configured, drain }))
             .ok_or_else(|| {
                 rpc_err(
                     INTERNAL_ERROR,
@@ -778,21 +822,30 @@ impl RpcDispatcher {
 
     async fn finish_channel_generation_mutation(
         &self,
-        configured: Option<&crate::agent::loop_::ConfiguredChannelMaps>,
+        prepared: Option<&PreparedChannelGenerationMutation>,
     ) {
-        let Some(configured) = configured else {
+        let Some(prepared) = prepared else {
             return;
         };
-        let invalidated = self.invalidate_channel_generation();
-        debug_assert!(
-            invalidated,
-            "channel controls were checked before config commit"
-        );
+        let drain_wait = if let Some(drain) = &prepared.drain {
+            Some(drain.begin())
+        } else {
+            let invalidated = self.invalidate_channel_generation_for_test();
+            debug_assert!(
+                invalidated,
+                "test channel controls were checked before config commit"
+            );
+            None
+        };
         self.ctx
             .sessions
             .cancel_all_inflight_and_wait(crate::rpc::session::CancelCause::ChannelGeneration)
             .await;
-        self.revoke_live_channel_generation(configured).await;
+        self.revoke_live_channel_generation(&prepared.configured)
+            .await;
+        if let Some(drain_wait) = drain_wait {
+            drain_wait.wait().await;
+        }
         self.schedule_daemon_reload("config-channel-generation");
     }
 
@@ -924,8 +977,9 @@ impl RpcDispatcher {
             &handles.poll,
             &handles.escalate,
         );
-        if let Some(configured) =
-            self.configured_channel_maps(seed_config, &current_config, agent_alias)
+        if self.configured_channel_access
+            && let Some(configured) =
+                self.configured_channel_maps(seed_config, &current_config, agent_alias)
         {
             Self::refresh_channel_handles_for_agent(&agent, &configured);
         }
@@ -949,6 +1003,7 @@ impl RpcDispatcher {
             prompt_tasks: tokio::task::JoinSet::new(),
             connection_cancel: self.connection_cancel.clone(),
             authenticated: true,
+            configured_channel_access: self.configured_channel_access,
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
@@ -5558,6 +5613,37 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
+    #[test]
+    fn transport_constructor_carries_configured_channel_capability_into_handles() {
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            4,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let ctx = RpcContext::minimal(Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let local = RpcDispatcher::new_with_cancel_and_channel_access(
+            Arc::clone(&ctx),
+            tx.clone(),
+            "unix:test".into(),
+            cancel.clone(),
+            true,
+        );
+        let wss = RpcDispatcher::new_with_cancel_and_channel_access(
+            ctx,
+            tx,
+            "wss:test".into(),
+            cancel,
+            false,
+        );
+        assert!(local.configured_channel_access);
+        assert!(local.spawn_handle().configured_channel_access);
+        assert!(!wss.configured_channel_access);
+        assert!(!wss.spawn_handle().configured_channel_access);
+    }
+
     fn run_rpc_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
     where
         F: std::future::Future<Output = ()> + 'static,
@@ -5734,6 +5820,22 @@ mod tests {
         assert!(
             !reaction.contains_key(absent),
             "channel {absent} absent from the selected agent config must not be synthesized"
+        );
+    }
+
+    async fn assert_rpc_only_channel(
+        agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        absent: &str,
+    ) {
+        let agent = agent.lock().await;
+        let reaction = agent.channel_handles().reaction.read();
+        assert!(
+            reaction.contains_key("rpc"),
+            "the synthetic RPC back-channel must remain registered"
+        );
+        assert!(
+            !reaction.contains_key(absent),
+            "WSS sessions must not receive configured channel {absent}"
         );
     }
 
@@ -9050,6 +9152,35 @@ mod tests {
         assert_rpc_and_configured_channels(agent, "git.configured", "git.missing").await;
     }
 
+    #[tokio::test]
+    async fn wss_acp_session_new_denies_configured_channels_but_keeps_rpc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.wss-configured".into()];
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        seed_test_channel_factory(&mut dispatcher);
+        dispatcher.configured_channel_access = false;
+
+        let sid = "wss-acp-channel-deny-new";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("WSS session/new should succeed without configured channels");
+
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("session/new must register a live agent");
+        assert_rpc_only_channel(agent, "git.wss-configured").await;
+    }
+
     async fn execute_reaction_for_channel_refresh_test(
         agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
         channel: &str,
@@ -10037,7 +10168,7 @@ mod tests {
             "a prompt registration must wait while mutation owns config_write_lock"
         );
 
-        assert!(dispatcher.invalidate_channel_generation());
+        assert!(dispatcher.invalidate_channel_generation_for_test());
         dispatcher.revoke_live_channel_generation(&configured).await;
         assert!(invalidated.load(std::sync::atomic::Ordering::Acquire));
         assert_channel_refresh_map(&agent, false).await;
@@ -10488,6 +10619,36 @@ mod tests {
             .await
             .expect("durable ACP session should rehydrate");
         assert_rpc_and_configured_channels(agent, "git.after-reload", "git.before-reload").await;
+    }
+
+    #[tokio::test]
+    async fn wss_reaped_acp_session_denies_configured_channels_but_keeps_rpc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.wss-configured".into()];
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        seed_test_channel_factory(&mut dispatcher);
+        dispatcher.configured_channel_access = false;
+
+        let sid = "wss-acp-channel-deny-rehydrate";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("WSS session/new should seed only the synthetic RPC channel");
+        assert!(sessions.remove(sid).await, "reap must remove the session");
+
+        let agent = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("durable ACP session should rehydrate");
+        assert_rpc_only_channel(agent, "git.wss-configured").await;
     }
 
     #[tokio::test]
@@ -12564,6 +12725,7 @@ mod tests {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
+            channel_generation_control: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -12607,6 +12769,7 @@ mod tests {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
+            channel_generation_control: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -12742,6 +12905,7 @@ mod tests {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
+            channel_generation_control: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,

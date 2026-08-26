@@ -206,11 +206,12 @@ pub async fn run_local_listener(
                     let mut transport = LocalTransport::new(stream);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new_with_cancel(
+                    let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
                         ctx.clone(),
                         writer_tx,
                         peer,
                         connection_cancel.child_token(),
+                        true,
                     );
                     tokio::select! {
                         _ = connection_cancel.cancelled() => {}
