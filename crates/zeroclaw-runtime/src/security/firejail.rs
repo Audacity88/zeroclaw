@@ -216,7 +216,8 @@ mod tests {
 
     #[test]
     fn firejail_description_mentions_dependency() {
-        let desc = FirejailSandbox::for_test().description();
+        let sandbox = FirejailSandbox::for_test();
+        let desc = sandbox.description();
         assert!(desc.contains("firejail"));
     }
 

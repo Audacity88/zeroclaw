@@ -149,6 +149,7 @@ fn host_native_non_windows_program(program: &OsStr) -> Result<OsString, CodingCl
         })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn host_native_non_windows_program_with_path<I, P>(
     program: &OsStr,
     path_entries: I,
