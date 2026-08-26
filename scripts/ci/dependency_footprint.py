@@ -115,7 +115,7 @@ def load_policy(path: Path) -> tuple[dict[str, Any], str]:
     if (
         not isinstance(edges, list)
         or len(edges) != 2
-        or any(item not in {"normal", "build"} for item in edges)
+        or any(not isinstance(item, str) or item not in {"normal", "build"} for item in edges)
         or sorted(edges) != ["build", "normal"]
     ):
         raise fail("policy.edge_kinds: expected exactly [\"normal\", \"build\"]")
@@ -366,6 +366,36 @@ def capture_path(raw_dir: Path, profile_id: str) -> Path:
     return existing[0]
 
 
+def normalize_resolved_selections(value: Any, label: str) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        raise fail(f"{label}: expected an object")
+    normalized: dict[str, list[str]] = {}
+    for selection, raw_features in value.items():
+        require_string(selection, f"{label} key", PROFILE_ID_RE)
+        features = require_feature_ref_list(raw_features, f"{label}.{selection}")
+        normalized[selection] = sorted(features)
+    return {selection: normalized[selection] for selection in sorted(normalized)}
+
+
+def require_policy_selection_keys(
+    selections: dict[str, list[str]],
+    policy: dict[str, Any],
+    label: str,
+) -> None:
+    expected = {profile["selection"] for profile in policy["profiles"] if profile["selection"] is not None}
+    actual = set(selections)
+    if actual == expected:
+        return
+    details = []
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing:
+        details.append(f"missing {', '.join(missing)}")
+    if extra:
+        details.append(f"extra {', '.join(extra)}")
+    raise fail(f"{label}: keys do not match supplied policy ({'; '.join(details)})")
+
+
 def load_context(path: Path) -> dict[str, Any]:
     context = load_json(path, "context")
     if not isinstance(context, dict):
@@ -397,15 +427,11 @@ def load_context(path: Path) -> dict[str, Any]:
     lock_digest = context.get("cargo_lock_sha256")
     if not isinstance(lock_digest, str) or re.fullmatch(r"[0-9a-f]{64}", lock_digest) is None:
         raise fail("context.cargo_lock_sha256: malformed digest")
-    selections = context.get("resolved_selections", {})
-    if not isinstance(selections, dict):
-        raise fail("context.resolved_selections: expected an object")
-    normalized: dict[str, list[str]] = {}
-    for selection, features in selections.items():
-        require_string(selection, "context.resolved_selections key", PROFILE_ID_RE)
-        normalized[selection] = require_feature_ref_list(features, f"context.resolved_selections.{selection}")
     result = dict(context)
-    result["resolved_selections"] = normalized
+    result["resolved_selections"] = normalize_resolved_selections(
+        context.get("resolved_selections", {}),
+        "context.resolved_selections",
+    )
     return result
 
 
@@ -440,7 +466,11 @@ def build_report(
     context: dict[str, Any],
     captures: dict[str, str],
 ) -> dict[str, Any]:
-    resolved = context.get("resolved_selections", {})
+    resolved = normalize_resolved_selections(
+        context.get("resolved_selections", {}),
+        "context.resolved_selections",
+    )
+    require_policy_selection_keys(resolved, policy, "context.resolved_selections")
     records: dict[str, dict[str, Any]] = {}
     for profile in policy["profiles"]:
         inputs = profile_inputs(profile, resolved)
@@ -466,7 +496,8 @@ def build_report(
                 "rustc_host",
                 "target",
             )
-        },
+        }
+        | {"resolved_selections": resolved},
         "evidence_units": {
             "cargo_package_name_version_pairs": "measured",
             "binary_bytes": "not measured",
@@ -880,6 +911,7 @@ def validate_report(
         "rustc_version",
         "rustc_host",
         "target",
+        "resolved_selections",
     }
     if not isinstance(context, dict) or set(context) != context_fields:
         raise fail(f"{label}.context: malformed fields")
@@ -895,6 +927,17 @@ def validate_report(
     lock_digest = context["cargo_lock_sha256"]
     if not isinstance(lock_digest, str) or re.fullmatch(r"[0-9a-f]{64}", lock_digest) is None:
         raise fail(f"{label}.context.cargo_lock_sha256: malformed digest")
+    resolved_selections = normalize_resolved_selections(
+        context["resolved_selections"],
+        f"{label}.context.resolved_selections",
+    )
+    if context["resolved_selections"] != resolved_selections:
+        raise fail(f"{label}.context.resolved_selections: expected sorted feature values")
+    require_policy_selection_keys(
+        resolved_selections,
+        expected_policy,
+        f"{label}.context.resolved_selections",
+    )
 
     if report["evidence_units"] != {
         "cargo_package_name_version_pairs": "measured",
@@ -924,7 +967,12 @@ def validate_report(
             raise fail(f"{label}.profiles.{profile['id']}: package or mode does not match supplied policy")
         if inputs["selection"] != expected["selection"]:
             raise fail(f"{label}.profiles.{profile['id']}: selection does not match supplied policy")
-        if expected["mode"] != "selection" and inputs["features"] != sorted(expected["features"]):
+        if expected["mode"] == "selection":
+            if inputs["features"] != resolved_selections[expected["selection"]]:
+                raise fail(
+                    f"{label}.profiles.{profile['id']}: features do not match captured selection"
+                )
+        elif inputs["features"] != sorted(expected["features"]):
             raise fail(f"{label}.profiles.{profile['id']}: features do not match supplied policy")
 
     contracts = report["contracts"]

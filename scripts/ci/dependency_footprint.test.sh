@@ -71,6 +71,9 @@ assert type(report["context"]["git_dirty"]) is bool
 assert len(report["context"]["git_worktree_digest_sha256"]) == 64
 assert len(report["context"]["cargo_lock_sha256"]) == 64
 assert "/fixture/checkout" not in json.dumps(report)
+assert report["context"]["resolved_selections"] == {
+    "dist": ["agent-runtime", "channel-matrix"]
+}
 PY
 
 replace_text "$test_root/raw-b/foundation.tree" 'dep-crate v1.0.0' 'dep-crate v1.1.0'
@@ -253,6 +256,75 @@ set -e
 [[ "$status" -ne 0 ]] || fail "boolean report schema was accepted"
 assert_contains "$test_root/boolean-schema.err" 'incompatible schema version'
 
+cp "$test_root/report-a.json" "$test_root/missing-resolved-selection.json"
+python3 - "$test_root/missing-resolved-selection.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+report["context"]["resolved_selections"].pop("dist")
+path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+set +e
+bash "$tool" compare \
+    "$test_root/missing-resolved-selection.json" \
+    "$test_root/report-a.json" \
+    2>"$test_root/missing-resolved-selection.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "report missing policy-referenced resolved selection was accepted"
+assert_contains "$test_root/missing-resolved-selection.err" 'keys do not match supplied policy (missing dist)'
+
+cp "$test_root/report-a.json" "$test_root/extra-resolved-selection.json"
+python3 - "$test_root/extra-resolved-selection.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+report["context"]["resolved_selections"]["extra"] = ["synthetic-feature"]
+path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+set +e
+bash "$tool" compare \
+    "$test_root/extra-resolved-selection.json" \
+    "$test_root/report-a.json" \
+    2>"$test_root/extra-resolved-selection.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "report with an extra resolved selection was accepted"
+assert_contains "$test_root/extra-resolved-selection.err" 'keys do not match supplied policy (extra extra)'
+
+for side in left right; do
+    cp "$test_root/report-a.json" "$test_root/selection-input-mismatch-${side}.json"
+done
+python3 - \
+    "$test_root/selection-input-mismatch-left.json" \
+    "$test_root/selection-input-mismatch-right.json" <<'PY'
+import json
+import pathlib
+import sys
+
+for value in sys.argv[1:]:
+    path = pathlib.Path(value)
+    report = json.loads(path.read_text(encoding="utf-8"))
+    profile = next(item for item in report["profiles"] if item["id"] == "standard-distribution")
+    profile["resolved_inputs"]["features"] = ["not-real"]
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+set +e
+bash "$tool" compare \
+    "$test_root/selection-input-mismatch-left.json" \
+    "$test_root/selection-input-mismatch-right.json" \
+    2>"$test_root/selection-input-mismatch.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "selection profile with mismatched resolved inputs was accepted"
+assert_contains "$test_root/selection-input-mismatch.err" 'features do not match captured selection'
+
 fake_cargo="$test_root/fake-cargo"
 cat >"$fake_cargo" <<'SH'
 #!/usr/bin/env bash
@@ -353,9 +425,13 @@ python3 - "$test_root/capture-a.json" <<'PY'
 import json
 import sys
 
-context = json.load(open(sys.argv[1], encoding="utf-8"))["context"]
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+context = report["context"]
 assert type(context["git_dirty"]) is bool
 assert len(context["git_worktree_digest_sha256"]) == 64
+assert context["resolved_selections"] == {
+    "dist": ["agent-runtime", "channel-matrix"]
+}
 PY
 assert_contains "$test_root/fake-cargo.log" 'run --locked --quiet -p xtask --bin generate -- features --selection dist'
 run_fake_capture "$test_root/capture-target.json" 'aarch64-unknown-linux-gnu'
@@ -618,6 +694,24 @@ status=$?
 set -e
 [[ "$status" -ne 0 ]] || fail "boolean policy schema was accepted"
 assert_contains "$test_root/boolean-policy.err" 'expected 1'
+
+cp "$fixture_root/policy.toml" "$test_root/malformed-edge-kinds.toml"
+replace_text \
+    "$test_root/malformed-edge-kinds.toml" \
+    'edge_kinds = ["normal", "build"]' \
+    'edge_kinds = [[], "build"]'
+set +e
+bash "$tool" normalize \
+    --policy "$test_root/malformed-edge-kinds.toml" \
+    --raw-dir "$fixture_root/raw" \
+    --context "$fixture_root/context.json" \
+    --output "$test_root/should-not-exist.json" \
+    2>"$test_root/malformed-edge-kinds.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "malformed policy edge kinds were accepted"
+assert_contains "$test_root/malformed-edge-kinds.err" 'error: policy.edge_kinds: expected exactly'
+! grep -Fq 'Traceback' "$test_root/malformed-edge-kinds.err" || fail "malformed policy emitted a Python traceback"
 
 printf '%s\n' '{"old": true}' > "$test_root/atomic.json"
 printf '%s\n' 'not a Cargo package line' > "$test_root/raw-b/foundation.tree"
