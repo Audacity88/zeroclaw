@@ -36,10 +36,11 @@ class Selection:
     mode: str
     packages: tuple[str, ...]
     reason: str
+    needs_plugin_host: bool
 
 
-def full(reason: str) -> Selection:
-    return Selection("full", (), reason)
+def full(reason: str, needs_plugin_host: bool = False) -> Selection:
+    return Selection("full", (), reason, needs_plugin_host)
 
 
 def normalize_git_path(raw_path: str) -> str | None:
@@ -224,8 +225,11 @@ def select_pull_request(
     reverse_dependents: dict[str, set[str]],
 ) -> Selection:
     if not changed_paths:
-        return Selection("skip", (), "No covered Rust compilation or test paths changed.")
+        return Selection("skip", (), "No covered Rust compilation or test paths changed.", False)
 
+    needs_plugin_host = any(
+        path.startswith(DYNAMIC_TEST_FIXTURE_PREFIX) for path in changed_paths
+    )
     selected: set[str] = set()
     lockfile_changed = False
 
@@ -234,45 +238,70 @@ def select_pull_request(
             lockfile_changed = True
             continue
         if path in FULL_PATHS or path == ".cargo" or path.startswith(".cargo/"):
-            return full("Workspace-wide or ambiguous Rust-affecting change requires the full suite.")
+            return full(
+                "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
+                needs_plugin_host,
+            )
         if path.startswith(".github/workflows/") or path.startswith("scripts/ci/"):
-            return full("Workspace-wide or ambiguous Rust-affecting change requires the full suite.")
+            return full(
+                "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
+                needs_plugin_host,
+            )
         if PurePosixPath(path).name in {"rust-toolchain", "rust-toolchain.toml"}:
-            return full("Workspace-wide or ambiguous Rust-affecting change requires the full suite.")
+            return full(
+                "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
+                needs_plugin_host,
+            )
         if path.startswith(DYNAMIC_TEST_FIXTURE_PREFIX):
-            return full("Dynamically consumed plugin test fixtures require the full suite.")
+            return full(
+                "Dynamically consumed plugin test fixtures require the full suite.",
+                needs_plugin_host,
+            )
         if is_obviously_irrelevant(path):
             continue
 
         package = package_for(path, repo_root, packages)
         if package is None:
-            return full("Workspace-wide or ambiguous Rust-affecting change requires the full suite.")
+            return full(
+                "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
+                needs_plugin_host,
+            )
         if package.name == DESKTOP_PACKAGE:
             continue
         if not is_package_test_path(path, package, repo_root):
-            return full("Workspace-wide or ambiguous Rust-affecting change requires the full suite.")
+            return full(
+                "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
+                needs_plugin_host,
+            )
         selected.add(package.name)
 
     if lockfile_changed:
-        return full("Cargo.lock changes require the full suite.")
+        return full("Cargo.lock changes require the full suite.", needs_plugin_host)
 
     if not selected:
-        return Selection("skip", (), "No covered Rust compilation or test paths changed.")
+        return Selection("skip", (), "No covered Rust compilation or test paths changed.", needs_plugin_host)
     selected = close_over_reverse_dependents(selected, reverse_dependents)
-    return Selection("scoped", tuple(sorted(selected)), "Changed paths map to workspace packages.")
+    return Selection(
+        "scoped", tuple(sorted(selected)), "Changed paths map to workspace packages.", needs_plugin_host
+    )
 
 
 def select(event: str, changed_file: Path | None, metadata_file: Path | None, repo_root: Path) -> Selection:
     if event != "pull_request":
-        return full("Non-pull-request events use the full suite.")
-    if changed_file is None or metadata_file is None:
-        return full("Changed paths or Cargo metadata are unavailable; selecting full is safer.")
+        return full("Non-pull-request events use the full suite.", True)
+    if changed_file is None:
+        return full("Changed paths or Cargo metadata are unavailable; selecting full is safer.", True)
     changed_paths, paths_ok = read_changed_paths(changed_file)
     if not paths_ok:
-        return full("Changed paths are malformed or unavailable; selecting full is safer.")
+        return full("Changed paths are malformed or unavailable; selecting full is safer.", True)
+    needs_plugin_host = any(
+        path.startswith(DYNAMIC_TEST_FIXTURE_PREFIX) for path in changed_paths
+    )
+    if metadata_file is None:
+        return full("Changed paths or Cargo metadata are unavailable; selecting full is safer.", needs_plugin_host)
     packages, reverse_dependents, metadata_error = load_packages(metadata_file, repo_root)
     if metadata_error is not None:
-        return full(metadata_error)
+        return full(metadata_error, needs_plugin_host)
     return select_pull_request(changed_paths, repo_root, packages, reverse_dependents)
 
 
@@ -280,6 +309,7 @@ def emit(selection: Selection) -> None:
     print(f"mode={selection.mode}")
     print(f"packages={json.dumps(list(selection.packages), ensure_ascii=True, separators=(',', ':'))}")
     print(f"reason={selection.reason}")
+    print(f"needs_plugin_host={'true' if selection.needs_plugin_host else 'false'}")
 
 
 def emit_package_args(raw_packages: str) -> int:

@@ -55,22 +55,24 @@ assert_selection() {
     local expected_packages="$3"
     local expected_reason="$4"
     local paths_file="$5"
+    local expected_plugin_host="${6:-false}"
     local output
     output="$(run_selector pull_request "$paths_file" "$metadata_file")"
-    SELECTION_OUTPUT="$output" EXPECTED_MODE="$expected_mode" EXPECTED_PACKAGES="$expected_packages" EXPECTED_REASON="$expected_reason" python3 - <<'PY'
+    SELECTION_OUTPUT="$output" EXPECTED_MODE="$expected_mode" EXPECTED_PACKAGES="$expected_packages" EXPECTED_REASON="$expected_reason" EXPECTED_PLUGIN_HOST="$expected_plugin_host" python3 - <<'PY'
 import json
 import os
 
 values = {}
 for line in os.environ["SELECTION_OUTPUT"].splitlines():
     key, separator, value = line.partition("=")
-    assert separator and key in {"mode", "packages", "reason"} and "\n" not in value
+    assert separator and key in {"mode", "packages", "reason", "needs_plugin_host"} and "\n" not in value
     values[key] = value
 assert values["mode"] == os.environ["EXPECTED_MODE"], (values, os.environ["EXPECTED_MODE"])
 assert json.loads(values["packages"]) == json.loads(os.environ["EXPECTED_PACKAGES"]), values
 if os.environ["EXPECTED_REASON"]:
     assert values["reason"] == os.environ["EXPECTED_REASON"], values
-assert set(values) == {"mode", "packages", "reason"}, values
+assert values["needs_plugin_host"] == os.environ["EXPECTED_PLUGIN_HOST"], values
+assert set(values) == {"mode", "packages", "reason", "needs_plugin_host"}, values
 PY
 }
 
@@ -97,7 +99,10 @@ printf '%s\n' 'crates/zeroclaw-channels/tests/fixture.md' > "$paths_file"
 assert_selection "test fixture" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
 
 printf '%s\n' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
-assert_selection "dynamically consumed plugin fixture" full '[]' 'Dynamically consumed plugin test fixtures require the full suite.' "$paths_file"
+assert_selection "dynamically consumed plugin fixture" full '[]' 'Dynamically consumed plugin test fixtures require the full suite.' "$paths_file" true
+
+printf '%s\n' 'Cargo.toml' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
+assert_selection "mixed full trigger with plugin fixture" full '[]' '' "$paths_file" true
 
 printf '%s\n' 'Cargo.toml' > "$paths_file"
 assert_selection "full workspace manifest" full '[]' '' "$paths_file"
@@ -136,7 +141,7 @@ if [ -e "$repo_root/should-not-exist" ] || printf '%s\n' "$output" | grep -q 'sh
 fi
 printf '%s\n' "$output" | while IFS= read -r line; do
     case "$line" in
-        mode=*|packages=*|reason=*) ;;
+        mode=*|packages=*|reason=*|needs_plugin_host=*) ;;
         *) echo "FAIL: unsafe selector output: $line" >&2; exit 1 ;;
     esac
 done
@@ -144,11 +149,23 @@ done
 for event in push merge_group workflow_dispatch unknown; do
     output="$(python3 "$selector" --event "$event" --repo-root "$repo_root")"
     printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
+    printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
 done
 
 output="$(python3 "$selector" --event pull_request --repo-root "$repo_root")"
 printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
 printf '%s\n' "$output" | grep -Fx 'reason=Changed paths or Cargo metadata are unavailable; selecting full is safer.' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
+
+missing_paths="$fixture_dir/missing-paths"
+output="$(python3 "$selector" --event pull_request --changed-paths-file "$missing_paths" --metadata-file "$metadata_file" --repo-root "$repo_root")"
+printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
+
+printf '%s\n' '../outside.rs' > "$paths_file"
+output="$(run_selector pull_request "$paths_file" "$metadata_file")"
+printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
 
 malformed_metadata="$fixture_dir/malformed.json"
 printf '%s\n' '{"packages": []}' > "$malformed_metadata"
@@ -156,11 +173,24 @@ printf '%s\n' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
 output="$(run_selector pull_request "$paths_file" "$malformed_metadata")"
 printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
 printf '%s\n' "$output" | grep -F 'reason=Cargo metadata is malformed or unavailable' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=false' >/dev/null
 
 missing_metadata="$fixture_dir/missing.json"
 output="$(run_selector pull_request "$paths_file" "$missing_metadata")"
 printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
 printf '%s\n' "$output" | grep -Fx 'reason=Cargo metadata is malformed or unavailable (FileNotFoundError).' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=false' >/dev/null
+
+printf '%s\n' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
+output="$(run_selector pull_request "$paths_file" "$malformed_metadata")"
+printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
+printf '%s\n' "$output" | grep -F 'reason=Cargo metadata is malformed or unavailable' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
+
+output="$(run_selector pull_request "$paths_file" "$missing_metadata")"
+printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'reason=Cargo metadata is malformed or unavailable (FileNotFoundError).' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
 
 package_args="$(python3 "$selector" --package-args-json '["zeroclaw","zeroclaw-channels"]')"
 test "$package_args" = $'-p\nzeroclaw\n-p\nzeroclaw-channels'
@@ -182,6 +212,9 @@ import os
 from pathlib import Path
 
 workflow = Path(os.environ["WORKFLOW"]).read_text()
+plugin_backend_job = workflow.split("\n  check-plugin-backends:\n", 1)[1].split(
+    "\n  msrv:\n", 1
+)[0]
 scope_job = workflow.split("\n  windows-test-scope:\n", 1)[1].split(
     "\n  windows-test:\n", 1
 )[0]
@@ -194,17 +227,42 @@ skip_condition = "needs.windows-test-scope.outputs.mode != 'skip'"
 package_conversion = 'scripts/ci/windows_test_scope.py --package-args-json "$PACKAGES_JSON"'
 scoped_command = 'cargo nextest run --locked --no-fail-fast "${package_args[@]}"'
 full_command = 'cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop'
+plugin_condition = 'if [[ "$NEEDS_PLUGIN_HOST" == "true" ]]; then'
+plugin_components_command = 'cargo nextest run --locked --no-fail-fast \\\n              -p zeroclaw-plugins'
+plugin_root_command = 'cargo nextest run --locked --no-fail-fast \\\n              --features plugins-wasm-cranelift \\\n              --test plugin_channel_runtime_e2e'
 assert "bash scripts/ci/windows_test_scope.test.sh" in scope_job
 metadata_fallback = 'if ! cargo metadata --locked --format-version 1 > "$metadata_file"; then'
 assert metadata_fallback in scope_job
 assert 'rm -f "$metadata_file"' in scope_job
 assert scope_job.index(metadata_fallback) < scope_job.index('rm -f "$metadata_file"')
+assert 'needs_plugin_host: ${{ steps.select.outputs.needs_plugin_host }}' in scope_job
+assert 'printf "| Plugin host required | %s |\\n" "$NEEDS_PLUGIN_HOST"' in scope_job
 assert skip_condition in windows_job
 assert package_conversion in windows_job
 assert scoped_command in windows_job
 assert full_command in windows_job
+assert 'name: Advisory Windows nextest (${{ needs.windows-test-scope.outputs.mode }}, plugin-host=${{ needs.windows-test-scope.outputs.needs_plugin_host }})' in windows_job
+assert "if: needs.windows-test-scope.outputs.needs_plugin_host == 'true'" in windows_job
+assert 'run: rustup target add wasm32-wasip2' in windows_job
+assert plugin_condition in windows_job
+assert plugin_components_command in windows_job
+for target in ("channel_plugin_e2e", "tool_plugin_timeout_e2e", "reference_plugin", "reference_plugin_e2e", "tool_plugin_e2e"):
+    assert f"--test {target}" in plugin_backend_job
+    assert f"--test {target}" in windows_job
+assert plugin_root_command in windows_job
+assert "--test plugin_channel_runtime_e2e" in plugin_backend_job
+assert 'plugin_components_status=${PIPESTATUS[0]}' in windows_job
+assert 'plugin_root_status=${PIPESTATUS[0]}' in windows_job
+assert 'Failure inventory' in windows_job
+assert 'Baseline duration' in windows_job
+assert 'Plugin-host duration' in windows_job
+assert 'Total duration' in windows_job
 assert windows_job.index("scoped)") < windows_job.index(scoped_command)
 assert windows_job.index("full)") < windows_job.index(full_command)
+assert windows_job.index(plugin_condition) < windows_job.index(plugin_components_command)
+assert windows_job.index(plugin_components_command) < windows_job.index('plugin_components_status=${PIPESTATUS[0]}')
+assert windows_job.index('plugin_components_status=${PIPESTATUS[0]}') < windows_job.index(plugin_root_command)
+assert windows_job.index(plugin_root_command) < windows_job.index('plugin_root_status=${PIPESTATUS[0]}')
 scoped_case = windows_job.split("\n            scoped)\n", 1)[1].split(
     "\n              ;;\n", 1
 )[0]
@@ -213,9 +271,9 @@ full_case = windows_job.split("\n            full)\n", 1)[1].split(
 )[0]
 for case, command in ((scoped_case, scoped_command), (full_case, full_command)):
     assert case.index("set +e") < case.index(command)
-    assert case.index(command) < case.index("status=$?")
-    assert case.index("status=$?") < case.index("set -e")
-assert '\n          exit "$status"' in windows_job
+    assert case.index(command) < case.index("baseline_status=${PIPESTATUS[0]}")
+    assert case.index("baseline_status=${PIPESTATUS[0]}") < case.index("set -e")
+assert '\n          exit "$overall_status"' in windows_job
 assert normalization in windows_job
 assert extraction in windows_job
 assert windows_job.index(normalization) < windows_job.index(extraction)
