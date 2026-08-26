@@ -4788,7 +4788,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let mut registry = daemon::DaemonRegistry::new();
                 #[cfg(feature = "agent-runtime")]
                 registry.register_channel_registry_clearer(std::sync::Arc::new(|| {
-                    zeroclaw_channels::orchestrator::prepare_live_channel_registry(true)
+                    zeroclaw_channels::orchestrator::prepare_live_channel_registry(true);
                 }));
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset

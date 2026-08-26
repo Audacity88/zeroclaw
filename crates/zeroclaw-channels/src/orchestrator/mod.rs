@@ -7902,19 +7902,33 @@ async fn process_channel_message_body(
 
 /// Shared worker body extracted so both the normal path and the debounce path
 /// can reuse the same in-flight tracking / cancellation / process logic.
+#[derive(Clone)]
+struct DispatchWorkerRegistrationGate {
+    started: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    cancellation_token: CancellationToken,
+    registration_gate: Option<DispatchWorkerRegistrationGate>,
 ) {
     let _permit = permit;
+    if let Some(gate) = registration_gate {
+        gate.started.wait().await;
+        let Ok(release_permit) = gate.release.acquire().await else {
+            return;
+        };
+        drop(release_permit);
+    }
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
     let sender_scope_key = interruption_scope_key(&msg);
-    let cancellation_token = CancellationToken::new();
     let completion = Arc::new(InFlightTaskCompletion::new());
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -8488,10 +8502,29 @@ async fn run_message_dispatch_loop(
 }
 
 async fn run_message_dispatch_loop_with_cancel(
+    rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    router: AgentRouter,
+    max_in_flight_messages: usize,
+    cancel: CancellationToken,
+) -> tokio::time::Instant {
+    run_message_dispatch_loop_with_cancel_and_drain_signal(
+        rx,
+        router,
+        max_in_flight_messages,
+        cancel,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
     cancel: CancellationToken,
+    drain_started: Option<tokio::sync::oneshot::Sender<()>>,
+    worker_registration_gate: Option<DispatchWorkerRegistrationGate>,
 ) -> tokio::time::Instant {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
@@ -8628,6 +8661,7 @@ async fn run_message_dispatch_loop_with_cancel(
                     let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
                     let debounce_cancel = cancel.clone();
+                    let debounce_registration_gate = worker_registration_gate.clone();
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
                         let combined = match tokio::select! {
@@ -8656,6 +8690,8 @@ async fn run_message_dispatch_loop_with_cancel(
                             debounce_in_flight,
                             debounce_task_seq,
                             permit,
+                            debounce_cancel.child_token(),
+                            debounce_registration_gate,
                         )
                         .await;
                     });
@@ -8683,8 +8719,19 @@ async fn run_message_dispatch_loop_with_cancel(
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
+        let worker_cancel = cancel.child_token();
+        let registration_gate = worker_registration_gate.clone();
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            dispatch_worker(
+                worker_ctx,
+                msg,
+                in_flight,
+                task_sequence,
+                permit,
+                worker_cancel,
+                registration_gate,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -8692,16 +8739,28 @@ async fn run_message_dispatch_loop_with_cancel(
         }
     }
 
-    {
-        let active = in_flight_by_sender.lock().await;
-        for state in active.values() {
-            state.cancellation.cancel();
-        }
+    if let Some(drain_started) = drain_started {
+        let _ = drain_started.send(());
     }
     let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let drain_workers = async {
-        while let Some(result) = workers.join_next().await {
-            log_worker_join_result(result);
+        let mut generation_cancelled = false;
+        while !workers.is_empty() {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled(), if !generation_cancelled => {
+                    generation_cancelled = true;
+                    let active = in_flight_by_sender.lock().await;
+                    for state in active.values() {
+                        state.cancellation.cancel();
+                    }
+                }
+                result = workers.join_next() => {
+                    if let Some(result) = result {
+                        log_worker_join_result(result);
+                    }
+                }
+            }
         }
     };
     if tokio::time::timeout_at(shutdown_deadline, drain_workers)
@@ -22559,7 +22618,11 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    async fn run_parallel_message_dispatch(cancel_generation: bool) {
+    async fn run_parallel_message_dispatch(
+        cancel_generation: bool,
+        close_before_generation_cancel: bool,
+        cancel_before_worker_registration: bool,
+    ) {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -22687,37 +22750,84 @@ BTC is currently around $65,000 based on latest tool output."#
         if cancel_generation {
             let cancel = CancellationToken::new();
             let dispatch_cancel = cancel.clone();
-            let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel(
+            let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
+            let worker_registration_gate =
+                cancel_before_worker_registration.then(|| DispatchWorkerRegistrationGate {
+                    started: Arc::new(tokio::sync::Barrier::new(3)),
+                    release: Arc::new(tokio::sync::Semaphore::new(0)),
+                });
+            let test_registration_gate = worker_registration_gate.clone();
+            let dispatch =
+                ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel_and_drain_signal(
+                    rx,
+                    AgentRouter::single(runtime_ctx),
+                    2,
+                    dispatch_cancel,
+                    close_before_generation_cancel.then_some(drain_started_tx),
+                    worker_registration_gate,
+                ));
+
+            if let Some(gate) = test_registration_gate {
+                tokio::time::timeout(Duration::from_secs(1), gate.started.wait())
+                    .await
+                    .expect("both channel workers should reach the registration barrier");
+                cancel.cancel();
+                gate.release.add_permits(2);
+                drop(tx);
+            } else {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while peak_in_flight.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("both channel workers should enter the provider");
+                if close_before_generation_cancel {
+                    drop(tx);
+                    tokio::time::timeout(Duration::from_secs(1), drain_started_rx)
+                        .await
+                        .expect("dispatch should observe sender close")
+                        .expect("dispatch should signal worker drain");
+                    cancel.cancel();
+                } else {
+                    cancel.cancel();
+                    drop(tx);
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(1), dispatch)
+                .await
+                .expect("generation cancellation should drain channel workers promptly")
+                .expect("dispatch task should join cleanly");
+        } else {
+            let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
                 rx,
                 AgentRouter::single(runtime_ctx),
                 2,
-                dispatch_cancel,
             ));
-
             tokio::time::timeout(Duration::from_secs(1), async {
                 while peak_in_flight.load(Ordering::SeqCst) < 2 {
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("both channel workers should enter the provider");
-            cancel.cancel();
+            .expect("both channel workers should be active before sender close");
             drop(tx);
             tokio::time::timeout(Duration::from_secs(1), dispatch)
                 .await
-                .expect("generation cancellation should drain channel workers promptly")
+                .expect("sender close should drain channel workers promptly")
                 .expect("dispatch task should join cleanly");
-        } else {
-            drop(tx);
-            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
         }
 
         let peak = peak_in_flight.load(Ordering::SeqCst);
-        assert!(
-            peak >= 2,
-            "expected at least 2 concurrent in-flight dispatches, got peak {}",
-            peak
-        );
+        if cancel_before_worker_registration {
+            assert_eq!(peak, 0, "cancelled workers must not enter the provider");
+        } else {
+            assert!(
+                peak >= 2,
+                "expected at least 2 concurrent in-flight dispatches, got peak {}",
+                peak
+            );
+        }
         assert_eq!(in_flight.load(Ordering::SeqCst), 0, "all workers drained");
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -22733,12 +22843,22 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn message_dispatch_processes_messages_in_parallel() {
-        run_parallel_message_dispatch(false).await;
+        run_parallel_message_dispatch(false, false, false).await;
     }
 
     #[tokio::test]
     async fn message_dispatch_generation_cancel_drains_parallel_workers() {
-        run_parallel_message_dispatch(true).await;
+        run_parallel_message_dispatch(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_generation_cancel_after_sender_close_drains_parallel_workers() {
+        run_parallel_message_dispatch(true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_generation_cancel_before_worker_registration_drops_replies() {
+        run_parallel_message_dispatch(true, false, true).await;
     }
 
     #[tokio::test]
