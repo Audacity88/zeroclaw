@@ -5183,10 +5183,7 @@ fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
             .find_map(|(offset, ch)| ch.is_whitespace().then_some(start + offset))
             .unwrap_or(text.len());
         let mut candidate_end = end;
-        loop {
-            let Some((offset, ch)) = text[start..candidate_end].char_indices().last() else {
-                break;
-            };
+        while let Some((offset, ch)) = text[start..candidate_end].char_indices().last() {
             let trim = match ch {
                 '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '>' => true,
                 ')' => {

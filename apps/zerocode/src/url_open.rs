@@ -19,7 +19,7 @@ pub(crate) fn validate_url(input: &str) -> anyhow::Result<String> {
     let authority = input
         .strip_prefix("https://")
         .or_else(|| input.strip_prefix("http://"))
-        .ok_or_else(|| anyhow::anyhow!("only HTTP(S) URLs can be opened"))?;
+        .ok_or_else(|| anyhow::Error::msg("only HTTP(S) URLs can be opened"))?;
     if authority.is_empty() || authority.starts_with('/') {
         anyhow::bail!("URL is missing a host");
     }
