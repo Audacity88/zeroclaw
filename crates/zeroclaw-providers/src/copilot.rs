@@ -1203,6 +1203,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cache_file_replacement_succeeds_while_old_handle_remains_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = admit_cache_dir(&temp.path().join("copilot")).unwrap();
+        let old_content = "old-complete-content";
+        let new_content = "new-complete-content";
+
+        assert!(write_file_secure(&cache_dir, "api-key.json", old_content).await);
+
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut old_file = cache_dir.open_with("api-key.json", &options).unwrap();
+
+        assert!(write_file_secure(&cache_dir, "api-key.json", new_content).await);
+
+        let mut retained_content = String::new();
+        old_file.read_to_string(&mut retained_content).unwrap();
+        assert_eq!(retained_content, old_content);
+        assert_eq!(
+            read_cache_file(&cache_dir, "api-key.json").await.as_deref(),
+            Some(new_content)
+        );
+    }
+
     #[test]
     fn deterministic_temp_collision_preserves_foreign_entry() {
         let temp = tempfile::tempdir().unwrap();
