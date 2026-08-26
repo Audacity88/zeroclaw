@@ -398,6 +398,7 @@ zc-chat-help-yank-selection = Copier la sélection
 zc-chat-help-return-to-input = Revenir à la saisie
 zc-chat-help-browse-mode = Mode navigation
 zc-chat-help-scroll-conversation = Faire défiler la conversation
+zc-chat-help-open-link = Cliquez sur un lien pour l’ouvrir ; faites glisser depuis ailleurs pour sélectionner du texte
 zc-chat-help-toggle-thoughts = Basculer les réflexions
 zc-chat-help-new-session = Nouvelle session
 zc-chat-session-list-resume-title = Sessions enregistrées (Entrée=reprendre, Échap=nouveau)
@@ -414,6 +415,9 @@ zc-chat-clipboard-you = Vous : { $text }
 zc-chat-clipboard-agent = Agent : { $text }
 zc-chat-copied-clipboard = Copié dans le presse-papiers
 zc-chat-context-menu-copy = Copier
+zc-chat-context-menu-open-link = Ouvrir le lien
+zc-chat-context-menu-copy-link = Copier le lien
+zc-chat-open-link-failed = Impossible d’ouvrir le lien : { $error }
 zc-chat-context-menu-send-now = Envoyer maintenant
 zc-chat-context-menu-edit = Modifier
 zc-chat-context-menu-delete = Supprimer

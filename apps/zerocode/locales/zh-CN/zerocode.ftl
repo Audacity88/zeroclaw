@@ -398,6 +398,7 @@ zc-chat-help-yank-selection = 复制选择
 zc-chat-help-return-to-input = 返回输入
 zc-chat-help-browse-mode = 浏览模式
 zc-chat-help-scroll-conversation = 滚动对话
+zc-chat-help-open-link = 点击链接打开；从其他位置拖动以选择文本
 zc-chat-help-toggle-thoughts = 切换思考
 zc-chat-help-new-session = 新建会话
 zc-chat-session-list-resume-title = 已保存会话（Enter=恢复，Esc=新建）
@@ -414,6 +415,9 @@ zc-chat-clipboard-you = 你：{ $text }
 zc-chat-clipboard-agent = Agent：{ $text }
 zc-chat-copied-clipboard = 已复制到剪贴板
 zc-chat-context-menu-copy = 复制
+zc-chat-context-menu-open-link = 打开链接
+zc-chat-context-menu-copy-link = 复制链接
+zc-chat-open-link-failed = 无法打开链接：{ $error }
 zc-chat-context-menu-send-now = 立即发送
 zc-chat-context-menu-edit = 编辑
 zc-chat-context-menu-delete = 删除

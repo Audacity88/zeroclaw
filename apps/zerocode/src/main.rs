@@ -47,6 +47,7 @@ mod text_navigation;
 mod theme;
 mod todo_tracker;
 mod turn_status;
+mod url_open;
 mod widgets;
 mod wire;
 mod zerocode_pane;
