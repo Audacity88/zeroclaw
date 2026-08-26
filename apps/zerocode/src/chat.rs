@@ -189,6 +189,7 @@ struct ChatEntryRetryResult {
 const ENTRY_RETRY_PRE_SESSION: u8 = 0;
 const ENTRY_RETRY_SESSION_CREATION: u8 = 1;
 const ENTRY_RETRY_CANCELLED: u8 = 2;
+const STALE_SESSION_CLOSE_ATTEMPTS: usize = 3;
 
 struct EntryRetryAttempt {
     result_rx: oneshot::Receiver<ChatEntryRetryResult>,
@@ -254,13 +255,21 @@ fn active_session_id(phase: &ChatPhase) -> Option<String> {
 
 fn spawn_close_session(rpc: Arc<RpcClient>, session_id: String) {
     tokio::spawn(async move {
-        let _ = rpc.session_close(&session_id).await;
+        close_stale_session(&rpc, &session_id).await;
     });
 }
 
 async fn close_active_session(rpc: &RpcClient, phase: &ChatPhase) {
     if let Some(session_id) = active_session_id(phase) {
-        let _ = rpc.session_close(&session_id).await;
+        close_stale_session(rpc, &session_id).await;
+    }
+}
+
+async fn close_stale_session(rpc: &RpcClient, session_id: &str) {
+    for _ in 0..STALE_SESSION_CLOSE_ATTEMPTS {
+        if rpc.session_close(session_id).await.is_ok() {
+            return;
+        }
     }
 }
 
@@ -747,7 +756,7 @@ impl Chat {
         match result {
             Ok(session) => {
                 if is_cancelled(cancellation) {
-                    let _ = self.rpc.session_close(&session.session_id).await;
+                    close_stale_session(&self.rpc, &session.session_id).await;
                     return;
                 }
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
@@ -762,12 +771,12 @@ impl Chat {
                 );
                 state.cwd = session.workspace_dir;
                 if is_cancelled(cancellation) {
-                    let _ = self.rpc.session_close(&state.session_id).await;
+                    close_stale_session(&self.rpc, &state.session_id).await;
                     return;
                 }
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
                 if is_cancelled(cancellation) {
-                    let _ = self.rpc.session_close(&state.session_id).await;
+                    close_stale_session(&self.rpc, &state.session_id).await;
                     return;
                 }
                 // On a resume, replay the daemon-retained transcript so the
@@ -779,7 +788,7 @@ impl Chat {
                     state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
                 }
                 if is_cancelled(cancellation) {
-                    let _ = self.rpc.session_close(&state.session_id).await;
+                    close_stale_session(&self.rpc, &state.session_id).await;
                     return;
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
@@ -11377,7 +11386,12 @@ mod tests {
         let close = next_rpc_request(&mut rx, "cancelled retry should close its session").await;
         assert_eq!(close["method"], method::SESSION_CLOSE);
         assert_eq!(close["params"]["session_id"], "sess-stale");
-        respond_ok(&rpc, &close, serde_json::json!({}));
+        respond_err(&rpc, &close, -32000, "close unavailable");
+
+        let retry = next_rpc_request(&mut rx, "failed stale close should be retried").await;
+        assert_eq!(retry["method"], method::SESSION_CLOSE);
+        assert_eq!(retry["params"]["session_id"], "sess-stale");
+        respond_ok(&rpc, &retry, serde_json::json!({}));
 
         for _ in 0..16 {
             if rpc.pending_count() == 0 {
@@ -11387,6 +11401,31 @@ mod tests {
         }
         assert_eq!(rpc.pending_count(), 0);
         assert!(matches!(chat.phase, ChatPhase::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn stale_session_close_stops_after_attempt_limit() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+
+        let close_task = tokio::spawn(async move {
+            close_stale_session(&client, "sess-stale").await;
+        });
+
+        for _ in 0..STALE_SESSION_CLOSE_ATTEMPTS {
+            let request = next_rpc_request(&mut rx, "stale close should be attempted").await;
+            assert_eq!(request["method"], method::SESSION_CLOSE);
+            assert_eq!(request["params"]["session_id"], "sess-stale");
+            respond_err(&rpc, &request, -32000, "close unavailable");
+        }
+
+        close_task.await.expect("stale close task should finish");
+        assert!(
+            rx.try_recv().is_err(),
+            "cleanup must stop after the configured attempt limit"
+        );
+        assert_eq!(rpc.pending_count(), 0);
     }
 
     #[tokio::test]
