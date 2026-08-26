@@ -319,7 +319,7 @@ async fn switch_mode(
         dashboard_pane.on_pane_blur();
     }
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
-        quickstart.dismiss_beacon().await;
+        quickstart.dismiss_beacon();
     }
     if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
         match next {
@@ -2087,6 +2087,66 @@ mod tests {
             .expect("RPC writer should remain connected");
         let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+    }
+
+    #[tokio::test]
+    async fn mode_switch_leaves_quickstart_for_sop_before_withheld_responses() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = Arc::new(Mutex::new(CrossReconnectState::default()));
+        let mut mode = Mode::Quickstart;
+        let conn_state = ConnectionState::Connected;
+        let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop_pane = sop_pane::SopPane::new(rpc);
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            switch_mode(
+                &mut mode,
+                Mode::Sop,
+                &conn_state,
+                &mut dashboard_pane,
+                &mut quickstart,
+                &mut acp_pane,
+                &mut chat_pane,
+                &mut sop_pane,
+            ),
+        )
+        .await
+        .expect("leaving Quickstart must not await dismissal or SOP refresh");
+        assert_eq!(mode, Mode::Sop);
+
+        let mut methods = Vec::new();
+        for _ in 0..2 {
+            let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .expect("mode switch should send both background requests")
+                .expect("RPC writer should remain connected");
+            let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let method = request["method"].as_str().unwrap().to_string();
+            if method == crate::client::method::QUICKSTART_DISMISS {
+                assert_eq!(request["params"]["surface"], "tui");
+            }
+            methods.push(method);
+        }
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == crate::client::method::QUICKSTART_DISMISS),
+            "mode switch should send dismissal telemetry: {methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == crate::client::method::SOPS_LIST),
+            "mode switch should refresh SOPs: {methods:?}"
+        );
+        assert_eq!(outbound.pending_count(), 2, "both responses are withheld");
     }
 
     #[tokio::test]
