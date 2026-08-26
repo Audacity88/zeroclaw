@@ -74,10 +74,46 @@ assert "/fixture/checkout" not in json.dumps(report)
 PY
 
 replace_text "$test_root/raw-b/foundation.tree" 'dep-crate v1.0.0' 'dep-crate v1.1.0'
+replace_text "$test_root/raw-b/foundation.tree" 'dep-crate v2.0.0' 'dep-crate v2.1.0'
 run_normalize "$test_root/raw-b" "$test_root/report-b.json"
 bash "$tool" compare "$test_root/report-a.json" "$test_root/report-b.json" --output "$test_root/delta.json"
 assert_contains "$test_root/delta.json" '"version": "1.1.0"'
 assert_contains "$test_root/delta.json" '"version": "1.0.0"'
+python3 - "$test_root/delta.json" <<'PY'
+import json
+import sys
+
+delta = json.load(open(sys.argv[1], encoding="utf-8"))
+foundation = next(item for item in delta["profiles"] if item["id"] == "foundation")
+assert foundation["feature_deltas"] == []
+PY
+
+cp -R "$fixture_root/raw" "$test_root/raw-feature-delta"
+replace_text \
+    "$test_root/raw-feature-delta/foundation.tree" \
+    $'dep-crate v2.0.0\tfeatures:__rustls,feature-a (*)' \
+    $'dep-crate v2.0.0\tfeatures:__rustls,feature-b (*)'
+run_normalize "$test_root/raw-feature-delta" "$test_root/report-feature-delta.json"
+bash "$tool" compare \
+    "$test_root/report-a.json" \
+    "$test_root/report-feature-delta.json" \
+    --output "$test_root/feature-delta.json"
+python3 - "$test_root/feature-delta.json" <<'PY'
+import json
+import sys
+
+delta = json.load(open(sys.argv[1], encoding="utf-8"))
+foundation = next(item for item in delta["profiles"] if item["id"] == "foundation")
+assert foundation["count_deltas"]["enabled_features"] == 0
+assert foundation["feature_deltas"] == [
+    {
+        "name": "dep-crate",
+        "version": "2.0.0",
+        "added_features": ["feature-b"],
+        "removed_features": ["feature-a"],
+    }
+]
+PY
 
 cp "$test_root/report-b.json" "$test_root/lockfile-change.json"
 python3 - "$test_root/lockfile-change.json" <<'PY'
@@ -137,6 +173,27 @@ status=$?
 set -e
 [[ "$status" -ne 0 ]] || fail "malformed report counts were accepted"
 assert_contains "$test_root/malformed-report.err" 'values do not match profile records'
+
+cp "$test_root/report-a.json" "$test_root/missing-root.json"
+python3 - "$test_root/missing-root.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+profile = next(item for item in report["profiles"] if item["id"] == "foundation")
+profile["package_pairs"] = [pair for pair in profile["package_pairs"] if pair["name"] != profile["package"]]
+profile["counts"]["package_pairs"] -= 1
+profile["counts"]["unique_package_names"] -= 1
+path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+set +e
+bash "$tool" compare "$test_root/missing-root.json" "$test_root/report-a.json" 2>"$test_root/missing-root.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "report without declared root package was accepted"
+assert_contains "$test_root/missing-root.err" 'declared package'
 
 cp "$test_root/report-a.json" "$test_root/stripped-contract.json"
 python3 - "$test_root/stripped-contract.json" <<'PY'
@@ -340,6 +397,109 @@ set -e
 [[ "$status" -ne 0 ]] || fail "tracked output path was accepted"
 assert_contains "$test_root/tracked-output.err" 'output path is tracked by Git'
 cmp -s "$source_repo/tracked.txt" "$test_root/tracked-before.txt" || fail "tracked output was modified"
+
+source_repo_link="$test_root/source-repo-link"
+ln -s "$source_repo" "$source_repo_link"
+set +e
+run_fake_capture \
+    "$source_repo_link/tracked.txt" \
+    '' \
+    'agent-runtime,channel-matrix' \
+    '' \
+    "$source_repo" \
+    2>"$test_root/symlinked-parent-output.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "tracked output through a symlinked parent was accepted"
+assert_contains "$test_root/symlinked-parent-output.err" 'output path is tracked by Git'
+cmp -s "$source_repo/tracked.txt" "$test_root/tracked-before.txt" || fail "tracked output through a symlinked parent was modified"
+
+external_sentinel="$test_root/external-sentinel.json"
+printf '%s\n' 'sentinel' >"$external_sentinel"
+symlink_output="$source_repo/symlink-report.json"
+ln -s "$external_sentinel" "$symlink_output"
+git -C "$source_repo" add symlink-report.json
+git -C "$source_repo" \
+    -c user.name='Dependency Footprint Fixture' \
+    -c user.email='fixture@example.invalid' \
+    commit -qm 'fixture symlink output'
+cp "$external_sentinel" "$test_root/external-sentinel-before.txt"
+set +e
+run_fake_capture \
+    "$symlink_output" \
+    '' \
+    'agent-runtime,channel-matrix' \
+    '' \
+    "$source_repo" \
+    2>"$test_root/symlink-output.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "tracked symlink output was accepted"
+assert_contains "$test_root/symlink-output.err" 'output path is an existing symlink'
+cmp -s "$external_sentinel" "$test_root/external-sentinel-before.txt" || fail "external symlink target was modified"
+
+normalize_symlink_output="$test_root/normalize-symlink.json"
+ln -s "$external_sentinel" "$normalize_symlink_output"
+set +e
+run_normalize "$test_root/raw-a" "$normalize_symlink_output" 2>"$test_root/normalize-symlink.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "normalize accepted a symlink output"
+assert_contains "$test_root/normalize-symlink.err" 'output path is an existing symlink'
+cmp -s "$external_sentinel" "$test_root/external-sentinel-before.txt" || fail "normalize modified an external symlink target"
+
+compare_symlink_output="$test_root/compare-symlink.json"
+ln -s "$external_sentinel" "$compare_symlink_output"
+set +e
+bash "$tool" compare \
+    "$test_root/report-a.json" \
+    "$test_root/report-b.json" \
+    --output "$compare_symlink_output" \
+    2>"$test_root/compare-symlink.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "compare accepted a symlink output"
+assert_contains "$test_root/compare-symlink.err" 'output path is an existing symlink'
+cmp -s "$external_sentinel" "$test_root/external-sentinel-before.txt" || fail "compare modified an external symlink target"
+
+python3 - "$script_dir/dependency_footprint.py" "$test_root" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+module_path = pathlib.Path(sys.argv[1])
+test_root = pathlib.Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("dependency_footprint", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+parent = test_root / "prepared-output-parent"
+moved_parent = test_root / "prepared-output-parent-moved"
+parent.mkdir()
+output = module.prepare_output(str(parent / "report.json"))
+parent.rename(moved_parent)
+parent.mkdir()
+try:
+    module.atomic_write(output, {"unexpected": True})
+except module.ToolError as exc:
+    assert "output parent changed before write" in str(exc)
+else:
+    raise AssertionError("replaced output parent was accepted")
+assert not (parent / "report.json").exists()
+assert not (moved_parent / "report.json").exists()
+PY
+
+set +e
+run_normalize \
+    "$test_root/raw-a" \
+    "$test_root/missing-output-parent/report.json" \
+    2>"$test_root/missing-output-parent.err"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "normalize created a missing output parent"
+assert_contains "$test_root/missing-output-parent.err" 'output parent does not exist'
+[[ ! -e "$test_root/missing-output-parent" ]] || fail "failed output created its missing parent"
 
 set +e
 run_fake_capture "$test_root/bad-selection.json" '' $'agent-runtime\nchannel-matrix' 2>"$test_root/bad-selection.err"

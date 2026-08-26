@@ -8,13 +8,13 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
-import tempfile
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 
 SCHEMA_VERSION = 1
@@ -33,6 +33,12 @@ PACKAGE_FIELD_RE = re.compile(
 
 class ToolError(Exception):
     pass
+
+
+class PreparedOutput(NamedTuple):
+    path: Path
+    parent: Path
+    parent_identity: tuple[int, int]
 
 
 def fail(message: str) -> ToolError:
@@ -549,6 +555,41 @@ def output_identity_exclusions(repo_root: Path, output_path: Path) -> set[bytes]
     return {os.fsencode(relative_text)}
 
 
+def output_parent_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def reject_output_symlink(path: Path, directory_fd: int) -> None:
+    try:
+        metadata = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode):
+        raise fail(f"output path is an existing symlink: {path}")
+
+
+def prepare_output(raw_path: str) -> PreparedOutput:
+    path = Path(raw_path).absolute()
+    try:
+        parent = path.parent.resolve()
+        if not parent.exists():
+            raise fail(f"output parent does not exist: {path.parent}")
+        directory_fd = os.open(parent, output_parent_flags())
+        try:
+            reject_output_symlink(path, directory_fd)
+            metadata = os.fstat(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except (OSError, NotImplementedError) as exc:
+        raise fail(f"could not inspect output path {path}: {exc}") from exc
+    return PreparedOutput(path, parent, (metadata.st_dev, metadata.st_ino))
+
+
 def context_from_capture(
     cargo: str,
     repo_root: Path,
@@ -582,37 +623,78 @@ def context_from_capture(
     }
 
 
-def atomic_write(path: Path, value: Any) -> None:
+def atomic_write(output: PreparedOutput, value: Any) -> None:
     text = json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    directory_fd: int | None = None
+    temporary_fd: int | None = None
+    temporary_name: str | None = None
     try:
-        path.parent.mkdir(parents=False, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
+        current_parent = output.path.parent.resolve(strict=True)
+        if current_parent != output.parent:
+            raise fail(f"output parent changed before write: {output.path.parent}")
+        directory_fd = os.open(current_parent, output_parent_flags())
+        parent_metadata = os.fstat(directory_fd)
+        current_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+        if current_identity != output.parent_identity:
+            raise fail(f"output parent changed before write: {output.path.parent}")
+        reject_output_symlink(output.path, directory_fd)
+        temporary_flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        for _attempt in range(100):
+            candidate = f".{output.path.name}.{secrets.token_hex(12)}"
+            try:
+                temporary_fd = os.open(candidate, temporary_flags, 0o600, dir_fd=directory_fd)
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_fd is None or temporary_name is None:
+            raise fail(f"could not create temporary output beside {output.path}")
+        handle = os.fdopen(temporary_fd, "w", encoding="utf-8")
+        temporary_fd = None
+        with handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except OSError as exc:
-        try:
-            temporary.unlink(missing_ok=True)
-        except (UnboundLocalError, OSError):
-            pass
-        raise fail(f"could not atomically write {path}: {exc}") from exc
+        os.replace(
+            temporary_name,
+            output.path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+    except (OSError, NotImplementedError, TypeError) as exc:
+        raise fail(f"could not atomically write {output.path}: {exc}") from exc
+    finally:
+        if temporary_fd is not None:
+            try:
+                os.close(temporary_fd)
+            except OSError:
+                pass
+        if temporary_name is not None and directory_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except (FileNotFoundError, OSError, NotImplementedError):
+                pass
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
 
 
 def command_capture(args: argparse.Namespace) -> None:
     policy_path = Path(args.policy).resolve()
     repo_root = Path(args.repo_root).resolve() if args.repo_root else SCRIPT_ROOT
-    output_path = Path(args.output).resolve()
+    output = prepare_output(args.output)
     cargo = require_string(args.cargo, "cargo command")
     policy, digest = load_policy(policy_path)
-    identity_exclusions = output_identity_exclusions(repo_root, output_path)
+    identity_exclusions = output_identity_exclusions(repo_root, output.parent / output.path.name)
     source_identity = git_source_identity(repo_root, identity_exclusions)
     resolved: dict[str, list[str]] = {}
     for profile in policy["profiles"]:
@@ -645,7 +727,7 @@ def command_capture(args: argparse.Namespace) -> None:
         captures[profile["id"]] = run_command(command, repo_root, f"profile {profile['id']}")
     if git_source_identity(repo_root, identity_exclusions) != source_identity:
         raise fail("git source identity: worktree changed during capture")
-    atomic_write(output_path, build_report(policy, digest, context, captures))
+    atomic_write(output, build_report(policy, digest, context, captures))
 
 
 def command_normalize(args: argparse.Namespace) -> None:
@@ -660,7 +742,7 @@ def command_normalize(args: argparse.Namespace) -> None:
             captures[profile["id"]] = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise fail(f"profile {profile['id']}: could not read capture: {exc}") from exc
-    atomic_write(Path(args.output).resolve(), build_report(policy, digest, context, captures))
+    atomic_write(prepare_output(args.output), build_report(policy, digest, context, captures))
 
 
 def validate_resolved_inputs(value: Any, label: str) -> None:
@@ -721,6 +803,11 @@ def validate_profile(profile: Any, label: str) -> str:
         normalized_pairs.append((name, version))
     if normalized_pairs != sorted(set(normalized_pairs)):
         raise fail(f"{label}.package_pairs: expected sorted unique pairs")
+    versions_by_name: dict[str, set[str]] = {}
+    for name, version in normalized_pairs:
+        versions_by_name.setdefault(name, set()).add(version)
+    if profile["package"] not in versions_by_name:
+        raise fail(f"{label}.package_pairs: declared package {profile['package']!r} is absent")
 
     enabled = profile["enabled_features"]
     if not isinstance(enabled, list):
@@ -757,9 +844,6 @@ def validate_profile(profile: Any, label: str) -> str:
         raise fail(f"{label}.counts: malformed fields")
     if any(type(counts[key]) is not int or counts[key] < 0 for key in count_keys):
         raise fail(f"{label}.counts: expected non-negative integers")
-    versions_by_name: dict[str, set[str]] = {}
-    for name, version in normalized_pairs:
-        versions_by_name.setdefault(name, set()).add(version)
     expected_counts = {
         "package_pairs": len(normalized_pairs),
         "unique_package_names": len(versions_by_name),
@@ -890,6 +974,30 @@ def command_compare(args: argparse.Namespace) -> None:
             raise fail(f"reports: incompatible inputs for profile {profile_id}")
         before_pairs = {(item["name"], item["version"]) for item in before["package_pairs"]}
         after_pairs = {(item["name"], item["version"]) for item in after["package_pairs"]}
+        before_features = {
+            (item["name"], item["version"]): set(item["features"])
+            for item in before["enabled_features"]
+        }
+        after_features = {
+            (item["name"], item["version"]): set(item["features"])
+            for item in after["enabled_features"]
+        }
+        feature_deltas = [
+            {
+                "name": name,
+                "version": version,
+                "added_features": sorted(
+                    after_features.get((name, version), set())
+                    - before_features.get((name, version), set())
+                ),
+                "removed_features": sorted(
+                    before_features.get((name, version), set())
+                    - after_features.get((name, version), set())
+                ),
+            }
+            for name, version in sorted(before_pairs & after_pairs)
+            if before_features.get((name, version), set()) != after_features.get((name, version), set())
+        ]
         before_counts = before.get("counts")
         after_counts = after.get("counts")
         if not isinstance(before_counts, dict) or not isinstance(after_counts, dict):
@@ -905,6 +1013,7 @@ def command_compare(args: argparse.Namespace) -> None:
                     {"name": name, "version": version}
                     for name, version in sorted(before_pairs - after_pairs)
                 ],
+                "feature_deltas": feature_deltas,
                 "count_deltas": {
                     key: after_counts[key] - before_counts[key]
                     for key in (
@@ -929,7 +1038,7 @@ def command_compare(args: argparse.Namespace) -> None:
         "profiles": deltas,
     }
     if args.output:
-        atomic_write(Path(args.output).resolve(), result)
+        atomic_write(prepare_output(args.output), result)
     else:
         sys.stdout.write(json.dumps(result, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
 
