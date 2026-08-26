@@ -494,12 +494,12 @@ impl CopilotModelProvider {
             return Ok(token.clone());
         }
 
-        if let Some(token_dir) = self.token_dir.as_ref() {
-            if let Some(cached) = read_cache_file(token_dir, "access-token").await {
-                let token = cached.trim();
-                if !token.is_empty() {
-                    return Ok(token.to_string());
-                }
+        if let Some(token_dir) = self.token_dir.as_ref()
+            && let Some(cached) = read_cache_file(token_dir, "access-token").await
+        {
+            let token = cached.trim();
+            if !token.is_empty() {
+                return Ok(token.to_string());
             }
         }
 
@@ -590,10 +590,10 @@ impl CopilotModelProvider {
             let body = response.text().await.unwrap_or_default();
             let sanitized = super::sanitize_api_error(&body);
 
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                if let Some(token_dir) = self.token_dir.as_ref() {
-                    remove_cache_file(token_dir, "access-token").await;
-                }
+            if (status.as_u16() == 401 || status.as_u16() == 403)
+                && let Some(token_dir) = self.token_dir.as_ref()
+            {
+                remove_cache_file(token_dir, "access-token").await;
             }
 
             anyhow::bail!(
@@ -746,8 +746,7 @@ impl Drop for TempCacheFileGuard {
 fn write_cache_file_sync(dir: &Arc<Dir>, final_name: &str, content: &str) -> io::Result<()> {
     ensure_final_cache_entry(dir, final_name)?;
 
-    let (mut file, temp_name) =
-        create_temp_cache_file_with(dir, final_name, |name| temp_cache_name(name))?;
+    let (mut file, temp_name) = create_temp_cache_file_with(dir, final_name, temp_cache_name)?;
     let mut guard = TempCacheFileGuard {
         dir: Arc::clone(dir),
         name: Some(temp_name.clone()),
