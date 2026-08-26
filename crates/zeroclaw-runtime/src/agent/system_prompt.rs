@@ -182,7 +182,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
 /// filtered for the prompt surface, while skill callable metadata uses this
 /// name set as its availability source of truth.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_system_prompt_with_mode_and_effective_tools(
+pub fn build_system_prompt_with_mode_and_effective_tools(
     workspace_dir: &std::path::Path,
     model_name: &str,
     tools: &[(&str, &str)],
@@ -202,9 +202,10 @@ pub(crate) fn build_system_prompt_with_mode_and_effective_tools(
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
     let has_tools = !tools.is_empty() || native_tool_specs_present;
+    let read_skill_available = is_tool_available("read_skill");
     let skills_prompt_mode = crate::skills::skills_prompt_mode_with_loader_fallback(
         skills_prompt_mode,
-        tools.iter().any(|(name, _)| *name == "read_skill"),
+        read_skill_available,
     );
 
     // ── 0. Anti-narration (top priority) ───────────────────────
@@ -565,6 +566,22 @@ pub(crate) fn build_system_prompt_with_mode_and_effective_tools(
     }
 }
 
+/// Render only the skills section against an assembled effective tool surface.
+/// Context-free callers should continue using [`crate::skills::skills_to_prompt_with_mode`].
+pub fn build_skills_prompt_with_effective_tools(
+    skills: &[Skill],
+    workspace_dir: &std::path::Path,
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    is_tool_available: impl Fn(&str) -> bool,
+) -> String {
+    crate::skills::skills_to_prompt_with_mode_and_availability(
+        skills,
+        workspace_dir,
+        mode,
+        is_tool_available,
+    )
+}
+
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
 fn inject_workspace_file(
     prompt: &mut String,
@@ -614,6 +631,45 @@ fn inject_workspace_file(
 mod tests {
     use super::*;
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
+
+    #[test]
+    fn compact_skills_fall_back_to_full_when_loader_is_described_but_unavailable() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let skills = vec![Skill {
+            name: "fallback-test".to_string(),
+            description: "Verify loader fallback".to_string(),
+            description_localizations: Default::default(),
+            version: "1".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec!["INLINE_FALLBACK_INSTRUCTIONS".to_string()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[("read_skill", "Load skill instructions")],
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Compact,
+            false,
+            0,
+            false,
+            false,
+            None,
+        );
+
+        assert!(prompt.contains("INLINE_FALLBACK_INSTRUCTIONS"));
+        assert!(!prompt.contains("read_skill(name)"));
+    }
 
     fn prompt_with_compact_context(compact_context: bool) -> String {
         build_system_prompt_with_mode_and_autonomy(
