@@ -28524,6 +28524,84 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[test]
+    fn compiled_channel_families_have_listener_registration_or_explicit_runtime_ownership() {
+        let source = include_str!("mod.rs");
+        let collector = source
+            .split_once("fn collect_configured_channels(")
+            .expect("collect_configured_channels must exist")
+            .1
+            .split_once("\nfn no_real_time_channels_message(")
+            .expect("collector boundary must remain identifiable")
+            .0;
+        let async_assembly = source
+            .split_once("pub async fn start_channels(")
+            .expect("start_channels must exist")
+            .1
+            .split_once("\npub async fn deliver_announcement(")
+            .expect("async assembly boundary must remain identifiable")
+            .0;
+        let mqtt_owner = include_str!("../../../zeroclaw-runtime/src/daemon/registry.rs");
+        let acp_owner = include_str!("acp_server.rs");
+
+        for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
+            if !compiled {
+                continue;
+            }
+            let registered = type_keys.iter().any(|key| {
+                let field = match *key {
+                    "whatsapp-web" | "whatsapp_web" => "whatsapp".to_string(),
+                    _ => key.replace('-', "_"),
+                };
+                let loop_marker = format!("in &config.channels.{field}");
+                collector
+                    .split_once(&loop_marker)
+                    .map(|(_, after_loop)| {
+                        after_loop
+                            .split("#[cfg(not(feature")
+                            .next()
+                            .is_some_and(|feature_block| {
+                                feature_block.contains("channels.push(ConfiguredChannel {")
+                            })
+                    })
+                    .unwrap_or(false)
+            });
+            if registered {
+                continue;
+            }
+
+            let primary_key = type_keys[0];
+            let runtime_owner_verified = match primary_key {
+                "nostr" => {
+                    async_assembly.contains("config.channels.nostr")
+                        && async_assembly.contains("NostrChannel::new")
+                        && async_assembly.contains("configured_channels.push(ConfiguredChannel {")
+                }
+                "filesystem" => {
+                    async_assembly.contains("config.channels.filesystem")
+                        && async_assembly.contains("FilesystemChannel::new")
+                        && async_assembly.contains("configured_channels.push(ConfiguredChannel {")
+                }
+                "mqtt" => {
+                    mqtt_owner.contains("pub type MqttStarter")
+                        && mqtt_owner.contains("pub fn register_mqtt")
+                }
+                "plugin" => {
+                    async_assembly.contains("configured_plugin_channels(")
+                        && async_assembly.contains("append_configured_plugin_channels(")
+                }
+                "acp-server" => {
+                    acp_owner.contains("pub async fn run(self: Arc<Self>) -> Result<()>")
+                }
+                _ => false,
+            };
+            assert!(
+                runtime_owner_verified,
+                "compiled channel family `{primary_key}` has no synchronous listener registration or explicit runtime owner"
+            );
+        }
+    }
+
     #[cfg(feature = "channel-mattermost")]
     #[test]
     fn collect_configured_channels_includes_mattermost_when_configured() {
@@ -30893,6 +30971,51 @@ This is an example JSON object for profile settings."#;
                 );
             }
             Ok(_) => panic!("should fail for unknown channel"),
+        }
+    }
+
+    #[test]
+    fn compiled_channel_keys_have_intentional_one_shot_builder_support() {
+        let config_arc = Arc::new(RwLock::new(Config::default()));
+        let intentionally_unsupported = HashSet::from([
+            "nextcloud",
+            "feishu",
+            "nostr",
+            "clawdtalk",
+            "reddit",
+            "bluesky",
+            "voice_call",
+            "voice-wake",
+            "voice_wake",
+            "mqtt",
+            "amqp",
+            "filesystem",
+            "webhook",
+            "plugin",
+            "acp-server",
+            "acp_server",
+        ]);
+
+        for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
+            if !compiled {
+                continue;
+            }
+            for key in type_keys {
+                let error = match build_channel_by_id(&config_arc, key) {
+                    Ok(_) => panic!("an empty config must not construct a one-shot channel"),
+                    Err(error) => error,
+                };
+                let feature_available =
+                    !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
+                        || cfg!(feature = "whatsapp-web");
+                let claimed =
+                    feature_available && error.downcast_ref::<UnknownChannelId>().is_none();
+                let expected = feature_available && !intentionally_unsupported.contains(key);
+                assert_eq!(
+                    claimed, expected,
+                    "compiled channel key `{key}` changed one-shot builder support without an explicit registration disposition"
+                );
+            }
         }
     }
 
@@ -33788,6 +33911,79 @@ Done."#;
             !message.contains("unsupported delivery channel"),
             "dotted linq id must not be delegated to deliver_announcement; got: {message}"
         );
+    }
+
+    #[test]
+    fn compiled_channel_keys_have_intentional_announcement_delivery_registration() {
+        let source = include_str!("mod.rs");
+        let dispatch = source
+            .split_once("pub async fn deliver_announcement(")
+            .expect("deliver_announcement must exist")
+            .1
+            .split_once("match channel_type.as_str() {")
+            .expect("announcement dispatch match must exist")
+            .1
+            .split_once("\n    #[allow(unreachable_code)]")
+            .expect("announcement dispatch boundary must remain identifiable")
+            .0;
+        let intentionally_unsupported = HashSet::from([
+            "mattermost",
+            "imessage",
+            "matrix",
+            "linq",
+            "nextcloud",
+            "nextcloud-talk",
+            "nextcloud_talk",
+            "gmail-push",
+            "gmail_push",
+            "irc",
+            "twitch",
+            "dingtalk",
+            "wecom",
+            "qq",
+            "nostr",
+            "clawdtalk",
+            "reddit",
+            "bluesky",
+            "git",
+            "twitter",
+            "mochat",
+            "line",
+            "voice-call",
+            "voice_call",
+            "voice-wake",
+            "voice_wake",
+            "mqtt",
+            "amqp",
+            "filesystem",
+            "plugin",
+            "acp-server",
+            "acp_server",
+        ]);
+
+        for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
+            if !compiled {
+                continue;
+            }
+            for key in type_keys {
+                let surface_available =
+                    !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
+                        || cfg!(feature = "whatsapp-web");
+                let claimed = surface_available
+                    && [
+                        format!("\"{key}\" =>"),
+                        format!("\"{key}\" |"),
+                        format!("| \"{key}\" =>"),
+                    ]
+                    .iter()
+                    .any(|arm| dispatch.contains(arm));
+                let expected = surface_available && !intentionally_unsupported.contains(key);
+                assert_eq!(
+                    claimed, expected,
+                    "compiled channel key `{key}` changed announcement delivery support without an explicit registration disposition"
+                );
+            }
+        }
     }
 
     #[tokio::test]
