@@ -2978,9 +2978,15 @@ mod tests {
         let config = Config::default();
         let workspace = std::env::temp_dir();
         let cmd = build_configured_shell_command(&config, "echo cron-test", &workspace).unwrap();
+        let expected =
+            zeroclaw_config::platform::resolve_executable(std::ffi::OsStr::new("sh")).unwrap();
         let debug = format!("{cmd:?}");
         assert!(debug.contains("echo cron-test"));
-        assert!(debug.contains("\"sh\""), "should use sh: {debug}");
+        assert_eq!(
+            cmd.as_std().get_program(),
+            expected.as_os_str(),
+            "cron should use the resolved native shell path"
+        );
         // Must NOT use login shell (-l) — login shells load full profile
         // and are slow/unpredictable for cron jobs.
         assert!(
@@ -3024,7 +3030,10 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(output.status.success());
-        assert_eq!(stdout.trim(), format!("CUSTOM_SHELL:{}", shim.display()));
+        assert_eq!(
+            stdout.trim(),
+            format!("CUSTOM_SHELL:{}", shim.canonicalize().unwrap().display())
+        );
     }
 
     #[test]
@@ -3038,9 +3047,11 @@ mod tests {
         let cmd =
             build_configured_shell_command(&config, "echo cron-docker", &std::env::temp_dir())
                 .unwrap();
+        let expected =
+            zeroclaw_config::platform::resolve_executable(std::ffi::OsStr::new("docker")).unwrap();
         let debug = format!("{cmd:?}");
 
-        assert!(debug.contains("\"docker\""), "{debug}");
+        assert_eq!(cmd.as_std().get_program(), expected.as_os_str(), "{debug}");
         assert!(debug.contains("\"run\""), "{debug}");
         assert!(debug.contains("\"--network\""), "{debug}");
         assert!(debug.contains("\"none\""), "{debug}");

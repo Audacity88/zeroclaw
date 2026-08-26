@@ -616,10 +616,11 @@ mod tests {
         let runtime = NativeRuntime::new();
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        let expected = crate::platform::resolve_executable(std::ffi::OsStr::new("sh")).unwrap();
         assert_eq!(
-            std::path::Path::new(cmd.as_std().get_program()).file_name(),
-            Some(std::ffi::OsStr::new("sh")),
-            "default shell should resolve to an executable named 'sh'"
+            cmd.as_std().get_program(),
+            expected.as_os_str(),
+            "default shell should use the resolved executable path"
         );
     }
 

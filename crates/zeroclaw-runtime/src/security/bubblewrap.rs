@@ -121,6 +121,7 @@ impl BubblewrapSandbox {
         }
     }
 
+    #[cfg(test)]
     fn wrap_command_with_support(
         &self,
         cmd: &mut Command,
