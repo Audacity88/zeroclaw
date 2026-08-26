@@ -2469,6 +2469,36 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let json = response_json(response).await;
+        let actual_fields: std::collections::BTreeSet<_> = json
+            .as_object()
+            .expect("status response object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected_fields = [
+            "agent_alias",
+            "allow_self_upgrade",
+            "channels",
+            "check_updates",
+            "daemon_started_at",
+            "gateway_port",
+            "health",
+            "locale",
+            "memory_backend",
+            "model",
+            "model_provider",
+            "nodes",
+            "paired",
+            "process",
+            "restart_hint",
+            "restart_mode",
+            "temperature",
+            "uptime_seconds",
+            "version",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual_fields, expected_fields);
         assert!(json["version"].as_str().is_some());
         assert!(json["temperature"].is_null());
         assert!(json["agent_alias"].is_null());
@@ -2485,7 +2515,10 @@ pub(crate) mod tests {
         );
         assert!(json["check_updates"].is_boolean());
         assert!(json["allow_self_upgrade"].is_boolean());
-        assert!(json["restart_mode"].as_str().is_some());
+        assert_eq!(
+            json["restart_mode"],
+            crate::version::detect_restart().mode.as_str()
+        );
         assert!(json["restart_hint"].as_str().is_some());
     }
 
