@@ -22559,8 +22559,7 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    #[tokio::test]
-    async fn message_dispatch_generation_cancel_drains_parallel_workers() {
+    async fn run_parallel_message_dispatch(cancel_generation: bool) {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -22685,28 +22684,33 @@ BTC is currently around $65,000 based on latest tool output."#
         })
         .await
         .unwrap();
-        let cancel = CancellationToken::new();
-        let dispatch_cancel = cancel.clone();
-        let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel(
-            rx,
-            AgentRouter::single(runtime_ctx),
-            2,
-            dispatch_cancel,
-        ));
+        if cancel_generation {
+            let cancel = CancellationToken::new();
+            let dispatch_cancel = cancel.clone();
+            let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel(
+                rx,
+                AgentRouter::single(runtime_ctx),
+                2,
+                dispatch_cancel,
+            ));
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while peak_in_flight.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("both channel workers should enter the provider");
-        cancel.cancel();
-        drop(tx);
-        tokio::time::timeout(Duration::from_secs(1), dispatch)
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while peak_in_flight.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .expect("generation cancellation should drain channel workers promptly")
-            .expect("dispatch task should join cleanly");
+            .expect("both channel workers should enter the provider");
+            cancel.cancel();
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(1), dispatch)
+                .await
+                .expect("generation cancellation should drain channel workers promptly")
+                .expect("dispatch task should join cleanly");
+        } else {
+            drop(tx);
+            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        }
 
         let peak = peak_in_flight.load(Ordering::SeqCst);
         assert!(
@@ -22717,10 +22721,24 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(in_flight.load(Ordering::SeqCst), 0, "all workers drained");
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(
-            sent_messages.is_empty(),
-            "cancelled generation workers must not publish old-channel replies"
-        );
+        if cancel_generation {
+            assert!(
+                sent_messages.is_empty(),
+                "cancelled generation workers must not publish old-channel replies"
+            );
+        } else {
+            assert_eq!(sent_messages.len(), 2, "both replies should be delivered");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_processes_messages_in_parallel() {
+        run_parallel_message_dispatch(false).await;
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_generation_cancel_drains_parallel_workers() {
+        run_parallel_message_dispatch(true).await;
     }
 
     #[tokio::test]
