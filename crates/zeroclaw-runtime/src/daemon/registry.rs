@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
 use super::{GatewayReadinessReporter, SocketReadinessReporter};
+use crate::LiveConfigAuthority;
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
@@ -27,6 +28,7 @@ pub type GatewayStarter = Box<
             String,
             u16,
             Config,
+            LiveConfigAuthority,
             Option<broadcast::Sender<Value>>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
@@ -37,7 +39,8 @@ pub type GatewayStarter = Box<
 >;
 
 /// Starts the supervised channel orchestrator for one daemon run/reload iteration.
-pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFuture + Send + Sync>;
+pub type ChannelsStarter =
+    Box<dyn Fn(LiveConfigAuthority, CancellationToken) -> StarterFuture + Send + Sync>;
 
 /// Starts the local IPC transport and optionally reports its secured bind.
 pub type SocketStarter = Box<
@@ -186,7 +189,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {
@@ -254,5 +257,49 @@ mod tests {
         assert!(!registry.has_socket_start());
         assert!(!registry.has_wss_start());
         assert!(!registry.has_mqtt_start());
+    }
+
+    #[test]
+    fn supervised_starters_receive_one_live_config_authority() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let expected_config = authority.config();
+        let expected_write_lock = authority.config_write_lock();
+
+        let gateway: GatewayStarter = Box::new({
+            let expected_config = expected_config.clone();
+            let expected_write_lock = expected_write_lock.clone();
+            move |_, _, _, received_authority, _, _, _, _| {
+                assert!(Arc::ptr_eq(&expected_config, &received_authority.config()));
+                assert!(Arc::ptr_eq(
+                    &expected_write_lock,
+                    &received_authority.config_write_lock()
+                ));
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let channels: ChannelsStarter = Box::new({
+            let expected_config = expected_config.clone();
+            let expected_write_lock = expected_write_lock.clone();
+            move |received_authority, _| {
+                assert!(Arc::ptr_eq(&expected_config, &received_authority.config()));
+                assert!(Arc::ptr_eq(
+                    &expected_write_lock,
+                    &received_authority.config_write_lock()
+                ));
+                Box::pin(async { Ok(()) })
+            }
+        });
+
+        let _ = gateway(
+            String::new(),
+            0,
+            Config::default(),
+            authority.clone(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let _ = channels(authority, CancellationToken::new());
     }
 }

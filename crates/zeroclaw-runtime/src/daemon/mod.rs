@@ -623,6 +623,7 @@ pub async fn run(
     if port != 0 {
         config.gateway.port = port;
     }
+    let live_config_authority = crate::LiveConfigAuthority::new(config.clone());
 
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
@@ -687,6 +688,7 @@ pub async fn run(
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         let gateway_readiness_tx = startup_readiness_tx.clone();
+        let gateway_live_config_authority = live_config_authority.clone();
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -699,6 +701,7 @@ pub async fn run(
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
+                let live_config_authority = gateway_live_config_authority.clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 async move {
@@ -707,6 +710,7 @@ pub async fn run(
                         host,
                         port,
                         cfg,
+                        live_config_authority,
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
@@ -743,20 +747,20 @@ pub async fn run(
 
     if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
-            let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
             let cancel_for_supervisor = channels_cancel.clone();
             let generation_control = channel_generation_control.clone();
+            let channels_live_config_authority = live_config_authority.clone();
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
                 channels_cancel.clone(),
                 move || {
-                    let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
                     let cancel = cancel_for_supervisor.clone();
                     let generation_control = generation_control.clone();
+                    let live_config_authority = channels_live_config_authority.clone();
                     async move {
                         let Some(attempt) = generation_control.begin_attempt(&cancel) else {
                             // A retired generation must never retry the old
@@ -766,7 +770,7 @@ pub async fn run(
                             return Ok(());
                         };
                         let attempt_cancel = attempt.cancel();
-                        let result = start(cfg, attempt_cancel).await;
+                        let result = start(live_config_authority, attempt_cancel).await;
                         drop(attempt);
                         result
                     }
@@ -892,9 +896,12 @@ pub async fn run(
             None
         };
 
+        let (rpc_config, rpc_config_write_lock) =
+            RpcContext::config_handles_for_authority(&live_config_authority);
+
         Some(std::sync::Arc::new(RpcContext {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            config: rpc_config,
+            config_write_lock: rpc_config_write_lock,
             sessions,
             session_backend,
             memory: rpc_memory,
@@ -3650,7 +3657,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_controls, tui_registry, _ready_tx| {
+            move |host,
+                  port,
+                  config,
+                  _live_config_authority,
+                  event_tx,
+                  reload_controls,
+                  tui_registry,
+                  _ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
@@ -3825,7 +3839,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _live_config_authority,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
                         .map(|controls| controls.reload_tx)

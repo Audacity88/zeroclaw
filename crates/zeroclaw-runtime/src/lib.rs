@@ -10,6 +10,7 @@ pub mod cli_input;
 /// `cargo generate installers runtime-locales`. Generated, not hand-edited.
 mod generated_locales;
 pub mod identity;
+pub mod live_config_authority;
 pub mod migration;
 pub mod util;
 
@@ -48,3 +49,5 @@ pub mod tools;
 pub mod trust;
 pub mod tunnel;
 pub mod verifiable_intent;
+
+pub use live_config_authority::LiveConfigAuthority;

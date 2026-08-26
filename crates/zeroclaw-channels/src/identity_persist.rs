@@ -11,15 +11,15 @@
 //! different on-disk layouts (and no channel grows a local allowlist
 //! cache).
 //!
-//! Writes go through the shared `Arc<RwLock<Config>>` handle the
-//! orchestrator wires into each channel — mutate canonical in-memory state
-//! under the lock, then persist a snapshot with `Config::save()`. Channels
-//! constructed without the handle (tests, one-shot CLI runs) skip
+//! Writes go through the shared live-config authority the orchestrator wires
+//! into each channel — acquire its mutation witness, mutate canonical
+//! in-memory state under the config lock, then persist a snapshot with
+//! `Config::save()`. Channels constructed without the handle (tests, one-shot CLI runs) skip
 //! persistence with a warning: pairing still works for the process
 //! lifetime, it just isn't durable.
 
-use std::sync::Arc;
 use zeroclaw_config::schema::Config;
+use zeroclaw_runtime::LiveConfigAuthority;
 
 /// Merge `identity` into the `external_peers` of the peer group whose
 /// `channel` ref matches `<channel_type>.<alias>`, on the canonical
@@ -148,14 +148,14 @@ pub(crate) fn merge_external_peer(
 /// callers may invoke this on every connect/reconnect. `persist = None`
 /// (no handle wired) warns and succeeds without persisting.
 pub(crate) async fn persist_external_peer(
-    persist: Option<&Arc<parking_lot::RwLock<Config>>>,
+    persist: Option<&LiveConfigAuthority>,
     channel_type: &str,
     alias: &str,
     identity: &str,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let Some(config) = persist else {
+    let Some(authority) = persist else {
         // The raw identity is a durable personal identifier (e.g. a phone
         // number) and must not reach the log sink; channel_type/alias give
         // the operator enough to locate the unwired constructor path.
@@ -171,6 +171,9 @@ pub(crate) async fn persist_external_peer(
         );
         return Ok(());
     };
+    let config_write_lock = authority.config_write_lock();
+    let _config_write_guard = config_write_lock.lock().await;
+    let config = authority.config();
     let snapshot = {
         let mut cfg = config.write();
         if !merge_external_peer(&mut cfg, channel_type, alias, identity)? {

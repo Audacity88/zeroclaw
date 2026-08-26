@@ -10317,6 +10317,25 @@ fn collect_configured_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Vec<ConfiguredChannel> {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::from_config(config_arc.clone());
+    collect_configured_channels_with_authority(
+        config_arc,
+        &authority,
+        matrix_skip_context,
+        tool_specs,
+        sop_engine,
+        sop_audit,
+    )
+}
+
+fn collect_configured_channels_with_authority(
+    config_arc: &Arc<RwLock<Config>>,
+    authority: &zeroclaw_runtime::LiveConfigAuthority,
+    matrix_skip_context: &str,
+    tool_specs: &[(String, String)],
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
     #[cfg(not(feature = "channel-amqp"))]
@@ -10390,7 +10409,7 @@ fn collect_configured_channels(
                         tg.mention_only,
                     )
                     .with_voice_peer_resolver(voice_peer_resolver)
-                    .with_persistence(config_arc.clone())
+                    .with_persistence_authority(authority.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
@@ -10884,7 +10903,7 @@ fn collect_configured_channels(
                                     peer_resolver,
                                     allowed_groups_resolver,
                                 )
-                                .with_persistence(config_arc.clone())
+                                .with_persistence_authority(authority.clone())
                                 .with_transcription(config.transcription.clone())
                                 .with_tts(&config)
                                 .with_workspace_dir(workspace_dir)
@@ -11293,7 +11312,7 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LineChannel::from_config(ln, alias.clone(), peer_resolver, sender_name_resolver)
-                    .with_persistence(config_arc.clone())
+                    .with_persistence_authority(authority.clone())
                     .with_transcription(config.transcription.clone()),
             ),
         });
@@ -11632,7 +11651,7 @@ fn collect_configured_channels(
                     alias: Some(alias.clone()),
                     channel: Arc::new(
                         channel
-                            .with_persistence(config_arc.clone())
+                            .with_persistence_authority(authority.clone())
                             .with_workspace_dir(
                                 config.channel_workspace_dir(&format!("wechat.{alias}")),
                             ),
@@ -12308,8 +12327,22 @@ pub async fn start_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+    start_channels_with_authority(authority, canvas_store, cancel, sop_engine, sop_audit).await
+}
+
+/// Start all configured channels with the live config authority owned by the
+/// current daemon generation.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_authority(
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+) -> Result<()> {
     let mut registry_startup = LiveChannelRegistryStartupGuard::new();
-    let config_arc = Arc::new(RwLock::new(config));
+    let config_arc = authority.config();
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
         .agents
@@ -12681,13 +12714,15 @@ pub async fn start_channels(
             }
 
             #[allow(unused_mut)]
-            let mut configured_channels: Vec<ConfiguredChannel> = collect_configured_channels(
-                &config_arc,
-                "runtime startup",
-                &tool_specs,
-                sop_engine.clone(),
-                sop_audit.clone(),
-            );
+            let mut configured_channels: Vec<ConfiguredChannel> =
+                collect_configured_channels_with_authority(
+                    &config_arc,
+                    &authority,
+                    "runtime startup",
+                    &tool_specs,
+                    sop_engine.clone(),
+                    sop_audit.clone(),
+                );
 
             #[cfg(feature = "channel-nostr")]
             {

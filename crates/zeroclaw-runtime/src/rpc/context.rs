@@ -16,6 +16,7 @@ use zeroclaw_infra::session_backend::SessionBackend;
 
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
+use crate::LiveConfigAuthority;
 use crate::daemon::ChannelGenerationControl;
 
 #[derive(Default)]
@@ -175,6 +176,12 @@ pub struct RpcContext {
 }
 
 impl RpcContext {
+    pub(crate) fn config_handles_for_authority(
+        authority: &LiveConfigAuthority,
+    ) -> (Arc<RwLock<Config>>, Arc<tokio::sync::Mutex<()>>) {
+        (authority.config(), authority.config_write_lock())
+    }
+
     pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
         let tui_dir = config
             .config_path
@@ -182,9 +189,10 @@ impl RpcContext {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| config.data_dir.clone());
         let data_dir = config.data_dir.clone();
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
             sessions,
             session_backend: None,
             memory: None,
@@ -204,9 +212,10 @@ impl RpcContext {
 
     #[cfg(test)]
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
             sessions,
             session_backend: None,
             memory: None,
@@ -230,9 +239,10 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         event_tx: tokio::sync::broadcast::Sender<Value>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
             sessions,
             session_backend: None,
             memory: None,
@@ -256,9 +266,10 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
             sessions,
             session_backend: None,
             memory: None,
@@ -282,9 +293,10 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         memory: Arc<dyn zeroclaw_api::memory_traits::Memory>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
             sessions,
             session_backend: None,
             memory: Some(memory),
@@ -308,9 +320,10 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         cost_tracker: Arc<CostTracker>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
             sessions,
             session_backend: None,
             memory: None,
@@ -335,9 +348,10 @@ impl RpcContext {
         session_backend: Option<Arc<dyn SessionBackend>>,
         acp_session_store: Option<Arc<AcpSessionStore>>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
             sessions,
             session_backend,
             memory: None,
@@ -362,9 +376,10 @@ impl RpcContext {
         gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
         reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
             sessions,
             session_backend: None,
             memory: None,
@@ -388,6 +403,15 @@ mod tests {
     use super::*;
     use tokio::sync::oneshot;
     use zeroclaw_api::channel::ChannelApprovalResponse;
+
+    #[test]
+    fn config_handles_for_authority_preserve_identity() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let (config, write_lock) = RpcContext::config_handles_for_authority(&authority);
+
+        assert!(Arc::ptr_eq(&config, &authority.config()));
+        assert!(Arc::ptr_eq(&write_lock, &authority.config_write_lock()));
+    }
 
     #[test]
     fn pending_map_insert_and_resolve() {

@@ -4823,12 +4823,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
+                    move |host,
+                          port,
+                          config,
+                          authority,
+                          tx,
+                          reload_controls,
+                          tui_registry,
+                          ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway_with_authority(
                                 &host,
                                 port,
                                 config,
@@ -4839,6 +4846,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 sop_engine,
                                 sop_audit,
                                 ready_tx,
+                                authority,
                             ))
                             .await
                         })
@@ -4848,18 +4856,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |config, cancel| {
+                    move |authority, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
-                                config,
-                                Some(canvas_store),
-                                cancel,
-                                sop_engine,
-                                sop_audit,
-                            ))
+                            Box::pin(
+                                zeroclaw_channels::orchestrator::start_channels_with_authority(
+                                    authority,
+                                    Some(canvas_store),
+                                    cancel,
+                                    sop_engine,
+                                    sop_audit,
+                                ),
+                            )
                             .await
                         })
                     }

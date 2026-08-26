@@ -34,7 +34,7 @@ pub struct LineChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    persist: Option<Arc<parking_lot::RwLock<Config>>>,
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     /// Pairing guard — `Some` when `dm_policy = Pairing`.
     pairing: Option<Arc<PairingGuard>>,
     /// TCP port the embedded webhook server listens on.
@@ -83,8 +83,8 @@ struct LineState {
     /// Resolves the configured peer allowlist at message-time. Reads
     /// canonical state, no cache.
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle for the `/bind` flow.
-    persist: Option<Arc<parking_lot::RwLock<Config>>>,
+    /// Optional pairing-persist authority for the `/bind` flow.
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     pairing: Option<Arc<PairingGuard>>,
     pending_tokens: Arc<RwLock<HashMap<String, String>>>,
     /// HTTP client and credentials for downloading audio content.
@@ -236,7 +236,7 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
     use zeroclaw_config::providers::ChannelRef;
 
-    let Some(config) = &state.persist else {
+    let Some(authority) = &state.persist else {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -250,6 +250,9 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     if normalized.is_empty() {
         anyhow::bail!("Cannot persist empty LINE userId");
     }
+    let config_write_lock = authority.config_write_lock();
+    let _config_write_guard = config_write_lock.lock().await;
+    let config = authority.config();
     let group_name = format!("line_{}", state.alias);
     let channel_ref = ChannelRef::new(format!("line.{}", state.alias));
     let snapshot = {
@@ -769,12 +772,22 @@ impl LineChannel {
         }
     }
 
-    /// Wire the shared `Config` handle so `persist_line_paired_identity`
-    /// can write a newly-paired userId into `peer_groups.line_<alias>.external_peers`
-    /// and save. Long-running daemon sets this from the orchestrator; tests
-    /// and one-shot callers leave it unset (pairing then doesn't survive).
+    /// Wire a config handle so `persist_line_paired_identity` can write a
+    /// newly-paired userId into `peer_groups.line_<alias>.external_peers` and
+    /// save. Standalone callers get a local mutation witness; supervised
+    /// callers use [`Self::with_persistence_authority`] to share the daemon
+    /// witness.
     pub fn with_persistence(mut self, config: Arc<parking_lot::RwLock<Config>>) -> Self {
-        self.persist = Some(config);
+        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
+        self
+    }
+
+    /// Wire the daemon generation's live-config authority for pairing writes.
+    pub fn with_persistence_authority(
+        mut self,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
+    ) -> Self {
+        self.persist = Some(authority);
         self
     }
 
@@ -1244,6 +1257,19 @@ mod tests {
             empty_resolver(),
             8444,
         )
+    }
+
+    #[test]
+    fn authority_persistence_preserves_live_handle_identity() {
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
+        let channel = make_channel().with_persistence_authority(authority.clone());
+        let stored = channel.persist.as_ref().expect("authority is stored");
+
+        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
+        assert!(Arc::ptr_eq(
+            &authority.config_write_lock(),
+            &stored.config_write_lock()
+        ));
     }
 
     /// Compute a valid `X-Line-Signature` for `body` signed with `secret`.

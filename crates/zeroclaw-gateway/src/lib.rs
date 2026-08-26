@@ -581,6 +581,39 @@ pub async fn run_gateway(
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config.clone());
+    run_gateway_with_authority(
+        host,
+        port,
+        config,
+        external_event_tx,
+        reload_controls,
+        tui_registry,
+        canvas_store,
+        sop_engine,
+        sop_audit,
+        readiness,
+        authority,
+    )
+    .await
+}
+
+/// Run the gateway with the live config authority owned by its daemon
+/// generation.
+#[allow(clippy::too_many_lines)]
+pub async fn run_gateway_with_authority(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
+    tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    canvas_store: Option<CanvasStore>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -596,7 +629,7 @@ pub async fn run_gateway(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
-    let config_state = Arc::new(RwLock::new(config.clone()));
+    let config_state = authority.config();
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
@@ -1519,7 +1552,7 @@ pub async fn run_gateway(
 
     let state = AppState {
         config: config_state,
-        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        config_write_lock: authority.config_write_lock(),
         model_provider,
         model,
         temperature,
