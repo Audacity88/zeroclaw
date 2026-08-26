@@ -3367,6 +3367,25 @@ pub enum MessageEntryKind {
     Message,
     ToolCall,
     ToolResult,
+    #[serde(other)]
+    Unknown,
+}
+
+#[cfg(test)]
+mod message_entry_kind_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_message_entry_kind_remains_readable() {
+        let entry: MessageEntry = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "future entry",
+            "kind": "future_kind"
+        }))
+        .expect("unknown additive kind should remain readable");
+
+        assert_eq!(entry.kind, MessageEntryKind::Unknown);
+    }
 }
 
 impl MessageEntry {

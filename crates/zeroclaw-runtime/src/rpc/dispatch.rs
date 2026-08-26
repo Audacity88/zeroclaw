@@ -4689,7 +4689,8 @@ impl RpcDispatcher {
 
 fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<MessageEntry> {
     let mut entries = Vec::new();
-    let mut tool_entry_by_id = std::collections::HashMap::new();
+    let mut tool_entries_by_id =
+        std::collections::HashMap::<String, std::collections::VecDeque<usize>>::new();
 
     for message in messages {
         match message {
@@ -4719,7 +4720,10 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
 
                 for call in tool_calls {
                     let index = entries.len();
-                    tool_entry_by_id.insert(call.id.clone(), index);
+                    tool_entries_by_id
+                        .entry(call.id.clone())
+                        .or_default()
+                        .push_back(index);
                     entries.push(MessageEntry {
                         role: "assistant".to_string(),
                         content: format!("Tool call: {}\n{}", call.name, call.arguments),
@@ -4737,10 +4741,16 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
             ConversationMessage::ToolResults(results) => {
                 for result in results {
                     let output = result.content.clone();
-                    if let Some(entry) = tool_entry_by_id
-                        .remove(&result.tool_call_id)
-                        .and_then(|index| entries.get_mut(index))
+                    let entry_index = tool_entries_by_id
+                        .get_mut(&result.tool_call_id)
+                        .and_then(std::collections::VecDeque::pop_front);
+                    if tool_entries_by_id
+                        .get(&result.tool_call_id)
+                        .is_some_and(std::collections::VecDeque::is_empty)
                     {
+                        tool_entries_by_id.remove(&result.tool_call_id);
+                    }
+                    if let Some(entry) = entry_index.and_then(|index| entries.get_mut(index)) {
                         entry.tool_output = Some(output.clone());
                         entry.content.push_str("\nResult:\n");
                         entry.content.push_str(&output);
@@ -8219,6 +8229,50 @@ mod tests {
         assert_eq!(entries[4].kind, MessageEntryKind::ToolResult);
         assert_eq!(entries[4].tool_call_id.as_deref(), Some("orphan"));
         assert_eq!(entries[4].tool_output.as_deref(), Some("late result"));
+    }
+
+    #[test]
+    fn conversation_message_entries_pairs_duplicate_tool_ids_in_order() {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let entries = conversation_message_entries(&[
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "duplicate".into(),
+                        name: "first".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "duplicate".into(),
+                        name: "second".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "duplicate".into(),
+                    content: "first result".into(),
+                    tool_name: "first".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "duplicate".into(),
+                    content: "second result".into(),
+                    tool_name: "second".into(),
+                },
+            ]),
+        ]);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].tool_name.as_deref(), Some("first"));
+        assert_eq!(entries[0].tool_output.as_deref(), Some("first result"));
+        assert_eq!(entries[1].tool_name.as_deref(), Some("second"));
+        assert_eq!(entries[1].tool_output.as_deref(), Some("second result"));
     }
 
     #[test]

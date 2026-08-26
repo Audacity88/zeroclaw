@@ -498,10 +498,20 @@ impl Chat {
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
                 // empty history. Fresh sessions have nothing to load.
-                if let Some(sid) = resumed_sid
-                    && let Ok(msgs) = self.rpc.session_messages(&sid).await
-                {
-                    state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
+                if let Some(sid) = resumed_sid {
+                    match self.rpc.session_messages(&sid).await {
+                        Ok(msgs) => {
+                            state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp)
+                        }
+                        Err(e) => {
+                            let _ = self.rpc.session_close(&sid).await;
+                            self.phase = ChatPhase::Error(crate::i18n::t_args(
+                                "zc-chat-session-switch-error",
+                                &[("error", &e.to_string())],
+                            ));
+                            return;
+                        }
+                    }
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -1944,6 +1954,20 @@ impl Chat {
             }
         };
 
+        let history = match rpc.session_messages(&new_sid).await {
+            Ok(messages) => messages,
+            Err(e) => {
+                let _ = rpc.session_close(&new_sid).await;
+                state.session_overlay = SessionOverlay::None;
+                state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                    "zc-chat-session-switch-error",
+                    &[("error", &e.to_string())],
+                )));
+                state.mark_dirty_full();
+                return;
+            }
+        };
+
         let _ = rpc.session_close(&state.session_id).await;
         state.session_overlay = SessionOverlay::None;
         let current = state.todo_tracker.settings();
@@ -1956,9 +1980,7 @@ impl Chat {
         state.cwd = rehydrated.workspace_dir;
 
         Self::refresh_model_identity(rpc, state).await;
-        if let Ok(msgs) = rpc.session_messages(&new_sid).await {
-            state.load_history(msgs.messages, pane_kind == PaneKind::Acp);
-        }
+        state.load_history(history.messages, pane_kind == PaneKind::Acp);
     }
 
     /// Apply a session override (model and/or model_provider) to the active
@@ -3579,9 +3601,15 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
 }
 
 fn bounded_tool_output(raw_output: String) -> String {
-    const MAX_RAW_OUTPUT: usize = 16 * 1024;
-    if raw_output.len() > MAX_RAW_OUTPUT {
-        format!("{}…[truncated]", truncate_utf8(&raw_output, MAX_RAW_OUTPUT))
+    const MAX_OUTPUT: usize = 16 * 1024;
+    const TRUNCATION_MARKER: &str = "…[truncated]";
+    if raw_output.len() > MAX_OUTPUT {
+        let content_limit = MAX_OUTPUT.saturating_sub(TRUNCATION_MARKER.len());
+        format!(
+            "{}{}",
+            truncate_utf8(&raw_output, content_limit),
+            TRUNCATION_MARKER
+        )
     } else {
         raw_output
     }
@@ -7418,7 +7446,8 @@ impl ChatState {
                     }
                     continue;
                 }
-                crate::client::MessageEntryKind::Message => {}
+                crate::client::MessageEntryKind::Message
+                | crate::client::MessageEntryKind::Unknown => {}
             }
             match m.role() {
                 crate::client::MessageRole::User => {
@@ -9997,15 +10026,6 @@ mod tests {
             }),
         );
 
-        let request = next_rpc_request(&mut rx, "successful switch should close old session").await;
-        assert_eq!(request["method"], method::SESSION_CLOSE);
-        assert_eq!(request["params"]["session_id"], "sess-old");
-        respond_ok(&rpc, &request, serde_json::json!({}));
-
-        let request = next_rpc_request(&mut rx, "double-click should refresh model identity").await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
         let request = next_rpc_request(&mut rx, "double-click should load history").await;
         assert_eq!(request["method"], method::SESSION_MESSAGES);
         assert_eq!(request["params"]["session_id"], "sess-new");
@@ -10020,6 +10040,15 @@ mod tests {
                 "start": 0
             }),
         );
+
+        let request = next_rpc_request(&mut rx, "successful switch should close old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let request = next_rpc_request(&mut rx, "double-click should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
 
         let chat = tokio::time::timeout(Duration::from_secs(2), switch)
             .await
@@ -10106,6 +10135,96 @@ mod tests {
             .expect("failed switch should surface an info-bar error");
         assert!(info.text.contains("Failed to switch session"));
         assert!(info.text.contains("Session not found"));
+    }
+
+    #[tokio::test]
+    async fn session_picker_history_error_keeps_old_session() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        state.session_overlay = SessionOverlay::List {
+            sessions: vec![crate::client::SessionEntry {
+                session_id: "sess-broken".to_string(),
+                session_key: "sess-broken".to_string(),
+                created_at: "2026-07-07T00:00:00Z".to_string(),
+                last_activity: "2026-07-07T00:01:00Z".to_string(),
+                message_count: 1,
+                agent_alias: Some("beta".to_string()),
+                channel_id: None,
+                name: Some("Broken work".to_string()),
+            }],
+            list_state,
+        };
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: overlay_area.x + 2,
+            row: overlay_area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let switch = tokio::spawn(async move {
+            chat.handle_mouse(click, area).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "switch should resume selected session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-broken",
+                "workspace_dir": "/tmp/broken"
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "switch should load history before replacing state").await;
+        assert_eq!(request["method"], method::SESSION_MESSAGES);
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "malformed ACP history",
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "failed restore should close resumed session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-broken");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("failed history restore should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("failed history restore should keep the old session active");
+        };
+        assert_eq!(state.session_id, "sess-old");
+        assert_eq!(state.agent_alias, "alpha");
+        assert!(matches!(state.session_overlay, SessionOverlay::None));
+        let info = state
+            .info_message
+            .as_ref()
+            .expect("failed history restore should surface an error");
+        assert!(info.text.contains("Failed to switch session"));
+        assert!(info.text.contains("malformed ACP history"));
     }
 
     #[tokio::test]
@@ -12985,7 +13104,7 @@ mod tests {
                 result: Some(result),
                 ..
             }] if result.ends_with("…[truncated]")
-                && result.len() <= 16 * 1024 + "…[truncated]".len()
+                && result.len() <= 16 * 1024
         ));
     }
 
