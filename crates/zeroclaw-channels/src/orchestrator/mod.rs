@@ -13341,6 +13341,23 @@ pub(crate) mod tests {
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    fn source_block_after<'a>(
+        source: &'a str,
+        marker: &str,
+        closing_indent: &str,
+    ) -> Option<&'a str> {
+        let (_, after_marker) = source.split_once(marker)?;
+        let closing_line = format!("\n{closing_indent}}}\n");
+        after_marker
+            .split_once(&closing_line)
+            .map(|(block, _)| block)
+    }
+
+    fn source_segment_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
+        let (_, after_start) = source.split_once(start)?;
+        after_start.split_once(end).map(|(segment, _)| segment)
+    }
+
     /// Runs a channel-dispatch test on an explicit stack because its async
     /// future can exceed the default test-thread stack on hosted CI.
     pub(crate) fn run_channel_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
@@ -28543,6 +28560,7 @@ This is an example JSON object for profile settings."#;
             .0;
         let mqtt_owner = include_str!("../../../zeroclaw-runtime/src/daemon/registry.rs");
         let acp_owner = include_str!("acp_server.rs");
+        let cli_owner = include_str!("../../../../src/main.rs");
 
         for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
             if !compiled {
@@ -28554,17 +28572,9 @@ This is an example JSON object for profile settings."#;
                     _ => key.replace('-', "_"),
                 };
                 let loop_marker = format!("in &config.channels.{field}");
-                collector
-                    .split_once(&loop_marker)
-                    .map(|(_, after_loop)| {
-                        after_loop
-                            .split("#[cfg(not(feature")
-                            .next()
-                            .is_some_and(|feature_block| {
-                                feature_block.contains("channels.push(ConfiguredChannel {")
-                            })
-                    })
-                    .unwrap_or(false)
+                source_block_after(collector, &loop_marker, "    ").is_some_and(|loop_body| {
+                    loop_body.contains("channels.push(ConfiguredChannel {")
+                })
             });
             if registered {
                 continue;
@@ -28572,26 +28582,61 @@ This is an example JSON object for profile settings."#;
 
             let primary_key = type_keys[0];
             let runtime_owner_verified = match primary_key {
-                "nostr" => {
-                    async_assembly.contains("config.channels.nostr")
-                        && async_assembly.contains("NostrChannel::new")
-                        && async_assembly.contains("configured_channels.push(ConfiguredChannel {")
-                }
-                "filesystem" => {
-                    async_assembly.contains("config.channels.filesystem")
-                        && async_assembly.contains("FilesystemChannel::new")
-                        && async_assembly.contains("configured_channels.push(ConfiguredChannel {")
-                }
+                "nostr" => source_block_after(
+                    async_assembly,
+                    "#[cfg(feature = \"channel-nostr\")]\n            {",
+                    "            ",
+                )
+                .is_some_and(|block| {
+                    block.contains("NostrChannel::new")
+                        && block.contains("configured_channels.push(ConfiguredChannel {")
+                }),
+                "filesystem" => source_block_after(
+                    async_assembly,
+                    "if let (Some(engine), Some(audit)) = (sop_engine.as_ref(), sop_audit.as_ref()) {",
+                    "            ",
+                )
+                .is_some_and(|block| {
+                    block.contains("config.channels.filesystem")
+                        && block.contains("FilesystemChannel::new")
+                        && block.contains("configured_channels.push(ConfiguredChannel {")
+                }),
                 "mqtt" => {
-                    mqtt_owner.contains("pub type MqttStarter")
-                        && mqtt_owner.contains("pub fn register_mqtt")
+                    source_block_after(mqtt_owner, "pub fn register_mqtt", "    ")
+                        .is_some_and(|block| block.contains("self.mqtt_start = Some(starter);"))
+                        && source_segment_between(
+                            cli_owner,
+                            "registry.register_mqtt(Box::new({",
+                            "registry.register_socket(Box::new(",
+                        )
+                        .is_some_and(|block| block.contains("run_mqtt_sop_listener("))
                 }
-                "plugin" => {
-                    async_assembly.contains("configured_plugin_channels(")
-                        && async_assembly.contains("append_configured_plugin_channels(")
-                }
+                "plugin" => source_segment_between(
+                    async_assembly,
+                    "let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(",
+                    "let channels: Vec<Arc<dyn Channel>>",
+                )
+                .is_some_and(|block| {
+                    block.contains("append_configured_plugin_channels(")
+                }),
                 "acp-server" => {
-                    acp_owner.contains("pub async fn run(self: Arc<Self>) -> Result<()>")
+                    source_block_after(
+                        acp_owner,
+                        "pub async fn run(self: Arc<Self>) -> Result<()> {",
+                        "    ",
+                    )
+                    .is_some_and(|block| {
+                        block.contains("self.serve_reader(tokio::io::stdin()).await?")
+                    })
+                        && source_segment_between(
+                            cli_owner,
+                            "Commands::Acp {\n            max_sessions,\n            session_timeout,\n        } => {",
+                            "Commands::Gateway {",
+                        )
+                        .is_some_and(|block| {
+                            block.contains("channels::acp_server::AcpServer::new")
+                                && block.contains("server.run().await")
+                        })
                 }
                 _ => false,
             };
