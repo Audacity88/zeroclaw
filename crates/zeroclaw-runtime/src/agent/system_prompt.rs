@@ -158,6 +158,47 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // reported shell cannot drift from the executed one.
     shell_profile: Option<&ShellProfile>,
 ) -> String {
+    build_system_prompt_with_mode_and_effective_tools(
+        workspace_dir,
+        model_name,
+        tools,
+        |_| true,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        autonomy_config,
+        native_tool_specs_present,
+        skills_prompt_mode,
+        compact_context,
+        max_system_prompt_chars,
+        inject_memory,
+        show_tool_calls,
+        shell_profile,
+    )
+}
+
+/// Build the system prompt with the effective callable tool names supplied by
+/// the turn's assembled registry. The tool descriptions remain separately
+/// filtered for the prompt surface, while skill callable metadata uses this
+/// name set as its availability source of truth.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_system_prompt_with_mode_and_effective_tools(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    is_tool_available: impl Fn(&str) -> bool,
+    skills: &[Skill],
+    identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
+    native_tool_specs_present: bool,
+    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    compact_context: bool,
+    max_system_prompt_chars: usize,
+    inject_memory: bool,
+    show_tool_calls: bool,
+    shell_profile: Option<&ShellProfile>,
+) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
     let has_tools = !tools.is_empty() || native_tool_specs_present;
@@ -342,10 +383,11 @@ pub fn build_system_prompt_with_mode_and_autonomy(
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
-        prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
+        prompt.push_str(&crate::skills::skills_to_prompt_with_mode_and_availability(
             skills,
             workspace_dir,
             skills_prompt_mode,
+            is_tool_available,
         ));
         prompt.push_str("\n\n");
     }

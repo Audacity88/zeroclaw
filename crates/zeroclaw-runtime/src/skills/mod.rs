@@ -1649,6 +1649,18 @@ pub fn skills_to_prompt_with_mode(
     // Compact renders summaries whose instructions load via `read_skill`.
     mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
 ) -> String {
+    skills_to_prompt_with_mode_and_availability(skills, workspace_dir, mode, |_| true)
+}
+
+/// Build the available-skills prompt while checking callable names against the
+/// effective tool surface. Tools that fail this availability check remain in
+/// descriptive metadata so the skill and its instructions are not dropped.
+pub(crate) fn skills_to_prompt_with_mode_and_availability(
+    skills: &[Skill],
+    workspace_dir: &Path,
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    is_tool_available: impl Fn(&str) -> bool,
+) -> String {
     use std::fmt::Write;
 
     if skills.is_empty() {
@@ -1699,12 +1711,24 @@ pub fn skills_to_prompt_with_mode(
             let registered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| skill_tool_is_prompt_callable(t))
+                .filter(|t| {
+                    skill_tool_is_prompt_callable(t)
+                        && is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                            &skill.name,
+                            &t.name,
+                        ))
+                })
                 .collect();
             let unregistered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| !skill_tool_is_prompt_callable(t))
+                .filter(|t| {
+                    !skill_tool_is_prompt_callable(t)
+                        || !is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                            &skill.name,
+                            &t.name,
+                        ))
+                })
                 .collect();
 
             if !registered.is_empty() {
