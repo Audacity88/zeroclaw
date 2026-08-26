@@ -5,7 +5,6 @@ use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
 use chrono::{Datelike, Local};
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
@@ -247,17 +246,14 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let available_tool_names: HashSet<&str> =
-            ctx.tools.iter().map(|tool| tool.name()).collect();
         let mode = crate::skills::skills_prompt_mode_with_loader_fallback(
             ctx.skills_prompt_mode,
-            available_tool_names.contains("read_skill"),
+            ctx.tools.iter().any(|tool| tool.name() == "read_skill"),
         );
-        Ok(crate::skills::skills_to_prompt_with_mode_and_availability(
+        Ok(crate::skills::skills_to_prompt_with_mode(
             ctx.skills,
             ctx.workspace_dir,
             mode,
-            |name| available_tool_names.contains(name),
         ))
     }
 }
