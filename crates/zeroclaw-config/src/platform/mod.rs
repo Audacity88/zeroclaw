@@ -146,10 +146,11 @@ mod tests {
         let cmd = rt
             .build_shell_command("echo hi", &std::env::temp_dir())
             .unwrap();
-        let debug = format!("{cmd:?}");
-        assert!(
-            debug.contains("/sh"),
-            "default shell should be 'sh', got: {debug}"
+        let expected = crate::platform::resolve_executable(std::ffi::OsStr::new("sh")).unwrap();
+        assert_eq!(
+            cmd.as_std().get_program(),
+            expected.as_os_str(),
+            "default shell should use the resolved executable path"
         );
     }
 
