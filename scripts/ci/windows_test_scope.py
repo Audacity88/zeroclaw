@@ -22,6 +22,11 @@ FULL_PATHS = {
     "Cargo.toml",
 }
 DYNAMIC_TEST_FIXTURE_PREFIX = "crates/zeroclaw-plugins/tests/fixtures/"
+PLUGIN_HOST_CONTROL_PATHS = {
+    ".github/workflows/ci.yml",
+    "scripts/ci/windows_test_scope.py",
+    "scripts/ci/windows_test_scope.test.sh",
+}
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,13 @@ class Selection:
 
 def full(reason: str, needs_plugin_host: bool = False) -> Selection:
     return Selection("full", (), reason, needs_plugin_host)
+
+
+def requires_plugin_host(changed_paths: list[str]) -> bool:
+    return any(
+        path in PLUGIN_HOST_CONTROL_PATHS or path.startswith(DYNAMIC_TEST_FIXTURE_PREFIX)
+        for path in changed_paths
+    )
 
 
 def normalize_git_path(raw_path: str) -> str | None:
@@ -227,9 +239,7 @@ def select_pull_request(
     if not changed_paths:
         return Selection("skip", (), "No covered Rust compilation or test paths changed.", False)
 
-    needs_plugin_host = any(
-        path.startswith(DYNAMIC_TEST_FIXTURE_PREFIX) for path in changed_paths
-    )
+    needs_plugin_host = requires_plugin_host(changed_paths)
     selected: set[str] = set()
     lockfile_changed = False
 
@@ -294,9 +304,7 @@ def select(event: str, changed_file: Path | None, metadata_file: Path | None, re
     changed_paths, paths_ok = read_changed_paths(changed_file)
     if not paths_ok:
         return full("Changed paths are malformed or unavailable; selecting full is safer.", True)
-    needs_plugin_host = any(
-        path.startswith(DYNAMIC_TEST_FIXTURE_PREFIX) for path in changed_paths
-    )
+    needs_plugin_host = requires_plugin_host(changed_paths)
     if metadata_file is None:
         return full("Changed paths or Cargo metadata are unavailable; selecting full is safer.", needs_plugin_host)
     packages, reverse_dependents, metadata_error = load_packages(metadata_file, repo_root)

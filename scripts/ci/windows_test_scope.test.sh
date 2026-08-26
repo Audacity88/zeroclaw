@@ -131,7 +131,13 @@ printf '%s\n' '.cargo/config.toml' > "$paths_file"
 assert_selection "cargo configuration" full '[]' '' "$paths_file"
 
 printf '%s\n' '.github/workflows/ci.yml' > "$paths_file"
-assert_selection "workflow itself" full '[]' '' "$paths_file"
+assert_selection "workflow itself exercises plugin host path" full '[]' '' "$paths_file" true
+
+printf '%s\n' 'scripts/ci/windows_test_scope.py' > "$paths_file"
+assert_selection "selector itself exercises plugin host path" full '[]' '' "$paths_file" true
+
+printf '%s\n' 'scripts/ci/windows_test_scope.test.sh' > "$paths_file"
+assert_selection "selector contract itself exercises plugin host path" full '[]' '' "$paths_file" true
 
 printf '%s\n' 'crates/zeroclaw-channels/src/$(touch should-not-exist).rs' > "$paths_file"
 output="$(run_selector pull_request "$paths_file" "$metadata_file")"
