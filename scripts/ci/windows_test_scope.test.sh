@@ -100,16 +100,16 @@ printf '%s\n' 'crates/zeroclaw-channels/config/ambiguous.yaml' > "$paths_file"
 assert_selection "ambiguous package path" full '[]' '' "$paths_file"
 
 printf '%s\n' 'Cargo.lock' > "$paths_file"
-assert_selection "lockfile only" full '[]' 'Cargo.lock cannot be attributed to package-local manifest changes.' "$paths_file"
+assert_selection "lockfile only" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file"
 
 printf '%s\n' 'Cargo.lock' 'crates/zeroclaw-channels/Cargo.toml' > "$paths_file"
-assert_selection "attributed lockfile" scoped '["zeroclaw","zeroclaw-channels"]' 'Cargo.lock is attributable to package-local manifest changes.' "$paths_file"
+assert_selection "manifest plus lockfile" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file"
 
 printf '%s\n' 'Cargo.lock' 'crates/zeroclaw-channels/Cargo.toml' 'crates/zeroclaw-providers/src/lib.rs' > "$paths_file"
-assert_selection "partially attributed multi-package lockfile" full '[]' 'Cargo.lock cannot be attributed to package-local manifest changes.' "$paths_file"
+assert_selection "lockfile with multiple packages" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file"
 
 printf '%s\n' 'Cargo.lock' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
-assert_selection "unattributed lockfile" full '[]' 'Cargo.lock cannot be attributed to package-local manifest changes.' "$paths_file"
+assert_selection "lockfile with source change" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file"
 
 assert_selection "desktop exclusion" skip '[]' 'No covered Rust compilation or test paths changed.' <(printf '%s\n' 'apps/tauri/src/main.rs')
 
@@ -148,6 +148,11 @@ output="$(run_selector pull_request "$paths_file" "$malformed_metadata")"
 printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
 printf '%s\n' "$output" | grep -F 'reason=Cargo metadata is malformed or unavailable' >/dev/null
 
+missing_metadata="$fixture_dir/missing.json"
+output="$(run_selector pull_request "$paths_file" "$missing_metadata")"
+printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'reason=Cargo metadata is malformed or unavailable (FileNotFoundError).' >/dev/null
+
 package_args="$(python3 "$selector" --package-args-json '["zeroclaw","zeroclaw-channels"]')"
 test "$package_args" = $'-p\nzeroclaw\n-p\nzeroclaw-channels'
 
@@ -181,6 +186,10 @@ package_conversion = 'scripts/ci/windows_test_scope.py --package-args-json "$PAC
 scoped_command = 'cargo nextest run --locked --no-fail-fast "${package_args[@]}"'
 full_command = 'cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop'
 assert "bash scripts/ci/windows_test_scope.test.sh" in scope_job
+metadata_fallback = 'if ! cargo metadata --locked --format-version 1 > "$metadata_file"; then'
+assert metadata_fallback in scope_job
+assert 'rm -f "$metadata_file"' in scope_job
+assert scope_job.index(metadata_fallback) < scope_job.index('rm -f "$metadata_file"')
 assert skip_condition in windows_job
 assert package_conversion in windows_job
 assert scoped_command in windows_job

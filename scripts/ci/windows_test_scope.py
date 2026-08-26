@@ -28,7 +28,6 @@ class Package:
     package_id: str
     name: str
     root: Path
-    manifest: Path
 
 
 @dataclass(frozen=True)
@@ -68,7 +67,7 @@ def read_changed_paths(path: Path) -> tuple[list[str], bool]:
     return paths, True
 
 
-def metadata_path(repo_root: Path, manifest_path: str) -> tuple[Path, Path] | None:
+def metadata_path(repo_root: Path, manifest_path: str) -> Path | None:
     manifest = Path(manifest_path)
     if not manifest.is_absolute():
         manifest = repo_root / manifest
@@ -79,7 +78,7 @@ def metadata_path(repo_root: Path, manifest_path: str) -> tuple[Path, Path] | No
         manifest.relative_to(repo_root)
     except ValueError:
         return None
-    return manifest.parent, manifest
+    return manifest.parent
 
 
 def load_packages(
@@ -114,14 +113,13 @@ def load_packages(
             continue
         if not SAFE_PACKAGE_NAME.fullmatch(name):
             return [], {}, "Cargo metadata is malformed or unavailable (package name)."
-        paths = metadata_path(repo_root, manifest_value)
-        if paths is None:
+        root = metadata_path(repo_root, manifest_value)
+        if root is None:
             return [], {}, "Cargo metadata is malformed or unavailable (manifest path)."
-        root, manifest = paths
         if root in seen_roots:
             return [], {}, "Cargo metadata is ambiguous (multiple packages share a root)."
         seen_roots.add(root)
-        packages.append(Package(package_id, name, root, manifest))
+        packages.append(Package(package_id, name, root))
 
     if not packages:
         return [], {}, "Cargo metadata is malformed or unavailable (no workspace packages)."
@@ -228,7 +226,6 @@ def select_pull_request(
         return Selection("skip", (), "No covered Rust compilation or test paths changed.")
 
     selected: set[str] = set()
-    package_manifests: set[str] = set()
     lockfile_changed = False
 
     for path in changed_paths:
@@ -252,20 +249,14 @@ def select_pull_request(
         if not is_package_test_path(path, package, repo_root):
             return full("Workspace-wide or ambiguous Rust-affecting change requires the full suite.")
         selected.add(package.name)
-        if (repo_root / PurePosixPath(path)).resolve() == package.manifest:
-            package_manifests.add(package.name)
 
     if lockfile_changed:
-        if not selected or package_manifests != selected:
-            return full("Cargo.lock cannot be attributed to package-local manifest changes.")
-        reason = "Cargo.lock is attributable to package-local manifest changes."
-    else:
-        reason = "Changed paths map to workspace packages."
+        return full("Cargo.lock changes require the full suite.")
 
     if not selected:
         return Selection("skip", (), "No covered Rust compilation or test paths changed.")
     selected = close_over_reverse_dependents(selected, reverse_dependents)
-    return Selection("scoped", tuple(sorted(selected)), reason)
+    return Selection("scoped", tuple(sorted(selected)), "Changed paths map to workspace packages.")
 
 
 def select(event: str, changed_file: Path | None, metadata_file: Path | None, repo_root: Path) -> Selection:
