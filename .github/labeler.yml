@@ -11,7 +11,9 @@
   - changed-files:
       - any-glob-to-any-file:
           - "Cargo.toml"
+          - "**/Cargo.toml"
           - "Cargo.lock"
+          - "**/Cargo.lock"
           - "deny.toml"
           - ".github/dependabot.yml"
 
