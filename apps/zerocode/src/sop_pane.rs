@@ -735,6 +735,9 @@ impl SopPane {
         self.names.retain(|candidate| candidate != name);
         self.list_state
             .select((!self.names.is_empty()).then_some(0));
+        self.graph = SopGraphView::default();
+        self.overlay = None;
+        self.current_run_id = None;
     }
 
     pub(crate) async fn load_selected_graph(&mut self) {
@@ -2721,7 +2724,7 @@ mod tests {
 #[cfg(test)]
 mod list_refresh_tests {
     use super::SopPane;
-    use crate::client::RpcClient;
+    use crate::client::{GraphNode, NodeKind, RpcClient};
     use crate::jsonrpc::{JsonRpcError, RpcOutbound};
     use serde_json::json;
     use std::sync::Arc;
@@ -2891,9 +2894,22 @@ mod list_refresh_tests {
         );
         assert_eq!(pane.selected_name(), Some("alpha"));
 
+        pane.graph.nodes.push(GraphNode {
+            step: 1,
+            title: "deleted alpha".to_string(),
+            kind: NodeKind::default(),
+            subtitle: None,
+            trigger_index: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
         pane.project_deleted_name("alpha");
         assert_eq!(pane.names, vec!["beta".to_string(), "gamma".to_string()]);
         assert_eq!(pane.selected_name(), Some("beta"));
+        assert!(
+            pane.graph.nodes.is_empty(),
+            "delete projection must not render the deleted SOP graph for the new selection"
+        );
     }
 }
 
