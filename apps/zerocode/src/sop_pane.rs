@@ -2925,11 +2925,9 @@ mod list_refresh_tests {
 
         let mut delete = Box::pin(pane.delete_selected());
         let raw = tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                tokio::select! {
-                    raw = rx.recv() => break raw.expect("RPC writer should remain connected"),
-                    _ = &mut delete => panic!("delete must wait for its RPC response"),
-                }
+            tokio::select! {
+                raw = rx.recv() => raw.expect("RPC writer should remain connected"),
+                _ = &mut delete => panic!("delete must wait for its RPC response"),
             }
         })
         .await
