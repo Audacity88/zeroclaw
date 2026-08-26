@@ -4346,8 +4346,8 @@ mod prompt_callable_name_tests {
             None,
         );
         let names: Vec<&str> = registered.iter().map(|tool| tool.name()).collect();
-        assert!(names.iter().any(|name| *name == "ops__run"));
-        assert!(!names.iter().any(|name| *name == "ops__fetch"));
+        assert!(names.contains(&"ops__run"));
+        assert!(!names.contains(&"ops__fetch"));
     }
 
     #[test]

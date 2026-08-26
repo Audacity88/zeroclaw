@@ -82,7 +82,8 @@ impl SkillHttpTool {
     }
 
     async fn validate_target(&self, raw_url: &str) -> anyhow::Result<ValidatedTarget> {
-        let mut url = reqwest::Url::parse(raw_url).map_err(|_| anyhow::anyhow!("Invalid URL"))?;
+        let mut url =
+            reqwest::Url::parse(raw_url).map_err(|_| anyhow::Error::msg("Invalid URL"))?;
         if !url.username().is_empty() || url.password().is_some() {
             anyhow::bail!("URL userinfo is not allowed");
         }
@@ -92,19 +93,19 @@ impl SkillHttpTool {
 
         let request_host = url
             .host_str()
-            .ok_or_else(|| anyhow::anyhow!("URL must include a host"))?;
+            .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
         let host = zeroclaw_infra::net_guard::normalize_host(request_host)
-            .map_err(|_| anyhow::anyhow!("URL host is invalid"))?;
+            .map_err(|_| anyhow::Error::msg("URL host is invalid"))?;
         let port = url
             .port_or_known_default()
-            .ok_or_else(|| anyhow::anyhow!("URL must include a valid port"))?;
+            .ok_or_else(|| anyhow::Error::msg("URL must include a valid port"))?;
 
         let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
             vec![SocketAddr::new(ip, port)]
         } else {
             tokio::net::lookup_host((host.as_str(), port))
                 .await
-                .map_err(|_| anyhow::anyhow!("Failed to resolve HTTP destination"))?
+                .map_err(|_| anyhow::Error::msg("Failed to resolve HTTP destination"))?
                 .collect::<Vec<_>>()
         };
         let destination = ResolvedDestination::new(
@@ -114,13 +115,13 @@ impl SkillHttpTool {
             PrivateNetworkAccess::Deny,
             &self.nat64_prefixes,
         )
-        .map_err(|_| anyhow::anyhow!("HTTP destination rejected by network policy"))?;
+        .map_err(|_| anyhow::Error::msg("HTTP destination rejected by network policy"))?;
 
         // Reqwest's DNS pin is keyed by the request host. Use the canonical
         // validated spelling so normalization cannot make the pin miss.
         if host.parse::<IpAddr>().is_err() {
             url.set_host(Some(destination.host()))
-                .map_err(|_| anyhow::anyhow!("URL host is invalid"))?;
+                .map_err(|_| anyhow::Error::msg("URL host is invalid"))?;
         }
 
         Ok(ValidatedTarget { url, destination })
@@ -138,7 +139,7 @@ impl SkillHttpTool {
         };
         builder
             .build()
-            .map_err(|_| anyhow::anyhow!("Failed to build HTTP client"))
+            .map_err(|_| anyhow::Error::msg("Failed to build HTTP client"))
     }
 }
 
