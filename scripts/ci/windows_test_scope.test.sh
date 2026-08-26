@@ -9,7 +9,10 @@ fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
 
 repo_root="${fixture_dir}/repo"
-mkdir -p "$repo_root/crates/zeroclaw-channels" "$repo_root/crates/zeroclaw-providers" "$repo_root/apps/tauri"
+mkdir -p "$repo_root/crates/zeroclaw-channels" \
+    "$repo_root/crates/zeroclaw-providers" \
+    "$repo_root/crates/zeroclaw-plugins/tests/fixtures/channel-fixture" \
+    "$repo_root/apps/tauri"
 metadata_file="${fixture_dir}/metadata.json"
 cat > "$metadata_file" <<EOF
 {
@@ -17,12 +20,14 @@ cat > "$metadata_file" <<EOF
     {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "name": "zeroclaw", "manifest_path": "Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "name": "zeroclaw-channels", "manifest_path": "crates/zeroclaw-channels/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "name": "zeroclaw-providers", "manifest_path": "crates/zeroclaw-providers/Cargo.toml"},
+    {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "name": "zeroclaw-channel-plugin-fixture", "manifest_path": "crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml"},
     {"id": "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4", "name": "zeroclaw-desktop", "manifest_path": "apps/tauri/Cargo.toml"}
   ],
   "workspace_members": [
     "path+file://${repo_root}#zeroclaw 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4",
+    "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0",
     "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4"
   ],
   "resolve": {
@@ -30,6 +35,7 @@ cat > "$metadata_file" <<EOF
       {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
       {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "deps": []},
+      {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "deps": []},
       {"id": "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}]}
     ]
   }
@@ -89,6 +95,9 @@ assert_selection "deduplication" scoped '["zeroclaw","zeroclaw-channels"]' '' "$
 
 printf '%s\n' 'crates/zeroclaw-channels/tests/fixture.md' > "$paths_file"
 assert_selection "test fixture" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
+
+printf '%s\n' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
+assert_selection "dynamically consumed plugin fixture" full '[]' 'Dynamically consumed plugin test fixtures require the full suite.' "$paths_file"
 
 printf '%s\n' 'Cargo.toml' > "$paths_file"
 assert_selection "full workspace manifest" full '[]' '' "$paths_file"

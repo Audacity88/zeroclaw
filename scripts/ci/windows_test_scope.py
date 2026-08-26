@@ -21,6 +21,7 @@ FULL_PATHS = {
     "scripts/ci/windows_test_scope.test.sh",
     "Cargo.toml",
 }
+DYNAMIC_TEST_FIXTURE_PREFIX = "crates/zeroclaw-plugins/tests/fixtures/"
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,8 @@ def select_pull_request(
             return full("Workspace-wide or ambiguous Rust-affecting change requires the full suite.")
         if PurePosixPath(path).name in {"rust-toolchain", "rust-toolchain.toml"}:
             return full("Workspace-wide or ambiguous Rust-affecting change requires the full suite.")
+        if path.startswith(DYNAMIC_TEST_FIXTURE_PREFIX):
+            return full("Dynamically consumed plugin test fixtures require the full suite.")
         if is_obviously_irrelevant(path):
             continue
 
