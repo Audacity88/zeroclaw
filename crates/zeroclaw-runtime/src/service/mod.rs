@@ -3320,12 +3320,12 @@ mod bounded_service_log_tests {
     fn desktop_pre_capture_failures_emit_once_and_preserve_the_error() {
         let cases = [
             (
-                anyhow::anyhow!("Failed to resolve desktop log path: config\r\npath"),
+                anyhow::Error::msg("Failed to resolve desktop log path: config\r\npath"),
                 "ERROR Failed to resolve desktop log path: config path\n",
             ),
             (
-                anyhow::anyhow!(
-                    "Failed to resolve the desktop daemon executable: executable\npath"
+                anyhow::Error::msg(
+                    "Failed to resolve the desktop daemon executable: executable\npath",
                 ),
                 "ERROR Failed to resolve the desktop daemon executable: executable path\n",
             ),
