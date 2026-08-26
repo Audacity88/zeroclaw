@@ -7,7 +7,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
@@ -2024,6 +2024,7 @@ fn remove_git_metadata(skill_path: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
+    source_open_seam();
     let source = open_source_dir_nofollow(src)?;
     let dest_parent_path = dest
         .parent()
@@ -2062,29 +2063,67 @@ fn open_parent_dir(path: &Path) -> Result<Dir> {
 }
 
 fn open_source_dir_nofollow(src: &Path) -> Result<Dir> {
-    let parent = open_parent_dir(src)?;
-    let name = src
-        .file_name()
-        .context("Skill source path must include a directory name")?;
-    let metadata = parent
-        .symlink_metadata(name)
-        .with_context(|| format!("failed to read metadata for {}", src.display().to_string()))?;
-    if metadata.file_type().is_symlink() {
+    let mut components = src.components();
+    let anchor = match components.next() {
+        Some(Component::RootDir) => PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+        Some(Component::Prefix(prefix)) => {
+            if !matches!(components.next(), Some(Component::RootDir)) {
+                anyhow::bail!(
+                    "Skill source path has an unsupported prefix without a root: {}",
+                    src.display()
+                );
+            }
+            #[cfg(windows)]
+            {
+                let mut anchor = prefix.as_os_str().to_os_string();
+                anchor.push(std::path::MAIN_SEPARATOR_STR);
+                PathBuf::from(anchor)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = prefix;
+                anyhow::bail!(
+                    "Skill source path has an unsupported platform prefix: {}",
+                    src.display()
+                );
+            }
+        }
+        Some(component) => anyhow::bail!(
+            "Skill source path must be absolute; unsupported initial component {component:?} in {}",
+            src.display()
+        ),
+        None => anyhow::bail!("Skill source path is empty"),
+    };
+
+    let mut current = Dir::open_ambient_dir(&anchor, ambient_authority())
+        .with_context(|| format!("failed to open stable source anchor {}", anchor.display()))?;
+    let mut normal_components = 0;
+    for component in components {
+        let name = match component {
+            Component::Normal(name) => name,
+            unsupported => anyhow::bail!(
+                "Skill source path has unsupported component {unsupported:?}: {}",
+                src.display()
+            ),
+        };
+        normal_components += 1;
+        current = current.open_dir_nofollow(name).with_context(|| {
+            format!(
+                "failed to open skill source component {} in {}",
+                name.to_string_lossy(),
+                src.display()
+            )
+        })?;
+    }
+
+    if normal_components == 0 {
         anyhow::bail!(
-            "Refusing to copy symlinked skill source path: {}",
+            "Skill source path must include a directory name: {}",
             src.display()
         );
     }
-    if !metadata.is_dir() {
-        anyhow::bail!(
-            "Skill source must be a directory: {}",
-            src.display().to_string()
-        );
-    }
 
-    parent
-        .open_dir_nofollow(name)
-        .with_context(|| format!("failed to open skill source {}", src.display()))
+    Ok(current)
 }
 
 fn copy_dir_contents(
@@ -2204,6 +2243,15 @@ fn entry_swap_seam(relative: &Path) {
     copy_tests::run_entry_swap_seam(relative);
 }
 
+#[cfg(not(test))]
+#[inline]
+fn source_open_seam() {}
+
+#[cfg(test)]
+fn source_open_seam() {
+    copy_tests::run_source_open_seam();
+}
+
 pub fn install_local_skill_source(
     source: &str,
     skills_path: &Path,
@@ -2251,15 +2299,25 @@ mod copy_tests {
     use std::rc::Rc;
 
     type Swap = Box<dyn Fn(&Path)>;
+    type SourceOpen = Box<dyn Fn()>;
 
     thread_local! {
         static ENTRY_SWAP: RefCell<Option<Swap>> = const { RefCell::new(None) };
+        static SOURCE_OPEN: RefCell<Option<SourceOpen>> = const { RefCell::new(None) };
     }
 
     pub(super) fn run_entry_swap_seam(relative: &Path) {
         ENTRY_SWAP.with(|swap| {
             if let Some(swap) = swap.borrow().as_ref() {
                 swap(relative);
+            }
+        });
+    }
+
+    pub(super) fn run_source_open_seam() {
+        SOURCE_OPEN.with(|swap| {
+            if let Some(swap) = swap.borrow().as_ref() {
+                swap();
             }
         });
     }
@@ -2279,6 +2337,21 @@ mod copy_tests {
         }
     }
 
+    struct SourceOpenGuard;
+
+    impl SourceOpenGuard {
+        fn install(swap: impl Fn() + 'static) -> Self {
+            SOURCE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    impl Drop for SourceOpenGuard {
+        fn drop(&mut self) {
+            SOURCE_OPEN.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
     #[test]
     fn copies_nested_files_and_preserves_permissions() {
         let root = tempfile::tempdir().unwrap();
@@ -2288,6 +2361,7 @@ mod copy_tests {
         std::fs::write(source.join("nested/deeper/SKILL.md"), "skill").unwrap();
         let script = source.join("run.sh");
         std::fs::write(&script, "#!/bin/sh\necho ok\n").unwrap();
+        let canonical_source = source.canonicalize().unwrap();
 
         #[cfg(unix)]
         {
@@ -2295,7 +2369,7 @@ mod copy_tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        copy_dir_recursive_secure(&source, &destination).unwrap();
+        copy_dir_recursive_secure(&canonical_source, &destination).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(destination.join("nested/deeper/SKILL.md")).unwrap(),
@@ -2394,6 +2468,54 @@ mod copy_tests {
 
     #[cfg(unix)]
     #[test]
+    fn install_rejects_an_ancestor_swapped_to_an_external_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join("ancestor");
+        let source = ancestor.join("source");
+        let moved_ancestor = root.path().join("ancestor-moved");
+        let outside = root.path().join("outside");
+        let skills_path = root.path().join("skills");
+        let destination = skills_path.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(outside.join("source")).unwrap();
+        std::fs::create_dir(&skills_path).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Safe Skill\n").unwrap();
+        std::fs::write(
+            outside.join("source/SKILL.md"),
+            "[outside host content](file:///etc/passwd)\n",
+        )
+        .unwrap();
+
+        let swapped = Rc::new(Cell::new(false));
+        let swapped_in_seam = Rc::clone(&swapped);
+        let ancestor_for_swap = ancestor.clone();
+        let moved_ancestor_for_swap = moved_ancestor.clone();
+        let outside_for_swap = outside.clone();
+        let result = {
+            let _swap = SourceOpenGuard::install(move || {
+                std::fs::rename(&ancestor_for_swap, &moved_ancestor_for_swap).unwrap();
+                std::os::unix::fs::symlink(&outside_for_swap, &ancestor_for_swap).unwrap();
+                swapped_in_seam.set(true);
+            });
+            install_local_skill_source(source.to_str().unwrap(), &skills_path, false)
+        };
+
+        let err = result.expect_err("an ancestor swapped to a symlink must fail the install");
+        assert!(
+            swapped.get(),
+            "the source-open seam must run after the audit"
+        );
+        assert!(err.to_string().contains("ancestor"), "got: {err}");
+        assert!(!destination.exists());
+        assert!(!destination.join("SKILL.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("source/SKILL.md")).unwrap(),
+            "[outside host content](file:///etc/passwd)\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_a_directory_swapped_to_an_external_symlink() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
@@ -2406,6 +2528,7 @@ mod copy_tests {
 
         let entry_for_swap = entry.clone();
         let outside_for_swap = outside.clone();
+        let canonical_source = source.canonicalize().unwrap();
         let result = {
             let _swap = EntrySwapGuard::install(move |relative| {
                 if relative == Path::new("nested") {
@@ -2413,7 +2536,7 @@ mod copy_tests {
                     std::os::unix::fs::symlink(&outside_for_swap, &entry_for_swap).unwrap();
                 }
             });
-            copy_dir_recursive_secure(&source, &destination)
+            copy_dir_recursive_secure(&canonical_source, &destination)
         };
 
         let err = result.expect_err("a swapped directory symlink must fail the copy");
