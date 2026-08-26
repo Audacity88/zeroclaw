@@ -21,12 +21,22 @@ FULL_PATHS = {
     "scripts/ci/windows_test_scope.test.sh",
     "Cargo.toml",
 }
-DYNAMIC_TEST_FIXTURE_PREFIX = "crates/zeroclaw-plugins/tests/fixtures/"
-PLUGIN_HOST_CONTROL_PATHS = {
+PLUGIN_HOST_PATH_PREFIXES = (
+    "crates/zeroclaw-plugins/",
+    "crates/zeroclaw-runtime/",
+    "crates/zeroclaw-config/",
+    "wit/",
+)
+PLUGIN_HOST_EXACT_PATHS = {
     ".github/workflows/ci.yml",
+    "Cargo.lock",
+    "Cargo.toml",
     "scripts/ci/windows_test_scope.py",
     "scripts/ci/windows_test_scope.test.sh",
+    "tests/plugin_channel_runtime_e2e.rs",
 }
+PLUGIN_HOST_SCRIPT_PREFIX = "scripts/ci/plugin_backend_change_filter"
+DYNAMIC_TEST_FIXTURE_PREFIX = "crates/zeroclaw-plugins/tests/fixtures/"
 
 
 @dataclass(frozen=True)
@@ -50,7 +60,9 @@ def full(reason: str, needs_plugin_host: bool = False) -> Selection:
 
 def requires_plugin_host(changed_paths: list[str]) -> bool:
     return any(
-        path in PLUGIN_HOST_CONTROL_PATHS or path.startswith(DYNAMIC_TEST_FIXTURE_PREFIX)
+        path in PLUGIN_HOST_EXACT_PATHS
+        or path.startswith(PLUGIN_HOST_PATH_PREFIXES)
+        or (path.startswith(PLUGIN_HOST_SCRIPT_PREFIX) and path.endswith(".sh"))
         for path in changed_paths
     )
 

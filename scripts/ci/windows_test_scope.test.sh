@@ -101,11 +101,27 @@ assert_selection "test fixture" scoped '["zeroclaw","zeroclaw-channels"]' '' "$p
 printf '%s\n' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
 assert_selection "dynamically consumed plugin fixture" full '[]' 'Dynamically consumed plugin test fixtures require the full suite.' "$paths_file" true
 
+for plugin_path in \
+    'crates/zeroclaw-plugins/src/lib.rs' \
+    'crates/zeroclaw-runtime/src/lib.rs' \
+    'crates/zeroclaw-config/src/lib.rs' \
+    'wit/zeroclaw-plugin.wit' \
+    'tests/plugin_channel_runtime_e2e.rs' \
+    'Cargo.toml' \
+    'Cargo.lock' \
+    'scripts/ci/plugin_backend_change_filter.sh' \
+    'scripts/ci/plugin_backend_change_filter.test.sh' \
+    'scripts/ci/plugin_backend_change_filter-v2.sh'; do
+    printf '%s\n' "$plugin_path" > "$paths_file"
+    output="$(run_selector pull_request "$paths_file" "$metadata_file")"
+    printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
+done
+
 printf '%s\n' 'Cargo.toml' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
 assert_selection "mixed full trigger with plugin fixture" full '[]' '' "$paths_file" true
 
 printf '%s\n' 'Cargo.toml' > "$paths_file"
-assert_selection "full workspace manifest" full '[]' '' "$paths_file"
+assert_selection "full workspace manifest" full '[]' '' "$paths_file" true
 
 printf '%s\n' 'crates/unknown/src/lib.rs' > "$paths_file"
 assert_selection "unknown path" full '[]' '' "$paths_file"
@@ -114,16 +130,16 @@ printf '%s\n' 'crates/zeroclaw-channels/config/ambiguous.yaml' > "$paths_file"
 assert_selection "ambiguous package path" full '[]' '' "$paths_file"
 
 printf '%s\n' 'Cargo.lock' > "$paths_file"
-assert_selection "lockfile only" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file"
+assert_selection "lockfile only" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file" true
 
 printf '%s\n' 'Cargo.lock' 'crates/zeroclaw-channels/Cargo.toml' > "$paths_file"
-assert_selection "manifest plus lockfile" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file"
+assert_selection "manifest plus lockfile" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file" true
 
 printf '%s\n' 'Cargo.lock' 'crates/zeroclaw-channels/Cargo.toml' 'crates/zeroclaw-providers/src/lib.rs' > "$paths_file"
-assert_selection "lockfile with multiple packages" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file"
+assert_selection "lockfile with multiple packages" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file" true
 
 printf '%s\n' 'Cargo.lock' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
-assert_selection "lockfile with source change" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file"
+assert_selection "lockfile with source change" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file" true
 
 assert_selection "desktop exclusion" skip '[]' 'No covered Rust compilation or test paths changed.' <(printf '%s\n' 'apps/tauri/src/main.rs')
 
@@ -236,6 +252,9 @@ full_command = 'cargo nextest run --locked --no-fail-fast --workspace --exclude 
 plugin_condition = 'if [[ "$NEEDS_PLUGIN_HOST" == "true" ]]; then'
 plugin_components_command = 'cargo nextest run --locked --no-fail-fast \\\n              -p zeroclaw-plugins'
 plugin_root_command = 'cargo nextest run --locked --no-fail-fast \\\n              --features plugins-wasm-cranelift \\\n              --test plugin_channel_runtime_e2e'
+plugin_lib_command = "cargo nextest run --locked --no-fail-fast \\\n              -p zeroclaw-plugins \\\n              --no-default-features \\\n              --features plugins-wasm-cranelift \\\n              --lib"
+plugin_runtime_config_command = "cargo nextest run --locked --no-fail-fast \\\n              -p zeroclaw-runtime \\\n              --features plugins-wasm-cranelift \\\n              --lib \\\n              live_agent_plugin_tool_observes_config_reload_after_construction"
+plugin_runtime_admission_command = "cargo nextest run --locked --no-fail-fast \\\n              -p zeroclaw-runtime \\\n              --features plugins-wasm-cranelift \\\n              --lib \\\n              plugin_runtime::"
 assert "bash scripts/ci/windows_test_scope.test.sh" in scope_job
 metadata_fallback = 'if ! cargo metadata --locked --format-version 1 > "$metadata_file"; then'
 assert metadata_fallback in scope_job
@@ -252,12 +271,27 @@ assert "if: needs.windows-test-scope.outputs.needs_plugin_host == 'true'" in win
 assert 'run: rustup target add wasm32-wasip2' in windows_job
 assert plugin_condition in windows_job
 assert plugin_components_command in windows_job
+assert plugin_lib_command in windows_job
+assert plugin_runtime_config_command in windows_job
+assert plugin_runtime_admission_command in windows_job
+for admission_filter in (
+    "plugin_runtime::",
+    "tools::tests::shared_ceiling",
+    "tools::tests::repeated_loader",
+    "tools::tests::auto_discover",
+    "tools::tests::colliding_plugin",
+):
+    assert admission_filter in plugin_backend_job
+    assert admission_filter in windows_job
 for target in ("channel_plugin_e2e", "tool_plugin_timeout_e2e", "reference_plugin", "reference_plugin_e2e", "tool_plugin_e2e"):
     assert f"--test {target}" in plugin_backend_job
     assert f"--test {target}" in windows_job
 assert plugin_root_command in windows_job
 assert "--test plugin_channel_runtime_e2e" in plugin_backend_job
 assert 'plugin_components_status=${PIPESTATUS[0]}' in windows_job
+assert 'plugin_lib_status=${PIPESTATUS[0]}' in windows_job
+assert 'plugin_runtime_config_status=${PIPESTATUS[0]}' in windows_job
+assert 'plugin_runtime_admission_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_root_status=${PIPESTATUS[0]}' in windows_job
 assert 'Failure inventory' in windows_job
 assert 'Baseline duration' in windows_job
@@ -267,7 +301,13 @@ assert windows_job.index("scoped)") < windows_job.index(scoped_command)
 assert windows_job.index("full)") < windows_job.index(full_command)
 assert windows_job.index(plugin_condition) < windows_job.index(plugin_components_command)
 assert windows_job.index(plugin_components_command) < windows_job.index('plugin_components_status=${PIPESTATUS[0]}')
-assert windows_job.index('plugin_components_status=${PIPESTATUS[0]}') < windows_job.index(plugin_root_command)
+assert windows_job.index('plugin_components_status=${PIPESTATUS[0]}') < windows_job.index(plugin_lib_command)
+assert windows_job.index(plugin_lib_command) < windows_job.index('plugin_lib_status=${PIPESTATUS[0]}')
+assert windows_job.index('plugin_lib_status=${PIPESTATUS[0]}') < windows_job.index(plugin_runtime_config_command)
+assert windows_job.index(plugin_runtime_config_command) < windows_job.index('plugin_runtime_config_status=${PIPESTATUS[0]}')
+assert windows_job.index('plugin_runtime_config_status=${PIPESTATUS[0]}') < windows_job.index(plugin_runtime_admission_command)
+assert windows_job.index(plugin_runtime_admission_command) < windows_job.index('plugin_runtime_admission_status=${PIPESTATUS[0]}')
+assert windows_job.index('plugin_runtime_admission_status=${PIPESTATUS[0]}') < windows_job.index(plugin_root_command)
 assert windows_job.index(plugin_root_command) < windows_job.index('plugin_root_status=${PIPESTATUS[0]}')
 scoped_case = windows_job.split("\n            scoped)\n", 1)[1].split(
     "\n              ;;\n", 1
