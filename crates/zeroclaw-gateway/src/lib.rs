@@ -460,6 +460,7 @@ pub struct AppState {
     /// that writer's change — clobbered in memory and, if its save hadn't
     /// landed yet, on disk too.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     /// `None` means "let the provider decide" — required for models
@@ -1553,6 +1554,7 @@ pub async fn run_gateway_with_authority(
     let state = AppState {
         config: config_state,
         config_write_lock: authority.config_write_lock(),
+        agent_lifecycle: authority.agent_lifecycle(),
         model_provider,
         model,
         temperature,
@@ -4574,6 +4576,7 @@ mod tests {
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5483,6 +5486,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5569,6 +5573,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -6242,6 +6247,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7148,6 +7154,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7267,6 +7274,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -7366,6 +7374,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7571,6 +7580,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7657,6 +7667,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7748,6 +7759,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7844,6 +7856,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7938,6 +7951,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -8088,6 +8102,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -8940,6 +8955,7 @@ path = "{trigger_path}"
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9025,6 +9041,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9345,6 +9362,7 @@ path = "{trigger_path}"
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,

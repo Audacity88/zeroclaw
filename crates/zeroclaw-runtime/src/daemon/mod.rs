@@ -902,6 +902,7 @@ pub async fn run(
         Some(std::sync::Arc::new(RpcContext {
             config: rpc_config,
             config_write_lock: rpc_config_write_lock,
+            agent_lifecycle: live_config_authority.agent_lifecycle(),
             sessions,
             session_backend,
             memory: rpc_memory,

@@ -963,7 +963,8 @@ impl RpcDispatcher {
         agent_alias: &str,
         cwd: &str,
         chat_mode: crate::rpc::types::ChatMode,
-    ) -> Result<(), &'static str> {
+        admission: crate::live_config_authority::AgentAdmissionReservation,
+    ) -> Result<(), JsonRpcError> {
         // Reconcile the exact local agent before publication. Sharing the
         // mutation lock makes either this insert or mutation enumeration win.
         let _config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
@@ -983,14 +984,22 @@ impl RpcDispatcher {
         {
             Self::refresh_channel_handles_for_agent(&agent, &configured);
         }
+        let lifecycle_lease = admission.publish().map_err(|_| {
+            rpc_err(
+                INVALID_PARAMS,
+                format!("Agent `{agent_alias}` changed while the session was being created"),
+            )
+        })?;
         self.ctx
             .sessions
             .insert(
                 session_id,
                 super::session::RpcSession::new(agent, agent_alias, cwd, chat_mode)
-                    .with_owner(self.tui_id.clone()),
+                    .with_owner(self.tui_id.clone())
+                    .with_lifecycle_lease(lifecycle_lease),
             )
             .await
+            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))
     }
 
     /// Construct a pre-authenticated dispatcher sharing the same context and
@@ -1637,6 +1646,19 @@ impl RpcDispatcher {
             .chat_mode
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        let admission = self
+            .ctx
+            .agent_lifecycle
+            .reserve_admission(req.agent_alias.clone())
+            .map_err(|_| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "Agent `{}` changed while the session was being created",
+                        req.agent_alias
+                    ),
+                )
+            })?;
 
         // Resuming an ACP session with no caller cwd: recover the original
         // working directory from the persisted store so the rehydrated session
@@ -1751,9 +1773,9 @@ impl RpcDispatcher {
             &req.agent_alias,
             &cwd,
             chat_mode.clone(),
+            admission,
         )
-        .await
-        .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+        .await?;
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -2177,6 +2199,11 @@ impl RpcDispatcher {
             }
         };
 
+        let admission = self
+            .ctx
+            .agent_lifecycle
+            .reserve_admission(data.agent_alias.clone())
+            .ok()?;
         let config = self.ctx.config.read().clone();
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
@@ -2229,6 +2256,7 @@ impl RpcDispatcher {
             &data.agent_alias,
             &data.workspace_dir,
             crate::rpc::types::ChatMode::Acp,
+            admission,
         )
         .await
         .ok()?;
@@ -3869,8 +3897,17 @@ impl RpcDispatcher {
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let mut agent_lifecycle_lease = None;
         let created = {
             let mut config = self.ctx.config.write();
+            if req.path == "agents" && !config.agents.contains_key(&req.key) {
+                agent_lifecycle_lease = Some(
+                    self.ctx
+                        .agent_lifecycle
+                        .begin_delete(req.key.clone())
+                        .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?,
+                );
+            }
             // Shared guarded boundary: enforces the reserved-agent rule (the
             // `default` runtime fallback) on this surface too, so the RPC create
             // path cannot author an `agents.default` the rename guard then traps.
@@ -3888,6 +3925,7 @@ impl RpcDispatcher {
         if created {
             self.flush_config(&config_write_guard).await?;
         }
+        drop(agent_lifecycle_lease);
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
             key: req.key,
@@ -3897,6 +3935,10 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        let _agent_lifecycle_lease = (req.path == "agents")
+            .then(|| self.ctx.agent_lifecycle.begin_delete(req.key.clone()))
+            .transpose()
+            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let refresh_channel_agent = (req.path == "agents").then(|| req.key.clone());
         let channel_generation_mutation = is_channel_generation_map_path(&req.path);
@@ -3943,6 +3985,42 @@ impl RpcDispatcher {
         };
 
         Box::pin(async move {
+            let _agent_lifecycle_leases = if req.path == "agents" {
+                let active = self
+                    .ctx
+                    .sessions
+                    .count_by_agent()
+                    .await
+                    .get(&req.from)
+                    .copied()
+                    .unwrap_or(0);
+                if active > 0 {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "{}.{}: cannot rename agent with {active} active RPC session(s); close those sessions first",
+                            req.path, req.from
+                        ),
+                    ));
+                }
+                let mut leases = vec![
+                    self.ctx
+                        .agent_lifecycle
+                        .begin_delete(req.from.clone())
+                        .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?,
+                ];
+                if req.to != req.from {
+                    leases.push(
+                        self.ctx
+                            .agent_lifecycle
+                            .begin_delete(req.to.clone())
+                            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?,
+                    );
+                }
+                leases
+            } else {
+                Vec::new()
+            };
             // Acquired once here, not inside `handle_config_alias_rename`:
             // the alias-kind branch below delegates into it, and the tokio
             // Mutex is not reentrant. The guard moves by value into the
@@ -9477,6 +9555,7 @@ mod tests {
         let config = make_channel_refresh_test_config(&tmp);
         let (mut dispatcher, _rx, sessions) = make_channel_refresh_test_dispatcher(config);
         seed_test_channel_factory(&mut dispatcher);
+        let lifecycle = dispatcher.ctx.agent_lifecycle.clone();
 
         let session_id = "channel-refresh-race";
         dispatcher
@@ -9511,6 +9590,12 @@ mod tests {
         let session_new = dispatcher.handle_session_new_for_test(&session_params);
         let mutation = async {
             seeded.notified().await;
+            assert!(matches!(
+                lifecycle.begin_delete("test-agent"),
+                Err(
+                    crate::live_config_authority::AgentDeleteBlocker::Reservations { count: 1, .. }
+                )
+            ));
             assert_eq!(
                 sessions.get_agent_alias(session_id).await.as_deref(),
                 Some("sibling"),
@@ -9547,6 +9632,10 @@ mod tests {
             Some("test-agent"),
             "the reconciled local agent must replace the duplicate ID"
         );
+        assert!(matches!(
+            lifecycle.begin_delete("test-agent"),
+            Err(crate::live_config_authority::AgentDeleteBlocker::LiveSessions { count: 1, .. })
+        ));
         assert!(
             !Arc::ptr_eq(&published_sibling, &agent),
             "publication must install the local agent rather than mutate the prior sibling"
@@ -12718,6 +12807,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -12762,6 +12852,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -12898,6 +12989,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,

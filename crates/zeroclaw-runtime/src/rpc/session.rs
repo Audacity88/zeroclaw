@@ -59,6 +59,7 @@ pub struct UploadEntry {
 
 pub struct RpcSession {
     pub agent: Arc<Mutex<Agent>>,
+    lifecycle_lease: Option<crate::live_config_authority::AgentSessionLease>,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -81,6 +82,7 @@ impl RpcSession {
     ) -> Self {
         Self {
             agent: Arc::new(Mutex::new(agent)),
+            lifecycle_lease: None,
             model_provider_update: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
             last_active: Instant::now(),
@@ -97,6 +99,14 @@ impl RpcSession {
     /// Bind this session to a TUI owner.
     pub fn with_owner(mut self, tui_id: Option<String>) -> Self {
         self.owner_tui_id = tui_id;
+        self
+    }
+
+    pub fn with_lifecycle_lease(
+        mut self,
+        lifecycle_lease: crate::live_config_authority::AgentSessionLease,
+    ) -> Self {
+        self.lifecycle_lease = Some(lifecycle_lease);
         self
     }
 }

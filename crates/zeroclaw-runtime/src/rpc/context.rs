@@ -124,6 +124,10 @@ pub struct RpcContext {
     /// flag is cleared by the concurrent flush).
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Alias-scoped admission and destructive lifecycle authority paired with
+    /// this context's live config identity.
+    pub agent_lifecycle: crate::live_config_authority::AgentLifecycleCoordinator,
+
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
 
@@ -193,6 +197,7 @@ impl RpcContext {
         Arc::new(Self {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             sessions,
             session_backend: None,
             memory: None,
@@ -216,6 +221,7 @@ impl RpcContext {
         Arc::new(Self {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             sessions,
             session_backend: None,
             memory: None,
@@ -243,6 +249,7 @@ impl RpcContext {
         Arc::new(Self {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             sessions,
             session_backend: None,
             memory: None,
@@ -270,6 +277,7 @@ impl RpcContext {
         Arc::new(Self {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             sessions,
             session_backend: None,
             memory: None,
@@ -297,6 +305,7 @@ impl RpcContext {
         Arc::new(Self {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             sessions,
             session_backend: None,
             memory: Some(memory),
@@ -324,6 +333,7 @@ impl RpcContext {
         Arc::new(Self {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             sessions,
             session_backend: None,
             memory: None,
@@ -352,6 +362,7 @@ impl RpcContext {
         Arc::new(Self {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             sessions,
             session_backend,
             memory: None,
@@ -380,6 +391,7 @@ impl RpcContext {
         Arc::new(Self {
             config: authority.config(),
             config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             sessions,
             session_backend: None,
             memory: None,
