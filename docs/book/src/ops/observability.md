@@ -7,7 +7,7 @@ the shape of the events, and how to query them.
 
 ## Desktop daemon capture
 
-The Desktop supervisor captures daemon stdout and stderr into one bounded file: `<config-dir>/logs/zeroclaw-desktop-daemon.log`. `<config-dir>` is resolved from `ZEROCLAW_CONFIG_DIR`, or the default home-directory layout when that variable is unset. The file is capped at 8 MiB; when output crosses the cap, the oldest bytes are compacted away and the newest tail is retained.
+The Desktop supervisor captures daemon stdout and stderr into one bounded file: `<config-dir>/logs/zeroclaw-desktop-daemon.log`. `<config-dir>` follows canonical config resolution precedence: `ZEROCLAW_CONFIG_DIR`, then `ZEROCLAW_DATA_DIR`, then deprecated `ZEROCLAW_WORKSPACE`, then Homebrew/default resolution. The file is capped at 8 MiB; when output crosses the cap, the oldest bytes are compacted away and the newest tail is retained.
 
 ## Config (`[observability]`)
 

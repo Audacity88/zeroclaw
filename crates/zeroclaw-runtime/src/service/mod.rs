@@ -668,16 +668,47 @@ async fn desktop_log_path() -> Result<PathBuf> {
         .join("logs/zeroclaw-desktop-daemon.log"))
 }
 
-fn emit_desktop_handshake(prefix: &str, message: Option<&str>) {
+fn desktop_handshake_frame(prefix: &str, message: Option<&str>) -> String {
     let mut line = prefix.to_string();
     if let Some(message) = message {
         line.push(' ');
-        line.push_str(&message.replace(['\r', '\n'], " "));
+        line.push_str(&message.replace("\r\n", " ").replace(['\r', '\n'], " "));
     }
+    line.push('\n');
+    line
+}
+
+fn desktop_error_frame(error: &anyhow::Error) -> String {
+    desktop_handshake_frame("ERROR", Some(&format!("{error:#}")))
+}
+
+fn emit_desktop_frame(frame: &str) {
     let mut stdout = std::io::stdout().lock();
-    let _ = std::io::Write::write_all(&mut stdout, line.as_bytes());
-    let _ = std::io::Write::write_all(&mut stdout, b"\n");
+    let _ = std::io::Write::write_all(&mut stdout, frame.as_bytes());
     let _ = std::io::Write::flush(&mut stdout);
+}
+
+fn emit_desktop_handshake(prefix: &str, message: Option<&str>) {
+    let line = desktop_handshake_frame(prefix, message);
+    emit_desktop_frame(&line);
+}
+
+fn emit_desktop_error(error: &anyhow::Error) {
+    let frame = desktop_error_frame(error);
+    emit_desktop_frame(&frame);
+}
+
+fn handle_desktop_preflight<T>(
+    result: Result<T>,
+    emit_error: impl FnOnce(&anyhow::Error),
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            emit_error(&error);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -992,9 +1023,11 @@ async fn supervise_launchd_child(
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub async fn run_desktop_daemon(port: u16) -> Result<()> {
-    let path = desktop_log_path().await?;
-    let executable =
-        std::env::current_exe().context("Failed to resolve the desktop daemon executable")?;
+    let path = handle_desktop_preflight(desktop_log_path().await, emit_desktop_error)?;
+    let executable = handle_desktop_preflight(
+        std::env::current_exe().context("Failed to resolve the desktop daemon executable"),
+        emit_desktop_error,
+    )?;
     run_desktop_capture_with_executable(path, executable, port).await
 }
 
@@ -3281,6 +3314,37 @@ mod bounded_service_log_tests {
         let stderr = fs::read_to_string(dir.path().join("logs/daemon.stderr.log"))
             .expect("read failure diagnostics");
         assert!(stderr.contains("daemon child exited with status"));
+    }
+
+    #[test]
+    fn desktop_pre_capture_failures_emit_once_and_preserve_the_error() {
+        let cases = [
+            (
+                anyhow::anyhow!("Failed to resolve desktop log path: config\r\npath"),
+                "ERROR Failed to resolve desktop log path: config path\n",
+            ),
+            (
+                anyhow::anyhow!(
+                    "Failed to resolve the desktop daemon executable: executable\npath"
+                ),
+                "ERROR Failed to resolve the desktop daemon executable: executable path\n",
+            ),
+        ];
+
+        for (error, expected_frame) in cases {
+            let expected_error = format!("{error:#}");
+            let mut frames = Vec::new();
+            let returned = handle_desktop_preflight::<()>(Err(error), |error| {
+                frames.push(desktop_error_frame(error));
+            })
+            .expect_err("pre-capture failure should be preserved");
+            assert_eq!(format!("{returned:#}"), expected_error);
+            assert_eq!(frames.len(), 1);
+            let frame = &frames[0];
+            assert_eq!(frame, expected_frame);
+            assert_eq!(frame.matches('\n').count(), 1);
+            assert!(!frame[..frame.len() - 1].contains('\r'));
+        }
     }
 
     #[tokio::test]

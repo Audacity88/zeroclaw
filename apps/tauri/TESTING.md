@@ -32,7 +32,7 @@ On launch:
 > `503 "no daemon supervisor — running as standalone gateway"`, so the new agent
 > won't go live until the process is restarted. The daemon hot-reloads instead.
 
-The desktop supervisor writes combined daemon stdout and stderr to `<config-dir>/logs/zeroclaw-desktop-daemon.log`, where `<config-dir>` follows `ZEROCLAW_CONFIG_DIR` and otherwise the default home-directory layout. The capture is capped at 8 MiB and retains the newest tail when the cap is crossed.
+The desktop supervisor writes combined daemon stdout and stderr to `<config-dir>/logs/zeroclaw-desktop-daemon.log`, where `<config-dir>` follows canonical config resolution precedence: `ZEROCLAW_CONFIG_DIR`, then `ZEROCLAW_DATA_DIR`, then deprecated `ZEROCLAW_WORKSPACE`, then Homebrew/default resolution. The capture is capped at 8 MiB and retains the newest tail when the cap is crossed.
 
 ## Self-contained build (bundled kernel)
 
