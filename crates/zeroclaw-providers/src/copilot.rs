@@ -6,9 +6,9 @@ use crate::traits::{
 };
 use async_trait::async_trait;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir, File, OpenOptions};
 #[cfg(unix)]
 use cap_std::fs::Permissions;
+use cap_std::fs::{Dir, File, OpenOptions};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -622,8 +622,7 @@ impl CopilotModelProvider {
 }
 
 fn project_cache_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "zeroclaw")
-        .map(|dir| dir.config_dir().join("copilot"))
+    directories::ProjectDirs::from("", "", "zeroclaw").map(|dir| dir.config_dir().join("copilot"))
 }
 
 fn cache_dir_from_location(path: Option<PathBuf>) -> Option<Arc<Dir>> {
@@ -747,9 +746,8 @@ impl Drop for TempCacheFileGuard {
 fn write_cache_file_sync(dir: &Arc<Dir>, final_name: &str, content: &str) -> io::Result<()> {
     ensure_final_cache_entry(dir, final_name)?;
 
-    let (mut file, temp_name) = create_temp_cache_file_with(dir, final_name, |name| {
-        temp_cache_name(name)
-    })?;
+    let (mut file, temp_name) =
+        create_temp_cache_file_with(dir, final_name, |name| temp_cache_name(name))?;
     let mut guard = TempCacheFileGuard {
         dir: Arc::clone(dir),
         name: Some(temp_name.clone()),
@@ -1065,9 +1063,7 @@ mod tests {
 
         assert!(write_file_secure(&cache_dir, "access-token", "gho_round_trip").await);
         assert_eq!(
-            read_cache_file(&cache_dir, "access-token")
-                .await
-                .as_deref(),
+            read_cache_file(&cache_dir, "access-token").await.as_deref(),
             Some("gho_round_trip")
         );
 
@@ -1083,8 +1079,13 @@ mod tests {
         assert_eq!(loaded.token, info.token);
         assert_eq!(loaded.expires_at, info.expires_at);
         assert_eq!(
-            loaded.endpoints.as_ref().and_then(|endpoints| endpoints.api.as_deref()),
-            info.endpoints.as_ref().and_then(|endpoints| endpoints.api.as_deref())
+            loaded
+                .endpoints
+                .as_ref()
+                .and_then(|endpoints| endpoints.api.as_deref()),
+            info.endpoints
+                .as_ref()
+                .and_then(|endpoints| endpoints.api.as_deref())
         );
     }
 
@@ -1162,9 +1163,7 @@ mod tests {
 
         assert!(write_file_secure(&cache_dir, "api-key.json", "retained-content").await);
         assert_eq!(
-            read_cache_file(&cache_dir, "api-key.json")
-                .await
-                .as_deref(),
+            read_cache_file(&cache_dir, "api-key.json").await.as_deref(),
             Some("retained-content")
         );
         assert_eq!(
@@ -1200,9 +1199,7 @@ mod tests {
         assert!(write_file_secure(&cache_dir, "api-key.json", "old-complete-content").await);
         assert!(write_file_secure(&cache_dir, "api-key.json", "new-complete-content").await);
         assert_eq!(
-            read_cache_file(&cache_dir, "api-key.json")
-                .await
-                .as_deref(),
+            read_cache_file(&cache_dir, "api-key.json").await.as_deref(),
             Some("new-complete-content")
         );
     }
@@ -1212,18 +1209,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = admit_cache_dir(&temp.path().join("copilot")).unwrap();
         let foreign_name = ".api-key.json.tmp-foreign";
-        cache_dir
-            .write(foreign_name, "foreign-content")
-            .unwrap();
+        cache_dir.write(foreign_name, "foreign-content").unwrap();
 
-        let result = create_temp_cache_file_with(&cache_dir, "api-key.json", |_| {
-            foreign_name.to_string()
-        });
+        let result =
+            create_temp_cache_file_with(&cache_dir, "api-key.json", |_| foreign_name.to_string());
         match result {
             Err(error) => assert_eq!(error.kind(), io::ErrorKind::AlreadyExists),
             Ok(_) => panic!("foreign temporary entry was unexpectedly replaced"),
         }
-        assert_eq!(cache_dir.read_to_string(foreign_name).unwrap(), "foreign-content");
+        assert_eq!(
+            cache_dir.read_to_string(foreign_name).unwrap(),
+            "foreign-content"
+        );
     }
 
     #[test]
@@ -1247,6 +1244,9 @@ mod tests {
             assert!(injected_failure.is_err());
         }
         assert!(cache_dir.symlink_metadata(&owned_name).is_err());
-        assert_eq!(cache_dir.read_to_string(foreign_name).unwrap(), "foreign-content");
+        assert_eq!(
+            cache_dir.read_to_string(foreign_name).unwrap(),
+            "foreign-content"
+        );
     }
 }
