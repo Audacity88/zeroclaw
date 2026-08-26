@@ -5,6 +5,8 @@ use crate::traits::{
     ModelProvider, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsSyncExt;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 #[cfg(unix)]
 use cap_std::fs::Permissions;
@@ -682,6 +684,8 @@ fn ensure_final_cache_entry(dir: &Dir, name: &str) -> io::Result<()> {
 fn read_cache_file_sync(dir: &Dir, name: &str) -> io::Result<String> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.nonblock(true);
     let mut file = dir.open_with(name, &options)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
@@ -1225,6 +1229,32 @@ mod tests {
             read_cache_file(&cache_dir, "api-key.json").await.as_deref(),
             Some(new_content)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_cache_file_read_fails_without_blocking() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_path = temp.path().join("copilot");
+        let cache_dir = admit_cache_dir(&cache_path).unwrap();
+        let fifo_path = cache_path.join("api-key.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo should be available on unix test hosts");
+        assert!(status.success(), "mkfifo failed");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(read_cache_file_sync(&cache_dir, "api-key.json"))
+                .unwrap();
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reading a FIFO cache entry must return promptly");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        worker.join().unwrap();
     }
 
     #[test]
