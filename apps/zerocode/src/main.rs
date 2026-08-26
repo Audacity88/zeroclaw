@@ -94,6 +94,7 @@ struct Cli {
 }
 
 /// Where zerocode should connect.
+#[derive(Clone)]
 pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
     Wss { url: String, skip_verify: bool },

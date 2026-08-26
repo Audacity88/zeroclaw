@@ -29,6 +29,66 @@ use crate::sop_pane;
 use crate::theme;
 use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
 
+/// The single in-flight reconnect operation owned by the app loop.
+///
+/// Reconnect work must not block the event loop. The handle is only awaited
+/// after Tokio reports it finished, and dropping an unfinished attempt aborts
+/// its transport task.
+struct ReconnectAttempt<T = RpcClient> {
+    handle: Option<tokio::task::JoinHandle<Result<T>>>,
+}
+
+impl<T> ReconnectAttempt<T> {
+    fn from_handle(handle: tokio::task::JoinHandle<Result<T>>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    async fn try_take(&mut self) -> Option<Result<T>> {
+        if !self.is_finished() {
+            return None;
+        }
+        let handle = self.handle.take()?;
+        Some(match handle.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::Error::msg(format!(
+                "reconnect task failed: {error}"
+            ))),
+        })
+    }
+}
+
+impl ReconnectAttempt<RpcClient> {
+    fn start(
+        target: crate::ConnectTarget,
+        prev_id: Option<String>,
+        prev_sig: Option<String>,
+    ) -> Self {
+        Self::from_handle(tokio::spawn(async move {
+            target
+                .connect(prev_id.as_deref(), prev_sig.as_deref())
+                .await
+        }))
+    }
+}
+
+impl<T> Drop for ReconnectAttempt<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && !handle.is_finished()
+        {
+            handle.abort();
+        }
+    }
+}
+
 /// Pending Quickstart chat transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingQuickstartChat {
@@ -395,6 +455,7 @@ pub async fn run(
     let mut mode_bar_layout = ModeBarLayout::default();
     let mut content_area = Rect::default();
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
+    let mut reconnect_attempt = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
 
@@ -631,16 +692,23 @@ pub async fn run(
                 let due = reconnect_last_attempt
                     .map(|t| now.duration_since(t) >= Duration::from_secs(1))
                     .unwrap_or(true);
-                if due {
+                if reconnect_attempt.is_none() && due {
                     reconnect_last_attempt = Some(now);
                     // Reclaim the same TUI identity so the daemon restores
                     // our UID via HMAC signature verification.
                     let prev_id = rpc.tui_id().map(String::from);
                     let prev_sig = rpc.tui_sig().map(String::from);
-                    if let Ok(new_client) = target
-                        .connect(prev_id.as_deref(), prev_sig.as_deref())
-                        .await
-                    {
+                    reconnect_attempt =
+                        Some(ReconnectAttempt::start(target.clone(), prev_id, prev_sig));
+                }
+
+                let reconnect_result = match reconnect_attempt.as_mut() {
+                    Some(attempt) => attempt.try_take().await,
+                    None => None,
+                };
+                if let Some(result) = reconnect_result {
+                    reconnect_attempt = None;
+                    if let Ok(new_client) = result {
                         rpc = Arc::new(new_client);
                         let resume_chat = (
                             chat_pane.current_session_id().map(String::from),
@@ -766,7 +834,12 @@ pub async fn run(
                     Mode::Acp => acp_pane.wants_quit_chord(),
                     _ => false,
                 };
-                if global == Some(GlobalAction::Quit) && !pane_wants_quit_chord {
+                if global == Some(GlobalAction::Quit)
+                    && should_handle_global_quit_at_dispatch(
+                        || rpc.connection_state(),
+                        pane_wants_quit_chord,
+                    )
+                {
                     // First Ctrl+C: clear input bar text, clear transient
                     // state (browse mode, overlay, …) and arm the confirm modal.
                     match mode {
@@ -1076,6 +1149,17 @@ fn pane_switch_delta(
         Some(GlobalAction::PaneNavRight) => Some(1),
         _ => None,
     }
+}
+
+fn should_handle_global_quit(conn_state: &ConnectionState, pane_wants_quit_chord: bool) -> bool {
+    !pane_wants_quit_chord || matches!(conn_state, ConnectionState::Disconnected { .. })
+}
+
+fn should_handle_global_quit_at_dispatch(
+    read_connection_state: impl FnOnce() -> ConnectionState,
+    pane_wants_quit_chord: bool,
+) -> bool {
+    should_handle_global_quit(&read_connection_state(), pane_wants_quit_chord)
 }
 
 fn resolve_agent_overrides(
@@ -2161,6 +2245,140 @@ mod tests {
             pane_switch_delta(Some(GlobalAction::PaneNavRight), true, false),
             Some(1)
         );
+    }
+
+    #[test]
+    fn connected_chat_or_acp_quit_chord_stays_with_the_pane() {
+        assert!(!should_handle_global_quit(
+            &ConnectionState::Connected,
+            true
+        ));
+        assert!(should_handle_global_quit(
+            &ConnectionState::Connected,
+            false
+        ));
+    }
+
+    #[test]
+    fn disconnected_chat_or_acp_quit_chord_uses_global_quit_confirm() {
+        assert!(should_handle_global_quit(
+            &ConnectionState::Disconnected {
+                reason: "test".into()
+            },
+            true
+        ));
+        assert!(should_handle_global_quit(
+            &ConnectionState::Disconnected {
+                reason: "test".into()
+            },
+            false
+        ));
+    }
+
+    #[test]
+    fn disconnected_dispatch_state_overrides_connected_frame_snapshot() {
+        let live_state = std::cell::RefCell::new(ConnectionState::Connected);
+        let frame_state = live_state.borrow().clone();
+        *live_state.borrow_mut() = ConnectionState::Disconnected {
+            reason: "disconnected while waiting for input".into(),
+        };
+
+        assert!(matches!(frame_state, ConnectionState::Connected));
+        assert!(should_handle_global_quit_at_dispatch(
+            || live_state.borrow().clone(),
+            true,
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_attempt_does_not_await_unfinished_work() {
+        let (_release, wait) = tokio::sync::oneshot::channel::<()>();
+        let mut attempt = ReconnectAttempt::<u8>::from_handle(tokio::spawn(async move {
+            let _ = wait.await;
+            Ok(7)
+        }));
+
+        assert!(!attempt.is_finished());
+        assert!(attempt.try_take().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconnect_attempt_consumes_completed_success_and_failure_once() {
+        let mut success =
+            ReconnectAttempt::<u8>::from_handle(tokio::spawn(async { Ok::<u8, anyhow::Error>(7) }));
+        while !success.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let value = success
+            .try_take()
+            .await
+            .expect("completed attempt")
+            .expect("successful attempt");
+        assert_eq!(value, 7);
+        assert!(success.try_take().await.is_none());
+
+        let mut failure = ReconnectAttempt::<u8>::from_handle(tokio::spawn(async {
+            Err::<u8, anyhow::Error>(anyhow::Error::msg("connect failed"))
+        }));
+        while !failure.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let error = failure
+            .try_take()
+            .await
+            .expect("completed attempt")
+            .expect_err("failed attempt");
+        assert_eq!(error.to_string(), "connect failed");
+        assert!(failure.try_take().await.is_none());
+
+        let task = tokio::spawn(async { std::future::pending::<Result<u8>>().await });
+        task.abort();
+        let mut join_failure = ReconnectAttempt::<u8>::from_handle(task);
+        while !join_failure.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let error = join_failure
+            .try_take()
+            .await
+            .expect("completed attempt")
+            .expect_err("aborted attempt");
+        assert!(error.to_string().contains("reconnect task failed:"));
+        assert!(join_failure.try_take().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_reconnect_attempt_aborts_unfinished_work() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _probe = probe;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok::<(), anyhow::Error>(())
+        });
+        let attempt = ReconnectAttempt::<()>::from_handle(task);
+        started_rx.await.expect("reconnect task should start");
+        drop(attempt);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted reconnect task should drop its state");
     }
 
     #[test]
