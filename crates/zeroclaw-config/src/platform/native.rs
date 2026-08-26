@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use zeroclaw_api::platform::is_android;
@@ -73,7 +74,7 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 /// `-Command` consumes the final argument as script text. Ordinary `arg`
 /// handling keeps the entire script in one process argument and preserves its
 /// internal PowerShell quoting.
-fn tokio_powershell_command(interpreter: &str, command: &str) -> tokio::process::Command {
+fn tokio_powershell_command(interpreter: &OsStr, command: &str) -> tokio::process::Command {
     let mut process = tokio::process::Command::new(interpreter);
     process
         .arg("-NoProfile")
@@ -88,7 +89,7 @@ pub fn windows_tokio_powershell_command(
     interpreter: &str,
     command: &str,
 ) -> tokio::process::Command {
-    let mut process = tokio_powershell_command(interpreter, command);
+    let mut process = tokio_powershell_command(OsStr::new(interpreter), command);
     process.creation_flags(CREATE_NO_WINDOW);
     process
 }
@@ -228,15 +229,22 @@ impl RuntimeAdapter for NativeRuntime {
             // on PATH for spawned processes; use the absolute path when present
             // so the shell can launch (and reach platform tools).
             // User-configured shell is ignored on Android.
-            let shell = if is_android() {
+            let configured_shell = if is_android() {
                 "/system/bin/sh"
             } else {
                 &self.shell
             };
+            let shell = crate::platform::resolve_executable(std::ffi::OsStr::new(configured_shell))
+                .map_err(|error| {
+                    let detail = error.to_string();
+                    anyhow::Error::new(error).context(format!(
+                        "native runtime shell {configured_shell:?} could not be resolved before setting workspace directory: {detail}"
+                    ))
+                })?;
             let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
-                tokio_powershell_command(shell, command)
+                tokio_powershell_command(shell.as_os_str(), command)
             } else {
-                let mut process = tokio::process::Command::new(shell);
+                let mut process = tokio::process::Command::new(&shell);
                 process.arg("-c").arg(command);
                 process
             };
@@ -394,15 +402,24 @@ mod tests {
     #[cfg(all(unix, not(target_os = "android")))]
     fn unix_powershell_shell_uses_safe_invocation_args() {
         use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt;
 
         let script = r#"Write-Output "quoted safe value" | Select-Object -First 1"#;
         let cwd = std::env::temp_dir();
-        let command = NativeRuntime::with_shell("pwsh".into())
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("pwsh");
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = NativeRuntime::with_shell(launcher.to_string_lossy().into_owned())
             .build_shell_command(script, &cwd)
             .unwrap();
         let command = command.as_std();
 
-        assert_eq!(command.get_program(), OsStr::new("pwsh"));
+        assert_eq!(
+            command.get_program(),
+            launcher.canonicalize().unwrap().as_os_str(),
+            "Unix PowerShell launcher should use the canonical configured path"
+        );
         let args: Vec<_> = command.get_args().collect();
         let expected = [
             OsStr::new("-NoProfile"),
@@ -599,9 +616,10 @@ mod tests {
         let runtime = NativeRuntime::new();
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        assert!(
-            format!("{cmd:?}").contains("\"sh\""),
-            "default shell should be 'sh', got: {cmd:?}"
+        assert_eq!(
+            std::path::Path::new(cmd.as_std().get_program()).file_name(),
+            Some(std::ffi::OsStr::new("sh")),
+            "default shell should resolve to an executable named 'sh'"
         );
     }
 
@@ -611,21 +629,24 @@ mod tests {
         let runtime = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        assert!(
-            format!("{cmd:?}").contains("\"bash\""),
-            "configured shell should appear in command debug, got: {cmd:?}"
+        assert_eq!(
+            std::path::Path::new(cmd.as_std().get_program()).file_name(),
+            Some(std::ffi::OsStr::new("bash")),
+            "configured shell should resolve to an executable named 'bash'"
         );
     }
 
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn native_with_shell_absolute_path() {
-        let runtime = NativeRuntime::with_shell("/usr/bin/zsh".into());
+        let configured = std::path::Path::new("/bin/sh");
+        let runtime = NativeRuntime::with_shell(configured.to_string_lossy().into_owned());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        assert!(
-            format!("{cmd:?}").contains("/usr/bin/zsh"),
-            "absolute path should appear verbatim, got: {cmd:?}"
+        assert_eq!(
+            cmd.as_std().get_program(),
+            configured.canonicalize().unwrap().as_os_str(),
+            "absolute path should be canonicalized before command construction"
         );
     }
 
