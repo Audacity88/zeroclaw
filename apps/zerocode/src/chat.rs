@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -14,7 +17,7 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::attachment::{PendingAttachment, build_attachments_json, cleanup_attachment_temps};
 use crate::client::{
@@ -134,6 +137,8 @@ pub(crate) struct Chat {
     /// answered `cancel`, unblocking the daemon's tool call). See
     /// `drain_inbound_requests` / `try_install_elicitation`.
     deferred_elicitations: Vec<DeferredInboundRequest>,
+    /// Owns the Chat-only entry retry so leaving the pane invalidates its result.
+    entry_retry_attempt: Option<EntryRetryAttempt>,
 }
 
 const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
@@ -175,6 +180,94 @@ struct ModelFetchResult {
     current: Option<String>,
 }
 
+struct ChatEntryRetryResult {
+    phase: ChatPhase,
+    resume_session_id: Option<String>,
+    resume_agent_alias: Option<String>,
+}
+
+const ENTRY_RETRY_PRE_SESSION: u8 = 0;
+const ENTRY_RETRY_SESSION_CREATION: u8 = 1;
+const ENTRY_RETRY_CANCELLED: u8 = 2;
+
+struct EntryRetryAttempt {
+    result_rx: oneshot::Receiver<ChatEntryRetryResult>,
+    worker: tokio::task::JoinHandle<()>,
+    cancelled: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
+    rpc: Arc<RpcClient>,
+}
+
+impl EntryRetryAttempt {
+    fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+}
+
+impl Drop for EntryRetryAttempt {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        // Before session/new, aborting drops the in-flight RPC future and its
+        // pending-map guard. Once session/new may have started, let the worker
+        // finish cooperatively so a late-created session can be closed. The
+        // phase CAS makes this ownership decision exclusive with the worker's
+        // session/new claim.
+        if claim_entry_retry_cancellation(&self.phase) {
+            self.worker.abort();
+        }
+        if let Ok(result) = self.result_rx.try_recv()
+            && let Some(session_id) = active_session_id(&result.phase)
+        {
+            spawn_close_session(Arc::clone(&self.rpc), session_id);
+        }
+    }
+}
+
+fn claim_entry_retry_session_creation(phase: &AtomicU8) -> bool {
+    phase
+        .compare_exchange(
+            ENTRY_RETRY_PRE_SESSION,
+            ENTRY_RETRY_SESSION_CREATION,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn claim_entry_retry_cancellation(phase: &AtomicU8) -> bool {
+    phase
+        .compare_exchange(
+            ENTRY_RETRY_PRE_SESSION,
+            ENTRY_RETRY_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn active_session_id(phase: &ChatPhase) -> Option<String> {
+    match phase {
+        ChatPhase::Active(state) => Some(state.session_id.clone()),
+        _ => None,
+    }
+}
+
+fn spawn_close_session(rpc: Arc<RpcClient>, session_id: String) {
+    tokio::spawn(async move {
+        let _ = rpc.session_close(&session_id).await;
+    });
+}
+
+async fn close_active_session(rpc: &RpcClient, phase: &ChatPhase) {
+    if let Some(session_id) = active_session_id(phase) {
+        let _ = rpc.session_close(&session_id).await;
+    }
+}
+
+fn is_cancelled(cancellation: Option<&Arc<AtomicBool>>) -> bool {
+    cancellation.is_some_and(|flag| flag.load(Ordering::Acquire))
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -206,6 +299,16 @@ impl Chat {
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
             help_requested: false,
             deferred_elicitations: Vec::new(),
+            entry_retry_attempt: None,
+        }
+    }
+
+    fn selected_agent_alias(&self) -> Option<String> {
+        match &self.phase {
+            ChatPhase::PickAgent {
+                agents, list_state, ..
+            } => list_state.selected().and_then(|i| agents.get(i)).cloned(),
+            _ => None,
         }
     }
 
@@ -244,6 +347,17 @@ impl Chat {
     /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
     /// show the CWD picker first on WSS ACP connections).
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
+        self.init_with_cancel(None, None).await
+    }
+
+    async fn init_with_cancel(
+        &mut self,
+        cancellation: Option<&Arc<AtomicBool>>,
+        phase: Option<&Arc<AtomicU8>>,
+    ) -> anyhow::Result<()> {
+        if is_cancelled(cancellation) {
+            return Ok(());
+        }
         let agents = match self.rpc.agents_status().await {
             Ok(result) => result
                 .agents
@@ -252,13 +366,19 @@ impl Chat {
                 .map(|a| a.alias)
                 .collect::<Vec<_>>(),
             Err(e) => {
-                self.phase = ChatPhase::Error(crate::i18n::t_args(
-                    "zc-chat-error-fetch-agents",
-                    &[("error", &e.to_string())],
-                ));
+                if !is_cancelled(cancellation) {
+                    self.phase = ChatPhase::Error(crate::i18n::t_args(
+                        "zc-chat-error-fetch-agents",
+                        &[("error", &e.to_string())],
+                    ));
+                }
                 return Ok(());
             }
         };
+
+        if is_cancelled(cancellation) {
+            return Ok(());
+        }
 
         if agents.is_empty() {
             self.phase = ChatPhase::Error(crate::i18n::t("zc-chat-no-agents"));
@@ -273,7 +393,8 @@ impl Chat {
             && self.resume_session_id.is_some()
         {
             if agents.iter().any(|a| a == &prior) {
-                self.pick_or_start_session(&prior).await;
+                self.pick_or_start_session_inner(&prior, cancellation, phase)
+                    .await;
                 return Ok(());
             }
             self.resume_session_id = None;
@@ -281,13 +402,15 @@ impl Chat {
 
         if agents.len() == 1 {
             if self.resume_session_id.is_some() {
-                self.pick_or_start_session(&agents[0]).await;
+                self.pick_or_start_session_inner(&agents[0], cancellation, phase)
+                    .await;
                 return Ok(());
             }
             if self.try_show_recent_acp_session_picker(&agents).await {
                 return Ok(());
             }
-            self.pick_or_start_session(&agents[0]).await;
+            self.pick_or_start_session_inner(&agents[0], cancellation, phase)
+                .await;
             return Ok(());
         }
 
@@ -381,11 +504,26 @@ impl Chat {
     /// Decide whether to show the CWD picker (WSS ACP) or start the session
     /// immediately (Unix, or non-ACP pane).
     async fn pick_or_start_session(&mut self, agent_alias: &str) {
+        self.cancel_entry_retry();
+        self.pick_or_start_session_inner(agent_alias, None, None)
+            .await;
+    }
+
+    async fn pick_or_start_session_inner(
+        &mut self,
+        agent_alias: &str,
+        cancellation: Option<&Arc<AtomicBool>>,
+        phase: Option<&Arc<AtomicU8>>,
+    ) {
+        if is_cancelled(cancellation) {
+            return;
+        }
         // A carried resume id means we are reattaching a daemon-retained session
         // across a reconnect: it already has a cwd, so skip the picker and
         // resume directly instead of forcing the user to re-pick a directory.
         if self.resume_session_id.is_some() {
-            self.start_session(agent_alias, None).await;
+            self.start_session_with_cancel(agent_alias, None, cancellation, phase)
+                .await;
             return;
         }
         if self.pane_kind == PaneKind::Acp && self.rpc.transport() == crate::client::Transport::Wss
@@ -400,7 +538,8 @@ impl Chat {
                 ),
             };
         } else {
-            self.start_session(agent_alias, None).await;
+            self.start_session_with_cancel(agent_alias, None, cancellation, phase)
+                .await;
         }
     }
 
@@ -411,9 +550,108 @@ impl Chat {
         self.pick_or_start_session(agent_alias).await;
     }
 
+    fn cancel_entry_retry(&mut self) {
+        self.entry_retry_attempt.take();
+    }
+
+    pub(crate) fn on_pane_blur(&mut self) {
+        self.cancel_entry_retry();
+    }
+
     pub(crate) async fn refresh_if_inactive(&mut self) {
         if should_retry_on_entry(&self.phase) {
             let _ = self.init().await;
+        }
+    }
+
+    /// Start a non-blocking Chat-pane retry when entering Chat. ACP keeps using
+    /// `refresh_if_inactive` because its session-list semantics are distinct.
+    pub(crate) fn start_entry_retry(&mut self) {
+        if self.pane_kind != PaneKind::Chat {
+            return;
+        }
+        if self.entry_retry_attempt.is_some() || !should_retry_on_entry(&self.phase) {
+            return;
+        }
+
+        let rpc = Arc::clone(&self.rpc);
+        let resume_session_id = self.resume_session_id.clone();
+        let resume_agent_alias = self.resume_agent_alias.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let phase = Arc::new(AtomicU8::new(ENTRY_RETRY_PRE_SESSION));
+        let worker_phase = Arc::clone(&phase);
+        let (result_tx, result_rx) = oneshot::channel();
+        self.entry_retry_attempt = Some(EntryRetryAttempt {
+            result_rx,
+            worker: tokio::spawn(async move {
+                let mut retry = Chat::new(rpc, PaneKind::Chat);
+                retry.set_resume_session_id(resume_session_id);
+                retry.set_resume_agent_alias(resume_agent_alias);
+                let _ = retry
+                    .init_with_cancel(Some(&worker_cancelled), Some(&worker_phase))
+                    .await;
+                let result = ChatEntryRetryResult {
+                    phase: retry.phase,
+                    resume_session_id: retry.resume_session_id,
+                    resume_agent_alias: retry.resume_agent_alias,
+                };
+                if worker_cancelled.load(Ordering::Acquire) {
+                    close_active_session(&retry.rpc, &result.phase).await;
+                    return;
+                }
+                if let Err(result) = result_tx.send(result) {
+                    close_active_session(&retry.rpc, &result.phase).await;
+                }
+            }),
+            cancelled,
+            phase,
+            rpc: Arc::clone(&self.rpc),
+        });
+    }
+
+    fn drain_entry_retry_results(&mut self) {
+        let Some(mut attempt) = self.entry_retry_attempt.take() else {
+            return;
+        };
+        match attempt.result_rx.try_recv() {
+            Ok(result) => {
+                let cancelled = attempt.cancelled.load(Ordering::Acquire);
+                drop(attempt);
+                if cancelled || !should_retry_on_entry(&self.phase) {
+                    if let Some(session_id) = active_session_id(&result.phase) {
+                        spawn_close_session(Arc::clone(&self.rpc), session_id);
+                    }
+                    return;
+                }
+
+                if matches!(result.phase, ChatPhase::Error(_)) {
+                    if matches!(self.phase, ChatPhase::Error(_)) {
+                        self.phase = result.phase;
+                    }
+                    return;
+                }
+
+                let prior_alias = self.selected_agent_alias();
+                let mut phase = result.phase;
+                if let ChatPhase::PickAgent {
+                    agents, list_state, ..
+                } = &mut phase
+                    && let Some(alias) = prior_alias
+                    && let Some(index) = agents.iter().position(|agent| agent == &alias)
+                {
+                    list_state.select(Some(index));
+                }
+                self.resume_session_id = result.resume_session_id;
+                self.resume_agent_alias = result.resume_agent_alias;
+                self.phase = phase;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                if !attempt.is_finished() {
+                    self.entry_retry_attempt = Some(attempt);
+                }
+            }
+            Err(oneshot::error::TryRecvError::Closed) => drop(attempt),
         }
     }
 
@@ -442,6 +680,20 @@ impl Chat {
     }
 
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
+        self.start_session_with_cancel(agent_alias, cwd_override, None, None)
+            .await;
+    }
+
+    async fn start_session_with_cancel(
+        &mut self,
+        agent_alias: &str,
+        cwd_override: Option<&str>,
+        cancellation: Option<&Arc<AtomicBool>>,
+        phase: Option<&Arc<AtomicU8>>,
+    ) {
+        if is_cancelled(cancellation) {
+            return;
+        }
         // TodoWrite display is a ZeroCode UI concern owned by
         // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
         // — so read it from the local config file (honoring `--config-dir` /
@@ -472,6 +724,17 @@ impl Chat {
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
         };
+        if is_cancelled(cancellation) {
+            return;
+        }
+        if let Some(phase) = phase
+            && !claim_entry_retry_session_creation(phase)
+        {
+            return;
+        }
+        if is_cancelled(cancellation) {
+            return;
+        }
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
                 .session_new_acp(agent_alias, cwd_str.as_deref(), resume.as_deref())
@@ -483,6 +746,10 @@ impl Chat {
         };
         match result {
             Ok(session) => {
+                if is_cancelled(cancellation) {
+                    let _ = self.rpc.session_close(&session.session_id).await;
+                    return;
+                }
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
                 // `todo_settings` is resolved fresh at this boundary from
                 // `zerocode-config.toml` (the canonical owner); the removed
@@ -494,7 +761,15 @@ impl Chat {
                     self.rpc.commands(),
                 );
                 state.cwd = session.workspace_dir;
+                if is_cancelled(cancellation) {
+                    let _ = self.rpc.session_close(&state.session_id).await;
+                    return;
+                }
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
+                if is_cancelled(cancellation) {
+                    let _ = self.rpc.session_close(&state.session_id).await;
+                    return;
+                }
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
                 // empty history. Fresh sessions have nothing to load.
@@ -502,6 +777,10 @@ impl Chat {
                     && let Ok(msgs) = self.rpc.session_messages(&sid).await
                 {
                     state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
+                }
+                if is_cancelled(cancellation) {
+                    let _ = self.rpc.session_close(&state.session_id).await;
+                    return;
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
             }
@@ -1039,6 +1318,7 @@ impl Chat {
     // ── Drawing ──────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        self.drain_entry_retry_results();
         self.drain_notifications();
         self.drain_inbound_requests();
         self.settle_stuck_cancel();
@@ -10944,6 +11224,286 @@ mod tests {
         );
         // ...and the prior highlight ("beta", row 1) is preserved.
         assert_eq!(list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn entry_retry_phase_claims_exclusive_boundary_ownership() {
+        let phase = AtomicU8::new(ENTRY_RETRY_PRE_SESSION);
+        assert!(claim_entry_retry_session_creation(&phase));
+        assert!(!claim_entry_retry_cancellation(&phase));
+        assert_eq!(
+            phase.load(Ordering::Acquire),
+            ENTRY_RETRY_SESSION_CREATION,
+            "worker ownership must prevent cancellation from aborting session/new"
+        );
+
+        let phase = AtomicU8::new(ENTRY_RETRY_PRE_SESSION);
+        assert!(claim_entry_retry_cancellation(&phase));
+        assert!(!claim_entry_retry_session_creation(&phase));
+        assert_eq!(
+            phase.load(Ordering::Acquire),
+            ENTRY_RETRY_CANCELLED,
+            "cancellation ownership must prevent session/new from starting"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_entry_retry_starts_once_until_result_is_drained() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Error("try again".to_string());
+
+        chat.start_entry_retry();
+        chat.start_entry_retry();
+
+        let request = next_rpc_request(&mut rx, "entry retry should request agents").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "repeated Chat entry must not start a second request"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_chat_aborts_unresolved_pre_session_entry_retry() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Error("try again".to_string());
+
+        chat.start_entry_retry();
+        let _request = next_rpc_request(&mut rx, "entry retry should request agents").await;
+        assert_eq!(rpc.pending_count(), 1);
+
+        drop(chat);
+        for _ in 0..16 {
+            if rpc.pending_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            rpc.pending_count(),
+            0,
+            "dropping Chat must drop an unresolved pre-session retry RPC"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "cancelling pre-session retry must not continue into session creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_entry_retry_applies_picker_and_preserves_selection() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut list_state = ListState::default();
+        list_state.select(Some(1));
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["alpha".to_string(), "beta".to_string()],
+            list_state,
+            loading: false,
+        };
+
+        chat.start_entry_retry();
+        let request = next_rpc_request(&mut rx, "entry retry should request agents").await;
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true},
+                    {"alias": "beta", "enabled": true},
+                    {"alias": "gamma", "enabled": true}
+                ]
+            }),
+        );
+
+        for _ in 0..32 {
+            chat.drain_entry_retry_results();
+            if matches!(
+                &chat.phase,
+                ChatPhase::PickAgent {
+                    agents,
+                    loading: false,
+                    list_state,
+                } if agents.len() == 3 && list_state.selected() == Some(1)
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("Chat entry retry result was not applied");
+    }
+
+    #[tokio::test]
+    async fn cancelling_entry_retry_during_session_creation_closes_new_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Error("try again".to_string());
+
+        chat.start_entry_retry();
+        let request = next_rpc_request(&mut rx, "entry retry should request agents").await;
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [{"alias": "alpha", "enabled": true}]
+            }),
+        );
+        let request = next_rpc_request(&mut rx, "entry retry should create a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+
+        chat.cancel_entry_retry();
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-stale",
+                "workspace_dir": "/tmp/stale"
+            }),
+        );
+        let close = next_rpc_request(&mut rx, "cancelled retry should close its session").await;
+        assert_eq!(close["method"], method::SESSION_CLOSE);
+        assert_eq!(close["params"]["session_id"], "sess-stale");
+        respond_ok(&rpc, &close, serde_json::json!({}));
+
+        for _ in 0..16 {
+            if rpc.pending_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rpc.pending_count(), 0);
+        assert!(matches!(chat.phase, ChatPhase::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn failed_resumed_entry_retry_preserves_live_resume_state() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Error("resume failed".to_string());
+        chat.resume_session_id = Some("sess-resume".to_string());
+        chat.resume_agent_alias = Some("alpha".to_string());
+
+        chat.start_entry_retry();
+        let request = next_rpc_request(&mut rx, "entry retry should request agents").await;
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [{"alias": "alpha", "enabled": true}]
+            }),
+        );
+        let request = next_rpc_request(&mut rx, "entry retry should resume a session").await;
+        assert_eq!(request["params"]["session_id"], "sess-resume");
+        respond_err(&rpc, &request, -32000, "resume rejected");
+
+        for _ in 0..32 {
+            chat.drain_entry_retry_results();
+            if chat.entry_retry_attempt.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(chat.phase, ChatPhase::Error(_)));
+        assert_eq!(chat.resume_session_id.as_deref(), Some("sess-resume"));
+        assert_eq!(chat.resume_agent_alias.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn agents_status_failure_keeps_picker_selection() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut list_state = ListState::default();
+        list_state.select(Some(1));
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["alpha".to_string(), "beta".to_string()],
+            list_state,
+            loading: false,
+        };
+
+        chat.start_entry_retry();
+        let request = next_rpc_request(&mut rx, "entry retry should request agents").await;
+        respond_err(&rpc, &request, -32000, "agents unavailable");
+
+        for _ in 0..32 {
+            chat.drain_entry_retry_results();
+            if chat.entry_retry_attempt.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let ChatPhase::PickAgent {
+            agents, list_state, ..
+        } = &chat.phase
+        else {
+            panic!("agent failure should keep the picker visible");
+        };
+        assert_eq!(agents, &["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(list_state.selected(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn active_chat_wins_against_queued_entry_retry_result() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Error("try again".to_string());
+
+        chat.start_entry_retry();
+        let request = next_rpc_request(&mut rx, "entry retry should request agents").await;
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [{"alias": "alpha", "enabled": true}]
+            }),
+        );
+        let request = next_rpc_request(&mut rx, "entry retry should create a session").await;
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-stale",
+                "workspace_dir": "/tmp/stale"
+            }),
+        );
+        let request = next_rpc_request(&mut rx, "entry retry should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let mut close = None;
+        for _ in 0..32 {
+            chat.drain_entry_retry_results();
+            if let Ok(request) = rx.try_recv() {
+                close = Some(serde_json::from_str::<serde_json::Value>(&request).unwrap());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let close = close.expect("stale Active retry result should be closed");
+        assert_eq!(close["method"], method::SESSION_CLOSE);
+        assert_eq!(close["params"]["session_id"], "sess-stale");
+        respond_ok(&rpc, &close, serde_json::json!({}));
+        assert!(matches!(chat.phase, ChatPhase::Active(_)));
     }
 
     #[tokio::test]
