@@ -23,4 +23,6 @@ mod reply_target_field_regression;
 mod schema_export_feature_graph;
 mod security;
 mod skills_bundle_cli;
+#[cfg(feature = "agent-runtime")]
+mod verifiable_intent_notice_visibility;
 mod whatsapp_webhook_security;
