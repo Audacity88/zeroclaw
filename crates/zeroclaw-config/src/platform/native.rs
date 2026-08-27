@@ -283,6 +283,39 @@ impl RuntimeAdapter for NativeRuntime {
             Ok(process)
         }
     }
+
+    fn build_shell_command_with_effective_path(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        effective_path: Option<&std::ffi::OsStr>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        #[cfg(not(target_os = "windows"))]
+        if let Some(path) = effective_path {
+            let configured_shell = if is_android() {
+                std::ffi::OsStr::new("/system/bin/sh")
+            } else {
+                std::ffi::OsStr::new(&self.shell)
+            };
+            let resolved_shell = crate::platform::resolve_executable_with_path(
+                configured_shell,
+                std::env::split_paths(path),
+            )
+            .map_err(|error| {
+                let detail = error.to_string();
+                anyhow::Error::new(error).context(format!(
+                    "native runtime shell {configured_shell:?} could not be resolved in the effective child PATH: {detail}"
+                ))
+            })?;
+            return Self::with_shell_and_resolved_path(self.shell.clone(), Some(resolved_shell))
+                .build_shell_command(command, workspace_dir);
+        }
+
+        #[cfg(target_os = "windows")]
+        let _ = effective_path;
+
+        self.build_shell_command(command, workspace_dir)
+    }
 }
 
 #[cfg(test)]

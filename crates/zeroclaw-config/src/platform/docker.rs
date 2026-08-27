@@ -203,27 +203,6 @@ impl DockerRuntime {
             Path::new("docker"),
         )
     }
-
-    #[cfg(test)]
-    fn build_shell_command_with_path_for_test<I, P>(
-        &self,
-        command: &str,
-        workspace_dir: &Path,
-        path_entries: I,
-    ) -> anyhow::Result<tokio::process::Command>
-    where
-        I: IntoIterator<Item = P>,
-        P: AsRef<Path>,
-    {
-        let docker =
-            crate::platform::resolve_executable_with_path(OsStr::new("docker"), path_entries)
-                .map_err(|error| {
-                    anyhow::Error::new(error).context(
-                        "Docker runtime launcher could not be resolved in the injected PATH",
-                    )
-                })?;
-        self.build_shell_command_with_launcher(command, workspace_dir, &[], &docker)
-    }
 }
 
 fn docker_env_key(key: &OsStr) -> Result<&str> {
@@ -282,6 +261,37 @@ impl RuntimeAdapter for DockerRuntime {
         env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
         self.build_shell_command_inner(command, workspace_dir, env_keys)
+    }
+
+    fn build_shell_command_with_effective_path(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        effective_path: Option<&OsStr>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        #[cfg(unix)]
+        if let Some(path) = effective_path {
+            let resolved_launcher = crate::platform::resolve_executable_with_path(
+                OsStr::new("docker"),
+                std::env::split_paths(path),
+            )
+            .map_err(|error| {
+                anyhow::Error::new(error).context(
+                    "Docker runtime launcher could not be resolved in the effective child PATH",
+                )
+            })?;
+            return self.build_shell_command_with_launcher(
+                command,
+                workspace_dir,
+                &[],
+                &resolved_launcher,
+            );
+        }
+
+        #[cfg(not(unix))]
+        let _ = effective_path;
+
+        self.build_shell_command(command, workspace_dir)
     }
 }
 
@@ -562,7 +572,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn docker_production_resolution_uses_injected_absolute_path() {
+    fn docker_effective_path_uses_injected_absolute_entry() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -574,8 +584,18 @@ mod tests {
             ..DockerRuntimeConfig::default()
         });
 
+        let path = std::env::join_paths([
+            PathBuf::new(),
+            PathBuf::from("relative-decoy"),
+            dir.path().to_path_buf(),
+        ])
+        .unwrap();
         let command = runtime
-            .build_shell_command_with_path_for_test("echo hello", dir.path(), [dir.path()])
+            .build_shell_command_with_effective_path(
+                "echo hello",
+                dir.path(),
+                Some(path.as_os_str()),
+            )
             .unwrap();
         assert_eq!(
             command.as_std().get_program(),
@@ -585,15 +605,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn docker_production_resolution_rejects_empty_and_relative_only_path() {
+    fn docker_effective_path_rejects_empty_and_relative_only_values() {
         let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
-        let error = runtime
-            .build_shell_command_with_path_for_test(
-                "echo hello",
-                &std::env::temp_dir(),
-                [PathBuf::new(), PathBuf::from(".")],
-            )
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("not found on PATH"));
+        for path in [
+            std::ffi::OsString::new(),
+            std::ffi::OsString::from("relative-only"),
+        ] {
+            let error = runtime
+                .build_shell_command_with_effective_path(
+                    "echo hello",
+                    &std::env::temp_dir(),
+                    Some(path.as_os_str()),
+                )
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("not found on PATH"));
+        }
     }
 }
