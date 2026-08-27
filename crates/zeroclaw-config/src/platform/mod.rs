@@ -56,15 +56,12 @@ pub fn create_runtime_with_path(
             #[cfg(unix)]
             let docker_path = path
                 .map(|path| {
-                    resolve_executable_with_path(
-                        OsStr::new("docker"),
-                        std::env::split_paths(path),
-                    )
-                    .map_err(|error| {
-                        anyhow::Error::new(error).context(
+                    resolve_executable_with_path(OsStr::new("docker"), std::env::split_paths(path))
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(
                             "Docker runtime launcher could not be resolved in the injected PATH",
                         )
-                    })
+                        })
                 })
                 .transpose()?;
             #[cfg(not(unix))]
