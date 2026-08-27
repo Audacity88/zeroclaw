@@ -13353,6 +13353,11 @@ pub(crate) mod tests {
             .map(|(block, _)| block)
     }
 
+    fn source_block_after_channel_loop<'a>(source: &'a str, field: &str) -> Option<&'a str> {
+        let marker = format!("in &config.channels.{field} {{");
+        source_block_after(source, &marker, "    ")
+    }
+
     fn source_segment_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
         let (_, after_start) = source.split_once(start)?;
         after_start.split_once(end).map(|(segment, _)| segment)
@@ -28571,8 +28576,7 @@ This is an example JSON object for profile settings."#;
                     "whatsapp-web" | "whatsapp_web" => "whatsapp".to_string(),
                     _ => key.replace('-', "_"),
                 };
-                let loop_marker = format!("in &config.channels.{field}");
-                source_block_after(collector, &loop_marker, "    ").is_some_and(|loop_body| {
+                source_block_after_channel_loop(collector, &field).is_some_and(|loop_body| {
                     loop_body.contains("channels.push(ConfiguredChannel {")
                 })
             });
@@ -28645,6 +28649,23 @@ This is an example JSON object for profile settings."#;
                 "compiled channel family `{primary_key}` has no synchronous listener registration or explicit runtime owner"
             );
         }
+    }
+
+    #[test]
+    fn channel_listener_guard_requires_a_complete_config_field_name() {
+        let web_socket_only_collector = r#"
+    for (alias, wc_ws) in &config.channels.wecom_ws {
+        channels.push(ConfiguredChannel {
+            display_name: "WeCom WebSocket",
+        });
+    }
+"#;
+
+        assert!(source_block_after_channel_loop(web_socket_only_collector, "wecom").is_none());
+        assert!(
+            source_block_after_channel_loop(web_socket_only_collector, "wecom_ws")
+                .is_some_and(|loop_body| loop_body.contains("channels.push(ConfiguredChannel {"))
+        );
     }
 
     #[cfg(feature = "channel-mattermost")]
