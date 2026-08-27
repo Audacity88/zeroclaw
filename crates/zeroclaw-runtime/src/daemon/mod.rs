@@ -1121,6 +1121,11 @@ pub async fn run(
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
     }
 
+    // Freeze lifecycle admission before stopping ingress. Existing ordinary
+    // turns lose their leases when component workers drain or are aborted;
+    // destructive leases remain registered through detached post-commit
+    // cleanup and are drained below before cross-process ownership can drop.
+    live_config_authority.close_agent_lifecycle();
     channels_cancel.cancel();
 
     const GRACE_WINDOW: Duration = Duration::from_millis(500);
@@ -1145,6 +1150,8 @@ pub async fn run(
     for handle in remaining {
         let _ = handle.await;
     }
+
+    live_config_authority.drain_agent_lifecycle().await;
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {

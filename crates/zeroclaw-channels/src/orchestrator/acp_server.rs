@@ -656,15 +656,18 @@ impl AcpServer {
     fn agent_admission_error(
         error: zeroclaw_runtime::live_config_authority::AgentAdmissionError,
     ) -> RpcError {
-        let alias = match error {
+        let message = match error {
             zeroclaw_runtime::live_config_authority::AgentAdmissionError::Deleting { alias }
             | zeroclaw_runtime::live_config_authority::AgentAdmissionError::StaleGeneration {
                 alias,
-            } => alias,
+            } => format!("Agent `{alias}` changed while the session was being created"),
+            zeroclaw_runtime::live_config_authority::AgentAdmissionError::GenerationClosing => {
+                "Agent sessions are unavailable while the daemon reloads".to_string()
+            }
         };
         RpcError {
             code: INVALID_PARAMS,
-            message: format!("Agent `{alias}` changed while the session was being created"),
+            message,
             data: None,
         }
     }

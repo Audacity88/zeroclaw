@@ -7911,6 +7911,8 @@ struct DispatchWorkerRegistrationGate {
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
+    agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    agent_generation: u64,
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -7918,6 +7920,23 @@ async fn dispatch_worker(
     registration_gate: Option<DispatchWorkerRegistrationGate>,
 ) {
     let _permit = permit;
+    let _turn_lease =
+        match agent_lifecycle.reserve_turn_at(ctx.agent_alias.as_str(), agent_generation) {
+            Ok(lease) => lease,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "agent": ctx.agent_alias.as_str(),
+                            "error": error.to_string(),
+                        })),
+                    "dropping inbound message: agent lifecycle unavailable"
+                );
+                return;
+            }
+        };
     if let Some(gate) = registration_gate {
         gate.started.wait().await;
         let Ok(release_permit) = gate.release.acquire().await else {
@@ -7981,6 +8000,8 @@ struct AgentRouter {
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    turn_generations: Arc<HashMap<String, u64>>,
 }
 
 impl AgentRouter {
@@ -7992,6 +8013,8 @@ impl AgentRouter {
             single_ctx: Some(ctx),
             sop_engine: None,
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            turn_generations: Arc::new(HashMap::new()),
         }
     }
 
@@ -8007,7 +8030,23 @@ impl AgentRouter {
             single_ctx: None,
             sop_engine,
             sop_audit,
+            agent_lifecycle: Default::default(),
+            turn_generations: Arc::new(HashMap::new()),
         }
+    }
+
+    fn with_agent_lifecycle(
+        mut self,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    ) -> Self {
+        self.turn_generations = Arc::new(
+            self.by_agent
+                .keys()
+                .map(|alias| (alias.clone(), agent_lifecycle.alias_generation(alias)))
+                .collect(),
+        );
+        self.agent_lifecycle = agent_lifecycle;
+        self
     }
 
     fn resolve(
@@ -8662,6 +8701,14 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
                     let debounce_task_seq = Arc::clone(&task_sequence);
                     let debounce_cancel = cancel.clone();
                     let debounce_registration_gate = worker_registration_gate.clone();
+                    let debounce_agent_lifecycle = router.agent_lifecycle.clone();
+                    let debounce_agent_generation = router
+                        .turn_generations
+                        .get(ctx.agent_alias.as_str())
+                        .copied()
+                        .unwrap_or_else(|| {
+                            debounce_agent_lifecycle.alias_generation(ctx.agent_alias.as_str())
+                        });
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
                         let combined = match tokio::select! {
@@ -8687,6 +8734,8 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
                         dispatch_worker(
                             debounce_ctx,
                             debounce_msg,
+                            debounce_agent_lifecycle,
+                            debounce_agent_generation,
                             debounce_in_flight,
                             debounce_task_seq,
                             permit,
@@ -8721,10 +8770,18 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
         let task_sequence = Arc::clone(&task_sequence);
         let worker_cancel = cancel.child_token();
         let registration_gate = worker_registration_gate.clone();
+        let agent_lifecycle = router.agent_lifecycle.clone();
+        let agent_generation = router
+            .turn_generations
+            .get(ctx.agent_alias.as_str())
+            .copied()
+            .unwrap_or_else(|| agent_lifecycle.alias_generation(ctx.agent_alias.as_str()));
         workers.spawn(async move {
             dispatch_worker(
                 worker_ctx,
                 msg,
+                agent_lifecycle,
+                agent_generation,
                 in_flight,
                 task_sequence,
                 permit,
@@ -13104,7 +13161,8 @@ pub async fn start_channels_with_authority(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit)
+        .with_agent_lifecycle(authority.agent_lifecycle());
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -22786,6 +22844,10 @@ BTC is currently around $65,000 based on latest tool output."#
         if cancel_generation {
             let cancel = CancellationToken::new();
             let dispatch_cancel = cancel.clone();
+            let agent_lifecycle =
+                zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
+            let router =
+                AgentRouter::single(runtime_ctx).with_agent_lifecycle(agent_lifecycle.clone());
             let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
             let worker_registration_gate =
                 cancel_before_worker_registration.then(|| DispatchWorkerRegistrationGate {
@@ -22796,7 +22858,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let dispatch =
                 ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel_and_drain_signal(
                     rx,
-                    AgentRouter::single(runtime_ctx),
+                    router,
                     2,
                     dispatch_cancel,
                     close_before_generation_cancel.then_some(drain_started_tx),
@@ -22807,6 +22869,15 @@ BTC is currently around $65,000 based on latest tool output."#
                 tokio::time::timeout(Duration::from_secs(1), gate.started.wait())
                     .await
                     .expect("both channel workers should reach the registration barrier");
+                assert!(matches!(
+                    agent_lifecycle.begin_delete("test-agent"),
+                    Err(
+                        zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::ActiveTurns {
+                            count: 2,
+                            ..
+                        }
+                    )
+                ));
                 cancel.cancel();
                 gate.release.add_permits(2);
                 drop(tx);
@@ -22834,6 +22905,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .await
                 .expect("generation cancellation should drain channel workers promptly")
                 .expect("dispatch task should join cleanly");
+            assert_eq!(agent_lifecycle.active_turn_count("test-agent"), 0);
         } else {
             let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
                 rx,
@@ -34302,6 +34374,8 @@ Done."#;
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            turn_generations: Arc::new(HashMap::new()),
         }
     }
 
@@ -34405,6 +34479,8 @@ Done."#;
             single_ctx: None,
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            turn_generations: Arc::new(HashMap::new()),
         };
         (router, engine, run_id)
     }

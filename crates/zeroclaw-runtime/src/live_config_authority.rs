@@ -73,6 +73,16 @@ impl LiveConfigAuthority {
     pub fn agent_lifecycle(&self) -> AgentLifecycleCoordinator {
         self.agent_lifecycle.clone()
     }
+
+    /// Close lifecycle admission for this daemon generation.
+    pub fn close_agent_lifecycle(&self) {
+        self.agent_lifecycle.close_generation();
+    }
+
+    /// Wait for post-commit agent cleanup admitted by this generation.
+    pub async fn drain_agent_lifecycle(&self) {
+        self.agent_lifecycle.drain_destructive_work().await;
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -216,24 +226,28 @@ struct AliasLifecycleState {
     generation: u64,
     reservations: usize,
     live_sessions: usize,
+    active_turns: usize,
     deleting: bool,
 }
 
 #[derive(Default)]
 struct AgentLifecycleState {
     aliases: HashMap<String, AliasLifecycleState>,
+    closing: bool,
 }
 
 /// Coordinates slow session admission with destructive alias mutations.
 #[derive(Clone, Default)]
 pub struct AgentLifecycleCoordinator {
     state: Arc<parking_lot::Mutex<AgentLifecycleState>>,
+    destructive_idle: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAdmissionError {
     Deleting { alias: String },
     StaleGeneration { alias: String },
+    GenerationClosing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +255,8 @@ pub enum AgentDeleteBlocker {
     Deleting { alias: String },
     Reservations { alias: String, count: usize },
     LiveSessions { alias: String, count: usize },
+    ActiveTurns { alias: String, count: usize },
+    GenerationClosing,
 }
 
 impl std::fmt::Display for AgentAdmissionError {
@@ -250,6 +266,7 @@ impl std::fmt::Display for AgentAdmissionError {
             Self::StaleGeneration { alias } => {
                 write!(formatter, "agent `{alias}` changed during admission")
             }
+            Self::GenerationClosing => write!(formatter, "agent lifecycle generation is closing"),
         }
     }
 }
@@ -265,6 +282,10 @@ impl std::fmt::Display for AgentDeleteBlocker {
             Self::LiveSessions { alias, count } => {
                 write!(formatter, "agent `{alias}` has {count} live session(s)")
             }
+            Self::ActiveTurns { alias, count } => {
+                write!(formatter, "agent `{alias}` has {count} active turn(s)")
+            }
+            Self::GenerationClosing => write!(formatter, "agent lifecycle generation is closing"),
         }
     }
 }
@@ -277,6 +298,12 @@ pub struct AgentAdmissionReservation {
 }
 
 pub struct AgentSessionLease {
+    coordinator: AgentLifecycleCoordinator,
+    alias: String,
+    active: bool,
+}
+
+pub struct AgentTurnLease {
     coordinator: AgentLifecycleCoordinator,
     alias: String,
     active: bool,
@@ -296,6 +323,9 @@ impl AgentLifecycleCoordinator {
     ) -> Result<AgentAdmissionReservation, AgentAdmissionError> {
         let alias = alias.into();
         let mut state = self.state.lock();
+        if state.closing {
+            return Err(AgentAdmissionError::GenerationClosing);
+        }
         let lifecycle = state.aliases.entry(alias.clone()).or_default();
         if lifecycle.deleting {
             return Err(AgentAdmissionError::Deleting { alias });
@@ -309,6 +339,52 @@ impl AgentLifecycleCoordinator {
         })
     }
 
+    /// Admit one ordinary message turn without pinning an idle connection.
+    pub fn reserve_turn(
+        &self,
+        alias: impl Into<String>,
+    ) -> Result<AgentTurnLease, AgentAdmissionError> {
+        let alias = alias.into();
+        let generation = self.alias_generation(&alias);
+        self.reserve_turn_at(alias, generation)
+    }
+
+    /// Return the current generation token for a persistent turn producer.
+    pub fn alias_generation(&self, alias: &str) -> u64 {
+        self.state
+            .lock()
+            .aliases
+            .get(alias)
+            .map_or(0, |lifecycle| lifecycle.generation)
+    }
+
+    /// Admit a turn only when its persistent producer still targets the same
+    /// alias generation it was constructed for.
+    pub fn reserve_turn_at(
+        &self,
+        alias: impl Into<String>,
+        generation: u64,
+    ) -> Result<AgentTurnLease, AgentAdmissionError> {
+        let alias = alias.into();
+        let mut state = self.state.lock();
+        if state.closing {
+            return Err(AgentAdmissionError::GenerationClosing);
+        }
+        let lifecycle = state.aliases.entry(alias.clone()).or_default();
+        if lifecycle.deleting {
+            return Err(AgentAdmissionError::Deleting { alias });
+        }
+        if lifecycle.generation != generation {
+            return Err(AgentAdmissionError::StaleGeneration { alias });
+        }
+        lifecycle.active_turns += 1;
+        Ok(AgentTurnLease {
+            coordinator: self.clone(),
+            alias,
+            active: true,
+        })
+    }
+
     /// Enter destructive work for one alias after proving no admission or
     /// published session is using it. The returned lease keeps the alias
     /// unavailable until cleanup finishes.
@@ -318,6 +394,9 @@ impl AgentLifecycleCoordinator {
     ) -> Result<AgentDeleteLease, AgentDeleteBlocker> {
         let alias = alias.into();
         let mut state = self.state.lock();
+        if state.closing {
+            return Err(AgentDeleteBlocker::GenerationClosing);
+        }
         let lifecycle = state.aliases.entry(alias.clone()).or_default();
         if lifecycle.deleting {
             return Err(AgentDeleteBlocker::Deleting { alias });
@@ -332,6 +411,12 @@ impl AgentLifecycleCoordinator {
             return Err(AgentDeleteBlocker::LiveSessions {
                 alias,
                 count: lifecycle.live_sessions,
+            });
+        }
+        if lifecycle.active_turns > 0 {
+            return Err(AgentDeleteBlocker::ActiveTurns {
+                alias,
+                count: lifecycle.active_turns,
             });
         }
         lifecycle.deleting = true;
@@ -350,18 +435,54 @@ impl AgentLifecycleCoordinator {
             .get(alias)
             .map_or(0, |state| state.live_sessions)
     }
+
+    pub fn active_turn_count(&self, alias: &str) -> usize {
+        self.state
+            .lock()
+            .aliases
+            .get(alias)
+            .map_or(0, |state| state.active_turns)
+    }
+
+    /// Prevent this generation from admitting new sessions, turns, or
+    /// destructive work before ingress shutdown begins.
+    pub fn close_generation(&self) {
+        self.state.lock().closing = true;
+    }
+
+    /// Wait until every destructive lease admitted before generation close has
+    /// left its detached post-commit cleanup task.
+    pub async fn drain_destructive_work(&self) {
+        loop {
+            let notified = self.destructive_idle.notified();
+            if self
+                .state
+                .lock()
+                .aliases
+                .values()
+                .all(|lifecycle| !lifecycle.deleting)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl AgentAdmissionReservation {
     /// Revalidate the reserved generation and publish one live session.
     pub fn publish(mut self) -> Result<AgentSessionLease, AgentAdmissionError> {
         let mut state = self.coordinator.state.lock();
+        let closing = state.closing;
         let lifecycle = state
             .aliases
             .get_mut(&self.alias)
             .expect("admission reservation must retain alias state");
         lifecycle.reservations = lifecycle.reservations.saturating_sub(1);
         self.active = false;
+        if closing {
+            return Err(AgentAdmissionError::GenerationClosing);
+        }
         if lifecycle.deleting || lifecycle.generation != self.generation {
             return Err(AgentAdmissionError::StaleGeneration {
                 alias: self.alias.clone(),
@@ -398,6 +519,17 @@ impl Drop for AgentSessionLease {
     }
 }
 
+impl Drop for AgentTurnLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(lifecycle) = self.coordinator.state.lock().aliases.get_mut(&self.alias) {
+            lifecycle.active_turns = lifecycle.active_turns.saturating_sub(1);
+        }
+    }
+}
+
 impl Drop for AgentDeleteLease {
     fn drop(&mut self) {
         if !self.active {
@@ -406,6 +538,7 @@ impl Drop for AgentDeleteLease {
         if let Some(lifecycle) = self.coordinator.state.lock().aliases.get_mut(&self.alias) {
             lifecycle.deleting = false;
         }
+        self.coordinator.destructive_idle.notify_waiters();
     }
 }
 
@@ -520,5 +653,122 @@ mod tests {
         })
         .await
         .expect("detached lifecycle job releases its lease after completion");
+    }
+
+    #[test]
+    fn active_turn_blocks_same_alias_delete_without_blocking_other_aliases() {
+        let lifecycle = AgentLifecycleCoordinator::default();
+        let generation = lifecycle.alias_generation("alpha");
+        let turn = lifecycle.reserve_turn("alpha").unwrap();
+
+        assert_eq!(lifecycle.active_turn_count("alpha"), 1);
+        assert_eq!(
+            lifecycle.begin_delete("alpha").err(),
+            Some(AgentDeleteBlocker::ActiveTurns {
+                alias: "alpha".to_string(),
+                count: 1,
+            })
+        );
+        assert!(lifecycle.begin_delete("beta").is_ok());
+
+        drop(turn);
+        assert_eq!(lifecycle.active_turn_count("alpha"), 0);
+        let delete = lifecycle.begin_delete("alpha").unwrap();
+        drop(delete);
+        assert_eq!(
+            lifecycle.reserve_turn_at("alpha", generation).err(),
+            Some(AgentAdmissionError::StaleGeneration {
+                alias: "alpha".to_string(),
+            })
+        );
+        assert!(lifecycle.reserve_turn("alpha").is_ok());
+    }
+
+    #[tokio::test]
+    async fn closing_generation_rejects_admission_and_drains_detached_cleanup() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let lifecycle = authority.agent_lifecycle();
+        let lease = lifecycle.begin_delete("alpha").unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = Arc::clone(&release);
+        let handle = spawn_agent_lifecycle_job(vec![lease], async move {
+            task_release.notified().await;
+        });
+        drop(handle);
+
+        authority.close_agent_lifecycle();
+        assert_eq!(
+            lifecycle.reserve_admission("beta").err(),
+            Some(AgentAdmissionError::GenerationClosing)
+        );
+        assert_eq!(
+            lifecycle.reserve_turn("beta").err(),
+            Some(AgentAdmissionError::GenerationClosing)
+        );
+        assert_eq!(
+            lifecycle.begin_delete("beta").err(),
+            Some(AgentDeleteBlocker::GenerationClosing)
+        );
+
+        let mut drain = std::pin::pin!(authority.drain_agent_lifecycle());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                .await
+                .is_err()
+        );
+        release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("generation drain completes after detached cleanup");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_job_panic_releases_generation_drain() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let lease = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+        let handle = spawn_agent_lifecycle_job(vec![lease], async move {
+            panic!("test cleanup panic");
+        });
+        authority.close_agent_lifecycle();
+        assert!(handle.await.is_err());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            authority.drain_agent_lifecycle(),
+        )
+        .await
+        .expect("panic drops destructive leases and unblocks generation drain");
+    }
+
+    #[tokio::test]
+    async fn generation_drain_retains_process_ownership_until_cleanup_finishes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = temp.path().to_path_buf();
+        let authority = LiveConfigAuthority::new_owned(config).unwrap();
+        let lease = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let task_release = Arc::clone(&release);
+        let cleanup = spawn_agent_lifecycle_job(vec![lease], async move {
+            let _permit = task_release
+                .acquire_owned()
+                .await
+                .expect("test release semaphore remains open");
+        });
+        authority.close_agent_lifecycle();
+
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(temp.path()),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
+        release.add_permits(1);
+        cleanup.await.unwrap();
+        authority.drain_agent_lifecycle().await;
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(temp.path()),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
+
+        drop(authority);
+        ConfigOwnershipGuard::acquire(temp.path()).unwrap();
     }
 }

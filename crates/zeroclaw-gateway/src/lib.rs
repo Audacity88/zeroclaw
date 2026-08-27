@@ -562,6 +562,19 @@ pub struct AppState {
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
+impl AppState {
+    pub(crate) fn reserve_agent_turn_at(
+        &self,
+        alias: impl Into<String>,
+        generation: u64,
+    ) -> Result<
+        zeroclaw_runtime::live_config_authority::AgentTurnLease,
+        zeroclaw_runtime::live_config_authority::AgentAdmissionError,
+    > {
+        self.agent_lifecycle.reserve_turn_at(alias, generation)
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
@@ -2573,8 +2586,21 @@ pub(crate) async fn run_gateway_chat_with_tools(
 
     #[cfg(not(test))]
     {
+        let initial_config = state.config.read().clone();
+        let agent_alias = require_gateway_chat_agent_alias(&initial_config, agent_override)?;
+        let generation = state.agent_lifecycle.alias_generation(&agent_alias);
+        let _turn_lease = state
+            .reserve_agent_turn_at(agent_alias.clone(), generation)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        // The first snapshot only identifies the alias. Re-read after admission
+        // so a delete/recreate completed just before the lease cannot run with
+        // the predecessor generation's agent configuration.
         let config = state.config.read().clone();
-        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        let current_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        anyhow::ensure!(
+            current_alias == agent_alias,
+            "gateway chat agent changed during turn admission"
+        );
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
@@ -4633,6 +4659,28 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    #[test]
+    fn gateway_and_ws_turn_admission_blocks_destructive_alias_work() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&temp, false, false);
+        let generation = state.agent_lifecycle.alias_generation("alpha");
+        let turn = state
+            .reserve_agent_turn_at("alpha", generation)
+            .expect("gateway turn is admitted");
+
+        assert!(matches!(
+            state.agent_lifecycle.begin_delete("alpha"),
+            Err(
+                zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::ActiveTurns {
+                    count: 1,
+                    ..
+                }
+            )
+        ));
+        drop(turn);
+        assert!(state.agent_lifecycle.begin_delete("alpha").is_ok());
     }
 
     fn webhook_sop_state(
