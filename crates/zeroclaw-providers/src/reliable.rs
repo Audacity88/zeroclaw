@@ -666,6 +666,7 @@ fn is_missing_credential_error(err: &anyhow::Error) -> bool {
         "api key is required",
         "missing access token",
         "token not set",
+        "anthropic credentials not set",
     ]
     .iter()
     .any(|hint| lower.contains(hint))
@@ -3613,6 +3614,7 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::AnthropicModelProvider;
     use crate::router::{Route, RouterModelProvider};
     use futures_util::StreamExt;
     use std::sync::Arc;
@@ -5845,6 +5847,12 @@ mod tests {
                 "configure provider credentials",
             ),
             (
+                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
+                "credentials_missing",
+                "configuration",
+                "configure provider credentials",
+            ),
+            (
                 "API error (401): missing API key",
                 "auth",
                 "http_response",
@@ -6111,6 +6119,33 @@ mod tests {
                 .downcast_ref::<ReliableProviderTerminalFailure>()
                 .is_some()
         }));
+    }
+
+    #[tokio::test]
+    async fn anthropic_missing_credentials_reach_typed_terminal_failure() {
+        let model_provider = ReliableModelProvider::new(
+            "anthropic",
+            vec![(
+                "anthropic".into(),
+                Box::new(AnthropicModelProvider::builder("anthropic").build()),
+            )],
+            0,
+            1,
+        );
+
+        let error = model_provider
+            .simple_chat("hello", "claude-sonnet-4-5", Some(0.0))
+            .await
+            .expect_err("missing Anthropic credentials should fail");
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("Reliable must retain the typed Anthropic failure");
+
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::CredentialsMissing
+        );
     }
 
     #[test]
