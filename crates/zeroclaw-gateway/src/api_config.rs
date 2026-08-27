@@ -1125,11 +1125,21 @@ async fn delete_agent_cascade(
     mut working: zeroclaw_config::schema::Config,
     alias: &str,
     guard: ConfigWriteGuard,
-    _lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentDeleteLease,
+    lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentDeleteLease,
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
 
-    let preflight = crate::agent_owned_state::plan_agent_delete(&working, alias);
+    let preflight_config = working.clone();
+    let preflight_alias = alias.to_string();
+    let live_acp = tokio::task::spawn_blocking(move || {
+        crate::agent_owned_state::live_acp_session_count(&preflight_config, &preflight_alias)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("ACP preflight task failed: {error}")));
+    let preflight = zeroclaw_runtime::agent_lifecycle::plan_agent_delete_with_acp_count(
+        &working, alias, live_acp,
+    );
     if !preflight.allowed {
         let code = if working.agents.contains_key(alias) {
             ConfigApiCode::ValidationFailed
@@ -1186,25 +1196,45 @@ async fn delete_agent_cascade(
     // Read it back from the (now-swapped) AppState for the side-effects below.
     let committed = state.config.read().clone();
 
-    let archive =
-        crate::agent_owned_state::archive_agent_workspace(&committed, alias, &workspace).await;
-    let archive_dir = archive.archive_dir;
-    let mut warnings = archive.warnings;
-
-    // Owned-state cascade (export-then-delete memory/cron/acp + clear sessions).
-    let owned = crate::agent_owned_state::cascade_owned_state(
-        &committed,
-        &state.mem,
-        state.session_backend.as_ref(),
-        alias,
-        &archive_dir,
-    )
-    .await;
+    let memory = Arc::clone(&state.mem);
+    let session_backend = state.session_backend.clone();
+    let cleanup_alias = alias.to_string();
+    let cleanup = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(
+        vec![lifecycle_lease],
+        async move {
+            let archive = crate::agent_owned_state::archive_agent_workspace(
+                &committed,
+                &cleanup_alias,
+                &workspace,
+            )
+            .await;
+            let archive_dir = archive.archive_dir;
+            let mut warnings = archive.warnings;
+            let owned = crate::agent_owned_state::cascade_owned_state(
+                &committed,
+                &memory,
+                session_backend.as_ref(),
+                &cleanup_alias,
+                &archive_dir,
+            )
+            .await;
+            warnings.extend(owned.warnings.iter().cloned());
+            (archive_dir, warnings, owned)
+        },
+    );
+    let (archive_dir, warnings, owned) = match cleanup.await {
+        Ok(result) => result,
+        Err(error) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("agent cleanup task failed: {error}"),
+            ));
+        }
+    };
     // Combine per-side-effect failures (archive dir / workspace rename) with
     // the per-store failures surfaced by `cascade_owned_state`, so the operator
     // sees the FULL partial-failure picture in the response, not just the
     // server log.
-    warnings.extend(owned.warnings.iter().cloned());
     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": alias, "memory": owned.memory_purged, "cron": owned.cron_removed, "acp": owned.acp_removed, "sessions_cleared": owned.sessions_cleared, "archive": archive_dir.display().to_string(), "warnings": warnings.len()})), "agent deleted with owned-state cascade");
 
     axum::Json(MapKeyResponse {
@@ -1739,7 +1769,7 @@ async fn rename_agent_cascade(
     mut working: zeroclaw_config::schema::Config,
     body: &RenameMapKeyBody,
     guard: ConfigWriteGuard,
-    _lifecycle_leases: Vec<zeroclaw_runtime::live_config_authority::AgentDeleteLease>,
+    lifecycle_leases: Vec<zeroclaw_runtime::live_config_authority::AgentDeleteLease>,
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind};
     let (from, to) = (&body.from, &body.to);
@@ -1781,23 +1811,37 @@ async fn rename_agent_cascade(
     // `<install>/agents/<from>/workspace` → `…/<to>/workspace`. A custom
     // workspace path is alias-independent, so `old_ws == new_ws` and we skip.
     let ws_existed = old_ws != new_ws && old_ws.exists();
-    let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
-    let workspace_moved = ws_existed && move_warning.is_none();
-    let mut warnings: Vec<String> = Vec::new();
-    warnings.extend(move_warning);
-
-    // Re-point owned DB state (memory/cron/acp/session). Best-effort + reported.
-    let owned = crate::agent_owned_state::cascade_rename_agent(
-        &cfg,
-        &state.mem,
-        state.session_backend.as_ref(),
-        from,
-        to,
-    )
-    .await;
-    // Combine the workspace-move warning (if any) with the owned-store warnings
-    // so every partial failure reaches the caller, not just the server log.
-    warnings.extend(owned.warnings);
+    let memory = Arc::clone(&state.mem);
+    let session_backend = state.session_backend.clone();
+    let cleanup_from = from.clone();
+    let cleanup_to = to.clone();
+    let cleanup = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(
+        lifecycle_leases,
+        async move {
+            let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
+            let workspace_moved = ws_existed && move_warning.is_none();
+            let mut warnings: Vec<String> = move_warning.into_iter().collect();
+            let owned = crate::agent_owned_state::cascade_rename_agent(
+                &cfg,
+                Some(&memory),
+                session_backend.as_ref(),
+                &cleanup_from,
+                &cleanup_to,
+            )
+            .await;
+            warnings.extend(owned.warnings.iter().cloned());
+            (workspace_moved, warnings, owned)
+        },
+    );
+    let (workspace_moved, warnings, owned) = match cleanup.await {
+        Ok(result) => result,
+        Err(error) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("agent rename cleanup task failed: {error}"),
+            ));
+        }
+    };
 
     // The config rename committed. A non-empty `warnings` means a post-persist
     // side-effect did not follow (config is `to`, some follower lags at `from`,

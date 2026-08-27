@@ -120,23 +120,26 @@ pub async fn archive_agent_workspace(
     alias: &str,
     workspace: &Path,
 ) -> WorkspaceArchiveReport {
+    let archive_root = config.data_dir.join("agents").join("_deleted");
     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let archive_dir = config
-        .data_dir
-        .join("agents")
-        .join("_deleted")
-        .join(format!("{alias}-{ts}"));
     let mut warnings = Vec::new();
-    if let Err(error) = tokio::fs::create_dir_all(&archive_dir).await {
+    if let Err(error) = tokio::fs::create_dir_all(&archive_root).await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"agent": alias, "archive": archive_dir.display().to_string(), "err": error.to_string()})),
+                .with_attrs(::serde_json::json!({"agent": alias, "archive": archive_root.display().to_string(), "err": error.to_string()})),
             "agent delete: archive dir creation failed"
         );
         warnings.push(format!(
             "archive dir creation failed ({}): {error}",
+            archive_root.display()
+        ));
+    }
+    let archive_dir = archive_root.join(format!("{alias}-{ts}-{}", uuid::Uuid::new_v4()));
+    if let Err(error) = tokio::fs::create_dir(&archive_dir).await {
+        warnings.push(format!(
+            "archive dir allocation failed ({}): {error}",
             archive_dir.display()
         ));
     }
@@ -395,41 +398,60 @@ pub struct RenameStateReport {
 
 pub async fn cascade_rename_agent(
     config: &Config,
-    mem: &Arc<dyn Memory>,
+    mem: Option<&Arc<dyn Memory>>,
     session_backend: Option<&Arc<dyn SessionBackend>>,
     from: &str,
     to: &str,
 ) -> RenameStateReport {
     let mut warnings = Vec::new();
-    let memory_rows = mem.rename_agent(from, to).await.unwrap_or_else(|error| {
-        warnings.push(format!("memory rename: {error}"));
-        0
-    });
-    let cron_jobs = crate::cron::rename_jobs_by_agent(config, from, to).unwrap_or_else(|error| {
-        warnings.push(format!("cron rename: {error}"));
-        0
-    });
-    let acp_sessions = match AcpSessionStore::new(&config.data_dir) {
-        Ok(store) => store
-            .rename_sessions_by_agent(from, to)
-            .unwrap_or_else(|error| {
-                warnings.push(format!("acp rename: {error}"));
-                0
-            }),
-        Err(error) => {
-            warnings.push(format!("acp store open: {error}"));
+    let memory_rows = match mem {
+        Some(mem) => mem.rename_agent(from, to).await.unwrap_or_else(|error| {
+            warnings.push(format!("memory rename: {error}"));
             0
-        }
-    };
-    let sessions_repointed = match session_backend {
-        Some(backend) => backend
-            .rename_agent_attribution(from, to)
-            .unwrap_or_else(|error| {
-                warnings.push(format!("session attribution rename: {error}"));
-                0
-            }),
+        }),
         None => 0,
     };
+    let blocking_config = config.clone();
+    let blocking_backend = session_backend.cloned();
+    let blocking_from = from.to_string();
+    let blocking_to = to.to_string();
+    let blocking = tokio::task::spawn_blocking(move || {
+        let mut warnings = Vec::new();
+        let cron_jobs =
+            crate::cron::rename_jobs_by_agent(&blocking_config, &blocking_from, &blocking_to)
+                .unwrap_or_else(|error| {
+                    warnings.push(format!("cron rename: {error}"));
+                    0
+                });
+        let acp_sessions = match AcpSessionStore::new(&blocking_config.data_dir) {
+            Ok(store) => store
+                .rename_sessions_by_agent(&blocking_from, &blocking_to)
+                .unwrap_or_else(|error| {
+                    warnings.push(format!("acp rename: {error}"));
+                    0
+                }),
+            Err(error) => {
+                warnings.push(format!("acp store open: {error}"));
+                0
+            }
+        };
+        let sessions_repointed = match blocking_backend {
+            Some(backend) => backend
+                .rename_agent_attribution(&blocking_from, &blocking_to)
+                .unwrap_or_else(|error| {
+                    warnings.push(format!("session attribution rename: {error}"));
+                    0
+                }),
+            None => 0,
+        };
+        (cron_jobs, acp_sessions, sessions_repointed, warnings)
+    })
+    .await;
+    let (cron_jobs, acp_sessions, sessions_repointed, blocking_warnings) = match blocking {
+        Ok(result) => result,
+        Err(error) => (0, 0, 0, vec![format!("rename state task failed: {error}")]),
+    };
+    warnings.extend(blocking_warnings);
     if !warnings.is_empty() {
         ::zeroclaw_log::record!(
             WARN,
@@ -485,6 +507,23 @@ mod tests {
                 .iter()
                 .any(|path| path == "acp.default_agent")
         );
+    }
+
+    #[tokio::test]
+    async fn archive_paths_are_unique_for_rapid_repeated_deletes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let missing = temp.path().join("missing-workspace");
+
+        let first = archive_agent_workspace(&config, "rapid", &missing).await;
+        let second = archive_agent_workspace(&config, "rapid", &missing).await;
+
+        assert_ne!(first.archive_dir, second.archive_dir);
+        assert!(first.archive_dir.is_dir());
+        assert!(second.archive_dir.is_dir());
     }
 
     #[test]

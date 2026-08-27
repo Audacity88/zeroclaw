@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -190,6 +191,24 @@ impl ConfigOwnershipGuard {
             )),
         }
     }
+}
+
+/// Detach post-commit lifecycle work while retaining alias exclusion.
+///
+/// Dropping the returned handle does not cancel the task, so request
+/// cancellation cannot release the leases while cleanup is still running.
+pub fn spawn_agent_lifecycle_job<F, T>(
+    leases: Vec<AgentDeleteLease>,
+    future: F,
+) -> tokio::task::JoinHandle<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        let _leases = leases;
+        future.await
+    })
 }
 
 #[derive(Default)]
@@ -476,5 +495,30 @@ mod tests {
         ));
         drop(first);
         ConfigOwnershipGuard::acquire(temp.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_lifecycle_job_retains_alias_exclusion() {
+        let lifecycle = AgentLifecycleCoordinator::default();
+        let lease = lifecycle.begin_delete("alpha").unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = Arc::clone(&release);
+        let handle = spawn_agent_lifecycle_job(vec![lease], async move {
+            task_release.notified().await;
+        });
+        drop(handle);
+
+        assert!(lifecycle.reserve_admission("alpha").is_err());
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if lifecycle.reserve_admission("alpha").is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached lifecycle job releases its lease after completion");
     }
 }

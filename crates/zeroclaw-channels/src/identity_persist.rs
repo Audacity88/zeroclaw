@@ -174,17 +174,15 @@ pub(crate) async fn persist_external_peer(
     let config_write_lock = authority.config_write_lock();
     let _config_write_guard = config_write_lock.lock().await;
     let config = authority.config();
-    let snapshot = {
-        let mut cfg = config.write();
-        if !merge_external_peer(&mut cfg, channel_type, alias, identity)? {
-            return Ok(());
-        }
-        cfg.clone()
-    };
+    let mut snapshot = config.read().clone();
+    if !merge_external_peer(&mut snapshot, channel_type, alias, identity)? {
+        return Ok(());
+    }
     snapshot
         .save()
         .await
         .with_context(|| format!("Failed to persist {channel_type} peer to config.toml"))?;
+    *config.write() = snapshot;
     Ok(())
 }
 
@@ -506,5 +504,28 @@ mod tests {
         persist_external_peer(None, "whatsapp", "admin", "+15551234567")
             .await
             .expect("missing handle is a soft no-op");
+    }
+
+    #[tokio::test]
+    async fn persist_save_failure_does_not_publish_peer_in_memory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let mut config = config_with_whatsapp("admin");
+        config.config_path = blocked_parent.join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = LiveConfigAuthority::new(config);
+
+        persist_external_peer(Some(&authority), "whatsapp", "admin", "+15551234567")
+            .await
+            .expect_err("save failure must reject paired identity");
+
+        assert!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("whatsapp", "admin")
+                .is_empty()
+        );
     }
 }

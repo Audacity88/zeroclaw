@@ -3901,33 +3901,23 @@ impl RpcDispatcher {
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let mut working = self.ctx.config.read().clone();
         let mut agent_lifecycle_lease = None;
-        let created = {
-            let mut config = self.ctx.config.write();
-            if req.path == "agents" && !config.agents.contains_key(&req.key) {
-                agent_lifecycle_lease = Some(
-                    self.ctx
-                        .agent_lifecycle
-                        .begin_delete(req.key.clone())
-                        .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?,
-                );
-            }
-            // Shared guarded boundary: enforces the reserved-agent rule (the
-            // `default` runtime fallback) on this surface too, so the RPC create
-            // path cannot author an `agents.default` the rename guard then traps.
-            let created = zeroclaw_config::alias_refs::create_map_key_checked(
-                &mut config,
-                &req.path,
-                &req.key,
-            )
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-            if created {
-                config.mark_dirty(&format!("{}.{}", req.path, req.key));
-            }
-            created
-        };
+        if req.path == "agents" && !working.agents.contains_key(&req.key) {
+            agent_lifecycle_lease = Some(
+                self.ctx
+                    .agent_lifecycle
+                    .begin_delete(req.key.clone())
+                    .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?,
+            );
+        }
+        let created =
+            zeroclaw_config::alias_refs::create_map_key_checked(&mut working, &req.path, &req.key)
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         if created {
-            self.flush_config(&config_write_guard).await?;
+            working.mark_dirty(&format!("{}.{}", req.path, req.key));
+            self.save_and_swap_config(working, &config_write_guard)
+                .await?;
         }
         drop(agent_lifecycle_lease);
         to_result(ConfigMapKeyCreateResult {
@@ -3939,15 +3929,34 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
-        let _agent_lifecycle_lease = (req.path == "agents")
-            .then(|| self.ctx.agent_lifecycle.begin_delete(req.key.clone()))
-            .transpose()
-            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+        if req.path == "agents" {
+            let result = self
+                .handle_agent_delete(&serde_json::json!({ "alias": req.key }))
+                .await?;
+            let result: AgentDeleteResult = serde_json::from_value(result).map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Invalid agent delete result: {error}"),
+                )
+            })?;
+            if !result.deleted {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    result
+                        .error
+                        .unwrap_or_else(|| format!("agent `{}` was not deleted", result.alias)),
+                ));
+            }
+            return to_result(ConfigMapKeyDeleteResult {
+                path: req.path,
+                key: result.alias,
+                deleted: true,
+            });
+        }
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let refresh_channel_agent = (req.path == "agents").then(|| req.key.clone());
         let channel_generation_mutation = is_channel_generation_map_path(&req.path);
-        let old_channel_config = (refresh_channel_agent.is_some() || channel_generation_mutation)
-            .then(|| self.ctx.config.read().clone());
+        let old_channel_config =
+            channel_generation_mutation.then(|| self.ctx.config.read().clone());
         let channel_generation_revocation = self.prepare_channel_generation_revocation(
             channel_generation_mutation,
             old_channel_config.as_ref(),
@@ -3962,18 +3971,6 @@ impl RpcDispatcher {
                 .await?;
             self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
                 .await;
-            if let (Some(agent_alias), Some(old_config)) = (
-                refresh_channel_agent.as_deref(),
-                old_channel_config.as_ref(),
-            ) {
-                let new_config = self.ctx.config.read().clone();
-                self.refresh_live_channel_handles_after_agent_channel_mutation(
-                    old_config,
-                    &new_config,
-                    agent_alias,
-                )
-                .await;
-            }
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -3989,7 +3986,7 @@ impl RpcDispatcher {
         };
 
         Box::pin(async move {
-            let _agent_lifecycle_leases = if req.path == "agents" {
+            let agent_lifecycle_leases = if req.path == "agents" {
                 let active = self
                     .ctx
                     .sessions
@@ -4033,7 +4030,12 @@ impl RpcDispatcher {
             let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
             if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
                 return self
-                    .handle_config_alias_rename(req, kind, config_write_guard)
+                    .handle_config_alias_rename(
+                        req,
+                        kind,
+                        config_write_guard,
+                        agent_lifecycle_leases,
+                    )
                     .await;
             }
 
@@ -4075,6 +4077,7 @@ impl RpcDispatcher {
         req: ConfigMapKeyRenameParams,
         kind: zeroclaw_config::alias_refs::AliasKind,
         config_write_guard: ConfigWriteGuard,
+        agent_lifecycle_leases: Vec<crate::live_config_authority::AgentDeleteLease>,
     ) -> BoxRpcFuture<'a> {
         Box::pin(async move {
             let is_agent = matches!(&kind, zeroclaw_config::alias_refs::AliasKind::Agent);
@@ -4143,14 +4146,44 @@ impl RpcDispatcher {
             drop(config_write_guard);
             let new_workspace = is_agent.then(|| working.agent_workspace_dir(&req.to));
 
-            let mut warnings = Vec::new();
-            if let (Some(old_workspace), Some(new_workspace)) = (old_workspace, new_workspace) {
-                warnings.extend(move_renamed_agent_workspace(&old_workspace, &new_workspace).await);
-                warnings.extend(
-                    self.rename_agent_owned_state(&working, &req.from, &req.to)
-                        .await,
-                );
-            }
+            let warnings = if let (Some(old_workspace), Some(new_workspace)) =
+                (old_workspace, new_workspace)
+            {
+                let memory = self.ctx.memory.clone();
+                let session_backend = self.ctx.session_backend.clone();
+                let cleanup_config = working.clone();
+                let from = req.from.clone();
+                let to = req.to.clone();
+                crate::live_config_authority::spawn_agent_lifecycle_job(
+                    agent_lifecycle_leases,
+                    async move {
+                        let mut warnings: Vec<String> =
+                            move_renamed_agent_workspace(&old_workspace, &new_workspace)
+                                .await
+                                .into_iter()
+                                .collect();
+                        let owned = crate::agent_lifecycle::cascade_rename_agent(
+                            &cleanup_config,
+                            memory.as_ref(),
+                            session_backend.as_ref(),
+                            &from,
+                            &to,
+                        )
+                        .await;
+                        warnings.extend(owned.warnings);
+                        warnings
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Agent rename cleanup task failed: {error}"),
+                    )
+                })?
+            } else {
+                Vec::new()
+            };
 
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -4161,64 +4194,6 @@ impl RpcDispatcher {
                 warnings,
             })
         })
-    }
-
-    async fn rename_agent_owned_state(
-        &self,
-        config: &zeroclaw_config::schema::Config,
-        from: &str,
-        to: &str,
-    ) -> Vec<String> {
-        let mut warnings = Vec::new();
-        let mut memory_rows = 0usize;
-        let mut cron_jobs = 0usize;
-        let mut acp_sessions = 0usize;
-        let mut sessions_repointed = 0usize;
-
-        if let Some(mem) = &self.ctx.memory {
-            match mem.rename_agent(from, to).await {
-                Ok(n) => memory_rows = n,
-                Err(e) => warnings.push(format!("memory rename: {e}")),
-            }
-        }
-
-        match crate::cron::rename_jobs_by_agent(config, from, to) {
-            Ok(n) => cron_jobs = n,
-            Err(e) => warnings.push(format!("cron rename: {e}")),
-        }
-
-        match &self.ctx.acp_session_store {
-            Some(store) => match store.rename_sessions_by_agent(from, to) {
-                Ok(n) => acp_sessions = n,
-                Err(e) => warnings.push(format!("acp rename: {e}")),
-            },
-            None => warnings.push("acp store unavailable".to_string()),
-        }
-
-        if let Some(backend) = &self.ctx.session_backend {
-            match backend.rename_agent_attribution(from, to) {
-                Ok(n) => sessions_repointed = n,
-                Err(e) => warnings.push(format!("session attribution rename: {e}")),
-            }
-        }
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "from": from,
-                    "to": to,
-                    "memory": memory_rows,
-                    "cron": cron_jobs,
-                    "acp": acp_sessions,
-                    "sessions": sessions_repointed,
-                    "warnings": warnings.clone(),
-                })
-            ),
-            "agent renamed with RPC owned-state cascade"
-        );
-
-        warnings
     }
 
     fn handle_config_templates(&self) -> RpcResult {
@@ -4320,7 +4295,7 @@ impl RpcDispatcher {
     async fn handle_agent_delete(&self, params: &Value) -> RpcResult {
         let req: AgentDeleteParams = parse_params(params)?;
         let alias = req.alias;
-        let _lifecycle_lease = self
+        let lifecycle_lease = self
             .ctx
             .agent_lifecycle
             .begin_delete(alias.clone())
@@ -4383,24 +4358,47 @@ impl RpcDispatcher {
         let workspace = preflight
             .workspace
             .expect("an allowed configured agent has a workspace path");
-        let archive =
-            crate::agent_lifecycle::archive_agent_workspace(&working, &alias, &workspace).await;
-        let mut warnings = archive.warnings;
-        let fallback_memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
-            Arc::new(zeroclaw_memory::NoneMemory::new("none"));
-        let memory = self.ctx.memory.as_ref().unwrap_or(&fallback_memory);
-        if self.ctx.memory.is_none() {
-            warnings.push("memory backend unavailable; memory state was not purged".to_string());
-        }
-        let owned = crate::agent_lifecycle::cascade_owned_state(
-            &working,
-            memory,
-            self.ctx.session_backend.as_ref(),
-            &alias,
-            &archive.archive_dir,
-        )
-        .await;
-        warnings.extend(owned.warnings);
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = self
+            .ctx
+            .memory
+            .clone()
+            .unwrap_or_else(|| Arc::new(zeroclaw_memory::NoneMemory::new("none")));
+        let memory_unavailable = self.ctx.memory.is_none();
+        let session_backend = self.ctx.session_backend.clone();
+        let cleanup_alias = alias.clone();
+        let cleanup = crate::live_config_authority::spawn_agent_lifecycle_job(
+            vec![lifecycle_lease],
+            async move {
+                let archive = crate::agent_lifecycle::archive_agent_workspace(
+                    &working,
+                    &cleanup_alias,
+                    &workspace,
+                )
+                .await;
+                let mut warnings = archive.warnings;
+                if memory_unavailable {
+                    warnings.push(
+                        "memory backend unavailable; memory state was not purged".to_string(),
+                    );
+                }
+                let owned = crate::agent_lifecycle::cascade_owned_state(
+                    &working,
+                    &memory,
+                    session_backend.as_ref(),
+                    &cleanup_alias,
+                    &archive.archive_dir,
+                )
+                .await;
+                warnings.extend(owned.warnings);
+                warnings
+            },
+        );
+        let warnings = cleanup.await.map_err(|error| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("Agent delete cleanup task failed: {error}"),
+            )
+        })?;
 
         to_result(AgentDeleteResult {
             alias,
@@ -9582,7 +9580,7 @@ mod tests {
         run_rpc_dispatch_test(config_set_refreshes_existing_rpc_session_channel_handles_body);
     }
 
-    async fn config_delete_and_agent_map_delete_refresh_existing_channel_handles_body() {
+    async fn config_delete_refreshes_handles_and_agent_delete_refuses_live_session_body() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_channel_refresh_test_config(&tmp);
         let (mut dispatcher, mut rx, sessions) = make_channel_refresh_test_dispatcher(config);
@@ -9645,27 +9643,38 @@ mod tests {
         .await;
         assert_channel_refresh_map(&agent, true).await;
 
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            17,
-            "config/map-key-delete",
-            json!({
+        let delete = json!({
+            "jsonrpc": "2.0",
+            "id": 17,
+            "method": "config/map-key-delete",
+            "params": {
                 "path": "agents",
                 "key": "test-agent",
-            }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, false).await;
-        assert_reaction_denied_after_channel_refresh(&agent).await;
+            },
+        })
+        .to_string();
+        dispatcher.process_line_for_test(&delete).await;
+        let response = loop {
+            let raw = rx.recv().await.expect("JSON-RPC response");
+            let response: Value = serde_json::from_str(&raw).expect("valid JSON-RPC response");
+            if response.get("id") == Some(&json!(17)) {
+                break response;
+            }
+        };
         assert!(
-            !dispatcher
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("live session"))
+        );
+        assert_channel_refresh_map(&agent, true).await;
+        assert!(
+            dispatcher
                 .ctx
                 .config
                 .read()
                 .agents
                 .contains_key("test-agent"),
-            "agents map-key-delete must remove the alias from live config"
+            "agents map-key-delete must preserve an alias with a live session"
         );
 
         let sibling = sibling.lock().await;
@@ -9675,14 +9684,14 @@ mod tests {
                 .reaction
                 .read()
                 .contains_key("git.sibling"),
-            "deleting one agent must not alter a sibling session"
+            "a refused agent deletion must not alter a sibling session"
         );
     }
 
     #[test]
-    fn config_delete_and_agent_map_delete_refresh_existing_channel_handles() {
+    fn config_delete_refreshes_handles_and_agent_delete_refuses_live_session() {
         run_rpc_dispatch_test(
-            config_delete_and_agent_map_delete_refresh_existing_channel_handles_body,
+            config_delete_refreshes_handles_and_agent_delete_refuses_live_session_body,
         );
     }
 
@@ -11267,6 +11276,71 @@ mod tests {
 
         assert!(dispatcher.ctx.config.read().agents.contains_key("preserve"));
         assert!(workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn agent_create_save_failure_preserves_live_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config.config_path = blocked_parent.join("config.toml");
+        let dispatcher = make_config_set_test_dispatcher(config);
+
+        dispatcher
+            .handle_config_map_key_create(&json!({
+                "path": "agents",
+                "key": "must_not_publish",
+            }))
+            .await
+            .expect_err("save failure must abort agent creation");
+
+        assert!(
+            !dispatcher
+                .ctx
+                .config
+                .read()
+                .agents
+                .contains_key("must_not_publish")
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .agent_lifecycle
+                .reserve_admission("must_not_publish")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_agent_map_delete_uses_lifecycle_preflight() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config
+            .create_map_key("agents", "referenced")
+            .expect("create disposable agent");
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = "referenced".to_string();
+        let dispatcher = make_config_set_test_dispatcher(config);
+
+        let error = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "referenced",
+            }))
+            .await
+            .expect_err("legacy delete must refuse hard references");
+
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("heartbeat.agent"));
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .agents
+                .contains_key("referenced")
+        );
     }
 
     #[tokio::test]
