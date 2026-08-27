@@ -31060,6 +31060,7 @@ This is an example JSON object for profile settings."#;
             "plugin",
             "acp-server",
             "acp_server",
+            "whatsapp",
         ]);
 
         for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
@@ -31074,8 +31075,9 @@ This is an example JSON object for profile settings."#;
                 let feature_available =
                     !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
                         || cfg!(feature = "whatsapp-web");
-                let claimed =
-                    feature_available && error.downcast_ref::<UnknownChannelId>().is_none();
+                let claimed = feature_available
+                    && !intentionally_unsupported.contains(key)
+                    && error.downcast_ref::<UnknownChannelId>().is_none();
                 let expected = feature_available && !intentionally_unsupported.contains(key);
                 assert_eq!(
                     claimed, expected,
@@ -34027,6 +34029,7 @@ Done."#;
             "plugin",
             "acp-server",
             "acp_server",
+            "whatsapp",
         ]);
 
         for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
@@ -34053,6 +34056,13 @@ Done."#;
                 );
             }
         }
+    }
+
+    #[test]
+    #[cfg(all(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
+    fn compiled_channel_guards_keep_whatsapp_cloud_explicit_under_dual_backends() {
+        compiled_channel_keys_have_intentional_one_shot_builder_support();
+        compiled_channel_keys_have_intentional_announcement_delivery_registration();
     }
 
     #[tokio::test]
