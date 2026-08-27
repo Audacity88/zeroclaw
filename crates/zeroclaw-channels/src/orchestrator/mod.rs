@@ -103,6 +103,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -142,6 +144,8 @@ static LIVE_CHANNEL_REGISTRY_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::
 
 #[cfg(test)]
 static LIVE_CHANNEL_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+static CHANNEL_LISTENER_SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Reset live channel state before a daemon generation starts. RPC listeners wait
 /// for publication when channels are expected, avoiding permanently under-seeded sessions.
@@ -12491,8 +12495,8 @@ pub async fn start_channels_with_authority(
     let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
-        None;
+    let mut configured_channels: Vec<ConfiguredChannel> = Vec::new();
+    let mut startup_display: Option<(String, String)> = None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
@@ -12771,16 +12775,14 @@ pub async fn start_channels_with_authority(
                 );
             }
 
-            #[allow(unused_mut)]
-            let mut configured_channels: Vec<ConfiguredChannel> =
-                collect_configured_channels_with_authority(
-                    &config_arc,
-                    &authority,
-                    "runtime startup",
-                    &tool_specs,
-                    sop_engine.clone(),
-                    sop_audit.clone(),
-                );
+            configured_channels = collect_configured_channels_with_authority(
+                &config_arc,
+                &authority,
+                "runtime startup",
+                &tool_specs,
+                sop_engine.clone(),
+                sop_audit.clone(),
+            );
 
             #[cfg(feature = "channel-nostr")]
             {
@@ -12866,72 +12868,22 @@ pub async fn start_channels_with_authority(
                 .iter()
                 .map(|cc| Arc::clone(&cc.channel))
                 .collect();
-            if channels.is_empty() {
-                registry_startup.publish(None);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "No active channels to supervise (none configured or all disabled). \
-                     Waiting for reload signal."
-                );
-                cancel.cancelled().await;
-                return Ok(());
+            if !channels.is_empty() {
+                let channel_labels: Vec<String> = configured_channels
+                    .iter()
+                    .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
+                    .collect();
+                collected_channel_keys = channel_labels.clone();
+                startup_display = Some((model.clone(), agent_alias.clone()));
             }
 
-            println!("🦀 ZeroClaw Channel Server");
-            println!("  🤖 Model:    {model} (agent: {agent_alias})");
-            let effective_backend = config.resolve_active_storage().kind();
-            println!(
-                "  🧠 Memory:   {} (auto-save: {})",
-                effective_backend,
-                if config.memory.auto_save { "on" } else { "off" }
-            );
-            let channel_labels: Vec<String> = configured_channels
-                .iter()
-                .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
-                .collect();
-            collected_channel_keys = channel_labels.clone();
-            println!("  📡 Channels: {}", channel_labels.join(", "));
-            println!("  🤖 Agents:   {}", enabled_agents.join(", "));
-            println!();
-            println!("  Listening for messages... (Ctrl+C to stop)");
-            println!();
-
-            zeroclaw_runtime::health::mark_component_ok("channels");
-
-            let initial_backoff_secs = config
-                .reliability
-                .channel_initial_backoff_secs
-                .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
-            let max_backoff_secs = config
-                .reliability
-                .channel_max_backoff_secs
-                .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
-
-            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
-
-            for cc in &configured_channels {
-                listener_handles.push(spawn_supervised_listener(
-                    cc.channel.clone(),
-                    cc.alias.clone(),
-                    tx.clone(),
-                    initial_backoff_secs,
-                    max_backoff_secs,
-                    cancel.clone(),
-                ));
-            }
-            drop(tx);
-
-            // Composite-key registry (see `composite_channel_key`).
+            // Build the complete channel map before any listener or registry
+            // publication. The map is needed by every agent's runtime context.
             let cbn = Arc::new(configured_channel_map(&configured_channels));
-            registry_startup.publish(Some(Arc::clone(&cbn)));
-
             let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
-            println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
             channels_by_name_shared = Some(cbn);
-            rx_holder = Some(rx);
         }
 
         let channels_by_name = Arc::clone(
@@ -13073,6 +13025,18 @@ pub async fn start_channels_with_authority(
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
     }
 
+    if configured_channels.is_empty() {
+        registry_startup.publish(None);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "No active channels to supervise (none configured or all disabled). \
+             Waiting for reload signal."
+        );
+        cancel.cancelled().await;
+        return Ok(());
+    }
+
     let owner_by_channel_key =
         build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
 
@@ -13164,9 +13128,62 @@ pub async fn start_channels_with_authority(
     let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit)
         .with_agent_lifecycle(authority.agent_lifecycle());
 
-    let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
-        max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
+        max_in_flight_messages.expect("max_in_flight initialized during channel setup");
+
+    let initial_backoff_secs = config
+        .reliability
+        .channel_initial_backoff_secs
+        .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
+    let max_backoff_secs = config
+        .reliability
+        .channel_max_backoff_secs
+        .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
+
+    let (display_model, display_agent) =
+        startup_display.expect("startup display initialized during channel setup");
+    println!("🦀 ZeroClaw Channel Server");
+    println!("  🤖 Model:    {display_model} (agent: {display_agent})");
+    let effective_backend = config.resolve_active_storage().kind();
+    println!(
+        "  🧠 Memory:   {} (auto-save: {})",
+        effective_backend,
+        if config.memory.auto_save { "on" } else { "off" }
+    );
+    let channel_labels: Vec<String> = configured_channels
+        .iter()
+        .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
+        .collect();
+    println!("  📡 Channels: {}", channel_labels.join(", "));
+    println!("  🤖 Agents:   {}", enabled_agents.join(", "));
+    println!();
+    println!("  Listening for messages... (Ctrl+C to stop)");
+    println!();
+    zeroclaw_runtime::health::mark_component_ok("channels");
+    println!("  🚦 In-flight message limit: {max_in_flight}");
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+    #[cfg(test)]
+    CHANNEL_LISTENER_SPAWN_COUNT.fetch_add(configured_channels.len(), Ordering::Relaxed);
+    for cc in &configured_channels {
+        listener_handles.push(spawn_supervised_listener(
+            cc.channel.clone(),
+            cc.alias.clone(),
+            tx.clone(),
+            initial_backoff_secs,
+            max_backoff_secs,
+            cancel.clone(),
+        ));
+    }
+    drop(tx);
+
+    // Composite-key registry (see `composite_channel_key`).
+    registry_startup.publish(Some(Arc::clone(
+        channels_by_name_shared
+            .as_ref()
+            .expect("channels_by_name initialized before agent construction"),
+    )));
+
     let shutdown_deadline =
         run_message_dispatch_loop_with_cancel(rx, router, max_in_flight, cancel.clone()).await;
 
@@ -15172,6 +15189,8 @@ api_key = "test-key"
 "#,
         )
         .unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        config.data_dir = data_dir.path().to_path_buf();
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
@@ -15205,6 +15224,86 @@ api_key = "test-key"
                 .expect("readiness waiter task must join"),
             "startup failure must publish an explicit unavailable registry"
         );
+        assert!(live_channel_map().is_empty());
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn channel_startup_failure_after_first_agent_does_not_start_listeners_or_publish_registry()
+     {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
+        let previous_registry = LIVE_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let previous_ready = LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire);
+        let _restore = RestoreLiveRegistry {
+            registry: previous_registry,
+            ready: previous_ready,
+        };
+        prepare_live_channel_registry(true);
+        CHANNEL_LISTENER_SPAWN_COUNT.store(0, Ordering::Release);
+
+        let mut config: Config = toml::from_str(
+            r#"
+[agents.first]
+model_provider = "openrouter.default"
+risk_profile = "default"
+channels = ["telegram.default"]
+
+[agents.second]
+model_provider = "openrouter.default"
+risk_profile = "missing"
+channels = ["telegram.default"]
+
+[providers.models.openrouter.default]
+model = "test-model"
+api_key = "test-key"
+
+[risk_profiles.default]
+"#,
+        )
+        .unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        config.data_dir = data_dir.path().to_path_buf();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let waiter_cancel = CancellationToken::new();
+        let waiter = {
+            let waiter_cancel = waiter_cancel.clone();
+            zeroclaw_spawn::spawn!(
+                async move { wait_for_live_channel_registry(&waiter_cancel).await }
+            )
+        };
+        tokio::task::yield_now().await;
+
+        let startup_error = start_channels(config, None, CancellationToken::new(), None, None)
+            .await
+            .expect_err("the later invalid agent must fail before listener startup");
+        assert!(
+            startup_error.to_string().contains("risk_profiles"),
+            "startup must fail while validating the later agent: {startup_error:#}"
+        );
+        assert_eq!(
+            CHANNEL_LISTENER_SPAWN_COUNT.load(Ordering::Acquire),
+            0,
+            "a later agent failure must not leave a partial listener generation"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("RPC readiness waiter must be released after startup failure")
+                .expect("readiness waiter task must join"),
+            "startup failure must publish unavailable readiness"
+        );
+        assert!(LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire));
         assert!(live_channel_map().is_empty());
     }
 
