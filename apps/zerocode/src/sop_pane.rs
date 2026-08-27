@@ -747,6 +747,8 @@ impl SopPane {
         self.graph = SopGraphView::default();
         self.overlay = None;
         self.current_run_id = None;
+        self.run_input = None;
+        self.run_payload_input = None;
     }
 
     fn project_saved_name(&mut self, name: &str) {
@@ -2884,6 +2886,8 @@ mod list_refresh_tests {
         });
         pane.overlay = Some(Default::default());
         pane.current_run_id = Some("run-alpha".to_string());
+        pane.run_input = Some("run-alpha".to_string());
+        pane.run_payload_input = Some(r#"{"source":"alpha"}"#.to_string());
 
         pane.refresh();
         let request_id = receive_list_request(&mut rx).await;
@@ -2895,6 +2899,22 @@ mod list_refresh_tests {
         assert!(pane.graph.nodes.is_empty());
         assert!(pane.overlay.is_none());
         assert!(pane.current_run_id.is_none());
+        assert!(pane.run_input.is_none());
+        assert!(pane.run_payload_input.is_none());
+
+        let mut submit_stale_prompt = Box::pin(async {
+            if pane.run_input.is_some() {
+                pane.submit_run_input().await;
+            }
+        });
+        tokio::select! {
+            _ = &mut submit_stale_prompt => {}
+            raw = rx.recv() => {
+                let raw = raw.expect("RPC writer should remain connected");
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                panic!("stale alpha prompt issued an RPC for beta: {request}");
+            }
+        }
     }
 
     #[tokio::test]
