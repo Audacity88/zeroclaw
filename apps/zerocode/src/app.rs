@@ -378,10 +378,10 @@ async fn switch_mode(
     if *mode == Mode::Dashboard && next != Mode::Dashboard {
         dashboard_pane.on_pane_blur();
     }
-    if *mode == Mode::Quickstart && next != Mode::Quickstart {
+    if *mode == Mode::Quickstart && next != Mode::Quickstart && rpc_dispatch_allowed(conn_state) {
         quickstart.dismiss_beacon().await;
     }
-    if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
+    if rpc_dispatch_allowed(conn_state) {
         match next {
             Mode::Acp => acp_pane.refresh_if_inactive().await,
             Mode::Chat => chat_pane.refresh_if_inactive().await,
@@ -754,44 +754,60 @@ pub async fn run(
         }
 
         let input_event = if let Some(pending) = pending_event.take() {
-            pending
+            Some(pending)
         } else {
             // Poll for input with a timeout so live panes refresh periodically.
-            if !event::poll(TICK)? {
-                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
-                    continue;
-                }
-                if mode == Mode::Dashboard {
-                    dashboard_pane.tick().await;
-                }
-                if mode == Mode::Logs {
-                    logs_pane.tick().await;
-                }
-                if mode == Mode::Quickstart {
-                    quickstart.tick().await;
-                }
-                if mode == Mode::Sop {
-                    sop_pane.tick();
-                }
-                consume_pending_quickstart_chat(
-                    &conn_state,
-                    &reconnect_state,
-                    &mut mode,
-                    &mut chat_pane,
-                )
-                .await;
+            if event::poll(TICK)? {
+                Some(event::read()?)
+            } else {
+                None
+            }
+        };
+        let (input_event, next_pending) = match input_event {
+            Some(input_event) => {
+                let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
+                    if event::poll(Duration::ZERO)? {
+                        Ok(Some(event::read()?))
+                    } else {
+                        Ok(None)
+                    }
+                })?;
+                (Some(input_event), next_pending)
+            }
+            None => (None, None),
+        };
+        pending_event = next_pending;
+
+        // The frame snapshot predates terminal polling and can become stale while
+        // the event loop waits. Every post-poll RPC dispatch gate must share this
+        // one fresh state so a disconnect cannot enter any dead-client handler.
+        let dispatch_conn_state = rpc.connection_state();
+
+        let Some(input_event) = input_event else {
+            if !rpc_dispatch_allowed(&dispatch_conn_state) {
                 continue;
             }
-            event::read()?
-        };
-        let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
-            if event::poll(Duration::ZERO)? {
-                Ok(Some(event::read()?))
-            } else {
-                Ok(None)
+            if mode == Mode::Dashboard {
+                dashboard_pane.tick().await;
             }
-        })?;
-        pending_event = next_pending;
+            if mode == Mode::Logs {
+                logs_pane.tick().await;
+            }
+            if mode == Mode::Quickstart {
+                quickstart.tick().await;
+            }
+            if mode == Mode::Sop {
+                sop_pane.tick();
+            }
+            consume_pending_quickstart_chat(
+                &dispatch_conn_state,
+                &reconnect_state,
+                &mut mode,
+                &mut chat_pane,
+            )
+            .await;
+            continue;
+        };
 
         match input_event {
             Event::Key(key) => {
@@ -835,10 +851,7 @@ pub async fn run(
                     _ => false,
                 };
                 if global == Some(GlobalAction::Quit)
-                    && should_handle_global_quit_at_dispatch(
-                        || rpc.connection_state(),
-                        pane_wants_quit_chord,
-                    )
+                    && should_handle_global_quit(&dispatch_conn_state, pane_wants_quit_chord)
                 {
                     // First Ctrl+C: clear input bar text, clear transient
                     // state (browse mode, overlay, …) and arm the confirm modal.
@@ -867,10 +880,12 @@ pub async fn run(
                     match ModalAction::from_chord(&key) {
                         Some(ModalAction::Confirm) => {
                             reload_confirm = false;
-                            reload_status = Some(match rpc.config_reload().await {
-                                Ok(_) => crate::i18n::t("zc-app-reload-status-signalled"),
-                                Err(e) => format!("Reload requested ({e})"),
-                            });
+                            if rpc_dispatch_allowed(&dispatch_conn_state) {
+                                reload_status = Some(match rpc.config_reload().await {
+                                    Ok(_) => crate::i18n::t("zc-app-reload-status-signalled"),
+                                    Err(e) => format!("Reload requested ({e})"),
+                                });
+                            }
                         }
                         Some(ModalAction::Cancel) => {
                             reload_confirm = false;
@@ -911,8 +926,7 @@ pub async fn run(
                 };
                 // Disconnected panes are skipped below to avoid dead-socket RPCs,
                 // so a retained editor cannot consume its local cursor chord.
-                let pane_can_receive_editor_chord =
-                    !matches!(conn_state, ConnectionState::Disconnected { .. });
+                let pane_can_receive_editor_chord = rpc_dispatch_allowed(&dispatch_conn_state);
                 let switch_to = pane_switch_delta(
                     global,
                     editor_claims_pane_navigation,
@@ -923,7 +937,7 @@ pub async fn run(
                     switch_mode(
                         &mut mode,
                         next,
-                        &conn_state,
+                        &dispatch_conn_state,
                         &mut dashboard_pane,
                         &mut quickstart,
                         &mut acp_pane,
@@ -943,7 +957,7 @@ pub async fn run(
 
                 // Skip pane key handlers when disconnected — they may
                 // issue RPC calls that hang on the dead socket.
-                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                if !rpc_dispatch_allowed(&dispatch_conn_state) {
                     continue;
                 }
 
@@ -973,7 +987,7 @@ pub async fn run(
                     switch_mode(
                         &mut mode,
                         Mode::Dashboard,
-                        &conn_state,
+                        &dispatch_conn_state,
                         &mut dashboard_pane,
                         &mut quickstart,
                         &mut acp_pane,
@@ -983,7 +997,7 @@ pub async fn run(
                     .await;
                 }
                 consume_pending_quickstart_chat(
-                    &conn_state,
+                    &dispatch_conn_state,
                     &reconnect_state,
                     &mut mode,
                     &mut chat_pane,
@@ -1013,7 +1027,7 @@ pub async fn run(
                     switch_mode(
                         &mut mode,
                         next,
-                        &conn_state,
+                        &dispatch_conn_state,
                         &mut dashboard_pane,
                         &mut quickstart,
                         &mut acp_pane,
@@ -1033,7 +1047,7 @@ pub async fn run(
                     continue;
                 }
                 // Forward to active pane (skip when disconnected).
-                if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                if rpc_dispatch_allowed(&dispatch_conn_state) {
                     match mode {
                         Mode::Dashboard => {
                             dashboard_pane.handle_mouse(mouse, content_area);
@@ -1061,7 +1075,7 @@ pub async fn run(
                         }
                     }
                     consume_pending_quickstart_chat(
-                        &conn_state,
+                        &dispatch_conn_state,
                         &reconnect_state,
                         &mut mode,
                         &mut chat_pane,
@@ -1077,7 +1091,7 @@ pub async fn run(
                     state.scroll = 0;
                 }
             }
-            Event::Paste(text) if !matches!(conn_state, ConnectionState::Disconnected { .. }) => {
+            Event::Paste(text) if rpc_dispatch_allowed(&dispatch_conn_state) => {
                 match mode {
                     Mode::Chat => chat_pane.handle_paste(&text),
                     Mode::Acp => acp_pane.handle_paste(&text),
@@ -1089,7 +1103,7 @@ pub async fn run(
                     Mode::Sop => sop_pane.handle_paste(&text),
                 }
                 consume_pending_quickstart_chat(
-                    &conn_state,
+                    &dispatch_conn_state,
                     &reconnect_state,
                     &mut mode,
                     &mut chat_pane,
@@ -1152,14 +1166,11 @@ fn pane_switch_delta(
 }
 
 fn should_handle_global_quit(conn_state: &ConnectionState, pane_wants_quit_chord: bool) -> bool {
-    !pane_wants_quit_chord || matches!(conn_state, ConnectionState::Disconnected { .. })
+    !pane_wants_quit_chord || !rpc_dispatch_allowed(conn_state)
 }
 
-fn should_handle_global_quit_at_dispatch(
-    read_connection_state: impl FnOnce() -> ConnectionState,
-    pane_wants_quit_chord: bool,
-) -> bool {
-    should_handle_global_quit(&read_connection_state(), pane_wants_quit_chord)
+fn rpc_dispatch_allowed(conn_state: &ConnectionState) -> bool {
+    !matches!(conn_state, ConnectionState::Disconnected { .. })
 }
 
 fn resolve_agent_overrides(
@@ -2276,18 +2287,20 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_dispatch_state_overrides_connected_frame_snapshot() {
+    fn post_poll_snapshot_blocks_tick_and_non_quit_dispatch_after_disconnect() {
         let live_state = std::cell::RefCell::new(ConnectionState::Connected);
         let frame_state = live_state.borrow().clone();
         *live_state.borrow_mut() = ConnectionState::Disconnected {
             reason: "disconnected while waiting for input".into(),
         };
+        let dispatch_state = live_state.borrow().clone();
+        let tick_may_dispatch = rpc_dispatch_allowed(&dispatch_state);
+        let non_quit_key_may_dispatch = rpc_dispatch_allowed(&dispatch_state);
 
         assert!(matches!(frame_state, ConnectionState::Connected));
-        assert!(should_handle_global_quit_at_dispatch(
-            || live_state.borrow().clone(),
-            true,
-        ));
+        assert!(!tick_may_dispatch);
+        assert!(!non_quit_key_may_dispatch);
+        assert!(should_handle_global_quit(&dispatch_state, true));
     }
 
     #[tokio::test]
