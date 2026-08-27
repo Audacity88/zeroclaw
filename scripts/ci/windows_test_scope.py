@@ -13,6 +13,7 @@ from pathlib import PurePosixPath
 
 
 DESKTOP_PACKAGE = "zeroclaw-desktop"
+PLUGIN_HOST_PACKAGE = "zeroclaw-plugins"
 SAFE_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$")
 DOC_SUFFIXES = {".md", ".mdx", ".markdown", ".rst"}
 FULL_PATHS = {
@@ -36,6 +37,10 @@ PLUGIN_HOST_EXACT_PATHS = {
     "tests/plugin_channel_runtime_e2e.rs",
 }
 PLUGIN_HOST_SCRIPT_PREFIX = "scripts/ci/plugin_backend_change_filter"
+PLUGIN_HOST_CONTROL_PREFIXES = (
+    ".cargo/",
+    ".github/actions/",
+)
 DYNAMIC_TEST_FIXTURE_PREFIX = "crates/zeroclaw-plugins/tests/fixtures/"
 
 
@@ -62,7 +67,9 @@ def requires_plugin_host(changed_paths: list[str]) -> bool:
     return any(
         path in PLUGIN_HOST_EXACT_PATHS
         or path.startswith(PLUGIN_HOST_PATH_PREFIXES)
+        or path.startswith(PLUGIN_HOST_CONTROL_PREFIXES)
         or (path.startswith(PLUGIN_HOST_SCRIPT_PREFIX) and path.endswith(".sh"))
+        or PurePosixPath(path).name in {"rust-toolchain", "rust-toolchain.toml"}
         for path in changed_paths
     )
 
@@ -303,6 +310,7 @@ def select_pull_request(
     if not selected:
         return Selection("skip", (), "No covered Rust compilation or test paths changed.", needs_plugin_host)
     selected = close_over_reverse_dependents(selected, reverse_dependents)
+    needs_plugin_host = needs_plugin_host or PLUGIN_HOST_PACKAGE in selected
     return Selection(
         "scoped", tuple(sorted(selected)), "Changed paths map to workspace packages.", needs_plugin_host
     )

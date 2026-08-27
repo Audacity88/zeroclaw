@@ -10,6 +10,8 @@ trap 'rm -rf "$fixture_dir"' EXIT
 
 repo_root="${fixture_dir}/repo"
 mkdir -p "$repo_root/crates/zeroclaw-channels" \
+    "$repo_root/crates/zeroclaw-api" \
+    "$repo_root/crates/zeroclaw-plugins" \
     "$repo_root/crates/zeroclaw-providers" \
     "$repo_root/crates/zeroclaw-plugins/tests/fixtures/channel-fixture" \
     "$repo_root/apps/tauri"
@@ -18,22 +20,28 @@ cat > "$metadata_file" <<EOF
 {
   "packages": [
     {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "name": "zeroclaw", "manifest_path": "Cargo.toml"},
+    {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "name": "zeroclaw-api", "manifest_path": "crates/zeroclaw-api/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "name": "zeroclaw-channels", "manifest_path": "crates/zeroclaw-channels/Cargo.toml"},
+    {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "name": "zeroclaw-plugins", "manifest_path": "crates/zeroclaw-plugins/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "name": "zeroclaw-providers", "manifest_path": "crates/zeroclaw-providers/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "name": "zeroclaw-channel-plugin-fixture", "manifest_path": "crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml"},
     {"id": "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4", "name": "zeroclaw-desktop", "manifest_path": "apps/tauri/Cargo.toml"}
   ],
   "workspace_members": [
     "path+file://${repo_root}#zeroclaw 0.8.4",
+    "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4",
+    "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0",
     "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4"
   ],
   "resolve": {
     "nodes": [
-      {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
+      {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
+      {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "deps": []},
+      {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}]},
       {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "deps": []},
       {"id": "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}]}
@@ -85,6 +93,9 @@ assert_selection "skip" skip '[]' 'No covered Rust compilation or test paths cha
 
 printf '%s\n' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
 assert_selection "one package and reverse dependent" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
+
+printf '%s\n' 'crates/zeroclaw-api/src/lib.rs' > "$paths_file"
+assert_selection "plugin host from reverse-dependent closure" scoped '["zeroclaw","zeroclaw-api","zeroclaw-plugins"]' '' "$paths_file" true
 
 printf '%s\n' 'crates/zeroclaw-providers/src/lib.rs' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
 assert_selection "multiple packages" scoped '["zeroclaw","zeroclaw-channels","zeroclaw-providers"]' '' "$paths_file"
@@ -144,7 +155,13 @@ assert_selection "lockfile with source change" full '[]' 'Cargo.lock changes req
 assert_selection "desktop exclusion" skip '[]' 'No covered Rust compilation or test paths changed.' <(printf '%s\n' 'apps/tauri/src/main.rs')
 
 printf '%s\n' '.cargo/config.toml' > "$paths_file"
-assert_selection "cargo configuration" full '[]' '' "$paths_file"
+assert_selection "cargo configuration" full '[]' '' "$paths_file" true
+
+printf '%s\n' '.github/actions/rust-cache/action.yml' > "$paths_file"
+assert_selection "workflow action" full '[]' '' "$paths_file" true
+
+printf '%s\n' 'rust-toolchain.toml' > "$paths_file"
+assert_selection "Rust toolchain" full '[]' '' "$paths_file" true
 
 printf '%s\n' '.github/workflows/ci.yml' > "$paths_file"
 assert_selection "workflow itself exercises plugin host path" full '[]' '' "$paths_file" true
