@@ -232,10 +232,6 @@ fn is_line_user_allowed(state: &LineState, user_id: &str) -> bool {
 /// via the shared Config handle. Mirrors telegram/wechat's `persist_allowed_identity`.
 /// No-op-with-warn when `state.persist` is unset (test fixtures).
 async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-
     let Some(authority) = &state.persist else {
         ::zeroclaw_log::record!(
             WARN,
@@ -250,38 +246,13 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     if normalized.is_empty() {
         anyhow::bail!("Cannot persist empty LINE userId");
     }
-    let config_write_lock = authority.config_write_lock();
-    let _config_write_guard = config_write_lock.lock().await;
-    let config = authority.config();
-    let group_name = format!("line_{}", state.alias);
-    let channel_ref = ChannelRef::new(format!("line.{}", state.alias));
-    let snapshot = {
-        let mut cfg = config.write();
-        if !cfg.channels.line.contains_key(&state.alias) {
-            anyhow::bail!("Missing [channels.line.{}] section", state.alias);
-        }
-        let group = cfg
-            .peer_groups
-            .entry(group_name)
-            .or_insert_with(|| PeerGroupConfig {
-                channel: channel_ref,
-                ..PeerGroupConfig::default()
-            });
-        if group
-            .external_peers
-            .iter()
-            .any(|p| p.as_str() == normalized)
-        {
-            return Ok(());
-        }
-        group.external_peers.push(PeerUsername::new(normalized));
-        cfg.clone()
-    };
-    snapshot
-        .save()
-        .await
-        .context("Failed to persist LINE paired userId to config.toml")?;
-    Ok(())
+    crate::identity_persist::persist_external_peer(
+        Some(authority),
+        "line",
+        &state.alias,
+        &normalized,
+    )
+    .await
 }
 
 async fn handle_webhook(
@@ -1270,6 +1241,54 @@ mod tests {
             &authority.config_write_lock(),
             &stored.config_write_lock()
         ));
+    }
+
+    #[tokio::test]
+    async fn paired_identity_save_failure_does_not_publish_line_peer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let mut config = Config::default();
+        config
+            .channels
+            .line
+            .insert("line_test_alias".to_string(), Default::default());
+        config.config_path = blocked_parent.join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let channel = make_channel().with_persistence_authority(authority.clone());
+        let (tx, _rx) = mpsc::channel(1);
+        let state = LineState {
+            tx,
+            channel_secret: channel.channel_secret.clone(),
+            bot_user_id: "bot-user".to_string(),
+            dm_policy: channel.dm_policy.clone(),
+            group_policy: channel.group_policy.clone(),
+            alias: channel.alias.clone(),
+            peer_resolver: Arc::clone(&channel.peer_resolver),
+            persist: channel.persist.clone(),
+            pairing: channel.pairing.clone(),
+            pending_tokens: Arc::clone(&channel.pending_tokens),
+            client: channel.client.clone(),
+            channel_access_token: channel.channel_access_token.clone(),
+            api_base_url: channel.api_base_url.clone(),
+            content_api_base_url: channel.content_api_base_url.clone(),
+            sender_name_resolver: Arc::clone(&channel.sender_name_resolver),
+            sender_icon: Arc::clone(&channel.sender_icon),
+            transcription_manager: channel.transcription_manager.clone(),
+        };
+
+        persist_line_paired_identity(&state, "line-user")
+            .await
+            .expect_err("save failure must reject paired identity");
+
+        assert!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("line", "line_test_alias")
+                .is_empty()
+        );
     }
 
     /// Compute a valid `X-Line-Signature` for `body` signed with `secret`.

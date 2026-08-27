@@ -1099,8 +1099,6 @@ impl TelegramChannel {
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-
         let Some(authority) = &self.persist else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1115,42 +1113,13 @@ impl TelegramChannel {
         if normalized.is_empty() {
             anyhow::bail!("Cannot persist empty Telegram identity");
         }
-        let config_write_lock = authority.config_write_lock();
-        let _config_write_guard = config_write_lock.lock().await;
-        let config = authority.config();
-        let group_name = format!("telegram_{}", self.alias);
-        let channel_ref: zeroclaw_config::providers::ChannelRef =
-            format!("telegram.{}", self.alias).into();
-        let snapshot = {
-            let mut cfg = config.write();
-            if !cfg.channels.telegram.contains_key(&self.alias) {
-                anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot_token <token>` to configure.",
-                    self.alias
-                );
-            }
-            let group = cfg
-                .peer_groups
-                .entry(group_name)
-                .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref,
-                    ..PeerGroupConfig::default()
-                });
-            if group
-                .external_peers
-                .iter()
-                .any(|p| Self::normalize_identity(p.as_str()) == normalized)
-            {
-                return Ok(());
-            }
-            group.external_peers.push(PeerUsername::new(normalized));
-            cfg.clone()
-        };
-        snapshot
-            .save()
-            .await
-            .context("Failed to persist Telegram peer to config.toml")?;
-        Ok(())
+        crate::identity_persist::persist_external_peer(
+            Some(authority),
+            "telegram",
+            &self.alias,
+            &normalized,
+        )
+        .await
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {
@@ -4767,6 +4736,41 @@ mod tests {
             &authority.config_write_lock(),
             &stored.config_write_lock()
         ));
+    }
+
+    #[tokio::test]
+    async fn paired_identity_save_failure_does_not_publish_telegram_peer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let mut config = Config::default();
+        config
+            .channels
+            .telegram
+            .insert("default".to_string(), Default::default());
+        config.config_path = blocked_parent.join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let channel = TelegramChannel::new(
+            "test-token".into(),
+            "default",
+            Arc::new(|| Vec::<String>::new()),
+            false,
+        )
+        .with_persistence_authority(authority.clone());
+
+        channel
+            .persist_allowed_identity("someone")
+            .await
+            .expect_err("save failure must reject paired identity");
+
+        assert!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("telegram", "default")
+                .is_empty()
+        );
     }
 
     #[test]

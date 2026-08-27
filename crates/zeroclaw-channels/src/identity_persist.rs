@@ -6,17 +6,17 @@
 //! is the dotted `<channel_type>.<alias>` instance ref — the same
 //! channel-ref contract `Config::channel_external_peers` matches at
 //! message-time (the runtime reader never looks at the map key). This
-//! module is the single writer for that shape: WeChat and WhatsApp Web
-//! both persist through it, so the two channels can never drift into
+//! module is the single writer for that shape: Telegram, LINE, WeChat, and
+//! WhatsApp Web all persist through it, so the channels cannot drift into
 //! different on-disk layouts (and no channel grows a local allowlist
 //! cache).
 //!
 //! Writes go through the shared live-config authority the orchestrator wires
-//! into each channel — acquire its mutation witness, mutate canonical
-//! in-memory state under the config lock, then persist a snapshot with
-//! `Config::save()`. Channels constructed without the handle (tests, one-shot CLI runs) skip
-//! persistence with a warning: pairing still works for the process
-//! lifetime, it just isn't durable.
+//! into each channel: acquire its mutation witness, clone and mutate a
+//! snapshot, persist it with `Config::save()`, then publish it in memory.
+//! Channels constructed without the handle (tests, one-shot CLI runs) skip
+//! persistence with a warning: pairing still works for the process lifetime,
+//! it just isn't durable.
 
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::LiveConfigAuthority;
@@ -142,8 +142,8 @@ pub(crate) fn merge_external_peer(
 
 /// Persist a paired identity as an authorized external peer.
 ///
-/// Mutates the shared canonical config under the write lock via
-/// [`merge_external_peer`], then saves a snapshot to `config.toml`.
+/// Clones the shared canonical config under the write lock, mutates the clone
+/// via [`merge_external_peer`], saves it to `config.toml`, then publishes it.
 /// Idempotent: an already-authorized identity returns without writing, so
 /// callers may invoke this on every connect/reconnect. `persist = None`
 /// (no handle wired) warns and succeeds without persisting.
