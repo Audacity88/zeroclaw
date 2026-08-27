@@ -5320,6 +5320,9 @@ enum LinesDirty {
     Full,
 }
 
+const MAX_RENDERED_ENTRIES: usize = 1_000;
+const RENDER_WINDOW_SHIFT_ENTRIES: usize = MAX_RENDERED_ENTRIES / 2;
+
 /// Scrollbar drag captured on mouse-down on the track.
 #[derive(Debug, Clone, Copy)]
 struct ScrollbarDrag {
@@ -6323,14 +6326,24 @@ impl ChatState {
             self.dirty = LinesDirty::Full;
             self.cached_render_width = width;
         }
-        const MAX_RENDERED_ENTRIES: usize = 1_000;
         let total = self.entries.len();
         let natural_start = total.saturating_sub(MAX_RENDERED_ENTRIES);
-        let start = if let Some((lo, _hi)) = self.browse_range() {
-            natural_start.min(lo)
-        } else {
+        let mut start = if self.pinned_to_bottom || self.cached_render_width == 0 {
             natural_start
+        } else {
+            self.cached_render_start.min(natural_start)
         };
+        if let Some(cursor) = self.browse_cursor {
+            if cursor < start {
+                start = cursor;
+            } else if cursor >= start.saturating_add(MAX_RENDERED_ENTRIES) {
+                start = cursor
+                    .saturating_add(1)
+                    .saturating_sub(MAX_RENDERED_ENTRIES);
+            }
+        }
+        start = start.min(natural_start);
+        let end = start.saturating_add(MAX_RENDERED_ENTRIES).min(total);
 
         // Incremental append path.
         if self.dirty == LinesDirty::Appended && start == self.cached_render_start {
@@ -6338,7 +6351,7 @@ impl ChatState {
             let show_thoughts = self.show_thoughts;
             let mut new_lines = Vec::new();
             let mut new_ranges = Vec::new();
-            for (rel_idx, entry) in self.entries[render_from..].iter().enumerate() {
+            for (rel_idx, entry) in self.entries[render_from..end].iter().enumerate() {
                 let abs_idx = render_from + rel_idx;
                 let before = new_lines.len();
                 render_entry_into(
@@ -6362,7 +6375,7 @@ impl ChatState {
                 .extend(row_breaks_for_lines(&new_lines, width));
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
-            self.cached_entry_count = total - start;
+            self.cached_entry_count = end - start;
             self.dirty = LinesDirty::Clean;
             self.cached_total_rows = self.cached_total_rows.saturating_add(appended_rows);
             self.rebuild_screen_ranges(width);
@@ -6373,7 +6386,7 @@ impl ChatState {
         let mut lines = Vec::new();
         let mut ranges = Vec::new();
         let show_thoughts = self.show_thoughts;
-        for (rel_idx, entry) in self.entries[start..].iter().enumerate() {
+        for (rel_idx, entry) in self.entries[start..end].iter().enumerate() {
             let abs_idx = start + rel_idx;
             let before = lines.len();
             render_entry_into(
@@ -6391,7 +6404,7 @@ impl ChatState {
         self.cached_row_breaks = row_breaks_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
-        self.cached_entry_count = total - start;
+        self.cached_entry_count = end - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
         self.cached_total_rows = self.compute_cached_rows(width);
@@ -6599,17 +6612,66 @@ impl ChatState {
         .line_count(width) as u16
     }
 
+    fn render_window_end(&self) -> usize {
+        self.cached_render_start
+            .saturating_add(self.cached_entry_count)
+            .min(self.entries.len())
+    }
+
+    fn shift_render_window(&mut self, new_start: usize) {
+        if self.cached_render_width == 0 || new_start == self.cached_render_start {
+            return;
+        }
+
+        let anchor = self
+            .cached_screen_ranges
+            .iter()
+            .find(|(_, _lo, hi, _)| *hi > self.scroll_offset)
+            .map(|(idx, lo, _hi, _)| (*idx, self.scroll_offset.saturating_sub(*lo)));
+
+        self.cached_render_start = new_start;
+        self.dirty = LinesDirty::Full;
+        self.rebuild_lines(self.cached_render_width);
+        self.last_total_rows = self.cached_total_rows;
+
+        if let Some((anchor_idx, intra_entry_row)) = anchor
+            && let Some((_, lo, _hi, _)) = self
+                .cached_screen_ranges
+                .iter()
+                .find(|(idx, _, _, _)| *idx == anchor_idx)
+        {
+            self.scroll_offset = lo.saturating_add(intra_entry_row);
+        }
+    }
+
     pub fn scroll_up(&mut self, lines: u16) {
         self.clear_transcript_selection();
         self.pinned_to_bottom = false;
+        if lines > self.scroll_offset && self.cached_render_start > 0 {
+            let new_start = self
+                .cached_render_start
+                .saturating_sub(RENDER_WINDOW_SHIFT_ENTRIES);
+            self.shift_render_window(new_start);
+        }
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
         self.clear_transcript_selection();
-        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        let mut max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        if self.scroll_offset.saturating_add(lines) > max
+            && self.render_window_end() < self.entries.len()
+        {
+            let natural_start = self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES);
+            let new_start = self
+                .cached_render_start
+                .saturating_add(RENDER_WINDOW_SHIFT_ENTRIES)
+                .min(natural_start);
+            self.shift_render_window(new_start);
+            max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        }
         self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
-        if self.scroll_offset >= max {
+        if self.scroll_offset >= max && self.render_window_end() == self.entries.len() {
             self.pinned_to_bottom = true;
         }
     }
@@ -6625,11 +6687,15 @@ impl ChatState {
     pub fn scroll_to_top(&mut self) {
         self.clear_transcript_selection();
         self.pinned_to_bottom = false;
+        self.cached_render_start = 0;
+        self.mark_dirty_full();
         self.scroll_offset = 0;
     }
 
     pub fn scroll_to_bottom(&mut self) {
         self.clear_transcript_selection();
+        self.cached_render_start = self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES);
+        self.mark_dirty_full();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = max;
         self.pinned_to_bottom = true;
@@ -8950,6 +9016,79 @@ mod tests {
         let max_scroll = s.cached_total_rows.saturating_sub(height);
         let (bottom, _) = s.visible_line_slice(max_scroll, height);
         assert!(!bottom.is_empty(), "bottom extent must still yield lines");
+    }
+
+    #[test]
+    fn ordinary_navigation_reaches_oldest_entry_with_a_bounded_render_window() {
+        let mut s = state();
+        s.entries.clear();
+        for i in 0..2_200 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+
+        assert_eq!(s.cached_render_start, 1_200);
+        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+
+        s.last_total_rows = s.cached_total_rows;
+        s.last_inner_height = 20;
+        s.scroll_offset = 0;
+        s.pinned_to_bottom = false;
+        let previous_top = s.cached_render_start;
+
+        s.page_up();
+
+        assert_eq!(s.cached_render_start, 700);
+        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+        let previous_top_row = s
+            .cached_screen_ranges
+            .iter()
+            .find(|(idx, _, _, _)| *idx == previous_top)
+            .map(|(_, lo, _, _)| *lo)
+            .expect("the previous top entry remains in the shifted window");
+        assert_eq!(
+            previous_top_row.saturating_sub(s.scroll_offset),
+            s.last_inner_height,
+            "Page Up preserves the prior top anchor before moving it down one viewport"
+        );
+
+        s.scroll_to_top();
+        s.rebuild_lines(80);
+
+        assert_eq!(s.cached_render_start, 0);
+        assert_eq!(s.cached_entry_count, MAX_RENDERED_ENTRIES);
+        assert_eq!(
+            s.cached_screen_ranges.first().map(|(idx, _, _, _)| *idx),
+            Some(0),
+            "Home exposes the oldest transcript entry"
+        );
+
+        let mut browse = state();
+        browse.entries = s.entries.clone();
+        browse.mark_dirty_full();
+        browse.rebuild_lines(80);
+        browse.last_total_rows = browse.cached_total_rows;
+        browse.last_inner_height = 20;
+        browse.enter_browse_mode();
+        browse.rebuild_lines(80);
+
+        browse.browse_move_up(1_200, true);
+        browse.rebuild_lines(80);
+
+        let cursor = browse.browse_cursor.expect("browse cursor");
+        assert_eq!(cursor, 999);
+        assert_eq!(browse.cached_entry_count, MAX_RENDERED_ENTRIES);
+        assert!(
+            browse
+                .cached_screen_ranges
+                .iter()
+                .any(|(idx, _, _, _)| *idx == cursor),
+            "an extended selection wider than the cache keeps its active cursor rendered"
+        );
     }
 
     #[test]
