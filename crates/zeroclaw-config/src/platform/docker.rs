@@ -27,11 +27,27 @@ pub enum DockerWorkspaceMountError {
 #[derive(Debug, Clone)]
 pub struct DockerRuntime {
     config: DockerRuntimeConfig,
+    /// Absolute launcher resolved by the TUI-aware runtime factory, when one
+    /// was supplied. Ambient callers continue resolving at command build time.
+    resolved_launcher: Option<PathBuf>,
 }
 
 impl DockerRuntime {
     pub fn new(config: DockerRuntimeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            resolved_launcher: None,
+        }
+    }
+
+    pub(crate) fn with_resolved_launcher(
+        config: DockerRuntimeConfig,
+        resolved_launcher: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            config,
+            resolved_launcher,
+        }
     }
 
     fn workspace_mount_path(&self, workspace_dir: &Path) -> Result<PathBuf> {
@@ -89,12 +105,15 @@ impl DockerRuntime {
         env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
         #[cfg(unix)]
-        let docker =
+        let docker = if let Some(resolved_launcher) = &self.resolved_launcher {
+            resolved_launcher.clone()
+        } else {
             crate::platform::resolve_executable(OsStr::new("docker")).map_err(|error| {
                 anyhow::Error::new(error).context(
                     "Docker runtime launcher could not be resolved before command construction",
                 )
-            })?;
+            })?
+        };
         #[cfg(not(unix))]
         let docker = PathBuf::from("docker");
 

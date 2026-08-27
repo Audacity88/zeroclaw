@@ -247,7 +247,8 @@ mod tests {
 
         // After wrapping, the program should be firejail
         if sandbox.is_available() {
-            assert_eq!(cmd.get_program().to_string_lossy(), "firejail");
+            let expected_launcher = FirejailSandbox::resolve_launcher().unwrap();
+            assert_eq!(cmd.get_program(), expected_launcher.as_os_str());
         }
     }
 

@@ -8,8 +8,21 @@ pub use native::NativeRuntime;
 pub use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellProfile};
 
 use crate::schema::{RuntimeConfig, RuntimeKind};
+use std::ffi::OsStr;
 
 pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
+    create_runtime_with_path(config, None)
+}
+
+/// Create a runtime, optionally resolving host launchers against an injected
+/// PATH before the runtime's child workspace is applied.
+pub fn create_runtime_with_path(
+    config: &RuntimeConfig,
+    path: Option<&OsStr>,
+) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
+    #[cfg(not(unix))]
+    let _ = path;
+
     match config.kind {
         RuntimeKind::Native => {
             let shell = config.shell.clone().unwrap_or_else(|| "sh".into());
@@ -17,9 +30,50 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
             validate_shell(&shell)?;
             #[cfg(windows)]
             validate_shell_windows(&shell)?;
-            Ok(Box::new(NativeRuntime::with_shell(shell)))
+            #[cfg(unix)]
+            let shell_path = path
+                .map(|path| {
+                    let configured_shell = if zeroclaw_api::platform::is_android() {
+                        OsStr::new("/system/bin/sh")
+                    } else {
+                        OsStr::new(&shell)
+                    };
+                    resolve_executable_with_path(configured_shell, std::env::split_paths(path))
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(format!(
+                                "native runtime shell {configured_shell:?} could not be resolved in the injected PATH"
+                            ))
+                        })
+                })
+                .transpose()?;
+            #[cfg(not(unix))]
+            let shell_path = None;
+            Ok(Box::new(NativeRuntime::with_shell_and_resolved_path(
+                shell, shell_path,
+            )))
         }
-        RuntimeKind::Docker => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
+        RuntimeKind::Docker => {
+            #[cfg(unix)]
+            let docker_path = path
+                .map(|path| {
+                    resolve_executable_with_path(
+                        OsStr::new("docker"),
+                        std::env::split_paths(path),
+                    )
+                    .map_err(|error| {
+                        anyhow::Error::new(error).context(
+                            "Docker runtime launcher could not be resolved in the injected PATH",
+                        )
+                    })
+                })
+                .transpose()?;
+            #[cfg(not(unix))]
+            let docker_path = None;
+            Ok(Box::new(DockerRuntime::with_resolved_launcher(
+                config.docker.clone(),
+                docker_path,
+            )))
+        }
         RuntimeKind::Cloudflare => anyhow::bail!(
             "runtime.kind='cloudflare' is not implemented yet. Use runtime.kind='native' for now."
         ),
@@ -112,6 +166,53 @@ mod tests {
         let rt = create_runtime(&cfg).unwrap();
         assert_eq!(rt.name(), "docker");
         assert!(rt.has_shell_access());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_resolves_native_and_docker_launchers_from_injected_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let native_shell = dir.path().join("native-shell");
+        let docker = dir.path().join("docker");
+        for launcher in [&native_shell, &docker] {
+            std::fs::write(launcher, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let native = create_runtime_with_path(
+            &RuntimeConfig {
+                kind: RuntimeKind::Native,
+                shell: Some("native-shell".into()),
+                ..RuntimeConfig::default()
+            },
+            Some(dir.path().as_os_str()),
+        )
+        .unwrap();
+        let native_command = native
+            .build_shell_command("echo native", &std::env::temp_dir())
+            .unwrap();
+        assert_eq!(
+            native_command.as_std().get_program(),
+            native_shell.canonicalize().unwrap().as_os_str()
+        );
+
+        let docker_runtime = create_runtime_with_path(
+            &RuntimeConfig {
+                kind: RuntimeKind::Docker,
+                ..RuntimeConfig::default()
+            },
+            Some(dir.path().as_os_str()),
+        )
+        .unwrap();
+        let docker_command = docker_runtime
+            .build_shell_command("echo docker", &std::env::temp_dir())
+            .unwrap();
+        assert_eq!(
+            docker_command.as_std().get_program(),
+            docker.canonicalize().unwrap().as_os_str()
+        );
     }
 
     #[test]

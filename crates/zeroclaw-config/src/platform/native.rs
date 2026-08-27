@@ -118,6 +118,9 @@ pub struct NativeRuntime {
     /// convention — `cmd.exe /C` (default, and for the cross-platform default
     /// `sh`) or PowerShell (`powershell`/`pwsh`).
     shell: String,
+    /// Absolute launcher resolved by the TUI-aware runtime factory, when one
+    /// was supplied. Ambient callers continue resolving at command build time.
+    resolved_shell: Option<PathBuf>,
 }
 
 impl Default for NativeRuntime {
@@ -142,7 +145,20 @@ impl NativeRuntime {
     /// `pwsh` (bare name or absolute path) run through PowerShell; every other
     /// value runs through `cmd.exe /C`.
     pub fn with_shell(shell: String) -> Self {
-        Self { shell }
+        Self {
+            shell,
+            resolved_shell: None,
+        }
+    }
+
+    pub(crate) fn with_shell_and_resolved_path(
+        shell: String,
+        resolved_shell: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            shell,
+            resolved_shell,
+        }
     }
 }
 
@@ -234,13 +250,17 @@ impl RuntimeAdapter for NativeRuntime {
             } else {
                 &self.shell
             };
-            let shell = crate::platform::resolve_executable(std::ffi::OsStr::new(configured_shell))
-                .map_err(|error| {
-                    let detail = error.to_string();
-                    anyhow::Error::new(error).context(format!(
-                        "native runtime shell {configured_shell:?} could not be resolved before setting workspace directory: {detail}"
-                    ))
-                })?;
+            let shell = if let Some(resolved_shell) = &self.resolved_shell {
+                resolved_shell.clone()
+            } else {
+                crate::platform::resolve_executable(std::ffi::OsStr::new(configured_shell))
+                    .map_err(|error| {
+                        let detail = error.to_string();
+                        anyhow::Error::new(error).context(format!(
+                            "native runtime shell {configured_shell:?} could not be resolved before setting workspace directory: {detail}"
+                        ))
+                    })?
+            };
             let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
                 tokio_powershell_command(shell.as_os_str(), command)
             } else {
