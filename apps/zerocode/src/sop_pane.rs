@@ -70,6 +70,9 @@ pub(crate) struct SopPane {
     /// A successful mutation projects locally first, then asks for one
     /// authoritative replacement after any older list response is discarded.
     list_refresh_follow_up: bool,
+    /// A request that spans a focus generation is no longer authoritative for
+    /// the pane the user re-entered. Queue one replacement after it settles.
+    list_refresh_stale_on_refocus: bool,
     /// List-refresh failures retain the projected names and do not overwrite
     /// the action error shown for create/save/delete/graph operations.
     list_refresh_error: Option<String>,
@@ -551,6 +554,7 @@ impl SopPane {
             list_refresh_rx: None,
             list_refresh_task: None,
             list_refresh_follow_up: false,
+            list_refresh_stale_on_refocus: false,
             list_refresh_error: None,
         }
     }
@@ -656,7 +660,17 @@ impl SopPane {
     }
 
     pub(crate) fn refresh(&mut self) {
+        if std::mem::take(&mut self.list_refresh_stale_on_refocus) && self.list_refresh_rx.is_some()
+        {
+            self.list_refresh_follow_up = true;
+        }
         self.request_list_refresh(false);
+    }
+
+    pub(crate) fn on_pane_blur(&mut self) {
+        if self.list_refresh_rx.is_some() {
+            self.list_refresh_stale_on_refocus = true;
+        }
     }
 
     fn request_list_refresh(&mut self, reconcile_after_mutation: bool) {
