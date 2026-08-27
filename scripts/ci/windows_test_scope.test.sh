@@ -206,19 +206,25 @@ output="$(run_selector pull_request "$paths_file" "$metadata_file")"
 printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
 printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
 
+printf '%s\n' 'crates/zeroclaw-api/src/lib.rs' > "$paths_file"
+output="$(python3 "$selector" --event pull_request --changed-paths-file "$paths_file" --repo-root "$repo_root")"
+printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'reason=Changed paths or Cargo metadata are unavailable; selecting full is safer.' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
+
 malformed_metadata="$fixture_dir/malformed.json"
 printf '%s\n' '{"packages": []}' > "$malformed_metadata"
-printf '%s\n' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
+printf '%s\n' 'crates/zeroclaw-api/src/lib.rs' > "$paths_file"
 output="$(run_selector pull_request "$paths_file" "$malformed_metadata")"
 printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
 printf '%s\n' "$output" | grep -F 'reason=Cargo metadata is malformed or unavailable' >/dev/null
-printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=false' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
 
 missing_metadata="$fixture_dir/missing.json"
 output="$(run_selector pull_request "$paths_file" "$missing_metadata")"
 printf '%s\n' "$output" | grep -Fx 'mode=full' >/dev/null
 printf '%s\n' "$output" | grep -Fx 'reason=Cargo metadata is malformed or unavailable (FileNotFoundError).' >/dev/null
-printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=false' >/dev/null
+printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
 
 printf '%s\n' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
 output="$(run_selector pull_request "$paths_file" "$malformed_metadata")"

@@ -324,12 +324,11 @@ def select(event: str, changed_file: Path | None, metadata_file: Path | None, re
     changed_paths, paths_ok = read_changed_paths(changed_file)
     if not paths_ok:
         return full("Changed paths are malformed or unavailable; selecting full is safer.", True)
-    needs_plugin_host = requires_plugin_host(changed_paths)
     if metadata_file is None:
-        return full("Changed paths or Cargo metadata are unavailable; selecting full is safer.", needs_plugin_host)
+        return full("Changed paths or Cargo metadata are unavailable; selecting full is safer.", True)
     packages, reverse_dependents, metadata_error = load_packages(metadata_file, repo_root)
     if metadata_error is not None:
-        return full(metadata_error, needs_plugin_host)
+        return full(metadata_error, True)
     return select_pull_request(changed_paths, repo_root, packages, reverse_dependents)
 
 
