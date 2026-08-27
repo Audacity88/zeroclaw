@@ -33985,6 +33985,8 @@ Done."#;
             "twitch",
             "dingtalk",
             "wecom",
+            "wecom_ws",
+            "wecom-ws",
             "qq",
             "nostr",
             "clawdtalk",
@@ -34015,6 +34017,7 @@ Done."#;
                     !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
                         || cfg!(feature = "whatsapp-web");
                 let claimed = surface_available
+                    && !intentionally_unsupported.contains(key)
                     && [
                         format!("\"{key}\" =>"),
                         format!("\"{key}\" |"),
