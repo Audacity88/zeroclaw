@@ -400,25 +400,6 @@ fn agent_alias_from_model_provider_prop(prop: &str) -> Option<String> {
     }
 }
 
-/// Extract the agent alias from an agent channel-authorization prop path.
-fn agent_alias_from_channel_auth_prop(prop: &str) -> Option<String> {
-    let rest = prop.strip_prefix("agents.")?;
-    let (alias, field) = rest.split_once('.')?;
-    if alias.is_empty() || !matches!(field, "channels" | "enabled") {
-        None
-    } else {
-        Some(alias.to_string())
-    }
-}
-
-fn is_channel_generation_prop(prop: &str) -> bool {
-    prop.starts_with("channels.")
-}
-
-fn is_channel_generation_map_path(path: &str) -> bool {
-    path == "channels" || path.starts_with("channels.")
-}
-
 /// Session-selection predicate for an agent-scoped `model_provider` refresh
 /// (`config/set agents.<alias>.model_provider`). Only sessions bound to the
 /// edited agent are eligible, and a session that carries its own
@@ -497,108 +478,28 @@ fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> boo
     !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
 }
 
-#[cfg(test)]
-type TestChannelMapFn = Arc<
-    dyn Fn(
-            &Config,
-            &str,
-        ) -> std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
-        + Send
-        + Sync,
->;
-
-#[cfg(test)]
-type TestChannelGenerationMapFn = Arc<
-    dyn Fn(&Config) -> std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
-        + Send
-        + Sync,
->;
-
-struct PreparedChannelGenerationMutation {
-    configured: crate::agent::loop_::ConfiguredChannelMaps,
-    drain: Option<crate::daemon::PreparedChannelGenerationDrain>,
-}
-
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
     rpc: Arc<RpcOutbound>,
-    prompt_tasks: tokio::task::JoinSet<()>,
-    connection_cancel: tokio_util::sync::CancellationToken,
     authenticated: bool,
-    /// Whether this transport may seed configured channel clients into RPC
-    /// sessions. Local IPC allows this; WSS deliberately does not.
-    configured_channel_access: bool,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
-    #[cfg(test)]
-    channel_map_factory: Option<TestChannelMapFn>,
-    #[cfg(test)]
-    channel_generation_map_factory: Option<TestChannelGenerationMapFn>,
-    #[cfg(test)]
-    channel_generation_invalidator: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(test)]
-    channel_seed_insert_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
-    #[cfg(test)]
-    prompt_registration_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl RpcDispatcher {
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
-        Self::new_with_cancel(
-            ctx,
-            writer_tx,
-            peer_label,
-            tokio_util::sync::CancellationToken::new(),
-        )
-    }
-
-    pub(crate) fn new_with_cancel(
-        ctx: Arc<RpcContext>,
-        writer_tx: mpsc::Sender<String>,
-        peer_label: String,
-        connection_cancel: tokio_util::sync::CancellationToken,
-    ) -> Self {
-        Self::new_with_cancel_and_channel_access(
-            ctx,
-            writer_tx,
-            peer_label,
-            connection_cancel,
-            true,
-        )
-    }
-
-    pub(crate) fn new_with_cancel_and_channel_access(
-        ctx: Arc<RpcContext>,
-        writer_tx: mpsc::Sender<String>,
-        peer_label: String,
-        connection_cancel: tokio_util::sync::CancellationToken,
-        configured_channel_access: bool,
-    ) -> Self {
         Self {
             ctx,
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
-            prompt_tasks: tokio::task::JoinSet::new(),
-            connection_cancel,
             authenticated: false,
-            configured_channel_access,
             tui_id: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
-            #[cfg(test)]
-            channel_map_factory: None,
-            #[cfg(test)]
-            channel_generation_map_factory: None,
-            #[cfg(test)]
-            channel_generation_invalidator: None,
-            #[cfg(test)]
-            channel_seed_insert_barrier: None,
-            #[cfg(test)]
-            prompt_registration_barrier: None,
         }
     }
 
@@ -617,382 +518,6 @@ impl RpcDispatcher {
         Arc::clone(&self.rpc)
     }
 
-    #[cfg(test)]
-    pub fn set_channel_map_factory_for_test<F>(&mut self, factory: F)
-    where
-        F: Fn(
-                &Config,
-                &str,
-            )
-                -> std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.channel_map_factory = Some(Arc::new(factory));
-    }
-
-    #[cfg(test)]
-    fn set_channel_generation_controls_for_test<M, I>(&mut self, map_factory: M, invalidate: I)
-    where
-        M: Fn(
-                &Config,
-            )
-                -> std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
-            + Send
-            + Sync
-            + 'static,
-        I: Fn() + Send + Sync + 'static,
-    {
-        self.channel_generation_map_factory = Some(Arc::new(map_factory));
-        self.channel_generation_invalidator = Some(Arc::new(invalidate));
-    }
-
-    #[cfg(test)]
-    fn set_channel_seed_insert_barrier_for_test(
-        &mut self,
-        seeded: Arc<tokio::sync::Notify>,
-        resume: Arc<tokio::sync::Notify>,
-    ) {
-        self.channel_seed_insert_barrier = Some((seeded, resume));
-    }
-
-    #[cfg(test)]
-    fn set_prompt_registration_barrier_for_test(
-        &mut self,
-        reached: Arc<tokio::sync::Notify>,
-        resume: Arc<tokio::sync::Notify>,
-    ) {
-        self.prompt_registration_barrier = Some((reached, resume));
-    }
-
-    fn seed_rpc_channel_handles(
-        &self,
-        agent: &crate::agent::agent::Agent,
-        config: &Config,
-        agent_alias: &str,
-    ) -> Vec<String> {
-        let handles = agent.channel_handles();
-        if !self.configured_channel_access {
-            return Vec::new();
-        }
-        #[cfg(test)]
-        if let Some(factory) = self.channel_map_factory.as_deref() {
-            crate::agent::loop_::seed_channel_handles_with_factory(
-                factory,
-                config,
-                agent_alias,
-                &handles.ask_user,
-                &handles.channel_room,
-                &handles.reaction,
-                &handles.poll,
-                &handles.escalate,
-            );
-            return handles.reaction.read().keys().cloned().collect();
-        }
-        crate::agent::loop_::seed_channel_handles(
-            config,
-            agent_alias,
-            &handles.ask_user,
-            &handles.channel_room,
-            &handles.reaction,
-            &handles.poll,
-            &handles.escalate,
-        );
-        handles.reaction.read().keys().cloned().collect()
-    }
-
-    fn configured_channel_maps(
-        &self,
-        old_config: &Config,
-        new_config: &Config,
-        agent_alias: &str,
-    ) -> Option<crate::agent::loop_::ConfiguredChannelMaps> {
-        #[cfg(test)]
-        if let Some(factory) = self.channel_map_factory.as_deref() {
-            return Some(crate::agent::loop_::configured_channel_maps_with_factory(
-                factory,
-                old_config,
-                new_config,
-                agent_alias,
-            ));
-        }
-
-        crate::agent::loop_::configured_channel_maps(old_config, new_config, agent_alias)
-    }
-
-    fn configured_channel_generation_revocation(
-        &self,
-        config: &Config,
-    ) -> Option<crate::agent::loop_::ConfiguredChannelMaps> {
-        #[cfg(test)]
-        if let Some(factory) = self.channel_generation_map_factory.as_deref() {
-            return Some(
-                crate::agent::loop_::configured_channel_generation_revocation_with_factory(
-                    factory, config,
-                ),
-            );
-        }
-
-        crate::agent::loop_::configured_channel_generation_revocation(config)
-    }
-
-    fn invalidate_channel_generation_for_test(&self) -> bool {
-        #[cfg(test)]
-        if let Some(invalidate) = self.channel_generation_invalidator.as_deref() {
-            invalidate();
-            return true;
-        }
-
-        false
-    }
-
-    async fn revoke_live_channel_generation(
-        &self,
-        configured: &crate::agent::loop_::ConfiguredChannelMaps,
-    ) {
-        for session_id in self.ctx.sessions.list_ids().await {
-            let Some(agent) = self.ctx.sessions.get_agent(&session_id).await else {
-                continue;
-            };
-            let agent = agent.lock().await;
-            Self::refresh_channel_handles_for_agent(&agent, configured);
-        }
-    }
-
-    fn prepare_channel_generation_revocation(
-        &self,
-        mutation: bool,
-        config: Option<&Config>,
-    ) -> Result<Option<PreparedChannelGenerationMutation>, JsonRpcError> {
-        if !mutation {
-            return Ok(None);
-        }
-        let config = config.ok_or_else(|| {
-            rpc_err(
-                INTERNAL_ERROR,
-                "Channel mutation is missing its pre-commit config snapshot",
-            )
-        })?;
-        if self.ctx.reload_tx.is_none() {
-            return Err(rpc_err(
-                INTERNAL_ERROR,
-                "Channel generation reload controls are unavailable; refusing a live channel mutation",
-            ));
-        }
-        let drain = match self.ctx.channel_generation_control.as_ref() {
-            Some(control) => Some(control.prepare().ok_or_else(|| {
-                rpc_err(
-                    INTERNAL_ERROR,
-                    "Channel registry clearer is unavailable; refusing a live channel mutation",
-                )
-            })?),
-            None => {
-                #[cfg(test)]
-                {
-                    if self.channel_generation_map_factory.is_some()
-                        && self.channel_generation_invalidator.is_some()
-                    {
-                        None
-                    } else {
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            "Channel generation controls are unavailable; refusing a live channel mutation",
-                        ));
-                    }
-                }
-                #[cfg(not(test))]
-                {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        "Channel generation controls are unavailable; refusing a live channel mutation",
-                    ));
-                }
-            }
-        };
-        self.configured_channel_generation_revocation(config)
-            .map(|configured| Some(PreparedChannelGenerationMutation { configured, drain }))
-            .ok_or_else(|| {
-                rpc_err(
-                    INTERNAL_ERROR,
-                    "Live channel registry is unavailable; refusing a live channel mutation",
-                )
-            })
-    }
-
-    async fn finish_channel_generation_mutation(
-        &self,
-        prepared: Option<&PreparedChannelGenerationMutation>,
-    ) {
-        let Some(prepared) = prepared else {
-            return;
-        };
-        let drain_wait = if let Some(drain) = &prepared.drain {
-            Some(drain.begin())
-        } else {
-            let invalidated = self.invalidate_channel_generation_for_test();
-            debug_assert!(
-                invalidated,
-                "test channel controls were checked before config commit"
-            );
-            None
-        };
-        self.ctx
-            .sessions
-            .cancel_all_inflight_and_wait(crate::rpc::session::CancelCause::ChannelGeneration)
-            .await;
-        self.revoke_live_channel_generation(&prepared.configured)
-            .await;
-        if let Some(drain_wait) = drain_wait {
-            drain_wait.wait().await;
-        }
-        self.schedule_daemon_reload("config-channel-generation");
-    }
-
-    fn refresh_channel_handles_for_agent(
-        agent: &crate::agent::agent::Agent,
-        configured: &crate::agent::loop_::ConfiguredChannelMaps,
-    ) -> usize {
-        let handles = agent.channel_handles();
-        crate::agent::loop_::refresh_channel_handles(
-            configured,
-            &handles.ask_user,
-            &handles.channel_room,
-            &handles.reaction,
-            &handles.poll,
-            &handles.escalate,
-        )
-    }
-
-    async fn refresh_live_channel_handles(
-        &self,
-        configured: &crate::agent::loop_::ConfiguredChannelMaps,
-        agent_alias: &str,
-    ) {
-        for session_id in self.ctx.sessions.list_ids().await {
-            let Some(session_agent_alias) = self.ctx.sessions.get_agent_alias(&session_id).await
-            else {
-                continue;
-            };
-            if session_agent_alias != agent_alias {
-                continue;
-            }
-            let Some(agent) = self.ctx.sessions.get_agent(&session_id).await else {
-                continue;
-            };
-            let agent = agent.lock().await;
-            Self::refresh_channel_handles_for_agent(&agent, configured);
-        }
-    }
-
-    async fn refresh_live_channel_handles_between_configs(
-        &self,
-        old_config: &Config,
-        new_config: &Config,
-        agent_alias: &str,
-    ) {
-        let Some(configured) = self.configured_channel_maps(old_config, new_config, agent_alias)
-        else {
-            return;
-        };
-        self.refresh_live_channel_handles(&configured, agent_alias)
-            .await;
-    }
-
-    fn all_agents_have_empty_channels(config: &Config) -> bool {
-        config
-            .agents
-            .values()
-            .all(|agent| agent.channels.is_empty())
-    }
-
-    async fn refresh_live_channel_handles_after_agent_channel_mutation(
-        &self,
-        old_config: &Config,
-        new_config: &Config,
-        agent_alias: &str,
-    ) {
-        if Self::all_agents_have_empty_channels(old_config)
-            != Self::all_agents_have_empty_channels(new_config)
-        {
-            for session_id in self.ctx.sessions.list_ids().await {
-                let Some(session_agent_alias) =
-                    self.ctx.sessions.get_agent_alias(&session_id).await
-                else {
-                    continue;
-                };
-                let Some(configured) =
-                    self.configured_channel_maps(old_config, new_config, &session_agent_alias)
-                else {
-                    continue;
-                };
-                let Some(agent) = self.ctx.sessions.get_agent(&session_id).await else {
-                    continue;
-                };
-                let agent = agent.lock().await;
-                Self::refresh_channel_handles_for_agent(&agent, &configured);
-            }
-            return;
-        }
-
-        self.refresh_live_channel_handles_between_configs(old_config, new_config, agent_alias)
-            .await;
-    }
-
-    async fn register_turn_cancel_token(
-        &self,
-        session_id: &str,
-    ) -> Option<(tokio_util::sync::CancellationToken, u64)> {
-        let config_registration_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_generation = self
-            .ctx
-            .sessions
-            .register_cancel_token_if_present(session_id, cancel.clone())
-            .await;
-        drop(config_registration_guard);
-        cancel_generation.map(|generation| (cancel, generation))
-    }
-
-    async fn insert_reconciled_session(
-        &self,
-        session_id: String,
-        agent: crate::agent::agent::Agent,
-        seeded_channel_names: &[String],
-        seed_config: &Config,
-        agent_alias: &str,
-        cwd: &str,
-        chat_mode: crate::rpc::types::ChatMode,
-    ) -> Result<(), &'static str> {
-        // Reconcile the exact local agent before publication. Sharing the
-        // mutation lock makes either this insert or mutation enumeration win.
-        let _config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let current_config = self.ctx.config.read().clone();
-        let handles = agent.channel_handles();
-        crate::agent::loop_::remove_channel_names(
-            seeded_channel_names,
-            &handles.ask_user,
-            &handles.channel_room,
-            &handles.reaction,
-            &handles.poll,
-            &handles.escalate,
-        );
-        if self.configured_channel_access
-            && let Some(configured) =
-                self.configured_channel_maps(seed_config, &current_config, agent_alias)
-        {
-            Self::refresh_channel_handles_for_agent(&agent, &configured);
-        }
-        self.ctx
-            .sessions
-            .insert(
-                session_id,
-                super::session::RpcSession::new(agent, agent_alias, cwd, chat_mode)
-                    .with_owner(self.tui_id.clone()),
-            )
-            .await
-    }
-
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
@@ -1000,23 +525,10 @@ impl RpcDispatcher {
         Self {
             ctx: Arc::clone(&self.ctx),
             rpc: Arc::clone(&self.rpc),
-            prompt_tasks: tokio::task::JoinSet::new(),
-            connection_cancel: self.connection_cancel.clone(),
             authenticated: true,
-            configured_channel_access: self.configured_channel_access,
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
-            #[cfg(test)]
-            channel_map_factory: self.channel_map_factory.clone(),
-            #[cfg(test)]
-            channel_generation_map_factory: self.channel_generation_map_factory.clone(),
-            #[cfg(test)]
-            channel_generation_invalidator: self.channel_generation_invalidator.clone(),
-            #[cfg(test)]
-            channel_seed_insert_barrier: self.channel_seed_insert_barrier.clone(),
-            #[cfg(test)]
-            prompt_registration_barrier: self.prompt_registration_barrier.clone(),
         }
     }
 
@@ -1024,7 +536,7 @@ impl RpcDispatcher {
         if let Some(event) = event
             && let Some(notification) = notification_for_turn_event(session_id, &event, None)
         {
-            let _ = self.send_raw_for_connection(notification).await;
+            let _ = self.rpc.send_raw(notification).await;
         }
     }
 
@@ -1129,18 +641,6 @@ impl RpcDispatcher {
         false
     }
 
-    fn log_prompt_task_failure(result: Result<(), tokio::task::JoinError>) {
-        if let Err(error) = result {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!("RPC session/prompt task failed: {error}")
-            );
-        }
-    }
-
     /// Read frames from transport, dispatch, repeat.
     pub async fn run(&mut self, transport: &mut (dyn RpcTransport + Send)) {
         while let Some(line) = transport.next_frame().await {
@@ -1149,26 +649,6 @@ impl RpcDispatcher {
                 continue;
             }
             self.process_line(trimmed).await;
-            while let Some(result) = self.prompt_tasks.try_join_next() {
-                Self::log_prompt_task_failure(result);
-            }
-        }
-    }
-
-    /// Stop every turn owned by this connection and wait until its prompt
-    /// tasks have released the shared RPC context and channel handles.
-    pub async fn shutdown(&mut self) {
-        self.connection_cancel.cancel();
-        while let Some(result) = self.prompt_tasks.join_next().await {
-            Self::log_prompt_task_failure(result);
-        }
-    }
-
-    async fn send_raw_for_connection(&self, json: String) -> bool {
-        tokio::select! {
-            biased;
-            _ = self.connection_cancel.cancelled() => false,
-            sent = self.rpc.send_raw(json) => sent,
         }
     }
 
@@ -1288,7 +768,7 @@ impl RpcDispatcher {
                 let id_clone = req_id.clone();
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
-                self.prompt_tasks.spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     let result = handle.handle_session_prompt(&params_clone).await;
                     if !is_notif {
                         match result {
@@ -1722,8 +1202,6 @@ impl RpcDispatcher {
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
 
-        let seeded_channel_names = self.seed_rpc_channel_handles(&agent, &config, &req.agent_alias);
-
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
             session_id.clone(),
@@ -1737,23 +1215,15 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        #[cfg(test)]
-        if let Some((seeded, resume)) = &self.channel_seed_insert_barrier {
-            seeded.notify_one();
-            resume.notified().await;
-        }
-
-        self.insert_reconciled_session(
-            session_id.clone(),
-            agent,
-            &seeded_channel_names,
-            &config,
-            &req.agent_alias,
-            &cwd,
-            chat_mode.clone(),
-        )
-        .await
-        .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+        self.ctx
+            .sessions
+            .insert(
+                session_id.clone(),
+                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                    .with_owner(self.tui_id.clone()),
+            )
+            .await
+            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -2177,7 +1647,6 @@ impl RpcDispatcher {
             }
         };
 
-        let config = self.ctx.config.read().clone();
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
@@ -2199,9 +1668,6 @@ impl RpcDispatcher {
         .await
         .ok()?;
 
-        let seeded_channel_names =
-            self.seed_rpc_channel_handles(&agent, &config, &data.agent_alias);
-
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
             sid.to_string(),
@@ -2214,24 +1680,21 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        #[cfg(test)]
-        if let Some((seeded, resume)) = &self.channel_seed_insert_barrier {
-            seeded.notify_one();
-            resume.notified().await;
-        }
-
         let message_count = data.messages.len();
-        self.insert_reconciled_session(
-            sid.to_string(),
-            agent,
-            &seeded_channel_names,
-            &config,
-            &data.agent_alias,
-            &data.workspace_dir,
-            crate::rpc::types::ChatMode::Acp,
-        )
-        .await
-        .ok()?;
+        self.ctx
+            .sessions
+            .insert(
+                sid.to_string(),
+                super::session::RpcSession::new(
+                    agent,
+                    &data.agent_alias,
+                    &data.workspace_dir,
+                    crate::rpc::types::ChatMode::Acp,
+                )
+                .with_owner(self.tui_id.clone()),
+            )
+            .await
+            .ok()?;
         let seed_event = self
             .ctx
             .sessions
@@ -2267,37 +1730,8 @@ impl RpcDispatcher {
             ));
         }
 
-        // Serialize the whole prompt lifecycle before recovering a session or
-        // processing attachments. A queued prompt must remain side-effect free
-        // if its owning connection begins teardown before permit handoff.
-        let acquire = self.ctx.sessions.session_queue.acquire(sid);
-        tokio::pin!(acquire);
-        let _guard = tokio::select! {
-            biased;
-            _ = self.connection_cancel.cancelled() => {
-                return Err(rpc_err(
-                    INTERNAL_ERROR,
-                    "RPC connection closed while waiting for the session turn",
-                ));
-            }
-            result = &mut acquire => result
-                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?,
-        };
-        if self.connection_cancel.is_cancelled() {
-            return Err(rpc_err(
-                INTERNAL_ERROR,
-                "RPC connection closed before the session turn started",
-            ));
-        }
-
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
-            None if self.connection_cancel.is_cancelled() => {
-                return Err(rpc_err(
-                    INTERNAL_ERROR,
-                    "RPC connection closed before session recovery",
-                ));
-            }
             None => match self.rehydrate_reaped_session(sid).await {
                 Some(a) => a,
                 None => {
@@ -2319,12 +1753,6 @@ impl RpcDispatcher {
                 }
             },
         };
-        if self.connection_cancel.is_cancelled() {
-            return Err(rpc_err(
-                INTERNAL_ERROR,
-                "RPC connection closed before prompt processing",
-            ));
-        }
 
         // Process inline attachments: upload each, append markers to prompt.
         let mut prompt = req.prompt.clone();
@@ -2349,12 +1777,6 @@ impl RpcDispatcher {
                 prompt.push('\n');
             }
             for (idx, entry) in req.attachments.iter().enumerate() {
-                if self.connection_cancel.is_cancelled() {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        "RPC connection closed before attachment processing completed",
-                    ));
-                }
                 let result =
                     process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions)
                         .await?;
@@ -2364,29 +1786,17 @@ impl RpcDispatcher {
                 prompt.push_str(&result.marker);
             }
         }
-        if self.connection_cancel.is_cancelled() {
-            return Err(rpc_err(
-                INTERNAL_ERROR,
-                "RPC connection closed before the session turn started",
-            ));
-        }
 
-        #[cfg(test)]
-        if let Some((reached, resume)) = &self.prompt_registration_barrier {
-            reached.notify_one();
-            resume.notified().await;
-        }
-
-        let (cancel, cancel_generation) = self
-            .register_turn_cancel_token(sid)
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
             .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session closed before turn start"))?;
-        if self.connection_cancel.is_cancelled() {
-            self.ctx
-                .sessions
-                .record_cancel_cause(sid, crate::rpc::session::CancelCause::ClientRpc);
-            cancel.cancel();
-        }
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
@@ -2433,7 +1843,6 @@ impl RpcDispatcher {
         // the latest TodoWrite plan (store-then-emit) before the plan
         // notification goes out. See `persist_plan_if_any`.
         let sessions_for_plan = self.ctx.sessions.clone();
-        let connection_cancel = self.connection_cancel.clone();
         let acp_token_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             self.ctx.acp_session_store.clone()
         } else {
@@ -2455,10 +1864,10 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
-        let turn = execute_turn(
+        let outcome = execute_turn(
             agent,
             prompt.clone(),
-            cancel.clone(),
+            cancel,
             TurnAttribution {
                 session_key: Some(sid.to_string()),
                 agent_alias,
@@ -2469,7 +1878,6 @@ impl RpcDispatcher {
             cost_context,
             move |event| {
                 let rpc = rpc.clone();
-                let connection_cancel = connection_cancel.clone();
                 let sid = sid_owned.clone();
                 let acp_token_store = acp_token_store.clone();
                 let sessions_for_plan = sessions_for_plan.clone();
@@ -2492,27 +1900,12 @@ impl RpcDispatcher {
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
                     if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
-                        tokio::select! {
-                            biased;
-                            _ = connection_cancel.cancelled() => {}
-                            _ = rpc.send_raw(n) => {}
-                        }
+                        let _ = rpc.send_raw(n).await;
                     }
                 }
             },
-        );
-        tokio::pin!(turn);
-        let outcome = tokio::select! {
-            biased;
-            _ = self.connection_cancel.cancelled() => {
-                self.ctx
-                    .sessions
-                    .record_cancel_cause(sid, crate::rpc::session::CancelCause::ClientRpc);
-                cancel.cancel();
-                turn.await
-            },
-            outcome = &mut turn => outcome,
-        };
+        )
+        .await;
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
@@ -2633,7 +2026,7 @@ impl RpcDispatcher {
                 )
                 .await;
                 to_result(SessionPromptResult {
-                    session_id: req.session_id.clone(),
+                    session_id: req.session_id,
                     stop_reason: "end_turn".to_string(),
                     content: text,
                 })
@@ -2676,7 +2069,7 @@ impl RpcDispatcher {
                 )
                 .await;
                 to_result(SessionPromptResult {
-                    session_id: req.session_id.clone(),
+                    session_id: req.session_id,
                     stop_reason: "cancelled".to_string(),
                     content: partial_text,
                 })
@@ -2731,7 +2124,7 @@ impl RpcDispatcher {
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
             if let Ok(s) = serde_json::to_string(&n) {
-                let _ = self.send_raw_for_connection(s).await;
+                let _ = self.rpc.send_raw(s).await;
             }
         }
     }
@@ -3416,14 +2809,6 @@ impl RpcDispatcher {
         let req: ConfigSetParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
-        let channel_generation_mutation = is_channel_generation_prop(&req.prop);
-        let old_channel_config = (refresh_channel_agent.is_some() || channel_generation_mutation)
-            .then(|| self.ctx.config.read().clone());
-        let channel_generation_revocation = self.prepare_channel_generation_revocation(
-            channel_generation_mutation,
-            old_channel_config.as_ref(),
-        )?;
         // Clone the live config and perform every mutation — alias creation,
         // field lookup, value coercion, masked-secret validation, and the
         // persistent write — on the working copy. Any early error simply
@@ -3488,20 +2873,6 @@ impl RpcDispatcher {
         }
         self.save_and_swap_config(*config, &config_write_guard)
             .await?;
-        self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
-            .await;
-        if let (Some(agent_alias), Some(old_config)) = (
-            refresh_channel_agent.as_deref(),
-            old_channel_config.as_ref(),
-        ) {
-            let new_config = self.ctx.config.read().clone();
-            self.refresh_live_channel_handles_after_agent_channel_mutation(
-                old_config,
-                &new_config,
-                agent_alias,
-            )
-            .await;
-        }
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -3797,40 +3168,13 @@ impl RpcDispatcher {
         let req: ConfigDeleteParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
-        let channel_generation_mutation = is_channel_generation_prop(&req.prop);
-        let old_channel_config = (refresh_channel_agent.is_some() || channel_generation_mutation)
-            .then(|| self.ctx.config.read().clone());
-        let channel_generation_revocation = self.prepare_channel_generation_revocation(
-            channel_generation_mutation,
-            old_channel_config.as_ref(),
-        )?;
-        // `enabled` is a non-optional field; deletion restores its true default.
-        let reset_value = if refresh_channel_agent.is_some() && req.prop.ends_with(".enabled") {
-            "true"
-        } else {
-            ""
-        };
-        let mut config = Box::new(self.ctx.config.read().clone());
-        config
-            .set_prop_persistent(&req.prop, reset_value)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
-        self.save_and_swap_config(*config, &config_write_guard)
-            .await?;
-        self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
-            .await;
-        if let (Some(agent_alias), Some(old_config)) = (
-            refresh_channel_agent.as_deref(),
-            old_channel_config.as_ref(),
-        ) {
-            let new_config = self.ctx.config.read().clone();
-            self.refresh_live_channel_handles_after_agent_channel_mutation(
-                old_config,
-                &new_config,
-                agent_alias,
-            )
-            .await;
+        {
+            let mut config = self.ctx.config.write();
+            config
+                .set_prop_persistent(&req.prop, "")
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
         }
+        self.flush_config(&config_write_guard).await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -3898,36 +3242,18 @@ impl RpcDispatcher {
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let refresh_channel_agent = (req.path == "agents").then(|| req.key.clone());
-        let channel_generation_mutation = is_channel_generation_map_path(&req.path);
-        let old_channel_config = (refresh_channel_agent.is_some() || channel_generation_mutation)
-            .then(|| self.ctx.config.read().clone());
-        let channel_generation_revocation = self.prepare_channel_generation_revocation(
-            channel_generation_mutation,
-            old_channel_config.as_ref(),
-        )?;
-        let mut config = Box::new(self.ctx.config.read().clone());
-        let deleted = config
-            .delete_map_key(&req.path, &req.key)
-            .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
-        if deleted {
-            config.mark_dirty(&format!("{}.{}", req.path, req.key));
-            self.save_and_swap_config(*config, &config_write_guard)
-                .await?;
-            self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
-                .await;
-            if let (Some(agent_alias), Some(old_config)) = (
-                refresh_channel_agent.as_deref(),
-                old_channel_config.as_ref(),
-            ) {
-                let new_config = self.ctx.config.read().clone();
-                self.refresh_live_channel_handles_after_agent_channel_mutation(
-                    old_config,
-                    &new_config,
-                    agent_alias,
-                )
-                .await;
+        let deleted = {
+            let mut config = self.ctx.config.write();
+            let deleted = config
+                .delete_map_key(&req.path, &req.key)
+                .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+            if deleted {
+                config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
+            deleted
+        };
+        if deleted {
+            self.flush_config(&config_write_guard).await?;
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -3955,12 +3281,6 @@ impl RpcDispatcher {
                     .await;
             }
 
-            let channel_generation_mutation = is_channel_generation_map_path(&req.path);
-            let channel_generation_revocation = self.prepare_channel_generation_revocation(
-                channel_generation_mutation,
-                Some(&self.ctx.config.read()),
-            )?;
-
             let renamed = {
                 let mut config = self.ctx.config.write();
                 let renamed = config
@@ -3974,8 +3294,6 @@ impl RpcDispatcher {
             };
             if renamed {
                 self.flush_config(&config_write_guard).await?;
-                self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
-                    .await;
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -3994,11 +3312,7 @@ impl RpcDispatcher {
         config_write_guard: ConfigWriteGuard,
     ) -> BoxRpcFuture<'a> {
         Box::pin(async move {
-            let is_agent = matches!(&kind, zeroclaw_config::alias_refs::AliasKind::Agent);
-            let is_channel = matches!(
-                &kind,
-                zeroclaw_config::alias_refs::AliasKind::Channel { .. }
-            );
+            let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
             if is_agent {
                 // Live RPC sessions hold the selected agent alias in memory; refuse
                 // rather than letting them recreate old-alias state after the rename.
@@ -4022,8 +3336,6 @@ impl RpcDispatcher {
             }
 
             let mut working = self.ctx.config.read().clone();
-            let channel_generation_revocation =
-                self.prepare_channel_generation_revocation(is_channel, Some(&working))?;
             let old_workspace = is_agent.then(|| working.agent_workspace_dir(&req.from));
             // If a prior call saved config as `to` but crashed before side effects,
             // re-running `from -> to` should converge lagging owned state instead
@@ -4047,8 +3359,6 @@ impl RpcDispatcher {
                 self.save_and_swap_config(working.clone(), &config_write_guard)
                     .await?;
             }
-            self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
-                .await;
             // Config is committed (saved + swapped, or already committed by a
             // prior crashed run). Release before the post-commit side effects
             // below: workspace moves and the memory/cron/ACP/session-backend
@@ -4844,7 +4154,7 @@ impl RpcDispatcher {
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
-            let _ = self.send_raw_for_connection(json).await;
+            let _ = self.rpc.send_raw(json).await;
         }
     }
 
@@ -4860,7 +4170,7 @@ impl RpcDispatcher {
             id,
         };
         if let Ok(json) = serde_json::to_string(&resp) {
-            let _ = self.send_raw_for_connection(json).await;
+            let _ = self.rpc.send_raw(json).await;
         }
     }
 
@@ -5612,349 +4922,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
-
-    #[test]
-    fn transport_constructor_carries_configured_channel_capability_into_handles() {
-        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
-            4,
-            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
-                4, 10, 60,
-            )),
-        ));
-        let ctx = RpcContext::minimal(Config::default(), sessions);
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let local = RpcDispatcher::new_with_cancel_and_channel_access(
-            Arc::clone(&ctx),
-            tx.clone(),
-            "unix:test".into(),
-            cancel.clone(),
-            true,
-        );
-        let wss = RpcDispatcher::new_with_cancel_and_channel_access(
-            ctx,
-            tx,
-            "wss:test".into(),
-            cancel,
-            false,
-        );
-        assert!(local.configured_channel_access);
-        assert!(local.spawn_handle().configured_channel_access);
-        assert!(!wss.configured_channel_access);
-        assert!(!wss.spawn_handle().configured_channel_access);
-    }
-
-    fn run_rpc_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
-    where
-        F: std::future::Future<Output = ()> + 'static,
-        MakeFuture: FnOnce() -> F + Send + 'static,
-    {
-        let handle = std::thread::Builder::new()
-            .name("zeroclaw-rpc-dispatch-test".into())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build RPC dispatch test runtime");
-                runtime.block_on(make_future());
-            })
-            .expect("spawn RPC dispatch test thread");
-        if let Err(payload) = handle.join() {
-            std::panic::resume_unwind(payload);
-        }
-    }
-
-    struct RpcSeedTestChannel;
-
-    struct RpcGenerationDropChannel {
-        revoked: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    impl Drop for RpcGenerationDropChannel {
-        fn drop(&mut self) {
-            self.revoked
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    impl zeroclaw_api::attribution::Attributable for RpcGenerationDropChannel {
-        fn role(&self) -> zeroclaw_api::attribution::Role {
-            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Git)
-        }
-
-        fn alias(&self) -> &str {
-            "configured"
-        }
-    }
-
-    #[async_trait]
-    impl zeroclaw_api::channel::Channel for RpcGenerationDropChannel {
-        fn name(&self) -> &str {
-            "git"
-        }
-
-        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl zeroclaw_api::attribution::Attributable for RpcSeedTestChannel {
-        fn role(&self) -> zeroclaw_api::attribution::Role {
-            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Git)
-        }
-
-        fn alias(&self) -> &str {
-            "configured"
-        }
-    }
-
-    #[async_trait]
-    impl zeroclaw_api::channel::Channel for RpcSeedTestChannel {
-        fn name(&self) -> &str {
-            "git"
-        }
-
-        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn seed_test_channel_factory(dispatcher: &mut RpcDispatcher) {
-        dispatcher.set_channel_map_factory_for_test(|config, agent_alias| {
-            config
-                .agents
-                .get(agent_alias)
-                .into_iter()
-                .filter(|agent| agent.enabled)
-                .flat_map(|agent| &agent.channels)
-                .map(|channel| {
-                    (
-                        channel.to_string(),
-                        Arc::new(RpcSeedTestChannel) as Arc<dyn zeroclaw_api::channel::Channel>,
-                    )
-                })
-                .collect()
-        });
-    }
-
-    fn seed_test_channel_generation_controls(
-        dispatcher: &mut RpcDispatcher,
-    ) -> Arc<std::sync::atomic::AtomicBool> {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let invalidated = Arc::new(AtomicBool::new(false));
-        let seed_invalidated = Arc::clone(&invalidated);
-        dispatcher.set_channel_map_factory_for_test(move |config, agent_alias| {
-            if seed_invalidated.load(Ordering::Acquire) {
-                return std::collections::HashMap::new();
-            }
-            config
-                .agents
-                .get(agent_alias)
-                .into_iter()
-                .filter(|agent| agent.enabled)
-                .flat_map(|agent| &agent.channels)
-                .map(|channel| {
-                    (
-                        channel.to_string(),
-                        Arc::new(RpcSeedTestChannel) as Arc<dyn zeroclaw_api::channel::Channel>,
-                    )
-                })
-                .collect()
-        });
-
-        let generation_invalidated = Arc::clone(&invalidated);
-        let invalidate = Arc::clone(&invalidated);
-        dispatcher.set_channel_generation_controls_for_test(
-            move |config| {
-                if generation_invalidated.load(Ordering::Acquire) {
-                    return std::collections::HashMap::new();
-                }
-                config
-                    .agents
-                    .values()
-                    .flat_map(|agent| &agent.channels)
-                    .map(|channel| {
-                        (
-                            channel.to_string(),
-                            Arc::new(RpcSeedTestChannel) as Arc<dyn zeroclaw_api::channel::Channel>,
-                        )
-                    })
-                    .collect()
-            },
-            move || invalidate.store(true, Ordering::Release),
-        );
-        invalidated
-    }
-
-    async fn assert_rpc_and_configured_channels(
-        agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
-        expected: &str,
-        absent: &str,
-    ) {
-        let agent = agent.lock().await;
-        let reaction = agent.channel_handles().reaction.read();
-        assert!(
-            reaction.contains_key(expected),
-            "configured channel {expected} must be available to git_forge"
-        );
-        assert!(
-            reaction.contains_key("rpc"),
-            "the synthetic RPC back-channel must remain registered"
-        );
-        assert!(
-            !reaction.contains_key(absent),
-            "channel {absent} absent from the selected agent config must not be synthesized"
-        );
-    }
-
-    async fn assert_rpc_only_channel(
-        agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
-        absent: &str,
-    ) {
-        let agent = agent.lock().await;
-        let reaction = agent.channel_handles().reaction.read();
-        assert!(
-            reaction.contains_key("rpc"),
-            "the synthetic RPC back-channel must remain registered"
-        );
-        assert!(
-            !reaction.contains_key(absent),
-            "WSS sessions must not receive configured channel {absent}"
-        );
-    }
-
-    fn make_channel_refresh_test_config(
-        tmp: &tempfile::TempDir,
-    ) -> zeroclaw_config::schema::Config {
-        use zeroclaw_config::schema::AliasedAgentConfig;
-
-        let mut config = make_acp_test_config(tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent fixture")
-            .channels = vec!["git.configured".into()];
-        // Keep a sibling binding so this fixture stays in explicit-binding
-        // mode when the test agent loses its own channels.
-        config.agents.insert(
-            "sibling".into(),
-            AliasedAgentConfig {
-                enabled: true,
-                model_provider: "openai.test-provider".into(),
-                risk_profile: "test-profile".into(),
-                channels: vec!["git.sibling".into()],
-                ..Default::default()
-            },
-        );
-        config.channels.git.insert(
-            "configured".into(),
-            zeroclaw_config::schema::GitConfig {
-                enabled: true,
-                provider: "gitea".into(),
-                api_base_url: Some("https://git.invalid/api/v1".into()),
-                access_token: "old-token".into(),
-                ..Default::default()
-            },
-        );
-        config
-    }
-
-    fn make_channel_generation_test_dispatcher(
-        config: zeroclaw_config::schema::Config,
-    ) -> (
-        RpcDispatcher,
-        tokio::sync::mpsc::Receiver<String>,
-        Arc<crate::rpc::session::SessionStore>,
-        tokio::sync::watch::Receiver<bool>,
-    ) {
-        use zeroclaw_infra::session_queue::SessionActorQueue;
-
-        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
-        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
-        let ctx = RpcContext::minimal_with_reload_controls(
-            config,
-            Arc::clone(&sessions),
-            None,
-            Some(reload_tx),
-        );
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-channel-generation".into());
-        dispatcher.authenticated = true;
-        (dispatcher, rx, sessions, reload_rx)
-    }
-
-    async fn assert_channel_generation_reload(reload_rx: &mut tokio::sync::watch::Receiver<bool>) {
-        tokio::time::timeout(std::time::Duration::from_secs(2), reload_rx.changed())
-            .await
-            .expect("channel mutation must schedule daemon reload")
-            .expect("reload sender must remain live");
-        assert!(*reload_rx.borrow_and_update());
-    }
-
-    fn make_channel_refresh_test_dispatcher(
-        config: zeroclaw_config::schema::Config,
-    ) -> (
-        RpcDispatcher,
-        tokio::sync::mpsc::Receiver<String>,
-        Arc<crate::rpc::session::SessionStore>,
-    ) {
-        use zeroclaw_infra::session_queue::SessionActorQueue;
-
-        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
-        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-channel-refresh".into());
-        dispatcher.authenticated = true;
-        (dispatcher, rx, sessions)
-    }
-
-    async fn call_rpc_for_channel_refresh_test(
-        dispatcher: &mut RpcDispatcher,
-        rx: &mut tokio::sync::mpsc::Receiver<String>,
-        id: u64,
-        method: &str,
-        params: Value,
-    ) -> Value {
-        let line = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        })
-        .to_string();
-        dispatcher.process_line_for_test(&line).await;
-
-        loop {
-            let raw = rx.recv().await.expect("JSON-RPC response");
-            let response: Value = serde_json::from_str(&raw).expect("valid JSON-RPC response");
-            if response.get("id") != Some(&json!(id)) {
-                continue;
-            }
-            assert!(
-                response.get("error").is_none(),
-                "RPC {method} failed: {response}"
-            );
-            return response["result"].clone();
-        }
-    }
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
@@ -9125,1310 +8092,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_session_new_seeds_configured_channels_alongside_rpc() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_acp_test_config(&tmp);
-        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.configured".into()];
-        let data_dir = config.data_dir.clone();
-        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        seed_test_channel_factory(&mut dispatcher);
-
-        let sid = "acp-channel-seed-new";
-        dispatcher
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "exclude_memory": true,
-                "chat_mode": "acp",
-                "session_id": sid,
-            }))
-            .await
-            .expect("session/new should succeed");
-
-        let agent = sessions
-            .get_agent(sid)
-            .await
-            .expect("session/new must register a live agent");
-        assert_rpc_and_configured_channels(agent, "git.configured", "git.missing").await;
-    }
-
-    #[tokio::test]
-    async fn wss_acp_session_new_denies_configured_channels_but_keeps_rpc() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_acp_test_config(&tmp);
-        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.wss-configured".into()];
-        let data_dir = config.data_dir.clone();
-        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        seed_test_channel_factory(&mut dispatcher);
-        dispatcher.configured_channel_access = false;
-
-        let sid = "wss-acp-channel-deny-new";
-        dispatcher
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "exclude_memory": true,
-                "chat_mode": "acp",
-                "session_id": sid,
-            }))
-            .await
-            .expect("WSS session/new should succeed without configured channels");
-
-        let agent = sessions
-            .get_agent(sid)
-            .await
-            .expect("session/new must register a live agent");
-        assert_rpc_only_channel(agent, "git.wss-configured").await;
-    }
-
-    async fn execute_reaction_for_channel_refresh_test(
-        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
-        channel: &str,
-    ) -> zeroclaw_api::tool::ToolResult {
-        agent
-            .lock()
-            .await
-            .execute_tool_for_test(
-                "reaction",
-                json!({
-                    "channel": channel,
-                    "channel_id": "channel-id",
-                    "message_id": "message-id",
-                    "emoji": "wave",
-                }),
-            )
-            .await
-            .expect("reaction tool must be registered")
-            .expect("reaction tool execution must return a result")
-    }
-
-    async fn assert_channel_refresh_map(
-        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
-        configured: bool,
-    ) {
-        let agent = agent.lock().await;
-        let reaction = agent.channel_handles().reaction.read();
-        assert_eq!(
-            reaction.contains_key("git.configured"),
-            configured,
-            "configured channel map should match the live config"
-        );
-        for preserved in ["rpc", "acp", "approval-only"] {
-            assert!(
-                reaction.contains_key(preserved),
-                "refresh must preserve the {preserved} channel entry"
-            );
-        }
-    }
-
-    async fn assert_reaction_denied_after_channel_refresh(
-        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
-    ) {
-        let denied = execute_reaction_for_channel_refresh_test(agent, "git.configured").await;
-        assert!(!denied.success);
-        assert!(
-            denied
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("not found")),
-            "revoked configured channel must be denied: {:?}",
-            denied.error
-        );
-    }
-
-    async fn create_channel_refresh_sessions(
-        dispatcher: &mut RpcDispatcher,
-        rx: &mut tokio::sync::mpsc::Receiver<String>,
-        sessions: &Arc<crate::rpc::session::SessionStore>,
-        request_id: u64,
-        session_prefix: &str,
-    ) -> (
-        Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
-        Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
-    ) {
-        let agent_session_id = format!("{session_prefix}-agent");
-        let sibling_session_id = format!("{session_prefix}-sibling");
-        for (id, alias, session_id) in [
-            (request_id, "test-agent", agent_session_id.as_str()),
-            (request_id + 1, "sibling", sibling_session_id.as_str()),
-        ] {
-            call_rpc_for_channel_refresh_test(
-                dispatcher,
-                rx,
-                id,
-                "session/new",
-                json!({
-                    "agent_alias": alias,
-                    "exclude_memory": true,
-                    "chat_mode": "chat",
-                    "session_id": session_id,
-                }),
-            )
-            .await;
-        }
-
-        let agent = sessions
-            .get_agent(&agent_session_id)
-            .await
-            .expect("test agent session must be live");
-        let sibling = sessions
-            .get_agent(&sibling_session_id)
-            .await
-            .expect("sibling session must be live");
-        let preserved_channel =
-            Arc::new(RpcSeedTestChannel) as Arc<dyn zeroclaw_api::channel::Channel>;
-        {
-            let agent = agent.lock().await;
-            agent
-                .channel_handles()
-                .register_channel("acp", Arc::clone(&preserved_channel));
-            agent
-                .channel_handles()
-                .register_channel("approval-only", preserved_channel);
-        }
-        (agent, sibling)
-    }
-
-    async fn config_set_refreshes_existing_rpc_session_channel_handles_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        let (mut dispatcher, mut rx, sessions) = make_channel_refresh_test_dispatcher(config);
-        seed_test_channel_factory(&mut dispatcher);
-
-        let (agent, sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            1,
-            "channel-refresh",
-        )
-        .await;
-
-        let initial = execute_reaction_for_channel_refresh_test(&agent, "git.configured").await;
-        assert!(
-            initial.success,
-            "configured channel should initially be callable"
-        );
-
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            3,
-            "config/set",
-            json!({
-                "prop": "agents.test-agent.enabled",
-                "value": false,
-            }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, false).await;
-        assert_reaction_denied_after_channel_refresh(&agent).await;
-
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            4,
-            "config/set",
-            json!({
-                "prop": "agents.test-agent.enabled",
-                "value": true,
-            }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, true).await;
-
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            5,
-            "config/set",
-            json!({
-                "prop": "agents.test-agent.channels",
-                "value": [],
-            }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, false).await;
-        assert_reaction_denied_after_channel_refresh(&agent).await;
-
-        let sibling = sibling.lock().await;
-        assert!(
-            sibling
-                .channel_handles()
-                .reaction
-                .read()
-                .contains_key("git.sibling"),
-            "refreshing one agent must not alter a sibling session"
-        );
-    }
-
-    #[test]
-    fn config_set_refreshes_existing_rpc_session_channel_handles() {
-        run_rpc_dispatch_test(config_set_refreshes_existing_rpc_session_channel_handles_body);
-    }
-
-    async fn config_delete_and_agent_map_delete_refresh_existing_channel_handles_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        let (mut dispatcher, mut rx, sessions) = make_channel_refresh_test_dispatcher(config);
-        seed_test_channel_factory(&mut dispatcher);
-
-        let (agent, sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            11,
-            "channel-delete",
-        )
-        .await;
-
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            13,
-            "config/delete",
-            json!({ "prop": "agents.test-agent.channels" }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, false).await;
-        assert_reaction_denied_after_channel_refresh(&agent).await;
-
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            14,
-            "config/set",
-            json!({
-                "prop": "agents.test-agent.channels",
-                "value": ["git.configured"],
-            }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, true).await;
-
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            15,
-            "config/set",
-            json!({
-                "prop": "agents.test-agent.enabled",
-                "value": false,
-            }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, false).await;
-        assert_reaction_denied_after_channel_refresh(&agent).await;
-
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            16,
-            "config/delete",
-            json!({ "prop": "agents.test-agent.enabled" }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, true).await;
-
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            17,
-            "config/map-key-delete",
-            json!({
-                "path": "agents",
-                "key": "test-agent",
-            }),
-        )
-        .await;
-        assert_channel_refresh_map(&agent, false).await;
-        assert_reaction_denied_after_channel_refresh(&agent).await;
-        assert!(
-            !dispatcher
-                .ctx
-                .config
-                .read()
-                .agents
-                .contains_key("test-agent"),
-            "agents map-key-delete must remove the alias from live config"
-        );
-
-        let sibling = sibling.lock().await;
-        assert!(
-            sibling
-                .channel_handles()
-                .reaction
-                .read()
-                .contains_key("git.sibling"),
-            "deleting one agent must not alter a sibling session"
-        );
-    }
-
-    #[test]
-    fn config_delete_and_agent_map_delete_refresh_existing_channel_handles() {
-        run_rpc_dispatch_test(
-            config_delete_and_agent_map_delete_refresh_existing_channel_handles_body,
-        );
-    }
-
-    #[tokio::test]
-    async fn session_new_reconciles_local_agent_before_duplicate_id_publication() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        let (mut dispatcher, _rx, sessions) = make_channel_refresh_test_dispatcher(config);
-        seed_test_channel_factory(&mut dispatcher);
-
-        let session_id = "channel-refresh-race";
-        dispatcher
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "sibling",
-                "exclude_memory": true,
-                "chat_mode": "chat",
-                "session_id": session_id,
-            }))
-            .await
-            .expect("preexisting duplicate-ID sibling must be live");
-        let published_sibling = sessions
-            .get_agent(session_id)
-            .await
-            .expect("duplicate-ID sibling agent");
-
-        let seeded = Arc::new(tokio::sync::Notify::new());
-        let resume = Arc::new(tokio::sync::Notify::new());
-        dispatcher
-            .set_channel_seed_insert_barrier_for_test(Arc::clone(&seeded), Arc::clone(&resume));
-        let session_params = json!({
-            "agent_alias": "test-agent",
-            "exclude_memory": true,
-            "chat_mode": "chat",
-            "session_id": session_id,
-        });
-        let mutation_params = json!({
-            "prop": "agents.test-agent.channels",
-            "value": [],
-        });
-
-        let session_new = dispatcher.handle_session_new_for_test(&session_params);
-        let mutation = async {
-            seeded.notified().await;
-            assert_eq!(
-                sessions.get_agent_alias(session_id).await.as_deref(),
-                Some("sibling"),
-                "the paused local test-agent must remain unpublished"
-            );
-            let still_published = sessions
-                .get_agent(session_id)
-                .await
-                .expect("the prior sibling must remain published while paused");
-            assert!(
-                Arc::ptr_eq(&published_sibling, &still_published),
-                "the paused session must not replace the duplicate ID before reconciliation"
-            );
-            dispatcher
-                .handle_config_set(&mutation_params)
-                .await
-                .expect("channel revocation must commit while the session is unpublished");
-            assert_eq!(
-                sessions.get_agent_alias(session_id).await.as_deref(),
-                Some("sibling"),
-                "the prior sibling must remain published through mutation refresh"
-            );
-            resume.notify_one();
-        };
-        let (session_result, ()) = tokio::join!(session_new, mutation);
-        session_result.expect("session/new must insert after the mutation commits");
-
-        let agent = sessions
-            .get_agent(session_id)
-            .await
-            .expect("racing session must be live");
-        assert_eq!(
-            sessions.get_agent_alias(session_id).await.as_deref(),
-            Some("test-agent"),
-            "the reconciled local agent must replace the duplicate ID"
-        );
-        assert!(
-            !Arc::ptr_eq(&published_sibling, &agent),
-            "publication must install the local agent rather than mutate the prior sibling"
-        );
-        {
-            let agent = agent.lock().await;
-            let reaction = agent.channel_handles().reaction.read();
-            assert!(!reaction.contains_key("git.configured"));
-            assert!(
-                reaction.contains_key("rpc"),
-                "reconciliation must preserve the chat session's synthetic rpc channel"
-            );
-        }
-        assert_reaction_denied_after_channel_refresh(&agent).await;
-        assert_rpc_and_configured_channels(
-            Arc::clone(&published_sibling),
-            "git.sibling",
-            "git.configured",
-        )
-        .await;
-        assert!(
-            dispatcher.ctx.config.read().agents["sibling"]
-                .channels
-                .iter()
-                .any(|channel| channel == "git.sibling"),
-            "the fixture must retain a sibling binding in explicit-binding mode"
-        );
-    }
-
-    async fn channel_auth_deletes_roll_back_live_state_when_save_fails_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        config.save().await.expect("seed config on disk");
-        let valid_config_path = config.config_path.clone();
-        let (mut dispatcher, mut rx, sessions) = make_channel_refresh_test_dispatcher(config);
-        seed_test_channel_factory(&mut dispatcher);
-        let (agent, _sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            21,
-            "channel-save-failure",
-        )
-        .await;
-
-        let blocked_parent = tmp.path().join("not-a-directory");
-        std::fs::write(&blocked_parent, "block config directory creation").unwrap();
-        dispatcher.ctx.config.write().config_path = blocked_parent.join("config.toml");
-
-        let delete_error = dispatcher
-            .handle_config_delete(&json!({ "prop": "agents.test-agent.channels" }))
-            .await
-            .expect_err("config/delete save must fail");
-        assert!(
-            delete_error.message.contains("Config save failed"),
-            "config/delete must reach the forced persistence failure: {delete_error:?}"
-        );
-        assert_channel_refresh_map(&agent, true).await;
-        assert!(
-            execute_reaction_for_channel_refresh_test(&agent, "git.configured")
-                .await
-                .success,
-            "failed config/delete must leave the live channel callable"
-        );
-        assert_eq!(
-            dispatcher.ctx.config.read().agents["test-agent"].channels,
-            vec![zeroclaw_config::providers::ChannelRef::from(
-                "git.configured",
-            )],
-            "failed config/delete must not publish its working clone"
-        );
-
-        let map_delete_error = dispatcher
-            .handle_config_map_key_delete(&json!({
-                "path": "agents",
-                "key": "test-agent",
-            }))
-            .await
-            .expect_err("config/map-key-delete save must fail");
-        assert!(
-            map_delete_error.message.contains("Config save failed"),
-            "map-key-delete must reach the forced persistence failure: {map_delete_error:?}"
-        );
-        assert!(
-            dispatcher
-                .ctx
-                .config
-                .read()
-                .agents
-                .contains_key("test-agent"),
-            "failed map-key-delete must leave the live agent present"
-        );
-        assert_channel_refresh_map(&agent, true).await;
-        assert!(
-            execute_reaction_for_channel_refresh_test(&agent, "git.configured")
-                .await
-                .success,
-            "failed map-key-delete must leave the live channel callable"
-        );
-
-        dispatcher.ctx.config.write().config_path = valid_config_path.clone();
-        call_rpc_for_channel_refresh_test(
-            &mut dispatcher,
-            &mut rx,
-            23,
-            "config/set",
-            json!({
-                "prop": "providers.models.openai.test-provider.model",
-                "value": "unrelated-success",
-            }),
-        )
-        .await;
-        assert!(
-            execute_reaction_for_channel_refresh_test(&agent, "git.configured")
-                .await
-                .success,
-            "a later successful save must not carry a latent revocation"
-        );
-
-        let disk = std::fs::read_to_string(valid_config_path).unwrap();
-        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
-        assert_eq!(
-            reloaded.agents["test-agent"].channels,
-            vec![zeroclaw_config::providers::ChannelRef::from(
-                "git.configured",
-            )],
-            "the unrelated save must persist the unchanged authorization"
-        );
-    }
-
-    #[test]
-    fn channel_auth_deletes_roll_back_live_state_when_save_fails() {
-        run_rpc_dispatch_test(channel_auth_deletes_roll_back_live_state_when_save_fails_body);
-    }
-
-    async fn channel_generation_mutation_revokes_before_reply_and_blocks_racing_seed_body() {
-        use std::sync::atomic::Ordering;
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        config.save().await.expect("seed channel config on disk");
-        let (mut dispatcher, mut rx, sessions, mut reload_rx) =
-            make_channel_generation_test_dispatcher(config);
-        let invalidated = seed_test_channel_generation_controls(&mut dispatcher);
-        let (existing, _sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            31,
-            "channel-generation-existing",
-        )
-        .await;
-        let blocked_session_id = "channel-generation-existing-agent";
-        let blocked_token = tokio_util::sync::CancellationToken::new();
-        let blocked_generation =
-            sessions.register_cancel_token(blocked_session_id, blocked_token.clone());
-        let blocked_sessions = Arc::clone(&sessions);
-        let blocked_turn = ::zeroclaw_spawn::spawn!(async move {
-            blocked_token.cancelled().await;
-            let cause = blocked_sessions.take_cancel_cause(blocked_session_id);
-            blocked_sessions.remove_cancel_token(blocked_session_id, blocked_generation);
-            cause
-        });
-
-        let seeded = Arc::new(tokio::sync::Notify::new());
-        let resume = Arc::new(tokio::sync::Notify::new());
-        dispatcher
-            .set_channel_seed_insert_barrier_for_test(Arc::clone(&seeded), Arc::clone(&resume));
-        let racing_params = json!({
-            "agent_alias": "test-agent",
-            "exclude_memory": true,
-            "chat_mode": "chat",
-            "session_id": "channel-generation-racing",
-        });
-        let mutation_params = json!({
-            "prop": "channels.git.configured.access_token",
-            "value": "rotated-token",
-        });
-
-        let racing_session = dispatcher.handle_session_new_for_test(&racing_params);
-        let mutation = async {
-            seeded.notified().await;
-            let result = dispatcher
-                .handle_config_set(&mutation_params)
-                .await
-                .expect("credential rotation must commit");
-            assert_eq!(result["set"], true);
-            assert!(
-                invalidated.load(Ordering::Acquire),
-                "success must invalidate the old registry before returning"
-            );
-            assert_channel_refresh_map(&existing, false).await;
-            assert_reaction_denied_after_channel_refresh(&existing).await;
-            resume.notify_one();
-        };
-        let (racing_result, ()) = tokio::join!(racing_session, mutation);
-        racing_result.expect("racing session creation must complete fail-closed");
-        assert_eq!(
-            blocked_turn.await.unwrap(),
-            Some(crate::rpc::session::CancelCause::ChannelGeneration),
-            "generation mutation must cancel and drain the blocked turn"
-        );
-
-        {
-            let racing = sessions
-                .get_agent("channel-generation-racing")
-                .await
-                .expect("racing session must publish after reconciliation");
-            let racing = racing.lock().await;
-            let reaction = racing.channel_handles().reaction.read();
-            assert!(reaction.contains_key("rpc"));
-            assert!(
-                !reaction.contains_key("git.configured"),
-                "a post-invalidation publication must not reseed the retired client"
-            );
-        }
-        assert_channel_generation_reload(&mut reload_rx).await;
-    }
-
-    #[test]
-    fn channel_generation_mutation_revokes_before_reply_and_blocks_racing_seed() {
-        run_rpc_dispatch_test(
-            channel_generation_mutation_revokes_before_reply_and_blocks_racing_seed_body,
-        );
-    }
-
-    async fn session_prompt_channel_generation_mutation_cancels_and_revokes_body() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        config.save().await.expect("seed channel config on disk");
-        let (mut dispatcher, mut rx, sessions, mut reload_rx) =
-            make_channel_generation_test_dispatcher(config);
-
-        let revoked = Arc::new(AtomicBool::new(false));
-        let channel_factory = {
-            let revoked = Arc::clone(&revoked);
-            move |config: &Config, agent_alias: &str| {
-                config
-                    .agents
-                    .get(agent_alias)
-                    .into_iter()
-                    .filter(|agent| agent.enabled)
-                    .flat_map(|agent| &agent.channels)
-                    .map(|channel| {
-                        (
-                            channel.to_string(),
-                            Arc::new(RpcGenerationDropChannel {
-                                revoked: Arc::clone(&revoked),
-                            })
-                                as Arc<dyn zeroclaw_api::channel::Channel>,
-                        )
-                    })
-                    .collect()
-            }
-        };
-        dispatcher.set_channel_map_factory_for_test(channel_factory);
-
-        let invalidated = Arc::new(AtomicBool::new(false));
-        let generation_factory = {
-            let revoked = Arc::clone(&revoked);
-            move |config: &Config| {
-                config
-                    .agents
-                    .values()
-                    .flat_map(|agent| &agent.channels)
-                    .map(|channel| {
-                        (
-                            channel.to_string(),
-                            Arc::new(RpcGenerationDropChannel {
-                                revoked: Arc::clone(&revoked),
-                            })
-                                as Arc<dyn zeroclaw_api::channel::Channel>,
-                        )
-                    })
-                    .collect()
-            }
-        };
-        let invalidate = Arc::clone(&invalidated);
-        dispatcher.set_channel_generation_controls_for_test(generation_factory, move || {
-            invalidate.store(true, Ordering::Release);
-        });
-
-        let (agent, _sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            41,
-            "channel-generation-prompt",
-        )
-        .await;
-        revoked.store(false, Ordering::Release);
-
-        let entered = Arc::new(tokio::sync::Notify::new());
-        agent
-            .lock()
-            .await
-            .set_model_provider(Box::new(CooperativeBlockingModelProvider {
-                entered: Arc::clone(&entered),
-                starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            }));
-
-        let prompt_dispatcher = dispatcher.spawn_handle();
-        let prompt = ::zeroclaw_spawn::spawn!(async move {
-            prompt_dispatcher
-                .handle_session_prompt(&json!({
-                    "session_id": "channel-generation-prompt-agent",
-                    "prompt": "block until channel generation is retired",
-                }))
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
-            .await
-            .expect("session/prompt must reach the blocking provider");
-        assert!(
-            sessions.has_inflight_turn("channel-generation-prompt-agent"),
-            "session/prompt must register a real cancellation token"
-        );
-
-        let mutation_dispatcher = dispatcher.spawn_handle();
-        let mutation = ::zeroclaw_spawn::spawn!(async move {
-            mutation_dispatcher
-                .handle_config_set(&json!({
-                    "prop": "channels.git.configured.access_token",
-                    "value": "rotated-token",
-                }))
-                .await
-        });
-
-        let mutation_result = tokio::time::timeout(std::time::Duration::from_secs(8), mutation)
-            .await
-            .expect("channel mutation must finish after draining the blocked prompt")
-            .expect("channel mutation task must join");
-        assert!(
-            mutation_result.is_ok(),
-            "channel mutation must commit: {mutation_result:?}"
-        );
-        assert!(invalidated.load(Ordering::Acquire));
-        assert!(revoked.load(Ordering::Acquire));
-        assert_channel_refresh_map(&agent, false).await;
-        assert_eq!(
-            mutation_result.expect("channel mutation must commit")["set"],
-            true
-        );
-        assert_eq!(
-            prompt
-                .await
-                .expect("session/prompt task must join")
-                .expect("cooperative cancellation must return a prompt result")["stop_reason"],
-            "cancelled"
-        );
-        assert!(
-            !sessions.has_inflight_turn("channel-generation-prompt-agent"),
-            "channel mutation must drain the real prompt registration"
-        );
-        assert_channel_generation_reload(&mut reload_rx).await;
-    }
-
-    #[test]
-    fn session_prompt_channel_generation_mutation_cancels_and_revokes() {
-        run_rpc_dispatch_test(session_prompt_channel_generation_mutation_cancels_and_revokes_body);
-    }
-
-    async fn channel_disable_revokes_live_generation_body() {
-        use std::sync::atomic::Ordering;
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        config.save().await.expect("seed channel config on disk");
-        let (mut dispatcher, mut rx, sessions, mut reload_rx) =
-            make_channel_generation_test_dispatcher(config);
-        let invalidated = seed_test_channel_generation_controls(&mut dispatcher);
-        let (agent, _sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            36,
-            "channel-disable",
-        )
-        .await;
-
-        dispatcher
-            .handle_config_set(&json!({
-                "prop": "channels.git.configured.enabled",
-                "value": false,
-            }))
-            .await
-            .expect("channel disable must commit");
-        assert!(!dispatcher.ctx.config.read().channels.git["configured"].enabled);
-        assert!(invalidated.load(Ordering::Acquire));
-        assert_channel_refresh_map(&agent, false).await;
-        assert_reaction_denied_after_channel_refresh(&agent).await;
-        assert_channel_generation_reload(&mut reload_rx).await;
-    }
-
-    #[test]
-    fn channel_disable_revokes_live_generation() {
-        run_rpc_dispatch_test(channel_disable_revokes_live_generation_body);
-    }
-
-    async fn channel_alias_delete_and_rename_revoke_live_generation_body() {
-        use std::sync::atomic::Ordering;
-
-        for rename in [false, true] {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let config = make_channel_refresh_test_config(&tmp);
-            config.save().await.expect("seed channel config on disk");
-            let (mut dispatcher, mut rx, sessions, mut reload_rx) =
-                make_channel_generation_test_dispatcher(config);
-            let invalidated = seed_test_channel_generation_controls(&mut dispatcher);
-            let (agent, _sibling) = create_channel_refresh_sessions(
-                &mut dispatcher,
-                &mut rx,
-                &sessions,
-                41,
-                if rename {
-                    "channel-alias-rename"
-                } else {
-                    "channel-alias-delete"
-                },
-            )
-            .await;
-
-            if rename {
-                dispatcher
-                    .handle_config_map_key_rename(&json!({
-                        "path": "channels.git",
-                        "from": "configured",
-                        "to": "renamed",
-                    }))
-                    .await
-                    .expect("channel alias rename must commit");
-                assert!(
-                    dispatcher
-                        .ctx
-                        .config
-                        .read()
-                        .channels
-                        .git
-                        .contains_key("renamed"),
-                    "renamed channel must be installed in canonical config"
-                );
-            } else {
-                dispatcher
-                    .handle_config_map_key_delete(&json!({
-                        "path": "channels.git",
-                        "key": "configured",
-                    }))
-                    .await
-                    .expect("channel alias delete must commit");
-                assert!(
-                    !dispatcher
-                        .ctx
-                        .config
-                        .read()
-                        .channels
-                        .git
-                        .contains_key("configured"),
-                    "deleted channel must leave canonical config"
-                );
-            }
-
-            assert!(invalidated.load(Ordering::Acquire));
-            assert_channel_refresh_map(&agent, false).await;
-            assert_reaction_denied_after_channel_refresh(&agent).await;
-            assert_channel_generation_reload(&mut reload_rx).await;
-        }
-    }
-
-    #[test]
-    fn channel_alias_delete_and_rename_revoke_live_generation() {
-        run_rpc_dispatch_test(channel_alias_delete_and_rename_revoke_live_generation_body);
-    }
-
-    async fn failed_channel_generation_save_preserves_registry_and_handles_body() {
-        use std::sync::atomic::Ordering;
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        config.save().await.expect("seed channel config on disk");
-        let (mut dispatcher, mut rx, sessions, _reload_rx) =
-            make_channel_generation_test_dispatcher(config);
-        let invalidated = seed_test_channel_generation_controls(&mut dispatcher);
-        let (agent, _sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            51,
-            "channel-generation-save-failure",
-        )
-        .await;
-
-        let blocked_parent = tmp.path().join("not-a-directory-generation");
-        std::fs::write(&blocked_parent, "block config directory creation").unwrap();
-        dispatcher.ctx.config.write().config_path = blocked_parent.join("config.toml");
-        let error = dispatcher
-            .handle_config_set(&json!({
-                "prop": "channels.git.configured.access_token",
-                "value": "must-not-publish",
-            }))
-            .await
-            .expect_err("failed persistence must reject channel mutation");
-        assert!(error.message.contains("Config save failed"));
-        assert!(
-            !invalidated.load(Ordering::Acquire),
-            "failed persistence must not invalidate the live generation"
-        );
-        assert_channel_refresh_map(&agent, true).await;
-        assert!(
-            execute_reaction_for_channel_refresh_test(&agent, "git.configured")
-                .await
-                .success
-        );
-    }
-
-    #[test]
-    fn failed_channel_generation_save_preserves_registry_and_handles() {
-        run_rpc_dispatch_test(failed_channel_generation_save_preserves_registry_and_handles_body);
-    }
-
-    async fn channel_generation_without_reload_rejects_before_persistence_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        let original_token = config.channels.git["configured"].access_token.clone();
-        let (mut dispatcher, _rx, _sessions) = make_channel_refresh_test_dispatcher(config);
-        let invalidated = seed_test_channel_generation_controls(&mut dispatcher);
-
-        let error = dispatcher
-            .handle_config_set(&json!({
-                "prop": "channels.git.configured.access_token",
-                "value": "must-not-persist",
-            }))
-            .await
-            .expect_err("channel mutation must require daemon reload controls");
-        assert!(error.message.contains("unavailable"));
-        assert_eq!(
-            dispatcher.ctx.config.read().channels.git["configured"].access_token,
-            original_token,
-            "unavailable reload must reject before changing live config"
-        );
-        assert!(!invalidated.load(std::sync::atomic::Ordering::Acquire));
-    }
-
-    #[test]
-    fn channel_generation_without_reload_rejects_before_persistence() {
-        run_rpc_dispatch_test(channel_generation_without_reload_rejects_before_persistence_body);
-    }
-
-    async fn channel_map_key_create_does_not_invalidate_generation_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        let (mut dispatcher, _rx, _sessions, mut reload_rx) =
-            make_channel_generation_test_dispatcher(config);
-        let invalidated = seed_test_channel_generation_controls(&mut dispatcher);
-
-        let result = dispatcher
-            .handle_config_map_key_create(&json!({
-                "path": "channels.git",
-                "key": "created",
-            }))
-            .await
-            .expect("channel alias creation must persist");
-        assert_eq!(result["created"], true);
-        assert!(
-            dispatcher
-                .ctx
-                .config
-                .read()
-                .channels
-                .git
-                .contains_key("created")
-        );
-        assert!(!dispatcher.ctx.config.read().channels.git["created"].enabled);
-        assert!(!invalidated.load(std::sync::atomic::Ordering::Acquire));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), reload_rx.changed())
-                .await
-                .is_err(),
-            "creating a disabled-by-default alias must not schedule reload"
-        );
-    }
-
-    #[test]
-    fn channel_map_key_create_does_not_invalidate_generation() {
-        run_rpc_dispatch_test(channel_map_key_create_does_not_invalidate_generation_body);
-    }
-
-    async fn guarded_registration_waits_for_generation_revocation_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        let (mut dispatcher, mut rx, sessions, _reload_rx) =
-            make_channel_generation_test_dispatcher(config);
-        let invalidated = seed_test_channel_generation_controls(&mut dispatcher);
-        let (agent, _sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            71,
-            "channel-registration-race",
-        )
-        .await;
-        let old_config = dispatcher.ctx.config.read().clone();
-        let configured = dispatcher
-            .configured_channel_generation_revocation(&old_config)
-            .expect("generation controls must be configured");
-        let config_guard = Arc::clone(&dispatcher.ctx.config_write_lock)
-            .lock_owned()
-            .await;
-        let registration_dispatcher = dispatcher.spawn_handle();
-        let registration = ::zeroclaw_spawn::spawn!(async move {
-            registration_dispatcher
-                .register_turn_cancel_token("channel-registration-race-agent")
-                .await
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !sessions.has_inflight_turn("channel-registration-race-agent"),
-            "a prompt registration must wait while mutation owns config_write_lock"
-        );
-
-        assert!(dispatcher.invalidate_channel_generation_for_test());
-        dispatcher.revoke_live_channel_generation(&configured).await;
-        assert!(invalidated.load(std::sync::atomic::Ordering::Acquire));
-        assert_channel_refresh_map(&agent, false).await;
-        drop(config_guard);
-
-        let (token, generation) = registration
-            .await
-            .unwrap()
-            .expect("live session registration must succeed");
-        assert!(sessions.has_inflight_turn("channel-registration-race-agent"));
-        token.cancel();
-        sessions.remove_cancel_token("channel-registration-race-agent", generation);
-    }
-
-    #[test]
-    fn guarded_registration_waits_for_generation_revocation() {
-        run_rpc_dispatch_test(guarded_registration_waits_for_generation_revocation_body);
-    }
-
-    async fn close_or_kill_before_prompt_registration_prevents_turn_start_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_channel_refresh_test_config(&tmp);
-        let (mut dispatcher, mut rx, sessions) = make_channel_refresh_test_dispatcher(config);
-        seed_test_channel_factory(&mut dispatcher);
-
-        for (index, kill) in [false, true].into_iter().enumerate() {
-            let prefix = if kill {
-                "pre-registration-kill"
-            } else {
-                "pre-registration-close"
-            };
-            let session_id = format!("{prefix}-agent");
-            let (agent, _sibling) = create_channel_refresh_sessions(
-                &mut dispatcher,
-                &mut rx,
-                &sessions,
-                81 + (index as u64 * 2),
-                prefix,
-            )
-            .await;
-            let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            agent
-                .lock()
-                .await
-                .set_model_provider(Box::new(CooperativeBlockingModelProvider {
-                    entered: Arc::new(tokio::sync::Notify::new()),
-                    starts: Arc::clone(&starts),
-                }));
-
-            let reached = Arc::new(tokio::sync::Notify::new());
-            let resume = Arc::new(tokio::sync::Notify::new());
-            dispatcher.set_prompt_registration_barrier_for_test(
-                Arc::clone(&reached),
-                Arc::clone(&resume),
-            );
-            let prompt_dispatcher = dispatcher.spawn_handle();
-            let prompt_session_id = session_id.clone();
-            let prompt = ::zeroclaw_spawn::spawn!(async move {
-                prompt_dispatcher
-                    .handle_session_prompt(&json!({
-                        "session_id": prompt_session_id,
-                        "prompt": "must not start after session removal",
-                    }))
-                    .await
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
-                .await
-                .expect("prompt must pause after acquiring its session permit");
-            assert!(!sessions.has_inflight_turn(&session_id));
-
-            let removed = if kill {
-                sessions.kill_session(&session_id).await
-            } else {
-                sessions.remove(&session_id).await
-            };
-            assert!(removed, "close/kill must remove the paused live session");
-            resume.notify_one();
-
-            let error = prompt
-                .await
-                .expect("prompt task should not panic")
-                .expect_err("removed session must fail before turn registration");
-            assert_eq!(error.code, SESSION_NOT_FOUND);
-            assert_eq!(
-                starts.load(std::sync::atomic::Ordering::Relaxed),
-                0,
-                "removed prompt must not reach the provider"
-            );
-            assert!(!sessions.has_inflight_turn(&session_id));
-            assert_eq!(sessions.session_queue.queue_depth(&session_id).await, 0);
-        }
-    }
-
-    #[test]
-    fn close_or_kill_before_prompt_registration_prevents_turn_start() {
-        run_rpc_dispatch_test(close_or_kill_before_prompt_registration_prevents_turn_start_body);
-    }
-
-    async fn final_agent_binding_enters_legacy_fallback_for_all_sessions_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_channel_refresh_test_config(&tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .unwrap()
-            .channels
-            .clear();
-        let (mut dispatcher, mut rx, sessions) = make_channel_refresh_test_dispatcher(config);
-        let legacy_factory = |config: &Config, agent_alias: &str| {
-            let names = if config
-                .agents
-                .values()
-                .all(|agent| agent.channels.is_empty())
-            {
-                config
-                    .channels_by_alias()
-                    .into_iter()
-                    .filter(|channel| channel.enabled)
-                    .map(|channel| format!("{}.{}", channel.channel_type, channel.alias))
-                    .collect::<Vec<_>>()
-            } else {
-                config
-                    .agents
-                    .get(agent_alias)
-                    .filter(|agent| agent.enabled)
-                    .map(|agent| agent.channels.iter().map(ToString::to_string).collect())
-                    .unwrap_or_default()
-            };
-            names
-                .into_iter()
-                .map(|name| {
-                    (
-                        name,
-                        Arc::new(RpcSeedTestChannel) as Arc<dyn zeroclaw_api::channel::Channel>,
-                    )
-                })
-                .collect()
-        };
-        dispatcher.set_channel_map_factory_for_test(legacy_factory);
-
-        let (agent, sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            61,
-            "channel-legacy-fallback",
-        )
-        .await;
-        dispatcher
-            .handle_config_set(&json!({
-                "prop": "agents.sibling.channels",
-                "value": [],
-            }))
-            .await
-            .expect("removing the final binding must persist");
-
-        assert_channel_refresh_map(&agent, true).await;
-        let sibling = sibling.lock().await;
-        let reaction = sibling.channel_handles().reaction.read();
-        assert!(!reaction.contains_key("git.sibling"));
-        assert!(reaction.contains_key("git.configured"));
-    }
-
-    #[test]
-    fn final_agent_binding_enters_legacy_fallback_for_all_sessions() {
-        run_rpc_dispatch_test(final_agent_binding_enters_legacy_fallback_for_all_sessions_body);
-    }
-
-    async fn first_agent_binding_exits_legacy_fallback_for_siblings_body() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_channel_refresh_test_config(&tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .unwrap()
-            .channels
-            .clear();
-        config.agents.get_mut("sibling").unwrap().channels.clear();
-        let (mut dispatcher, mut rx, sessions) = make_channel_refresh_test_dispatcher(config);
-        let legacy_factory = |config: &Config, agent_alias: &str| {
-            let names = if config
-                .agents
-                .values()
-                .all(|agent| agent.channels.is_empty())
-            {
-                config
-                    .channels_by_alias()
-                    .into_iter()
-                    .filter(|channel| channel.enabled)
-                    .map(|channel| format!("{}.{}", channel.channel_type, channel.alias))
-                    .collect::<Vec<_>>()
-            } else {
-                config
-                    .agents
-                    .get(agent_alias)
-                    .filter(|agent| agent.enabled)
-                    .map(|agent| agent.channels.iter().map(ToString::to_string).collect())
-                    .unwrap_or_default()
-            };
-            names
-                .into_iter()
-                .map(|name| {
-                    (
-                        name,
-                        Arc::new(RpcSeedTestChannel) as Arc<dyn zeroclaw_api::channel::Channel>,
-                    )
-                })
-                .collect()
-        };
-        dispatcher.set_channel_map_factory_for_test(legacy_factory);
-
-        let (agent, sibling) = create_channel_refresh_sessions(
-            &mut dispatcher,
-            &mut rx,
-            &sessions,
-            81,
-            "channel-legacy-reverse",
-        )
-        .await;
-        {
-            let agent = agent.lock().await;
-            let reaction = agent.channel_handles().reaction.read();
-            assert!(reaction.contains_key("git.configured"));
-        }
-        {
-            let sibling = sibling.lock().await;
-            let reaction = sibling.channel_handles().reaction.read();
-            assert!(reaction.contains_key("git.configured"));
-        }
-
-        dispatcher
-            .handle_config_set(&json!({
-                "prop": "agents.test-agent.channels",
-                "value": ["git.configured"],
-            }))
-            .await
-            .expect("adding the first explicit binding must persist");
-
-        {
-            let agent = agent.lock().await;
-            let reaction = agent.channel_handles().reaction.read();
-            assert!(reaction.contains_key("git.configured"));
-            assert!(!reaction.contains_key("git.sibling"));
-            assert!(reaction.contains_key("rpc"));
-        }
-        {
-            let sibling = sibling.lock().await;
-            let reaction = sibling.channel_handles().reaction.read();
-            assert!(!reaction.contains_key("git.configured"));
-            assert!(!reaction.contains_key("git.sibling"));
-            assert!(reaction.contains_key("rpc"));
-        }
-    }
-
-    #[test]
-    fn first_agent_binding_exits_legacy_fallback_for_siblings() {
-        run_rpc_dispatch_test(first_agent_binding_exits_legacy_fallback_for_siblings_body);
-    }
-
-    #[tokio::test]
     async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
         use serde_json::from_value;
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
@@ -10581,74 +8244,6 @@ mod tests {
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
         );
-    }
-
-    #[tokio::test]
-    async fn reaped_acp_session_reseeds_configured_channels_alongside_rpc() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_acp_test_config(&tmp);
-        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.before-reload".into()];
-        let data_dir = config.data_dir.clone();
-        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        seed_test_channel_factory(&mut dispatcher);
-
-        let sid = "acp-channel-seed-rehydrate";
-        dispatcher
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "exclude_memory": true,
-                "chat_mode": "acp",
-                "session_id": sid,
-            }))
-            .await
-            .expect("session/new should succeed");
-        assert!(sessions.remove(sid).await, "reap must remove the session");
-
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .unwrap()
-            .channels = vec!["git.after-reload".into()];
-
-        let agent = dispatcher
-            .rehydrate_reaped_session(sid)
-            .await
-            .expect("durable ACP session should rehydrate");
-        assert_rpc_and_configured_channels(agent, "git.after-reload", "git.before-reload").await;
-    }
-
-    #[tokio::test]
-    async fn wss_reaped_acp_session_denies_configured_channels_but_keeps_rpc() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_acp_test_config(&tmp);
-        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.wss-configured".into()];
-        let data_dir = config.data_dir.clone();
-        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        seed_test_channel_factory(&mut dispatcher);
-        dispatcher.configured_channel_access = false;
-
-        let sid = "wss-acp-channel-deny-rehydrate";
-        dispatcher
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "exclude_memory": true,
-                "chat_mode": "acp",
-                "session_id": sid,
-            }))
-            .await
-            .expect("WSS session/new should seed only the synthetic RPC channel");
-        assert!(sessions.remove(sid).await, "reap must remove the session");
-
-        let agent = dispatcher
-            .rehydrate_reaped_session(sid)
-            .await
-            .expect("durable ACP session should rehydrate");
-        assert_rpc_only_channel(agent, "git.wss-configured").await;
     }
 
     #[tokio::test]
@@ -11059,9 +8654,7 @@ mod tests {
     #[tokio::test]
     async fn config_set_still_materializes_operator_chosen_alias() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (mut dispatcher, _rx, _sessions, mut reload_rx) =
-            make_channel_generation_test_dispatcher(make_secret_test_config(&tmp));
-        let invalidated = seed_test_channel_generation_controls(&mut dispatcher);
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
         let res = dispatcher
             .handle_config_set(&json!({
                 "prop": "channels.telegram.newbot.bot_token",
@@ -11081,8 +8674,6 @@ mod tests {
                 .telegram
                 .contains_key("newbot")
         );
-        assert!(invalidated.load(std::sync::atomic::Ordering::Acquire));
-        assert_channel_generation_reload(&mut reload_rx).await;
     }
 
     #[tokio::test]
@@ -12725,7 +10316,6 @@ mod tests {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -12769,7 +10359,6 @@ mod tests {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -12799,41 +10388,6 @@ mod tests {
     //    session_end so that configured hooks observe RPC lifecycles ──
 
     struct DummyModelProvider;
-
-    struct CooperativeBlockingModelProvider {
-        entered: Arc<tokio::sync::Notify>,
-        starts: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl zeroclaw_api::model_provider::ModelProvider for CooperativeBlockingModelProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            self.starts
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.entered.notify_one();
-            std::future::pending::<anyhow::Result<String>>().await
-        }
-    }
-
-    impl zeroclaw_api::attribution::Attributable for CooperativeBlockingModelProvider {
-        fn role(&self) -> zeroclaw_api::attribution::Role {
-            zeroclaw_api::attribution::Role::Provider(
-                zeroclaw_api::attribution::ProviderKind::Model(
-                    zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-
-        fn alias(&self) -> &str {
-            "cooperative-blocking"
-        }
-    }
 
     #[async_trait]
     impl zeroclaw_api::model_provider::ModelProvider for DummyModelProvider {
@@ -12905,7 +10459,6 @@ mod tests {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -12938,40 +10491,6 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
         dispatcher.authenticated = true;
         (dispatcher, rx)
-    }
-
-    #[tokio::test]
-    async fn connection_cancel_preempts_full_prompt_outbound_queue() {
-        use zeroclaw_infra::session_queue::SessionActorQueue;
-
-        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
-            16,
-            Arc::new(SessionActorQueue::new(4, 10, 60)),
-        ));
-        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        tx.send("occupy the only outbound slot".to_string())
-            .await
-            .unwrap();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let dispatcher =
-            RpcDispatcher::new_with_cancel(ctx, tx, "test-peer-full:pid=1".into(), cancel.clone());
-
-        let blocked = dispatcher.send_raw_for_connection("blocked".to_string());
-        tokio::pin!(blocked);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut blocked)
-                .await
-                .is_err(),
-            "the test must first prove the outbound queue is full"
-        );
-
-        cancel.cancel();
-        assert!(
-            !tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
-                .await
-                .expect("connection cancellation should preempt the blocked enqueue")
-        );
     }
 
     #[tokio::test]
@@ -13363,7 +10882,8 @@ mod tests {
         task.await.expect("blocked RPC task must not panic")
     }
 
-    async fn config_set_blocks_while_config_write_lock_held_body() {
+    #[tokio::test]
+    async fn config_set_blocks_while_config_write_lock_held() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         let cfg = make_two_provider_test_config(&tmp);
@@ -13390,11 +10910,6 @@ mod tests {
             on_disk.contains("blocked-value"),
             "config/set must persist once unblocked; on-disk file:\n{on_disk}"
         );
-    }
-
-    #[test]
-    fn config_set_blocks_while_config_write_lock_held() {
-        run_rpc_dispatch_test(config_set_blocks_while_config_write_lock_held_body);
     }
 
     #[tokio::test]

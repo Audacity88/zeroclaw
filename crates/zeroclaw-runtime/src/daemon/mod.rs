@@ -5,140 +5,6 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
 
-/// A daemon-run-owned channel generation. RPC config mutations prepare an
-/// opaque drain for this exact generation; committing the mutation retires the
-/// generation, clears channel admission, and waits for its channel task.
-#[derive(Clone)]
-pub(crate) struct ChannelGenerationControl {
-    state: std::sync::Arc<ChannelGenerationState>,
-    registry_clearer: Option<ChannelRegistryClearer>,
-}
-
-struct ChannelGenerationState {
-    retired: std::sync::atomic::AtomicBool,
-    active: parking_lot::Mutex<Option<ChannelGenerationAttemptState>>,
-}
-
-struct ChannelGenerationAttemptState {
-    cancel: tokio_util::sync::CancellationToken,
-    done: tokio::sync::oneshot::Receiver<()>,
-}
-
-pub(crate) struct PreparedChannelGenerationDrain {
-    control: ChannelGenerationControl,
-}
-
-pub(crate) struct ChannelGenerationDrainWait {
-    done: Option<tokio::sync::oneshot::Receiver<()>>,
-}
-
-pub(crate) struct ChannelGenerationAttempt {
-    cancel: tokio_util::sync::CancellationToken,
-    done: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl ChannelGenerationControl {
-    pub(crate) fn new(registry_clearer: Option<ChannelRegistryClearer>) -> Self {
-        Self {
-            state: std::sync::Arc::new(ChannelGenerationState {
-                retired: std::sync::atomic::AtomicBool::new(false),
-                active: parking_lot::Mutex::new(None),
-            }),
-            registry_clearer,
-        }
-    }
-
-    pub(crate) fn prepare(&self) -> Option<PreparedChannelGenerationDrain> {
-        self.registry_clearer.as_ref()?;
-        Some(PreparedChannelGenerationDrain {
-            control: self.clone(),
-        })
-    }
-
-    fn begin_attempt(
-        &self,
-        daemon_cancel: &tokio_util::sync::CancellationToken,
-    ) -> Option<ChannelGenerationAttempt> {
-        let mut active = self.state.active.lock();
-        if self
-            .state
-            .retired
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return None;
-        }
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let cancel = daemon_cancel.child_token();
-        active.replace(ChannelGenerationAttemptState {
-            cancel: cancel.clone(),
-            done: done_rx,
-        });
-        Some(ChannelGenerationAttempt {
-            cancel,
-            done: Some(done_tx),
-        })
-    }
-
-    fn retire(&self) -> ChannelGenerationDrainWait {
-        let active = {
-            let mut slot = self.state.active.lock();
-            if self
-                .state
-                .retired
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-            {
-                return ChannelGenerationDrainWait { done: None };
-            }
-            slot.take()
-        };
-        if let Some(clear) = &self.registry_clearer {
-            clear();
-        }
-        if let Some(active) = active {
-            active.cancel.cancel();
-            return ChannelGenerationDrainWait {
-                done: Some(active.done),
-            };
-        }
-        ChannelGenerationDrainWait { done: None }
-    }
-
-    #[cfg(test)]
-    fn is_retired(&self) -> bool {
-        self.state
-            .retired
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-}
-
-impl ChannelGenerationDrainWait {
-    pub(crate) async fn wait(mut self) {
-        if let Some(done) = self.done.take() {
-            let _ = done.await;
-        }
-    }
-}
-
-impl PreparedChannelGenerationDrain {
-    pub(crate) fn begin(&self) -> ChannelGenerationDrainWait {
-        self.control.retire()
-    }
-}
-
-impl ChannelGenerationAttempt {
-    fn cancel(&self) -> tokio_util::sync::CancellationToken {
-        self.cancel.clone()
-    }
-}
-
-impl Drop for ChannelGenerationAttempt {
-    fn drop(&mut self) {
-        if let Some(done) = self.done.take() {
-            let _ = done.send(());
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StartupReadiness {
     gateway_generation: u64,
@@ -326,7 +192,7 @@ impl Drop for StartupReadinessAttempt {
 }
 
 mod registry;
-pub use registry::{ChannelRegistryClearer, DaemonRegistry, GatewayReloadControls};
+pub use registry::{DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -656,9 +522,6 @@ pub async fn run(
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
-    let channel_generation_control = std::sync::Arc::new(ChannelGenerationControl::new(
-        registry.take_channel_registry_clearer(),
-    ));
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
     let (startup_readiness_tx, startup_readiness_rx) = if startup_feedback_enabled {
         let (tx, rx) = tokio::sync::watch::channel(StartupReadiness::default());
@@ -746,7 +609,6 @@ pub async fn run(
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
             let cancel_for_supervisor = channels_cancel.clone();
-            let generation_control = channel_generation_control.clone();
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
@@ -756,20 +618,7 @@ pub async fn run(
                     let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
                     let cancel = cancel_for_supervisor.clone();
-                    let generation_control = generation_control.clone();
-                    async move {
-                        let Some(attempt) = generation_control.begin_attempt(&cancel) else {
-                            // A retired generation must never retry the old
-                            // configuration. Wait for daemon shutdown/reload
-                            // so the generic supervisor cannot hot-loop.
-                            cancel.cancelled().await;
-                            return Ok(());
-                        };
-                        let attempt_cancel = attempt.cancel();
-                        let result = start(cfg, attempt_cancel).await;
-                        drop(attempt);
-                        result
-                    }
+                    async move { start(cfg, cancel).await }
                 },
             ));
         } else {
@@ -908,7 +757,6 @@ pub async fn run(
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
-            channel_generation_control: Some(channel_generation_control.clone()),
             approval_pending: std::sync::Arc::new(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),
@@ -2612,60 +2460,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::MattermostListenMode;
-
-    #[tokio::test]
-    async fn channel_generation_drain_cancels_active_attempt_and_blocks_retry() {
-        let parent = tokio_util::sync::CancellationToken::new();
-        let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let clearer = cleared.clone();
-        let control = ChannelGenerationControl::new(Some(std::sync::Arc::new(move || {
-            clearer.store(true, std::sync::atomic::Ordering::Release);
-        })));
-        let attempt = control
-            .begin_attempt(&parent)
-            .expect("a live generation should admit its first attempt");
-        let attempt_cancel = attempt.cancel();
-        let prepared = control
-            .prepare()
-            .expect("a wired registry clearer should prepare a drain");
-        let wait = prepared.begin();
-        assert!(cleared.load(std::sync::atomic::Ordering::Acquire));
-        assert!(attempt_cancel.is_cancelled());
-        let waiter = ::zeroclaw_spawn::spawn!(wait.wait());
-        tokio::task::yield_now().await;
-        assert!(
-            !waiter.is_finished(),
-            "drain must wait for the attempt guard"
-        );
-        drop(attempt);
-        waiter
-            .await
-            .expect("attempt completion should release the drain");
-        assert!(control.is_retired());
-        assert!(control.begin_attempt(&parent).is_none());
-    }
-
-    #[tokio::test]
-    async fn channel_generation_without_active_attempt_retires_immediately() {
-        let parent = tokio_util::sync::CancellationToken::new();
-        let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let clearer = cleared.clone();
-        let control = ChannelGenerationControl::new(Some(std::sync::Arc::new(move || {
-            clearer.store(true, std::sync::atomic::Ordering::Release);
-        })));
-        let prepared = control
-            .prepare()
-            .expect("a wired registry clearer should prepare a drain");
-        prepared.begin().wait().await;
-        assert!(cleared.load(std::sync::atomic::Ordering::Acquire));
-        assert!(control.is_retired());
-        assert!(control.begin_attempt(&parent).is_none());
-    }
-
-    #[test]
-    fn channel_generation_prepare_fails_closed_without_registry_clearer() {
-        assert!(ChannelGenerationControl::new(None).prepare().is_none());
-    }
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {

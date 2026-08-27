@@ -103,8 +103,6 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -133,81 +131,13 @@ use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy};
 use zeroclaw_runtime::tools::{self, Tool};
 use zeroclaw_runtime::util::truncate_with_ellipsis;
 
-type LiveChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
+type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
-/// Live channel registry shared by delivery and late-bound agent tool handles so they
-/// reuse authenticated channel instances. Replaced wholesale by each `start_channels` call.
-static LIVE_CHANNEL_REGISTRY: std::sync::RwLock<Option<LiveChannelRegistry>> =
+/// Live channel registry consulted by `deliver_announcement` so cron sends reuse the
+/// authenticated channel instance (Matrix E2EE can't tolerate per-send session restore).
+/// Replaced wholesale by each `start_channels` call.
+static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
     std::sync::RwLock::new(None);
-static LIVE_CHANNEL_REGISTRY_READY: AtomicBool = AtomicBool::new(true);
-static LIVE_CHANNEL_REGISTRY_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
-#[cfg(test)]
-static LIVE_CHANNEL_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-#[cfg(test)]
-static CHANNEL_LISTENER_SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// Reset live channel state before a daemon generation starts. RPC listeners wait
-/// for publication when channels are expected, avoiding permanently under-seeded sessions.
-pub fn prepare_live_channel_registry(expect_channels: bool) {
-    LIVE_CHANNEL_REGISTRY_READY.store(!expect_channels, Ordering::Release);
-    *LIVE_CHANNEL_REGISTRY
-        .write()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-    if !expect_channels {
-        LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
-    }
-}
-
-fn publish_live_channel_registry(registry: Option<LiveChannelRegistry>) {
-    *LIVE_CHANNEL_REGISTRY
-        .write()
-        .unwrap_or_else(|e| e.into_inner()) = registry;
-    LIVE_CHANNEL_REGISTRY_READY.store(true, Ordering::Release);
-    LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
-}
-
-/// Ensures an RPC generation cannot wait forever when channel startup fails
-/// before it has a live registry to publish.
-struct LiveChannelRegistryStartupGuard {
-    published: bool,
-}
-
-impl LiveChannelRegistryStartupGuard {
-    const fn new() -> Self {
-        Self { published: false }
-    }
-
-    fn publish(&mut self, registry: Option<LiveChannelRegistry>) {
-        publish_live_channel_registry(registry);
-        self.published = true;
-    }
-}
-
-impl Drop for LiveChannelRegistryStartupGuard {
-    fn drop(&mut self) {
-        if !self.published {
-            publish_live_channel_registry(None);
-        }
-    }
-}
-
-/// Wait until the current daemon generation has either published its channels or
-/// established that no live channels are available.
-pub async fn wait_for_live_channel_registry(cancel: &CancellationToken) -> bool {
-    tokio::select! {
-        () = async {
-            loop {
-                let notified = LIVE_CHANNEL_REGISTRY_NOTIFY.notified();
-                if LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire) {
-                    return;
-                }
-                notified.await;
-            }
-        } => true,
-        () = cancel.cancelled() => false,
-    }
-}
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
@@ -7906,33 +7836,19 @@ async fn process_channel_message_body(
 
 /// Shared worker body extracted so both the normal path and the debounce path
 /// can reuse the same in-flight tracking / cancellation / process logic.
-#[derive(Clone)]
-struct DispatchWorkerRegistrationGate {
-    started: Arc<tokio::sync::Barrier>,
-    release: Arc<tokio::sync::Semaphore>,
-}
-
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
-    cancellation_token: CancellationToken,
-    registration_gate: Option<DispatchWorkerRegistrationGate>,
 ) {
     let _permit = permit;
-    if let Some(gate) = registration_gate {
-        gate.started.wait().await;
-        let Ok(release_permit) = gate.release.acquire().await else {
-            return;
-        };
-        drop(release_permit);
-    }
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
     let sender_scope_key = interruption_scope_key(&msg);
+    let cancellation_token = CancellationToken::new();
     let completion = Arc::new(InFlightTaskCompletion::new());
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -8490,46 +8406,11 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
-#[cfg(test)]
 async fn run_message_dispatch_loop(
-    rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
-    router: AgentRouter,
-    max_in_flight_messages: usize,
-) {
-    run_message_dispatch_loop_with_cancel(
-        rx,
-        router,
-        max_in_flight_messages,
-        CancellationToken::new(),
-    )
-    .await;
-}
-
-async fn run_message_dispatch_loop_with_cancel(
-    rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
-    router: AgentRouter,
-    max_in_flight_messages: usize,
-    cancel: CancellationToken,
-) -> tokio::time::Instant {
-    run_message_dispatch_loop_with_cancel_and_drain_signal(
-        rx,
-        router,
-        max_in_flight_messages,
-        cancel,
-        None,
-        None,
-    )
-    .await
-}
-
-async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
-    cancel: CancellationToken,
-    drain_started: Option<tokio::sync::oneshot::Sender<()>>,
-    worker_registration_gate: Option<DispatchWorkerRegistrationGate>,
-) -> tokio::time::Instant {
+) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
     let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
@@ -8538,11 +8419,7 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
-    while let Some(msg) = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => None,
-        msg = rx.recv() => msg,
-    } {
+    while let Some(msg) = rx.recv().await {
         // Gate answers (button-click markers / `approve <ref>` text replies)
         // resolve a PARKED run and must never start one, so they are consumed
         // BEFORE agent ownership lookup. A configured approval route may be
@@ -8646,16 +8523,11 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
                 &ctx.prompt_config.channels.telegram,
             );
 
-            let debounce_result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                result = ctx.debouncer.debounce_with_window(
-                    &debounce_key,
-                    &msg.content,
-                    debounce_window,
-                ) => result,
-            };
-            match debounce_result {
+            match ctx
+                .debouncer
+                .debounce_with_window(&debounce_key, &msg.content, debounce_window)
+                .await
+            {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
                     // Spawn a lightweight task that waits for the debounce window
                     // to expire, then feeds the combined message through the normal
@@ -8664,26 +8536,19 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
-                    let debounce_cancel = cancel.clone();
-                    let debounce_registration_gate = worker_registration_gate.clone();
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
-                        let combined = match tokio::select! {
-                            biased;
-                            _ = debounce_cancel.cancelled() => return,
-                            combined = rx => combined.ok(),
-                        } {
-                            Some(combined) => combined,
-                            None => return,
+                        let combined = match rx.await {
+                            Ok(combined) => combined,
+                            Err(_) => {
+                                // Receiver dropped — a newer message superseded this one.
+                                return;
+                            }
                         };
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
 
-                        let permit = match tokio::select! {
-                            biased;
-                            _ = debounce_cancel.cancelled() => return,
-                            permit = debounce_semaphore.acquire_owned() => permit,
-                        } {
+                        let permit = match debounce_semaphore.acquire_owned().await {
                             Ok(permit) => permit,
                             Err(_) => return,
                         };
@@ -8694,8 +8559,6 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
                             debounce_in_flight,
                             debounce_task_seq,
                             permit,
-                            debounce_cancel.child_token(),
-                            debounce_registration_gate,
                         )
                         .await;
                     });
@@ -8711,11 +8574,7 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
             msg
         };
 
-        let permit = match tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            permit = Arc::clone(&semaphore).acquire_owned() => permit,
-        } {
+        let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
         };
@@ -8723,19 +8582,8 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
-        let worker_cancel = cancel.child_token();
-        let registration_gate = worker_registration_gate.clone();
         workers.spawn(async move {
-            dispatch_worker(
-                worker_ctx,
-                msg,
-                in_flight,
-                task_sequence,
-                permit,
-                worker_cancel,
-                registration_gate,
-            )
-            .await;
+            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -8743,40 +8591,9 @@ async fn run_message_dispatch_loop_with_cancel_and_drain_signal(
         }
     }
 
-    if let Some(drain_started) = drain_started {
-        let _ = drain_started.send(());
+    while let Some(result) = workers.join_next().await {
+        log_worker_join_result(result);
     }
-    let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let drain_workers = async {
-        let mut generation_cancelled = false;
-        while !workers.is_empty() {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled(), if !generation_cancelled => {
-                    generation_cancelled = true;
-                    let active = in_flight_by_sender.lock().await;
-                    for state in active.values() {
-                        state.cancellation.cancel();
-                    }
-                }
-                result = workers.join_next() => {
-                    if let Some(result) = result {
-                        log_worker_join_result(result);
-                    }
-                }
-            }
-        }
-    };
-    if tokio::time::timeout_at(shutdown_deadline, drain_workers)
-        .await
-        .is_err()
-    {
-        workers.abort_all();
-        while let Some(result) = workers.join_next().await {
-            log_worker_join_result(result);
-        }
-    }
-    shutdown_deadline
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -9927,13 +9744,13 @@ struct ConfiguredChannel {
 /// `PluginChannelEndpoint`, not from re-reading config — so the registry key is
 /// the same `plugin.<alias>` an agent already routes to.
 ///
-/// Plugin channels deliberately remain unavailable to ordinary
-/// channel-addressed tools. The synchronous static tool-map builders cannot
-/// construct them, and the daemon's live per-agent tool map filters them to keep
-/// that authorization surface consistent. The full live registry still retains
-/// them for supervised listeners and routed delivery or approval. Supporting
-/// plugin channels in tools requires one deliberate policy across both static
-/// and live tool-map paths, which is outside this change.
+/// Note the deliberate asymmetry with `collect_configured_channels`: plugin
+/// channels are constructed asynchronously, so the synchronous
+/// `build_channel_map` and `register_channels_for_tools` surfaces cannot see
+/// them. Nostr already has this shape. The consequence is that channel-addressed
+/// *tools* cannot target a plugin channel yet; inbound and outbound delivery
+/// through the supervised listener are unaffected. Closing that gap means making
+/// those two surfaces async, which is deliberately not part of this change.
 fn append_configured_plugin_channels(
     configured: &mut Vec<ConfiguredChannel>,
     plugin_channels: Vec<Arc<dyn Channel>>,
@@ -9959,13 +9776,10 @@ pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
     }
 }
 
-fn configured_channel_map<'a>(
-    configured: impl IntoIterator<Item = &'a ConfiguredChannel>,
-) -> HashMap<String, Arc<dyn Channel>> {
-    let configured: Vec<_> = configured.into_iter().collect();
+fn configured_channel_map(configured: &[ConfiguredChannel]) -> HashMap<String, Arc<dyn Channel>> {
     let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
-    for cc in &configured {
+    for cc in configured {
         *name_counts.entry(cc.channel.name()).or_insert(0) += 1;
     }
     for cc in configured {
@@ -10102,11 +9916,11 @@ impl ActiveChannelAliases {
 
     /// Computes the canonical channel-binding view used by collection and
     /// startup checks. Disabled owners never activate channels, while an
-    /// explicit SOP or risk-profile approval route keeps its delivery channel
-    /// live without assigning it to an agent.
+    /// explicit SOP approval route keeps its delivery channel live without
+    /// assigning it to an agent.
     fn compute(config: &Config) -> Self {
         let configured_channel_aliases = config.channels_by_alias();
-        let sop_approval_channels = config
+        let approval_route_bindings = config
             .sop
             .approval
             .policies
@@ -10120,17 +9934,7 @@ impl ActiveChannelAliases {
             .filter_map(|route| {
                 route.and_then(zeroclaw_runtime::sop::approval::channel_route::parse_approval_route)
             })
-            .map(|(channel_key, _)| channel_key);
-        let risk_profile_approval_channels = config
-            .agents
-            .iter()
-            .filter(|(_, agent)| agent.enabled)
-            .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
-            .filter_map(|profile| profile.approval_route.as_ref())
-            .map(|route| route.approver_channel.as_str());
-        let approval_route_bindings = sop_approval_channels
-            .chain(risk_profile_approval_channels)
-            .flat_map(|channel_key| {
+            .flat_map(|(channel_key, _)| {
                 if channel_key.contains('.') {
                     return vec![channel_key.to_string()];
                 }
@@ -10169,107 +9973,6 @@ pub fn build_channel_map(
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
     configured_channel_map(&configured)
-}
-
-fn configured_channel_map_for_agent(
-    config: &Config,
-    agent_alias: &str,
-    configured: &[ConfiguredChannel],
-) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
-    let available = configured_channel_map(configured);
-    channel_map_for_agent(config, agent_alias, &available)
-}
-
-fn channel_map_for_agent(
-    config: &Config,
-    agent_alias: &str,
-    available: &HashMap<String, Arc<dyn Channel>>,
-) -> HashMap<String, Arc<dyn Channel>> {
-    let Some(agent) = config.agents.get(agent_alias).filter(|agent| agent.enabled) else {
-        return HashMap::new();
-    };
-    if config
-        .agents
-        .values()
-        .all(|agent| agent.channels.is_empty())
-    {
-        return available.clone();
-    }
-
-    let mut selected = HashMap::new();
-    for binding in &agent.channels {
-        let binding = binding.as_str();
-        for (key, channel) in available {
-            let matches = key == binding
-                || (!binding.contains('.')
-                    && key
-                        .strip_prefix(binding)
-                        .is_some_and(|suffix| suffix.starts_with('.')));
-            if matches {
-                selected.insert(key.clone(), Arc::clone(channel));
-            }
-        }
-    }
-
-    let mut singleton_by_type: HashMap<String, Option<Arc<dyn Channel>>> = HashMap::new();
-    for (key, channel) in &selected {
-        let Some((channel_type, _)) = key.split_once('.') else {
-            continue;
-        };
-        singleton_by_type
-            .entry(channel_type.to_string())
-            .and_modify(|singleton| *singleton = None)
-            .or_insert_with(|| Some(Arc::clone(channel)));
-    }
-    for (channel_type, channel) in singleton_by_type {
-        if let Some(channel) = channel {
-            selected.entry(channel_type).or_insert(channel);
-        }
-    }
-
-    selected
-}
-
-/// Build the configured channel registry visible to one agent's tools.
-/// Explicit bindings are an authorization boundary; the legacy all-channel
-/// fallback applies only when no agent declares any channel binding.
-pub fn build_channel_map_for_agent(
-    config: &Config,
-    agent_alias: &str,
-) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
-    configured_channel_map_for_agent(config, agent_alias, &configured)
-}
-
-/// Return the daemon's live configured channels visible to one agent's tools.
-/// The returned map clones only `Arc` handles; it never reconstructs channel clients.
-pub fn live_channel_map_for_agent(
-    config: &Config,
-    agent_alias: &str,
-) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
-    let registry = LIVE_CHANNEL_REGISTRY
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    registry
-        .as_deref()
-        .map(|available| {
-            let mut selected = channel_map_for_agent(config, agent_alias, available);
-            selected.retain(|key, _| key != "plugin" && !key.starts_with("plugin."));
-            selected
-        })
-        .unwrap_or_default()
-}
-
-/// Return the daemon's full live registry for routed approval delivery.
-pub fn live_channel_map() -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
-    LIVE_CHANNEL_REGISTRY
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_deref()
-        .cloned()
-        .unwrap_or_default()
 }
 
 pub fn register_channels_for_tools(
@@ -12312,7 +12015,6 @@ pub async fn start_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
-    let mut registry_startup = LiveChannelRegistryStartupGuard::new();
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
@@ -12321,7 +12023,6 @@ pub async fn start_channels(
         .filter(|(_, a)| a.enabled)
         .any(|(_, a)| runtime_defaults_from_config(&config, a.model_provider.as_str()).is_ok());
     if !any_agent_provider_resolves {
-        registry_startup.publish(None);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -12404,8 +12105,8 @@ pub async fn start_channels(
     let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut configured_channels: Vec<ConfiguredChannel> = Vec::new();
-    let mut startup_display: Option<(String, String)> = None;
+    let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
+        None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
@@ -12684,7 +12385,8 @@ pub async fn start_channels(
                 );
             }
 
-            configured_channels = collect_configured_channels(
+            #[allow(unused_mut)]
+            let mut configured_channels: Vec<ConfiguredChannel> = collect_configured_channels(
                 &config_arc,
                 "runtime startup",
                 &tool_specs,
@@ -12776,22 +12478,73 @@ pub async fn start_channels(
                 .iter()
                 .map(|cc| Arc::clone(&cc.channel))
                 .collect();
-            if !channels.is_empty() {
-                let channel_labels: Vec<String> = configured_channels
-                    .iter()
-                    .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
-                    .collect();
-                collected_channel_keys = channel_labels.clone();
-                startup_display = Some((model.clone(), agent_alias.clone()));
+            if channels.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "No active channels to supervise (none configured or all disabled). \
+                     Waiting for reload signal."
+                );
+                cancel.cancelled().await;
+                return Ok(());
             }
 
-            // Build the complete channel map before any listener or registry
-            // publication. The map is needed by every agent's runtime context.
+            println!("🦀 ZeroClaw Channel Server");
+            println!("  🤖 Model:    {model} (agent: {agent_alias})");
+            let effective_backend = config.resolve_active_storage().kind();
+            println!(
+                "  🧠 Memory:   {} (auto-save: {})",
+                effective_backend,
+                if config.memory.auto_save { "on" } else { "off" }
+            );
+            let channel_labels: Vec<String> = configured_channels
+                .iter()
+                .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
+                .collect();
+            collected_channel_keys = channel_labels.clone();
+            println!("  📡 Channels: {}", channel_labels.join(", "));
+            println!("  🤖 Agents:   {}", enabled_agents.join(", "));
+            println!();
+            println!("  Listening for messages... (Ctrl+C to stop)");
+            println!();
+
+            zeroclaw_runtime::health::mark_component_ok("channels");
+
+            let initial_backoff_secs = config
+                .reliability
+                .channel_initial_backoff_secs
+                .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
+            let max_backoff_secs = config
+                .reliability
+                .channel_max_backoff_secs
+                .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+
+            for cc in &configured_channels {
+                listener_handles.push(spawn_supervised_listener(
+                    cc.channel.clone(),
+                    cc.alias.clone(),
+                    tx.clone(),
+                    initial_backoff_secs,
+                    max_backoff_secs,
+                    cancel.clone(),
+                ));
+            }
+            drop(tx);
+
+            // Composite-key registry (see `composite_channel_key`).
             let cbn = Arc::new(configured_channel_map(&configured_channels));
+            *CRON_CHANNEL_REGISTRY
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cbn));
+
             let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
+            println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
             channels_by_name_shared = Some(cbn);
+            rx_holder = Some(rx);
         }
 
         let channels_by_name = Arc::clone(
@@ -12933,18 +12686,6 @@ pub async fn start_channels(
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
     }
 
-    if configured_channels.is_empty() {
-        registry_startup.publish(None);
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "No active channels to supervise (none configured or all disabled). \
-             Waiting for reload signal."
-        );
-        cancel.cancelled().await;
-        return Ok(());
-    }
-
     let owner_by_channel_key =
         build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
 
@@ -13035,71 +12776,13 @@ pub async fn start_channels(
 
     let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
 
+    let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
-        max_in_flight_messages.expect("max_in_flight initialized during channel setup");
+        max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
+    run_message_dispatch_loop(rx, router, max_in_flight).await;
 
-    let initial_backoff_secs = config
-        .reliability
-        .channel_initial_backoff_secs
-        .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
-    let max_backoff_secs = config
-        .reliability
-        .channel_max_backoff_secs
-        .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
-
-    let (display_model, display_agent) =
-        startup_display.expect("startup display initialized during channel setup");
-    println!("🦀 ZeroClaw Channel Server");
-    println!("  🤖 Model:    {display_model} (agent: {display_agent})");
-    let effective_backend = config.resolve_active_storage().kind();
-    println!(
-        "  🧠 Memory:   {} (auto-save: {})",
-        effective_backend,
-        if config.memory.auto_save { "on" } else { "off" }
-    );
-    let channel_labels: Vec<String> = configured_channels
-        .iter()
-        .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
-        .collect();
-    println!("  📡 Channels: {}", channel_labels.join(", "));
-    println!("  🤖 Agents:   {}", enabled_agents.join(", "));
-    println!();
-    println!("  Listening for messages... (Ctrl+C to stop)");
-    println!();
-    zeroclaw_runtime::health::mark_component_ok("channels");
-    println!("  🚦 In-flight message limit: {max_in_flight}");
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
-    #[cfg(test)]
-    CHANNEL_LISTENER_SPAWN_COUNT.fetch_add(configured_channels.len(), Ordering::Relaxed);
-    for cc in &configured_channels {
-        listener_handles.push(spawn_supervised_listener(
-            cc.channel.clone(),
-            cc.alias.clone(),
-            tx.clone(),
-            initial_backoff_secs,
-            max_backoff_secs,
-            cancel.clone(),
-        ));
-    }
-    drop(tx);
-
-    // Composite-key registry (see `composite_channel_key`).
-    registry_startup.publish(Some(Arc::clone(
-        channels_by_name_shared
-            .as_ref()
-            .expect("channels_by_name initialized before agent construction"),
-    )));
-
-    let shutdown_deadline =
-        run_message_dispatch_loop_with_cancel(rx, router, max_in_flight, cancel.clone()).await;
-
-    for mut h in listener_handles {
-        let remaining = shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if tokio::time::timeout(remaining, &mut h).await.is_err() {
-            h.abort();
-            let _ = h.await;
-        }
+    for h in listener_handles {
+        let _ = h.await;
     }
 
     Ok(())
@@ -13127,7 +12810,7 @@ pub async fn deliver_announcement(
     // channel instance when available — critical for Matrix E2EE which
     // must reuse the authenticated client rather than re-running session
     // restore per delivery.
-    let registry_snapshot = LIVE_CHANNEL_REGISTRY
+    let registry_snapshot = CRON_CHANNEL_REGISTRY
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
@@ -13623,36 +13306,6 @@ pub(crate) mod tests {
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
-
-    struct RestoreLiveRegistry {
-        registry: Option<LiveChannelRegistry>,
-        ready: bool,
-    }
-
-    impl Drop for RestoreLiveRegistry {
-        fn drop(&mut self) {
-            *LIVE_CHANNEL_REGISTRY
-                .write()
-                .unwrap_or_else(|e| e.into_inner()) = self.registry.take();
-            LIVE_CHANNEL_REGISTRY_READY.store(self.ready, Ordering::Release);
-            LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
-        }
-    }
-
-    fn replace_live_channel_registry(registry: LiveChannelRegistry) -> RestoreLiveRegistry {
-        let previous_registry = LIVE_CHANNEL_REGISTRY
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let previous_ready = LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire);
-        let restore = RestoreLiveRegistry {
-            registry: previous_registry,
-            ready: previous_ready,
-        };
-        prepare_live_channel_registry(true);
-        publish_live_channel_registry(Some(registry));
-        restore
-    }
 
     /// Runs a channel-dispatch test on an explicit stack because its async
     /// future can exceed the default test-thread stack on hosted CI.
@@ -14888,414 +14541,6 @@ temperature = 0.3
             !map.contains_key("discord"),
             "bare key would be ambiguous for multiple aliases"
         );
-    }
-
-    #[test]
-    fn configured_channel_map_for_agent_enforces_explicit_bindings() {
-        let alpha = mock_channel("discord");
-        let beta = mock_channel("discord");
-        let configured = vec![
-            ConfiguredChannel {
-                display_name: "Discord",
-                alias: Some("alpha".to_string()),
-                channel: Arc::clone(&alpha),
-            },
-            ConfiguredChannel {
-                display_name: "Discord",
-                alias: Some("beta".to_string()),
-                channel: Arc::clone(&beta),
-            },
-        ];
-        let mut config = Config::default();
-        config.agents.clear();
-        config.agents.insert(
-            "alpha".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                channels: vec!["discord.alpha".into()],
-                ..Default::default()
-            },
-        );
-        config.agents.insert(
-            "beta".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                channels: vec!["discord.beta".into()],
-                ..Default::default()
-            },
-        );
-
-        let map = configured_channel_map_for_agent(&config, "alpha", &configured);
-
-        assert!(Arc::ptr_eq(map.get("discord.alpha").unwrap(), &alpha));
-        assert!(Arc::ptr_eq(map.get("discord").unwrap(), &alpha));
-        assert!(!map.contains_key("discord.beta"));
-    }
-
-    #[test]
-    fn configured_channel_map_for_agent_preserves_legacy_fallback() {
-        let alpha = mock_channel("discord");
-        let beta = mock_channel("discord");
-        let configured = vec![
-            ConfiguredChannel {
-                display_name: "Discord",
-                alias: Some("alpha".to_string()),
-                channel: Arc::clone(&alpha),
-            },
-            ConfiguredChannel {
-                display_name: "Discord",
-                alias: Some("beta".to_string()),
-                channel: Arc::clone(&beta),
-            },
-        ];
-        let mut config = Config::default();
-        config.agents.clear();
-        config.agents.insert(
-            "legacy".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                channels: vec![],
-                ..Default::default()
-            },
-        );
-        config.agents.insert(
-            "disabled".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: false,
-                channels: vec![],
-                ..Default::default()
-            },
-        );
-
-        let map = configured_channel_map_for_agent(&config, "legacy", &configured);
-
-        assert!(Arc::ptr_eq(map.get("discord.alpha").unwrap(), &alpha));
-        assert!(Arc::ptr_eq(map.get("discord.beta").unwrap(), &beta));
-        assert!(!map.contains_key("discord"));
-        assert!(
-            configured_channel_map_for_agent(&config, "disabled", &configured).is_empty(),
-            "legacy fallback must not grant channels to a disabled agent"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn live_channel_map_factory_reuses_daemon_registry_on_tokio_worker() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
-        let worker = mock_channel("discord");
-        let ops = mock_channel("discord");
-        let registry = Arc::new(HashMap::from([
-            ("discord.worker".to_string(), Arc::clone(&worker)),
-            ("discord.ops".to_string(), Arc::clone(&ops)),
-        ]));
-        let previous_registry = LIVE_CHANNEL_REGISTRY
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let previous_ready = LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire);
-        let _restore = RestoreLiveRegistry {
-            registry: previous_registry,
-            ready: previous_ready,
-        };
-        prepare_live_channel_registry(true);
-
-        let cancelled = CancellationToken::new();
-        let cancelled_wait = {
-            let cancelled = cancelled.clone();
-            zeroclaw_spawn::spawn!(async move { wait_for_live_channel_registry(&cancelled).await })
-        };
-        tokio::task::yield_now().await;
-        cancelled.cancel();
-        assert!(!cancelled_wait.await.unwrap());
-
-        let pending = CancellationToken::new();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                wait_for_live_channel_registry(&pending)
-            )
-            .await
-            .is_err(),
-            "RPC factory must wait until the daemon publishes its live registry"
-        );
-
-        let mut config = Config::default();
-        config.agents.clear();
-        config.agents.insert(
-            "worker".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                channels: vec!["discord.worker".into()],
-                ..Default::default()
-            },
-        );
-
-        let cancel = CancellationToken::new();
-        let factory_config = config.clone();
-        let factory = zeroclaw_spawn::spawn!(async move {
-            assert!(wait_for_live_channel_registry(&cancel).await);
-            (
-                live_channel_map_for_agent(&factory_config, "worker"),
-                live_channel_map(),
-            )
-        });
-        publish_live_channel_registry(Some(registry));
-        let (tool_map, approval_map) = factory
-            .await
-            .expect("daemon channel-map factory should not overflow its Tokio worker");
-
-        assert!(Arc::ptr_eq(
-            tool_map.get("discord.worker").unwrap(),
-            &worker
-        ));
-        assert!(Arc::ptr_eq(tool_map.get("discord").unwrap(), &worker));
-        assert!(!tool_map.contains_key("discord.ops"));
-        assert!(!tool_map.contains_key("telegram"));
-        assert!(Arc::ptr_eq(approval_map.get("discord.ops").unwrap(), &ops));
-
-        let replacement = mock_channel("discord");
-        prepare_live_channel_registry(true);
-        publish_live_channel_registry(Some(Arc::new(HashMap::from([(
-            "discord.worker".to_string(),
-            Arc::clone(&replacement),
-        )]))));
-        let replacement_map = live_channel_map_for_agent(&config, "worker");
-        assert!(Arc::ptr_eq(
-            replacement_map.get("discord.worker").unwrap(),
-            &replacement
-        ));
-        assert!(!Arc::ptr_eq(
-            replacement_map.get("discord.worker").unwrap(),
-            &worker
-        ));
-    }
-
-    #[tokio::test]
-    async fn channel_startup_failure_publishes_unavailable_registry_for_rpc_readiness() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
-        let previous_registry = LIVE_CHANNEL_REGISTRY
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let previous_ready = LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire);
-        let _restore = RestoreLiveRegistry {
-            registry: previous_registry,
-            ready: previous_ready,
-        };
-        prepare_live_channel_registry(true);
-
-        let mut config: Config = toml::from_str(
-            r#"
-[agents.worker]
-model_provider = "openrouter.default"
-risk_profile = "missing"
-channels = ["telegram.default"]
-
-[providers.models.openrouter.default]
-model = "test-model"
-api_key = "test-key"
-"#,
-        )
-        .unwrap();
-        config.channels.telegram.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::TelegramConfig {
-                enabled: true,
-                bot_token: "test-token".to_string(),
-                ..Default::default()
-            },
-        );
-        assert!(config.channels.has_any_enabled());
-
-        let waiter_cancel = CancellationToken::new();
-        let waiter = {
-            let waiter_cancel = waiter_cancel.clone();
-            zeroclaw_spawn::spawn!(
-                async move { wait_for_live_channel_registry(&waiter_cancel).await }
-            )
-        };
-        tokio::task::yield_now().await;
-
-        let startup_error = start_channels(config, None, CancellationToken::new(), None, None)
-            .await
-            .expect_err("missing risk profile must fail before channel registry publication");
-        assert!(
-            startup_error.to_string().contains("risk_profiles"),
-            "startup must fail at the configured pre-publication boundary: {startup_error:#}"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), waiter)
-                .await
-                .expect("RPC readiness waiter must be released after startup failure")
-                .expect("readiness waiter task must join"),
-            "startup failure must publish an explicit unavailable registry"
-        );
-        assert!(live_channel_map().is_empty());
-    }
-
-    #[cfg(feature = "channel-telegram")]
-    #[tokio::test]
-    async fn channel_startup_failure_after_first_agent_does_not_start_listeners_or_publish_registry()
-     {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
-        let previous_registry = LIVE_CHANNEL_REGISTRY
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let previous_ready = LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire);
-        let _restore = RestoreLiveRegistry {
-            registry: previous_registry,
-            ready: previous_ready,
-        };
-        prepare_live_channel_registry(true);
-        CHANNEL_LISTENER_SPAWN_COUNT.store(0, Ordering::Release);
-
-        let mut config: Config = toml::from_str(
-            r#"
-[agents.first]
-model_provider = "openrouter.default"
-risk_profile = "default"
-channels = ["telegram.default"]
-
-[agents.second]
-model_provider = "openrouter.default"
-risk_profile = "missing"
-channels = ["telegram.default"]
-
-[providers.models.openrouter.default]
-model = "test-model"
-api_key = "test-key"
-
-[risk_profiles.default]
-"#,
-        )
-        .unwrap();
-        config.channels.telegram.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::TelegramConfig {
-                enabled: true,
-                bot_token: "test-token".to_string(),
-                ..Default::default()
-            },
-        );
-
-        let waiter_cancel = CancellationToken::new();
-        let waiter = {
-            let waiter_cancel = waiter_cancel.clone();
-            zeroclaw_spawn::spawn!(
-                async move { wait_for_live_channel_registry(&waiter_cancel).await }
-            )
-        };
-        tokio::task::yield_now().await;
-
-        let startup_error = start_channels(config, None, CancellationToken::new(), None, None)
-            .await
-            .expect_err("the later invalid agent must fail before listener startup");
-        assert!(
-            startup_error.to_string().contains("risk_profiles"),
-            "startup must fail while validating the later agent: {startup_error:#}"
-        );
-        assert_eq!(
-            CHANNEL_LISTENER_SPAWN_COUNT.load(Ordering::Acquire),
-            0,
-            "a later agent failure must not leave a partial listener generation"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), waiter)
-                .await
-                .expect("RPC readiness waiter must be released after startup failure")
-                .expect("readiness waiter task must join"),
-            "startup failure must publish unavailable readiness"
-        );
-        assert!(LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire));
-        assert!(live_channel_map().is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_agent_tool_map_excludes_single_plugin_but_full_registry_retains_it() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
-        let plugin = mock_channel("plugin");
-        let registry = Arc::new(HashMap::from([
-            ("plugin.fable".to_string(), Arc::clone(&plugin)),
-            ("plugin".to_string(), Arc::clone(&plugin)),
-        ]));
-        let _restore = replace_live_channel_registry(registry);
-        let mut config = Config::default();
-        config.agents.clear();
-        config.agents.insert(
-            "worker".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                channels: vec!["plugin.fable".into()],
-                ..Default::default()
-            },
-        );
-
-        let tool_map = live_channel_map_for_agent(&config, "worker");
-        let full_map = live_channel_map();
-
-        assert!(!tool_map.contains_key("plugin.fable"));
-        assert!(!tool_map.contains_key("plugin"));
-        assert!(Arc::ptr_eq(full_map.get("plugin.fable").unwrap(), &plugin));
-        assert!(Arc::ptr_eq(full_map.get("plugin").unwrap(), &plugin));
-    }
-
-    #[tokio::test]
-    async fn live_agent_tool_map_excludes_every_plugin_alias() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
-        let fable = mock_channel("plugin");
-        let forge = mock_channel("plugin");
-        let registry = Arc::new(HashMap::from([
-            ("plugin.fable".to_string(), Arc::clone(&fable)),
-            ("plugin.forge".to_string(), Arc::clone(&forge)),
-        ]));
-        let _restore = replace_live_channel_registry(registry);
-        let mut config = Config::default();
-        config.agents.clear();
-        config.agents.insert(
-            "worker".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                channels: vec!["plugin".into()],
-                ..Default::default()
-            },
-        );
-
-        let tool_map = live_channel_map_for_agent(&config, "worker");
-        let full_map = live_channel_map();
-
-        assert!(!tool_map.keys().any(|key| key.starts_with("plugin")));
-        assert!(Arc::ptr_eq(full_map.get("plugin.fable").unwrap(), &fable));
-        assert!(Arc::ptr_eq(full_map.get("plugin.forge").unwrap(), &forge));
-        assert!(!full_map.contains_key("plugin"));
-    }
-
-    #[tokio::test]
-    async fn live_agent_tool_map_legacy_fallback_keeps_builtins_but_excludes_plugins() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
-        let discord = mock_channel("discord");
-        let plugin = mock_channel("plugin");
-        let registry = Arc::new(HashMap::from([
-            ("discord.ops".to_string(), Arc::clone(&discord)),
-            ("plugin.fable".to_string(), Arc::clone(&plugin)),
-            ("plugin".to_string(), Arc::clone(&plugin)),
-        ]));
-        let _restore = replace_live_channel_registry(registry);
-        let mut config = Config::default();
-        config.agents.clear();
-        config.agents.insert(
-            "legacy".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                channels: vec![],
-                ..Default::default()
-            },
-        );
-
-        let tool_map = live_channel_map_for_agent(&config, "legacy");
-
-        assert!(Arc::ptr_eq(tool_map.get("discord.ops").unwrap(), &discord));
-        assert!(!tool_map.contains_key("plugin.fable"));
-        assert!(!tool_map.contains_key("plugin"));
     }
 
     #[test]
@@ -22676,14 +21921,6 @@ BTC is currently around $65,000 based on latest tool output."#
         peak_in_flight: Arc<AtomicUsize>,
     }
 
-    struct InFlightGuard(Arc<AtomicUsize>);
-
-    impl Drop for InFlightGuard {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
     #[async_trait::async_trait]
     impl ModelProvider for ConcurrencyTrackingProvider {
         async fn chat_with_system(
@@ -22694,9 +21931,9 @@ BTC is currently around $65,000 based on latest tool output."#
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            let _in_flight = InFlightGuard(Arc::clone(&self.in_flight));
             self.peak_in_flight.fetch_max(current, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(format!("echo: {message}"))
         }
     }
@@ -22714,11 +21951,8 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    async fn run_parallel_message_dispatch(
-        cancel_generation: bool,
-        close_before_generation_cancel: bool,
-        cancel_before_worker_registration: bool,
-    ) {
+    #[tokio::test]
+    async fn message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -22843,118 +22077,24 @@ BTC is currently around $65,000 based on latest tool output."#
         })
         .await
         .unwrap();
-        if cancel_generation {
-            let cancel = CancellationToken::new();
-            let dispatch_cancel = cancel.clone();
-            let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
-            let worker_registration_gate =
-                cancel_before_worker_registration.then(|| DispatchWorkerRegistrationGate {
-                    started: Arc::new(tokio::sync::Barrier::new(3)),
-                    release: Arc::new(tokio::sync::Semaphore::new(0)),
-                });
-            let test_registration_gate = worker_registration_gate.clone();
-            let dispatch =
-                ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel_and_drain_signal(
-                    rx,
-                    AgentRouter::single(runtime_ctx),
-                    2,
-                    dispatch_cancel,
-                    close_before_generation_cancel.then_some(drain_started_tx),
-                    worker_registration_gate,
-                ));
+        drop(tx);
 
-            if let Some(gate) = test_registration_gate {
-                tokio::time::timeout(Duration::from_secs(1), gate.started.wait())
-                    .await
-                    .expect("both channel workers should reach the registration barrier");
-                cancel.cancel();
-                gate.release.add_permits(2);
-                drop(tx);
-            } else {
-                tokio::time::timeout(Duration::from_secs(1), async {
-                    while peak_in_flight.load(Ordering::SeqCst) < 2 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("both channel workers should enter the provider");
-                if close_before_generation_cancel {
-                    drop(tx);
-                    tokio::time::timeout(Duration::from_secs(1), drain_started_rx)
-                        .await
-                        .expect("dispatch should observe sender close")
-                        .expect("dispatch should signal worker drain");
-                    cancel.cancel();
-                } else {
-                    cancel.cancel();
-                    drop(tx);
-                }
-            }
-            tokio::time::timeout(Duration::from_secs(1), dispatch)
-                .await
-                .expect("generation cancellation should drain channel workers promptly")
-                .expect("dispatch task should join cleanly");
-        } else {
-            let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
-                rx,
-                AgentRouter::single(runtime_ctx),
-                2,
-            ));
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while peak_in_flight.load(Ordering::SeqCst) < 2 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("both channel workers should be active before sender close");
-            drop(tx);
-            tokio::time::timeout(Duration::from_secs(1), dispatch)
-                .await
-                .expect("sender close should drain channel workers promptly")
-                .expect("dispatch task should join cleanly");
-        }
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
 
         let peak = peak_in_flight.load(Ordering::SeqCst);
-        if cancel_before_worker_registration {
-            assert_eq!(peak, 0, "cancelled workers must not enter the provider");
-        } else {
-            assert!(
-                peak >= 2,
-                "expected at least 2 concurrent in-flight dispatches, got peak {}",
-                peak
-            );
-        }
-        assert_eq!(in_flight.load(Ordering::SeqCst), 0, "all workers drained");
+        assert!(
+            peak >= 2,
+            "expected at least 2 concurrent in-flight dispatches, got peak {}",
+            peak
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "all in-flight dispatches should have completed",
+        );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        if cancel_generation {
-            assert!(
-                sent_messages.is_empty(),
-                "cancelled generation workers must not publish old-channel replies"
-            );
-        } else {
-            assert_eq!(sent_messages.len(), 2, "both replies should be delivered");
-        }
-    }
-
-    #[tokio::test]
-    async fn message_dispatch_processes_messages_in_parallel() {
-        run_parallel_message_dispatch(false, false, false).await;
-    }
-
-    #[tokio::test]
-    async fn message_dispatch_generation_cancel_drains_parallel_workers() {
-        run_parallel_message_dispatch(true, false, false).await;
-    }
-
-    #[tokio::test]
-    async fn message_dispatch_generation_cancel_after_sender_close_drains_parallel_workers() {
-        run_parallel_message_dispatch(true, true, false).await;
-    }
-
-    #[tokio::test]
-    async fn message_dispatch_generation_cancel_before_worker_registration_drops_replies() {
-        run_parallel_message_dispatch(true, false, true).await;
+        assert_eq!(sent_messages.len(), 2);
     }
 
     #[tokio::test]
@@ -29639,61 +28779,6 @@ This is an example JSON object for profile settings."#;
 
     #[cfg(feature = "channel-discord")]
     #[test]
-    fn risk_profile_approval_route_is_live_only_in_approval_map() {
-        let mut config = Config::default();
-        config.agents.clear();
-        config.agents.insert(
-            "worker".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                channels: vec!["discord.worker".into()],
-                risk_profile: "worker-risk".into(),
-                ..Default::default()
-            },
-        );
-        config.risk_profiles.insert(
-            "worker-risk".to_string(),
-            zeroclaw_config::schema::RiskProfileConfig {
-                approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
-                    approver_channel: "discord.ops".to_string(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
-        config.channels.discord.insert(
-            "worker".to_string(),
-            zeroclaw_config::schema::DiscordConfig {
-                enabled: true,
-                bot_token: "worker-token".to_string(),
-                ..Default::default()
-            },
-        );
-        config.channels.discord.insert(
-            "ops".to_string(),
-            zeroclaw_config::schema::DiscordConfig {
-                enabled: true,
-                bot_token: "ops-token".to_string(),
-                ..Default::default()
-            },
-        );
-
-        let approval_map = build_channel_map(&config);
-        let worker_tool_map = build_channel_map_for_agent(&config, "worker");
-
-        assert!(
-            approval_map.contains_key("discord.ops"),
-            "the worker risk profile's distinct approver must be live"
-        );
-        assert!(worker_tool_map.contains_key("discord.worker"));
-        assert!(
-            !worker_tool_map.contains_key("discord.ops"),
-            "approval-only channel must not become an ordinary worker tool capability"
-        );
-    }
-
-    #[cfg(feature = "channel-discord")]
-    #[test]
     fn bare_approval_route_collects_the_sole_enabled_alias() {
         let mut config = Config::default();
         config.agents.clear();
@@ -34178,7 +33263,6 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_routes_lark_to_lark_arm() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         // Both names must enter the merged lark|feishu arm. Falling through
         // to `unsupported delivery channel` would mean the schema enum and
         // the match arm have drifted apart.
@@ -34206,7 +33290,6 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "channel-email")]
     async fn deliver_announcement_routes_email_to_email_arm() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         let config = zeroclaw_config::schema::Config::default();
 
         let err = deliver_announcement(&config, "email.default", "user@example.com", None, "hi")
@@ -34226,7 +33309,6 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn deliver_announcement_routes_whatsapp_to_whatsapp_arm() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         let config = zeroclaw_config::schema::Config::default();
 
         let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
@@ -34246,7 +33328,6 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn deliver_announcement_rejects_whatsapp_non_web_config_clearly() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         let mut config = zeroclaw_config::schema::Config::default();
         config.channels.whatsapp.insert(
             "default".to_string(),
@@ -34283,7 +33364,6 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_rejects_feishu_value_when_use_feishu_false() {
-        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         // Reject (not warn): otherwise the message silently lands on the
         // Lark endpoint despite the user explicitly naming Feishu.
         let mut config = zeroclaw_config::schema::Config::default();

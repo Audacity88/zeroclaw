@@ -23,8 +23,6 @@ pub enum CancelCause {
     AdminKill,
     /// The session was explicitly removed/torn down while a turn was live.
     SessionRemoved,
-    /// A channel configuration generation was retired while a turn was live.
-    ChannelGeneration,
 }
 
 impl CancelCause {
@@ -33,7 +31,6 @@ impl CancelCause {
             CancelCause::ClientRpc => "client_rpc",
             CancelCause::AdminKill => "admin_kill",
             CancelCause::SessionRemoved => "session_removed",
-            CancelCause::ChannelGeneration => "channel_generation",
         }
     }
 }
@@ -108,7 +105,6 @@ pub struct SessionStore {
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
-    cancel_tokens_changed: Arc<tokio::sync::Notify>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
 }
@@ -122,7 +118,6 @@ impl SessionStore {
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
-            cancel_tokens_changed: Arc::new(tokio::sync::Notify::new()),
             max_sessions,
             session_queue,
         }
@@ -390,23 +385,16 @@ impl SessionStore {
     }
 
     pub async fn remove(&self, id: &str) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        let removed = sessions.remove(id).is_some();
-        if !removed {
-            return false;
-        }
-        let active_turn = {
-            self.cancel_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(id)
-                .map(|(_, token)| token.clone())
-        };
-        if let Some(token) = active_turn {
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
             self.record_cancel_cause(id, CancelCause::SessionRemoved);
             token.cancel();
         }
-        true
+        self.sessions.lock().await.remove(id).is_some()
     }
 
     pub async fn evict_same_mode_sibling(
@@ -471,72 +459,36 @@ impl SessionStore {
         {
             stale.cancel();
         }
-        self.cancel_tokens_changed.notify_waiters();
         generation
     }
 
-    /// Install a turn registration only while the session is still live.
-    /// Removal takes the session lock before observing the cancel registry, so
-    /// close/kill and prompt registration have one atomic lifecycle ordering:
-    /// either removal wins and this returns `None`, or registration wins and
-    /// removal sees and cancels the active turn.
-    pub async fn register_cancel_token_if_present(
-        &self,
-        id: &str,
-        token: tokio_util::sync::CancellationToken,
-    ) -> Option<u64> {
-        let sessions = self.sessions.lock().await;
-        if !sessions.contains_key(id) {
-            return None;
-        }
-        let generation = self
-            .cancel_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .wrapping_add(1);
-        if let Some((_, stale)) = self
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), (generation, token))
-        {
-            stale.cancel();
-        }
-        drop(sessions);
-        self.cancel_tokens_changed.notify_waiters();
-        Some(generation)
-    }
-
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {
-        let removed = {
+        {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
             match tokens.get(id) {
                 Some((g, _)) if *g == generation => {
                     tokens.remove(id);
-                    true
                 }
-                _ => false,
+                _ => return,
             }
-        };
-        if !removed {
-            return;
         }
         self.cancel_causes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
-        self.cancel_tokens_changed.notify_waiters();
     }
 
     pub fn cancel_session(&self, id: &str) -> bool {
-        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((_, token)) = tokens.get(id) else {
-            return false;
-        };
-        // Keep lookup, attribution, and firing linearized with token
-        // replacement so this call cannot acknowledge a stale generation.
         self.record_cancel_cause(id, CancelCause::ClientRpc);
-        token.cancel();
-        true
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|(_, t)| {
+                t.cancel();
+                true
+            })
+            .unwrap_or(false)
     }
 
     /// Returns true if a cancel token is registered — i.e. a turn is in flight.
@@ -547,56 +499,17 @@ impl SessionStore {
             .contains_key(id)
     }
 
-    /// Cancel every active turn and wait until each turn has removed its
-    /// registration. The cause is first-writer-wins with any earlier cancel
-    /// already recorded for the same session.
-    pub async fn cancel_all_inflight_and_wait(&self, cause: CancelCause) {
-        loop {
-            let notified = self.cancel_tokens_changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            let tokens = {
-                let token_guard = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-                if token_guard.is_empty() {
-                    return;
-                }
-
-                let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
-                let tokens: Vec<(String, tokio_util::sync::CancellationToken)> = token_guard
-                    .iter()
-                    .map(|(id, (_, token))| (id.clone(), token.clone()))
-                    .collect();
-                for (id, _) in &tokens {
-                    causes.entry(id.clone()).or_insert(cause);
-                }
-                tokens
-            };
-            for (_, token) in tokens {
-                token.cancel();
-            }
-            notified.await;
-        }
-    }
-
     pub async fn kill_session(&self, id: &str) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        let removed = sessions.remove(id).is_some();
-        if !removed {
-            return false;
-        }
-        let active_turn = {
-            self.cancel_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(id)
-                .map(|(_, token)| token.clone())
-        };
-        if let Some(token) = active_turn {
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
             self.record_cancel_cause(id, CancelCause::AdminKill);
             token.cancel();
         }
-        true
+        self.sessions.lock().await.remove(id).is_some()
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
@@ -605,8 +518,7 @@ impl SessionStore {
         self.cancel_causes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(id.to_string())
-            .or_insert(cause);
+            .insert(id.to_string(), cause);
     }
 
     /// Drain the recorded cancel cause for a session. Returns `None` only
@@ -918,16 +830,12 @@ mod tests {
             .unwrap();
 
         let token = tokio_util::sync::CancellationToken::new();
-        let generation = store.register_cancel_token("s1", token.clone());
+        store.register_cancel_token("s1", token.clone());
 
         assert!(store.remove("s1").await);
         assert_eq!(store.count().await, 0);
-        assert!(token.is_cancelled());
-        assert!(
-            store.has_inflight_turn("s1"),
-            "removal must retain the turn registration until its owner drains"
-        );
-        store.remove_cancel_token("s1", generation);
+        // Cancel token was also removed -- cancelling is a no-op now.
+        assert!(!store.cancel_session("s1"));
     }
 
     #[tokio::test]
@@ -1036,32 +944,6 @@ mod tests {
         // Second cancel returns false (token was consumed by remove).
         store.remove_cancel_token("s1", generation);
         assert!(!store.cancel_session("s1"));
-    }
-
-    #[test]
-    fn cancellation_cause_is_first_writer_wins() {
-        let store = make_store(4);
-        store.record_cancel_cause("s1", CancelCause::AdminKill);
-        store.record_cancel_cause("s1", CancelCause::ClientRpc);
-
-        assert_eq!(
-            store.take_cancel_cause("s1"),
-            Some(CancelCause::AdminKill),
-            "connection teardown must preserve the cause that fired first"
-        );
-    }
-
-    #[test]
-    fn cancel_without_active_turn_does_not_create_or_overwrite_cause() {
-        let store = make_store(4);
-        store.record_cancel_cause("s1", CancelCause::SessionRemoved);
-
-        assert!(!store.cancel_session("s1"));
-        assert_eq!(
-            store.take_cancel_cause("s1"),
-            Some(CancelCause::SessionRemoved),
-            "a late session/cancel must not replace the terminal cause"
-        );
     }
 
     #[tokio::test]
@@ -1226,111 +1108,5 @@ mod tests {
             Some(CancelCause::AdminKill),
             "kill_session must preserve AdminKill cause for verdict-site attribution"
         );
-    }
-
-    #[tokio::test]
-    async fn kill_session_preserves_earlier_connection_cause() {
-        let store = make_store(4);
-        store
-            .insert(
-                "s".into(),
-                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
-            )
-            .await
-            .unwrap();
-        let token = tokio_util::sync::CancellationToken::new();
-        store.register_cancel_token("s", token);
-        store.record_cancel_cause("s", CancelCause::ClientRpc);
-
-        store.kill_session("s").await;
-        assert_eq!(
-            store.take_cancel_cause("s"),
-            Some(CancelCause::ClientRpc),
-            "admin kill must not overwrite an earlier connection cancellation"
-        );
-    }
-
-    #[tokio::test]
-    async fn channel_generation_cancel_drains_turns_and_preserves_first_cause() {
-        let store = Arc::new(make_store(4));
-        let admin_token = tokio_util::sync::CancellationToken::new();
-        let admin_generation = store.register_cancel_token("admin", admin_token.clone());
-        store.record_cancel_cause("admin", CancelCause::AdminKill);
-        let admin_store = Arc::clone(&store);
-        let admin_turn = ::zeroclaw_spawn::spawn!(async move {
-            admin_token.cancelled().await;
-            let cause = admin_store.take_cancel_cause("admin");
-            admin_store.remove_cancel_token("admin", admin_generation);
-            cause
-        });
-        let generation_token = tokio_util::sync::CancellationToken::new();
-        let generation = store.register_cancel_token("generation", generation_token.clone());
-        let generation_store = Arc::clone(&store);
-        let generation_turn = ::zeroclaw_spawn::spawn!(async move {
-            generation_token.cancelled().await;
-            let cause = generation_store.take_cancel_cause("generation");
-            generation_store.remove_cancel_token("generation", generation);
-            cause
-        });
-
-        store
-            .cancel_all_inflight_and_wait(CancelCause::ChannelGeneration)
-            .await;
-
-        assert_eq!(
-            admin_turn.await.unwrap(),
-            Some(CancelCause::AdminKill),
-            "generation cancellation must not overwrite an earlier cause"
-        );
-        assert_eq!(
-            generation_turn.await.unwrap(),
-            Some(CancelCause::ChannelGeneration),
-            "generation cancellation must be visible at the turn verdict site"
-        );
-        assert!(!store.has_inflight_turn("admin"));
-        assert!(!store.has_inflight_turn("generation"));
-    }
-
-    #[tokio::test]
-    async fn channel_generation_drain_waits_for_removed_or_killed_turn_cleanup() {
-        for kill in [false, true] {
-            let store = Arc::new(make_store(4));
-            let session_id = if kill { "killed" } else { "removed" };
-            store
-                .insert(
-                    session_id.into(),
-                    RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
-                )
-                .await
-                .unwrap();
-            let token = tokio_util::sync::CancellationToken::new();
-            let generation = store.register_cancel_token(session_id, token.clone());
-
-            if kill {
-                assert!(store.kill_session(session_id).await);
-            } else {
-                assert!(store.remove(session_id).await);
-            }
-            assert!(token.is_cancelled());
-            assert!(store.has_inflight_turn(session_id));
-
-            let drain_store = Arc::clone(&store);
-            let mut drain = ::zeroclaw_spawn::spawn!(async move {
-                drain_store
-                    .cancel_all_inflight_and_wait(CancelCause::ChannelGeneration)
-                    .await;
-            });
-            tokio::task::yield_now().await;
-            assert!(
-                !drain.is_finished(),
-                "generation drain must wait for the removed turn owner"
-            );
-
-            store.remove_cancel_token(session_id, generation);
-            tokio::time::timeout(std::time::Duration::from_secs(1), &mut drain)
-                .await
-                .expect("generation drain should finish after turn cleanup")
-                .expect("drain task should not panic");
-        }
     }
 }

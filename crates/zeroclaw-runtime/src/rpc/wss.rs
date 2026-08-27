@@ -203,9 +203,6 @@ pub async fn run_wss_listener(
         "RPC WSS listener started"
     );
 
-    let connections_cancel = cancel.child_token();
-    let mut connections = tokio::task::JoinSet::new();
-    let mut listener_result: Result<()> = Ok(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -215,16 +212,6 @@ pub async fn run_wss_listener(
                     "RPC WSS listener shutting down"
                 );
                 break;
-            }
-            completed = connections.join_next(), if !connections.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        &format!("RPC WSS connection task failed: {error}")
-                    );
-                }
             }
             accept = listener.accept() => {
                 let (tcp_stream, remote_addr) = match accept {
@@ -244,69 +231,52 @@ pub async fn run_wss_listener(
                             tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                             continue;
                         }
-                        listener_result = Err(e).context("WSS accept error");
-                        break;
+                        return Err(e).context("WSS accept error");
                     }
                 };
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
-                let connection_cancel = connections_cancel.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                connections.spawn(async move {
-                    let ws_stream = tokio::select! {
-                        _ = connection_cancel.cancelled() => None,
-                        ws_stream = async {
-                            let tls_stream = match acceptor.accept(tcp_stream).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                        &format!("WSS TLS handshake failed from {remote_addr}: {e}")
-                                    );
-                                    return None;
-                                }
-                            };
-
-                            match tokio_tungstenite::accept_async(tls_stream).await {
-                                Ok(ws) => Some(ws),
-                                Err(e) => {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                        &format!("WSS WebSocket upgrade failed from {remote_addr}: {e}")
-                                    );
-                                    None
-                                }
-                            }
-                        } => ws_stream,
+                zeroclaw_spawn::spawn!(async move {
+                    // TLS handshake.
+                    let tls_stream = match acceptor.accept(tcp_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!("WSS TLS handshake failed from {remote_addr}: {e}")
+                            );
+                            count.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
                     };
-                    let Some(ws_stream) = ws_stream else {
-                        count.fetch_sub(1, Ordering::Relaxed);
-                        return;
+
+                    // WebSocket upgrade.
+                    let ws_stream = match tokio_tungstenite::accept_async(tls_stream).await {
+                        Ok(ws) => ws,
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!("WSS WebSocket upgrade failed from {remote_addr}: {e}")
+                            );
+                            count.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
                     };
 
                     let mut transport = WssTransport::new(ws_stream, remote_addr);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
-                        ctx.clone(),
-                        writer_tx,
-                        peer,
-                        connection_cancel.child_token(),
-                        false,
-                    );
-                    tokio::select! {
-                        _ = connection_cancel.cancelled() => {}
-                        _ = dispatcher.run(&mut transport) => {}
-                    }
-                    dispatcher.shutdown().await;
+                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    dispatcher.run(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
@@ -335,19 +305,7 @@ pub async fn run_wss_listener(
         }
     }
 
-    connections_cancel.cancel();
-    while let Some(completed) = connections.join_next().await {
-        if let Err(error) = completed {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!("RPC WSS connection task failed during shutdown: {error}")
-            );
-        }
-    }
-
-    listener_result
+    Ok(())
 }
 
 #[cfg(test)]
@@ -375,336 +333,5 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
-    }
-}
-
-#[cfg(test)]
-mod connection_tests {
-    use super::*;
-    use crate::rpc::dispatch::Method;
-    use crate::rpc::session::SessionStore;
-    use crate::rpc::types::InitializeParams;
-    use futures_util::{SinkExt, StreamExt};
-    use rcgen::{CertifiedKey, generate_simple_self_signed};
-    use tokio::io::AsyncReadExt;
-    use zeroclaw_api::jsonrpc::{JSONRPC_VERSION, JsonRpcRequest};
-    use zeroclaw_infra::session_queue::SessionActorQueue;
-
-    fn test_ctx(tmp: &std::path::Path) -> Arc<RpcContext> {
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.to_path_buf(),
-            config_path: tmp.join("config.toml"),
-            ..Default::default()
-        };
-        let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
-        let sessions = Arc::new(SessionStore::new(64, session_queue));
-        RpcContext::minimal(config, sessions)
-    }
-
-    fn test_tls_acceptor(tmp: &std::path::Path) -> TlsAcceptor {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let CertifiedKey { cert, key_pair } =
-            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_path = tmp.join("cert.pem");
-        let key_path = tmp.join("key.pem");
-        std::fs::write(&cert_path, cert.pem()).unwrap();
-        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
-        build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap()
-    }
-
-    fn rpc_request<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
-        serde_json::to_string(&JsonRpcRequest::new(
-            method.wire_name(),
-            serde_json::to_value(params).unwrap(),
-            serde_json::Value::Number(id.into()),
-        ))
-        .unwrap()
-    }
-
-    struct BlockingModelProvider {
-        started: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        starts: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl zeroclaw_api::model_provider::ModelProvider for BlockingModelProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            self.starts.fetch_add(1, Ordering::Relaxed);
-            self.started.notify_one();
-            self.release.notified().await;
-            Ok("released".to_string())
-        }
-    }
-
-    impl zeroclaw_api::attribution::Attributable for BlockingModelProvider {
-        fn role(&self) -> zeroclaw_api::attribution::Role {
-            zeroclaw_api::attribution::Role::Provider(
-                zeroclaw_api::attribution::ProviderKind::Model(
-                    zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-
-        fn alias(&self) -> &str {
-            "blocking-wss-test"
-        }
-    }
-
-    async fn insert_blocking_session(
-        ctx: &Arc<RpcContext>,
-        session_id: &str,
-        started: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        starts: Arc<AtomicUsize>,
-    ) {
-        let agent = crate::agent::agent::Agent::builder()
-            .model_provider(Box::new(BlockingModelProvider {
-                started,
-                release,
-                starts,
-            }))
-            .tools(vec![])
-            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
-            .observer(Arc::new(crate::observability::noop::NoopObserver))
-            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
-            .workspace_dir(std::env::temp_dir())
-            .build()
-            .expect("blocking WSS test agent should build");
-        ctx.sessions
-            .insert(
-                session_id.to_string(),
-                crate::rpc::session::RpcSession::new(
-                    agent,
-                    "test-agent",
-                    std::env::temp_dir().to_str().unwrap(),
-                    crate::rpc::types::ChatMode::Chat,
-                ),
-            )
-            .await
-            .expect("blocking WSS test session should insert");
-    }
-
-    async fn wait_for_client_count(count: &Arc<AtomicUsize>, expected: usize) {
-        for _ in 0..250 {
-            if count.load(Ordering::Relaxed) == expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "client count never reached {expected}; last observed {}",
-            count.load(Ordering::Relaxed)
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_interrupts_and_joins_inflight_wss_handshake() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(tmp.path());
-        let acceptor = test_tls_acceptor(tmp.path());
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bind_addr = probe.local_addr().unwrap();
-        drop(probe);
-
-        let cancel = CancellationToken::new();
-        let count = Arc::new(AtomicUsize::new(0));
-        let server_cancel = cancel.clone();
-        let server_count = count.clone();
-        let server = zeroclaw_spawn::spawn!(async move {
-            run_wss_listener(ctx, server_cancel, server_count, acceptor, bind_addr).await
-        });
-
-        let mut client = None;
-        for _ in 0..50 {
-            match TcpStream::connect(bind_addr).await {
-                Ok(stream) => {
-                    client = Some(stream);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        }
-        let mut client = client.expect("WSS listener never accepted a TCP client");
-        wait_for_client_count(&count, 1).await;
-
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .expect("WSS listener should join an in-flight handshake after cancellation")
-            .expect("WSS listener task should not panic")
-            .expect("WSS listener should stop cleanly");
-
-        assert_eq!(count.load(Ordering::Relaxed), 0);
-        let mut byte = [0_u8; 1];
-        let bytes = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
-            .await
-            .expect("cancelled WSS client should observe EOF")
-            .expect("client read should not fail");
-        assert_eq!(bytes, 0, "cancelled WSS connection should be closed");
-    }
-
-    #[tokio::test]
-    async fn cancel_joins_inflight_wss_prompt_before_releasing_connection() {
-        Box::pin(cancel_joins_inflight_wss_prompt_before_releasing_connection_impl()).await;
-    }
-
-    async fn cancel_joins_inflight_wss_prompt_before_releasing_connection_impl() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(tmp.path());
-        let CertifiedKey { cert, key_pair } =
-            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_path = tmp.path().join("prompt-cert.pem");
-        let key_path = tmp.path().join("prompt-key.pem");
-        std::fs::write(&cert_path, cert.pem()).unwrap();
-        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
-        let acceptor =
-            build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bind_addr = probe.local_addr().unwrap();
-        drop(probe);
-
-        let cancel = CancellationToken::new();
-        let count = Arc::new(AtomicUsize::new(0));
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let starts = Arc::new(AtomicUsize::new(0));
-        let session_id = "inflight-wss-prompt";
-        insert_blocking_session(
-            &ctx,
-            session_id,
-            Arc::clone(&started),
-            Arc::clone(&release),
-            Arc::clone(&starts),
-        )
-        .await;
-
-        let server_cancel = cancel.clone();
-        let server_ctx = Arc::clone(&ctx);
-        let server_count = Arc::clone(&count);
-        let server = zeroclaw_spawn::spawn!(async move {
-            run_wss_listener(server_ctx, server_cancel, server_count, acceptor, bind_addr).await
-        });
-
-        let tcp = loop {
-            match TcpStream::connect(bind_addr).await {
-                Ok(stream) => break stream,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        };
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(cert.der().clone()).unwrap();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        ));
-        let tls = connector
-            .connect(
-                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-                tcp,
-            )
-            .await
-            .unwrap();
-        let (mut client, _) = tokio_tungstenite::client_async("wss://localhost/", tls)
-            .await
-            .unwrap();
-
-        let init = InitializeParams {
-            protocol_version: 1,
-            tui_id: None,
-            tui_sig: None,
-            env: Default::default(),
-            client_capabilities: None,
-        };
-        client
-            .send(Message::Text(
-                rpc_request(Method::Initialize, &init, 1).into(),
-            ))
-            .await
-            .unwrap();
-        let init_response = tokio::time::timeout(Duration::from_secs(2), client.next())
-            .await
-            .expect("WSS initialize should receive a response")
-            .expect("WSS connection should remain open")
-            .expect("WSS initialize response should be readable");
-        let Message::Text(init_response) = init_response else {
-            panic!("WSS initialize should return a text frame");
-        };
-        let init_response: serde_json::Value = serde_json::from_str(&init_response).unwrap();
-        assert_eq!(init_response["jsonrpc"], JSONRPC_VERSION);
-        assert!(init_response["error"].is_null());
-
-        client
-            .send(Message::Text(
-                rpc_request(
-                    Method::SessionPrompt,
-                    &serde_json::json!({
-                        "session_id": session_id,
-                        "prompt": "remain in flight until the WSS generation closes",
-                    }),
-                    2,
-                )
-                .into(),
-            ))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), started.notified())
-            .await
-            .expect("WSS prompt should reach the blocking provider");
-        assert!(ctx.sessions.has_inflight_turn(session_id));
-        client
-            .send(Message::Text(
-                rpc_request(
-                    Method::SessionPrompt,
-                    &serde_json::json!({
-                        "session_id": session_id,
-                        "prompt": "remain queued until the WSS generation closes",
-                    }),
-                    3,
-                )
-                .into(),
-            ))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while ctx.sessions.session_queue.queue_depth(session_id).await < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("second WSS prompt should register behind the in-flight turn");
-        assert_eq!(starts.load(Ordering::Relaxed), 1);
-
-        // Make permit release and transport teardown ready in the same
-        // scheduler turn. The queued request must resolve the biased
-        // cancellation branch instead of starting a second provider call.
-        release.notify_one();
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .expect("WSS listener should drain the in-flight prompt before returning")
-            .expect("WSS listener task should not panic")
-            .expect("WSS listener should stop cleanly");
-
-        assert_eq!(count.load(Ordering::Relaxed), 0);
-        assert!(!ctx.sessions.has_inflight_turn(session_id));
-        assert_eq!(ctx.sessions.session_queue.queue_depth(session_id).await, 0);
-        assert_eq!(
-            starts.load(Ordering::Relaxed),
-            1,
-            "the queued WSS prompt must not start during teardown"
-        );
-        assert!(
-            ctx.sessions.get_agent(session_id).await.is_some(),
-            "WSS teardown must retain the resumable session"
-        );
     }
 }

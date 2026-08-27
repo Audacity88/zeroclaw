@@ -16,7 +16,6 @@ use zeroclaw_infra::session_backend::SessionBackend;
 
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
-use crate::daemon::ChannelGenerationControl;
 
 #[derive(Default)]
 pub struct ApprovalPendingMap {
@@ -148,10 +147,6 @@ pub struct RpcContext {
     /// daemon reload rebinds the same address.
     pub gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 
-    /// The exact daemon-run channel generation used by channel config
-    /// mutations. `None` for standalone RPC contexts.
-    pub(crate) channel_generation_control: Option<Arc<ChannelGenerationControl>>,
-
     /// In-flight approval requests waiting for session/approve RPC calls.
     pub approval_pending: Arc<ApprovalPendingMap>,
 
@@ -192,7 +187,6 @@ impl RpcContext {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
@@ -214,7 +208,6 @@ impl RpcContext {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -240,7 +233,6 @@ impl RpcContext {
             event_tx: Some(event_tx),
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -266,7 +258,6 @@ impl RpcContext {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -292,7 +283,6 @@ impl RpcContext {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -318,7 +308,6 @@ impl RpcContext {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -345,7 +334,6 @@ impl RpcContext {
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
-            channel_generation_control: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
@@ -372,7 +360,6 @@ impl RpcContext {
             event_tx: None,
             reload_tx,
             gateway_shutdown_tx,
-            channel_generation_control: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
