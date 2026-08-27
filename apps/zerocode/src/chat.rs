@@ -5206,7 +5206,10 @@ fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
             candidate_end = start + offset;
         }
         let candidate = &text[start..candidate_end];
-        if !candidate.is_empty() && crate::url_open::validate_url(candidate).is_ok() {
+        if !candidate.is_empty()
+            && !candidate.contains('\u{2026}')
+            && crate::url_open::validate_url(candidate).is_ok()
+        {
             ranges.push((start, candidate_end, candidate.to_string()));
         }
     }
@@ -12579,6 +12582,28 @@ mod tests {
             20,
         );
         assert!(out.contains('\u{2026}'), "expected ellipsis: {out}");
+    }
+
+    #[test]
+    fn md_table_truncated_url_is_not_actionable() {
+        let lines = markdown_to_lines(
+            "| col |\n|-----|\n| https://example.com/a/very/long/path |\n\nhttps://example.org/ok\n",
+            24,
+        );
+        let truncated = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("https://") && span.content.contains('\u{2026}'))
+            .expect("truncated table URL");
+        assert_ne!(truncated.style.fg, Some(theme::active().accent));
+        assert_ne!(
+            truncated.style.add_modifier(Modifier::UNDERLINED),
+            truncated.style
+        );
+
+        let regions = url_cell_regions_for_lines(&lines, 24);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].url, "https://example.org/ok");
     }
 
     #[test]
