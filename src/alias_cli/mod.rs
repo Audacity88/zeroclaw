@@ -354,13 +354,13 @@ async fn save(config: &mut Config) -> Result<()> {
 }
 
 #[cfg(feature = "agent-runtime")]
-enum AgentMutationRoute {
+pub(crate) enum AgentMutationRoute {
     Daemon(serde_json::Value),
     Offline(zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard),
 }
 
 #[cfg(feature = "agent-runtime")]
-async fn route_agent_mutation(
+pub(crate) async fn route_agent_mutation(
     config: &mut Config,
     method: &str,
     params: serde_json::Value,

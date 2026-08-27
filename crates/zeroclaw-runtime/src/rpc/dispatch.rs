@@ -3446,6 +3446,11 @@ impl RpcDispatcher {
 
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
+        let _agent_config_reservation =
+            zeroclaw_config::alias_refs::agent_alias_for_prop_path(&req.prop)
+                .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
+                .transpose()
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
@@ -3518,8 +3523,23 @@ impl RpcDispatcher {
         if let Err(e) = config.set_prop_persistent(&req.prop, &value_str) {
             return Err(rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")));
         }
+        let config_path = config.config_path.clone();
         self.save_and_swap_config(*config, &config_write_guard)
             .await?;
+        if let Some(comment) = req.comment.as_ref().filter(|comment| !comment.is_empty()) {
+            let annotations = [(req.prop.clone(), comment.clone())];
+            if let Err(error) =
+                zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "failed to apply config/set comment to config.toml"
+                );
+            }
+        }
         self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
             .await;
         if let (Some(agent_alias), Some(old_config)) = (
@@ -3900,17 +3920,12 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        let _agent_config_reservation = (req.path == "agents")
+            .then(|| self.ctx.agent_lifecycle.reserve_config_mutation(&req.key))
+            .transpose()
+            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         let mut working = self.ctx.config.read().clone();
-        let mut agent_lifecycle_lease = None;
-        if req.path == "agents" && !working.agents.contains_key(&req.key) {
-            agent_lifecycle_lease = Some(
-                self.ctx
-                    .agent_lifecycle
-                    .begin_delete(req.key.clone())
-                    .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?,
-            );
-        }
         let created =
             zeroclaw_config::alias_refs::create_map_key_checked(&mut working, &req.path, &req.key)
                 .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
@@ -3919,7 +3934,6 @@ impl RpcDispatcher {
             self.save_and_swap_config(working, &config_write_guard)
                 .await?;
         }
-        drop(agent_lifecycle_lease);
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
             key: req.key,
@@ -4300,27 +4314,16 @@ impl RpcDispatcher {
             .agent_lifecycle
             .begin_delete(alias.clone())
             .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        let mut working = self.ctx.config.read().clone();
-        let preflight_config = working.clone();
+        let data_dir = self.ctx.config.read().data_dir.clone();
         let store = self.ctx.acp_session_store.clone();
         let preflight_alias = alias.clone();
-        let preflight = tokio::task::spawn_blocking(move || {
-            let live_acp = match store {
-                Some(store) => store
-                    .count_live_sessions_by_agent(&preflight_alias)
-                    .map_err(|error| error.to_string()),
-                None => zeroclaw_infra::acp_session_store::AcpSessionStore::new(
-                    &preflight_config.data_dir,
-                )
+        let live_acp = tokio::task::spawn_blocking(move || match store {
+            Some(store) => store
+                .count_live_sessions_by_agent(&preflight_alias)
+                .map_err(|error| error.to_string()),
+            None => zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir)
                 .and_then(|store| store.count_live_sessions_by_agent(&preflight_alias))
                 .map_err(|error| error.to_string()),
-            };
-            crate::agent_lifecycle::plan_agent_delete_with_acp_count(
-                &preflight_config,
-                &preflight_alias,
-                live_acp,
-            )
         })
         .await
         .map_err(|error| {
@@ -4329,6 +4332,11 @@ impl RpcDispatcher {
                 format!("Agent delete preflight task failed: {error}"),
             )
         })?;
+
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let mut working = self.ctx.config.read().clone();
+        let preflight =
+            crate::agent_lifecycle::plan_agent_delete_with_acp_count(&working, &alias, live_acp);
 
         if !preflight.allowed {
             return to_result(AgentDeleteResult {
@@ -11600,6 +11608,72 @@ mod tests {
                 .map(String::as_str),
             Some("fresh-value"),
             "fresh alias dotted key must survive the RPC save/reload boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_cannot_recreate_agent_during_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = make_secret_test_config(&tmp);
+        cfg.save().await.expect("seed config");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let _cleanup = dispatcher
+            .ctx
+            .agent_lifecycle
+            .begin_delete("recreated")
+            .expect("hold destructive cleanup lease");
+
+        let result = dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.recreated.enabled",
+                "value": true,
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "autovivification must be refused during cleanup"
+        );
+        assert!(
+            !dispatcher
+                .ctx
+                .config
+                .read()
+                .agents
+                .contains_key("recreated")
+        );
+    }
+
+    #[tokio::test]
+    async fn map_key_create_cannot_recreate_agent_during_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = make_secret_test_config(&tmp);
+        cfg.save().await.expect("seed config");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let _cleanup = dispatcher
+            .ctx
+            .agent_lifecycle
+            .begin_delete("recreated")
+            .expect("hold destructive cleanup lease");
+
+        let result = dispatcher
+            .handle_config_map_key_create(&json!({
+                "path": "agents",
+                "key": "recreated",
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "explicit create must be refused during cleanup"
+        );
+        assert!(
+            !dispatcher
+                .ctx
+                .config
+                .read()
+                .agents
+                .contains_key("recreated")
         );
     }
 

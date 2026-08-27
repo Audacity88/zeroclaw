@@ -316,6 +316,16 @@ pub struct AgentDeleteLease {
 }
 
 impl AgentLifecycleCoordinator {
+    /// Reserve an alias while a config property mutation is prepared and
+    /// committed. This prevents delete/rename from crossing an autovivifying
+    /// write without treating an ordinary config edit as destructive work.
+    pub fn reserve_config_mutation(
+        &self,
+        alias: impl Into<String>,
+    ) -> Result<AgentAdmissionReservation, AgentAdmissionError> {
+        self.reserve_admission(alias)
+    }
+
     /// Reserve an alias generation before slow agent construction starts.
     pub fn reserve_admission(
         &self,

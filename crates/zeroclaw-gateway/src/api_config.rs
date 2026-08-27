@@ -698,6 +698,19 @@ pub async fn handle_prop_put(
         return e.into_response();
     }
 
+    let _agent_config_reservation =
+        match zeroclaw_config::alias_refs::agent_alias_for_prop_path(&body.path)
+            .map(|alias| state.agent_lifecycle.reserve_config_mutation(alias))
+            .transpose()
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                        .with_path(&body.path),
+                );
+            }
+        };
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut new_config = state.config.read().clone();
     if new_config.ensure_map_key_for_path(&body.path) {
@@ -1067,10 +1080,6 @@ pub async fn handle_delete_map_key(
     } else {
         None
     };
-    // Acquired before this read-for-modify, threaded into the cascade
-    // helpers below, and held through whichever branch's swap runs.
-    let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-    let working = state.config.read().clone();
     match zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
             // Agent deletion is special: it must scrub config references
@@ -1079,18 +1088,19 @@ pub async fn handle_delete_map_key(
             // cron / acp / session).
             return delete_agent_cascade(
                 &state,
-                working,
                 &q.key,
-                _cfg_guard,
                 agent_lifecycle_lease.expect("agent path acquires lifecycle lease"),
             )
             .await;
         }
-        Some(kind) => {
-            return delete_config_cascade(&state, working, &kind, &q.path, &q.key, &_cfg_guard)
-                .await;
-        }
-        None => {}
+        Some(_) | None => {}
+    }
+    // Acquired before this read-for-modify, threaded into the cascade
+    // helpers below, and held through whichever branch's swap runs.
+    let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+    let working = state.config.read().clone();
+    if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
+        return delete_config_cascade(&state, working, &kind, &q.path, &q.key, &_cfg_guard).await;
     }
     let mut working = working;
     let removed = match working.delete_map_key(&q.path, &q.key) {
@@ -1122,14 +1132,12 @@ pub async fn handle_delete_map_key(
 /// (export-then-delete memory/cron/acp + clear session attribution), and persist.
 async fn delete_agent_cascade(
     state: &AppState,
-    mut working: zeroclaw_config::schema::Config,
     alias: &str,
-    guard: ConfigWriteGuard,
     lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentDeleteLease,
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
 
-    let preflight_config = working.clone();
+    let preflight_config = state.config.read().clone();
     let preflight_alias = alias.to_string();
     let live_acp = tokio::task::spawn_blocking(move || {
         crate::agent_owned_state::live_acp_session_count(&preflight_config, &preflight_alias)
@@ -1137,6 +1145,8 @@ async fn delete_agent_cascade(
     })
     .await
     .unwrap_or_else(|error| Err(format!("ACP preflight task failed: {error}")));
+    let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+    let mut working = state.config.read().clone();
     let preflight = zeroclaw_runtime::agent_lifecycle::plan_agent_delete_with_acp_count(
         &working, alias, live_acp,
     );
@@ -1301,13 +1311,11 @@ pub async fn handle_map_key(
         return e.into_response();
     }
 
-    let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-    let mut working = state.config.read().clone();
     let path = q.path.clone();
     let key = q.key.clone();
-    let _agent_lifecycle_lease = if path == "agents" && !working.agents.contains_key(&key) {
-        match state.agent_lifecycle.begin_delete(key.clone()) {
-            Ok(lease) => Some(lease),
+    let _agent_config_reservation = if path == "agents" {
+        match state.agent_lifecycle.reserve_config_mutation(key.clone()) {
+            Ok(reservation) => Some(reservation),
             Err(error) => {
                 return error_response(
                     ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
@@ -1318,6 +1326,8 @@ pub async fn handle_map_key(
     } else {
         None
     };
+    let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+    let mut working = state.config.read().clone();
 
     // Create through the shared guarded boundary so the reserved-agent rule (the
     // `default` runtime fallback) is enforced once for every surface. Reserved ->
@@ -1992,6 +2002,27 @@ pub async fn handle_patch(
         Ok(ops) => ops,
         Err(e) => return error_response(e),
     };
+
+    let agent_aliases: std::collections::BTreeSet<String> = ops
+        .iter()
+        .filter(|op| matches!(op.op.as_str(), "add" | "replace" | "remove"))
+        .filter_map(|op| {
+            let path = json_pointer_to_dotted(&op.path);
+            zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).map(str::to_owned)
+        })
+        .collect();
+    let mut _agent_config_reservations = Vec::with_capacity(agent_aliases.len());
+    for alias in agent_aliases {
+        match state.agent_lifecycle.reserve_config_mutation(&alias) {
+            Ok(reservation) => _agent_config_reservations.push(reservation),
+            Err(error) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                        .with_path(format!("agents.{alias}")),
+                );
+            }
+        }
+    }
 
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let working = state.config.read().clone();
@@ -2855,6 +2886,86 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert!(state.config.read().channels.telegram.contains_key("newbot"));
+    }
+
+    #[tokio::test]
+    async fn prop_put_cannot_recreate_agent_during_destructive_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(temp_config(&tmp));
+        let _cleanup = state
+            .agent_lifecycle
+            .begin_delete("recreated")
+            .expect("hold destructive cleanup lease");
+
+        let (status, _json) = response_json(
+            handle_prop_put(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::Json(PropPutBody {
+                    path: "agents.recreated.enabled".to_string(),
+                    value: serde_json::json!(true),
+                    comment: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!state.config.read().agents.contains_key("recreated"));
+    }
+
+    #[tokio::test]
+    async fn patch_cannot_recreate_agent_during_destructive_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(temp_config(&tmp));
+        let _cleanup = state
+            .agent_lifecycle
+            .begin_delete("recreated")
+            .expect("hold destructive cleanup lease");
+
+        let (status, _json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "add",
+                    "path": "/agents/recreated/enabled",
+                    "value": true,
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!state.config.read().agents.contains_key("recreated"));
+    }
+
+    #[tokio::test]
+    async fn map_key_create_cannot_recreate_agent_during_destructive_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(temp_config(&tmp));
+        let _cleanup = state
+            .agent_lifecycle
+            .begin_delete("recreated")
+            .expect("hold destructive cleanup lease");
+
+        let (status, _json) = response_json(
+            handle_map_key(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(MapKeyQuery {
+                    path: "agents".to_string(),
+                    key: "recreated".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!state.config.read().agents.contains_key("recreated"));
     }
 
     /// Regression test for the lost-update race `persist_and_swap` callers
@@ -4127,15 +4238,8 @@ mod tests {
         );
 
         let state = crate::api::test_state(config.clone());
-        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = delete_agent_cascade(
-            &state,
-            config.clone(),
-            "victim",
-            guard,
-            test_agent_delete_lease(&state, "victim"),
-        )
-        .await;
+        let resp =
+            delete_agent_cascade(&state, "victim", test_agent_delete_lease(&state, "victim")).await;
 
         // Persist failed -> error response, not a clean delete.
         assert!(
@@ -4190,15 +4294,8 @@ mod tests {
             .expect("seed cron job");
 
         let state = crate::api::test_state(config.clone());
-        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = delete_agent_cascade(
-            &state,
-            config.clone(),
-            "victim",
-            guard,
-            test_agent_delete_lease(&state, "victim"),
-        )
-        .await;
+        let resp =
+            delete_agent_cascade(&state, "victim", test_agent_delete_lease(&state, "victim")).await;
         assert!(resp.status().is_success(), "a clean delete returns success");
 
         // Config swapped: `victim` is GONE.
@@ -4269,15 +4366,8 @@ mod tests {
             .expect("seed cron job");
 
         let state = crate::api::test_state(config.clone());
-        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = delete_agent_cascade(
-            &state,
-            config.clone(),
-            "victim",
-            guard,
-            test_agent_delete_lease(&state, "victim"),
-        )
-        .await;
+        let resp =
+            delete_agent_cascade(&state, "victim", test_agent_delete_lease(&state, "victim")).await;
 
         // The HTTP call is still 200 OK — partial failure is not an error
         // response, it is a successful response with `warnings` populated.

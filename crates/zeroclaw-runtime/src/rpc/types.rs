@@ -603,6 +603,8 @@ rpc_type! {
     pub struct ConfigSetParams {
         pub prop: String,
         pub value: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub comment: Option<String>,
     }
 }
 

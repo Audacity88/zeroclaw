@@ -6101,7 +6101,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 comment,
                 json,
             } => {
-                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let known_paths: Vec<String> =
                     config.prop_fields().into_iter().map(|f| f.name).collect();
                 let mut path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
@@ -6110,7 +6109,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         config.prop_fields().into_iter().map(|f| f.name).collect();
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
-                if no_interactive {
+                let selected_value = if no_interactive {
                     let val = value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -6123,7 +6122,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         ))
                     })?;
-                    config.set_prop_persistent(&path, &val)?;
+                    val
                 } else if Config::prop_is_secret(&path) {
                     if value.is_some() {
                         eprintln!(
@@ -6139,9 +6138,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
-                    config.set_prop_persistent(&path, &secret_value)?;
+                    secret_value
                 } else if let Some(val) = value {
-                    config.set_prop_persistent(&path, &val)?;
+                    val
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
                     let provider_ref = path
@@ -6167,7 +6166,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         else {
                             anyhow::bail!("cancelled");
                         };
-                        config.set_prop_persistent(&path, &models[idx])?;
+                        models[idx].clone()
                     } else {
                         eprintln!(
                             "  no live catalog for `{provider_type}` — \
@@ -6177,7 +6176,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .with_prompt(format!("Model id for {provider_type}"))
                             .allow_empty(false)
                             .interact_text()?;
-                        config.set_prop_persistent(&path, &m)?;
+                        m
                     }
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
@@ -6196,7 +6195,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .items(&variants)
                             .default(current_index)
                             .interact()?;
-                        config.set_prop_persistent(&path, &variants[selected])?;
+                        variants[selected].clone()
                     } else if field_info
                         .as_ref()
                         .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
@@ -6232,11 +6231,57 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .filter(|l| !l.is_empty())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        config.set_prop_persistent(&path, &val)?;
+                        val
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
+                };
+
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership =
+                    if zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).is_some() {
+                        match crate::alias_cli::route_agent_mutation(
+                            &mut config,
+                            "config/set",
+                            serde_json::json!({
+                                "prop": path,
+                                "value": selected_value,
+                                "comment": comment,
+                            }),
+                        )
+                        .await?
+                        {
+                            crate::alias_cli::AgentMutationRoute::Daemon(_) => {
+                                if json {
+                                    let envelope = if Config::prop_is_secret(&path) {
+                                        serde_json::json!({"path": path, "populated": true})
+                                    } else {
+                                        serde_json::json!({"path": path, "value": selected_value})
+                                    };
+                                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                                } else {
+                                    println!(
+                                        "{}",
+                                        ta("cli-config-updated", &[("path", &path)], "updated")
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            crate::alias_cli::AgentMutationRoute::Offline(ownership) => {
+                                Some(ownership)
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+                if ensure_map_key_for_prop_path(&mut config, &path)? {
+                    let known_paths: Vec<String> =
+                        config.prop_fields().into_iter().map(|f| f.name).collect();
+                    path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
+                config.set_prop_persistent(&path, &selected_value)?;
                 Box::pin(config.save_dirty()).await?;
                 if let Some(c) = comment.as_ref()
                     && !c.is_empty()
@@ -6260,6 +6305,53 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Init { section, json } => {
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership = if let Some(("agents", alias)) = section
+                    .as_deref()
+                    .and_then(|arg| alias_target_for_path(arg, map_key_for_section_arg))
+                {
+                    match crate::alias_cli::route_agent_mutation(
+                        &mut config,
+                        "config/map-key-create",
+                        serde_json::json!({ "path": "agents", "key": alias }),
+                    )
+                    .await?
+                    {
+                        crate::alias_cli::AgentMutationRoute::Daemon(value) => {
+                            let result: zeroclaw_runtime::rpc::types::ConfigMapKeyCreateResult =
+                                serde_json::from_value(value)
+                                    .context("decode daemon config-init response")?;
+                            let initialized = result
+                                .created
+                                .then(|| format!("{}.{}", result.path, result.key))
+                                .into_iter()
+                                .collect::<Vec<_>>();
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(
+                                        &serde_json::json!({"initialized": initialized})
+                                    )?
+                                );
+                            } else if initialized.is_empty() {
+                                println!(
+                                    "{}",
+                                    t(
+                                        "cli-config-all-configured",
+                                        "All sections already configured."
+                                    )
+                                );
+                            } else {
+                                println!("Initialized 1 section(s) with defaults:");
+                                println!("  {}", initialized[0]);
+                            }
+                            return Ok(());
+                        }
+                        crate::alias_cli::AgentMutationRoute::Offline(ownership) => Some(ownership),
+                    }
+                } else {
+                    None
+                };
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
@@ -6377,7 +6469,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Patch { input, json } => {
-                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let body = match input.as_deref() {
                     None | Some("-") => {
                         use std::io::Read;
@@ -6441,6 +6532,36 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         )?
                     }
                 };
+
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership = if ops.iter().any(|op| {
+                    let op_name = op.get("op").and_then(|value| value.as_str());
+                    let path = op.get("path").and_then(|value| value.as_str()).map(|path| {
+                        path.strip_prefix('/')
+                            .map_or_else(|| path.to_string(), |path| path.replace('/', "."))
+                    });
+                    matches!(op_name, Some("add" | "replace" | "remove"))
+                        && path.as_deref().is_some_and(|path| {
+                            zeroclaw_config::alias_refs::agent_alias_for_prop_path(path).is_some()
+                        })
+                }) {
+                    match crate::alias_cli::route_agent_mutation(
+                        &mut config,
+                        "config/get",
+                        serde_json::json!({}),
+                    )
+                    .await?
+                    {
+                        crate::alias_cli::AgentMutationRoute::Daemon(_) => anyhow::bail!(
+                            "refusing agent-targeting config patch while the daemon owns config; use the daemon-backed config API"
+                        ),
+                        crate::alias_cli::AgentMutationRoute::Offline(ownership) => Some(ownership),
+                    }
+                } else {
+                    None
+                };
+
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
 
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
