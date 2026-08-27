@@ -9804,8 +9804,9 @@ impl GuardedLocalGitChannel {
         if !current.enabled {
             anyhow::bail!("local git channel is disabled");
         }
-        let current_serialized = serde_json::to_string(current)
-            .map_err(|e| anyhow::anyhow!("serializing live git channel configuration: {e}"))?;
+        let current_serialized = serde_json::to_string(current).map_err(|e| {
+            anyhow::Error::msg(format!("serializing live git channel configuration: {e}"))
+        })?;
         if current_serialized != self.serialized_config {
             anyhow::bail!("local git channel configuration changed");
         }
