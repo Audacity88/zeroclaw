@@ -123,10 +123,6 @@ impl PostPollDispatchState {
         Self(connection_state)
     }
 
-    fn connection_state(&self) -> &ConnectionState {
-        &self.0
-    }
-
     fn rpc_allowed(&self) -> bool {
         !matches!(self.0, ConnectionState::Disconnected { .. })
     }
@@ -2359,10 +2355,6 @@ mod tests {
         let (ordinary_event, ordinary_state) = poll_after_disconnect(Some(ordinary_key.clone()));
         assert_eq!(ordinary_event, Some(ordinary_key));
         assert!(!ordinary_state.rpc_allowed());
-        assert!(matches!(
-            ordinary_state.connection_state(),
-            ConnectionState::Disconnected { .. }
-        ));
         assert!(should_handle_global_quit(&ordinary_state, true));
     }
 
