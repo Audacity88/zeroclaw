@@ -51,6 +51,144 @@ pub fn socket_path(config: &Config) -> PathBuf {
     platform::default_endpoint(&config.data_dir)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum LocalRpcCallError {
+    #[error("local daemon is unavailable at {path}: {source}")]
+    Unavailable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("local daemon protocol failed: {0}")]
+    Protocol(String),
+    #[error("local daemon rejected the request ({code}): {message}")]
+    Remote { code: i64, message: String },
+}
+
+#[cfg(unix)]
+async fn connect_client(path: &std::path::Path) -> std::io::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(path).await
+}
+
+#[cfg(windows)]
+async fn connect_client(
+    path: &std::path::Path,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let name = path.to_string_lossy();
+    for _ in 0..50 {
+        match ClientOptions::new().open(name.as_ref()) {
+            Ok(client) => return Ok(client),
+            Err(error) if error.raw_os_error() == Some(231) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!("named pipe {name} remained busy"),
+    ))
+}
+
+async fn request_response<S>(
+    stream: &mut BufReader<S>,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, LocalRpcCallError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    let mut encoded = serde_json::to_vec(&request)
+        .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+    encoded.push(b'\n');
+    stream
+        .get_mut()
+        .write_all(&encoded)
+        .await
+        .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+
+    loop {
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read_line(&mut line))
+            .await
+            .map_err(|_| LocalRpcCallError::Protocol(format!("{method} response timed out")))?
+            .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+        if read == 0 {
+            return Err(LocalRpcCallError::Protocol(format!(
+                "daemon closed the connection during {method}"
+            )));
+        }
+        let frame: serde_json::Value = serde_json::from_str(line.trim())
+            .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+        if frame.get("id") != Some(&serde_json::Value::String(id.to_string())) {
+            continue;
+        }
+        if let Some(error) = frame.get("error") {
+            return Err(LocalRpcCallError::Remote {
+                code: error
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1),
+                message: error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown RPC error")
+                    .to_string(),
+            });
+        }
+        return frame.get("result").cloned().ok_or_else(|| {
+            LocalRpcCallError::Protocol(format!("{method} response omitted result"))
+        });
+    }
+}
+
+/// Call one administrative method on the daemon owning `config`.
+pub async fn call_local(
+    config: &Config,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, LocalRpcCallError> {
+    let path = socket_path(config);
+    let stream = connect_client(&path)
+        .await
+        .map_err(|source| LocalRpcCallError::Unavailable {
+            path: path.clone(),
+            source,
+        })?;
+    let mut stream = BufReader::new(stream);
+    let initialize = request_response(
+        &mut stream,
+        "cli-initialize",
+        "initialize",
+        serde_json::json!({
+            "protocol_version": super::dispatch::RPC_PROTOCOL_VERSION,
+            "clientCapabilities": {},
+        }),
+    )
+    .await?;
+    let server_version = initialize
+        .get("server_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LocalRpcCallError::Protocol("initialize response omitted server_version".to_string())
+        })?;
+    if server_version != env!("CARGO_PKG_VERSION") {
+        return Err(LocalRpcCallError::Protocol(format!(
+            "daemon version {server_version} does not match CLI {}",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    request_response(&mut stream, "cli-request", method, params).await
+}
+
 // ── Transport ────────────────────────────────────────────────────
 
 /// Platform-neutral half-write type produced by `tokio::io::split`.
@@ -912,6 +1050,56 @@ mod tests {
         cancel.cancel();
         drop(writer);
         let _ = handle.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_local_initializes_and_executes_one_admin_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        ctx.config
+            .write()
+            .create_map_key("agents", "local_client")
+            .unwrap();
+        let config = ctx.config.read().clone();
+        let sock_path = socket_path(&config);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+        wait_for_socket(&sock_path).await;
+
+        let value = call_local(&config, "agents/list", serde_json::json!({}))
+            .await
+            .expect("local administrative call");
+        let result: crate::rpc::types::AgentsListResult =
+            serde_json::from_value(value).expect("agents/list wire shape");
+        assert!(
+            result
+                .agents
+                .iter()
+                .any(|agent| agent.alias == "local_client")
+        );
+
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_local_classifies_absent_endpoint_as_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let error = call_local(&config, "agents/list", serde_json::json!({}))
+            .await
+            .expect_err("absent endpoint must not look like a protocol failure");
+        assert!(matches!(error, LocalRpcCallError::Unavailable { .. }));
     }
 
     #[cfg(unix)]

@@ -1,8 +1,14 @@
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use zeroclaw_config::schema::Config;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 /// The live configuration state shared by one supervised daemon generation.
 ///
@@ -13,6 +19,7 @@ pub struct LiveConfigAuthority {
     config: Arc<RwLock<Config>>,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
     agent_lifecycle: AgentLifecycleCoordinator,
+    _ownership: Option<Arc<ConfigOwnershipGuard>>,
 }
 
 impl LiveConfigAuthority {
@@ -22,7 +29,19 @@ impl LiveConfigAuthority {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
+            _ownership: None,
         }
+    }
+
+    /// Create an authority that exclusively owns this config across processes.
+    pub fn new_owned(config: Config) -> Result<Self> {
+        let ownership = ConfigOwnershipGuard::acquire(&config.data_dir)?;
+        Ok(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: AgentLifecycleCoordinator::default(),
+            _ownership: Some(Arc::new(ownership)),
+        })
     }
 
     /// Pair an existing live config handle with a local mutation witness.
@@ -35,6 +54,7 @@ impl LiveConfigAuthority {
             config,
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
+            _ownership: None,
         }
     }
 
@@ -51,6 +71,124 @@ impl LiveConfigAuthority {
     /// Return the alias-scoped lifecycle authority shared by this daemon run.
     pub fn agent_lifecycle(&self) -> AgentLifecycleCoordinator {
         self.agent_lifecycle.clone()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigOwnershipError {
+    #[error("config lifecycle is already owned at {path}")]
+    AlreadyOwned { path: PathBuf },
+    #[error(transparent)]
+    Unavailable(#[from] anyhow::Error),
+}
+
+/// Cross-process witness for config and alias lifecycle ownership.
+#[derive(Debug)]
+pub struct ConfigOwnershipGuard {
+    _file: File,
+}
+
+#[cfg(unix)]
+fn validate_lock_dir(path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("inspecting config lifecycle directory {}", path.display()))?;
+    let euid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.uid() == euid,
+        "config lifecycle directory {} is owned by uid {}, not the current user",
+        path.display(),
+        metadata.uid()
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o022 == 0,
+        "config lifecycle directory {} is writable by other users (mode {:o})",
+        path.display(),
+        metadata.mode() & 0o7777
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_lock_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_lock_file(file: &File, path: &Path) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting config lifecycle lock {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "config lifecycle lock {} is not a regular file",
+        path.display()
+    );
+    let euid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        metadata.uid() == euid,
+        "config lifecycle lock {} is owned by uid {}, not the current user",
+        path.display(),
+        metadata.uid()
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o077 == 0,
+        "config lifecycle lock {} is accessible to other users (mode {:o})",
+        path.display(),
+        metadata.mode() & 0o7777
+    );
+    anyhow::ensure!(
+        metadata.nlink() > 0,
+        "config lifecycle lock {} was unlinked while being opened",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_lock_file(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+impl ConfigOwnershipGuard {
+    pub fn acquire(data_dir: &Path) -> std::result::Result<Self, ConfigOwnershipError> {
+        std::fs::create_dir_all(data_dir).with_context(|| {
+            format!("creating config lifecycle directory {}", data_dir.display())
+        })?;
+        validate_lock_dir(data_dir)?;
+        let path = data_dir.join("config-lifecycle.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(&path)
+            .with_context(|| format!("opening config lifecycle lock {}", path.display()))?;
+        validate_lock_file(&file, &path)?;
+        match file.try_lock() {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    let locked = file.metadata().with_context(|| {
+                        format!("inspecting locked config lifecycle file {}", path.display())
+                    })?;
+                    let current = std::fs::symlink_metadata(&path).with_context(|| {
+                        format!("confirming config lifecycle lock {}", path.display())
+                    })?;
+                    if locked.dev() != current.dev() || locked.ino() != current.ino() {
+                        return Err(ConfigOwnershipError::Unavailable(anyhow::anyhow!(
+                            "config lifecycle lock {} was replaced while being acquired",
+                            path.display()
+                        )));
+                    }
+                }
+                Ok(Self { _file: file })
+            }
+            Err(TryLockError::WouldBlock) => Err(ConfigOwnershipError::AlreadyOwned { path }),
+            Err(TryLockError::Error(error)) => Err(ConfigOwnershipError::Unavailable(
+                anyhow::Error::new(error)
+                    .context(format!("locking config lifecycle at {}", path.display())),
+            )),
+        }
     }
 }
 
@@ -326,5 +464,17 @@ mod tests {
 
         drop(delete);
         assert!(lifecycle.reserve_admission("alpha").is_ok());
+    }
+
+    #[test]
+    fn config_ownership_is_exclusive_and_released_on_drop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = ConfigOwnershipGuard::acquire(temp.path()).unwrap();
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(temp.path()),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
+        drop(first);
+        ConfigOwnershipGuard::acquire(temp.path()).unwrap();
     }
 }

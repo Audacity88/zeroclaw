@@ -353,16 +353,244 @@ async fn save(config: &mut Config) -> Result<()> {
         .context("failed to persist config")
 }
 
+#[cfg(feature = "agent-runtime")]
+enum AgentMutationRoute {
+    Daemon(serde_json::Value),
+    Offline(zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard),
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn route_agent_mutation(
+    config: &mut Config,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<AgentMutationRoute> {
+    match zeroclaw_runtime::rpc::local::call_local(config, method, params).await {
+        Ok(result) => Ok(AgentMutationRoute::Daemon(result)),
+        Err(zeroclaw_runtime::rpc::local::LocalRpcCallError::Unavailable { path, source })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            let ownership =
+                zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(
+                    &config.data_dir,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "daemon endpoint {} is unavailable, but offline config ownership could not be acquired: {error}",
+                        path.display()
+                    )
+                })?;
+            let expected_path = config.config_path.clone();
+            let fresh = Box::pin(Config::load_or_init())
+                .await
+                .context("reload config after acquiring offline lifecycle ownership")?;
+            anyhow::ensure!(
+                fresh.config_path == expected_path,
+                "config path changed while acquiring lifecycle ownership ({} -> {})",
+                expected_path.display(),
+                fresh.config_path.display()
+            );
+            *config = fresh;
+            Ok(AgentMutationRoute::Offline(ownership))
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "refusing offline agent mutation because daemon coordination failed: {error}"
+        )),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_daemon_create(value: serde_json::Value) -> Result<()> {
+    let result: zeroclaw_runtime::rpc::types::ConfigMapKeyCreateResult =
+        serde_json::from_value(value).context("decode daemon agent-create response")?;
+    if result.created {
+        println!(
+            "{}",
+            mta(
+                "cli-alias-created",
+                &[
+                    ("section", result.path.as_str()),
+                    ("alias", result.key.as_str())
+                ],
+                "created {$section}.{$alias}"
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            mta(
+                "cli-alias-exists",
+                &[
+                    ("section", result.path.as_str()),
+                    ("alias", result.key.as_str())
+                ],
+                "{$section}.{$alias} already exists (no change)"
+            )
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_daemon_rename(value: serde_json::Value) -> Result<()> {
+    let result: zeroclaw_runtime::rpc::types::ConfigMapKeyRenameResult =
+        serde_json::from_value(value).context("decode daemon agent-rename response")?;
+    let count = result.rewritten.to_string();
+    println!(
+        "{}",
+        mta(
+            "cli-alias-renamed",
+            &[
+                ("section", result.path.as_str()),
+                ("from", result.from.as_str()),
+                ("to", result.to.as_str()),
+                ("count", count.as_str())
+            ],
+            "renamed {$section}.{$from} -> {$section}.{$to} (rewrote {$count} reference path(s))"
+        )
+    );
+    for warning in result.warnings {
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn",
+                &[("warning", warning.as_str())],
+                "warning: {$warning}"
+            )
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_daemon_delete_preview(value: serde_json::Value) -> Result<()> {
+    let result: zeroclaw_runtime::rpc::types::AgentDeletePreviewResult =
+        serde_json::from_value(value).context("decode daemon agent-delete preview")?;
+    if result.allowed {
+        let count = result.scrubs.len().to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-alias-impact-scrub-header",
+                &[
+                    ("section", "agents"),
+                    ("alias", result.alias.as_str()),
+                    ("count", count.as_str())
+                ],
+                "deleting {$section}.{$alias} would scrub {$count} reference(s):"
+            )
+        );
+    } else {
+        let count = result.blockers.len().to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-alias-impact-blocked-header",
+                &[
+                    ("section", "agents"),
+                    ("alias", result.alias.as_str()),
+                    ("count", count.as_str())
+                ],
+                "deleting {$section}.{$alias} is BLOCKED by {$count} hard reference(s):"
+            )
+        );
+        for blocker in result.blockers {
+            println!(
+                "  {}",
+                mta(
+                    "cli-alias-impact-blocker",
+                    &[("path", blocker.as_str())],
+                    "x {$path} (hard reference)"
+                )
+            );
+        }
+    }
+    for scrub in result.scrubs {
+        println!(
+            "  {}",
+            mta(
+                "cli-alias-impact-scrub",
+                &[("path", scrub.as_str())],
+                "- {$path} (would be scrubbed)"
+            )
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+fn print_daemon_delete(value: serde_json::Value) -> Result<()> {
+    let result: zeroclaw_runtime::rpc::types::AgentDeleteResult =
+        serde_json::from_value(value).context("decode daemon agent-delete response")?;
+    if !result.deleted {
+        bail!(
+            "{}",
+            result
+                .error
+                .unwrap_or_else(|| format!("agent `{}` was not deleted", result.alias))
+        );
+    }
+    let count = result.scrubbed.to_string();
+    println!(
+        "{}",
+        mta(
+            "cli-alias-deleted",
+            &[
+                ("section", "agents"),
+                ("alias", result.alias.as_str()),
+                ("count", count.as_str())
+            ],
+            "deleted {$section}.{$alias} (scrubbed {$count} reference(s))"
+        )
+    );
+    for warning in result.warnings {
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn",
+                &[("warning", warning.as_str())],
+                "warning: {$warning}"
+            )
+        );
+    }
+    Ok(())
+}
+
 // ── agents ──────────────────────────────────────────────────────────────────
 
 pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<()> {
     match cmd {
         AgentsCommands::List => list_section(config, "agents"),
         AgentsCommands::Create { alias } => {
+            #[cfg(feature = "agent-runtime")]
+            let _offline_ownership = match route_agent_mutation(
+                config,
+                "config/map-key-create",
+                serde_json::json!({ "path": "agents", "key": alias }),
+            )
+            .await?
+            {
+                AgentMutationRoute::Daemon(value) => return print_daemon_create(value),
+                AgentMutationRoute::Offline(ownership) => ownership,
+            };
             create_entry(config, "agents", &alias)?;
             save(config).await
         }
         AgentsCommands::Rename { from, to } => {
+            #[cfg(feature = "agent-runtime")]
+            let _offline_ownership = match route_agent_mutation(
+                config,
+                "config/map-key-rename",
+                serde_json::json!({ "path": "agents", "from": from, "to": to }),
+            )
+            .await?
+            {
+                AgentMutationRoute::Daemon(value) => return print_daemon_rename(value),
+                AgentMutationRoute::Offline(ownership) => ownership,
+            };
             // Capture the workspace path while the `from` entry still exists
             // (custom paths are read off the entry, which the rename moves).
             let old_ws = config.agent_workspace_dir(&from);
@@ -387,6 +615,36 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
                     )
                 );
             }
+            #[cfg(feature = "agent-runtime")]
+            let _offline_ownership = {
+                let method = if dry_run || !yes {
+                    "agents/delete-preview"
+                } else {
+                    "agents/delete"
+                };
+                match route_agent_mutation(config, method, serde_json::json!({ "alias": alias }))
+                    .await?
+                {
+                    AgentMutationRoute::Daemon(value) => {
+                        if dry_run {
+                            return print_daemon_delete_preview(value);
+                        }
+                        if !yes {
+                            print_daemon_delete_preview(value)?;
+                            println!(
+                                "\n{}",
+                                mt(
+                                    "cli-alias-no-changes",
+                                    "No changes made. Re-run with --yes to apply (or --dry-run to preview)."
+                                )
+                            );
+                            return Ok(());
+                        }
+                        return print_daemon_delete(value);
+                    }
+                    AgentMutationRoute::Offline(ownership) => ownership,
+                }
+            };
             if dry_run {
                 print_impact(&AliasKind::Agent, &alias, config);
                 return Ok(());
@@ -828,5 +1086,33 @@ mod tests {
             }),
             "channels.discord"
         );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn agent_mutation_fails_closed_when_owner_has_no_rpc_endpoint() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        let _owner = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone()).unwrap();
+
+        let error = route_agent_mutation(
+            &mut config,
+            "config/map-key-create",
+            serde_json::json!({ "path": "agents", "key": "blocked" }),
+        )
+        .await
+        .err()
+        .expect("offline mutation must not bypass a live owner");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ownership could not be acquired")
+        );
+        assert!(!config.agents.contains_key("blocked"));
     }
 }

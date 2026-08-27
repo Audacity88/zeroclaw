@@ -12328,7 +12328,7 @@ pub async fn start_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
-    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config)?;
     start_channels_with_authority(authority, canvas_store, cancel, sop_engine, sop_audit).await
 }
 

@@ -124,6 +124,8 @@ pub enum Method {
     // Agents
     AgentsList,
     AgentsStatus,
+    AgentDeletePreview,
+    AgentDelete,
 
     // Cost
     CostQuery,
@@ -243,6 +245,8 @@ impl Method {
         // Agents
         (Method::AgentsList, "agents/list"),
         (Method::AgentsStatus, "agents/status"),
+        (Method::AgentDeletePreview, "agents/delete-preview"),
+        (Method::AgentDelete, "agents/delete"),
         // Cost
         (Method::CostQuery, "cost/query"),
         (Method::CostOrg, "cost/org"),
@@ -1064,8 +1068,7 @@ impl RpcDispatcher {
         );
         let mut snapshot = self.ctx.config.read().clone();
         let saved_paths = snapshot.dirty_paths.clone();
-        snapshot
-            .save_dirty()
+        Box::pin(snapshot.save_dirty())
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
         self.ctx
@@ -1095,8 +1098,7 @@ impl RpcDispatcher {
             self.ctx.config_write_lock.try_lock().is_err(),
             "save_and_swap_config caller must hold ctx.config_write_lock"
         );
-        snapshot
-            .save_dirty()
+        Box::pin(snapshot.save_dirty())
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
         *self.ctx.config.write() = snapshot;
@@ -1355,6 +1357,8 @@ impl RpcDispatcher {
             // Agents
             Method::AgentsList => self.handle_agents_list(),
             Method::AgentsStatus => self.handle_agents_status().await,
+            Method::AgentDeletePreview => self.handle_agent_delete_preview(&req.params).await,
+            Method::AgentDelete => Box::pin(self.handle_agent_delete(&req.params)).await,
 
             // Cost
             Method::CostQuery => self.handle_cost_query(&req.params),
@@ -4060,6 +4064,7 @@ impl RpcDispatcher {
                 from: req.from,
                 to: req.to,
                 renamed,
+                rewritten: usize::from(renamed) * 2,
                 warnings: Vec::new(),
             })
         })
@@ -4111,7 +4116,7 @@ impl RpcDispatcher {
                 && working.agent(&req.to).is_some()
                 && self.agent_rename_residue_exists(&working, &req.from).await;
 
-            if !resume_committed_to {
+            let rewritten = if !resume_committed_to {
                 let report = zeroclaw_config::alias_refs::rename_with_cascade(
                     &mut working,
                     &kind,
@@ -4124,7 +4129,10 @@ impl RpcDispatcher {
                 }
                 self.save_and_swap_config(working.clone(), &config_write_guard)
                     .await?;
-            }
+                report.dirty_paths.len()
+            } else {
+                0
+            };
             self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
                 .await;
             // Config is committed (saved + swapped, or already committed by a
@@ -4149,6 +4157,7 @@ impl RpcDispatcher {
                 from: req.from,
                 to: req.to,
                 renamed: true,
+                rewritten,
                 warnings,
             })
         })
@@ -4274,6 +4283,132 @@ impl RpcDispatcher {
             })
             .collect();
         to_result(AgentsStatusResult { agents })
+    }
+
+    async fn handle_agent_delete_preview(&self, params: &Value) -> RpcResult {
+        let req: AgentDeleteParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let store = self.ctx.acp_session_store.clone();
+        let alias = req.alias;
+        let preview = tokio::task::spawn_blocking(move || {
+            let live_acp = match store {
+                Some(store) => store
+                    .count_live_sessions_by_agent(&alias)
+                    .map_err(|error| error.to_string()),
+                None => zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+                    .and_then(|store| store.count_live_sessions_by_agent(&alias))
+                    .map_err(|error| error.to_string()),
+            };
+            crate::agent_lifecycle::plan_agent_delete_with_acp_count(&config, &alias, live_acp)
+        })
+        .await
+        .map_err(|error| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("Agent delete preview task failed: {error}"),
+            )
+        })?;
+        to_result(AgentDeletePreviewResult {
+            alias: preview.alias,
+            allowed: preview.allowed,
+            blockers: preview.blockers,
+            scrubs: preview.scrubs,
+            owned_state: preview.owned_state,
+        })
+    }
+
+    async fn handle_agent_delete(&self, params: &Value) -> RpcResult {
+        let req: AgentDeleteParams = parse_params(params)?;
+        let alias = req.alias;
+        let _lifecycle_lease = self
+            .ctx
+            .agent_lifecycle
+            .begin_delete(alias.clone())
+            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let mut working = self.ctx.config.read().clone();
+        let preflight_config = working.clone();
+        let store = self.ctx.acp_session_store.clone();
+        let preflight_alias = alias.clone();
+        let preflight = tokio::task::spawn_blocking(move || {
+            let live_acp = match store {
+                Some(store) => store
+                    .count_live_sessions_by_agent(&preflight_alias)
+                    .map_err(|error| error.to_string()),
+                None => zeroclaw_infra::acp_session_store::AcpSessionStore::new(
+                    &preflight_config.data_dir,
+                )
+                .and_then(|store| store.count_live_sessions_by_agent(&preflight_alias))
+                .map_err(|error| error.to_string()),
+            };
+            crate::agent_lifecycle::plan_agent_delete_with_acp_count(
+                &preflight_config,
+                &preflight_alias,
+                live_acp,
+            )
+        })
+        .await
+        .map_err(|error| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("Agent delete preflight task failed: {error}"),
+            )
+        })?;
+
+        if !preflight.allowed {
+            return to_result(AgentDeleteResult {
+                alias: preflight.alias,
+                deleted: false,
+                scrubbed: 0,
+                warnings: Vec::new(),
+                error: Some(preflight.blockers.join("; ")),
+            });
+        }
+
+        let report = zeroclaw_config::alias_refs::delete_with_cascade(
+            &mut working,
+            &zeroclaw_config::alias_refs::AliasKind::Agent,
+            &alias,
+            zeroclaw_config::alias_refs::CascadePolicy::RefuseOnHard,
+        )
+        .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+        let scrubbed = report.applied.len();
+        for path in report.dirty_paths() {
+            working.mark_dirty(&path);
+        }
+        self.save_and_swap_config(working.clone(), &config_write_guard)
+            .await?;
+        drop(config_write_guard);
+
+        let workspace = preflight
+            .workspace
+            .expect("an allowed configured agent has a workspace path");
+        let archive =
+            crate::agent_lifecycle::archive_agent_workspace(&working, &alias, &workspace).await;
+        let mut warnings = archive.warnings;
+        let fallback_memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let memory = self.ctx.memory.as_ref().unwrap_or(&fallback_memory);
+        if self.ctx.memory.is_none() {
+            warnings.push("memory backend unavailable; memory state was not purged".to_string());
+        }
+        let owned = crate::agent_lifecycle::cascade_owned_state(
+            &working,
+            memory,
+            self.ctx.session_backend.as_ref(),
+            &alias,
+            &archive.archive_dir,
+        )
+        .await;
+        warnings.extend(owned.warnings);
+
+        to_result(AgentDeleteResult {
+            alias,
+            deleted: true,
+            scrubbed,
+            warnings,
+            error: None,
+        })
     }
 
     // ── Cost handler ─────────────────────────────────────────────
@@ -9026,6 +9161,7 @@ mod tests {
         assert_eq!(result["path"], "agents");
         assert_eq!(result["from"], "alpha");
         assert_eq!(result["to"], "beta");
+        assert!(result["rewritten"].as_u64().is_some_and(|count| count > 2));
         assert!(
             result.get("warnings").is_none(),
             "test stores should make owned-state cascade warning-free: {result:?}"
@@ -9102,6 +9238,7 @@ mod tests {
         assert_eq!(result["renamed"], true);
         assert_eq!(result["from"], "alpha");
         assert_eq!(result["to"], "beta");
+        assert_eq!(result["rewritten"], 0);
         assert!(
             !old_workspace.exists(),
             "old workspace should be moved on resume"
@@ -11023,6 +11160,114 @@ mod tests {
     // isolation of its own, and a successful `config/set` falls through to
     // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
     // (`make_secret_test_config`), never a bare `Config::default()`.
+
+    #[test]
+    fn agent_delete_rpc_persists_on_default_worker_stack() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("default-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let task = tokio::spawn(async {
+                let tmp = tempfile::TempDir::new().expect("temporary config root");
+                let mut config = make_secret_test_config(&tmp);
+                config
+                    .create_map_key("agents", "delete_me")
+                    .expect("create disposable agent");
+                config.save().await.expect("seed persisted agent config");
+                let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+                let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+                let ctx = RpcContext::minimal(config, sessions);
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let mut dispatcher =
+                    RpcDispatcher::new(ctx, tx, "test-peer-agent-delete-stack:pid=1".into());
+                dispatcher.authenticated = true;
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "agents/delete",
+                    "params": { "alias": "delete_me" },
+                })
+                .to_string();
+
+                dispatcher.process_line_for_test(&frame).await;
+
+                let response = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("agents/delete response timeout")
+                    .expect("agents/delete response");
+                let response: Value =
+                    serde_json::from_str(&response).expect("valid agents/delete response");
+                assert_eq!(response["result"]["alias"], "delete_me");
+                assert_eq!(response["result"]["deleted"], true);
+                assert!(
+                    !dispatcher
+                        .ctx
+                        .config
+                        .read()
+                        .agents
+                        .contains_key("delete_me")
+                );
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .expect("agents/delete worker task timeout")
+                .expect("agents/delete worker task");
+        });
+    }
+
+    #[tokio::test]
+    async fn agent_delete_refuses_inflight_admission_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config
+            .create_map_key("agents", "busy")
+            .expect("create busy agent");
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let reservation = dispatcher
+            .ctx
+            .agent_lifecycle
+            .reserve_admission("busy")
+            .expect("reserve admission");
+
+        let error = dispatcher
+            .handle_agent_delete(&json!({ "alias": "busy" }))
+            .await
+            .expect_err("delete must refuse an in-flight admission");
+
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("in-flight session admission"));
+        assert!(dispatcher.ctx.config.read().agents.contains_key("busy"));
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn agent_delete_save_failure_preserves_config_and_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config.config_path = blocked_parent.join("config.toml");
+        config
+            .create_map_key("agents", "preserve")
+            .expect("create disposable agent");
+        config.agents.get_mut("preserve").unwrap().workspace.path = Some(workspace.clone());
+        let dispatcher = make_config_set_test_dispatcher(config);
+
+        dispatcher
+            .handle_agent_delete(&json!({ "alias": "preserve" }))
+            .await
+            .expect_err("save failure must abort deletion");
+
+        assert!(dispatcher.ctx.config.read().agents.contains_key("preserve"));
+        assert!(workspace.exists());
+    }
 
     #[tokio::test]
     async fn config_set_does_not_materialize_resource_keyed_rate_alias() {

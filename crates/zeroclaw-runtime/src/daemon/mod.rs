@@ -623,7 +623,7 @@ pub async fn run(
     if port != 0 {
         config.gateway.port = port;
     }
-    let live_config_authority = crate::LiveConfigAuthority::new(config.clone());
+    let live_config_authority = crate::LiveConfigAuthority::new_owned(config.clone())?;
 
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config

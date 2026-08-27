@@ -582,7 +582,7 @@ pub async fn run_gateway(
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
-    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config.clone());
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
     run_gateway_with_authority(
         host,
         port,
