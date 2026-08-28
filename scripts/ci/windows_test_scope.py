@@ -14,6 +14,7 @@ from pathlib import PurePosixPath
 
 DESKTOP_PACKAGE = "zeroclaw-desktop"
 PLUGIN_HOST_PACKAGE = "zeroclaw-plugins"
+PLUGIN_FEATURE_OWNER_PACKAGES = {"zeroclaw", "zeroclaw-gateway"}
 SAFE_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$")
 DOC_SUFFIXES = {".md", ".mdx", ".markdown", ".rst"}
 FULL_PATHS = {
@@ -309,6 +310,7 @@ def select_pull_request(
 
     if not selected:
         return Selection("skip", (), "No covered Rust compilation or test paths changed.", needs_plugin_host)
+    needs_plugin_host = needs_plugin_host or bool(selected & PLUGIN_FEATURE_OWNER_PACKAGES)
     selected = close_over_reverse_dependents(selected, reverse_dependents)
     needs_plugin_host = needs_plugin_host or PLUGIN_HOST_PACKAGE in selected
     return Selection(

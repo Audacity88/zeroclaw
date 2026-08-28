@@ -12,6 +12,7 @@ repo_root="${fixture_dir}/repo"
 mkdir -p "$repo_root/crates/zeroclaw-channels" \
     "$repo_root/crates/zeroclaw-api" \
     "$repo_root/crates/zeroclaw-plugins" \
+    "$repo_root/crates/zeroclaw-gateway" \
     "$repo_root/crates/zeroclaw-providers" \
     "$repo_root/crates/zeroclaw-plugins/tests/fixtures/channel-fixture" \
     "$repo_root/apps/tauri"
@@ -23,6 +24,7 @@ cat > "$metadata_file" <<EOF
     {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "name": "zeroclaw-api", "manifest_path": "crates/zeroclaw-api/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "name": "zeroclaw-channels", "manifest_path": "crates/zeroclaw-channels/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "name": "zeroclaw-plugins", "manifest_path": "crates/zeroclaw-plugins/Cargo.toml"},
+    {"id": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4", "name": "zeroclaw-gateway", "manifest_path": "crates/zeroclaw-gateway/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "name": "zeroclaw-providers", "manifest_path": "crates/zeroclaw-providers/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "name": "zeroclaw-channel-plugin-fixture", "manifest_path": "crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml"},
     {"id": "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4", "name": "zeroclaw-desktop", "manifest_path": "apps/tauri/Cargo.toml"}
@@ -32,16 +34,18 @@ cat > "$metadata_file" <<EOF
     "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4",
+    "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0",
     "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4"
   ],
   "resolve": {
     "nodes": [
-      {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
+      {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
       {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}]},
+      {"id": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "deps": []},
       {"id": "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}]}
@@ -101,7 +105,10 @@ printf '%s\n' 'crates/zeroclaw-providers/src/lib.rs' 'crates/zeroclaw-channels/s
 assert_selection "multiple packages" scoped '["zeroclaw","zeroclaw-channels","zeroclaw-providers"]' '' "$paths_file"
 
 printf '%s\n' 'src/lib.rs' 'tests/integration.rs' > "$paths_file"
-assert_selection "root package" scoped '["zeroclaw"]' '' "$paths_file"
+assert_selection "root feature owner" scoped '["zeroclaw"]' '' "$paths_file" true
+
+printf '%s\n' 'crates/zeroclaw-gateway/src/api_plugins.rs' > "$paths_file"
+assert_selection "gateway feature owner" scoped '["zeroclaw","zeroclaw-gateway"]' '' "$paths_file" true
 
 printf '%s\n' 'crates/zeroclaw-channels/src/lib.rs' 'crates/zeroclaw-channels/tests/one.rs' > "$paths_file"
 assert_selection "deduplication" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
@@ -297,6 +304,10 @@ assert plugin_components_command in windows_job
 assert plugin_lib_command in windows_job
 assert plugin_runtime_config_command in windows_job
 assert plugin_runtime_admission_command in windows_job
+assert "-p zeroclaw-gateway" in windows_job
+assert "--features plugins-wasm" in windows_job
+assert "--bin zeroclaw" in windows_job
+assert "plugin_registry::" in windows_job
 for admission_filter in (
     "plugin_runtime::",
     "tools::tests::shared_ceiling",
@@ -315,7 +326,15 @@ assert 'plugin_components_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_lib_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_runtime_config_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_runtime_admission_status=${PIPESTATUS[0]}' in windows_job
+assert 'plugin_gateway_status=${PIPESTATUS[0]}' in windows_job
+assert 'plugin_cli_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_root_status=${PIPESTATUS[0]}' in windows_job
+assert 'plugin_gateway_status != 0' in windows_job
+assert 'plugin_cli_status != 0' in windows_job
+assert '}plugin-gateway"' in windows_job
+assert '}plugin-cli"' in windows_job
+assert 'Plugin-host gateway status' in windows_job
+assert 'Plugin-host CLI status' in windows_job
 assert 'Failure inventory' in windows_job
 assert 'Baseline duration' in windows_job
 assert 'Plugin-host duration' in windows_job
@@ -330,7 +349,11 @@ assert windows_job.index('plugin_lib_status=${PIPESTATUS[0]}') < windows_job.ind
 assert windows_job.index(plugin_runtime_config_command) < windows_job.index('plugin_runtime_config_status=${PIPESTATUS[0]}')
 assert windows_job.index('plugin_runtime_config_status=${PIPESTATUS[0]}') < windows_job.index(plugin_runtime_admission_command)
 assert windows_job.index(plugin_runtime_admission_command) < windows_job.index('plugin_runtime_admission_status=${PIPESTATUS[0]}')
-assert windows_job.index('plugin_runtime_admission_status=${PIPESTATUS[0]}') < windows_job.index(plugin_root_command)
+assert windows_job.index('plugin_runtime_admission_status=${PIPESTATUS[0]}') < windows_job.index("-p zeroclaw-gateway")
+assert windows_job.index("-p zeroclaw-gateway") < windows_job.index('plugin_gateway_status=${PIPESTATUS[0]}')
+assert windows_job.index('plugin_gateway_status=${PIPESTATUS[0]}') < windows_job.index("--bin zeroclaw")
+assert windows_job.index("--bin zeroclaw") < windows_job.index('plugin_cli_status=${PIPESTATUS[0]}')
+assert windows_job.index('plugin_cli_status=${PIPESTATUS[0]}') < windows_job.index(plugin_root_command)
 assert windows_job.index(plugin_root_command) < windows_job.index('plugin_root_status=${PIPESTATUS[0]}')
 scoped_case = windows_job.split("\n            scoped)\n", 1)[1].split(
     "\n              ;;\n", 1

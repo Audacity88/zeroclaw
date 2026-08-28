@@ -718,6 +718,8 @@ jobs:
           plugin_lib_log="$RUNNER_TEMP/windows-plugin-lib-nextest.log"
           plugin_runtime_config_log="$RUNNER_TEMP/windows-plugin-runtime-config-nextest.log"
           plugin_runtime_admission_log="$RUNNER_TEMP/windows-plugin-runtime-admission-nextest.log"
+          plugin_gateway_log="$RUNNER_TEMP/windows-plugin-gateway-nextest.log"
+          plugin_cli_log="$RUNNER_TEMP/windows-plugin-cli-nextest.log"
           plugin_root_log="$RUNNER_TEMP/windows-plugin-root-nextest.log"
           case "$MODE" in
             scoped)
@@ -757,6 +759,8 @@ jobs:
           plugin_lib_status=not-run
           plugin_runtime_config_status=not-run
           plugin_runtime_admission_status=not-run
+          plugin_gateway_status=not-run
+          plugin_cli_status=not-run
           plugin_root_status=not-run
           if [[ "$NEEDS_PLUGIN_HOST" == "true" ]]; then
             plugin_started_at=$SECONDS
@@ -793,12 +797,22 @@ jobs:
               tools::tests::colliding_plugin 2>&1 | tee "$plugin_runtime_admission_log"
             plugin_runtime_admission_status=${PIPESTATUS[0]}
             cargo nextest run --locked --no-fail-fast \
+              -p zeroclaw-gateway \
+              --features plugins-wasm \
+              --lib 2>&1 | tee "$plugin_gateway_log"
+            plugin_gateway_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
+              --features plugins-wasm-cranelift \
+              --bin zeroclaw \
+              plugin_registry:: 2>&1 | tee "$plugin_cli_log"
+            plugin_cli_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
               --test plugin_channel_runtime_e2e 2>&1 | tee "$plugin_root_log"
             plugin_root_status=${PIPESTATUS[0]}
             set -e
             plugin_host_duration=$((SECONDS - plugin_started_at))
-            if (( plugin_components_status != 0 || plugin_lib_status != 0 || plugin_runtime_config_status != 0 || plugin_runtime_admission_status != 0 || plugin_root_status != 0 )); then
+            if (( plugin_components_status != 0 || plugin_lib_status != 0 || plugin_runtime_config_status != 0 || plugin_runtime_admission_status != 0 || plugin_gateway_status != 0 || plugin_cli_status != 0 || plugin_root_status != 0 )); then
               plugin_host_status=1
             fi
           fi
@@ -823,6 +837,12 @@ jobs:
           if [[ "$plugin_runtime_admission_status" != "not-run" && "$plugin_runtime_admission_status" != "0" ]]; then
             failure_inventory="${failure_inventory:+$failure_inventory,}plugin-runtime-admission"
           fi
+          if [[ "$plugin_gateway_status" != "not-run" && "$plugin_gateway_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-gateway"
+          fi
+          if [[ "$plugin_cli_status" != "not-run" && "$plugin_cli_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-cli"
+          fi
           if [[ "$plugin_root_status" != "not-run" && "$plugin_root_status" != "0" ]]; then
             failure_inventory="${failure_inventory:+$failure_inventory,}plugin-root"
           fi
@@ -844,6 +864,8 @@ jobs:
             printf "| Plugin-host library status | %s |\n" "$plugin_lib_status"
             printf "| Plugin-host runtime config status | %s |\n" "$plugin_runtime_config_status"
             printf "| Plugin-host runtime admission status | %s |\n" "$plugin_runtime_admission_status"
+            printf "| Plugin-host gateway status | %s |\n" "$plugin_gateway_status"
+            printf "| Plugin-host CLI status | %s |\n" "$plugin_cli_status"
             printf "| Plugin-host root status | %s |\n" "$plugin_root_status"
             printf "| Failure inventory | %s |\n" "$failure_inventory"
             printf "| Baseline duration | %ss |\n" "$baseline_duration"
