@@ -9019,7 +9019,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_navigation_reaches_oldest_entry_with_a_bounded_render_window() {
+    fn long_transcript_navigation_reaches_oldest_entry_with_a_bounded_render_window() {
         let mut s = state();
         s.entries.clear();
         for i in 0..2_200 {
@@ -9064,7 +9064,7 @@ mod tests {
         assert_eq!(
             s.cached_screen_ranges.first().map(|(idx, _, _, _)| *idx),
             Some(0),
-            "Home exposes the oldest transcript entry"
+            "jump-to-start exposes the oldest transcript entry"
         );
 
         let mut browse = state();
