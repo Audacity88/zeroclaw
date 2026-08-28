@@ -2358,6 +2358,79 @@ mod tests {
         assert!(should_handle_global_quit(&ordinary_state, true));
     }
 
+    #[test]
+    fn app_run_post_poll_dispatch_is_wired_to_the_fresh_snapshot() {
+        fn assert_between(source: &str, start: &str, end: &str, expected: &str) {
+            let start = source
+                .find(start)
+                .expect("dispatch branch must remain in app::run");
+            let end = source[start..]
+                .find(end)
+                .map(|offset| start + offset)
+                .expect("dispatch branch must retain its end boundary");
+            assert!(
+                source[start..end].contains(expected),
+                "dispatch branch must use {expected:?}"
+            );
+        }
+
+        let source = include_str!("app.rs");
+        let start = source
+            .find("// Poll for input with a timeout so live panes refresh periodically.")
+            .expect("app::run post-poll boundary must remain explicit");
+        let end = source[start..]
+            .find("\n    Ok(())\n}")
+            .map(|offset| start + offset)
+            .expect("app::run dispatch loop must retain its return boundary");
+        let dispatch = &source[start..end];
+
+        assert_between(
+            dispatch,
+            "let Some(input_event) = input_event else",
+            "match input_event",
+            "if !dispatch_conn_state.rpc_allowed()",
+        );
+        assert_between(
+            dispatch,
+            "let editor_claims_pane_navigation",
+            "let quit = match mode",
+            "let pane_can_receive_editor_chord = dispatch_conn_state.rpc_allowed()",
+        );
+        assert_between(
+            dispatch,
+            "let editor_claims_pane_navigation",
+            "let quit = match mode",
+            "&dispatch_conn_state",
+        );
+        assert_between(
+            dispatch,
+            "let editor_claims_pane_navigation",
+            "let quit = match mode",
+            "if !dispatch_conn_state.rpc_allowed()",
+        );
+        assert_between(
+            dispatch,
+            "Event::Mouse(mouse) =>",
+            "Event::Paste(text) if help_overlay.is_some()",
+            "&dispatch_conn_state",
+        );
+        assert_between(
+            dispatch,
+            "Event::Mouse(mouse) =>",
+            "Event::Paste(text) if help_overlay.is_some()",
+            "if dispatch_conn_state.rpc_allowed()",
+        );
+        assert!(
+            dispatch
+                .contains("should_handle_global_quit(&dispatch_conn_state, pane_wants_quit_chord)"),
+            "local Ctrl+C routing must use the fresh post-poll snapshot"
+        );
+        assert!(
+            dispatch.contains("Event::Paste(text) if dispatch_conn_state.rpc_allowed()"),
+            "paste dispatch must use the fresh post-poll snapshot"
+        );
+    }
+
     #[tokio::test]
     async fn reconnect_attempt_does_not_await_unfinished_work() {
         let (_release, wait) = tokio::sync::oneshot::channel::<()>();
