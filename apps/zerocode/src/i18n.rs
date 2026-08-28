@@ -258,26 +258,81 @@ mod tests {
     }
 
     #[test]
-    fn japanese_config_metadata_catalogue_has_stable_keys() {
-        let map = format_ftl_messages(include_str!("../locales/ja/zerocode.ftl"), "ja");
-        assert_eq!(
-            map.get("zc-config-group-foundation").map(String::as_str),
-            Some("基盤")
-        );
-        assert_eq!(
-            map.get("zc-config-section-providers-models-label")
-                .map(String::as_str),
-            Some("モデルプロバイダー")
-        );
-        assert!(
-            map.get("zc-config-section-providers-models-help")
-                .is_some_and(|value| value.contains("OpenAI"))
-        );
-        assert_eq!(
-            map.get("zc-config-section-heartbeat-label")
-                .map(String::as_str),
-            Some("ハートビート")
-        );
+    fn config_metadata_catalogues_have_stable_keys_and_translations() {
+        let english = format_ftl_messages(EN_FTL, "en");
+        let metadata_keys: HashSet<String> = english
+            .keys()
+            .filter(|key| {
+                key.starts_with("zc-config-group-")
+                    || (key.starts_with("zc-config-section-")
+                        && (key.ends_with("-label") || key.ends_with("-help")))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(metadata_keys.len(), 72);
+
+        let catalogues = [
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+        for (locale, source) in catalogues {
+            let map = format_ftl_messages(source, locale);
+            for key in &metadata_keys {
+                let value = map
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{locale} catalogue missing metadata key `{key}`"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{locale} metadata key `{key}` resolved to an empty value"
+                );
+            }
+        }
+
+        let representatives = [
+            (
+                "es",
+                include_str!("../locales/es/zerocode.ftl"),
+                "zc-config-group-foundation",
+                "Fundamentos",
+                "zc-config-section-providers-models-label",
+                "Proveedores de modelos",
+            ),
+            (
+                "fr",
+                include_str!("../locales/fr/zerocode.ftl"),
+                "zc-config-group-foundation",
+                "Fondations",
+                "zc-config-section-providers-models-label",
+                "Fournisseurs de modèles",
+            ),
+            (
+                "ja",
+                include_str!("../locales/ja/zerocode.ftl"),
+                "zc-config-group-foundation",
+                "基盤",
+                "zc-config-section-providers-models-label",
+                "モデルプロバイダー",
+            ),
+            (
+                "zh-CN",
+                include_str!("../locales/zh-CN/zerocode.ftl"),
+                "zc-config-group-foundation",
+                "基础",
+                "zc-config-section-providers-models-label",
+                "模型提供商",
+            ),
+        ];
+        for (locale, source, group_key, group_value, section_key, section_value) in representatives
+        {
+            let map = format_ftl_messages(source, locale);
+            assert_eq!(map.get(group_key).map(String::as_str), Some(group_value));
+            assert_eq!(
+                map.get(section_key).map(String::as_str),
+                Some(section_value)
+            );
+        }
     }
 
     // Every Config-pane key the zerocode UI section renders must resolve
