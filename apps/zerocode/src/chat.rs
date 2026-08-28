@@ -5185,7 +5185,17 @@ fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
         let mut candidate_end = end;
         while let Some((offset, ch)) = text[start..candidate_end].char_indices().last() {
             let trim = match ch {
-                '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '>' => true,
+                '.' | ',' | ';' | ':' | '\'' | '"' | '>' => true,
+                '!' | '?' => {
+                    let before = text[start..start + offset].trim_end_matches(['!', '?']);
+                    match before.chars().next_back() {
+                        Some('>' | '\'' | '"') => true,
+                        Some(')') => before.matches('(').count() < before.matches(')').count(),
+                        Some(']') => before.matches('[').count() < before.matches(']').count(),
+                        Some('}') => before.matches('{').count() < before.matches('}').count(),
+                        _ => false,
+                    }
+                }
                 ')' => {
                     text[start..candidate_end].matches('(').count()
                         < text[start..candidate_end].matches(')').count()
@@ -5681,6 +5691,10 @@ impl ChatContextMenuTarget {
             Self::Transcript(copy) | Self::UrlWithCopy { copy, .. } => Some(copy.kind),
             Self::Url(_) | Self::Queue(_) => None,
         }
+    }
+
+    fn is_url(&self) -> bool {
+        matches!(self, Self::Url(_) | Self::UrlWithCopy { .. })
     }
 }
 
@@ -6187,7 +6201,7 @@ impl ChatState {
     }
 
     fn mark_dirty_append(&mut self) {
-        self.pending_url_activation = None;
+        self.invalidate_url_interactions();
         if self.dirty == LinesDirty::Clean {
             self.dirty = LinesDirty::Appended;
         }
@@ -6195,7 +6209,7 @@ impl ChatState {
     }
 
     fn mark_dirty_full(&mut self) {
-        self.pending_url_activation = None;
+        self.invalidate_url_interactions();
         self.dirty = LinesDirty::Full;
     }
 
@@ -6302,10 +6316,21 @@ impl ChatState {
         self.pending_url_activation = None;
     }
 
+    fn invalidate_url_interactions(&mut self) {
+        self.pending_url_activation = None;
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.target.is_url())
+        {
+            self.context_menu = None;
+        }
+    }
+
     fn take_url_activation(&mut self, column: u16, row: u16) -> Option<String> {
         let pending = self.pending_url_activation.take()?;
         let hit = self.url_hit_at(column, row)?;
-        (hit.occurrence == pending.occurrence).then_some(pending.url)
+        (hit.occurrence == pending.occurrence && hit.url == pending.url).then_some(hit.url)
     }
 
     fn handle_url_pointer(
@@ -6519,7 +6544,7 @@ impl ChatState {
     fn context_menu_select_step(&mut self, delta: isize) {
         if let Some(menu) = self.context_menu.as_mut() {
             menu.select_step(delta);
-            self.mark_dirty_full();
+            self.dirty = LinesDirty::Full;
         }
     }
 
@@ -7191,6 +7216,7 @@ impl ChatState {
 
         match update {
             SessionUpdate::AgentMessageChunk { text, .. } => {
+                self.invalidate_url_interactions();
                 // Flush any accumulated thought before the response text begins
                 // so it appears inline at the right position, not piled at the end.
                 if self.streaming_text.is_empty() {
@@ -7206,6 +7232,7 @@ impl ChatState {
                 }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
+                self.invalidate_url_interactions();
                 self.streaming_thought.push_str(&text);
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::Thinking;
@@ -8086,6 +8113,26 @@ mod tests {
     }
 
     #[test]
+    fn recognized_urls_preserve_valid_terminal_punctuation() {
+        let ranges = recognized_url_ranges(
+            "https://example.com/foo! https://example.com/? https://example.com/end, See <https://example.com/docs>?!",
+        );
+        let urls = ranges
+            .into_iter()
+            .map(|(_, _, url)| url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/foo!",
+                "https://example.com/?",
+                "https://example.com/end",
+                "https://example.com/docs",
+            ]
+        );
+    }
+
+    #[test]
     fn recognized_urls_reject_other_schemes_and_malformed_hosts() {
         for text in [
             "javascript:alert(1)",
@@ -8293,6 +8340,109 @@ mod tests {
         state.rebuild_lines(40);
 
         assert!(state.pending_url_activation.is_none());
+    }
+
+    #[test]
+    fn streaming_updates_invalidate_pending_url_actions() {
+        let updates = [
+            SessionUpdate::AgentMessageChunk {
+                session_id: "sess-1".to_string(),
+                text: "/private".to_string(),
+            },
+            SessionUpdate::AgentThoughtChunk {
+                session_id: "sess-1".to_string(),
+                text: "/thinking".to_string(),
+            },
+        ];
+
+        for update in updates {
+            let mut state = state();
+            let hit = url_hit(Rect::new(0, 0, 19, 1), "https://example.com", 0, 0);
+            state.url_hit_regions = vec![hit.clone()];
+            assert_eq!(
+                state.handle_url_pointer(
+                    &MouseEventKind::Down(MouseButton::Left),
+                    crossterm::event::KeyModifiers::NONE,
+                    2,
+                    0,
+                ),
+                UrlPointerAction::Consumed
+            );
+            state.context_menu = Some(ChatContextMenu {
+                rect: Rect::new(0, 1, 20, 4),
+                target: ChatContextMenuTarget::Url(hit),
+                selected: 0,
+            });
+
+            state.apply_update(update);
+
+            assert!(state.pending_url_activation.is_none());
+            assert!(state.context_menu.is_none());
+            assert_eq!(
+                state.handle_url_pointer(
+                    &MouseEventKind::Up(MouseButton::Left),
+                    crossterm::event::KeyModifiers::NONE,
+                    2,
+                    0,
+                ),
+                UrlPointerAction::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_transitions_preserve_non_url_context_menus() {
+        let transcript = ChatContextMenuTarget::Transcript(CopyHitRegion {
+            rect: Rect::new(0, 0, 1, 1),
+            text: "message".to_string(),
+            kind: CopyHitKind::Message,
+            group: 0,
+        });
+        let queue = ChatContextMenuTarget::Queue(7);
+
+        for (index, target) in [transcript, queue].into_iter().enumerate() {
+            let mut state = state();
+            state.context_menu = Some(ChatContextMenu {
+                rect: Rect::new(0, 1, 20, 4),
+                target: target.clone(),
+                selected: 0,
+            });
+
+            if index == 0 {
+                state.mark_dirty_append();
+            } else {
+                state.mark_dirty_full();
+            }
+
+            assert_eq!(
+                state.context_menu.as_ref().map(|menu| &menu.target),
+                Some(&target)
+            );
+        }
+    }
+
+    #[test]
+    fn url_context_menu_keyboard_selection_remains_actionable() {
+        let mut state = state();
+        state.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 1, 20, 4),
+            target: ChatContextMenuTarget::Url(url_hit(
+                Rect::new(0, 0, 19, 1),
+                "https://example.com",
+                0,
+                0,
+            )),
+            selected: 0,
+        });
+
+        state.context_menu_select_step(1);
+
+        assert_eq!(
+            state.take_context_menu_request(),
+            Some(ChatContextMenuRequest::CopyUrl(
+                "https://example.com".to_string()
+            ))
+        );
     }
 
     fn command_action_from_initialize(
