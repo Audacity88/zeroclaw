@@ -177,10 +177,6 @@ the handoff.
    Sort milestones by version order (semver ascending on the title) so
    "earliest open milestone" is unambiguous in step 4 below.
 
-   Also read the PR's current milestone before selecting a replacement. If it is `Parking Lot` or `Icebox`, do not continue into the ordinary assignment tree. Follow Step 1a of `.claude/skills/squash-merge/SKILL.md` and prepare its explicit active-line or future-line placement outcome first. Apply any approved milestone, label, and comment changes together, read them back, and restart milestone alignment from current state. Never clear a holding milestone merely because another milestone sorts earlier or matches the PR's scope.
-
-   If the PR carries `release-gate`, reconcile the named gate from its current milestone, body, linked tracker, or durable comment before selecting a milestone. The label is a routing signal, not a merge hold by itself; apply `do-not-merge` and `status:blocked` only when a concrete unresolved condition must prevent the PR from landing.
-
 2. **Classify the PR** before comparing scope:
    - **Break-fix** — commit title prefix is `fix:` (any scope, e.g. `fix(agent):`) **or** the PR carries a `bug` label. The commit prefix is the primary signal; the label is a secondary confirmation.
    - **Docs** — commit title prefix is `docs:` (any scope). Treated identically to break-fix for milestone purposes: scope-match first, then fall back to earliest open milestone by version. Documentation supports ongoing milestone work and should ship with it, not queue Jordan.
@@ -330,7 +326,6 @@ These norms are documented in
    block unless the active reviewer explicitly asks for that format.
 7. **Always run milestone alignment after posting**, unless the PR is a
    documented no-milestone type (`chore:`/`deps:` prefix or deps-only diff).
-   A current `Parking Lot` or `Icebox` milestone is a transition guard: require the explicit placement outcome in the squash-merge skill before replacing it, then restart alignment from the applied public state.
    Note the skip reason in the handoff when bypassing. Break-fix (`fix:`
    prefix or `bug` label) and docs (`docs:` prefix) PRs with no scope match
    are assigned the earliest open milestone by version order. Feature PRs with
