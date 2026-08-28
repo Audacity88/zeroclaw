@@ -95,7 +95,7 @@ The skill stops on:
 
 A `REVIEW_REQUIRED` state prompts confirmation but doesn't block.
 
-The skill also reconciles `release-gate` against the current milestone, body, linked tracker, or durable comment. `release-gate` routes that inspection but does not block a merge by itself. Immediately before merging, the skill rereads the head, release labels, milestone, and any linked tracker or comment fact used for placement; a changed value invalidates the confirmation packet and restarts preflight.
+The skill also reconciles `release-gate` against the current milestone, body, closing issue, linked tracker, or durable comment. `release-gate` routes that inspection but does not block a merge by itself. Immediately before merging, the skill rereads those public sources, recomputes the release-line disposition, and compares the head, release labels, milestone, sorted closing-issue set, and every placement fact it relied on. A changed or ambiguous release disposition, closing reference, or relied-upon fact invalidates the confirmation packet and restarts preflight; unrelated body wording does not.
 
 ### Invocation
 

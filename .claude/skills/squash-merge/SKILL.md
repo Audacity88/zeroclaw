@@ -129,7 +129,7 @@ When the current milestone is `Parking Lot` or `Icebox`, do not continue until a
 
 Label, milestone, and comment changes are separate public mutations. Show their exact text and commands and obtain explicit approval before applying them. Apply only the approved changes, read back the live labels, milestone, and relevant comment, then restart at Step 1 and rerun the complete review, required-CI, mergeability, and freshness preflight. Rebuild the final merge packet if any fact changed.
 
-Save one evidence-backed `$RELEASE_LINE_DISPOSITION` for every PR and carry it into the mandatory confirmation packet: the selected future-release or holding-milestone outcome, the reconciled named gate for `release-gate`, or a statement that no future-line trigger applies with the live milestone or lack of one. When the disposition depends on a linked tracker or durable comment, save that source and the exact placement fact used as `$RELEASE_EVIDENCE_STATE`; do not copy unrelated body or comment content. Also save the current head, release labels, and milestone for the final pre-merge readback:
+Save one evidence-backed `$RELEASE_LINE_DISPOSITION` for every PR and carry it into the mandatory confirmation packet: the selected future-release or holding-milestone outcome, the reconciled named gate for `release-gate`, or a statement that no future-line trigger applies with the live milestone or lack of one. Save the sorted closing-issue number set as `$RELEASE_CLOSING_ISSUES`. When the disposition depends on a fact from the PR body, a closing issue, a linked tracker, or a durable comment, save that source identity and the exact placement fact used as `$RELEASE_EVIDENCE_STATE`; do not copy unrelated body, issue, or comment content. Also save the current head, release labels, and milestone for the final pre-merge readback:
 
 ```bash
 if ! RELEASE_GUARD_STATE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
@@ -141,6 +141,13 @@ fi
 
 if [[ -z "$RELEASE_GUARD_STATE" ]]; then
   echo "Release guard state is empty; stopping before confirmation." >&2
+  exit 1
+fi
+
+if ! RELEASE_CLOSING_ISSUES=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
+  --json closingIssuesReferences \
+  --jq '[.closingIssuesReferences[].number] | sort'); then
+  echo "Failed to capture closing issue references; stopping before confirmation." >&2
   exit 1
 fi
 ```
@@ -308,7 +315,7 @@ Do not infer consent from silence, prior approval of the commit message, or any 
 
 Only after explicit confirmation in Step 4:
 
-Re-read the current head, `do-not-merge`, `status:blocked`, and `release-gate` labels, and milestone immediately before merge. If `$RELEASE_EVIDENCE_STATE` names a linked tracker or comment, reread that source and compare the exact placement fact as well. If either state changed, stop without merging, restart at Step 1, and build a new confirmation packet. This is a bounded last-moment consistency check, not an atomic lock: `--match-head-commit` protects the source head but does not detect concurrent metadata or evidence changes after the read.
+Immediately before merge, reread the current PR body and closing references and rerun Step 1a's complete release-line classification from the refreshed body, closing issues, labels, milestone, and any deeper public evidence it triggers. Set `$CURRENT_RELEASE_LINE_DISPOSITION` from that recomputation; merely fetching the sources is not sufficient. The no-signal fast path must satisfy its complete predicate again. If `$RELEASE_EVIDENCE_STATE` names a PR-body, closing-issue, linked-tracker, or comment fact, reread that source and compare the exact placement fact as well. Also reread the current head, `do-not-merge`, `status:blocked`, and `release-gate` labels and milestone, and save the current sorted closing-issue number set as `$CURRENT_RELEASE_CLOSING_ISSUES`. If the guard state, derived disposition, closing-issue set, or any relied-upon fact changed or became ambiguous, stop without merging, restart at Step 1, and build a new confirmation packet. Unrelated body wording that leaves the release disposition, closing references, and relied-upon facts unchanged does not invalidate the packet. This is a bounded last-moment consistency check, not an atomic lock: `--match-head-commit` protects the source head but does not detect concurrent metadata or evidence changes after the read.
 
 ```bash
 if ! CURRENT_RELEASE_GUARD_STATE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
@@ -320,6 +327,18 @@ fi
 
 if [[ -z "$CURRENT_RELEASE_GUARD_STATE" || "$CURRENT_RELEASE_GUARD_STATE" != "$RELEASE_GUARD_STATE" ]]; then
   echo "Release guard state changed or is empty; restart preflight and rebuild the confirmation packet." >&2
+  exit 1
+fi
+
+if ! CURRENT_RELEASE_CLOSING_ISSUES=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
+  --json closingIssuesReferences \
+  --jq '[.closingIssuesReferences[].number] | sort'); then
+  echo "Failed to refresh closing issue references; stopping without merge." >&2
+  exit 1
+fi
+
+if [[ "$CURRENT_RELEASE_LINE_DISPOSITION" != "$RELEASE_LINE_DISPOSITION" || "$CURRENT_RELEASE_CLOSING_ISSUES" != "$RELEASE_CLOSING_ISSUES" ]]; then
+  echo "Release-line disposition or closing issue references changed; restart preflight and rebuild the confirmation packet." >&2
   exit 1
 fi
 ```
