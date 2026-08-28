@@ -45,7 +45,7 @@ cat > "$metadata_file" <<EOF
       {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}]},
-      {"id": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4", "deps": []},
+      {"id": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
       {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "deps": []},
       {"id": "path+file://${repo_root}/apps/tauri#zeroclaw-desktop 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}]}
@@ -102,7 +102,10 @@ printf '%s\n' 'crates/zeroclaw-api/src/lib.rs' > "$paths_file"
 assert_selection "plugin host from reverse-dependent closure" scoped '["zeroclaw","zeroclaw-api","zeroclaw-plugins"]' '' "$paths_file" true
 
 printf '%s\n' 'crates/zeroclaw-providers/src/lib.rs' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
-assert_selection "multiple packages" scoped '["zeroclaw","zeroclaw-channels","zeroclaw-providers"]' '' "$paths_file"
+assert_selection "multiple packages" scoped '["zeroclaw","zeroclaw-channels","zeroclaw-gateway","zeroclaw-providers"]' '' "$paths_file" true
+
+printf '%s\n' 'crates/zeroclaw-providers/src/lib.rs' > "$paths_file"
+assert_selection "provider feature owner" scoped '["zeroclaw","zeroclaw-gateway","zeroclaw-providers"]' '' "$paths_file" true
 
 printf '%s\n' 'src/lib.rs' 'tests/integration.rs' > "$paths_file"
 assert_selection "root feature owner" scoped '["zeroclaw"]' '' "$paths_file" true

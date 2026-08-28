@@ -14,7 +14,7 @@ from pathlib import PurePosixPath
 
 DESKTOP_PACKAGE = "zeroclaw-desktop"
 PLUGIN_HOST_PACKAGE = "zeroclaw-plugins"
-PLUGIN_FEATURE_OWNER_PACKAGES = {"zeroclaw", "zeroclaw-gateway"}
+PLUGIN_FEATURE_OWNER_PACKAGES = {"zeroclaw", "zeroclaw-gateway", "zeroclaw-providers"}
 SAFE_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$")
 DOC_SUFFIXES = {".md", ".mdx", ".markdown", ".rst"}
 FULL_PATHS = {
