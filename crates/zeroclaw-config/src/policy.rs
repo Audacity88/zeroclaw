@@ -916,7 +916,10 @@ struct ShellWord {
     redirection: Option<RedirectionMetadata>,
 }
 
-fn split_shell_words_with_metadata(segment: &str, backslash_is_literal: bool) -> Vec<ShellWord> {
+fn split_shell_words_with_metadata(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax =
+        matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell);
     let mut words = Vec::new();
     let mut current = String::new();
     let mut is_assignment = false;
@@ -1030,7 +1033,7 @@ fn split_shell_words_with_metadata(segment: &str, backslash_is_literal: bool) ->
                         escaped = true;
                         in_word = true;
                     }
-                    '\'' if !cfg!(target_os = "windows") => {
+                    '\'' if single_quotes_are_syntax => {
                         if !is_assignment {
                             assignment_prefix_is_unquoted = false;
                         }
@@ -1118,7 +1121,7 @@ fn split_shell_words_with_metadata(segment: &str, backslash_is_literal: bool) ->
 }
 
 fn shell_words_after_env_assignments(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
-    let words = split_shell_words_with_metadata(segment, shell_uses_windows_path_syntax(dialect));
+    let words = split_shell_words_with_metadata(segment, dialect);
     let first_command = words
         .iter()
         .position(|word| !word.is_assignment)
@@ -1132,8 +1135,8 @@ struct NormalizedShellCommand {
     has_ambiguous_redirection: bool,
 }
 
-fn normalized_shell_command(segment: &str) -> NormalizedShellCommand {
-    let raw_words = split_shell_words_with_metadata(segment, cfg!(target_os = "windows"));
+fn normalized_shell_command(segment: &str, dialect: ShellDialect) -> NormalizedShellCommand {
+    let raw_words = split_shell_words_with_metadata(segment, dialect);
     let mut has_leading_env_assignment = false;
     let mut words = Vec::with_capacity(raw_words.len());
     let mut has_ambiguous_redirection = false;
@@ -2148,25 +2151,23 @@ fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
         && (target.eq_ignore_ascii_case("nul") || target.eq_ignore_ascii_case(r"\\.\nul"))
 }
 
-/// Extract the basename using the current platform's path separators.
-/// Windows accepts both `/` and `\`, while Unix treats `\` as a literal.
-fn command_basename(raw: &str) -> &str {
+/// Extract the basename using the shell dialect's path separators.
+/// Windows command dialects accept both `/` and `\`, while POSIX treats `\`
+/// as a literal that can escape the following character.
+fn command_basename_for_shell(raw: &str, dialect: ShellDialect) -> &str {
     let after_fwd = raw.rsplit('/').next().unwrap_or(raw);
-    #[cfg(target_os = "windows")]
-    {
+    if shell_uses_windows_path_syntax(dialect) {
         after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
+    } else {
         after_fwd
     }
 }
 
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
-/// matching against allowlists and risk tables. On non-Windows platforms this
-/// is a no-op that returns the input unchanged.
-fn strip_windows_exe_suffix(name: &str) -> &str {
-    if cfg!(target_os = "windows") {
+/// matching against allowlists and risk tables. POSIX command dialects keep
+/// suffixes literal even when the host itself is Windows.
+fn strip_windows_exe_suffix_for_shell(name: &str, dialect: ShellDialect) -> &str {
+    if shell_uses_windows_path_syntax(dialect) {
         name.strip_suffix(".exe")
             .or_else(|| name.strip_suffix(".cmd"))
             .or_else(|| name.strip_suffix(".bat"))
@@ -2203,6 +2204,26 @@ fn command_names_equivalent(left: &str, right: &str) -> bool {
     false
 }
 
+fn command_names_equivalent_for_shell(left: &str, right: &str, dialect: ShellDialect) -> bool {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    if left_lower == right_lower {
+        return true;
+    }
+
+    if shell_uses_windows_path_syntax(dialect) {
+        for ext in &[".exe", ".cmd", ".bat"] {
+            if right_lower == format!("{left_lower}{ext}")
+                || left_lower == format!("{right_lower}{ext}")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     let left = strip_wrapping_quotes(left).trim();
     let right = strip_wrapping_quotes(right).trim();
@@ -2219,7 +2240,12 @@ fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     command_names_equivalent(left, right)
 }
 
-fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
+fn is_allowlist_entry_match(
+    allowed: &str,
+    executable: &str,
+    executable_base: &str,
+    dialect: ShellDialect,
+) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
         return false;
@@ -2242,7 +2268,7 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     // Callers lowercase the basename before it reaches here, so folding only
     // one side would leave an entry written as `Git` or `Docker` unable to
     // match anything.
-    command_names_equivalent(allowed, executable_base)
+    command_names_equivalent_for_shell(allowed, executable_base, dialect)
 }
 
 /// Decide whether a completed PowerShell token must be rejected by the bounded
@@ -2748,11 +2774,19 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
+        self.command_risk_level_for_posix_like_shell(command, ShellDialect::Posix)
+    }
+
+    fn command_risk_level_for_posix_like_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> CommandRiskLevel {
         let mut saw_medium = false;
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
-            let normalized = normalized_shell_command(&segment);
+            let normalized = normalized_shell_command(&segment, dialect);
             if normalized.has_ambiguous_redirection {
                 return CommandRiskLevel::High;
             }
@@ -2761,8 +2795,8 @@ impl SecurityPolicy {
                 continue;
             };
 
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
-            let base = strip_windows_exe_suffix(&base_owned);
+            let base_owned = command_basename_for_shell(base_raw, dialect).to_ascii_lowercase();
+            let base = strip_windows_exe_suffix_for_shell(&base_owned, dialect);
 
             let args: Vec<String> = words.iter().skip(1).cloned().collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
@@ -2789,7 +2823,7 @@ impl SecurityPolicy {
     ) -> CommandRiskLevel {
         match dialect {
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                return self.command_risk_level(command);
+                return self.command_risk_level_for_posix_like_shell(command, dialect);
             }
             ShellDialect::None => return CommandRiskLevel::High,
             ShellDialect::PowerShell => {}
@@ -2806,7 +2840,8 @@ impl SecurityPolicy {
             let Some(base_raw) = words.next() else {
                 return CommandRiskLevel::High;
             };
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
+            let base_owned =
+                command_basename_for_shell(base_raw, ShellDialect::PowerShell).to_ascii_lowercase();
             if is_powershell_batch_file(&base_owned) {
                 return CommandRiskLevel::High;
             }
@@ -2963,7 +2998,8 @@ impl SecurityPolicy {
                     let raw_executable =
                         strip_wrapping_quotes(segment.split_whitespace().next().unwrap_or(""))
                             .trim();
-                    let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+                    let base_owned =
+                        command_basename_for_shell(raw_executable, dialect).to_ascii_lowercase();
                     let base = strip_powershell_executable_suffix(&base_owned);
                     !base.is_empty()
                         && !is_powershell_batch_file(&base_owned)
@@ -2978,23 +3014,24 @@ impl SecurityPolicy {
                 })
             }
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_command_explicitly_allowed(command)
+                self.is_command_explicitly_allowed(command, dialect)
             }
             ShellDialect::None => false,
         }
     }
 
-    fn is_command_explicitly_allowed(&self, command: &str) -> bool {
+    fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            let normalized = normalized_shell_command(segment);
+            let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection {
                 return false;
             }
             let words = normalized.words;
             let executable = words.first().map(String::as_str).unwrap_or_default();
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
@@ -3006,7 +3043,7 @@ impl SecurityPolicy {
                 if allowed.is_empty() || allowed == "*" {
                     return false;
                 }
-                is_allowlist_entry_match(allowed, executable, base_cmd)
+                is_allowlist_entry_match(allowed, executable, base_cmd, dialect)
             });
 
             if !explicitly_listed {
@@ -3016,7 +3053,7 @@ impl SecurityPolicy {
 
         // At least one real command must be present.
         segments.iter().any(|s| {
-            normalized_shell_command(s.trim())
+            normalized_shell_command(s.trim(), dialect)
                 .words
                 .first()
                 .is_some_and(|w| !w.is_empty())
@@ -3077,7 +3114,8 @@ impl SecurityPolicy {
                 return false;
             }
 
-            let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+            let base_owned = command_basename_for_shell(raw_executable, ShellDialect::PowerShell)
+                .to_ascii_lowercase();
             if is_powershell_batch_file(&base_owned) {
                 return false;
             }
@@ -3164,14 +3202,15 @@ impl SecurityPolicy {
         // Split on unquoted command separators and validate each sub-command.
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            let normalized = normalized_shell_command(segment);
+            let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection || normalized.has_leading_env_assignment {
                 return false;
             }
             let words = normalized.words;
             let executable = words.first().map(String::as_str).unwrap_or_default();
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
@@ -3180,7 +3219,7 @@ impl SecurityPolicy {
             if !self
                 .allowed_commands
                 .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd, dialect))
             {
                 return false;
             }
@@ -3198,7 +3237,7 @@ impl SecurityPolicy {
 
         // At least one command must be present
         segments.iter().any(|s| {
-            normalized_shell_command(s.trim())
+            normalized_shell_command(s.trim(), dialect)
                 .words
                 .first()
                 .is_some_and(|w| !w.is_empty())
@@ -5234,6 +5273,39 @@ mod tests {
         assert_eq!(
             p.forbidden_path_argument("cat ..\\/secret.txt"),
             Some("..\\/secret.txt".into())
+        );
+    }
+
+    #[test]
+    fn posix_policy_does_not_inherit_windows_executable_syntax() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Docker executes POSIX `sh` even on a Windows host. Backslashes escape
+        // the next character there, while cmd.exe treats them as path separators.
+        for command in [r"attacker\git status", "git.exe status"] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::Posix)
+                    .is_err(),
+                "POSIX must not treat {command:?} as allowlisted git"
+            );
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::WindowsCmd)
+                    .is_ok(),
+                "cmd.exe semantics must remain available for {command:?}"
+            );
+        }
+
+        assert_eq!(
+            p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::Posix),
+            CommandRiskLevel::Low
+        );
+        assert_eq!(
+            p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::WindowsCmd),
+            CommandRiskLevel::Medium
         );
     }
 
@@ -7713,6 +7785,21 @@ mod tests {
                 .as_deref(),
             None,
             "POSIX backslash escapes must retain their existing tokenization"
+        );
+
+        // PowerShell single quotes preserve a path with spaces as one argument.
+        // The path guard must inspect that complete path before the shell resolves
+        // the in-workspace symlink.
+        symlink(&outside, workspace.join("link dir")).unwrap();
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat 'link dir\secret.txt'",
+                    ShellDialect::PowerShell,
+                )
+                .as_deref(),
+            Some(r"link dir\secret.txt"),
+            "PowerShell quoted paths must retain symlink-boundary checks"
         );
 
         // A DANGLING symlink (its target directory does not exist yet) still
