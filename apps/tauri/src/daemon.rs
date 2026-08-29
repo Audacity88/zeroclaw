@@ -667,13 +667,11 @@ mod tests {
         ));
         fs::create_dir(&dir).expect("create fixture directory");
         let binary = dir.join("stale-zeroclaw");
-        let fixture = format!(
-            "#!/bin/sh\n\
+        let fixture = "#!/bin/sh\n\
              trap '' HUP TERM INT\n\
              sleep 30 &\n\
              child=$!\n\
-             wait \"$child\"\n"
-        );
+             wait \"$child\"\n";
         fs::write(&binary, fixture).expect("write stale kernel fixture");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make stale kernel fixture executable");
