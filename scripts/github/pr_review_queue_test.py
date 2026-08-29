@@ -137,6 +137,16 @@ class ReviewQueueTest(unittest.TestCase):
         queue.fetch_timeline(pr(), fake)
         self.assertTrue(all("--paginate" in call and "--slurp" in call for call in calls))
 
+    def test_published_core_roster_is_parseable(self) -> None:
+        self.assertGreaterEqual(len(queue.load_core_roster()), 2)
+
+    def test_missing_core_roster_degrades_second_core_to_unknown(self) -> None:
+        with patch.object(queue, "load_core_roster", side_effect=queue.GitHubReadError("format changed")):
+            with patch.object(queue, "discover", return_value=[pr()]):
+                rows = queue.collect("second-core", None, 7, lambda *args: self.fail("unexpected detail read"), NOW)
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertIn("Core roster unavailable", rows[0]["detail"])
+
     def test_all_adds_mine_only_when_author_is_present(self) -> None:
         seen: list[str] = []
 

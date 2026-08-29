@@ -286,10 +286,20 @@ def collect(
     if queue == "all" and author:
         lanes += ("mine",)
     now = now or datetime.now(timezone.utc)
-    core = core if core is not None else load_core_roster() if "second-core" in lanes else set()
+    core_error: str | None = None
+    if core is None:
+        try:
+            core = load_core_roster() if "second-core" in lanes else set()
+        except (GitHubReadError, OSError) as exc:
+            core = set()
+            core_error = str(exc)
     rows: list[dict[str, Any]] = []
     for lane in lanes:
-        rows.extend(detail_rows(lane, discover(lane, author, gh), older_than_days, now, gh, core))
+        discovered = discover(lane, author, gh)
+        if lane == "second-core" and core_error:
+            rows.extend(base_row(pr, lane, "unknown", f"Core roster unavailable: {core_error}") for pr in discovered)
+        else:
+            rows.extend(detail_rows(lane, discovered, older_than_days, now, gh, core))
     return sorted(rows, key=lambda row: (row["queue"], row["number"]))
 
 
