@@ -1519,14 +1519,19 @@ impl DeviceStoreTrait for RusqliteStore {
         extra_content: Option<&[u8]>,
     ) -> wacore::store::error::Result<()> {
         let snapshot_path = format!("{}.snapshot.{}", self.db_path, name);
+        let content_path = format!("{}.extra", snapshot_path);
 
         // Serialize replacement and sidecar creation with the database copy so
         // concurrent requests cannot pair artifacts from different snapshots.
         let conn = self.conn.lock();
-        match std::fs::remove_file(&snapshot_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(wacore::store::error::StoreError::Database(Box::new(error))),
+        for path in [&snapshot_path, &content_path] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(wacore::store::error::StoreError::Database(Box::new(error)));
+                }
+            }
         }
         // VACUUM INTO reads through SQLite, so committed pages still in the
         // WAL are included in the standalone snapshot.
@@ -1534,7 +1539,6 @@ impl DeviceStoreTrait for RusqliteStore {
 
         // If extra_content is provided, save it alongside.
         if let Some(content) = extra_content {
-            let content_path = format!("{}.extra", snapshot_path);
             to_store_err!(std::fs::write(&content_path, content))?;
         }
 
@@ -1671,14 +1675,24 @@ mod tests {
             .unwrap();
 
         let snapshot_path = format!("{}.snapshot.wal", path.to_string_lossy());
-        let snapshot = Connection::open(&snapshot_path).unwrap();
-        let value: String = snapshot
-            .query_row("SELECT value FROM snapshot_probe", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(value, "wal-only");
+        {
+            let snapshot = Connection::open(&snapshot_path).unwrap();
+            let value: String = snapshot
+                .query_row("SELECT value FROM snapshot_probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "wal-only");
+        }
         assert_eq!(
             std::fs::read(format!("{snapshot_path}.extra")).unwrap(),
             b"extra"
+        );
+
+        DeviceStoreTrait::snapshot_db(&store, "wal", None)
+            .await
+            .unwrap();
+        assert!(
+            !Path::new(&format!("{snapshot_path}.extra")).exists(),
+            "snapshot without extra content must remove a stale sidecar"
         );
     }
 
