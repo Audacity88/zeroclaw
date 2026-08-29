@@ -190,6 +190,10 @@ For AI-heavy PRs, reviewers focus on:
 
 For stacked work, require explicit `Depends on #...` so review order is deterministic.
 
+Apply that deterministic order operationally: prioritize and review a parent before its children; when a parent is not reviewable, defer deep child review unless a bounded independent slice benefits from early review; after the parent lands, refresh and revalidate the child. A parent becoming reviewable does not make previously collected child evidence current.
+
+For a report-only snapshot of the live GitHub queues, run `python3 scripts/github/pr_review_queue.py --queue all --older-than-days 7 --format table`. The `--queue` values are `maintainer`, `second-core`, `author-action`, `stacked`, `mine`, and `all`; `--format` accepts `table`, `json`, or `links`. `all` includes the shared lanes; add `--author LOGIN` to include the `mine` lane. The command reads GitHub state and the published maintainer summary, derives timeline-based wait clocks, and never writes queue state or mutates GitHub. `second-core` is a routing aid; confirm admission facts and current applicable approvals during review before merge. `stacked` is reported separately from review-ready lanes; lightweight lanes report Required Gate as `NOT_CHECKED` because discovery does not query it, while ambiguous mergeability, review, maintainer-summary, or timeline evidence is shown as unknown.
+
 For replacements, require explicit `Supersedes #...`. See [Superseding PRs](./superseding.md) for attribution and template rules.
 
 The reviewer-side queue management, backlog pruning order, stale handling, label hygiene, is in [Reviewer Playbook](./reviewer-playbook.md).
