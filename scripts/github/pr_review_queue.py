@@ -17,7 +17,7 @@ from urllib.parse import quote_plus
 
 REPOSITORY = "zeroclaw-labs/zeroclaw"
 CORE_ROSTER_PATH = Path(__file__).resolve().parents[2] / "docs/book/src/contributing/communication.md"
-QUEUES = ("maintainer", "second-core", "author-action", "stacked", "mine", "all")
+QUEUES = ("near-ready", "maintainer", "second-core", "author-action", "stacked", "mine", "all")
 MAX_WORKERS = 8
 GH_TIMEOUT_SECONDS = 30
 
@@ -106,8 +106,10 @@ def timestamp(event: dict[str, Any]) -> datetime | None:
 
 def search_query(queue: str, author: str | None = None) -> str:
     base = f"repo:{REPOSITORY} is:pr is:open draft:false"
-    if queue in {"maintainer", "mine", "second-core"}:
+    if queue in {"near-ready", "maintainer", "mine", "second-core"}:
         query = f'{base} label:"needs-maintainer-review" -label:"needs-author-action" -label:"status:blocked" -label:"do-not-merge" -label:stacked'
+        if queue == "near-ready":
+            query += " status:success"
         if queue == "mine":
             query += f" author:{author or '<author>'}"
         if queue == "second-core":
@@ -147,7 +149,10 @@ def load_core_roster(path: Path = CORE_ROSTER_PATH) -> set[str]:
     for line in path.read_text().splitlines():
         if not line.startswith("|") or "|---" in line:
             continue
-        first_cell = line.split("|", 2)[1]
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 2 or not cells[1].startswith("Core Team"):
+            continue
+        first_cell = cells[0]
         for token in first_cell.split("@")[1:]:
             handle = token.split("]", 1)[0].strip()
             if handle:
@@ -166,6 +171,8 @@ def latest_review_by_author(reviews: Iterable[dict[str, Any]]) -> dict[str, dict
     latest: dict[str, tuple[tuple[datetime, int], dict[str, Any]]] = {}
     minimum = datetime.min.replace(tzinfo=timezone.utc)
     for review in reviews:
+        if str(review.get("state", "")).upper() not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+            continue
         reviewer = login(review.get("user") or review.get("author"))
         if not reviewer:
             continue
@@ -217,22 +224,28 @@ def event_label(event: dict[str, Any]) -> str | None:
 
 def author_action_row(pr: dict[str, Any], timeline: list[dict[str, Any]], now: datetime, threshold: float) -> dict[str, Any] | None:
     active_start: datetime | None = None
-    for event in timeline:
+    active_label_index: int | None = None
+    for index, event in enumerate(timeline):
         kind = str(event.get("event") or event.get("type") or "").lower()
         if event_label(event) != "needs-author-action":
             continue
         if kind == "labeled":
             active_start = timestamp(event) or active_start
+            active_label_index = index
         elif kind == "unlabeled":
             active_start = None
-    if active_start is None:
+            active_label_index = None
+    if active_start is None or active_label_index is None:
         return base_row(pr, "author-action", "unknown", "label start is missing from timeline")
     pr_author = (login(pr.get("author")) or "").casefold()
-    for event in timeline:
+    for index, event in enumerate(timeline):
+        if index <= active_label_index:
+            continue
         kind = str(event.get("event") or event.get("type") or "").lower()
+        if kind == "committed":
+            return base_row(pr, "author-action", "unknown", "commit activity followed the request; unresolved age is uncertain")
         actor = (login(event.get("actor") or event.get("user") or event.get("author")) or "").casefold()
-        occurred = timestamp(event)
-        if actor == pr_author and kind in {"commented", "committed", "reviewed"} and occurred and occurred > active_start:
+        if actor == pr_author and kind in {"commented", "reviewed"}:
             return base_row(pr, "author-action", "unknown", "author activity followed the request; unresolved age is uncertain")
     days = round(max(0.0, (now - active_start).total_seconds() / 86400), 1)
     if days < threshold:
