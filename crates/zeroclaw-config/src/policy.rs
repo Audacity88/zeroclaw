@@ -1876,7 +1876,7 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
     false
 }
 
-fn contains_unmodeled_shell_word_expansion(command: &str) -> bool {
+fn contains_unmodeled_shell_word_expansion(command: &str, dialect: ShellDialect) -> bool {
     if command.contains("\\\n") || command.contains("\\\r\n") {
         return true;
     }
@@ -1885,7 +1885,7 @@ fn contains_unmodeled_shell_word_expansion(command: &str) -> bool {
     // delayed expansion is enabled by host policy, and removes caret escapes
     // before launching the executable. The policy does not model those
     // transforms, so reject them before command identity or Git risk is accepted.
-    if cfg!(target_os = "windows") && command.contains(['%', '!', '^']) {
+    if shell_uses_windows_path_syntax(dialect) && command.contains(['%', '!', '^']) {
         return true;
     }
 
@@ -1983,9 +1983,9 @@ fn contains_unmodeled_shell_word_expansion(command: &str) -> bool {
                     // zsh EXTENDED_GLOB also gives unquoted `#` and `^`
                     // pattern meaning, while infix `~` excludes a pattern.
                     // Preserve leading and assignment-value `~` expansion.
-                    '{' | '}' | '(' | ')' | '*' | '?' | '[' | '^' => return true,
-                    '#' if cfg!(not(target_os = "windows")) => return true,
-                    '~' if cfg!(not(target_os = "windows")) && !at_tilde_prefix => return true,
+                    '{' | '}' | '(' | ')' | '*' | '?' | '[' => return true,
+                    '^' | '#' if dialect == ShellDialect::Posix => return true,
+                    '~' if dialect == ShellDialect::Posix && !at_tilde_prefix => return true,
                     _ => {}
                 }
                 if !in_assignment_value {
@@ -3163,7 +3163,7 @@ impl SecurityPolicy {
 
         if command.contains('`')
             || contains_unquoted_shell_variable_expansion(command)
-            || contains_unmodeled_shell_word_expansion(command)
+            || contains_unmodeled_shell_word_expansion(command, dialect)
             || command.contains("<(")
             || command.contains(">(")
         {
@@ -5704,7 +5704,6 @@ mod tests {
             );
         }
 
-        #[cfg(not(target_os = "windows"))]
         for command in ["git -C . com#mit -m test", "git -C . crates~status -m test"] {
             let err = p
                 .validate_command_execution(command, false)
@@ -5715,21 +5714,35 @@ mod tests {
             );
         }
 
-        assert!(!contains_unmodeled_shell_word_expansion(
-            "git -C ~/repo status"
-        ));
-        assert!(!contains_unmodeled_shell_word_expansion(
-            "FOO=~/repo git status"
-        ));
-        assert!(!contains_unmodeled_shell_word_expansion(
-            "FOO=x:~/repo git status"
-        ));
-
-        #[cfg(target_os = "windows")]
-        {
-            assert!(!contains_unmodeled_shell_word_expansion("echo C#"));
-            assert!(!contains_unmodeled_shell_word_expansion("echo file~backup"));
+        for command in [
+            "git -C ~/repo status",
+            "FOO=~/repo git status",
+            "FOO=x:~/repo git status",
+        ] {
+            assert!(!contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::Posix,
+            ));
         }
+
+        for command in ["echo C#", "echo file~backup"] {
+            assert!(contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::Posix,
+            ));
+            assert!(!contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::WindowsCmd,
+            ));
+        }
+        assert!(contains_unmodeled_shell_word_expansion(
+            "echo %USERPROFILE%",
+            ShellDialect::WindowsCmd,
+        ));
+        assert!(!contains_unmodeled_shell_word_expansion(
+            "echo %USERPROFILE%",
+            ShellDialect::Posix,
+        ));
     }
 
     #[cfg(target_os = "windows")]
