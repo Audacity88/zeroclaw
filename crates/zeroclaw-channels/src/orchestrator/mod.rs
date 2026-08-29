@@ -13385,6 +13385,21 @@ pub(crate) mod tests {
         after_start.split_once(end).map(|(segment, _)| segment)
     }
 
+    fn assert_channel_surface_disposition(
+        key: &str,
+        surface: &str,
+        surface_available: bool,
+        production_support_detected: bool,
+        intentionally_unsupported: &HashSet<&str>,
+    ) {
+        let claimed = surface_available && production_support_detected;
+        let expected = surface_available && !intentionally_unsupported.contains(key);
+        assert_eq!(
+            claimed, expected,
+            "compiled channel key `{key}` changed {surface} support without an explicit registration disposition"
+        );
+    }
+
     /// Runs a channel-dispatch test on an explicit stack because its async
     /// future can exceed the default test-thread stack on hosted CI.
     pub(crate) fn run_channel_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
@@ -31143,7 +31158,6 @@ This is an example JSON object for profile settings."#;
             "plugin",
             "acp-server",
             "acp_server",
-            "whatsapp",
         ]);
 
         for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
@@ -31158,13 +31172,12 @@ This is an example JSON object for profile settings."#;
                 let feature_available =
                     !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
                         || cfg!(feature = "whatsapp-web");
-                let claimed = feature_available
-                    && !intentionally_unsupported.contains(key)
-                    && error.downcast_ref::<UnknownChannelId>().is_none();
-                let expected = feature_available && !intentionally_unsupported.contains(key);
-                assert_eq!(
-                    claimed, expected,
-                    "compiled channel key `{key}` changed one-shot builder support without an explicit registration disposition"
+                assert_channel_surface_disposition(
+                    key,
+                    "one-shot builder",
+                    feature_available,
+                    error.downcast_ref::<UnknownChannelId>().is_none(),
+                    &intentionally_unsupported,
                 );
             }
         }
@@ -34112,7 +34125,6 @@ Done."#;
             "plugin",
             "acp-server",
             "acp_server",
-            "whatsapp",
         ]);
 
         for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
@@ -34123,29 +34135,43 @@ Done."#;
                 let surface_available =
                     !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
                         || cfg!(feature = "whatsapp-web");
-                let claimed = surface_available
-                    && !intentionally_unsupported.contains(key)
-                    && [
-                        format!("\"{key}\" =>"),
-                        format!("\"{key}\" |"),
-                        format!("| \"{key}\" =>"),
-                    ]
-                    .iter()
-                    .any(|arm| dispatch.contains(arm));
-                let expected = surface_available && !intentionally_unsupported.contains(key);
-                assert_eq!(
-                    claimed, expected,
-                    "compiled channel key `{key}` changed announcement delivery support without an explicit registration disposition"
+                let production_support_detected = [
+                    format!("\"{key}\" =>"),
+                    format!("\"{key}\" |"),
+                    format!("| \"{key}\" =>"),
+                ]
+                .iter()
+                .any(|arm| dispatch.contains(arm));
+                assert_channel_surface_disposition(
+                    key,
+                    "announcement delivery",
+                    surface_available,
+                    production_support_detected,
+                    &intentionally_unsupported,
                 );
             }
         }
     }
 
     #[test]
-    #[cfg(all(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
-    fn compiled_channel_guards_keep_whatsapp_cloud_explicit_under_dual_backends() {
-        compiled_channel_keys_have_intentional_one_shot_builder_support();
-        compiled_channel_keys_have_intentional_announcement_delivery_registration();
+    fn compiled_channel_guards_reject_new_support_with_stale_unsupported_disposition() {
+        let intentionally_unsupported = HashSet::from(["newly-supported"]);
+
+        for surface in ["one-shot builder", "announcement delivery"] {
+            let result = std::panic::catch_unwind(|| {
+                assert_channel_surface_disposition(
+                    "newly-supported",
+                    surface,
+                    true,
+                    true,
+                    &intentionally_unsupported,
+                );
+            });
+            assert!(
+                result.is_err(),
+                "{surface} support must fail while its unsupported disposition is stale"
+            );
+        }
     }
 
     #[tokio::test]
