@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+#[cfg(windows)]
+use process_wrap::tokio::{ChildWrapper, CommandWrap, CommandWrapper, JobObject, KillOnDrop};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::collections::VecDeque;
 use std::fs;
@@ -88,6 +90,7 @@ impl BoundedServiceLog {
         Ok(log)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
     fn open_desktop(path: &Path) -> Result<Self> {
         let file = open_private_desktop_file(path)?;
         let mut log = Self {
@@ -138,187 +141,200 @@ impl BoundedServiceLog {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn open_private_desktop_directory(path: &Path) -> Result<cap_std::fs::Dir> {
-    use cap_std::ambient_authority;
-    #[cfg(unix)]
-    use cap_std::fs::DirBuilderExt;
-    use cap_std::fs::{Dir, DirBuilder};
-
     let logs_path = path
         .parent()
         .context("desktop log path has no parent directory")?;
     let config_root = logs_path
         .parent()
         .context("desktop log path has no config root")?;
-    let root_parent = config_root
-        .parent()
-        .context("desktop config root has no parent directory")?;
-    let root_name = config_root
+    let root = open_or_create_private_desktop_root(config_root)?;
+    let logs_name = logs_path
         .file_name()
-        .context("desktop config root has no directory name")?;
-    let root_parent =
-        Dir::open_ambient_dir(root_parent, ambient_authority()).with_context(|| {
-            format!(
-                "Failed to bind desktop config root parent directory {}",
-                root_parent.display()
-            )
-        })?;
-    let root_name = Path::new(root_name);
-    match root_parent.symlink_metadata(root_name) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        .context("desktop log path has no logs directory name")?;
+    open_or_create_private_desktop_subdir(&root, Path::new(logs_name), logs_path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_or_create_private_desktop_root(path: &Path) -> Result<cap_std::fs::Dir> {
+    use std::path::Component;
+
+    // macOS exposes these root-owned compatibility aliases as symlinks. Resolve
+    // only the fixed system aliases before the no-follow component walk; user-
+    // controlled symlinks below them must still be rejected.
+    #[cfg(target_os = "macos")]
+    let path = ["var", "tmp", "etc"]
+        .into_iter()
+        .find_map(|alias| {
+            path.strip_prefix(Path::new("/").join(alias))
+                .ok()
+                .map(|suffix| Path::new("/private").join(alias).join(suffix))
+        })
+        .unwrap_or_else(|| path.to_path_buf());
+    #[cfg(target_os = "macos")]
+    let path = path.as_path();
+
+    if !path.is_absolute() {
+        bail!("desktop config root is not absolute: {}", path.display());
+    }
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            Component::RootDir => anchor.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(name) => names.push(PathBuf::from(name)),
+            Component::ParentDir => {
                 bail!(
-                    "desktop config root is not a private directory: {}",
-                    config_root.display()
+                    "desktop config root contains an unresolved parent component: {}",
+                    path.display()
                 );
             }
-            #[cfg(windows)]
-            {
-                use cap_std::fs::MetadataExt;
-                if metadata.file_attributes() & 0x0000_0400 != 0 {
-                    bail!(
-                        "desktop config root is a reparse point: {}",
-                        config_root.display()
-                    );
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = DirBuilder::new();
-            #[cfg(unix)]
-            builder.mode(0o700);
-            root_parent
-                .create_dir_with(root_name, &builder)
-                .with_context(|| {
-                    format!(
-                        "Failed to create desktop config root {}",
-                        config_root.display()
-                    )
-                })?;
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "Failed to inspect desktop config root {}",
-                    config_root.display()
-                )
-            });
         }
     }
-    let root = open_private_desktop_subdir(&root_parent, root_name).with_context(|| {
-        format!(
-            "Failed to bind desktop config root directory {}",
-            config_root.display()
-        )
-    })?;
-    let root_std = root.into_std_file();
-    let root_metadata = root_std.metadata().with_context(|| {
-        format!(
-            "Failed to inspect desktop config root {}",
-            config_root.display()
-        )
-    })?;
-    if !root_metadata.is_dir() {
+    if anchor.as_os_str().is_empty() || names.is_empty() {
         bail!(
-            "desktop config root is not a directory: {}",
-            config_root.display()
+            "desktop config root has no directory name: {}",
+            path.display()
         );
     }
+
+    let mut directory = open_private_desktop_anchor(&anchor).with_context(|| {
+        format!(
+            "Failed to bind desktop config filesystem root {}",
+            anchor.display()
+        )
+    })?;
+    let mut current_path = anchor;
+    let mut creating_private_chain = false;
+    let final_index = names.len() - 1;
+    for (index, name) in names.into_iter().enumerate() {
+        current_path.push(&name);
+        if creating_private_chain || index == final_index {
+            directory = open_or_create_private_desktop_subdir(&directory, &name, &current_path)?;
+            continue;
+        }
+        match open_private_desktop_subdir(&directory, &name, false) {
+            Ok(next) => directory = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                creating_private_chain = true;
+                directory =
+                    open_or_create_private_desktop_subdir(&directory, &name, &current_path)?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to bind desktop config ancestor {}",
+                        current_path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_private_desktop_anchor(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let owner = unsafe { libc::geteuid() };
-        if root_metadata.uid() != owner {
-            bail!(
-                "desktop config root {} is owned by uid {}, not the current user",
-                config_root.display(),
-                root_metadata.uid()
-            );
-        }
-        if root_metadata.mode() & 0o077 != 0 {
-            root_std
-                .set_permissions(fs::Permissions::from_mode(0o700))
-                .with_context(|| {
-                    format!(
-                        "Failed to restrict desktop config root {}",
-                        config_root.display()
-                    )
-                })?;
-        }
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        options.access_mode(GENERIC_READ);
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "desktop config ancestor is not a directory: {}",
+            path.display()
+        )));
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if root_metadata.file_attributes() & 0x0000_0400 != 0 {
-            bail!(
-                "desktop config root is a reparse point: {}",
-                config_root.display()
-            );
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "desktop config ancestor is a reparse point: {}",
+                path.display()
+            )));
         }
-        enforce_windows_private_acl(&root_std, config_root, true)?;
     }
+    Ok(cap_std::fs::Dir::from_std_file(file))
+}
 
-    let root = Dir::from_std_file(root_std);
-    let logs_name = logs_path
-        .file_name()
-        .context("desktop log path has no logs directory name")?;
-    let logs_name = Path::new(logs_name);
-    match root.symlink_metadata(logs_name) {
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_or_create_private_desktop_subdir(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    full_path: &Path,
+) -> Result<cap_std::fs::Dir> {
+    #[cfg(unix)]
+    use cap_std::fs::DirBuilderExt;
+    use cap_std::fs::{Dir, DirBuilder};
+
+    match parent.symlink_metadata(name) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 bail!(
-                    "desktop log directory is not a private directory: {}",
-                    logs_path.display()
+                    "desktop private directory is not a directory: {}",
+                    full_path.display()
                 );
             }
             #[cfg(windows)]
-            {
-                use cap_std::fs::MetadataExt;
-                if metadata.file_attributes() & 0x0000_0400 != 0 {
-                    bail!(
-                        "desktop log directory is a reparse point: {}",
-                        logs_path.display()
-                    );
-                }
+            if cap_std::fs::MetadataExt::file_attributes(&metadata) & 0x0000_0400 != 0 {
+                bail!(
+                    "desktop private directory is a reparse point: {}",
+                    full_path.display()
+                );
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut builder = DirBuilder::new();
             #[cfg(unix)]
             builder.mode(0o700);
-            root.create_dir_with(logs_name, &builder).with_context(|| {
+            parent.create_dir_with(name, &builder).with_context(|| {
                 format!(
-                    "Failed to create desktop log directory {}",
-                    logs_path.display()
+                    "Failed to create private desktop directory {}",
+                    full_path.display()
                 )
             })?;
         }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "Failed to inspect desktop log directory {}",
-                    logs_path.display()
+                    "Failed to inspect private desktop directory {}",
+                    full_path.display()
                 )
             });
         }
     }
 
-    let logs = open_private_desktop_subdir(&root, logs_name).with_context(|| {
+    let directory = open_private_desktop_subdir(parent, name, true).with_context(|| {
         format!(
-            "Failed to bind desktop log directory {}",
-            logs_path.display()
+            "Failed to bind private desktop directory {}",
+            full_path.display()
         )
     })?;
-    let logs_std = logs.into_std_file();
-    let metadata = logs_std.metadata().with_context(|| {
+    let std_file = directory.into_std_file();
+    let metadata = std_file.metadata().with_context(|| {
         format!(
-            "Failed to inspect desktop log directory {}",
-            logs_path.display()
+            "Failed to inspect private desktop directory {}",
+            full_path.display()
         )
     })?;
     if !metadata.is_dir() {
         bail!(
-            "desktop log directory is not a private directory: {}",
-            logs_path.display()
+            "desktop private path is not a directory: {}",
+            full_path.display()
         );
     }
     #[cfg(unix)]
@@ -327,18 +343,18 @@ fn open_private_desktop_directory(path: &Path) -> Result<cap_std::fs::Dir> {
         let owner = unsafe { libc::geteuid() };
         if metadata.uid() != owner {
             bail!(
-                "desktop log directory {} is owned by uid {}, not the current user",
-                logs_path.display(),
+                "desktop private directory {} is owned by uid {}, not the current user",
+                full_path.display(),
                 metadata.uid()
             );
         }
         if metadata.mode() & 0o077 != 0 {
-            logs_std
+            std_file
                 .set_permissions(fs::Permissions::from_mode(0o700))
                 .with_context(|| {
                     format!(
-                        "Failed to restrict desktop log directory {}",
-                        logs_path.display()
+                        "Failed to restrict private desktop directory {}",
+                        full_path.display()
                     )
                 })?;
         }
@@ -348,17 +364,21 @@ fn open_private_desktop_directory(path: &Path) -> Result<cap_std::fs::Dir> {
         use std::os::windows::fs::MetadataExt;
         if metadata.file_attributes() & 0x0000_0400 != 0 {
             bail!(
-                "desktop log directory is a reparse point: {}",
-                logs_path.display()
+                "desktop private directory is a reparse point: {}",
+                full_path.display()
             );
         }
-        enforce_windows_private_acl(&logs_std, logs_path, true)?;
+        enforce_windows_private_acl(&std_file, full_path, true)?;
     }
-    Ok(Dir::from_std_file(logs_std))
+    Ok(Dir::from_std_file(std_file))
 }
 
 #[cfg(any(unix, windows))]
-fn open_private_desktop_subdir(parent: &cap_std::fs::Dir, name: &Path) -> Result<cap_std::fs::Dir> {
+fn open_private_desktop_subdir(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    _require_write_dac: bool,
+) -> std::io::Result<cap_std::fs::Dir> {
     use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 
     let mut options = OpenOptions::new();
@@ -368,28 +388,28 @@ fn open_private_desktop_subdir(parent: &cap_std::fs::Dir, name: &Path) -> Result
     #[cfg(windows)]
     {
         // GENERIC_READ preserves directory traversal/read-control access; WRITE_DAC is
-        // required for SetSecurityInfo to apply the private DACL on this handle.
+        // required only when SetSecurityInfo will harden this private directory.
         const GENERIC_READ: u32 = 0x8000_0000;
         const WRITE_DAC: u32 = 0x0004_0000;
-        options.access_mode(GENERIC_READ | WRITE_DAC);
+        options.access_mode(GENERIC_READ | if _require_write_dac { WRITE_DAC } else { 0 });
         options.custom_flags(0x0020_0000 | 0x0200_0000);
     }
     let file = parent.open_with(name, &options)?.into_std();
     let metadata = file.metadata()?;
     if !metadata.is_dir() {
-        bail!(
+        return Err(std::io::Error::other(format!(
             "desktop directory entry is not a directory: {}",
             name.display()
-        );
+        )));
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         if metadata.file_attributes() & 0x0000_0400 != 0 {
-            bail!(
+            return Err(std::io::Error::other(format!(
                 "desktop directory entry is a reparse point: {}",
                 name.display()
-            );
+            )));
         }
     }
     Ok(Dir::from_std_file(file))
@@ -585,6 +605,7 @@ fn enforce_windows_private_acl(file: &fs::File, path: &Path, is_directory: bool)
     result
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn open_private_desktop_file(path: &Path) -> Result<fs::File> {
     use cap_std::fs::{OpenOptions, OpenOptionsExt};
 
@@ -656,10 +677,26 @@ async fn desktop_config_dir() -> Result<PathBuf> {
 }
 
 fn normalize_desktop_config_dir(config_dir: PathBuf) -> Result<PathBuf> {
-    if config_dir.is_absolute() {
-        return Ok(config_dir);
+    use std::path::Component;
+
+    let absolute = if config_dir.is_absolute() {
+        config_dir
+    } else {
+        std::env::current_dir()?.join(config_dir)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
     }
-    Ok(std::env::current_dir()?.join(config_dir))
+    Ok(normalized)
 }
 
 async fn desktop_log_path() -> Result<PathBuf> {
@@ -1148,13 +1185,37 @@ async fn supervise_desktop_child(
             .env(crate::restart::DESKTOP_SUPERVISED_ENV, "1")
             .env(crate::restart::DESKTOP_RESTART_MARKER_ENV, &marker_path)
             .kill_on_drop(true);
+        #[cfg(windows)]
+        let mut child = {
+            let mut command = CommandWrap::from(command);
+            command
+                .wrap(KillOnDrop)
+                .wrap(WindowsSpawnFailureGuard)
+                .wrap(JobObject);
+            command
+                .spawn()
+                .context("Failed to start desktop daemon child in its supervisor job")?
+        };
+        #[cfg(not(windows))]
         let mut child = command
             .spawn()
             .context("Failed to start desktop daemon child")?;
+        #[cfg(windows)]
+        let stdout = child
+            .stdout()
+            .take()
+            .context("desktop daemon stdout pipe unavailable")?;
+        #[cfg(not(windows))]
         let stdout = child
             .stdout
             .take()
             .context("desktop daemon stdout pipe unavailable")?;
+        #[cfg(windows)]
+        let stderr = child
+            .stderr()
+            .take()
+            .context("desktop daemon stderr pipe unavailable")?;
+        #[cfg(not(windows))]
         let stderr = child
             .stderr
             .take()
@@ -1186,6 +1247,66 @@ async fn supervise_desktop_child(
             return Ok(());
         }
         bail!("daemon child exited with status {status}");
+    }
+}
+
+/// Reaps a suspended Windows child if a later command wrapper cannot finish setup.
+///
+/// `JobObject` assigns the process before resuming it, so this guard runs before
+/// a failed assignment is returned and the child cannot have spawned descendants.
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsSpawnFailureGuard;
+
+#[cfg(windows)]
+impl CommandWrapper for WindowsSpawnFailureGuard {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn ChildWrapper>,
+        _core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn ChildWrapper>> {
+        Ok(Box::new(WindowsSpawnFailureChild { child: Some(child) }))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsSpawnFailureChild {
+    child: Option<Box<dyn ChildWrapper>>,
+}
+
+#[cfg(windows)]
+impl ChildWrapper for WindowsSpawnFailureChild {
+    fn inner(&self) -> &dyn ChildWrapper {
+        self.child.as_deref().expect("guard child must be present")
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("guard child must be present")
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+        self.child.take().expect("guard child must be present")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSpawnFailureChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_deref_mut() else {
+            return;
+        };
+        let Some(raw_handle) = child.inner_child().raw_handle() else {
+            return;
+        };
+        let _ = child.start_kill();
+        let handle = windows::Win32::Foundation::HANDLE(raw_handle as _);
+        // A suspended pre-assignment child has no descendants. Waiting here
+        // closes the only gap between spawn and durable Job Object ownership.
+        let _ = unsafe { windows::Win32::System::Threading::WaitForSingleObject(handle, 5_000) };
+        let _ = child.try_wait();
     }
 }
 
@@ -3191,6 +3312,71 @@ mod bounded_service_log_tests {
         assert_eq!(fs::read(&target).expect("read target"), b"original");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_first_run_creates_nested_config_and_data_roots() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        for source in ["config", "data"] {
+            let root = dir.path().join(source).join("fresh/nested/root");
+            let path = root.join("logs/zeroclaw-desktop-daemon.log");
+            drop(BoundedServiceLog::open_desktop(&path).expect("open nested desktop log"));
+
+            for component in [
+                dir.path().join(source),
+                dir.path().join(source).join("fresh"),
+                dir.path().join(source).join("fresh/nested"),
+                root.clone(),
+                root.join("logs"),
+            ] {
+                let metadata = fs::symlink_metadata(&component).expect("inspect private directory");
+                assert!(metadata.is_dir());
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            assert!(path.is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_rejects_symlink_as_nearest_existing_anchor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let redirected = tempfile::tempdir().expect("redirect target");
+        let first_missing = dir.path().join("fresh");
+        std::os::unix::fs::symlink(redirected.path(), &first_missing)
+            .expect("create ancestor symlink");
+        let path = first_missing.join("nested/root/logs/zeroclaw-desktop-daemon.log");
+
+        let error = match BoundedServiceLog::open_desktop(&path) {
+            Ok(_) => panic!("ancestor symlink must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ancestor"));
+        assert!(!redirected.path().join("nested").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_rejects_symlink_in_existing_ancestor_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let redirected = tempfile::tempdir().expect("redirect target");
+        let link = dir.path().join("redirected");
+        let existing = redirected.path().join("already/exists");
+        fs::create_dir_all(&existing).expect("create redirected subtree");
+        std::os::unix::fs::symlink(redirected.path(), &link)
+            .expect("create intermediate ancestor symlink");
+        let path = link.join("already/exists/config/logs/zeroclaw-desktop-daemon.log");
+
+        let error = match BoundedServiceLog::open_desktop(&path) {
+            Ok(_) => panic!("intermediate ancestor symlink must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ancestor"));
+        assert!(!existing.join("config").exists());
+    }
+
     #[test]
     fn openrc_stream_worker_writes_to_the_bounded_file() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -3514,6 +3700,14 @@ mod bounded_service_log_tests {
         let relative = PathBuf::from("relative-first-run-config");
         let resolved = normalize_desktop_config_dir(relative.clone()).expect("resolve config dir");
         assert_eq!(resolved, std::env::current_dir().unwrap().join(relative));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn relative_desktop_config_dir_resolves_parent_components() {
+        let resolved = normalize_desktop_config_dir(PathBuf::from("nested/../config"))
+            .expect("resolve config dir parent component");
+        assert_eq!(resolved, std::env::current_dir().unwrap().join("config"));
         assert!(resolved.is_absolute());
     }
 

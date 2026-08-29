@@ -1,5 +1,7 @@
 //! Locate and launch a bounded desktop daemon supervisor when none is already running.
 
+#[cfg(windows)]
+use process_wrap::tokio::{ChildWrapper, CommandWrap, CommandWrapper, JobObject, KillOnDrop};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -9,6 +11,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 const READINESS_FRAME_MAX_BYTES: usize = 4096;
+const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
@@ -16,6 +19,8 @@ const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
 #[cfg(unix)]
 const ESRCH: i32 = 3;
+#[cfg(unix)]
+const EPERM: i32 = 1;
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -78,6 +83,7 @@ pub fn find_zeroclaw_binary() -> Option<PathBuf> {
 /// The child handle is returned but intentionally not reaped because the
 /// supervisor owns the daemon's background lifecycle and log capture.
 pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
+    ensure_desktop_supervisor_capability(binary)?;
     let mut cmd = desktop_daemon_command(binary, port);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -167,6 +173,190 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
     }
 }
 
+fn ensure_desktop_supervisor_capability(binary: &Path) -> std::io::Result<()> {
+    ensure_desktop_supervisor_capability_with_timeout(binary, CAPABILITY_PROBE_TIMEOUT)
+}
+
+fn ensure_desktop_supervisor_capability_with_timeout(
+    binary: &Path,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let mut command = Command::new(binary);
+    command
+        .args(["service", "run-desktop-daemon", "--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    let mut child = {
+        let mut command = CommandWrap::from(tokio::process::Command::from(command));
+        command
+            .wrap(KillOnDrop)
+            .wrap(WindowsProbeSpawnFailureGuard)
+            .wrap(JobObject);
+        command.spawn().map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to check Desktop supervisor support in {}: {error}",
+                    binary.display()
+                ),
+            )
+        })?
+    };
+    #[cfg(not(windows))]
+    let mut child = command.spawn().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to check Desktop supervisor support in {}: {error}",
+                binary.display()
+            ),
+        )
+    })?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                return Err(attach_capability_cleanup_error(
+                    error,
+                    terminate_capability_probe(&mut child),
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            let timeout_error = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out checking Desktop supervisor support in {}; install or bundle a ZeroClaw kernel that supports the Desktop supervisor command",
+                    binary.display()
+                ),
+            );
+            return Err(attach_capability_cleanup_error(
+                timeout_error,
+                terminate_capability_probe(&mut child),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let cleanup_result = terminate_capability_probe(&mut child);
+    if status.success() {
+        return cleanup_result;
+    }
+    let unsupported_error = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "the ZeroClaw kernel at {} does not support the required Desktop supervisor command; install or bundle a kernel that supports this command",
+            binary.display()
+        ),
+    );
+    Err(attach_capability_cleanup_error(
+        unsupported_error,
+        cleanup_result,
+    ))
+}
+
+#[cfg(not(windows))]
+fn terminate_capability_probe(child: &mut Child) -> std::io::Result<()> {
+    terminate_supervisor_tree(child)
+}
+
+#[cfg(windows)]
+fn terminate_capability_probe(child: &mut Box<dyn ChildWrapper>) -> std::io::Result<()> {
+    child.start_kill()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out reaping capability probe",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Reaps a still-suspended probe if Job Object setup fails after process creation.
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsProbeSpawnFailureGuard;
+
+#[cfg(windows)]
+impl CommandWrapper for WindowsProbeSpawnFailureGuard {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn ChildWrapper>,
+        _core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn ChildWrapper>> {
+        Ok(Box::new(WindowsProbeSpawnFailureChild {
+            child: Some(child),
+        }))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsProbeSpawnFailureChild {
+    child: Option<Box<dyn ChildWrapper>>,
+}
+
+#[cfg(windows)]
+impl ChildWrapper for WindowsProbeSpawnFailureChild {
+    fn inner(&self) -> &dyn ChildWrapper {
+        self.child.as_deref().expect("guard child must be present")
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("guard child must be present")
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+        self.child.take().expect("guard child must be present")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProbeSpawnFailureChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_deref_mut() else {
+            return;
+        };
+        let _ = child.start_kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+}
+
+fn attach_capability_cleanup_error(
+    probe_error: std::io::Error,
+    cleanup_result: std::io::Result<()>,
+) -> std::io::Error {
+    match cleanup_result {
+        Ok(()) => probe_error,
+        Err(cleanup_error) => std::io::Error::new(
+            probe_error.kind(),
+            format!("{probe_error}; capability probe cleanup failed: {cleanup_error}"),
+        ),
+    }
+}
+
 fn read_readiness_frame<R: Read>(mut reader: R) -> std::io::Result<Option<String>> {
     let mut frame = Vec::with_capacity(READINESS_FRAME_MAX_BYTES + 1);
     let bytes_read = std::io::BufReader::new(&mut reader)
@@ -225,22 +415,51 @@ fn terminate_supervisor_tree(child: &mut Child) -> std::io::Result<()> {
         } else {
             let deadline = Instant::now() + Duration::from_millis(250);
             while Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                if let Err(error) = child.try_wait() {
+                    utility_errors.push(format!("failed to reap supervisor: {error}"));
+                    break;
+                }
+                match supervisor_group_still_running(pid) {
+                    Ok(false) => break,
+                    Ok(true) => std::thread::sleep(Duration::from_millis(10)),
                     Err(error) => {
-                        utility_errors.push(format!("failed to inspect supervisor: {error}"));
+                        utility_errors.push(format!(
+                            "failed to inspect supervisor process group: {error}"
+                        ));
                         break;
                     }
                 }
             }
         }
-        if child_still_running(child) {
-            if let Err(error) = signal_supervisor_group(pid, SIGKILL) {
-                utility_errors.push(error.to_string());
-            } else {
-                forceful_termination_initiated = true;
+        match supervisor_group_still_running(pid) {
+            Ok(true) => {
+                if let Err(error) = signal_supervisor_group(pid, SIGKILL) {
+                    utility_errors.push(error.to_string());
+                } else {
+                    forceful_termination_initiated = true;
+                    let deadline = Instant::now() + Duration::from_millis(250);
+                    while Instant::now() < deadline {
+                        if let Err(error) = child.try_wait() {
+                            utility_errors.push(format!("failed to reap supervisor: {error}"));
+                            break;
+                        }
+                        match supervisor_group_still_running(pid) {
+                            Ok(false) => break,
+                            Ok(true) => std::thread::sleep(Duration::from_millis(10)),
+                            Err(error) => {
+                                utility_errors.push(format!(
+                                    "failed to verify supervisor process group cleanup: {error}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
             }
+            Ok(false) => {}
+            Err(error) => utility_errors.push(format!(
+                "failed to inspect supervisor process group before escalation: {error}"
+            )),
         }
     }
     #[cfg(windows)]
@@ -296,6 +515,16 @@ fn terminate_supervisor_tree(child: &mut Child) -> std::io::Result<()> {
     if child_still_running(child) {
         utility_errors.push("supervisor remained running after cleanup".to_string());
     }
+    #[cfg(unix)]
+    match supervisor_group_still_running(child.id()) {
+        Ok(true) => {
+            utility_errors.push("supervisor process group remained after cleanup".to_string())
+        }
+        Ok(false) => {}
+        Err(error) => utility_errors.push(format!(
+            "failed to verify supervisor process group cleanup: {error}"
+        )),
+    }
     if utility_errors.is_empty() {
         Ok(())
     } else {
@@ -315,6 +544,21 @@ fn signal_supervisor_group(pid: u32, signal: i32) -> std::io::Result<()> {
     let error = std::io::Error::last_os_error();
     if result == 0 || error.raw_os_error() == Some(ESRCH) {
         Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn supervisor_group_still_running(pid: u32) -> std::io::Result<bool> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| std::io::Error::other("supervisor PID does not fit in pid_t"))?;
+    let result = unsafe { kill(-pid, 0) };
+    let error = std::io::Error::last_os_error();
+    if result == 0 || error.raw_os_error() == Some(EPERM) {
+        Ok(true)
+    } else if error.raw_os_error() == Some(ESRCH) {
+        Ok(false)
     } else {
         Err(error)
     }
@@ -362,6 +606,86 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, ["service", "run-desktop-daemon", "--port", "42617"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_kernel_reports_selected_path_and_matching_version_action() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw-desktop-old-kernel-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create fixture directory");
+        let binary = dir.join("old-zeroclaw");
+        let descendant_pid_file = dir.join("unsupported-child.pid");
+        let descendant_pid_file_literal =
+            descendant_pid_file.to_string_lossy().replace('\'', "'\\''");
+        let fixture = format!(
+            "#!/bin/sh\n\
+             trap '' HUP TERM INT\n\
+             sleep 30 &\n\
+             printf '%s' \"$!\" > '{descendant_pid_file_literal}'\n\
+             exit 64\n"
+        );
+        fs::write(&binary, fixture).expect("write old kernel fixture");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("make old kernel fixture executable");
+
+        let error = spawn_daemon(&binary, 0).expect_err("old kernel must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(&binary.display().to_string()));
+        assert!(error.to_string().contains("supports this command"));
+        assert!(!error.to_string().contains("cleanup failed"));
+        let descendant_pid: i32 = fs::read_to_string(&descendant_pid_file)
+            .expect("fixture should record unsupported probe descendant pid")
+            .parse()
+            .expect("unsupported probe descendant pid should be numeric");
+        let result = unsafe { kill(descendant_pid, 0) };
+        assert_eq!(result, -1, "unsupported probe descendant remained alive");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(ESRCH));
+        fs::remove_dir_all(&dir).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_probe_times_out_and_reaps_stale_kernel() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw-desktop-stale-kernel-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create fixture directory");
+        let binary = dir.join("stale-zeroclaw");
+        let fixture = format!(
+            "#!/bin/sh\n\
+             trap '' HUP TERM INT\n\
+             sleep 30 &\n\
+             child=$!\n\
+             wait \"$child\"\n"
+        );
+        fs::write(&binary, fixture).expect("write stale kernel fixture");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("make stale kernel fixture executable");
+
+        let error =
+            ensure_desktop_supervisor_capability_with_timeout(&binary, Duration::from_millis(100))
+                .expect_err("stale kernel capability probe must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains(&binary.display().to_string()));
+        assert!(!error.to_string().contains("cleanup failed"));
+
+        fs::remove_dir_all(&dir).expect("remove fixture directory");
     }
 
     #[test]
@@ -435,6 +759,7 @@ mod tests {
         fs::create_dir(&log_destination).expect("make log destination a directory");
         let fixture = format!(
             "#!/bin/sh\n\
+             if [ \"${{1:-}}\" = service ] && [ \"${{2:-}}\" = run-desktop-daemon ] && [ \"${{3:-}}\" = --help ]; then exit 0; fi\n\
              sleep 30 &\n\
              child=$!\n\
              printf '%s' \"$$\" > '{supervisor_pid_file_literal}'\n\
@@ -488,5 +813,55 @@ mod tests {
             assert!(exited, "{label} process {pid} remained alive after cleanup");
         }
         fs::remove_dir_all(&dir).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_daemon_kills_group_when_supervisor_exits_before_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw-desktop-exiting-supervisor-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create fixture directory");
+        let pid_file = dir.join("descendant.pid");
+        let binary = dir.join("exiting-supervisor-fixture");
+        let pid_file_literal = pid_file.to_string_lossy().replace('\'', "'\\''");
+        let fixture = format!(
+            "#!/bin/sh\n\
+             if [ \"${{1:-}}\" = service ] && [ \"${{2:-}}\" = run-desktop-daemon ] && [ \"${{3:-}}\" = --help ]; then exit 0; fi\n\
+             trap '' HUP TERM INT\n\
+             sleep 30 &\n\
+             child=$!\n\
+             printf '%s' \"$child\" > '{pid_file_literal}'\n\
+             printf '%s\\n' 'INVALID'\n\
+             exit 0\n"
+        );
+        fs::write(&binary, fixture).expect("write exiting supervisor fixture");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("make exiting supervisor fixture executable");
+
+        let error = spawn_daemon(&binary, 0).expect_err("invalid readiness must reject startup");
+        assert!(error.to_string().contains("invalid readiness response"));
+        assert!(!error.to_string().contains("cleanup failed"));
+        let descendant_pid: i32 = fs::read_to_string(&pid_file)
+            .expect("fixture should record descendant pid")
+            .parse()
+            .expect("descendant pid should be numeric");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let result = unsafe { kill(descendant_pid, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
+                fs::remove_dir_all(&dir).expect("remove fixture directory");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("descendant process {descendant_pid} remained alive after cleanup");
     }
 }
