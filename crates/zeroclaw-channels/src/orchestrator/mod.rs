@@ -13358,6 +13358,28 @@ pub(crate) mod tests {
         source_block_after(source, &marker, "    ")
     }
 
+    fn whatsapp_listener_branch_markers(key: &str) -> Option<(&'static str, &'static str)> {
+        match key {
+            "whatsapp" => Some((
+                "#[cfg(feature = \"channel-whatsapp-cloud\")]\n            \"cloud\" => {",
+                "            #[cfg(not(feature = \"channel-whatsapp-cloud\"))]",
+            )),
+            "whatsapp-web" | "whatsapp_web" => Some((
+                "#[cfg(feature = \"whatsapp-web\")]\n                if wa.is_web_config() {",
+                "                #[cfg(not(feature = \"whatsapp-web\"))]",
+            )),
+            _ => None,
+        }
+    }
+
+    fn whatsapp_listener_registration_in_loop(loop_body: &str, key: &str) -> bool {
+        let Some((start, end)) = whatsapp_listener_branch_markers(key) else {
+            return false;
+        };
+        let branch = source_segment_between(loop_body, start, end);
+        branch.is_some_and(|branch| branch.contains("channels.push(ConfiguredChannel {"))
+    }
+
     fn source_segment_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
         let (_, after_start) = source.split_once(start)?;
         after_start.split_once(end).map(|(segment, _)| segment)
@@ -28577,7 +28599,11 @@ This is an example JSON object for profile settings."#;
                     _ => key.replace('-', "_"),
                 };
                 source_block_after_channel_loop(collector, &field).is_some_and(|loop_body| {
-                    loop_body.contains("channels.push(ConfiguredChannel {")
+                    if matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web") {
+                        whatsapp_listener_registration_in_loop(loop_body, key)
+                    } else {
+                        loop_body.contains("channels.push(ConfiguredChannel {")
+                    }
                 })
             });
             if registered {
@@ -28666,6 +28692,63 @@ This is an example JSON object for profile settings."#;
             source_block_after_channel_loop(web_socket_only_collector, "wecom_ws")
                 .is_some_and(|loop_body| loop_body.contains("channels.push(ConfiguredChannel {"))
         );
+    }
+
+    #[test]
+    fn compiled_channel_listener_guard_distinguishes_whatsapp_backends() {
+        const PUSH_MARKER: &str = "channels.push(ConfiguredChannel {";
+
+        let source = include_str!("mod.rs");
+        let whatsapp_loop = source_block_after_channel_loop(source, "whatsapp")
+            .expect("WhatsApp listener loop must remain identifiable");
+        assert!(whatsapp_listener_registration_in_loop(
+            whatsapp_loop,
+            "whatsapp"
+        ));
+        assert!(whatsapp_listener_registration_in_loop(
+            whatsapp_loop,
+            "whatsapp-web"
+        ));
+
+        let without_backend_push = |key: &str| {
+            let (branch_start_marker, branch_end_marker) =
+                whatsapp_listener_branch_markers(key).expect("WhatsApp backend key must be known");
+            let branch_start = whatsapp_loop
+                .find(branch_start_marker)
+                .expect("WhatsApp backend branch must remain identifiable")
+                + branch_start_marker.len();
+            let branch_end = branch_start
+                + whatsapp_loop[branch_start..]
+                    .find(branch_end_marker)
+                    .expect("WhatsApp backend branch boundary must remain identifiable");
+            let relative_push = whatsapp_loop[branch_start..branch_end]
+                .find(PUSH_MARKER)
+                .expect("WhatsApp backend branch must register a channel");
+            let push_start = branch_start + relative_push;
+            let mut mutated = whatsapp_loop.to_string();
+            mutated.replace_range(push_start..push_start + PUSH_MARKER.len(), "removed_push({");
+            mutated
+        };
+
+        let cloud_removed = without_backend_push("whatsapp");
+        assert!(!whatsapp_listener_registration_in_loop(
+            &cloud_removed,
+            "whatsapp"
+        ));
+        assert!(whatsapp_listener_registration_in_loop(
+            &cloud_removed,
+            "whatsapp-web"
+        ));
+
+        let web_removed = without_backend_push("whatsapp-web");
+        assert!(whatsapp_listener_registration_in_loop(
+            &web_removed,
+            "whatsapp"
+        ));
+        assert!(!whatsapp_listener_registration_in_loop(
+            &web_removed,
+            "whatsapp-web"
+        ));
     }
 
     #[cfg(feature = "channel-mattermost")]
