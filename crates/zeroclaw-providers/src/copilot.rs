@@ -27,6 +27,9 @@ const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_API_KEY_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const DEFAULT_API: &str = "https://api.githubcopilot.com";
+const CACHE_OPERATION_ADMIT_DIRECTORY: &str = "admit_cache_directory";
+const CACHE_OPERATION_PERSIST_ACCESS_TOKEN: &str = "persist_access_token";
+const CACHE_OPERATION_PERSIST_API_KEY: &str = "persist_api_key";
 
 // ── Token types ──────────────────────────────────────────────────
 
@@ -72,6 +75,75 @@ struct CachedApiKey {
     token: String,
     api_endpoint: String,
     expires_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheFailure {
+    LocationUnavailable,
+    Io {
+        kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
+    },
+    BlockingTask,
+}
+
+impl CacheFailure {
+    fn from_io(error: &io::Error) -> Self {
+        Self::Io {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+}
+
+fn cache_failure_attrs(operation: &'static str, failure: CacheFailure) -> serde_json::Value {
+    match failure {
+        CacheFailure::LocationUnavailable => serde_json::json!({
+            "operation": operation,
+            "error_category": "location_unavailable",
+        }),
+        CacheFailure::Io { kind, raw_os_error } => serde_json::json!({
+            "operation": operation,
+            "error_category": "io",
+            "error_kind": format!("{kind:?}"),
+            "raw_os_error": raw_os_error,
+        }),
+        CacheFailure::BlockingTask => serde_json::json!({
+            "operation": operation,
+            "error_category": "blocking_task",
+        }),
+    }
+}
+
+fn warn_cache_failure(operation: &'static str, failure: CacheFailure) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(cache_failure_attrs(operation, failure)),
+        "Copilot credential cache operation failed; continuing without persisted credentials"
+    );
+}
+
+fn cache_result_or_report<T, F>(
+    operation: &'static str,
+    result: Result<T, CacheFailure>,
+    reporter: F,
+) -> Option<T>
+where
+    F: FnOnce(&'static str, CacheFailure),
+{
+    match result {
+        Ok(value) => Some(value),
+        Err(failure) => {
+            reporter(operation, failure);
+            None
+        }
+    }
+}
+
+fn cache_result_or_warn<T>(operation: &'static str, result: Result<T, CacheFailure>) -> Option<T> {
+    cache_result_or_report(operation, result, warn_cache_failure)
 }
 
 // ── Chat completions types ───────────────────────────────────────
@@ -225,7 +297,10 @@ impl CopilotModelProvider {
     }
 
     fn new_impl(alias: String, github_token: Option<String>) -> Self {
-        let token_dir = cache_dir_from_location(project_cache_dir());
+        let token_dir = cache_result_or_warn(
+            CACHE_OPERATION_ADMIT_DIRECTORY,
+            cache_dir_from_location(project_cache_dir()),
+        );
 
         Self {
             alias,
@@ -507,7 +582,10 @@ impl CopilotModelProvider {
 
         let token = self.device_code_login().await?;
         if let Some(token_dir) = self.token_dir.as_ref() {
-            write_file_secure(token_dir, "access-token", &token).await;
+            let _ = cache_result_or_warn(
+                CACHE_OPERATION_PERSIST_ACCESS_TOKEN,
+                write_file_secure(token_dir, "access-token", &token).await,
+            );
         }
         Ok(token)
     }
@@ -618,7 +696,10 @@ impl CopilotModelProvider {
         if let Some(token_dir) = self.token_dir.as_ref()
             && let Ok(json) = serde_json::to_string_pretty(info)
         {
-            write_file_secure(token_dir, "api-key.json", &json).await;
+            let _ = cache_result_or_warn(
+                CACHE_OPERATION_PERSIST_API_KEY,
+                write_file_secure(token_dir, "api-key.json", &json).await,
+            );
         }
     }
 }
@@ -627,18 +708,28 @@ fn project_cache_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "zeroclaw").map(|dir| dir.config_dir().join("copilot"))
 }
 
-fn cache_dir_from_location(path: Option<PathBuf>) -> Option<Arc<Dir>> {
-    path.and_then(|path| admit_cache_dir(&path))
+fn cache_dir_from_location(path: Option<PathBuf>) -> Result<Arc<Dir>, CacheFailure> {
+    let path = path.ok_or(CacheFailure::LocationUnavailable)?;
+    admit_cache_dir(&path).map_err(|error| CacheFailure::from_io(&error))
 }
 
-fn admit_cache_dir(path: &Path) -> Option<Arc<Dir>> {
-    let parent_path = path.parent()?;
-    let leaf = path.file_name()?.to_owned();
-    fs::create_dir_all(parent_path).ok()?;
+fn admit_cache_dir(path: &Path) -> io::Result<Arc<Dir>> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache path has no parent"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache path has no leaf"))?;
+    fs::create_dir_all(parent_path)?;
 
-    let parent = Dir::open_ambient_dir(parent_path, cap_std::ambient_authority()).ok()?;
+    let parent = Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())?;
     match parent.symlink_metadata(&leaf) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => return None,
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache directory entry is not a directory",
+            ));
+        }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut builder = cap_std::fs::DirBuilder::new();
@@ -650,21 +741,19 @@ fn admit_cache_dir(path: &Path) -> Option<Arc<Dir>> {
             match parent.create_dir_with(&leaf, &builder) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(_) => return None,
+                Err(error) => return Err(error),
             }
         }
-        Err(_) => return None,
+        Err(error) => return Err(error),
     }
 
-    let cache_dir = parent.open_dir_nofollow(&leaf).ok()?;
+    let cache_dir = parent.open_dir_nofollow(&leaf)?;
     #[cfg(unix)]
     {
         use cap_std::fs::PermissionsExt;
-        cache_dir
-            .set_permissions(".", Permissions::from_mode(0o700))
-            .ok()?;
+        cache_dir.set_permissions(".", Permissions::from_mode(0o700))?;
     }
-    Some(Arc::new(cache_dir))
+    Ok(Arc::new(cache_dir))
 }
 
 fn ensure_final_cache_entry(dir: &Dir, name: &str) -> io::Result<()> {
@@ -773,12 +862,17 @@ fn write_cache_file_sync(dir: &Arc<Dir>, final_name: &str, content: &str) -> io:
     Ok(())
 }
 
-async fn write_file_secure(dir: &Arc<Dir>, name: &'static str, content: &str) -> bool {
+async fn write_file_secure(
+    dir: &Arc<Dir>,
+    name: &'static str,
+    content: &str,
+) -> Result<(), CacheFailure> {
     let dir = Arc::clone(dir);
     let content = content.to_string();
-    tokio::task::spawn_blocking(move || write_cache_file_sync(&dir, name, &content))
-        .await
-        .is_ok_and(|result| result.is_ok())
+    match tokio::task::spawn_blocking(move || write_cache_file_sync(&dir, name, &content)).await {
+        Ok(result) => result.map_err(|error| CacheFailure::from_io(&error)),
+        Err(_) => Err(CacheFailure::BlockingTask),
+    }
 }
 
 fn remove_cache_file_sync(dir: &Dir, name: &str) -> io::Result<()> {
@@ -1054,7 +1148,72 @@ mod tests {
     #[test]
     fn unavailable_project_location_disables_cache_without_temp_fallback() {
         let location: Option<PathBuf> = None;
-        assert!(cache_dir_from_location(location).is_none());
+        assert_eq!(
+            cache_dir_from_location(location).unwrap_err(),
+            CacheFailure::LocationUnavailable
+        );
+    }
+
+    #[test]
+    fn cache_failure_attrs_omit_paths_and_secret_bearing_error_text() {
+        let error = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "credential secret at /private/cache/path",
+        );
+        let attrs = cache_failure_attrs("persist_api_key", CacheFailure::from_io(&error));
+
+        assert_eq!(attrs["operation"], "persist_api_key");
+        assert_eq!(attrs["error_category"], "io");
+        assert_eq!(attrs["error_kind"], "PermissionDenied");
+        let serialized = attrs.to_string();
+        assert!(!serialized.contains("credential secret"));
+        assert!(!serialized.contains("/private/cache/path"));
+    }
+
+    #[test]
+    fn blocking_task_failure_has_a_fixed_sanitized_category() {
+        let attrs = cache_failure_attrs(
+            CACHE_OPERATION_PERSIST_ACCESS_TOKEN,
+            CacheFailure::BlockingTask,
+        );
+
+        assert_eq!(attrs["operation"], CACHE_OPERATION_PERSIST_ACCESS_TOKEN);
+        assert_eq!(attrs["error_category"], "blocking_task");
+        assert!(attrs.get("error_kind").is_none());
+    }
+
+    #[test]
+    fn cache_failure_reporting_is_exactly_once_and_success_is_silent() {
+        for operation in [
+            CACHE_OPERATION_ADMIT_DIRECTORY,
+            CACHE_OPERATION_PERSIST_ACCESS_TOKEN,
+            CACHE_OPERATION_PERSIST_API_KEY,
+        ] {
+            let mut reports = Vec::new();
+            let value: Option<()> = cache_result_or_report(
+                operation,
+                Err(CacheFailure::Io {
+                    kind: io::ErrorKind::PermissionDenied,
+                    raw_os_error: Some(13),
+                }),
+                |reported_operation, failure| {
+                    reports.push(cache_failure_attrs(reported_operation, failure));
+                },
+            );
+
+            assert!(value.is_none());
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0]["operation"], operation);
+            assert_eq!(reports[0]["error_kind"], "PermissionDenied");
+        }
+
+        let mut reported = false;
+        let value =
+            cache_result_or_report(CACHE_OPERATION_PERSIST_API_KEY, Ok("persisted"), |_, _| {
+                reported = true
+            });
+        assert_eq!(value, Some("persisted"));
+        assert!(!reported);
     }
 
     #[tokio::test]
@@ -1064,7 +1223,11 @@ mod tests {
         let cache_dir = admit_cache_dir(&cache_path).unwrap();
         let provider = provider_with_cache_dir(Arc::clone(&cache_dir));
 
-        assert!(write_file_secure(&cache_dir, "access-token", "gho_round_trip").await);
+        assert!(
+            write_file_secure(&cache_dir, "access-token", "gho_round_trip")
+                .await
+                .is_ok()
+        );
         assert_eq!(
             read_cache_file(&cache_dir, "access-token").await.as_deref(),
             Some("gho_round_trip")
@@ -1129,7 +1292,7 @@ mod tests {
 
         let parent = Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority()).unwrap();
         assert!(parent.open_dir_nofollow("copilot").is_err());
-        assert!(admit_cache_dir(&link).is_none());
+        assert!(admit_cache_dir(&link).is_err());
     }
 
     #[cfg(unix)]
@@ -1145,7 +1308,11 @@ mod tests {
         symlink(&target, &cache_file).unwrap();
 
         assert!(read_cache_file(&cache_dir, "api-key.json").await.is_none());
-        assert!(!write_file_secure(&cache_dir, "api-key.json", "must-not-follow").await);
+        assert!(
+            write_file_secure(&cache_dir, "api-key.json", "must-not-follow")
+                .await
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(target).unwrap(), "external-original");
     }
 
@@ -1164,7 +1331,11 @@ mod tests {
         fs::write(external.join("api-key.json"), "external-original").unwrap();
         fs::rename(&external, &visible).unwrap();
 
-        assert!(write_file_secure(&cache_dir, "api-key.json", "retained-content").await);
+        assert!(
+            write_file_secure(&cache_dir, "api-key.json", "retained-content")
+                .await
+                .is_ok()
+        );
         assert_eq!(
             read_cache_file(&cache_dir, "api-key.json").await.as_deref(),
             Some("retained-content")
@@ -1189,7 +1360,11 @@ mod tests {
         std::os::unix::fs::symlink(&external, cache_path.join("api-key.json")).unwrap();
 
         assert!(read_cache_file(&cache_dir, "api-key.json").await.is_none());
-        assert!(!write_file_secure(&cache_dir, "api-key.json", "credential").await);
+        assert!(
+            write_file_secure(&cache_dir, "api-key.json", "credential")
+                .await
+                .is_err()
+        );
         assert!(!remove_cache_file(&cache_dir, "api-key.json").await);
         assert_eq!(fs::read_to_string(external).unwrap(), "external-original");
     }
@@ -1199,8 +1374,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = admit_cache_dir(&temp.path().join("copilot")).unwrap();
 
-        assert!(write_file_secure(&cache_dir, "api-key.json", "old-complete-content").await);
-        assert!(write_file_secure(&cache_dir, "api-key.json", "new-complete-content").await);
+        assert!(
+            write_file_secure(&cache_dir, "api-key.json", "old-complete-content")
+                .await
+                .is_ok()
+        );
+        assert!(
+            write_file_secure(&cache_dir, "api-key.json", "new-complete-content")
+                .await
+                .is_ok()
+        );
         assert_eq!(
             read_cache_file(&cache_dir, "api-key.json").await.as_deref(),
             Some("new-complete-content")
@@ -1214,13 +1397,21 @@ mod tests {
         let old_content = "old-complete-content";
         let new_content = "new-complete-content";
 
-        assert!(write_file_secure(&cache_dir, "api-key.json", old_content).await);
+        assert!(
+            write_file_secure(&cache_dir, "api-key.json", old_content)
+                .await
+                .is_ok()
+        );
 
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let mut old_file = cache_dir.open_with("api-key.json", &options).unwrap();
 
-        assert!(write_file_secure(&cache_dir, "api-key.json", new_content).await);
+        assert!(
+            write_file_secure(&cache_dir, "api-key.json", new_content)
+                .await
+                .is_ok()
+        );
 
         let mut retained_content = String::new();
         old_file.read_to_string(&mut retained_content).unwrap();
