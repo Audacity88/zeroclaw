@@ -5394,7 +5394,9 @@ mod tests {
                 .model_provider(Box::new(MockModelProvider {
                     responses: Mutex::new(vec![]),
                 }))
-                .tools(vec![Box::new(NamedMockTool::new("ops__shell"))])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(NamedMockTool::new("ops__shell"))],
+                ))
                 .skills(vec![make_skill("ops", &["fetch", "shell"])])
                 .memory(mem)
                 .observer(observer)
