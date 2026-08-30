@@ -44,6 +44,7 @@ mod terminal_backend;
 #[cfg(test)]
 mod test_support;
 mod text_navigation;
+mod text_selection;
 mod theme;
 mod todo_tracker;
 mod turn_status;
