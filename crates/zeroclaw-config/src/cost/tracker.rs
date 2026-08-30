@@ -742,6 +742,19 @@ impl CostStorage {
         })
     }
 
+    fn recover_concatenated_records<F>(
+        input: &str,
+        mut on_record: F,
+    ) -> Result<(), serde_json::Error>
+    where
+        F: FnMut(CostRecord),
+    {
+        for value in serde_json::Deserializer::from_str(input).into_iter::<CostRecord>() {
+            on_record(value?);
+        }
+        Ok(())
+    }
+
     fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
     where
         F: FnMut(CostRecord),
@@ -774,20 +787,9 @@ impl CostStorage {
 
             match serde_json::from_str::<CostRecord>(trimmed) {
                 Ok(record) => on_record(record),
-                Err(error) => {
-                    let mut recovered = 0usize;
-                    let stream =
-                        serde_json::Deserializer::from_str(trimmed).into_iter::<CostRecord>();
-                    for value in stream {
-                        match value {
-                            Ok(record) => {
-                                on_record(record);
-                                recovered += 1;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if recovered == 0 {
+                Err(_) => {
+                    if let Err(error) = Self::recover_concatenated_records(trimmed, &mut on_record)
+                    {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -854,6 +856,14 @@ impl CostStorage {
 
     /// Add a new record.
     fn add_record(&mut self, record: CostRecord) -> Result<()> {
+        self.add_record_with_sync(record, File::sync_all)
+    }
+
+    fn add_record_with_sync(
+        &mut self,
+        record: CostRecord,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<()> {
         self.ensure_period_cache_current()?;
 
         let mut file = OpenOptions::new()
@@ -875,12 +885,6 @@ impl CostStorage {
                 self.path.display().to_string()
             )
         })?;
-        file.sync_all().with_context(|| {
-            format!(
-                "Failed to sync cost storage at {}",
-                self.path.display().to_string()
-            )
-        })?;
 
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
@@ -889,6 +893,13 @@ impl CostStorage {
         if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
             self.monthly_cost_usd += record.usage.cost_usd;
         }
+
+        sync_file(&file).with_context(|| {
+            format!(
+                "Failed to sync cost storage at {}",
+                self.path.display().to_string()
+            )
+        })?;
         Ok(())
     }
 
@@ -1084,6 +1095,78 @@ mod tests {
         let mut count = 0usize;
         storage.for_each_record(|_| count += 1).unwrap();
         assert_eq!(count, 2, "both concatenated records should be recovered");
+    }
+
+    #[test]
+    fn recovery_helper_accepts_clean_concatenated_records() {
+        let first = record_at("test/model-a", 1.0, Utc::now(), Some("task-a"));
+        let second = record_at("test/model-b", 2.0, Utc::now(), Some("task-b"));
+        let input = format!(
+            "{}{}",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records(&input, |record| recovered.push(record));
+
+        assert!(result.is_ok());
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].id, first.id);
+        assert_eq!(recovered[1].id, second.id);
+    }
+
+    #[test]
+    fn recovery_helper_returns_error_after_recovering_valid_prefix() {
+        let record = record_at("test/model", 1.0, Utc::now(), Some("task-a"));
+        let input = format!("{}{{malformed", serde_json::to_string(&record).unwrap());
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records(&input, |record| recovered.push(record));
+
+        assert!(result.is_err());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, record.id);
+    }
+
+    #[test]
+    fn recovery_helper_returns_error_without_recovering_wholly_malformed_input() {
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records("not-json", |record| recovered.push(record));
+
+        assert!(result.is_err());
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn sync_failure_keeps_appended_file_and_current_period_cache_visible() {
+        fn fail_sync(_: &File) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "forced sync failure",
+            ))
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let mut storage = CostStorage::new(&path).unwrap();
+        let record = record_at("test/model", 1.0, Utc::now(), Some("task-a"));
+        let expected_line = format!("{}\n", serde_json::to_string(&record).unwrap());
+
+        let error = storage.add_record_with_sync(record, fail_sync).unwrap_err();
+
+        assert!(error.to_string().contains("Failed to sync cost storage"));
+        assert!(
+            path.exists(),
+            "a complete append must leave the ledger file"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected_line);
+        assert!((storage.daily_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!((storage.monthly_cost_usd - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
