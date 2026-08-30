@@ -157,7 +157,9 @@ pub fn should_hydrate(workspace_dir: &Path) -> bool {
         return true;
     }
 
-    let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+    let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .or_else(|_| Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE))
+    {
         Ok(conn) => conn,
         Err(_) => {
             log_hydration_admission_failure();
@@ -544,6 +546,32 @@ Rule 3: Protect the user.
         fs::remove_file(&db_path).unwrap();
         fs::write(&db_path, "not a sqlite database").unwrap();
         assert!(!should_hydrate(workspace));
+    }
+
+    #[test]
+    fn should_hydrate_opens_closed_empty_wal_without_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::write(
+            workspace.join(SNAPSHOT_FILENAME),
+            "### 🔑 `test`\n\nHello\n",
+        )
+        .unwrap();
+        let db_path = workspace.join("memory").join("brain.db");
+
+        let conn = SqliteMemory::open_and_initialize(&db_path, None).unwrap();
+        drop(conn);
+        for sidecar in [
+            db_path.with_extension("db-wal"),
+            db_path.with_extension("db-shm"),
+        ] {
+            if sidecar.exists() {
+                fs::remove_file(&sidecar).unwrap();
+            }
+            assert!(!sidecar.exists());
+        }
+
+        assert!(should_hydrate(workspace));
     }
 
     #[test]
