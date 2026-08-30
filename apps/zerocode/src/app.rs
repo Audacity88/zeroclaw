@@ -1,10 +1,12 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -89,6 +91,16 @@ impl<T> Drop for ReconnectAttempt<T> {
     }
 }
 
+fn publish_reconnect_candidate<T, P>(
+    live: &mut Arc<T>,
+    candidate: Arc<T>,
+    panes: Result<P>,
+) -> Result<P> {
+    let panes = panes?;
+    *live = candidate;
+    Ok(panes)
+}
+
 /// Pending Quickstart chat transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingQuickstartChat {
@@ -132,6 +144,224 @@ impl PostPollDispatchState {
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
+const SGR_MOUSE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(50);
+const MAX_SGR_MOUSE_SEQUENCE_EVENTS: usize = 32;
+
+/// Reassembles SGR mouse sequences that crossterm exposed as individual key
+/// events after an input read split the sequence at the escape byte.
+///
+/// A complete sequence is converted back into the same `MouseEvent` that
+/// crossterm would have produced. Invalid or incomplete sequences are replayed
+/// in order, so ordinary Escape-prefixed keyboard input is not discarded.
+#[derive(Debug, Default)]
+struct SgrMouseEventDecoder {
+    pending: VecDeque<Event>,
+    candidate: Vec<Event>,
+    candidate_started_at: Option<Instant>,
+}
+
+impl SgrMouseEventDecoder {
+    fn feed(&mut self, event: Event) {
+        let output = if self.candidate.is_empty() {
+            if is_sgr_mouse_start(&event) {
+                self.candidate.push(event);
+                self.candidate_started_at = Some(Instant::now());
+                Vec::new()
+            } else {
+                vec![event]
+            }
+        } else {
+            self.candidate.push(event);
+            self.decode_candidate()
+        };
+        self.pending.extend(output);
+    }
+
+    fn next(&mut self) -> Option<Event> {
+        self.pending.pop_front()
+    }
+
+    fn push_front(&mut self, event: Event) {
+        self.pending.push_front(event);
+    }
+
+    fn poll_timeout(&self) -> Duration {
+        self.candidate_started_at
+            .map(|started| SGR_MOUSE_SEQUENCE_TIMEOUT.saturating_sub(started.elapsed()))
+            .unwrap_or(TICK)
+    }
+
+    fn flush_candidate(&mut self) -> bool {
+        if self.candidate.is_empty() {
+            return false;
+        }
+        self.pending.extend(self.candidate.drain(..));
+        self.candidate_started_at = None;
+        true
+    }
+
+    fn flush_timed_out_candidate(&mut self) -> bool {
+        let timed_out = self
+            .candidate_started_at
+            .is_some_and(|started| started.elapsed() >= SGR_MOUSE_SEQUENCE_TIMEOUT);
+        timed_out && self.flush_candidate()
+    }
+
+    fn read_ready_with<F>(&mut self, mut read_event: F) -> Result<Option<Event>>
+    where
+        F: FnMut() -> Result<Option<Event>>,
+    {
+        loop {
+            if let Some(event) = self.next() {
+                return Ok(Some(event));
+            }
+            let Some(event) = read_event()? else {
+                return Ok(None);
+            };
+            self.feed(event);
+        }
+    }
+
+    fn decode_candidate(&mut self) -> Vec<Event> {
+        if self.candidate.len() > MAX_SGR_MOUSE_SEQUENCE_EVENTS {
+            return self.replay_candidate();
+        }
+
+        let Some(chars) = self.candidate[1..]
+            .iter()
+            .map(key_event_char)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return self.replay_candidate();
+        };
+
+        let prefix = ['[', '<'];
+        for (index, expected) in prefix.iter().enumerate() {
+            let Some(actual) = chars.get(index) else {
+                return Vec::new();
+            };
+            if actual != expected {
+                return self.replay_candidate();
+            }
+        }
+
+        let Some(final_char) = chars.last().copied() else {
+            return Vec::new();
+        };
+        if !matches!(final_char, 'M' | 'm') {
+            if chars[2..]
+                .iter()
+                .all(|character| character.is_ascii_digit() || *character == ';')
+            {
+                return Vec::new();
+            }
+            return self.replay_candidate();
+        }
+
+        let Some(mouse) = parse_sgr_mouse(&chars) else {
+            return self.replay_candidate();
+        };
+        self.candidate.clear();
+        self.candidate_started_at = None;
+        vec![Event::Mouse(mouse)]
+    }
+
+    fn replay_candidate(&mut self) -> Vec<Event> {
+        self.candidate_started_at = None;
+        self.candidate.drain(..).collect()
+    }
+}
+
+fn is_sgr_mouse_start(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if key.code == KeyCode::Esc // keyguard: recognize terminal protocol escape, not an app chord
+                && key.kind == KeyEventKind::Press
+                && key.modifiers == KeyModifiers::NONE
+    )
+}
+
+fn key_event_char(event: &Event) -> Option<char> {
+    match event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(character), // keyguard: extract terminal protocol byte
+            kind: KeyEventKind::Press,
+            ..
+        }) => Some(*character),
+        _ => None,
+    }
+}
+
+fn parse_sgr_mouse(chars: &[char]) -> Option<MouseEvent> {
+    let final_char = *chars.last()?;
+    let payload: String = chars[2..chars.len().checked_sub(1)?].iter().collect();
+    let payload = payload.strip_suffix(';').unwrap_or(payload.as_str());
+    let fields: Vec<_> = payload.split(';').collect();
+    if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+        return None;
+    }
+    let cb = fields[0].parse::<u8>().ok()?;
+    let column = fields[1].parse::<u16>().ok()?;
+    let row = fields[2].parse::<u16>().ok()?;
+    if column == 0 || row == 0 {
+        return None;
+    }
+
+    let (mut kind, modifiers) = parse_sgr_mouse_button(cb)?;
+    if final_char == 'm'
+        && let MouseEventKind::Down(button) = kind
+    {
+        kind = MouseEventKind::Up(button);
+    }
+
+    Some(MouseEvent {
+        kind,
+        column: column - 1,
+        row: row - 1,
+        modifiers,
+    })
+}
+
+fn parse_sgr_mouse_button(cb: u8) -> Option<(MouseEventKind, KeyModifiers)> {
+    let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
+    let dragging = cb & 0b0010_0000 == 0b0010_0000;
+    let kind = match (button_number, dragging) {
+        (0, false) => MouseEventKind::Down(MouseButton::Left),
+        (1, false) => MouseEventKind::Down(MouseButton::Middle),
+        (2, false) => MouseEventKind::Down(MouseButton::Right),
+        (0, true) => MouseEventKind::Drag(MouseButton::Left),
+        (1, true) => MouseEventKind::Drag(MouseButton::Middle),
+        (2, true) => MouseEventKind::Drag(MouseButton::Right),
+        (3, false) => MouseEventKind::Up(MouseButton::Left),
+        (3, true) | (4, true) | (5, true) => MouseEventKind::Moved,
+        (4, false) => MouseEventKind::ScrollUp,
+        (5, false) => MouseEventKind::ScrollDown,
+        (6, false) => MouseEventKind::ScrollLeft,
+        (7, false) => MouseEventKind::ScrollRight,
+        _ => return None,
+    };
+
+    let mut modifiers = KeyModifiers::NONE;
+    if cb & 0b0000_0100 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if cb & 0b0000_1000 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if cb & 0b0001_0000 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    Some((kind, modifiers))
+}
+
+/// Returns whether an application-level confirmation modal owns an input event.
+///
+/// Confirmation dialogs sit above every pane and intentionally consume paste
+/// events so text or file paths cannot mutate a hidden composer.
+fn confirmation_modal_owns_event(event: &Event, reload_confirm: bool, quit_confirm: bool) -> bool {
+    matches!(event, Event::Paste(_)) && (reload_confirm || quit_confirm)
+}
 
 fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
     match event {
@@ -167,42 +397,50 @@ where
 }
 
 fn poll_input_event_and_snapshot<P, R, S>(
-    pending_event: Option<Event>,
+    input_decoder: &mut SgrMouseEventDecoder,
     mut poll: P,
     mut read: R,
     connection_state: S,
-) -> Result<(Option<Event>, Option<Event>, PostPollDispatchState)>
+) -> Result<(Option<Event>, PostPollDispatchState)>
 where
     P: FnMut(Duration) -> Result<bool>,
     R: FnMut() -> Result<Event>,
     S: FnOnce() -> ConnectionState,
 {
-    let input_event = if let Some(pending) = pending_event {
-        Some(pending)
-    } else if poll(TICK)? {
-        Some(read()?)
-    } else {
-        None
-    };
-    let (input_event, next_pending) = match input_event {
-        Some(input_event) => {
-            let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
-                if poll(Duration::ZERO)? {
-                    Ok(Some(read()?))
-                } else {
-                    Ok(None)
-                }
-            })?;
-            (Some(input_event), next_pending)
+    let input_event = loop {
+        if let Some(event) = input_decoder.next() {
+            break Some(event);
         }
-        None => (None, None),
+
+        if !poll(input_decoder.poll_timeout())? {
+            if input_decoder.flush_timed_out_candidate() {
+                continue;
+            }
+            break None;
+        }
+        input_decoder.feed(read()?);
     };
 
-    Ok((
-        input_event,
-        next_pending,
-        PostPollDispatchState::new(connection_state()),
-    ))
+    let input_event = match input_event {
+        Some(input_event) => {
+            let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
+                input_decoder.read_ready_with(|| {
+                    if poll(Duration::ZERO)? {
+                        Ok(Some(read()?))
+                    } else {
+                        Ok(None)
+                    }
+                })
+            })?;
+            if let Some(next_pending) = next_pending {
+                input_decoder.push_front(next_pending);
+            }
+            Some(input_event)
+        }
+        None => None,
+    };
+
+    Ok((input_event, PostPollDispatchState::new(connection_state())))
 }
 
 /// Ephemeral interaction state for the keybinding overlay. Keybinding
@@ -516,8 +754,9 @@ pub async fn run(
     let mut rpc = rpc;
 
     macro_rules! build_panes {
-        ($resume_chat:expr, $resume_acp:expr) => {
+        ($rpc:expr, $resume_chat:expr, $resume_acp:expr) => {
             async {
+                let rpc = $rpc;
                 let mut dashboard_pane =
                     dashboard::Dashboard::new(rpc.clone(), connect_label, insecure_tls);
                 dashboard_pane.init().await?;
@@ -535,16 +774,16 @@ pub async fn run(
                 chat_pane.set_resume_session_id($resume_chat.0);
                 chat_pane.set_resume_agent_alias($resume_chat.1);
                 chat_pane.init().await?;
-                let pending_start_chat = take_pending_quickstart_chat(
-                    &reconnect_state,
-                    QuickstartChatDrain::AfterReconnect,
-                );
                 let mut logs_pane = logs::Logs::new(rpc.clone());
                 logs_pane.init().await?;
                 let mut quickstart =
                     quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
                 quickstart.init().await?;
                 let sop_pane = sop_pane::SopPane::new(rpc.clone());
+                let pending_start_chat = take_pending_quickstart_chat(
+                    &reconnect_state,
+                    QuickstartChatDrain::AfterReconnect,
+                );
                 if let Some(alias) = pending_start_chat {
                     chat_pane.focus_agent(&alias).await;
                     mode = Mode::Chat;
@@ -574,12 +813,13 @@ pub async fn run(
         mut quickstart,
         mut sop_pane,
     ) = build_panes!(
+        Arc::clone(&rpc),
         (None::<String>, None::<String>),
         (None::<String>, None::<String>)
     )?;
     let mut chrome_status = ChromeStatus::default();
     chrome_status.tick(&rpc);
-    let mut pending_event = None;
+    let mut input_decoder = SgrMouseEventDecoder::default();
 
     loop {
         // Draw
@@ -761,7 +1001,7 @@ pub async fn run(
                 if let Some(result) = reconnect_result {
                     reconnect_attempt = None;
                     if let Ok(new_client) = result {
-                        rpc = Arc::new(new_client);
+                        let candidate_rpc = Arc::new(new_client);
                         let resume_chat = (
                             chat_pane.current_session_id().map(String::from),
                             chat_pane.current_agent_alias().map(String::from),
@@ -770,7 +1010,10 @@ pub async fn run(
                             acp_pane.current_session_id().map(String::from),
                             acp_pane.current_agent_alias().map(String::from),
                         );
-                        match build_panes!(resume_chat, resume_acp) {
+                        let candidate_panes =
+                            build_panes!(Arc::clone(&candidate_rpc), resume_chat, resume_acp);
+                        match publish_reconnect_candidate(&mut rpc, candidate_rpc, candidate_panes)
+                        {
                             Ok(mut panes) => {
                                 refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
                                 dashboard_pane = panes.0;
@@ -806,13 +1049,16 @@ pub async fn run(
         }
 
         // Poll for input with a timeout so live panes refresh periodically.
-        let (input_event, next_pending, dispatch_conn_state) = poll_input_event_and_snapshot(
-            pending_event.take(),
+        // A shorter deadline while an Escape-prefixed sequence is being
+        // assembled keeps an ordinary Escape key responsive. The fresh
+        // connection snapshot is taken only after sequence assembly and drag
+        // coalescing finish, or after a genuine no-input timeout.
+        let (input_event, dispatch_conn_state) = poll_input_event_and_snapshot(
+            &mut input_decoder,
             |timeout| Ok(event::poll(timeout)?),
             || Ok(event::read()?),
             || rpc.connection_state(),
         )?;
-        pending_event = next_pending;
 
         // The frame snapshot predates terminal polling and can become stale while
         // the event loop waits. Every post-poll RPC dispatch gate must share this
@@ -843,6 +1089,12 @@ pub async fn run(
             .await;
             continue;
         };
+
+        if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
+            // The visible confirmation modal is the authoritative input
+            // owner; discard paste instead of forwarding it underneath.
+            continue;
+        }
 
         match input_event {
             Event::Key(key) => {
@@ -1960,12 +2212,41 @@ mod tests {
     use std::collections::VecDeque;
 
     fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        mouse_event_with_modifiers(kind, column, row, KeyModifiers::NONE)
+    }
+
+    fn mouse_event_with_modifiers(
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
             kind,
             column,
             row,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
         })
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn decode_sgr_sequence(sequence: &str) -> Vec<Event> {
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(key_event(KeyCode::Esc));
+        for character in sequence.chars() {
+            decoder.feed(key_event(KeyCode::Char(character)));
+        }
+        std::iter::from_fn(|| decoder.next()).collect()
+    }
+
+    fn split_sgr_events(sequence: &str) -> VecDeque<Event> {
+        sequence
+            .chars()
+            .map(|character| key_event(KeyCode::Char(character)))
+            .collect()
     }
 
     #[test]
@@ -2104,6 +2385,190 @@ mod tests {
         assert_eq!(current, first);
         assert_eq!(pending, None);
         assert!(!read_ahead);
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_vertical_wheel_events() {
+        for (sequence, kind) in [
+            ("[<64;32;17M", MouseEventKind::ScrollUp),
+            ("[<65;32;17M", MouseEventKind::ScrollDown),
+        ] {
+            assert_eq!(
+                decode_sgr_sequence(sequence),
+                vec![mouse_event(kind, 31, 16)]
+            );
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_click_and_release_events() {
+        for (sequence, kind) in [
+            ("[<0;3;4M", MouseEventKind::Down(MouseButton::Left)),
+            ("[<1;3;4M", MouseEventKind::Down(MouseButton::Middle)),
+            ("[<2;3;4M", MouseEventKind::Down(MouseButton::Right)),
+            ("[<3;3;4M", MouseEventKind::Up(MouseButton::Left)),
+            ("[<0;3;4m", MouseEventKind::Up(MouseButton::Left)),
+        ] {
+            assert_eq!(decode_sgr_sequence(sequence), vec![mouse_event(kind, 2, 3)]);
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_drag_and_movement_events() {
+        for (sequence, kind) in [
+            ("[<32;5;6M", MouseEventKind::Drag(MouseButton::Left)),
+            ("[<33;5;6M", MouseEventKind::Drag(MouseButton::Middle)),
+            ("[<34;5;6M", MouseEventKind::Drag(MouseButton::Right)),
+            ("[<35;5;6M", MouseEventKind::Moved),
+        ] {
+            assert_eq!(decode_sgr_sequence(sequence), vec![mouse_event(kind, 4, 5)]);
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_horizontal_wheel_events() {
+        for (sequence, kind) in [
+            ("[<66;10;11M", MouseEventKind::ScrollLeft),
+            ("[<67;10;11M", MouseEventKind::ScrollRight),
+        ] {
+            assert_eq!(
+                decode_sgr_sequence(sequence),
+                vec![mouse_event(kind, 9, 10)]
+            );
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_preserves_modifiers_and_coordinates() {
+        assert_eq!(
+            decode_sgr_sequence("[<93;1;2M"),
+            vec![mouse_event_with_modifiers(
+                MouseEventKind::ScrollDown,
+                0,
+                1,
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+            )]
+        );
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_accepts_optional_delimiter_and_lowercase_release() {
+        assert_eq!(
+            decode_sgr_sequence("[<64;32;17;M"),
+            vec![mouse_event(MouseEventKind::ScrollUp, 31, 16)]
+        );
+        assert_eq!(
+            decode_sgr_sequence("[<0;32;17;m"),
+            vec![mouse_event(MouseEventKind::Up(MouseButton::Left), 31, 16)]
+        );
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_rejects_multiple_empty_trailing_fields() {
+        let sequence = "[<64;32;17;;M";
+        let expected: Vec<Event> = std::iter::once(key_event(KeyCode::Esc))
+            .chain(
+                sequence
+                    .chars()
+                    .map(|character| key_event(KeyCode::Char(character))),
+            )
+            .collect();
+
+        assert_eq!(decode_sgr_sequence(sequence), expected);
+    }
+
+    #[test]
+    fn drag_read_ahead_reassembles_split_sgr_drag_without_leaking_escape() {
+        let first_drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 4, 5);
+        let latest_drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 7, 8);
+        let following_key = key_event(KeyCode::Char('x'));
+        let mut queued = VecDeque::from([key_event(KeyCode::Esc)]);
+        queued.extend(split_sgr_events("[<32;8;9M"));
+        queued.push_back(following_key.clone());
+        let mut decoder = SgrMouseEventDecoder::default();
+
+        let (current, pending) = coalesce_mouse_drag(first_drag, || {
+            decoder.read_ready_with(|| Ok(queued.pop_front()))
+        })
+        .expect("reassemble SGR drag during read-ahead");
+
+        assert_eq!(current, latest_drag);
+        assert_eq!(pending, Some(following_key.clone()));
+        assert!(decoder.candidate.is_empty());
+        assert!(queued.is_empty());
+
+        decoder.push_front(pending.expect("preserve following input"));
+        assert_eq!(decoder.next(), Some(following_key));
+    }
+
+    #[test]
+    fn invalid_escape_prefix_is_replayed_in_order() {
+        let original = vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        ];
+        let mut decoder = SgrMouseEventDecoder::default();
+        for event in original.iter().cloned() {
+            decoder.feed(event);
+        }
+
+        let decoded: Vec<Event> = std::iter::from_fn(|| decoder.next()).collect();
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn incomplete_escape_flush_preserves_the_escape_key() {
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(escape.clone());
+
+        assert_eq!(decoder.next(), None);
+        assert!(decoder.flush_candidate());
+        assert_eq!(decoder.next(), Some(escape));
+    }
+
+    #[test]
+    fn delayed_input_flushes_an_expired_escape_before_the_next_tick() {
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(escape.clone());
+        decoder.candidate_started_at = Some(Instant::now() - SGR_MOUSE_SEQUENCE_TIMEOUT);
+
+        assert_eq!(decoder.poll_timeout(), Duration::ZERO);
+        assert!(decoder.flush_timed_out_candidate());
+        assert_eq!(decoder.next(), Some(escape));
+    }
+
+    #[test]
+    fn confirmation_modals_consume_text_and_path_paste_before_pane_dispatch() {
+        let paste_payloads = ["hidden composer text", "/tmp/hidden-attachment.txt"];
+        let modal_states = [(true, false), (false, true), (true, true)];
+
+        for (reload_confirm, quit_confirm) in modal_states {
+            for payload in paste_payloads {
+                // Both plain text and path-shaped paste must stop at the
+                // application modal boundary before any pane sees the value.
+                let event = Event::Paste(payload.to_owned());
+                assert!(confirmation_modal_owns_event(
+                    &event,
+                    reload_confirm,
+                    quit_confirm
+                ));
+            }
+        }
+
+        assert!(!confirmation_modal_owns_event(
+            &Event::Paste("visible composer text".to_owned()),
+            false,
+            false
+        ));
+        assert!(!confirmation_modal_owns_event(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -2314,8 +2779,9 @@ mod tests {
             let live_state = std::cell::RefCell::new(ConnectionState::Connected);
             let frame_state = live_state.borrow().clone();
             let event = std::cell::RefCell::new(event);
-            let (input_event, pending, dispatch_state) = poll_input_event_and_snapshot(
-                None,
+            let mut input_decoder = SgrMouseEventDecoder::default();
+            let (input_event, dispatch_state) = poll_input_event_and_snapshot(
+                &mut input_decoder,
                 |_| {
                     *live_state.borrow_mut() = ConnectionState::Disconnected {
                         reason: "disconnected while waiting for input".into(),
@@ -2328,7 +2794,6 @@ mod tests {
             .expect("poll input and take the post-poll snapshot");
 
             assert!(matches!(frame_state, ConnectionState::Connected));
-            assert_eq!(pending, None);
             (input_event, dispatch_state)
         }
 
@@ -2429,6 +2894,29 @@ mod tests {
             dispatch.contains("Event::Paste(text) if dispatch_conn_state.rpc_allowed()"),
             "paste dispatch must use the fresh post-poll snapshot"
         );
+    }
+
+    #[test]
+    fn reconnect_candidate_is_published_only_after_panes_build() {
+        let mut live = Arc::new("disconnected");
+        let disconnected = Arc::clone(&live);
+        let failed_candidate = Arc::new("failed candidate");
+        let failure = publish_reconnect_candidate(
+            &mut live,
+            failed_candidate,
+            Err::<(), _>(anyhow::Error::msg("pane initialization failed")),
+        );
+
+        assert!(failure.is_err());
+        assert!(Arc::ptr_eq(&live, &disconnected));
+
+        let candidate = Arc::new("connected");
+        let expected = Arc::clone(&candidate);
+        let panes = publish_reconnect_candidate(&mut live, candidate, Ok("rebuilt panes"))
+            .expect("successful pane build publishes the candidate");
+
+        assert_eq!(panes, "rebuilt panes");
+        assert!(Arc::ptr_eq(&live, &expected));
     }
 
     #[tokio::test]
