@@ -16,6 +16,7 @@ use zeroclaw_runtime::rpc::types::{
 
 use super::AppState;
 use super::api::require_auth;
+use super::api_config::persist_and_swap;
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
@@ -1069,13 +1070,17 @@ pub async fn handle_section_select(
         working.mark_dirty(&fields_prefix);
     }
 
-    if let Err(e) = working.save_dirty().await {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ReloadFailed,
-            format!("save after select failed: {e}"),
-        ));
+    if working.dirty_paths.is_empty() {
+        return axum::Json(SelectItemResponse {
+            fields_prefix,
+            created,
+        })
+        .into_response();
     }
-    *state.config.write() = working;
+
+    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+        return error_response(e);
+    }
 
     axum::Json(SelectItemResponse {
         fields_prefix,
@@ -1754,12 +1759,124 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let cfg = state.config.read().clone();
         assert_eq!(cfg.tunnel.tunnel_provider, "cloudflare");
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        let raw = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
+        let disk_value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            disk_value
+                .get("tunnel")
+                .and_then(|value| value.get("tunnel_provider"))
+                .and_then(toml::Value::as_str),
+            Some(cfg.tunnel.tunnel_provider.as_str()),
+            "section selection must persist and publish the selected provider"
+        );
         let items = tunnel_provider_picker(&cfg);
         let cloudflare = items
             .iter()
             .find(|item| item.key == "cloudflare")
             .expect("cloudflare should appear in the picker");
         assert_eq!(cloudflare.badge.as_deref(), Some("active"));
+    }
+
+    #[tokio::test]
+    async fn existing_section_selection_without_changes_skips_reload() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("seed model provider alias");
+        cfg.save().await.expect("seed disk config");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read seed config");
+        let state = section_test_state(cfg);
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "providers.models".to_string(),
+                key: "anthropic".to_string(),
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(json["fields_prefix"], "providers.models.anthropic.default");
+        assert_eq!(json["created"], false);
+
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        let live_after = state.config.read().clone();
+        let live_before_value = toml::Value::try_from(&live_before).unwrap();
+        let live_after_value = toml::Value::try_from(&live_after).unwrap();
+        assert_eq!(
+            live_after_value, live_before_value,
+            "an existing selection must not replace the live snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn section_select_failed_save_retains_prior_live_and_disk_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::create_dir_all(&config_path).unwrap();
+        let state = section_test_state(zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        });
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "cloudflare".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            config_path.is_dir(),
+            "failed save must retain the prior disk state"
+        );
+        let live_after = state.config.read().clone();
+        assert_eq!(
+            live_after.tunnel.tunnel_provider, live_before.tunnel.tunnel_provider,
+            "failed save must not publish the working snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]
