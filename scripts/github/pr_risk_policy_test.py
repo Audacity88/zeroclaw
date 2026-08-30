@@ -214,6 +214,21 @@ class RiskPolicyTest(unittest.TestCase):
             with self.assertRaisesRegex(policy.PolicyError, "reviews changed"):
                 policy.evaluate(api, 1, POLICY_PATH, roster_file(Path(directory)))
 
+    def test_head_change_during_evaluation_fails_closed(self) -> None:
+        class ChangingHeadAPI(FakeAPI):
+            pull_reads = 0
+
+            def get_pull(self, number: int) -> dict[str, object]:
+                self.pull_reads += 1
+                if self.pull_reads == 1:
+                    return super().get_pull(number)
+                return pull(["risk:high"], head={"sha": "c" * 40})
+
+        api = ChangingHeadAPI(pull(["risk:high"]), [changed_file("wit/plugin.wit")])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(policy.PolicyError, "metadata changed"):
+                policy.evaluate(api, 1, POLICY_PATH, roster_file(Path(directory)))
+
     def test_malformed_api_and_roster_fail_closed(self) -> None:
         with self.assertRaises(policy.PolicyError):
             policy.parse_pr_metadata({"head": {"sha": HEAD}, "base": {"sha": BASE}, "labels": [{"bad": "label"}], "changed_files": 1})
