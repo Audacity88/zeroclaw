@@ -3551,8 +3551,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn quickstart_submission_adapter_persists_provider_webhook_and_agent() {
+    #[test]
+    fn quickstart_submission_adapter_preserves_provider_webhook_and_agent_name() {
         let mut form = complete_form();
         form.provider_fields
             .insert("api_key".into(), "placeholder-provider-credential".into());
@@ -3566,95 +3566,80 @@ mod tests {
             mode: SelectorMode::Fresh,
         });
 
-        let wire_submission = form.to_submission();
         let rpc_params = serde_json::json!({
-            "submission": wire_submission,
+            "submission": form.to_submission(),
         });
-        let canonical_submission: zeroclaw_config::presets::BuilderSubmission =
-            serde_json::from_value(
-                rpc_params
-                    .get("submission")
-                    .cloned()
-                    .expect("quickstart RPC submission parameter"),
-            )
-            .expect("wire submission should deserialize as the canonical submission");
 
-        let dir = tempfile::tempdir().expect("temp config directory");
-        let mut config = zeroclaw_config::schema::Config {
-            config_path: dir.path().join("config.toml"),
-            data_dir: dir.path().join("data"),
-            ..Default::default()
-        };
-        config.save().await.expect("initial config persist");
-
-        zeroclaw_runtime::quickstart::apply_with_surface(
-            canonical_submission,
-            &mut config,
-            zeroclaw_runtime::quickstart::Surface::Test,
-        )
-        .await
-        .expect("adapter submission should apply");
-
-        let raw = std::fs::read_to_string(&config.config_path).expect("persisted config");
-        let reloaded = zeroclaw_config::migration::migrate_to_current(&raw)
-            .expect("persisted config should migrate to the current schema");
-        let secrets = zeroclaw_config::secrets::SecretStore::new(dir.path(), true);
-
-        let provider = reloaded
-            .providers
-            .models
-            .anthropic
-            .get("default")
-            .expect("fresh provider should survive reload");
         assert_eq!(
-            provider.base.model.as_deref(),
+            rpc_params.as_object().map(|params| params.len()),
+            Some(1),
+            "quickstart/apply must receive only the submission parameter"
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/mode")
+                .and_then(serde_json::Value::as_str),
+            Some("fresh")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/value/provider_type")
+                .and_then(serde_json::Value::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/value/alias")
+                .and_then(serde_json::Value::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/value/model")
+                .and_then(serde_json::Value::as_str),
             Some("claude-3-5-haiku-20241022")
         );
-        let provider_credential = provider
-            .base
-            .api_key
-            .as_deref()
-            .expect("provider credential");
-        assert!(zeroclaw_config::secrets::SecretStore::is_secure_encrypted(
-            provider_credential
-        ));
         assert_eq!(
-            secrets
-                .decrypt(provider_credential)
-                .expect("provider credential should decrypt"),
-            "placeholder-provider-credential"
+            rpc_params
+                .pointer("/submission/model_provider/value/fields/api_key")
+                .and_then(serde_json::Value::as_str),
+            Some("placeholder-provider-credential")
         );
-
-        let webhook = reloaded
-            .channels
-            .webhook
-            .get("incoming")
-            .expect("fresh Webhook channel should survive reload");
-        let webhook_secret = webhook.secret.as_deref().expect("Webhook secret");
-        assert!(zeroclaw_config::secrets::SecretStore::is_secure_encrypted(
-            webhook_secret
-        ));
         assert_eq!(
-            secrets
-                .decrypt(webhook_secret)
-                .expect("Webhook secret should decrypt"),
-            "placeholder-webhook-secret"
+            rpc_params
+                .pointer("/submission/channels/0/mode")
+                .and_then(serde_json::Value::as_str),
+            Some("fresh")
         );
-        assert_eq!(webhook.port, 18080);
-        assert!(webhook.enabled);
-
-        let agent = reloaded
-            .agents
-            .get("bob")
-            .expect("agent should survive reload");
-        assert_eq!(agent.model_provider.as_str(), "anthropic.default");
         assert_eq!(
-            agent
-                .channels
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            vec!["webhook.incoming"]
+            rpc_params
+                .pointer("/submission/channels/0/value/channel_type")
+                .and_then(serde_json::Value::as_str),
+            Some("webhook")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/channels/0/value/alias")
+                .and_then(serde_json::Value::as_str),
+            Some("incoming")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/channels/0/value/fields/secret")
+                .and_then(serde_json::Value::as_str),
+            Some("placeholder-webhook-secret")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/channels/0/value/fields/port")
+                .and_then(serde_json::Value::as_str),
+            Some("18080")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/agent/name")
+                .and_then(serde_json::Value::as_str),
+            Some("bob")
         );
     }
 

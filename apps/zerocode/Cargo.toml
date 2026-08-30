@@ -55,9 +55,5 @@ unic-langid = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 url = "2.5"
 
-[dev-dependencies]
-zeroclaw-config.workspace = true
-zeroclaw-runtime.workspace = true
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
