@@ -138,6 +138,18 @@ impl PostPollDispatchState {
     fn rpc_allowed(&self) -> bool {
         !matches!(self.0, ConnectionState::Disconnected { .. })
     }
+
+    async fn run_rpc_dispatch<F, Fut, T>(&self, dispatch: F) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        if self.rpc_allowed() {
+            Some(dispatch().await)
+        } else {
+            None
+        }
+    }
 }
 
 /// How often the UI redraws when no input arrives (for live panes).
@@ -1065,28 +1077,29 @@ pub async fn run(
         // one fresh state so a disconnect cannot enter any dead-client handler.
 
         let Some(input_event) = input_event else {
-            if !dispatch_conn_state.rpc_allowed() {
-                continue;
-            }
-            if mode == Mode::Dashboard {
-                dashboard_pane.tick().await;
-            }
-            if mode == Mode::Logs {
-                logs_pane.tick().await;
-            }
-            if mode == Mode::Quickstart {
-                quickstart.tick().await;
-            }
-            if mode == Mode::Sop {
-                sop_pane.tick();
-            }
-            consume_pending_quickstart_chat(
-                &dispatch_conn_state,
-                &reconnect_state,
-                &mut mode,
-                &mut chat_pane,
-            )
-            .await;
+            dispatch_conn_state
+                .run_rpc_dispatch(|| async {
+                    if mode == Mode::Dashboard {
+                        dashboard_pane.tick().await;
+                    }
+                    if mode == Mode::Logs {
+                        logs_pane.tick().await;
+                    }
+                    if mode == Mode::Quickstart {
+                        quickstart.tick().await;
+                    }
+                    if mode == Mode::Sop {
+                        sop_pane.tick();
+                    }
+                    consume_pending_quickstart_chat(
+                        &dispatch_conn_state,
+                        &reconnect_state,
+                        &mut mode,
+                        &mut chat_pane,
+                    )
+                    .await;
+                })
+                .await;
             continue;
         };
 
@@ -1167,11 +1180,16 @@ pub async fn run(
                     match ModalAction::from_chord(&key) {
                         Some(ModalAction::Confirm) => {
                             reload_confirm = false;
-                            if dispatch_conn_state.rpc_allowed() {
-                                reload_status = Some(match rpc.config_reload().await {
-                                    Ok(_) => crate::i18n::t("zc-app-reload-status-signalled"),
-                                    Err(e) => format!("Reload requested ({e})"),
-                                });
+                            if let Some(status) = dispatch_conn_state
+                                .run_rpc_dispatch(|| async {
+                                    match rpc.config_reload().await {
+                                        Ok(_) => crate::i18n::t("zc-app-reload-status-signalled"),
+                                        Err(e) => format!("Reload requested ({e})"),
+                                    }
+                                })
+                                .await
+                            {
+                                reload_status = Some(status);
                             }
                         }
                         Some(ModalAction::Cancel) => {
@@ -1244,20 +1262,24 @@ pub async fn run(
 
                 // Skip pane key handlers when disconnected — they may
                 // issue RPC calls that hang on the dead socket.
-                if !dispatch_conn_state.rpc_allowed() {
+                let Some(quit) = dispatch_conn_state
+                    .run_rpc_dispatch(|| async {
+                        anyhow::Ok(match mode {
+                            Mode::Dashboard => dashboard_pane.handle_key(key).await,
+                            Mode::Config => config_app.handle_key(key, term).await?,
+                            Mode::Doctor => doctor_pane.handle_key(key).await,
+                            Mode::Acp => acp_pane.handle_key(key, term).await,
+                            Mode::Chat => chat_pane.handle_key(key, term).await,
+                            Mode::Logs => logs_pane.handle_key(key).await,
+                            Mode::Quickstart => quickstart.handle_key(key).await,
+                            Mode::Sop => sop_pane.handle_key(key).await,
+                        })
+                    })
+                    .await
+                else {
                     continue;
-                }
-
-                let quit = match mode {
-                    Mode::Dashboard => dashboard_pane.handle_key(key).await,
-                    Mode::Config => config_app.handle_key(key, term).await?,
-                    Mode::Doctor => doctor_pane.handle_key(key).await,
-                    Mode::Acp => acp_pane.handle_key(key, term).await,
-                    Mode::Chat => chat_pane.handle_key(key, term).await,
-                    Mode::Logs => logs_pane.handle_key(key).await,
-                    Mode::Quickstart => quickstart.handle_key(key).await,
-                    Mode::Sop => sop_pane.handle_key(key).await,
                 };
+                let quit = quit?;
                 if quit {
                     break;
                 }
@@ -1334,40 +1356,46 @@ pub async fn run(
                     continue;
                 }
                 // Forward to active pane (skip when disconnected).
-                if dispatch_conn_state.rpc_allowed() {
-                    match mode {
-                        Mode::Dashboard => {
-                            dashboard_pane.handle_mouse(mouse, content_area);
+                if let Some(result) = dispatch_conn_state
+                    .run_rpc_dispatch(|| async {
+                        match mode {
+                            Mode::Dashboard => {
+                                dashboard_pane.handle_mouse(mouse, content_area);
+                            }
+                            Mode::Config => {
+                                config_app.handle_mouse(mouse, content_area, term).await?;
+                            }
+                            Mode::Doctor => {
+                                doctor_pane.handle_mouse(mouse, content_area);
+                            }
+                            Mode::Logs => {
+                                logs_pane.handle_mouse(mouse, content_area);
+                            }
+                            Mode::Acp => {
+                                acp_pane.handle_mouse(mouse, content_area).await;
+                            }
+                            Mode::Chat => {
+                                chat_pane.handle_mouse(mouse, content_area).await;
+                            }
+                            Mode::Quickstart => {
+                                quickstart.handle_mouse(mouse, content_area).await;
+                            }
+                            Mode::Sop => {
+                                sop_pane.handle_mouse(mouse).await;
+                            }
                         }
-                        Mode::Config => {
-                            config_app.handle_mouse(mouse, content_area, term).await?;
-                        }
-                        Mode::Doctor => {
-                            doctor_pane.handle_mouse(mouse, content_area);
-                        }
-                        Mode::Logs => {
-                            logs_pane.handle_mouse(mouse, content_area);
-                        }
-                        Mode::Acp => {
-                            acp_pane.handle_mouse(mouse, content_area).await;
-                        }
-                        Mode::Chat => {
-                            chat_pane.handle_mouse(mouse, content_area).await;
-                        }
-                        Mode::Quickstart => {
-                            quickstart.handle_mouse(mouse, content_area).await;
-                        }
-                        Mode::Sop => {
-                            sop_pane.handle_mouse(mouse).await;
-                        }
-                    }
-                    consume_pending_quickstart_chat(
-                        &dispatch_conn_state,
-                        &reconnect_state,
-                        &mut mode,
-                        &mut chat_pane,
-                    )
-                    .await;
+                        consume_pending_quickstart_chat(
+                            &dispatch_conn_state,
+                            &reconnect_state,
+                            &mut mode,
+                            &mut chat_pane,
+                        )
+                        .await;
+                        anyhow::Ok(())
+                    })
+                    .await
+                {
+                    result?;
                 }
             }
             Event::Paste(text) if help_overlay.is_some() => {
@@ -1378,24 +1406,28 @@ pub async fn run(
                     state.scroll = 0;
                 }
             }
-            Event::Paste(text) if dispatch_conn_state.rpc_allowed() => {
-                match mode {
-                    Mode::Chat => chat_pane.handle_paste(&text),
-                    Mode::Acp => acp_pane.handle_paste(&text),
-                    Mode::Config => config_app.handle_paste(&text),
-                    Mode::Doctor => doctor_pane.handle_paste(&text),
-                    Mode::Quickstart => quickstart.handle_paste(&text),
-                    Mode::Dashboard => dashboard_pane.handle_paste(&text),
-                    Mode::Logs => logs_pane.handle_paste(&text),
-                    Mode::Sop => sop_pane.handle_paste(&text),
-                }
-                consume_pending_quickstart_chat(
-                    &dispatch_conn_state,
-                    &reconnect_state,
-                    &mut mode,
-                    &mut chat_pane,
-                )
-                .await;
+            Event::Paste(text) => {
+                dispatch_conn_state
+                    .run_rpc_dispatch(|| async {
+                        match mode {
+                            Mode::Chat => chat_pane.handle_paste(&text),
+                            Mode::Acp => acp_pane.handle_paste(&text),
+                            Mode::Config => config_app.handle_paste(&text),
+                            Mode::Doctor => doctor_pane.handle_paste(&text),
+                            Mode::Quickstart => quickstart.handle_paste(&text),
+                            Mode::Dashboard => dashboard_pane.handle_paste(&text),
+                            Mode::Logs => logs_pane.handle_paste(&text),
+                            Mode::Sop => sop_pane.handle_paste(&text),
+                        }
+                        consume_pending_quickstart_chat(
+                            &dispatch_conn_state,
+                            &reconnect_state,
+                            &mut mode,
+                            &mut chat_pane,
+                        )
+                        .await;
+                    })
+                    .await;
             }
             _ => {} // Resize, etc. — just redraw on next iteration
         }
@@ -2773,8 +2805,8 @@ mod tests {
         assert!(should_handle_global_quit(&dispatch_state, false));
     }
 
-    #[test]
-    fn post_poll_snapshot_blocks_tick_and_non_quit_dispatch_after_disconnect() {
+    #[tokio::test]
+    async fn post_poll_snapshot_blocks_tick_and_non_quit_dispatch_after_disconnect() {
         fn poll_after_disconnect(event: Option<Event>) -> (Option<Event>, PostPollDispatchState) {
             let live_state = std::cell::RefCell::new(ConnectionState::Connected);
             let frame_state = live_state.borrow().clone();
@@ -2800,6 +2832,21 @@ mod tests {
         let (timeout_event, timeout_state) = poll_after_disconnect(None);
         assert_eq!(timeout_event, None);
         assert!(!timeout_state.rpc_allowed());
+
+        for family in ["tick", "key", "mouse", "paste", "reload"] {
+            let invoked = std::cell::Cell::new(false);
+            let result = timeout_state
+                .run_rpc_dispatch(|| async {
+                    invoked.set(true);
+                    family
+                })
+                .await;
+            assert_eq!(result, None, "{family} must remain locally suppressed");
+            assert!(
+                !invoked.get(),
+                "{family} must not enter its RPC dispatch path"
+            );
+        }
 
         let pane_navigation_key = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
         let pane_navigation = Event::Key(pane_navigation_key);
@@ -2853,25 +2900,25 @@ mod tests {
             dispatch,
             "let Some(input_event) = input_event else",
             "match input_event",
-            "if !dispatch_conn_state.rpc_allowed()",
+            ".run_rpc_dispatch(|| async",
         );
         assert_between(
             dispatch,
             "let editor_claims_pane_navigation",
-            "let quit = match mode",
+            "let Some(quit) = dispatch_conn_state",
             "let pane_can_receive_editor_chord = dispatch_conn_state.rpc_allowed()",
         );
         assert_between(
             dispatch,
             "let editor_claims_pane_navigation",
-            "let quit = match mode",
+            "let Some(quit) = dispatch_conn_state",
             "&dispatch_conn_state",
         );
         assert_between(
             dispatch,
             "let editor_claims_pane_navigation",
-            "let quit = match mode",
-            "if !dispatch_conn_state.rpc_allowed()",
+            "let Some(quit) = dispatch_conn_state",
+            "switch_mode(",
         );
         assert_between(
             dispatch,
@@ -2883,7 +2930,7 @@ mod tests {
             dispatch,
             "Event::Mouse(mouse) =>",
             "Event::Paste(text) if help_overlay.is_some()",
-            "if dispatch_conn_state.rpc_allowed()",
+            ".run_rpc_dispatch(|| async",
         );
         assert!(
             dispatch
@@ -2891,7 +2938,8 @@ mod tests {
             "local Ctrl+C routing must use the fresh post-poll snapshot"
         );
         assert!(
-            dispatch.contains("Event::Paste(text) if dispatch_conn_state.rpc_allowed()"),
+            dispatch.contains("Event::Paste(text) =>")
+                && dispatch.contains(".run_rpc_dispatch(|| async"),
             "paste dispatch must use the fresh post-poll snapshot"
         );
     }
