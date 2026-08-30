@@ -1,7 +1,7 @@
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
-    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
+    ModelProvider, ProviderCapabilities, ProviderImageInputRejected, StreamChunk, StreamError,
+    StreamEvent, StreamOptions, StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -143,6 +143,48 @@ struct NativeChatRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<NativeThinkingConfig>,
+}
+
+fn native_messages_contain_image_blocks(messages: &[NativeMessage]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, NativeContentOut::Image { .. }))
+    })
+}
+
+async fn api_error_for_request(
+    model_provider: &str,
+    response: reqwest::Response,
+    request_contains_images: bool,
+) -> anyhow::Error {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| format!("HTTP error: {status}"));
+    if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
+        return anyhow::Error::new(ProviderImageInputRejected::new(
+            None,
+            super::sanitize_api_error(&body),
+        ));
+    }
+    super::api_error_from_parts(model_provider, status, &body)
+}
+
+fn stream_error_for_response(
+    status: reqwest::StatusCode,
+    body: &str,
+    request_contains_images: bool,
+) -> StreamError {
+    if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
+        return StreamError::from(ProviderImageInputRejected::new(
+            None,
+            super::sanitize_api_error(body),
+        ));
+    }
+    StreamError::ModelProvider(format!("{status}: {body}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -2383,6 +2425,8 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: thinking_config,
         };
+        let request_contains_images =
+            native_messages_contain_image_blocks(&native_request.messages);
 
         let req = self
             .http_client()
@@ -2393,7 +2437,9 @@ impl ModelProvider for AnthropicModelProvider {
 
         let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
+            return Err(
+                api_error_for_request("Anthropic", response, request_contains_images).await,
+            );
         }
 
         let native_response: NativeChatResponse = response.json().await?;
@@ -2573,6 +2619,8 @@ impl ModelProvider for AnthropicModelProvider {
                 stream: None,
                 thinking: thinking_config,
             };
+            let request_contains_images =
+                native_messages_contain_image_blocks(&native_request.messages);
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
             let body = serde_json::to_value(&native_request)
@@ -2608,7 +2656,11 @@ impl ModelProvider for AnthropicModelProvider {
                         .text()
                         .await
                         .unwrap_or_else(|_| format!("HTTP error: {status}"));
-                    return Err(StreamError::ModelProvider(format!("{status}: {body}")));
+                    return Err(stream_error_for_response(
+                        status,
+                        &body,
+                        request_contains_images,
+                    ));
                 }
                 let parsed: NativeChatResponse = response
                     .json()
@@ -2673,6 +2725,8 @@ impl ModelProvider for AnthropicModelProvider {
             stream: Some(true),
             thinking: thinking_config,
         };
+        let request_contains_images =
+            native_messages_contain_image_blocks(&native_request.messages);
 
         let body = match Self::build_streaming_request(&native_request) {
             Ok(body) => body,
@@ -2757,9 +2811,11 @@ impl ModelProvider for AnthropicModelProvider {
                     ),
                 };
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!(
-                        "{status}: {error}"
-                    ))))
+                    .send(Err(stream_error_for_response(
+                        status,
+                        &error,
+                        request_contains_images,
+                    )))
                     .await;
                 return;
             }
@@ -3352,6 +3408,55 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(
             !saw_usage,
             "must not emit Usage when provider sent no usage frames"
+        );
+    }
+
+    #[test]
+    fn native_image_bad_request_preserves_typed_stream_rejection() {
+        let image_messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                },
+            }],
+        }];
+        assert!(native_messages_contain_image_blocks(&image_messages));
+
+        let typed = stream_error_for_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"image rejected: sk-test-secret"}}"#,
+            native_messages_contain_image_blocks(&image_messages),
+        );
+        assert!(matches!(
+            typed,
+            StreamError::ProviderImageInputRejected(ProviderImageInputRejected {
+                image_indices: None,
+                detail,
+            }) if detail.contains("image rejected") && !detail.contains("sk-test-secret")
+        ));
+    }
+
+    #[test]
+    fn native_text_bad_request_remains_an_ordinary_stream_error() {
+        let text_messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::Text {
+                text: "hello".to_string(),
+                cache_control: None,
+            }],
+        }];
+        assert!(!native_messages_contain_image_blocks(&text_messages));
+
+        let error = stream_error_for_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            "bad request",
+            native_messages_contain_image_blocks(&text_messages),
+        );
+        assert!(
+            matches!(error, StreamError::ModelProvider(message) if message.contains("bad request"))
         );
     }
 
