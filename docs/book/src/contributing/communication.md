@@ -72,7 +72,7 @@ The Focus column describes where each person works, not how much authority they 
 | [@Stalesamy](https://github.com/Stalesamy) | Core Team | Marketing and community, plus occasional PRs |
 | [@perlowja](https://github.com/perlowja) | Core Team | Marketing and community, plus occasional PRs |
 
-Repository automation uses this table as the operational projection of current Core Team membership when it evaluates the conditional two-Core-approval merge policy. The parser accepts only unique GitHub handles whose Role includes `Core Team` and fails closed if the table is empty or malformed. Update this summary promptly after a public membership decision so the automated projection remains accurate; editing the table records that decision downstream but does not create or end membership.
+Repository automation uses this table as the operational projection of current Core Team membership when it evaluates the conditional two-Core-approval merge policy. The parser accepts only unique GitHub handles whose Role begins with `Core Team` and fails closed if the table is empty or malformed. Update this summary promptly after a public membership decision so the automated projection remains accurate; editing the table records that decision downstream but does not create or end membership.
 
 Not everyone listed reviews code. Route code review by the Focus column and by CODEOWNERS, not by tier.
 
