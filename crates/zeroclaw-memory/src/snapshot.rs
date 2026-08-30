@@ -121,13 +121,14 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
 
     for (key, content) in &entries {
         let id = uuid::Uuid::new_v4().to_string();
-        tx.execute(
+        let changed = tx.execute(
             "INSERT INTO memories (
                 id, key, content, category, created_at, updated_at, agent_id
-             ) VALUES (?1, ?2, ?3, 'core', ?4, ?5, ?6)",
+             ) VALUES (?1, ?2, ?3, 'core', ?4, ?5, ?6)
+             ON CONFLICT(agent_id, key) DO NOTHING",
             params![id, key, content, now, now, default_agent_id],
         )?;
-        hydrated += 1;
+        hydrated += changed;
     }
 
     tx.commit()?;
@@ -446,7 +447,7 @@ Rule 3: Protect the user.
     }
 
     #[test]
-    fn hydrate_rolls_back_entire_batch_on_insert_failure() {
+    fn hydrate_keeps_first_duplicate_key() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path();
         fs::write(
@@ -455,8 +456,47 @@ Rule 3: Protect the user.
         )
         .unwrap();
 
-        assert!(hydrate_from_snapshot(workspace).is_err());
+        assert_eq!(hydrate_from_snapshot(workspace).unwrap(), 1);
         let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE key = 'first'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "first value");
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1);
+    }
+
+    #[test]
+    fn hydrate_rolls_back_entire_batch_on_insert_failure() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::write(
+            workspace.join(SNAPSHOT_FILENAME),
+            "### 🔑 `first`\n\nfirst value\n\n### 🔑 `second`\n\nsecond value\n",
+        )
+        .unwrap();
+
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = SqliteMemory::open_and_initialize(&db_path, None).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_second_snapshot_entry
+             BEFORE INSERT ON memories
+             WHEN NEW.key = 'second'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected snapshot insert failure');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(hydrate_from_snapshot(workspace).is_err());
+        let conn = Connection::open(db_path).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
             .unwrap();
