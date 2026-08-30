@@ -110,7 +110,7 @@ directories = "6.0"
 toml = "1.0"
 
 # JSON Schema generation for config export
-schemars = "1.2"
+schemars = { version = "1.2", optional = true }
 
 # Logging - minimal
 
@@ -195,6 +195,7 @@ non_row_features = [
 dist_extra_features = [
     "channel-matrix",
     "channel-lark",
+    "channel-git",
     "whatsapp-web",
 ]
 
@@ -262,7 +263,7 @@ gateway = [
     "dep:zeroclaw-gateway",
     "dep:axum", "dep:tower",
 ]
-schema-export = ["zeroclaw-config/schema-export"]
+schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 acp-bridge = ["dep:tokio-tungstenite"]
 
 # Channels — each forwards to zeroclaw-channels.
@@ -405,6 +406,11 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
+# Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
+# so this package's integration-test helpers can mint the now-sealed engine tool
+# registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
+# binary build, so the assemble()-only seal holds in production.
+zeroclaw-runtime = { workspace = true, features = ["test-util"] }
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
@@ -442,6 +448,12 @@ path = "tests/test_live.rs"
 [[test]]
 name = "architecture"
 path = "tests/test_architecture.rs"
+
+# Cross-crate activation proof: a configured channel plugin reaching a real
+# WASM component. Needs `plugins-wasm-cranelift` and the wasm32-wasip2 target.
+[[test]]
+name = "plugin_channel_runtime_e2e"
+path = "tests/plugin_channel_runtime_e2e.rs"
 
 [[bench]]
 name = "agent_benchmarks"
