@@ -291,7 +291,7 @@ impl Tool for SessionsListTool {
                 last_activity: summary.last_activity,
                 message_count: summary.message_count,
             }));
-            metadata.sort_by(|left, right| right.last_activity.cmp(&left.last_activity));
+            metadata.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
         }
 
         if metadata.is_empty() {
