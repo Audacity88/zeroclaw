@@ -1145,10 +1145,7 @@ mod tests {
     #[test]
     fn sync_failure_keeps_appended_file_and_current_period_cache_visible() {
         fn fail_sync(_: &File) -> std::io::Result<()> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "forced sync failure",
-            ))
+            Err(std::io::Error::other("forced sync failure"))
         }
 
         let tmp = TempDir::new().unwrap();
