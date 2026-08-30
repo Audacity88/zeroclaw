@@ -390,7 +390,7 @@ Rule 3: Protect the user.
 
         let agent_id_not_null: i64 = conn
             .query_row(
-                "SELECT notnull FROM pragma_table_info('memories') WHERE name = 'agent_id'",
+                "SELECT [notnull] FROM pragma_table_info('memories') WHERE name = 'agent_id'",
                 [],
                 |row| row.get(0),
             )
