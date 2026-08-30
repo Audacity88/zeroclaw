@@ -13385,6 +13385,13 @@ pub(crate) mod tests {
         after_start.split_once(end).map(|(segment, _)| segment)
     }
 
+    fn announcement_arm_supports_delivery(dispatch: &str, key: &str) -> bool {
+        [format!("\"{key}\" => {{"), format!("\"{key}\" |")]
+            .iter()
+            .find_map(|marker| source_block_after(dispatch, marker, "        "))
+            .is_some_and(|arm| arm.contains("zeroclaw_api::channel::Channel::send("))
+    }
+
     fn assert_channel_surface_disposition(
         key: &str,
         surface: &str,
@@ -34135,13 +34142,7 @@ Done."#;
                 let surface_available =
                     !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
                         || cfg!(feature = "whatsapp-web");
-                let production_support_detected = [
-                    format!("\"{key}\" =>"),
-                    format!("\"{key}\" |"),
-                    format!("| \"{key}\" =>"),
-                ]
-                .iter()
-                .any(|arm| dispatch.contains(arm));
+                let production_support_detected = announcement_arm_supports_delivery(dispatch, key);
                 assert_channel_surface_disposition(
                     key,
                     "announcement delivery",
@@ -34171,6 +34172,25 @@ Done."#;
                 result.is_err(),
                 "{surface} support must fail while its unsupported disposition is stale"
             );
+        }
+    }
+
+    #[test]
+    fn compiled_channel_announcement_guard_requires_positive_delivery_in_combined_arms() {
+        let dispatch = r#"
+        "supported" | "supported-alias" => {
+            zeroclaw_api::channel::Channel::send(&ch, &message).await?;
+        }
+        "rejected" | "rejected-alias" => {
+            anyhow::bail!("not connected");
+        }
+"#;
+
+        for key in ["supported", "supported-alias"] {
+            assert!(announcement_arm_supports_delivery(dispatch, key));
+        }
+        for key in ["rejected", "rejected-alias"] {
+            assert!(!announcement_arm_supports_delivery(dispatch, key));
         }
     }
 
