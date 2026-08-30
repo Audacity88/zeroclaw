@@ -3551,6 +3551,113 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn quickstart_submission_adapter_persists_provider_webhook_and_agent() {
+        let mut form = complete_form();
+        form.provider_fields
+            .insert("api_key".into(), "placeholder-provider-credential".into());
+        form.channels.push(ChannelDraft {
+            channel_type: "webhook".into(),
+            alias: "incoming".into(),
+            fields: std::collections::HashMap::from([
+                ("secret".into(), "placeholder-webhook-secret".into()),
+                ("port".into(), "18080".into()),
+            ]),
+            mode: SelectorMode::Fresh,
+        });
+
+        let wire_submission = form.to_submission();
+        let rpc_params = serde_json::json!({
+            "submission": wire_submission,
+        });
+        let canonical_submission: zeroclaw_config::presets::BuilderSubmission =
+            serde_json::from_value(
+                rpc_params
+                    .get("submission")
+                    .cloned()
+                    .expect("quickstart RPC submission parameter"),
+            )
+            .expect("wire submission should deserialize as the canonical submission");
+
+        let dir = tempfile::tempdir().expect("temp config directory");
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.expect("initial config persist");
+
+        zeroclaw_runtime::quickstart::apply_with_surface(
+            canonical_submission,
+            &mut config,
+            zeroclaw_runtime::quickstart::Surface::Test,
+        )
+        .await
+        .expect("adapter submission should apply");
+
+        let raw = std::fs::read_to_string(&config.config_path).expect("persisted config");
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&raw)
+            .expect("persisted config should migrate to the current schema");
+        let secrets = zeroclaw_config::secrets::SecretStore::new(dir.path(), true);
+
+        let provider = reloaded
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .expect("fresh provider should survive reload");
+        assert_eq!(
+            provider.base.model.as_deref(),
+            Some("claude-3-5-haiku-20241022")
+        );
+        let provider_credential = provider
+            .base
+            .api_key
+            .as_deref()
+            .expect("provider credential");
+        assert!(zeroclaw_config::secrets::SecretStore::is_secure_encrypted(
+            provider_credential
+        ));
+        assert_eq!(
+            secrets
+                .decrypt(provider_credential)
+                .expect("provider credential should decrypt"),
+            "placeholder-provider-credential"
+        );
+
+        let webhook = reloaded
+            .channels
+            .webhook
+            .get("incoming")
+            .expect("fresh Webhook channel should survive reload");
+        let webhook_secret = webhook.secret.as_deref().expect("Webhook secret");
+        assert!(zeroclaw_config::secrets::SecretStore::is_secure_encrypted(
+            webhook_secret
+        ));
+        assert_eq!(
+            secrets
+                .decrypt(webhook_secret)
+                .expect("Webhook secret should decrypt"),
+            "placeholder-webhook-secret"
+        );
+        assert_eq!(webhook.port, 18080);
+        assert!(webhook.enabled);
+
+        let agent = reloaded
+            .agents
+            .get("bob")
+            .expect("agent should survive reload");
+        assert_eq!(agent.model_provider.as_str(), "anthropic.default");
+        assert_eq!(
+            agent
+                .channels
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["webhook.incoming"]
+        );
+    }
+
     fn selectable_labels(options: &[PickerOption]) -> Vec<&str> {
         options
             .iter()
