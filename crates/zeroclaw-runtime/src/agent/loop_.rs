@@ -9088,7 +9088,8 @@ mod tests {
         let model_provider = VisibleThenServerStreamFailureModelProvider {
             chat_calls: Arc::clone(&chat_calls),
         };
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("stream an answer"),
