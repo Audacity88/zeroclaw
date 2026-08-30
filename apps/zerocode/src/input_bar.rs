@@ -2439,7 +2439,7 @@ mod tests {
 
     #[test]
     fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         bar.move_cursor_left();
@@ -2471,7 +2471,7 @@ mod tests {
 
     #[test]
     fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         let selection_start = "🇺".len();

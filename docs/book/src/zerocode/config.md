@@ -13,7 +13,7 @@ instruction to open the file in an editor. Hand editing is a fallback for
 headless hosts and scripted provisioning, where the docs call it out
 explicitly.
 
-### Keybinding modifiers
+## Keybinding modifiers
 
 Keybindings use canonical modifier names: `control` is literal Control, `primary` is Command on macOS and Control elsewhere, and `super` is literal Super/Command. For example, `control+c`, `primary+r`, and `alt+shift+up` are portable persisted values. Older `ctrl+...` values are migrated once when the config loads and rewritten to the corresponding canonical spelling.
 
