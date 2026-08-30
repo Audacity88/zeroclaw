@@ -1,0 +1,19 @@
+name: PR Risk Event Signal
+run-name: PR Risk Event Signal pr=${{ github.event.pull_request.number }} head=${{ github.event.pull_request.head.sha }}
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, converted_to_draft, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  signal:
+    name: Signal PR policy input change
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Complete signal
+        run: ":"

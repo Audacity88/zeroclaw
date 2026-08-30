@@ -385,7 +385,7 @@ Membership itself is established by decision, not by any file or GitHub setting.
 
 **`.github/CODEOWNERS`** at the repository root: **review routing**, not membership. It records who is requested on which paths. Being listed does not confer membership and being a member does not imply being listed. Changes to it require an explicit Core Team vote, per §5.2.
 
-**The maintainer table in [Communication](../contributing/communication.md#maintainer-contacts)**: the human-readable summary of current members and what each works on. It is the closest thing to a published roster, and it is maintained by hand, so treat it as a summary of admission decisions rather than as an authority. For focus areas it is a convenience view over CODEOWNERS, and where those two disagree, CODEOWNERS wins.
+**The maintainer table in [Communication](../contributing/communication.md#maintainer-contacts)**: the human-readable summary of current members and what each works on. It is the closest thing to a published roster, and it is maintained by hand, so treat it as a summary of admission decisions rather than as the authority that creates or ends membership. Repository automation uses the checked table as its operational enforcement projection, so update it promptly after a public membership decision and review changes to it as high risk. For focus areas it is a convenience view over CODEOWNERS, and where those two disagree, CODEOWNERS wins.
 
 Removals work the same way as admissions: they are decisions, recorded where they are made. Revoking access or removing someone from CODEOWNERS implements a departure; it does not by itself constitute one.
 
@@ -454,7 +454,7 @@ Configure the following branch protection rules for `master`:
 
 **Why admins cannot bypass:** One of the most common mistakes in small team projects is treating branch protection as "for other people." When an admin can bypass, they will, under time pressure, in an emergency, "just this once." Then it becomes the norm. The rule must apply to everyone for it to mean anything. If there is a genuine emergency, the right response is to follow the process faster, not to skip it.
 
-GitHub's native approval count is configured per protected branch or ruleset target, not conditionally by PR label. Until a separately approved technical enforcement design has a machine-readable authority for Core Team approval, maintainers must apply the `risk:high OR domain:security` requirement through the documented merge checklist and retain an auditable review record. `risk:manual` freezes future automatic risk replacement only; it cannot lower this requirement.
+GitHub's native approval count is configured per protected branch or ruleset target, not conditionally by PR label. The `zeroclaw/pr-risk-policy` status evaluates the conditional rule against exact-head formal approvals from the operational Core Team projection in the Communication maintainer table. It becomes merge enforcement only when a separately approved repository ruleset requires that status on `master`; until then, maintainers must also apply the requirement through the documented merge checklist. `risk:manual` freezes future automatic risk replacement only; it cannot lower this requirement.
 
 ### 6.3 Required Status Checks
 
@@ -466,6 +466,8 @@ test                    ← cargo test
 fmt                     ← cargo fmt --all -- --check
 clippy                  ← cargo clippy --all-targets -- -D warnings
 ```
+
+After its workflow has landed and the separately approved repository ruleset is active, `zeroclaw/pr-risk-policy` is also required. It applies the conditional two-Core-approval rule without replacing the ordinary CI gate.
 
 As the workspace decomposes into crates (per the architecture RFC), add per-crate checks. A change to `crates/zeroclaw-api` should run that crate's test suite independently.
 

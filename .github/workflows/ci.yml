@@ -741,12 +741,16 @@ jobs:
 
           for path in (
               ".github/workflows/ci.yml",
+              ".github/workflows/pr-risk-policy.yml",
+              ".github/workflows/pr-risk-policy-review-signal.yml",
               ".github/workflows/project-dashboard-plan.yml",
               ".github/workflows/release-stable-manual.yml",
           ):
               yaml.safe_load(open(path))
               print(f"{path}: valid")
           PY
+      - name: Validate PR risk policy
+        run: python3 scripts/github/pr_risk_policy_test.py
       - name: Validate project dashboard planner
         run: python3 scripts/github/project_dashboard_plan_test.py
       - name: Install cargo-audit

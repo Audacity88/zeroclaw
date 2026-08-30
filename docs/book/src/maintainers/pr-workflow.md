@@ -114,6 +114,7 @@ Branch protection on `master`:
 
 - Require status checks before merge.
 - Require check `CI Required Gate`.
+- Require check `zeroclaw/pr-risk-policy` after the workflow has landed and a separate repository-ruleset change has been approved. The check passes ordinary PRs and conditionally requires two exact-head Core Team approvals for PRs carrying `risk:high` or `domain:security`.
 - Require pull request reviews before merge.
 - Require CODEOWNERS review for protected paths. `.github/**` (including `.github/workflows/**`) is owned by the maintainers listed in `.github/CODEOWNERS`, so workflow changes need an owning maintainer's review.
 - Keep branch / ruleset bypass limited to org owners.
@@ -137,6 +138,7 @@ Before requesting review, the PR has all of these:
 Before merge:
 
 - `CI Required Gate` is green.
+- `zeroclaw/pr-risk-policy` is green once it is configured as a required status check.
 - Required reviewers approved (including any CODEOWNERS paths); a PR carrying `risk:high` or `domain:security` has two independent Core Team approvals.
 - Risk labels match the actual diff and consequence rather than broad component location. See [Labels](./labels.md).
 - Migration / compatibility impact is documented.
@@ -148,6 +150,7 @@ Every merge:
 
 - Scope is focused and understandable.
 - CI gate is green.
+- `zeroclaw/pr-risk-policy` is green once it is configured as a required status check.
 - Docs-quality checks are green when docs changed.
 - Security and privacy fields are complete; evidence is redacted / anonymized.
 - A PR carrying `risk:high` or `domain:security` has two independent Core Team approvals; automated review does not count.

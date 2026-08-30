@@ -84,6 +84,18 @@ This workflow does not currently apply `risk:*`, `size:*`, `type:*`, contributor
 
 Dependabot has separate label configuration in `.github/dependabot.yml` for its own PRs. Cargo update PRs start with `dependencies`; GitHub Actions and Docker update PRs start with `ci` and `dependencies`.
 
+### PR Risk Policy (`pr-risk-policy.yml`)
+
+Pull request updates and label changes trigger `pull_request_target` only in the no-permission `pr-risk-policy-review-signal.yml`, so the fixed signal definition comes from the trusted default branch; formal review submissions or dismissals trigger the same inert signal through `pull_request_review`. The signal has empty token permissions, performs no checkout, and emits no artifact. For the trusted target event, its fixed run title carries only GitHub's pull request number and exact 40-hex head SHA. For review events, the privileged consumer ignores the merge-commit workflow title and requires GitHub's native run-to-PR association. Completion triggers the privileged default-branch policy workflow through `workflow_run`, which rejects unsupported event sources and strictly validates the identity appropriate to the source event. The privileged workflow never downloads signal artifacts, checks out contributor code, or executes contributor-controlled content. It resolves the live pull request through the GitHub API, loads the policy helper, `.github/risk-labeler.yml`, and the published Core Team summary from the default branch, evaluates current API state, and writes the stable `zeroclaw/pr-risk-policy` status on the exact live head. The encoded target-event head is used only for a bounded error status when live pull request resolution itself fails; a review signal without native association or live resolution fails without writing a status, and manual dispatch is the recovery path.
+
+Pull requests without `risk:high` or `domain:security` pass the conditional approval gate. Pull requests carrying either label pass only with two distinct Core Team approvals on the exact head. Automated reviews do not count. `risk:manual` prevents future automatic replacement of a maintainer's risk choice, but it does not suppress this approval requirement.
+
+The same run emits a report-only risk recommendation and evidence. It does not add, remove, or replace labels. `.github/risk-labeler.yml` uses the `actions/labeler` path dialect for deterministic high-risk path evidence, and the helper applies the narrow #9530 production-inert test-only exception only when the complete changed-line context proves every high-risk Rust change stays inside an existing `#[cfg(test)]` item or module. Missing or ambiguous evidence remains high risk.
+
+When the trusted policy, helper, event-signal workflow, or Core Team summary changes on `master`, the workflow reevaluates every open pull request so an old green status cannot outlive its authority inputs. Manual dispatch reevaluates one named pull request and is the fail-closed recovery path if event-run association is unavailable.
+
+The workflow status is advisory until a separately approved repository ruleset requires `zeroclaw/pr-risk-policy` on `master`. Source changes must not describe the policy as merge-enforcing before that repository setting is active.
+
 ### Project Dashboard Planner (`project-dashboard-plan.yml`)
 
 Runs manually for a single issue number. It reads issue state and labels, then writes a report-only step summary proposing the existing Project Status value that best matches the issue.

@@ -1,0 +1,26 @@
+{
+  "risk:high": [
+    {
+      "changed-files": {
+        "any-glob-to-any-file": [
+          "crates/zeroclaw-runtime/src/security/**",
+          "crates/zeroclaw-runtime/src/approval/**",
+          "crates/zeroclaw-runtime/src/trust/**",
+          "crates/zeroclaw-providers/src/auth/**",
+          "wit/**",
+          ".github/CODEOWNERS",
+          ".github/risk-labeler.yml",
+          ".github/workflows/pr-risk-labeler.yml",
+          ".github/workflows/pr-risk-policy.yml",
+          ".github/workflows/pr-risk-policy-review-signal.yml",
+          ".github/workflows/*release*.yml",
+          ".github/workflows/*publish*.yml",
+          ".github/workflows/pub-*.yml",
+          "docs/book/src/contributing/communication.md",
+          "scripts/github/pr_risk_policy.py",
+          "scripts/release/**"
+        ]
+      }
+    }
+  ]
+}
