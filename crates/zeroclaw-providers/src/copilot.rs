@@ -723,7 +723,7 @@ fn admit_cache_dir(path: &Path) -> io::Result<Arc<Dir>> {
     fs::create_dir_all(parent_path)?;
 
     let parent = Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())?;
-    match parent.symlink_metadata(&leaf) {
+    match parent.symlink_metadata(leaf) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -738,7 +738,7 @@ fn admit_cache_dir(path: &Path) -> io::Result<Arc<Dir>> {
                 use cap_std::fs::DirBuilderExt;
                 builder.mode(0o700);
             }
-            match parent.create_dir_with(&leaf, &builder) {
+            match parent.create_dir_with(leaf, &builder) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
@@ -747,7 +747,7 @@ fn admit_cache_dir(path: &Path) -> io::Result<Arc<Dir>> {
         Err(error) => return Err(error),
     }
 
-    let cache_dir = parent.open_dir_nofollow(&leaf)?;
+    let cache_dir = parent.open_dir_nofollow(leaf)?;
     #[cfg(unix)]
     {
         use cap_std::fs::PermissionsExt;
