@@ -4107,6 +4107,8 @@ impl RpcDispatcher {
 
         to_result(LogsQueryResult {
             events,
+            log_path: zeroclaw_log::active_log_path()
+                .map(|path| path.to_string_lossy().into_owned()),
             next_cursor: page.next_cursor,
             next_cursor_line_offset: page.next_cursor_line_offset,
             at_end: page.at_end,

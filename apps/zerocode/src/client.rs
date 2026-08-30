@@ -2953,6 +2953,8 @@ pub struct LogsQueryParams {
 #[serde(rename_all = "snake_case")]
 pub struct LogsQueryResult {
     pub events: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub log_path: Option<String>,
     /// Legacy cursor: `(timestamp, id)` to feed back as `until_ts` +
     /// `until_id` for older. Tie-breaks same-timestamp events by
     /// lexicographic id, which can drop earlier-written events when id
@@ -2974,6 +2976,24 @@ pub struct LogsQueryResult {
 #[serde(rename_all = "snake_case")]
 pub struct LogsGetResult {
     pub event: serde_json::Value,
+}
+
+#[cfg(test)]
+mod logs_query_tests {
+    use super::LogsQueryResult;
+
+    #[test]
+    fn older_response_without_log_path_remains_compatible() {
+        let result: LogsQueryResult = serde_json::from_value(serde_json::json!({
+            "events": [],
+            "next_cursor": null,
+            "next_cursor_line_offset": null,
+            "at_end": true
+        }))
+        .expect("older logs/query response");
+
+        assert!(result.log_path.is_none());
+    }
 }
 
 // ── Session / Agents types ───────────────────────────────────────

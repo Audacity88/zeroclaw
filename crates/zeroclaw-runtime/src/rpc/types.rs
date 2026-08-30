@@ -1304,6 +1304,9 @@ rpc_type! {
 rpc_type! {
     pub struct LogsQueryResult {
         pub events: Vec<serde_json::Value>,
+        /// Resolved path of the active installed persistence writer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub log_path: Option<String>,
         /// Legacy cursor. Deprecated since 0.8.0; tracked for removal in
         /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
         #[deprecated(
@@ -1815,5 +1818,23 @@ mod tests {
         assert_eq!(params.run_id, "r1");
         assert_eq!(params.surface, Surface::Tui);
         assert!(params.last_step.is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn logs_query_result_exposes_active_log_path_when_present() {
+        let result = LogsQueryResult {
+            events: Vec::new(),
+            log_path: Some("/var/lib/zeroclaw/runtime-trace.jsonl".into()),
+            next_cursor: None,
+            next_cursor_line_offset: None,
+            at_end: true,
+        };
+
+        let value = serde_json::to_value(result).expect("logs/query result");
+        assert_eq!(
+            value["log_path"],
+            json!("/var/lib/zeroclaw/runtime-trace.jsonl")
+        );
     }
 }
