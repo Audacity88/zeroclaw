@@ -65,7 +65,8 @@ const SAFE_ENV_VARS: &[&str] = &[
 ];
 
 /// Environment variables safe to pass to shell commands on Windows.
-/// Includes Windows-specific variables needed for cmd.exe and program resolution.
+/// Includes Windows-specific variables needed for cmd.exe, PowerShell module discovery,
+/// and program resolution.
 #[cfg(target_os = "windows")]
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH",
@@ -78,6 +79,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "SYSTEMDRIVE",
     "WINDIR",
     "COMSPEC",
+    "PSModulePath",
     "TEMP",
     "TMP",
     "TERM",
@@ -1860,6 +1862,12 @@ mod tests {
             SAFE_ENV_VARS.contains(&"TERM"),
             "TERM must be in safe env vars"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_safe_env_vars_preserves_powershell_module_discovery() {
+        assert!(SAFE_ENV_VARS.contains(&"PSModulePath"));
     }
 
     #[tokio::test]

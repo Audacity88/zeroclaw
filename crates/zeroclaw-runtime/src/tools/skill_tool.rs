@@ -32,6 +32,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "SYSTEMDRIVE",
     "WINDIR",
     "COMSPEC",
+    "PSModulePath",
     "TEMP",
     "TMP",
     "TERM",
@@ -640,6 +641,50 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn skill_shell_safe_env_vars_preserves_powershell_module_discovery() {
+        assert!(SAFE_ENV_VARS.contains(&"PSModulePath"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_shell_tool_executes_powershell_safe_pipeline_with_sanitized_env() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let skill = SkillTool {
+            name: "safe_pipeline".to_string(),
+            description: "Run a safe PowerShell pipeline".to_string(),
+            kind: "shell".to_string(),
+            command: "Write-Output \"quoted safe value\" | Select-Object -First 1".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = SkillShellTool::new_with_runtime("test", &skill, security, runtime);
+
+        let result = tool
+            .execute(serde_json::json!({}))
+            .await
+            .expect("safe PowerShell pipeline should return a tool result");
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.output.contains("quoted safe value"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]
