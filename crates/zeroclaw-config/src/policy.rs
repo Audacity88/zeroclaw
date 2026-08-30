@@ -1015,11 +1015,13 @@ enum QuoteState {
     Double,
 }
 
-fn split_unquoted_segments(command: &str) -> Vec<String> {
+fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
     // Heredoc state: Some(delim) while inside a heredoc body.
     let mut heredoc_delimiter: Option<String> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
@@ -1051,7 +1053,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     current.push(ch);
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     current.push(ch);
                     continue;
@@ -1071,7 +1073,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     }
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     if heredoc_delimiter.is_some() {
                         heredoc_line_buf.push(ch);
@@ -1120,7 +1122,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 }
 
                 match ch {
-                    '\'' => {
+                    '\'' if single_quotes_are_syntax => {
                         quote = QuoteState::Single;
                         current.push(ch);
                     }
@@ -1187,8 +1189,7 @@ struct ShellWord {
 
 fn split_shell_words_with_metadata(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
     let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
-    let single_quotes_are_syntax =
-        matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
     let mut words = Vec::new();
     let mut current = String::new();
     let mut is_assignment = false;
@@ -1890,10 +1891,12 @@ fn strip_fd_merge_redirects(command: &str) -> String {
 
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
-fn contains_unquoted_single_ampersand(command: &str) -> bool {
+fn contains_unquoted_single_ampersand(command: &str, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let mut chars = command.chars().peekable();
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
 
     while let Some(ch) = chars.next() {
         match quote {
@@ -1907,7 +1910,7 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -1920,12 +1923,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     // This must consume the second '&' so `&&` is not later
                     // re-read as a lone trailing '&'.
@@ -1942,9 +1945,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
 }
 
 /// Detect an unquoted character in a shell command.
-fn contains_unquoted_char(command: &str, target: char) -> bool {
+fn contains_unquoted_char(command: &str, target: char, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax =
+        matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell);
 
     for ch in command.chars() {
         match quote {
@@ -1958,7 +1964,7 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -1971,12 +1977,12 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     _ if ch == target => return true,
                     _ => {}
@@ -2005,7 +2011,11 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
         .expect("static safe-device redirect regex must compile")
     });
 
-    let safe = re.replace_all(command, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        re.replace_all(command, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Windows null device: strip `>nul`, `1>nul`, `2>nul`, `2>NUL`, and the
     // `\\.\nul` device form (case-insensitive) — the platform equivalent of the
     // `/dev/null` forms stripped above. A trailing non-boundary char (e.g.
@@ -2028,7 +2038,7 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
     };
     // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '>')
+    contains_unquoted_char(&safe, '>', dialect)
 }
 
 /// POSIX-dialect convenience wrapper for tests — the conservative default that
@@ -2041,7 +2051,7 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
 
 /// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
 /// or a safe input redirect from `/dev/*`.
-fn contains_unquoted_input_redirect(command: &str) -> bool {
+fn contains_unquoted_input_redirect(command: &str, dialect: ShellDialect) -> bool {
     // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources
     // with word boundary enforcement.
     use regex::Regex;
@@ -2052,11 +2062,15 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
         Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").expect("SAFE_INPUT_RE regex must compile")
     });
 
-    let safe = command.replace("<<<", "").replace("<<", "");
-    let safe = re.replace_all(&safe, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        let safe = command.replace("<<<", "").replace("<<", "");
+        re.replace_all(&safe, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Also strip fd-merge redirects (<&0, <&-, etc.) so they don't leave a bare `<`
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '<')
+    contains_unquoted_char(&safe, '<', dialect)
 }
 
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
@@ -2302,6 +2316,10 @@ fn shell_uses_windows_path_syntax(dialect: ShellDialect) -> bool {
     matches!(dialect, ShellDialect::WindowsCmd | ShellDialect::PowerShell)
 }
 
+fn shell_uses_single_quote_syntax(dialect: ShellDialect) -> bool {
+    matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell)
+}
+
 fn has_windows_drive_prefix(candidate: &str) -> bool {
     let bytes = candidate.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
@@ -2408,7 +2426,7 @@ fn safe_device_redirect_names_pattern() -> String {
 
 fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
     let target = strip_wrapping_quotes(target).trim();
-    if SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
+    if matches!(dialect, ShellDialect::Posix) && SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
         return true;
     }
     // Windows null device: `nul`/`NUL` (case-insensitive) and the full `\\.\nul`
@@ -3053,7 +3071,7 @@ impl SecurityPolicy {
     ) -> CommandRiskLevel {
         let mut saw_medium = false;
 
-        for segment in split_unquoted_segments(command) {
+        for segment in split_unquoted_segments(command, dialect) {
             let cmd_part = skip_env_assignments(&segment);
             let normalized = normalized_shell_command(&segment, dialect);
             if normalized.has_ambiguous_redirection {
@@ -3290,7 +3308,7 @@ impl SecurityPolicy {
     }
 
     fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
-        let segments = split_unquoted_segments(command);
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
             let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection {
@@ -3446,7 +3464,7 @@ impl SecurityPolicy {
         if contains_unsafe_output_redirect_for_shell(command, dialect) {
             return false;
         }
-        if contains_unquoted_input_redirect(command) {
+        if contains_unquoted_input_redirect(command, dialect) {
             return false;
         }
 
@@ -3464,12 +3482,12 @@ impl SecurityPolicy {
         // Strip fd-merge redirects (N>&M, N<&M) first so their `&` isn't
         // flagged as background chaining.
         let ampersand_check = strip_fd_merge_redirects(command);
-        if contains_unquoted_single_ampersand(&ampersand_check) {
+        if contains_unquoted_single_ampersand(&ampersand_check, dialect) {
             return false;
         }
 
         // Split on unquoted command separators and validate each sub-command.
-        let segments = split_unquoted_segments(command);
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
             let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection || normalized.has_leading_env_assignment {
@@ -3684,7 +3702,7 @@ impl SecurityPolicy {
             })
         };
 
-        for segment in split_unquoted_segments(command) {
+        for segment in split_unquoted_segments(command, dialect) {
             let words = shell_words_after_env_assignments(&segment, dialect);
             let Some(executable) = words.first() else {
                 continue;
@@ -7047,16 +7065,55 @@ mod tests {
             Posix
         ));
 
-        // /dev/null stays safe under BOTH dialects; a real file and a non-bare
-        // `nul`-prefixed name stay blocked under both.
+        // POSIX device paths are safe only for the POSIX shell. A real file and
+        // a non-bare `nul`-prefixed name stay blocked under both dialects.
         assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", Posix));
-        assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
+        assert!(!p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
         assert!(!p.is_command_allowed_for_shell("echo secret 2>out.txt", WindowsCmd));
         assert!(!p.is_command_allowed_for_shell("echo secret >nul.txt", WindowsCmd));
         assert!(contains_unsafe_output_redirect_for_shell(
             "echo secret >nul.txt",
             WindowsCmd
         ));
+    }
+
+    #[test]
+    fn windows_cmd_operator_and_device_redirects_are_fail_closed() {
+        use ShellDialect::{Posix, WindowsCmd};
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git status 'x & whoami'",
+            r"git status x\&whoami",
+            "git status 'x | whoami'",
+            "git status 'x > /dev/null'",
+            "git status >/dev/null",
+            "git status </dev/zero",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, WindowsCmd)
+                    .is_err(),
+                "cmd.exe must reject policy-hidden operator or POSIX device redirect: {command}"
+            );
+        }
+
+        for command in [
+            "git status 'x & whoami'",
+            r"git status x\&whoami",
+            "git status 'x | whoami'",
+            "git status 'x > /dev/null'",
+            "git status >/dev/null",
+            "git status </dev/zero",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, Posix)
+                    .is_ok(),
+                "POSIX must retain quoted, escaped, and safe-device behavior: {command}"
+            );
+        }
     }
 
     #[test]
@@ -7124,15 +7181,34 @@ mod tests {
 
     #[test]
     fn redirect_helper_unit_tests() {
-        assert!(!contains_unquoted_input_redirect("cat << 'EOF'"));
-        assert!(!contains_unquoted_input_redirect("cat <<< 'hello'"));
-        assert!(contains_unquoted_input_redirect("cat < /etc/passwd"));
-        assert!(!contains_unquoted_input_redirect("echo 'a<b'"));
-        assert!(!contains_unquoted_input_redirect("cat</dev/null"));
-        // Input redirect word→non-word bypass (same fix as output redirects)
-        assert!(contains_unquoted_input_redirect("cat</dev/null.secret"));
+        assert!(!contains_unquoted_input_redirect(
+            "cat << 'EOF'",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "cat <<< 'hello'",
+            ShellDialect::Posix
+        ));
         assert!(contains_unquoted_input_redirect(
-            "cat </dev/zero/etc/passwd"
+            "cat < /etc/passwd",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "echo 'a<b'",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "cat</dev/null",
+            ShellDialect::Posix
+        ));
+        // Input redirect word→non-word bypass (same fix as output redirects)
+        assert!(contains_unquoted_input_redirect(
+            "cat</dev/null.secret",
+            ShellDialect::Posix
+        ));
+        assert!(contains_unquoted_input_redirect(
+            "cat </dev/zero/etc/passwd",
+            ShellDialect::Posix
         ));
         assert!(!contains_unsafe_output_redirect("cmd 2>/dev/null"));
         assert!(!contains_unsafe_output_redirect("cmd >/dev/null"));
