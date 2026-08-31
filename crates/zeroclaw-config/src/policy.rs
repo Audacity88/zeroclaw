@@ -1664,8 +1664,9 @@ fn git_delegates_to_external_command(args: &[String]) -> bool {
         "grep" => {
             git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_opens_files_in_pager)
         }
-        "help" => git_args_before_pathspec(args, subcommand_idx + 1)
-            .any(|arg| git_arg_eq(arg, "-w") || git_arg_eq(arg, "--web")),
+        "help" => git_args_before_pathspec(args, subcommand_idx + 1).any(|arg| {
+            git_arg_eq(arg, "-w") || git_arg_is_long_option_or_abbreviation(arg, "--web")
+        }),
         _ => false,
     }
 }
@@ -1871,9 +1872,7 @@ fn git_arg_is_option_or_abbreviation(arg: &str, option: &str) -> bool {
 }
 
 fn git_arg_opens_files_in_pager(arg: &str) -> bool {
-    arg.starts_with("-O")
-        || git_arg_eq(arg, "--open-files-in-pager")
-        || git_arg_starts_with(arg, "--open-files-in-pager=")
+    arg.starts_with("-O") || git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager")
 }
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
@@ -5774,8 +5773,11 @@ mod tests {
             "git grep -O./pager pattern",
             "git grep --open-files-in-pager pattern",
             "git grep --open-files-in-pager=./pager pattern",
+            "git grep --open-files-in-pag pattern",
+            "git grep --open-files-in-pag=./pager pattern",
             "git help -w status",
             "git help --web status",
+            "git help --we status",
             "git --no-pager bisect run ./helper",
             "git -C . submodule --quiet foreach './helper'",
             "git submodule--helper foreach -- './helper'",
@@ -5899,6 +5901,9 @@ mod tests {
             "git diff -- ext::helper",
             "git diff ext::helper",
             "git status ext::helper",
+            "git grep -- --open-files-in-pag",
+            "git grep -- --open-files-in-pag=./pager",
+            "git help -- --we",
             "git log -- --upload-pack=./helper",
             "git clone https://example.invalid/repo ./dst::name",
             "git clone https://example.invalid/repo ./evil://dst",
