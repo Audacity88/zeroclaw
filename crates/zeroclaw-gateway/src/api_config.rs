@@ -2808,7 +2808,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_rejects_masked_or_empty_secret_values_without_mutation() {
+    async fn authenticated_patch_route_rejects_masked_or_empty_secret_values_without_mutation() {
+        use axum::body::Body;
+        use axum::routing::patch;
+        use tower::ServiceExt;
+
+        let token = "patch-secret-test-token";
         for op in ["add", "replace"] {
             for value in [zeroclaw_config::traits::MASKED_SECRET, "****", ""] {
                 let tmp = tempfile::tempdir().unwrap();
@@ -2817,24 +2822,32 @@ mod tests {
                 config.save().await.unwrap();
                 let disk_before = tokio::fs::read(&config.config_path).await.unwrap();
                 let live_before = config.gateway.webhook_secret.clone();
-                let state = test_state(config);
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    "x-zeroclaw-override-drift",
-                    axum::http::HeaderValue::from_static("true"),
-                );
+                let mut state = test_state(config);
+                state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+                let app = axum::Router::new()
+                    .route("/api/config", patch(handle_patch))
+                    .with_state(state.clone());
 
                 let (status, json) = response_json(
-                    handle_patch(
-                        State(state.clone()),
-                        headers,
-                        axum::Json(serde_json::json!([{
-                            "op": op,
-                            "path": "/gateway/webhook_secret",
-                            "value": value,
-                        }])),
+                    app.oneshot(
+                        axum::http::Request::builder()
+                            .method("PATCH")
+                            .uri("/api/config")
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header("x-zeroclaw-override-drift", "true")
+                            .body(Body::from(
+                                serde_json::json!([{
+                                    "op": op,
+                                    "path": "/gateway/webhook_secret",
+                                    "value": value,
+                                }])
+                                .to_string(),
+                            ))
+                            .unwrap(),
                     )
-                    .await,
+                    .await
+                    .unwrap(),
                 )
                 .await;
 
