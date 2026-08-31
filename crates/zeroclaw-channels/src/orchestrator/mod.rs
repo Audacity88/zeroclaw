@@ -10093,16 +10093,20 @@ pub fn register_channels_for_tools(
 }
 
 /// Resolve the `transcription_provider` configured on the enabled agent that
-/// owns `channel_key` (for example `"telegram.support"` or
-/// `"voice_wake.frontdoor"`). Returns an empty string when no owning agent
+/// owns `channel_key` (for example `"telegram.support"`, `"discord.community"`,
+/// or `"voice_wake.frontdoor"`). Returns an empty string when no owning agent
 /// declares a preference. `channel_key` only selects which agent to consult
 /// — it is never itself treated as a provider identity, and the returned
 /// value must not be confused with the channel alias embedded in the key.
 ///
-/// Gated to match its callers: with both transcribing channels compiled out
+/// Gated to match its callers: with all transcribing channels compiled out
 /// this has no call sites, and an ungated definition trips the dead-code lint
 /// under a no-default-features build.
-#[cfg(any(feature = "channel-telegram", feature = "voice-wake"))]
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-discord",
+    feature = "voice-wake"
+))]
 fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
     let enabled_agents = enabled_agent_aliases(config);
     build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
@@ -10110,6 +10114,71 @@ fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> S
         .and_then(|owner| config.agents.get(owner))
         .map(|agent| agent.transcription_provider.as_str().to_string())
         .unwrap_or_default()
+}
+
+#[cfg(feature = "channel-discord")]
+fn configure_discord_transcription(
+    channel: DiscordChannel,
+    config: &Config,
+    channel_key: &str,
+) -> DiscordChannel {
+    if !config.transcription.enabled {
+        return channel;
+    }
+
+    let provider = resolve_agent_transcription_provider(config, channel_key);
+    match crate::transcription::TranscriptionManager::from_config_with_provider(config, provider) {
+        Ok(manager) => channel.with_transcription_manager(config.transcription.clone(), manager),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "transcription manager init failed, voice transcription disabled"
+            );
+            channel
+        }
+    }
+}
+
+#[cfg(feature = "channel-discord")]
+fn build_configured_discord_channel(
+    config_arc: &Arc<RwLock<Config>>,
+    config: &Config,
+    alias: &str,
+    dc: &zeroclaw_config::schema::DiscordConfig,
+) -> DiscordChannel {
+    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+        let cfg_arc = config_arc.clone();
+        let alias = alias.to_string();
+        Arc::new(move || cfg_arc.read().channel_external_peers("discord", &alias))
+    };
+    let channel_key = format!("discord.{alias}");
+    let channel = DiscordChannel::new(
+        dc.bot_token.clone(),
+        dc.guild_ids.clone(),
+        alias,
+        peer_resolver,
+        dc.listen_to_bots,
+        dc.mention_only,
+    )
+    .with_channel_ids(dc.channel_ids.clone())
+    .with_workspace_dir(config.channel_workspace_dir(&channel_key))
+    .with_streaming(
+        dc.stream_mode,
+        dc.draft_update_interval_ms,
+        dc.multi_message_delay_ms,
+    )
+    .with_proxy_url(dc.proxy_url.clone())
+    .with_stall_timeout(dc.stall_timeout_secs)
+    .with_approval_timeout_secs(dc.approval_timeout_secs)
+    .with_slash_commands(dc.slash_commands)
+    .with_slash_command_scope(dc.slash_command_scope)
+    .with_intents_mask(dc.intents_mask)
+    .with_reaction_notifications(dc.reaction_notifications);
+
+    configure_discord_transcription(channel, config, &channel_key)
 }
 
 /// Per-alias Matrix state directory. Each `[channels.matrix.<alias>]` block
@@ -10227,40 +10296,14 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-discord")]
     for (alias, dc) in &config.channels.discord {
-        if !active_channel_aliases.contains(&format!("discord.{alias}")) {
+        let channel_key = format!("discord.{alias}");
+        if !active_channel_aliases.contains(&channel_key) {
             continue;
         }
         if !dc.enabled {
             continue;
         }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("discord", &alias))
-        };
-        let mut discord_ch = DiscordChannel::new(
-            dc.bot_token.clone(),
-            dc.guild_ids.clone(),
-            alias.clone(),
-            peer_resolver,
-            dc.listen_to_bots,
-            dc.mention_only,
-        )
-        .with_channel_ids(dc.channel_ids.clone())
-        .with_workspace_dir(config.channel_workspace_dir(&format!("discord.{alias}")))
-        .with_streaming(
-            dc.stream_mode,
-            dc.draft_update_interval_ms,
-            dc.multi_message_delay_ms,
-        )
-        .with_proxy_url(dc.proxy_url.clone())
-        .with_transcription(config.transcription.clone())
-        .with_stall_timeout(dc.stall_timeout_secs)
-        .with_approval_timeout_secs(dc.approval_timeout_secs)
-        .with_slash_commands(dc.slash_commands)
-        .with_slash_command_scope(dc.slash_command_scope)
-        .with_intents_mask(dc.intents_mask)
-        .with_reaction_notifications(dc.reaction_notifications);
+        let mut discord_ch = build_configured_discord_channel(config_arc, &config, alias, dc);
         if dc.slash_commands {
             let cfg_arc_for_slash = config_arc.clone();
             let channel_ref = format!("discord.{alias}");
@@ -29788,6 +29831,90 @@ This is an example JSON object for profile settings."#;
                 .any(|entry| entry.display_name == "Voice Call"),
             "enabled Voice Call without credentials must not be collected (would crashloop)"
         );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn configured_discord_transcription_dispatches_to_routed_agent_provider() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "routed transcript"})),
+            )
+            .expect(1)
+            .mount(&whisper_server)
+            .await;
+
+        let mut config = Config::default();
+        config.transcription.enabled = true;
+        config.channels.discord.insert(
+            "community".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".into(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "listener".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.community".into()],
+                transcription_provider: "local_whisper.routed".into(),
+                ..Default::default()
+            },
+        );
+        config.providers.transcription.local_whisper.insert(
+            "routed".to_string(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", whisper_server.uri()),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let config = config_arc.read();
+        let channel = build_configured_discord_channel(
+            &config_arc,
+            &config,
+            "community",
+            config
+                .channels
+                .discord
+                .get("community")
+                .expect("configured Discord alias"),
+        );
+        drop(config);
+
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": format!("{}/voice.ogg", media_server.uri()),
+        })];
+        let (text, media) = channel
+            .process_attachments_for_test(&attachments, &reqwest::Client::new())
+            .await;
+
+        assert_eq!(text, "[Voice] routed transcript");
+        assert!(
+            media.is_empty(),
+            "successful direct-channel transcription must not fall back to media"
+        );
+        media_server.verify().await;
+        whisper_server.verify().await;
     }
 
     // Regression: Voice Wake bound its transcription manager to its own
