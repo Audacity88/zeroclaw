@@ -4063,7 +4063,7 @@ fn url_cell_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlCel
                 }
             }
         }
-        screen_row = screen_row.saturating_add(wrapped.len() as u16);
+        screen_row = screen_row.saturating_add(wrapped_rows(line, width));
     }
     regions
 }
@@ -8081,20 +8081,46 @@ mod tests {
 
     #[test]
     fn url_context_menu_remains_actionable_in_browse_mode() {
+        use ratatui::{Terminal, backend::TestBackend};
+
         let mut state = state();
-        state
-            .entries
-            .push(ChatEntry::AgentMessage(Arc::from("https://example.com")));
+        state.entries.push(ChatEntry::AgentMessage(Arc::from(
+            "| Link |\n| --- |\n| https://example.com/this/is/a/very/long/path/that/must/be/truncated |\n\nhttps://example.complete",
+        )));
         state.browse_cursor = Some(0);
-        state.entry_rects.push((0, Rect::new(0, 0, 20, 1)));
-        state
-            .url_hit_regions
-            .push(url_hit(Rect::new(0, 0, 19, 1), "https://example.com", 0, 0));
-        state.transcript_snapshot = Some(transcript_snapshot(
-            Rect::new(0, 0, 20, 6),
-            &["https://example.com"],
-        ));
-        assert!(state.open_transcript_context_menu(2, 0));
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 140, 40);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw browse-mode transcript");
+
+        let snapshot = state
+            .transcript_snapshot
+            .as_ref()
+            .expect("render captures transcript cells");
+        let (row, column) = snapshot
+            .cells
+            .chunks(usize::from(snapshot.area.width))
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+                    .find("https://example.complete")
+                    .map(|column| {
+                        (
+                            snapshot.area.y + row as u16,
+                            snapshot.area.x + column as u16,
+                        )
+                    })
+            })
+            .expect("complete URL remains visible after the table");
+
+        assert!(state.open_transcript_context_menu(column, row));
         let menu = state.context_menu.as_ref().expect("URL menu");
         assert_eq!(menu.target.actions(), URL_WITH_COPY_CONTEXT_ACTIONS);
         assert_eq!(
