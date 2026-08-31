@@ -1696,7 +1696,7 @@ fn git_arg_is_paginate(arg: &str) -> bool {
 }
 
 fn git_arg_is_external_diff_option(arg: &str) -> bool {
-    git_arg_eq(arg, "--ext-diff")
+    git_arg_is_long_option_or_abbreviation(arg, "--ext-diff")
         || git_arg_eq(arg, "--extcmd")
         || git_arg_starts_with(arg, "--extcmd=")
 }
@@ -5765,6 +5765,8 @@ mod tests {
             "git mergetool --tool=vimdiff file",
             "git mergetool--helper --tool=vimdiff file",
             "git diff --ext-diff -- file",
+            "git diff --ext-d -- file",
+            "git diff --ext -- file",
             "git log --ext-diff -1",
             "git show --ext-diff --stat HEAD",
             "git -p status",
@@ -5884,6 +5886,8 @@ mod tests {
             "git show --stat --no-patch HEAD",
             "git submodule status",
             "git diff -- --ext-diff",
+            "git diff -- --ext-d",
+            "git diff -- --ext",
             "git log -- --ext-diff",
             "git submodule status foreach",
             "git submodule status -- foreach",
