@@ -185,9 +185,16 @@ struct ModelFetchResult {
 
 struct ChatEntryRetryResult {
     phase: ChatPhase,
+    init_outcome: ChatInitOutcome,
     resume_session_id: Option<String>,
     resume_agent_alias: Option<String>,
     session_ownership: Option<EntryRetrySessionOwnership>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChatInitOutcome {
+    Other,
+    NoEnabledAgents,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,16 +399,16 @@ impl Chat {
     /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
     /// show the CWD picker first on WSS ACP connections).
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
-        self.init_with_cancel(None, None).await
+        self.init_with_cancel(None, None).await.map(|_| ())
     }
 
     async fn init_with_cancel(
         &mut self,
         cancellation: Option<&Arc<AtomicBool>>,
         phase: Option<&Arc<AtomicU8>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ChatInitOutcome> {
         if is_cancelled(cancellation) {
-            return Ok(());
+            return Ok(ChatInitOutcome::Other);
         }
         let agents = match self.rpc.agents_status().await {
             Ok(result) => result
@@ -417,17 +424,17 @@ impl Chat {
                         &[("error", &e.to_string())],
                     ));
                 }
-                return Ok(());
+                return Ok(ChatInitOutcome::Other);
             }
         };
 
         if is_cancelled(cancellation) {
-            return Ok(());
+            return Ok(ChatInitOutcome::Other);
         }
 
         if agents.is_empty() {
             self.phase = ChatPhase::Error(crate::i18n::t("zc-chat-no-agents"));
-            return Ok(());
+            return Ok(ChatInitOutcome::NoEnabledAgents);
         }
 
         // Multi-agent reconnect: if a resumed session was carried across the
@@ -440,7 +447,7 @@ impl Chat {
             if agents.iter().any(|a| a == &prior) {
                 self.pick_or_start_session_inner(&prior, cancellation, phase)
                     .await;
-                return Ok(());
+                return Ok(ChatInitOutcome::Other);
             }
             self.resume_session_id = None;
         }
@@ -449,22 +456,22 @@ impl Chat {
             if self.resume_session_id.is_some() {
                 self.pick_or_start_session_inner(&agents[0], cancellation, phase)
                     .await;
-                return Ok(());
+                return Ok(ChatInitOutcome::Other);
             }
             if self.try_show_recent_acp_session_picker(&agents).await {
-                return Ok(());
+                return Ok(ChatInitOutcome::Other);
             }
             self.pick_or_start_session_inner(&agents[0], cancellation, phase)
                 .await;
-            return Ok(());
+            return Ok(ChatInitOutcome::Other);
         }
 
         if self.try_show_recent_acp_session_picker(&agents).await {
-            return Ok(());
+            return Ok(ChatInitOutcome::Other);
         }
 
         self.show_agent_picker(agents);
-        Ok(())
+        Ok(ChatInitOutcome::Other)
     }
 
     fn show_agent_picker(&mut self, agents: Vec<String>) {
@@ -633,11 +640,13 @@ impl Chat {
                 let mut retry = Chat::new(rpc, PaneKind::Chat);
                 retry.set_resume_session_id(resume_session_id);
                 retry.set_resume_agent_alias(resume_agent_alias);
-                let _ = retry
+                let init_outcome = retry
                     .init_with_cancel(Some(&worker_cancelled), Some(&worker_phase))
-                    .await;
+                    .await
+                    .unwrap_or(ChatInitOutcome::Other);
                 let result = ChatEntryRetryResult {
                     phase: retry.phase,
+                    init_outcome,
                     resume_session_id: retry.resume_session_id,
                     resume_agent_alias: retry.resume_agent_alias,
                     session_ownership: retry.entry_retry_session_ownership,
@@ -678,7 +687,9 @@ impl Chat {
                 }
 
                 if matches!(result.phase, ChatPhase::Error(_)) {
-                    if matches!(self.phase, ChatPhase::Error(_)) {
+                    if matches!(self.phase, ChatPhase::Error(_))
+                        || result.init_outcome == ChatInitOutcome::NoEnabledAgents
+                    {
                         self.phase = result.phase;
                     }
                     return;
@@ -11426,6 +11437,46 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("Chat entry retry result was not applied");
+    }
+
+    #[tokio::test]
+    async fn chat_entry_retry_replaces_picker_when_no_enabled_agents_remain() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut list_state = ListState::default();
+        list_state.select(Some(1));
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["alpha".to_string(), "beta".to_string()],
+            list_state,
+            loading: false,
+        };
+
+        chat.start_entry_retry();
+        let request = next_rpc_request(&mut rx, "entry retry should request agents").await;
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": false},
+                    {"alias": "beta", "enabled": false}
+                ]
+            }),
+        );
+
+        for _ in 0..32 {
+            chat.drain_entry_retry_results();
+            if matches!(
+                &chat.phase,
+                ChatPhase::Error(message) if message == &crate::i18n::t("zc-chat-no-agents")
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("authoritative empty-agent result did not replace the stale picker");
     }
 
     #[tokio::test]
