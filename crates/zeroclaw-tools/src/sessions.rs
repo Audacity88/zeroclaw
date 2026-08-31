@@ -96,6 +96,34 @@ fn current_session_key() -> Option<String> {
         .flatten()
 }
 
+fn tool_msg_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, args)
+}
+
+fn session_history_header(session_id: &str, shown: usize, total: usize) -> String {
+    let shown = shown.to_string();
+    let total = total.to_string();
+    tool_msg_with_args(
+        "tool-sessions-history-header",
+        &[
+            ("session_id", session_id),
+            ("shown", &shown),
+            ("total", &total),
+        ],
+    )
+}
+
+fn acp_send_unsupported() -> String {
+    tool_msg_with_args(
+        "tool-sessions-send-error-acp-unsupported",
+        &[
+            ("tool", "sessions_send"),
+            ("channel", "ACP"),
+            ("product", "Code"),
+        ],
+    )
+}
+
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,10 +488,8 @@ impl Tool for SessionsHistoryTool {
         let tail = &messages[start..];
 
         let mut output = format!(
-            "Session '{}': showing {}/{} messages\n",
-            session_id,
-            tail.len(),
-            messages.len()
+            "{}\n",
+            session_history_header(session_id, tail.len(), messages.len())
         );
         for msg in tail {
             let _ = writeln!(output, "[{}] {}", msg.role, msg.content);
@@ -481,10 +507,8 @@ fn render_acp_history(session: &AcpSessionData, limit: usize) -> ToolResult {
     let start = session.messages.len().saturating_sub(limit);
     let tail = &session.messages[start..];
     let mut output = format!(
-        "Session '{}': showing {}/{} messages\n",
-        session.session_uuid,
-        tail.len(),
-        session.messages.len()
+        "{}\n",
+        session_history_header(&session.session_uuid, tail.len(), session.messages.len())
     );
     for message in tail {
         match message {
@@ -643,10 +667,7 @@ impl Tool for SessionsSendTool {
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
-                        error: Some(
-                            "sessions_send does not support ACP sessions because durable transcript writes do not deliver messages to the live Code session."
-                                .into(),
-                        ),
+                        error: Some(acp_send_unsupported()),
                     });
                 }
                 AcpTargetAccess::Foreign => return Ok(session_not_found(session_id)),
@@ -749,7 +770,9 @@ impl Tool for SessionsCurrentTool {
         if let Some(view) = &self.acp_sessions
             && view.is_active()?
         {
-            let _ = writeln!(output, "Channel: acp");
+            let channel =
+                tool_msg_with_args("tool-sessions-current-channel", &[("channel", "acp")]);
+            let _ = writeln!(output, "{channel}");
             return Ok(ToolResult {
                 success: true,
                 output: output.into(),
@@ -2015,6 +2038,25 @@ mod tests {
         (tmp, store, view, current, other, foreign)
     }
 
+    #[test]
+    fn acp_session_output_fluent_keys_interpolate_protocol_values() {
+        let header = session_history_header("session-alpha", 37, 89);
+        assert!(header.contains("session-alpha"));
+        assert!(header.contains("37"));
+        assert!(header.contains("89"));
+        assert!(!header.contains("{tool-sessions-history-header}"));
+
+        let channel = tool_msg_with_args("tool-sessions-current-channel", &[("channel", "acp")]);
+        assert!(channel.contains("acp"));
+        assert!(!channel.contains("{tool-sessions-current-channel}"));
+
+        let unsupported = acp_send_unsupported();
+        assert!(unsupported.contains("sessions_send"));
+        assert!(unsupported.contains("ACP"));
+        assert!(unsupported.contains("Code"));
+        assert!(!unsupported.contains("{tool-sessions-send-error-acp-unsupported}"));
+    }
+
     #[tokio::test]
     async fn acp_current_list_and_history_share_owned_session_view() {
         let (_acp_tmp, _store, view, current, other, _foreign) = acp_fixture();
@@ -2028,7 +2070,9 @@ mod tests {
                 let current_result = current_tool.execute(json!({})).await.unwrap();
                 assert!(current_result.success);
                 assert!(current_result.output.contains(&current));
-                assert!(current_result.output.contains("Channel: acp"));
+                let channel =
+                    tool_msg_with_args("tool-sessions-current-channel", &[("channel", "acp")]);
+                assert!(current_result.output.contains(&channel));
 
                 let list_result = list_tool.execute(json!({})).await.unwrap();
                 assert!(list_result.success);
@@ -2040,6 +2084,11 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(current_history.success);
+                assert!(
+                    current_history
+                        .output
+                        .starts_with(&session_history_header(&current, 1, 1))
+                );
                 assert!(current_history.output.contains("current prompt"));
 
                 let other_history = history_tool
@@ -2047,6 +2096,11 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(other_history.success);
+                assert!(
+                    other_history
+                        .output
+                        .starts_with(&session_history_header(&other, 1, 1))
+                );
                 assert!(other_history.output.contains("other answer"));
             })
             .await;
@@ -2141,7 +2195,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(!send_result.success);
-                assert!(send_result.error.unwrap().contains("does not support ACP"));
+                assert_eq!(send_result.error.unwrap(), acp_send_unsupported());
             })
             .await;
 
