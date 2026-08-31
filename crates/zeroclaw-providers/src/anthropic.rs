@@ -147,30 +147,59 @@ struct NativeChatRequest {
 
 fn native_messages_contain_image_blocks(messages: &[NativeMessage]) -> bool {
     messages.iter().any(|message| {
-        message
-            .content
-            .iter()
-            .any(|block| matches!(block, NativeContentOut::Image { .. }))
+        message.content.iter().any(|block| match block {
+            NativeContentOut::Image { .. } => true,
+            NativeContentOut::ToolResult {
+                content: ToolResultContent::Blocks(blocks),
+                ..
+            } => blocks
+                .iter()
+                .any(|block| matches!(block, ToolResultBlock::Image { .. })),
+            _ => false,
+        })
     })
 }
 
-async fn api_error_for_request(
+fn anthropic_image_rejection_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?.as_object()?;
+    let discriminator = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str))?;
+    let is_image_rejection = [
+        "image_input_rejected",
+        "image_processing_error",
+        "invalid_image",
+        "unsupported_image",
+    ]
+    .iter()
+    .any(|known| discriminator.trim().eq_ignore_ascii_case(known));
+    if !is_image_rejection {
+        return None;
+    }
+
+    Some(super::sanitize_api_error(
+        error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(body),
+    ))
+}
+
+fn api_error_for_request(
     model_provider: &str,
-    response: reqwest::Response,
+    status: reqwest::StatusCode,
+    body: &str,
     request_contains_images: bool,
 ) -> anyhow::Error {
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| format!("HTTP error: {status}"));
-    if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
-        return anyhow::Error::new(ProviderImageInputRejected::new(
-            None,
-            super::sanitize_api_error(&body),
-        ));
+    if status == reqwest::StatusCode::BAD_REQUEST
+        && request_contains_images
+        && let Some(detail) = anthropic_image_rejection_detail(body)
+    {
+        return anyhow::Error::new(ProviderImageInputRejected::new(None, detail));
     }
-    super::api_error_from_parts(model_provider, status, &body)
+    super::api_error_from_parts(model_provider, status, body)
 }
 
 fn stream_error_for_response(
@@ -178,11 +207,11 @@ fn stream_error_for_response(
     body: &str,
     request_contains_images: bool,
 ) -> StreamError {
-    if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
-        return StreamError::from(ProviderImageInputRejected::new(
-            None,
-            super::sanitize_api_error(body),
-        ));
+    if status == reqwest::StatusCode::BAD_REQUEST
+        && request_contains_images
+        && let Some(detail) = anthropic_image_rejection_detail(body)
+    {
+        return StreamError::from(ProviderImageInputRejected::new(None, detail));
     }
     StreamError::ModelProvider(format!("{status}: {body}"))
 }
@@ -2437,9 +2466,17 @@ impl ModelProvider for AnthropicModelProvider {
 
         let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
-            return Err(
-                api_error_for_request("Anthropic", response, request_contains_images).await,
-            );
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| format!("HTTP error: {status}"));
+            return Err(api_error_for_request(
+                "Anthropic",
+                status,
+                &body,
+                request_contains_images,
+            ));
         }
 
         let native_response: NativeChatResponse = response.json().await?;
@@ -3412,22 +3449,40 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_image_bad_request_preserves_typed_stream_rejection() {
+    fn native_structured_image_bad_request_is_typed_for_both_transports() {
         let image_messages = vec![NativeMessage {
             role: "user".to_string(),
-            content: vec![NativeContentOut::Image {
-                source: ImageSource {
-                    source_type: "base64".to_string(),
-                    media_type: "image/png".to_string(),
-                    data: "AAAA".to_string(),
-                },
+            content: vec![NativeContentOut::ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                content: ToolResultContent::Blocks(vec![ToolResultBlock::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: "AAAA".to_string(),
+                    },
+                }]),
+                cache_control: None,
             }],
         }];
         assert!(native_messages_contain_image_blocks(&image_messages));
+        let body = r#"{"error":{"type":"image_input_rejected","message":"image rejected: sk-test-secret"}}"#;
+
+        let non_streaming = api_error_for_request(
+            "Anthropic",
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            native_messages_contain_image_blocks(&image_messages),
+        );
+        let rejection = non_streaming
+            .downcast_ref::<ProviderImageInputRejected>()
+            .expect("structured image rejection must remain typed");
+        assert_eq!(rejection.image_indices, None);
+        assert!(rejection.detail.contains("image rejected"));
+        assert!(!rejection.detail.contains("sk-test-secret"));
 
         let typed = stream_error_for_response(
             reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"image rejected: sk-test-secret"}}"#,
+            body,
             native_messages_contain_image_blocks(&image_messages),
         );
         assert!(matches!(
@@ -3440,23 +3495,39 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_text_bad_request_remains_an_ordinary_stream_error() {
-        let text_messages = vec![NativeMessage {
+    fn native_unrelated_image_bad_request_is_ordinary_for_both_transports() {
+        let image_messages = vec![NativeMessage {
             role: "user".to_string(),
-            content: vec![NativeContentOut::Text {
-                text: "hello".to_string(),
-                cache_control: None,
+            content: vec![NativeContentOut::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                },
             }],
         }];
-        assert!(!native_messages_contain_image_blocks(&text_messages));
+        let body = r#"{"error":{"type":"invalid_request_error","message":"invalid tool schema"}}"#;
+
+        let non_streaming = api_error_for_request(
+            "Anthropic",
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            native_messages_contain_image_blocks(&image_messages),
+        );
+        assert!(
+            non_streaming
+                .downcast_ref::<ProviderImageInputRejected>()
+                .is_none()
+        );
+        assert!(non_streaming.to_string().contains("invalid tool schema"));
 
         let error = stream_error_for_response(
             reqwest::StatusCode::BAD_REQUEST,
-            "bad request",
-            native_messages_contain_image_blocks(&text_messages),
+            body,
+            native_messages_contain_image_blocks(&image_messages),
         );
         assert!(
-            matches!(error, StreamError::ModelProvider(message) if message.contains("bad request"))
+            matches!(error, StreamError::ModelProvider(message) if message.contains("invalid tool schema"))
         );
     }
 

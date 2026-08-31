@@ -344,6 +344,17 @@ mod provider_image_quarantine_tests {
         );
     }
 
+    #[test]
+    fn ordinary_provider_error_does_not_quarantine_submitted_images() {
+        let submitted = image_ids();
+        let error = anyhow::anyhow!("400 Bad Request: invalid tool schema");
+        let mut quarantine = ProviderImageQuarantine::default();
+
+        retain_provider_image_rejection(&mut quarantine, &error, &submitted);
+
+        assert!(quarantine.as_slice().is_empty());
+    }
+
     #[tokio::test]
     async fn terminal_rejection_quarantines_replay_until_explicit_retry_succeeds() {
         let uri = "data:image/png;base64,AAAA";

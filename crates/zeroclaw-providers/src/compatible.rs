@@ -306,17 +306,43 @@ fn api_chat_request_contains_image_blocks(request: &ApiChatRequest) -> bool {
     })
 }
 
+fn compatible_image_rejection_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value
+        .get("error")
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| value.as_object())?;
+    let discriminator = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str))?;
+    let is_image_rejection = [
+        "image_input_rejected",
+        "image_processing_error",
+        "invalid_image",
+        "unsupported_image",
+    ]
+    .iter()
+    .any(|known| discriminator.trim().eq_ignore_ascii_case(known));
+    if !is_image_rejection {
+        return None;
+    }
+
+    let detail = structured_api_error_message(&value).unwrap_or_else(|| body.to_string());
+    Some(super::sanitize_api_error(&detail))
+}
+
 fn api_error_for_request(
     model_provider: &str,
     status: reqwest::StatusCode,
     body: &str,
     request_contains_images: bool,
 ) -> anyhow::Error {
-    if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
-        return anyhow::Error::new(ProviderImageInputRejected::new(
-            None,
-            super::sanitize_api_error(body),
-        ));
+    if status == reqwest::StatusCode::BAD_REQUEST
+        && request_contains_images
+        && let Some(detail) = compatible_image_rejection_detail(body)
+    {
+        return anyhow::Error::new(ProviderImageInputRejected::new(None, detail));
     }
     super::api_error_from_parts(model_provider, status, body)
 }
@@ -334,12 +360,11 @@ fn streaming_api_error_for_request(
     body: &str,
     request_contains_images: bool,
 ) -> StreamError {
-    if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
-        let message = serde_json::from_str(body)
-            .ok()
-            .and_then(|value| structured_api_error_message(&value));
-        let sanitized = super::sanitize_api_error(message.as_deref().unwrap_or(body));
-        return StreamError::from(ProviderImageInputRejected::new(None, sanitized));
+    if status == reqwest::StatusCode::BAD_REQUEST
+        && request_contains_images
+        && let Some(detail) = compatible_image_rejection_detail(body)
+    {
+        return StreamError::from(ProviderImageInputRejected::new(None, detail));
     }
     streaming_api_error(status, body)
 }
@@ -4121,7 +4146,7 @@ mod tests {
     }
 
     #[test]
-    fn image_bearing_bad_request_preserves_typed_rejection() {
+    fn structured_image_bad_request_is_typed_for_both_transports() {
         let payload = serde_json::json!({
             "messages": [{
                 "role": "user",
@@ -4131,61 +4156,70 @@ mod tests {
                 }]
             }]
         });
-        let body = r#"{"error":{"message":"image rejected: sk-test-secret"}}"#;
+        let body = r#"{"error":{"code":"image_input_rejected","message":"image rejected: sk-test-secret"}}"#;
 
-        let error = api_error_for_request(
+        let non_streaming = api_error_for_request(
             "test",
             reqwest::StatusCode::BAD_REQUEST,
             body,
             request_contains_image_blocks(&payload),
         );
-        let rejection = error
+        let rejection = non_streaming
             .downcast_ref::<ProviderImageInputRejected>()
-            .expect("image-bearing HTTP 400 must be typed");
+            .expect("structured image rejection must remain typed");
         assert_eq!(rejection.image_indices, None);
         assert!(rejection.detail.contains("image rejected"));
         assert!(!rejection.detail.contains("sk-test-secret"));
-    }
 
-    #[test]
-    fn text_only_bad_request_remains_an_ordinary_provider_error() {
-        let payload = serde_json::json!({
-            "messages": [{"role": "user", "content": "hello"}]
-        });
-        let error = api_error_for_request(
-            "test",
+        let streaming = streaming_api_error_for_request(
             reqwest::StatusCode::BAD_REQUEST,
-            "bad request",
+            body,
             request_contains_image_blocks(&payload),
         );
-
-        assert!(error.downcast_ref::<ProviderImageInputRejected>().is_none());
-        assert!(error.to_string().contains("test API error"));
-    }
-
-    #[test]
-    fn streaming_image_rejection_is_typed_only_for_image_bearing_bad_requests() {
-        let typed = streaming_api_error_for_request(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"message":"image rejected"}"#,
-            true,
-        );
         assert!(matches!(
-            typed,
+            streaming,
             StreamError::ProviderImageInputRejected(ProviderImageInputRejected {
                 image_indices: None,
                 detail,
-            }) if detail == "image rejected"
+            }) if detail.contains("image rejected") && !detail.contains("sk-test-secret")
         ));
+    }
 
-        let ordinary = streaming_api_error_for_request(
+    #[test]
+    fn unrelated_image_bad_request_is_ordinary_for_both_transports() {
+        let payload = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"}
+                }]
+            }]
+        });
+        let body = r#"{"error":{"code":"invalid_request_error","message":"invalid tool schema"}}"#;
+        let non_streaming = api_error_for_request(
+            "test",
             reqwest::StatusCode::BAD_REQUEST,
-            "image rejected",
-            false,
+            body,
+            request_contains_image_blocks(&payload),
         );
+
         assert!(
-            matches!(ordinary, StreamError::ModelProvider(message) if message.contains("400 Bad Request"))
+            non_streaming
+                .downcast_ref::<ProviderImageInputRejected>()
+                .is_none()
         );
+        assert!(non_streaming.to_string().contains("invalid tool schema"));
+
+        let streaming = streaming_api_error_for_request(
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            request_contains_image_blocks(&payload),
+        );
+        assert!(matches!(
+            streaming,
+            StreamError::ModelProvider(message) if message.contains("invalid tool schema")
+        ));
     }
 
     fn make_model_provider(
