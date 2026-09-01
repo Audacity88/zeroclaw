@@ -439,7 +439,10 @@ pub fn register_skill_tools_with_context_and_runtime(
     );
 }
 
-pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<dyn Tool>> {
+pub async fn collect_mcp_elevation_arcs(
+    registry: &Arc<McpRegistry>,
+    security: &Arc<zeroclaw_config::policy::SecurityPolicy>,
+) -> Vec<Arc<dyn Tool>> {
     let mut arcs: Vec<Arc<dyn Tool>> = Vec::new();
     for name in registry.tool_names() {
         if let Some(def) = registry.get_tool_def(&name).await {
@@ -447,6 +450,7 @@ pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<
                 name,
                 def,
                 Arc::clone(registry),
+                Arc::clone(security),
             )));
         }
     }
@@ -520,6 +524,35 @@ pub struct AllToolsResult {
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
+impl AllToolsResult {
+    /// Wrap an already-built tool vector as `assemble` INPUT, with every
+    /// side-channel handle empty. This mints an `AllToolsResult` (the input to
+    /// [`crate::tools::scoped::ScopedToolRegistry::assemble`]), NOT a
+    /// `ScopedToolRegistry` - it does not touch the seal. (`AllToolsResult`'s
+    /// fields are all `pub`, so a caller could already hand-roll this literal;
+    /// the helper just centralizes the "all handles empty" shape.) Used by the
+    /// paths that already own a fixed / pre-filtered tool set (the skill-review
+    /// harness, bounded delegation, and the `zeroclaw-eval` replay harness) and
+    /// route it through `assemble` only to seal it: they pass `skills: &[]`,
+    /// `connect_mcp: false`, `connect_peripherals: false`, so the empty handles
+    /// here are never read by the assembly. `pub` (not `pub(crate)`) so the
+    /// out-of-crate `zeroclaw-eval` harness can reach it.
+    pub fn from_prebuilt_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+        Self {
+            tools,
+            delegate_handle: None,
+            ask_user_handle: None,
+            channel_room_handle: None,
+            reaction_handle: Arc::new(RwLock::new(HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            unfiltered_tool_arcs: Vec::new(),
+            #[cfg(test)]
+            delegate_tool: None,
+        }
+    }
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
@@ -582,6 +615,71 @@ fn filter_agent_peer_groups(
         .filter(|(_, pg)| pg.agents.iter().any(|a| a.as_str() == agent_alias))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+/// One plugin instance's egress policy, read from canonical config at use time.
+///
+/// `instance_key` is the instance's
+/// [`PluginInstanceScope::config_entry_key`][key] — the very same
+/// `plugins.entries[].name` that [`plugin_config_values`] resolves against, so
+/// a single row carries both an instance's config and its granted reach.
+///
+/// The operator's `plugins.entries[].egress_hosts` is the only source of reach.
+/// The deployment's NAT64 prefixes and connection ceiling are read from the same
+/// config so a plugin and a built-in tool cannot classify one answer set
+/// differently.
+///
+/// [key]: zeroclaw_plugins::instance::PluginInstanceScope::config_entry_key
+#[cfg(feature = "plugins-wasm")]
+fn plugin_egress_policy(
+    config: &Config,
+    instance_key: &str,
+) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
+    let (hosts, allow_private) = config.plugins.entry_egress(instance_key);
+    zeroclaw_plugins::egress::EgressPolicy::new(
+        &hosts,
+        &allow_private,
+        &config.security.nat64_prefixes,
+        config.plugins.limits.max_connections_per_instance,
+    )
+}
+
+/// The one host-owned egress authority shared by every plugin instance in a
+/// registry.
+///
+/// It resolves a *view* of canonical config at the moment each request is made
+/// rather than snapshotting one here, so an operator edit takes effect without
+/// re-instantiating the guest. The live handle is preferred; one-shot callers
+/// that have none fall back to the documented `root_config` snapshot.
+///
+/// A fresh service is built per registry, and that is deliberately fine: the
+/// per-instance connection budget does *not* live in the service. It lives in
+/// `zeroclaw_plugins::egress`'s process-wide registry, keyed by canonical
+/// instance identity, so the agent loop, the gateway, the channels
+/// orchestrator, and the delegate tool spend one ceiling between them rather
+/// than one each.
+///
+/// Egress and config resolve the **same** `[[plugins.entries]]` row: both key on
+/// the instance's `config_entry_key()` (the opaque `zpi1_` instance key), never
+/// on the package name or the raw binding. Keying egress by the binding would
+/// miss the row `zeroclaw plugin install` seeds and deny every destination the
+/// operator granted.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_egress_service(
+    config: Arc<Config>,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> zeroclaw_plugins::egress::EgressHostService {
+    zeroclaw_plugins::egress::EgressHostService::new(
+        zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
+            let instance_key = scope.id().config_entry_key().map_err(|error| {
+                zeroclaw_plugins::egress::EgressError::PolicyUnavailable(error.to_string())
+            })?;
+            match live_config.as_ref() {
+                Some(handle) => plugin_egress_policy(&handle.read(), &instance_key),
+                None => plugin_egress_policy(&config, &instance_key),
+            }
+        }),
+    )
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -674,7 +772,17 @@ pub fn all_tools_with_runtime(
     let register_coding_cli_tools = has_shell_access && persistent_writes;
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    let sandbox_extra_roots = crate::security::SandboxExtraRoots {
+        read_write: security.allowed_roots.clone(),
+        read_only: security.allowed_roots_read_only.clone(),
+        write_only: security.allowed_roots_write_only.clone(),
+    };
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        runtime_kind,
+        Some(&security.workspace_dir),
+        &sandbox_extra_roots,
+    );
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -735,7 +843,7 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronListTool::new(config.clone())),
+        Arc::new(CronListTool::new(config.clone(), agent_alias)),
         Arc::new(CronRemoveTool::new(
             config.clone(),
             security.clone(),
@@ -750,9 +858,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunTool::new_with_runtime(
             config.clone(),
             security.clone(),
+            agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunsTool::new(config.clone())),
+        Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
@@ -1675,11 +1784,14 @@ pub fn all_tools_with_runtime(
                             config.plugins.limits.call_timeout_ms,
                         ),
                     };
+                    let egress_service =
+                        plugin_egress_service(Arc::clone(&config), live_config.clone());
                     register_plugin_tools(
                         &config,
                         &host,
                         &host_services,
                         plugin_limits,
+                        Some(egress_service),
                         &mut registered_names,
                         &mut tool_arcs,
                     );
@@ -1764,6 +1876,7 @@ fn register_plugin_tools(
     host: &zeroclaw_plugins::host::PluginHost,
     services: &zeroclaw_plugins::services::PluginHostServices,
     plugin_limits: zeroclaw_plugins::component::PluginLimits,
+    egress: Option<zeroclaw_plugins::egress::EgressHostService>,
     registered_names: &mut std::collections::HashSet<String>,
     tool_arcs: &mut Vec<Arc<dyn Tool>>,
 ) {
@@ -1820,6 +1933,7 @@ fn register_plugin_tools(
             scope,
             services.clone(),
             plugin_limits,
+            egress.clone(),
         );
         match tool {
             Ok(tool) => {
@@ -2002,6 +2116,97 @@ const = true
         );
     }
 
+    /// End-to-end over the resolver the registry actually installs: an operator
+    /// grant authored on the instance-key row that `zeroclaw plugin install`
+    /// seeds must reach the policy, and nothing else may stand in for it.
+    ///
+    /// The existing egress tests build an `EgressPolicy` directly, so they
+    /// cannot see which `[[plugins.entries]]` row the runtime reads. This one
+    /// starts from canonical config and goes through `plugin_egress_service`.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_egress_resolves_the_instance_key_row_config_resolves() {
+        let plugins_dir = TempDir::new().unwrap();
+        let plugin_dir = plugins_dir.path().join("egress-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"name = "egress-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client"]
+"#,
+        )
+        .unwrap();
+        let host =
+            zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins_dir.path()).unwrap();
+        let manifest = host.manifest("egress-plugin").unwrap();
+        // The production tool path: binding == package name, which is exactly
+        // what used to be handed to `entry_egress`.
+        let scope = zeroclaw_plugins::instance::PluginInstanceScope::for_package_binding(
+            manifest,
+            zeroclaw_plugins::PluginCapability::Tool,
+            manifest.permissions.iter().copied(),
+        )
+        .unwrap();
+        let instance_key = scope.id().config_entry_key().unwrap();
+        assert_ne!(
+            instance_key,
+            scope.id().binding(),
+            "the canonical entry key must not coincide with the binding, or this test proves nothing"
+        );
+
+        let entry = |name: &str| zeroclaw_config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+        };
+        let request = || {
+            zeroclaw_plugins::egress::EgressRequest::new(
+                scope.clone(),
+                zeroclaw_plugins::egress::EgressTransport::Http { encrypted: true },
+                "api.example.com",
+                443,
+            )
+            .unwrap()
+        };
+        let addresses = ["1.1.1.1:443".parse::<std::net::SocketAddr>().unwrap()];
+
+        // Granted on the instance-key row: the operator's grant reaches policy.
+        let mut granted = Config::default();
+        granted.plugins.entries = vec![entry(&instance_key)];
+        let service = plugin_egress_service(Arc::new(granted), None);
+        service
+            .authorize_addresses(request(), addresses)
+            .expect("a grant on the instance-key row must reach the resolved policy");
+
+        // No row at all: deny.
+        let service = plugin_egress_service(Arc::new(Config::default()), None);
+        assert!(
+            matches!(
+                service.authorize_addresses(request(), addresses),
+                Err(zeroclaw_plugins::egress::EgressError::DestinationNotGranted { .. })
+            ),
+            "an unconfigured instance must have no reach"
+        );
+
+        // A legacy package/binding-named row must not stand in for the
+        // canonical key, or egress and config would read two different rows.
+        let mut legacy = Config::default();
+        legacy.plugins.entries = vec![entry(scope.id().binding())];
+        let service = plugin_egress_service(Arc::new(legacy), None);
+        assert!(
+            matches!(
+                service.authorize_addresses(request(), addresses),
+                Err(zeroclaw_plugins::egress::EgressError::DestinationNotGranted { .. })
+            ),
+            "a raw package or binding entry must not bypass the canonical key"
+        );
+    }
+
     #[test]
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
@@ -2148,6 +2353,7 @@ const = true
             host,
             &services,
             test_plugin_limits(),
+            None,
             &mut registered_names,
             &mut tool_arcs,
         );
