@@ -29886,18 +29886,19 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let config = config_arc.read();
-        let channel = build_configured_discord_channel(
-            &config_arc,
-            &config,
-            "community",
-            config
-                .channels
-                .discord
-                .get("community")
-                .expect("configured Discord alias"),
-        );
-        drop(config);
+        let channel = {
+            let config = config_arc.read();
+            build_configured_discord_channel(
+                &config_arc,
+                &config,
+                "community",
+                config
+                    .channels
+                    .discord
+                    .get("community")
+                    .expect("configured Discord alias"),
+            )
+        };
 
         let attachments = vec![serde_json::json!({
             "content_type": "audio/ogg",
