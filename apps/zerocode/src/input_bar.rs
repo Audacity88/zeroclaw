@@ -2609,6 +2609,15 @@ mod tests {
     }
 
     #[test]
+    fn append_text_at_end_populates_empty_draft_without_separator() {
+        let mut bar = input_bar_with_shared_commands();
+
+        assert!(bar.append_text_at_end("> selected"));
+        assert_eq!(bar.input(), "> selected");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
     fn append_text_at_end_preserves_draft_selection_attachments_and_unicode_cursor() {
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("draft 世界");
