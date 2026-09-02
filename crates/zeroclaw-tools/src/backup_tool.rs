@@ -1276,7 +1276,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("symlink"));
+        let destination = workspace.path().canonicalize().unwrap().join("config");
+        let write_blocked = tool_text_arg(
+            "tool-backup-error-write-blocked",
+            "path",
+            &destination.display().to_string(),
+        );
+        assert_eq!(result.error.as_deref(), Some(write_blocked.as_str()));
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("memory/value.txt")).unwrap(),
             "current"
