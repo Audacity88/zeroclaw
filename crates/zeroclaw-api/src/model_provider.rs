@@ -12,9 +12,37 @@ pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
 /// Parameters for native extended thinking support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeThinkingParams {
     pub budget_tokens: u32,
+    /// Requests Anthropic's `thinking.display` beta
+    /// (`thinking-display-updates-2026-08-18`), which controls whether
+    /// thinking blocks come back omitted, as progress updates, or
+    /// summarized. `None` leaves the field out of the request entirely,
+    /// matching pre-beta behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<ThinkingDisplay>,
+}
+
+/// Anthropic's `thinking.display` request field (beta
+/// `thinking-display-updates-2026-08-18`), controlling whether thinking
+/// blocks come back omitted, as progress updates, or summarized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    Omitted,
+    Updates,
+    Summarized,
+}
+
+impl ThinkingDisplay {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Omitted => "omitted",
+            Self::Updates => "updates",
+            Self::Summarized => "summarized",
+        }
+    }
 }
 
 /// A single message in a conversation.
@@ -1143,5 +1171,41 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod thinking_display_tests {
+    use super::{NativeThinkingParams, ThinkingDisplay};
+
+    #[test]
+    fn as_str_maps_updates_variant() {
+        assert_eq!(ThinkingDisplay::Updates.as_str(), "updates");
+    }
+
+    #[test]
+    fn serialization_includes_display_when_present() {
+        let params = NativeThinkingParams {
+            budget_tokens: 1_024,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let json = serde_json::to_string(&params).expect("serialization should succeed");
+        assert!(
+            json.contains("\"display\":\"updates\""),
+            "expected display field in serialized params, got: {json}"
+        );
+    }
+
+    #[test]
+    fn serialization_omits_display_when_absent() {
+        let params = NativeThinkingParams {
+            budget_tokens: 1_024,
+            display: None,
+        };
+        let json = serde_json::to_string(&params).expect("serialization should succeed");
+        assert!(
+            !json.contains("display"),
+            "expected display field to be omitted, got: {json}"
+        );
     }
 }

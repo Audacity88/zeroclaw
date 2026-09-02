@@ -6062,6 +6062,7 @@ mod tests {
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens: 10_000,
+            display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -6110,6 +6111,7 @@ mod tests {
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens: 10_000,
+            display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -6165,6 +6167,7 @@ mod tests {
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens: 10_000,
+            display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
