@@ -150,7 +150,11 @@ struct NativeChatRequest {
 struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
-    budget_tokens: u32,
+    /// Fixed token budget for `enabled` thinking. Absent for `adaptive`
+    /// thinking, which lets the model pace itself — adaptive-only models
+    /// (Opus 4.7, Fable 5.1) reject `enabled` with HTTP 400.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
     /// Anthropic's `thinking.display` beta field. `None` leaves the key out
     /// of the request body entirely, matching pre-beta requests byte-for-byte.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -185,7 +189,10 @@ async fn flush_streaming_thinking_block(
     let thinking = std::mem::take(thinking_text);
     let signature = std::mem::take(thinking_signature);
     *thinking_block_active = false;
-    if thinking.is_empty() {
+    // `omitted` display and some `updates` blocks legitimately carry an
+    // empty `thinking` field with a required signature; the signature alone
+    // must reach replay or tool-use continuation breaks.
+    if thinking.is_empty() && signature.is_empty() {
         return true;
     }
     let mut payload = String::new();
@@ -214,8 +221,21 @@ fn anthropic_beta_features(is_oauth: bool, thinking_display_beta: bool) -> Optio
     }
 }
 
-fn anthropic_model_supports_native_thinking(model: &str) -> bool {
-    !model.contains("claude-opus-4-7")
+/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
+/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
+/// require `adaptive`; budget-based models require `enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicThinkingStyle {
+    Budget,
+    Adaptive,
+}
+
+fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
+        AnthropicThinkingStyle::Adaptive
+    } else {
+        AnthropicThinkingStyle::Budget
+    }
 }
 
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
@@ -1838,12 +1858,18 @@ impl AnthropicModelProvider {
                     }
                 }
                 "thinking" => {
-                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref())
-                        && !thinking.is_empty()
-                    {
+                    // Signature-only blocks (empty `thinking`, e.g. under
+                    // the `omitted` display) must reach replay too.
+                    let thinking = block
+                        .thinking
+                        .as_deref()
+                        .or(block.text.as_deref())
+                        .unwrap_or("");
+                    let signature = block.signature.as_deref().unwrap_or("");
+                    if !thinking.is_empty() || !signature.is_empty() {
                         let json_block = serde_json::json!({
                             "thinking": thinking,
-                            "signature": block.signature.as_deref().unwrap_or(""),
+                            "signature": signature,
                         });
                         thinking_parts.push(json_block.to_string());
                     }
@@ -1936,38 +1962,44 @@ impl AnthropicModelProvider {
         model: &str,
     ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
         match thinking {
-            Some(params) if anthropic_model_supports_native_thinking(model) => {
+            Some(params) => {
+                let style = anthropic_thinking_style(model);
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                        .with_attrs(::serde_json::json!({
+                            "model": model,
+                            "style": match style {
+                                AnthropicThinkingStyle::Budget => "enabled",
+                                AnthropicThinkingStyle::Adaptive => "adaptive",
+                            },
+                        })),
                     "Native extended thinking enabled; forcing temperature=1.0"
                 );
-                // API requires max_tokens > budget_tokens (strictly greater).
-                let min_required = params.budget_tokens + 1;
-                let max_tokens = self.max_tokens.max(min_required);
-                (
-                    Some(1.0),
-                    Some(NativeThinkingConfig {
-                        kind: "enabled",
-                        budget_tokens: params.budget_tokens,
-                        display: params.display,
-                    }),
-                    max_tokens,
-                )
-            }
-            Some(_) => {
-                // Caller asked for native thinking but the model rejects the
-                // fixed-budget request shape. Drop to prompt-based reasoning
-                // (the agent loop's prefix already injected) and keep the
-                // caller-supplied temperature so per-model guards still apply.
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"model": model})),
-                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
-                );
-                (temperature, None, self.max_tokens)
+                // Thinking mode requires temperature 1.0 regardless of style.
+                let (config, max_tokens) = match style {
+                    AnthropicThinkingStyle::Budget => {
+                        // API requires max_tokens > budget_tokens (strictly greater).
+                        let min_required = params.budget_tokens + 1;
+                        (
+                            NativeThinkingConfig {
+                                kind: "enabled",
+                                budget_tokens: Some(params.budget_tokens),
+                                display: params.display,
+                            },
+                            self.max_tokens.max(min_required),
+                        )
+                    }
+                    AnthropicThinkingStyle::Adaptive => (
+                        NativeThinkingConfig {
+                            kind: "adaptive",
+                            budget_tokens: None,
+                            display: params.display,
+                        },
+                        self.max_tokens,
+                    ),
+                };
+                (Some(1.0), Some(config), max_tokens)
             }
             None => (temperature, None, self.max_tokens),
         }
@@ -3882,25 +3914,44 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn anthropic_model_supports_native_thinking_excludes_opus_4_7() {
+    fn anthropic_thinking_style_matrix() {
+        // Adaptive-only families: fixed-budget `enabled` returns 400.
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-7"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-7-20260101"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5-1"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5-1-20260815"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        // Budget-based families keep the `enabled` shape.
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-6"),
+            AnthropicThinkingStyle::Budget
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-sonnet-4-6"),
+            AnthropicThinkingStyle::Budget
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-haiku-4-5"),
+            AnthropicThinkingStyle::Budget
+        );
+    }
+
+    #[test]
+    fn resolve_thinking_uses_adaptive_for_opus_4_7() {
         // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
-        assert!(!anthropic_model_supports_native_thinking("claude-opus-4-7"));
-        assert!(!anthropic_model_supports_native_thinking(
-            "claude-opus-4-7-20260101"
-        ));
-    }
-
-    #[test]
-    fn anthropic_model_supports_native_thinking_allows_other_models() {
-        assert!(anthropic_model_supports_native_thinking("claude-opus-4-6"));
-        assert!(anthropic_model_supports_native_thinking(
-            "claude-sonnet-4-6"
-        ));
-        assert!(anthropic_model_supports_native_thinking("claude-haiku-4-5"));
-    }
-
-    #[test]
-    fn resolve_thinking_drops_native_for_opus_4_7() {
+        // Native thinking is now sent in adaptive form instead of being
+        // dropped to prompt-based reasoning.
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
@@ -3910,13 +3961,30 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         let (temp, config, max_tokens) =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
-        assert!(
-            config.is_none(),
-            "native thinking should be gated off for opus-4-7"
-        );
-        // Caller-supplied temperature is preserved (so per-model omit guard
-        // can still take effect downstream).
-        assert!((temp.unwrap() - 0.7_f64).abs() < f64::EPSILON);
+        let config = config.expect("adaptive thinking config for opus-4-7");
+        assert_eq!(config.kind, "adaptive");
+        assert_eq!(config.budget_tokens, None);
+        assert_eq!(config.display, None);
+        assert_eq!(temp, Some(1.0));
+        assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_uses_adaptive_for_fable_5_1_and_propagates_display() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let (temp, config, max_tokens) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1-20260815");
+        let config = config.expect("adaptive thinking config for fable-5-1");
+        assert_eq!(config.kind, "adaptive");
+        assert_eq!(config.budget_tokens, None);
+        assert_eq!(config.display, Some(ThinkingDisplay::Updates));
+        assert_eq!(temp, Some(1.0));
         assert_eq!(max_tokens, provider.max_tokens);
     }
 
@@ -4774,7 +4842,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_response_drops_empty_thinking_blocks() {
+    fn native_response_keeps_signature_only_blocks() {
+        // `omitted` display yields empty `thinking` with a required
+        // signature; dropping the block would break tool-use replay.
         let json = r#"{
             "content": [
                 {"type": "thinking", "thinking": "", "signature": "sig_xyz"},
@@ -4783,7 +4853,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp);
-        assert!(result.reasoning_content.is_none());
+        let reasoning = result
+            .reasoning_content
+            .expect("signature-only block must reach replay");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reasoning).expect("replay line must be a JSON object");
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sig_xyz");
     }
 
     #[test]
@@ -7603,7 +7679,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: Some(NativeThinkingConfig {
                 kind: "enabled",
-                budget_tokens: 1_024,
+                budget_tokens: Some(1_024),
                 display: Some(ThinkingDisplay::Updates),
             }),
         };
@@ -7614,7 +7690,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let request = NativeChatRequest {
             thinking: Some(NativeThinkingConfig {
                 kind: "enabled",
-                budget_tokens: 1_024,
+                budget_tokens: Some(1_024),
                 display: None,
             }),
             ..request
@@ -7902,5 +7978,164 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(body["stream"], serde_json::json!(true));
         assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
         assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(2_048));
+    }
+
+    #[test]
+    fn request_body_omits_budget_tokens_for_adaptive_models() {
+        let message = NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+            }],
+        };
+        let request = NativeChatRequest {
+            model: "claude-fable-5-1".to_string(),
+            max_tokens: 1_024,
+            system: None,
+            messages: vec![message],
+            temperature: Some(1.0),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: Some(NativeThinkingConfig {
+                kind: "adaptive",
+                budget_tokens: None,
+                display: Some(ThinkingDisplay::Updates),
+            }),
+        };
+
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(body["thinking"]["type"], serde_json::json!("adaptive"));
+        assert!(
+            body["thinking"].get("budget_tokens").is_none(),
+            "adaptive thinking must not carry a budget: {body}"
+        );
+        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+    }
+
+    #[tokio::test]
+    async fn streaming_signature_only_omitted_block_reaches_replay() {
+        // `omitted` display returns signature-only blocks: empty `thinking`
+        // plus a required signature. Dropping them breaks tool-use replay.
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigO\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        let mut text = String::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ThinkingDelta(delta)) => thinking_deltas.push(delta),
+                Ok(StreamEvent::ReasoningFinalized(payload)) => reasoning_payloads.push(payload),
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+        }
+
+        assert!(
+            thinking_deltas.is_empty(),
+            "signature-only block must not produce visible deltas: {thinking_deltas:?}"
+        );
+        assert_eq!(reasoning_payloads.len(), 1, "block must reach replay");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning_payloads[0])
+            .expect("reasoning payload must be a JSON object");
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sigO");
+        assert_eq!(text, "answer");
+    }
+
+    #[tokio::test]
+    async fn streaming_mixed_updates_blocks_emit_deltas_and_full_replay() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigA\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigB\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ThinkingDelta(delta)) => thinking_deltas.push(delta),
+                Ok(StreamEvent::ReasoningFinalized(payload)) => reasoning_payloads.push(payload),
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+        }
+
+        assert_eq!(
+            thinking_deltas,
+            vec!["step one".to_string()],
+            "only the text-bearing block produces visible deltas"
+        );
+        assert_eq!(reasoning_payloads.len(), 2, "both blocks reach replay");
+        let second: serde_json::Value =
+            serde_json::from_str(reasoning_payloads[1].trim_start_matches('\n'))
+                .expect("second payload must be a JSON object");
+        assert_eq!(second["thinking"], "");
+        assert_eq!(second["signature"], "sigB");
+    }
+
+    #[test]
+    fn non_streaming_signature_only_block_reaches_replay() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sigX"},
+                {"type": "text", "text": "done"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        let reasoning = result
+            .reasoning_content
+            .expect("signature-only block must reach replay");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reasoning).expect("reasoning_content line must be a JSON object");
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sigX");
     }
 }

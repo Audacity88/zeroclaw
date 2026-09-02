@@ -117,6 +117,9 @@ delivered when native thinking is enabled (`agent.thinking.native_thinking
 - `off` (default): no `display` field is sent; requests are byte-identical
   to earlier ZeroClaw versions and thinking requests use the non-streaming
   fallback.
+- `omitted`: Anthropic omits thinking text from the response; blocks arrive
+  signature-only (empty `thinking`, required signature), keeping replay
+  intact while minimizing visible reasoning.
 - `updates`: the request carries the
   `thinking-display-updates-2026-08-18` beta and uses the streaming
   response path. Readable thinking progress is surfaced live while the
