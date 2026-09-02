@@ -239,12 +239,6 @@ struct EntryRetryAttempt {
     rpc: Arc<RpcClient>,
 }
 
-impl EntryRetryAttempt {
-    fn is_finished(&self) -> bool {
-        self.worker.is_finished()
-    }
-}
-
 impl Drop for EntryRetryAttempt {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
@@ -742,9 +736,7 @@ impl Chat {
                 self.phase = phase;
             }
             Err(oneshot::error::TryRecvError::Empty) => {
-                if !attempt.is_finished() {
-                    self.entry_retry_attempt = Some(attempt);
-                }
+                self.entry_retry_attempt = Some(attempt);
             }
             Err(oneshot::error::TryRecvError::Closed) => drop(attempt),
         }
@@ -11416,6 +11408,54 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("authoritative empty-agent result did not replace the stale picker");
+    }
+
+    #[tokio::test]
+    async fn chat_entry_retry_keeps_empty_receiver_after_worker_finishes() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(Arc::clone(&client), PaneKind::Chat);
+        chat.phase = ChatPhase::Error("stale error".to_string());
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let worker = tokio::spawn(async {});
+        while !worker.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        chat.entry_retry_attempt = Some(EntryRetryAttempt {
+            result_rx,
+            worker,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            phase: Arc::new(AtomicU8::new(ENTRY_RETRY_PRE_SESSION)),
+            rpc: client,
+        });
+
+        chat.drain_entry_retry_results();
+        assert!(
+            chat.entry_retry_attempt.is_some(),
+            "worker completion cannot prove an empty receiver is terminal"
+        );
+
+        assert!(
+            result_tx
+                .send(ChatEntryRetryResult {
+                    phase: ChatPhase::Error("authoritative result".to_string()),
+                    init_outcome: ChatInitOutcome::NoEnabledAgents,
+                    resume_session_id: None,
+                    resume_agent_alias: None,
+                    session_ownership: None,
+                })
+                .is_ok(),
+            "retained receiver should accept the completed result"
+        );
+        chat.drain_entry_retry_results();
+
+        assert!(chat.entry_retry_attempt.is_none());
+        assert!(matches!(
+            chat.phase,
+            ChatPhase::Error(ref message) if message == "authoritative result"
+        ));
     }
 
     #[tokio::test]
