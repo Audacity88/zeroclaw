@@ -16,7 +16,7 @@ use zeroclaw_runtime::rpc::types::{
 
 use super::AppState;
 use super::api::require_auth;
-use super::api_config::persist_and_swap;
+use super::api_config::{compute_drift, persist_and_swap};
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
@@ -1081,6 +1081,36 @@ pub async fn handle_section_select(
     }
 
     if working.dirty_paths.is_empty() {
+        let drifted = match section_enum {
+            Section::Memory | Section::Tunnel => compute_drift(&working).await,
+            _ => Vec::new(),
+        };
+        let tunnel_prefix =
+            (section_enum == Section::Tunnel && key != "none").then(|| format!("tunnel.{key}."));
+        let conflict_paths: Vec<String> = drifted
+            .into_iter()
+            .filter(|drift| match section_enum {
+                Section::Memory => drift.path == "memory.backend",
+                Section::Tunnel => {
+                    drift.path == "tunnel.tunnel_provider"
+                        || tunnel_prefix
+                            .as_deref()
+                            .is_some_and(|prefix| drift.path.starts_with(prefix))
+                }
+                _ => false,
+            })
+            .map(|drift| drift.path)
+            .collect();
+        if !conflict_paths.is_empty() {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ConfigChangedExternally,
+                format!(
+                    "on-disk config has drifted from in-memory state on {} path(s) required by this selection: {}. Reload the config or GET /api/config/drift to inspect first.",
+                    conflict_paths.len(),
+                    conflict_paths.join(", "),
+                ),
+            ));
+        }
         return axum::Json(SelectItemResponse {
             fields_prefix,
             created,
@@ -1952,6 +1982,126 @@ mod tests {
         );
         assert!(
             !tunnel_state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_memory_selection_rejects_disk_drift() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("memory tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut live_cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        live_cfg.memory.backend = "sqlite".to_string();
+        live_cfg
+            .onboard_state
+            .completed_sections
+            .push("memory".to_string());
+        live_cfg.save().await.expect("seed live memory config");
+        let state = section_test_state(live_cfg);
+
+        let mut disk_cfg = state.config.read().clone();
+        disk_cfg.memory.backend = "postgres".to_string();
+        disk_cfg.save().await.expect("write external memory drift");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read drifted memory config");
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "memory".to_string(),
+                key: "sqlite".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("memory response body")
+            .to_bytes();
+        let error: ConfigApiError = serde_json::from_slice(&body).expect("memory error response");
+        assert_eq!(error.code, ConfigApiCode::ConfigChangedExternally);
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        assert_eq!(
+            toml::Value::try_from(&*state.config.read()).unwrap(),
+            toml::Value::try_from(&live_before).unwrap(),
+            "a rejected memory selection must preserve the live snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_tunnel_selection_rejects_default_disk_drift() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("tunnel tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut live_cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        live_cfg.tunnel.tunnel_provider = "tailscale".to_string();
+        live_cfg.tunnel.tailscale = Some(Default::default());
+        live_cfg.save().await.expect("seed live tunnel config");
+        let state = section_test_state(live_cfg);
+
+        let mut disk_cfg = state.config.read().clone();
+        disk_cfg
+            .tunnel
+            .tailscale
+            .as_mut()
+            .expect("tailscale defaults")
+            .funnel = true;
+        disk_cfg.save().await.expect("write external tunnel drift");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read drifted tunnel config");
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "tailscale".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("tunnel response body")
+            .to_bytes();
+        let error: ConfigApiError = serde_json::from_slice(&body).expect("tunnel error response");
+        assert_eq!(error.code, ConfigApiCode::ConfigChangedExternally);
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        assert_eq!(
+            toml::Value::try_from(&*state.config.read()).unwrap(),
+            toml::Value::try_from(&live_before).unwrap(),
+            "a rejected tunnel selection must preserve the live snapshot"
+        );
+        assert!(
+            !state
                 .pending_reload
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
