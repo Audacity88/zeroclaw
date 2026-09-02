@@ -352,6 +352,15 @@ impl StreamChunk {
 pub enum StreamEvent {
     /// Text delta from the assistant.
     TextDelta(StreamChunk),
+    /// Transient, human-readable thinking progress. Surfaced to the user
+    /// (gated by the runtime visibility policy) and never persisted into
+    /// reasoning_content.
+    ThinkingDelta(String),
+    /// Durable, replay-only finalized reasoning payload (signed thinking
+    /// blocks in the provider's history-replay representation). Appended to
+    /// `ChatResponse::reasoning_content` for the next provider request and
+    /// never surfaced as user-visible progress.
+    ReasoningFinalized(String),
     /// Structured tool call emitted during streaming.
     ToolCall(ToolCall),
     /// A tool call that was already executed by the model_provider (e.g. Claude Code proxy).

@@ -1,7 +1,7 @@
 //! Thinking/Reasoning Level Control
 
 // Re-exported from zeroclaw-config.
-pub use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
+pub use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingDisplayMode, ThinkingLevel};
 
 /// Parameters derived from a thinking level, applied to the LLM request.
 #[derive(Debug, Clone, PartialEq)]
@@ -577,7 +577,28 @@ mod tests {
     fn thinking_config_deserializes_from_toml() {
         let toml_str = r#"default_level = "high""#;
         let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.display, ThinkingDisplayMode::Off);
+
+        let toml_str = r#"
+default_level = "high"
+native_thinking = true
+display = "updates"
+"#;
+        let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.default_level, ThinkingLevel::High);
+        assert!(config.native_thinking);
+        assert_eq!(config.display, ThinkingDisplayMode::Updates);
+        assert_eq!(
+            config.display.to_display(),
+            Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates)
+        );
+
+        // Round-trip: serialization keeps the knob settable again.
+        let serialized = toml::to_string(&config).expect("ThinkingConfig must serialize");
+        let reparsed: ThinkingConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.display, ThinkingDisplayMode::Updates);
+        assert_eq!(reparsed.default_level, ThinkingLevel::High);
+        assert!(reparsed.native_thinking);
     }
 
     #[test]

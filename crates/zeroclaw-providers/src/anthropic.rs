@@ -165,6 +165,41 @@ const ANTHROPIC_OAUTH_BETA_FEATURES: &str =
 /// (`thinking.display` controls omitted/updates/summarized thinking blocks).
 const ANTHROPIC_THINKING_DISPLAY_BETA: &str = "thinking-display-updates-2026-08-18";
 
+/// Flush an in-flight streaming thinking block as a durable reasoning chunk.
+///
+/// Emits the accumulated `{"thinking":..,"signature":..}` JSON object in the
+/// exact newline-joined representation the non-streaming `reasoning_content`
+/// contract uses (subsequent blocks are '\n'-prefixed so the consumer's raw
+/// concatenation round-trips). Returns `false` when the receiver is gone and
+/// the caller should stop pumping the stream.
+async fn flush_streaming_thinking_block(
+    thinking_text: &mut String,
+    thinking_signature: &mut String,
+    thinking_block_active: &mut bool,
+    reasoning_block_emitted: &mut bool,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+) -> bool {
+    if !*thinking_block_active {
+        return true;
+    }
+    let thinking = std::mem::take(thinking_text);
+    let signature = std::mem::take(thinking_signature);
+    *thinking_block_active = false;
+    if thinking.is_empty() {
+        return true;
+    }
+    let mut payload = String::new();
+    if *reasoning_block_emitted {
+        payload.push('\n');
+    }
+    payload
+        .push_str(&serde_json::json!({ "thinking": thinking, "signature": signature }).to_string());
+    *reasoning_block_emitted = true;
+    tx.send(Ok(StreamEvent::ReasoningFinalized(payload)))
+        .await
+        .is_ok()
+}
+
 /// Value for the `anthropic-beta` header, if one should be sent. OAuth tokens
 /// always carry the Claude Code beta set; the thinking-display beta is appended
 /// whenever the request body carries `thinking.display`.
@@ -2099,33 +2134,16 @@ impl AnthropicModelProvider {
                         }
                         // Defensive flush: a block start without a prior stop
                         // means the previous thinking block never closed.
-                        if thinking_block_active {
-                            let thinking = std::mem::take(&mut thinking_text);
-                            let signature = std::mem::take(&mut thinking_signature);
-                            thinking_block_active = false;
-                            if !thinking.is_empty() {
-                                let mut payload = String::new();
-                                if reasoning_block_emitted {
-                                    payload.push('\n');
-                                }
-                                payload.push_str(
-                                    &serde_json::json!({
-                                        "thinking": thinking,
-                                        "signature": signature
-                                    })
-                                    .to_string(),
-                                );
-                                reasoning_block_emitted = true;
-                                if tx
-                                    .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
-                                        payload,
-                                    ))))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
+                        if !flush_streaming_thinking_block(
+                            &mut thinking_text,
+                            &mut thinking_signature,
+                            &mut thinking_block_active,
+                            &mut reasoning_block_emitted,
+                            tx,
+                        )
+                        .await
+                        {
+                            return;
                         }
                         if block_type == "thinking" {
                             thinking_block_active = true;
@@ -2186,6 +2204,16 @@ impl AnthropicModelProvider {
                             }
                             "thinking_delta" => {
                                 if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                    // Transient, human-readable progress: goes
+                                    // to the UI immediately, never persisted.
+                                    if !text.is_empty()
+                                        && tx
+                                            .send(Ok(StreamEvent::ThinkingDelta(text.to_string())))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
                                     thinking_text.push_str(text);
                                 }
                             }
@@ -2201,31 +2229,16 @@ impl AnthropicModelProvider {
                     }
                 }
                 "content_block_stop" => {
-                    if thinking_block_active {
-                        let thinking = std::mem::take(&mut thinking_text);
-                        let signature = std::mem::take(&mut thinking_signature);
-                        thinking_block_active = false;
-                        if !thinking.is_empty() {
-                            let mut payload = String::new();
-                            if reasoning_block_emitted {
-                                payload.push('\n');
-                            }
-                            payload.push_str(
-                                &serde_json::json!({
-                                    "thinking": thinking,
-                                    "signature": signature
-                                })
-                                .to_string(),
-                            );
-                            reasoning_block_emitted = true;
-                            if tx
-                                .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(payload))))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
+                    if !flush_streaming_thinking_block(
+                        &mut thinking_text,
+                        &mut thinking_signature,
+                        &mut thinking_block_active,
+                        &mut reasoning_block_emitted,
+                        tx,
+                    )
+                    .await
+                    {
+                        return;
                     }
                     if let Some(id) = tool_id.take() {
                         let name = tool_name.take().unwrap_or_default();
@@ -2274,6 +2287,20 @@ impl AnthropicModelProvider {
                     }
                 }
                 "message_stop" => {
+                    // A thinking block still active at message_stop never got
+                    // its content_block_stop; flush it rather than silently
+                    // dropping the accumulated reasoning.
+                    if !flush_streaming_thinking_block(
+                        &mut thinking_text,
+                        &mut thinking_signature,
+                        &mut thinking_block_active,
+                        &mut reasoning_block_emitted,
+                        tx,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     if collect_debug_metadata {
                         ::zeroclaw_log::record!(
                             DEBUG,
@@ -2665,7 +2692,7 @@ impl ModelProvider for AnthropicModelProvider {
             .as_ref()
             .is_some_and(|config| config.display.is_some());
 
-        if thinking_config.is_some() {
+        if thinking_config.is_some() && !thinking_display_beta {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2678,7 +2705,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
                     })),
-                "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
+                "native thinking without display beta; using non-streaming fallback to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
                 model: model.to_string(),
@@ -2739,12 +2766,18 @@ impl ModelProvider for AnthropicModelProvider {
                 Ok(resp) => {
                     let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
                     if let Some(rc) = resp.reasoning_content {
-                        events.push(Ok(StreamEvent::TextDelta(StreamChunk {
-                            delta: String::new(),
-                            reasoning: Some(rc),
-                            is_final: false,
-                            token_count: 0,
-                        })));
+                        // Readable thinking progress (transient): the raw
+                        // text without the signed JSON envelope. Visible
+                        // thinking must never carry the signature payload.
+                        for part in rc.split('\n') {
+                            if let Ok(block) = serde_json::from_str::<serde_json::Value>(part)
+                                && let Some(text) = block.get("thinking").and_then(|t| t.as_str())
+                                && !text.is_empty()
+                            {
+                                events.push(Ok(StreamEvent::ThinkingDelta(text.to_string())));
+                            }
+                        }
+                        events.push(Ok(StreamEvent::ReasoningFinalized(rc)));
                     }
                     if let Some(text) = resp.text.filter(|t| !t.is_empty()) {
                         events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
@@ -2776,7 +2809,8 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": false,
+                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking_display_beta": thinking_display_beta,
                     })),
                 "anthropic streaming provider request prepared"
             );
@@ -3208,6 +3242,8 @@ data: {\"type\":\"message_stop\"}\n\n"
             .iter()
             .map(|e| match e.as_ref() {
                 Ok(StreamEvent::TextDelta(_)) => "text",
+                Ok(StreamEvent::ThinkingDelta(_)) => "thinking",
+                Ok(StreamEvent::ReasoningFinalized(_)) => "reasoning_final",
                 Ok(StreamEvent::ToolCall(_)) => "tool_call",
                 Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
                 Ok(StreamEvent::PreExecutedToolResult { .. }) => "pre_tool_result",
@@ -7617,27 +7653,59 @@ data: {\"type\":\"message_stop\"}\n\n";
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
 
         let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
         let mut text = String::new();
         let mut saw_final = false;
+        let mut first_thinking_pos = None;
+        let mut finalized_pos = None;
+        let mut position = 0usize;
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match ev {
-                Ok(StreamEvent::TextDelta(chunk)) => match &chunk.reasoning {
-                    Some(reasoning) => reasoning_payloads.push(reasoning.clone()),
-                    None => text.push_str(&chunk.delta),
-                },
+                Ok(StreamEvent::ThinkingDelta(delta)) => {
+                    first_thinking_pos.get_or_insert(position);
+                    thinking_deltas.push(delta);
+                }
+                Ok(StreamEvent::ReasoningFinalized(payload)) => {
+                    finalized_pos.get_or_insert(position);
+                    reasoning_payloads.push(payload);
+                }
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
                 Ok(StreamEvent::Final) => saw_final = true,
                 Ok(_) => {}
                 Err(e) => panic!("stream must not error: {e:?}"),
             }
+            position += 1;
         }
 
+        // Property 1: readable thinking updates arrive BEFORE the finalized
+        // replay block and before completion.
+        let first_thinking = first_thinking_pos.expect("transient thinking deltas must fire");
+        let finalized = finalized_pos.expect("finalized reasoning payload must be emitted");
+        assert!(
+            first_thinking < finalized,
+            "readable progress must precede the finalized replay block"
+        );
+        assert_eq!(
+            thinking_deltas,
+            vec!["weigh the options"],
+            "one readable delta per thinking_delta frame"
+        );
+
+        // Property 2: the signature payload exists only in the durable
+        // replay channel, never in visible events.
+        let visible: String = thinking_deltas.concat();
+        assert!(
+            !visible.contains("sigA") && !visible.contains("signature"),
+            "visible thinking must not carry the signature: {visible:?}"
+        );
         assert_eq!(reasoning_payloads.len(), 1, "one thinking block, one chunk");
         let parsed: serde_json::Value = serde_json::from_str(&reasoning_payloads[0])
             .expect("reasoning payload must be a JSON object");
         assert_eq!(parsed["thinking"], "weigh the options");
         assert_eq!(parsed["signature"], "sigA");
+
         assert_eq!(text, "answer");
         assert!(saw_final);
     }
@@ -7674,10 +7742,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
-            if let Ok(StreamEvent::TextDelta(chunk)) = ev
-                && let Some(reasoning) = &chunk.reasoning
-            {
-                reasoning_payloads.push(reasoning.clone());
+            if let Ok(StreamEvent::ReasoningFinalized(payload)) = ev {
+                reasoning_payloads.push(payload);
             }
         }
 
@@ -7700,5 +7766,141 @@ data: {\"type\":\"message_stop\"}\n\n";
             assert!(parsed.get("thinking").is_some());
             assert!(parsed.get("signature").is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn message_stop_flushes_unclosed_thinking_block() {
+        use std::io::Cursor;
+
+        // No content_block_stop for the thinking block: the accumulated
+        // reasoning must still be flushed at message_stop, not dropped.
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"orphan\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigX\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut finalized = None;
+        let mut saw_final = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ReasoningFinalized(payload)) => finalized = Some(payload),
+                Ok(StreamEvent::Final) => saw_final = true,
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+        }
+
+        let payload = finalized.expect("unclosed thinking block must be flushed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("flushed payload must be a JSON object");
+        assert_eq!(parsed["thinking"], "orphan");
+        assert_eq!(parsed["signature"], "sigX");
+        assert!(saw_final);
+    }
+
+    #[tokio::test]
+    async fn display_enabled_thinking_uses_streaming_production_path() {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+        use zeroclaw_api::model_provider::NativeThinkingParams;
+
+        // The reviewer's core blocker: `display = "updates"` must construct a
+        // real streaming request, not detour through the non-streaming
+        // fallback. Capture the request body the provider actually sends.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |body: axum::body::Bytes| {
+                let captured = captured_for_route.clone();
+                async move {
+                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        *captured.lock().unwrap() = Some(parsed);
+                    }
+                    let sse = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"live\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+                    axum::body::Body::from_stream(futures_util::stream::once(async move {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse))
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic SSE test server");
+        let addr = listener.local_addr().expect("Anthropic SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic SSE test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(NativeThinkingParams {
+                    budget_tokens: 2_048,
+                    display: Some(ThinkingDisplay::Updates),
+                }),
+            },
+            "claude-sonnet-4-6",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let mut saw_thinking_delta = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("display-enabled stream must not fail") {
+                StreamEvent::ThinkingDelta(delta) => {
+                    saw_thinking_delta = true;
+                    assert_eq!(delta, "live");
+                }
+                StreamEvent::Final => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert!(
+            saw_thinking_delta,
+            "display-enabled requests must produce live thinking deltas from the SSE path"
+        );
+        let body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("streaming request body must be captured");
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+        assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(2_048));
     }
 }

@@ -5917,6 +5917,7 @@ mod tests {
     #[derive(Debug)]
     struct RecordedThinkingRequest {
         thinking_budget: Option<u32>,
+        thinking_display: Option<zeroclaw_api::model_provider::ThinkingDisplay>,
         system_prompt: Option<String>,
         temperature: Option<f64>,
     }
@@ -5952,7 +5953,9 @@ mod tests {
             _model: &str,
             temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
-            let thinking_budget = request.thinking.map(|params| params.budget_tokens);
+            let thinking = request.thinking.as_ref();
+            let thinking_budget = thinking.map(|params| params.budget_tokens);
+            let thinking_display = thinking.and_then(|params| params.display);
             let system_prompt = request
                 .messages
                 .iter()
@@ -5960,6 +5963,7 @@ mod tests {
                 .map(|message| message.content.clone());
             self.requests.lock().unwrap().push(RecordedThinkingRequest {
                 thinking_budget,
+                thinking_display,
                 system_prompt,
                 temperature,
             });
@@ -6096,6 +6100,51 @@ mod tests {
             request
                 .temperature
                 .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_propagates_display_mode_to_target_request() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        use zeroclaw_config::scattered_types::ThinkingDisplayMode;
+
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            display: ThinkingDisplayMode::Updates,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(
+            request.thinking_display,
+            Some(ThinkingDisplay::Updates),
+            "the target agent's display mode must reach the provider request"
         );
     }
 
