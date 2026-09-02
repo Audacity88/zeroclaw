@@ -25036,16 +25036,31 @@ BTC is currently around $65,000 based on latest tool output."#
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
-        assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
-        assert!(prompt.contains("Be helpful"), "missing SOUL content");
-        assert!(prompt.contains("### IDENTITY.md"), "missing IDENTITY.md");
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
+        const SOUL_CONTENT: &str = "# Soul\nBe helpful.";
+        assert!(prompt.contains(SOUL_CONTENT), "missing SOUL content");
+        assert_eq!(
+            prompt.matches(SOUL_CONTENT).count(),
+            1,
+            "SOUL content should be injected exactly once"
+        );
+        assert!(
+            !prompt.contains("### IDENTITY.md"),
+            "heading removed: IDENTITY.md"
+        );
         assert!(
             prompt.contains("Name: ZeroClaw"),
             "missing IDENTITY content"
         );
-        assert!(prompt.contains("### USER.md"), "missing USER.md");
-        assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
-        assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
+        assert!(!prompt.contains("### USER.md"), "heading removed: USER.md");
+        assert!(
+            !prompt.contains("### AGENTS.md"),
+            "heading removed: AGENTS.md"
+        );
+        assert!(
+            !prompt.contains("### TOOLS.md"),
+            "heading removed: TOOLS.md"
+        );
         // HEARTBEAT.md is intentionally excluded from channel prompts — it's only
         // relevant to the heartbeat worker and causes LLMs to emit spurious
         // "HEARTBEAT_OK" acknowledgments in channel conversations.
@@ -25053,7 +25068,10 @@ BTC is currently around $65,000 based on latest tool output."#
             !prompt.contains("### HEARTBEAT.md"),
             "HEARTBEAT.md should not be in channel prompt"
         );
-        assert!(prompt.contains("### MEMORY.md"), "missing MEMORY.md");
+        assert!(
+            !prompt.contains("### MEMORY.md"),
+            "heading removed: MEMORY.md"
+        );
         assert!(prompt.contains("User likes Rust"), "missing MEMORY content");
     }
 
@@ -25078,12 +25096,16 @@ BTC is currently around $65,000 based on latest tool output."#
             "BOOTSTRAP.md should not appear when missing"
         );
 
-        // Create BOOTSTRAP.md — should appear
+        // Create BOOTSTRAP.md — content should appear, heading should not
         std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
         let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, None);
         assert!(
-            prompt2.contains("### BOOTSTRAP.md"),
-            "BOOTSTRAP.md should appear when present"
+            !prompt2.contains("### BOOTSTRAP.md"),
+            "BOOTSTRAP heading removed: {prompt2}"
+        );
+        assert!(
+            prompt2.contains("First run."),
+            "BOOTSTRAP content should appear: {prompt2}"
         );
         assert!(prompt2.contains("First run"));
     }
@@ -29065,18 +29087,24 @@ This is an example JSON object for profile settings."#;
     fn aieos_fallback_to_openclaw_on_parse_error() {
         use zeroclaw_config::schema::IdentityConfig;
 
+        let ws = make_workspace();
+        std::fs::write(ws.path().join("identity.json"), "{not valid json").unwrap();
+
         let config = IdentityConfig {
             format: "aieos".into(),
-            aieos_path: Some("nonexistent.json".into()),
+            aieos_path: Some("identity.json".into()),
             aieos_inline: None,
         };
 
-        let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
-        // Should fall back to OpenClaw format when AIEOS file is not found
-        // (Error is logged to stderr with filename, not included in prompt)
-        assert!(prompt.contains("### SOUL.md"));
+        // Should fall back to OpenClaw format when AIEOS JSON cannot be parsed.
+        // The parse error is logged to stderr, not included in the prompt.
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
+        assert!(
+            prompt.contains("Be helpful"),
+            "OpenClaw fallback should inject workspace content"
+        );
     }
 
     #[test]
@@ -29094,7 +29122,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should use OpenClaw format (not configured for AIEOS)
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
         assert!(prompt.contains("Be helpful"));
     }
 
@@ -29112,7 +29140,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should use OpenClaw format even if aieos_path is set
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
         assert!(prompt.contains("Be helpful"));
         assert!(!prompt.contains("## Identity"));
     }
@@ -29124,7 +29152,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         // Should use OpenClaw format
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
         assert!(prompt.contains("Be helpful"));
     }
 
