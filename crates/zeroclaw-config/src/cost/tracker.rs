@@ -217,6 +217,23 @@ impl CostTracker {
         task_id: Option<String>,
         honor_enabled: bool,
     ) -> Result<()> {
+        self.record_usage_with_owned_task_attribution_inner_with_sync(
+            usage,
+            agent_alias,
+            task_id,
+            honor_enabled,
+            File::sync_all,
+        )
+    }
+
+    fn record_usage_with_owned_task_attribution_inner_with_sync(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        honor_enabled: bool,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<()> {
         let (enabled, track_per_agent) = {
             let config = self.config.read();
             (config.enabled, config.track_per_agent)
@@ -246,10 +263,8 @@ impl CostTracker {
         let record =
             CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage);
 
-        {
-            let mut storage = self.lock_storage();
-            storage.add_record(record)?;
-        }
+        let mut storage = self.lock_storage();
+        let append_outcome = storage.add_record_with_sync(record, sync_file)?;
 
         {
             let mut totals = self.lock_session_totals();
@@ -259,7 +274,8 @@ impl CostTracker {
             entry.request_count += 1;
         }
 
-        Ok(())
+        drop(storage);
+        append_outcome.into_result()
     }
 
     /// Get the current cost summary. When `[cost].track_per_agent` is
@@ -692,6 +708,20 @@ struct CostStorage {
     aggregates_current: bool,
 }
 
+enum AppendOutcome {
+    Synced,
+    AppendedButSyncFailed(anyhow::Error),
+}
+
+impl AppendOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Synced => Ok(()),
+            Self::AppendedButSyncFailed(error) => Err(error),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ReportingPeriod {
     day: NaiveDate,
@@ -854,16 +884,11 @@ impl CostStorage {
         Ok(())
     }
 
-    /// Add a new record.
-    fn add_record(&mut self, record: CostRecord) -> Result<()> {
-        self.add_record_with_sync(record, File::sync_all)
-    }
-
     fn add_record_with_sync(
         &mut self,
         record: CostRecord,
         sync_file: fn(&File) -> std::io::Result<()>,
-    ) -> Result<()> {
+    ) -> Result<AppendOutcome> {
         self.ensure_period_cache_current()?;
 
         let mut file = OpenOptions::new()
@@ -894,13 +919,17 @@ impl CostStorage {
             self.monthly_cost_usd += record.usage.cost_usd;
         }
 
-        sync_file(&file).with_context(|| {
+        let sync_result = sync_file(&file).with_context(|| {
             format!(
                 "Failed to sync cost storage at {}",
                 self.path.display().to_string()
             )
-        })?;
-        Ok(())
+        });
+
+        Ok(match sync_result {
+            Ok(()) => AppendOutcome::Synced,
+            Err(error) => AppendOutcome::AppendedButSyncFailed(error),
+        })
     }
 
     /// Get aggregated costs for current day and month.
@@ -1143,27 +1172,46 @@ mod tests {
     }
 
     #[test]
-    fn sync_failure_keeps_appended_file_and_current_period_cache_visible() {
+    fn sync_failure_keeps_all_process_visible_totals_consistent() {
         fn fail_sync(_: &File) -> std::io::Result<()> {
             Err(std::io::Error::other("forced sync failure"))
         }
 
         let tmp = TempDir::new().unwrap();
-        let path = resolve_storage_path(tmp.path()).unwrap();
-        let mut storage = CostStorage::new(&path).unwrap();
-        let record = record_at("test/model", 1.0, Utc::now(), Some("task-a"));
-        let expected_line = format!("{}\n", serde_json::to_string(&record).unwrap());
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let usage = TokenUsage {
+            model: "test/model".to_string(),
+            input_tokens: 10,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            total_tokens: 20,
+            cost_usd: 1.0,
+            pricing_available: true,
+            timestamp: Utc::now(),
+        };
 
-        let error = storage.add_record_with_sync(record, fail_sync).unwrap_err();
+        let error = tracker
+            .record_usage_with_owned_task_attribution_inner_with_sync(
+                usage,
+                None,
+                Some("task-a".to_string()),
+                true,
+                fail_sync,
+            )
+            .unwrap_err();
 
         assert!(error.to_string().contains("Failed to sync cost storage"));
-        assert!(
-            path.exists(),
-            "a complete append must leave the ledger file"
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), expected_line);
-        assert!((storage.daily_cost_usd - 1.0).abs() < f64::EPSILON);
-        assert!((storage.monthly_cost_usd - 1.0).abs() < f64::EPSILON);
+        let summary = tracker.get_summary().unwrap();
+        assert!((summary.session_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!((summary.daily_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!((summary.monthly_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(summary.total_tokens, 20);
+        assert_eq!(summary.request_count, 1);
+
+        let model = summary.by_model.get("test/model").unwrap();
+        assert!((model.cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(model.total_tokens, 20);
+        assert_eq!(model.request_count, 1);
     }
 
     #[test]
