@@ -4222,6 +4222,10 @@ pub struct SessionMessagesResult {
     /// Index of `messages[0]` in the full projected history.
     #[serde(default)]
     pub start: usize,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub has_older: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -5880,5 +5884,17 @@ mod relay_transport_tests {
             Some(true),
             "the relay pump must not outlive the client that owned it"
         );
+    }
+
+    #[test]
+    fn cursor_session_messages_response_wire_shape_round_trips() {
+        let result: SessionMessagesResult = serde_json::from_value(serde_json::json!({
+            "messages": [],
+            "next_cursor": "acp1.deadbeef",
+            "has_older": true
+        }))
+        .unwrap();
+        assert_eq!(result.next_cursor.as_deref(), Some("acp1.deadbeef"));
+        assert_eq!(result.has_older, Some(true));
     }
 }
