@@ -158,9 +158,9 @@ In bounded agentic delegation the sub-agent's tools are drawn from the caller's 
 
 The `delegate` tool itself follows the same bounded shape: it is stripped from the child registry unless the **target's** risk profile sets `delegation_policy mode = "allow"` (the default `"forbidden"` keeps today's no-sub-delegation behavior), and the caller-side gates still apply: the caller's `allowed_tools`/`excluded_tools` must admit `delegate`, and the target's tool policy must not exclude it. When granted, the child's delegate instance is bound to the target's identity: its calls resolve `delegation_policy`, reachability, and the advertised roster from the target's own alias and delegates config, never the delegating parent's, and each granted hop increments the depth counter (see below).
 
-In independent agentic delegation the sub-agent's tools are built from the target agent's own configured policy and runtime registry, like opening a fresh chat with that target. The parent registry is not used as the ceiling. The `delegate` tool is still removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
+In independent agentic delegation the sub-agent's tools are built from the target agent's own configured policy and runtime registry, like opening a fresh chat with that target. The parent registry is not used as the ceiling. The `delegate` tool is removed from that child registry: independent delegation does not recurse through another `delegate` call.
 
-Depth is capped per the parent's `runtime_profile.max_delegation_depth`. Set it to `1` to allow the top agent a single delegation hop with no further sub-delegation.
+Depth is capped per the delegating parent's `runtime_profile.max_delegation_depth`, and each granted hop carries that ceiling tightened (min) with the next target's own profile cap, so a parent's cap binds its whole subtree and a chain can only tighten. Set it to `1` to allow the top agent a single delegation hop with no further sub-delegation.
 
 #### Agentic target tool policy
 
@@ -169,7 +169,7 @@ If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` b
 1. A configured empty `[risk_profiles.<target_profile>].allowed_tools` list leaves the selected registry unrestricted.
 2. A non-empty `allowed_tools` list keeps only exact matching tool names.
 3. `[risk_profiles.<target_profile>].excluded_tools` always subtracts from the result.
-4. `delegate` is always removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
+4. `delegate` is removed from the child registry unless bounded sub-delegation is granted: a bounded target whose risk profile sets `delegation_policy mode = "allow"` (and whose caller-side gates admit the tool) receives a target-bound delegate instance; independent child registries always drop it.
 
 This policy lives on the target, not the caller. Same-profile peers use the shared risk profile. Explicit cross-profile delegates use the target's risk profile after the reachability and delegation-policy gates. Bounded agentic delegates receive only the caller-capped tool registry intersected with the target's tool policy; independent agentic delegates receive the target-owned tool registry. A missing target risk profile refuses before the sub-loop starts. A configured profile that leaves zero executable child tools still permits a normal model turn with no tools.
 
