@@ -4,7 +4,7 @@ An RFC records a durable project-level decision before implementation. The proce
 
 Most work does not need one. The RFC trigger is deliberately narrow so that proposals which genuinely need a project-level decision are not queued behind ordinary features.
 
-RFC scope, discussion timing, and ratification rules were last set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), accepted 2026-08-10 and adopted as FND-003 Rev. 15, then clarified by FND-003 Rev. 16. See [FND-003](../foundations/fnd-003-governance.md) for the durable protocol.
+RFC scope, discussion timing, and ratification rules were last set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), accepted 2026-08-10 and adopted as FND-003 Rev. 15, then clarified by FND-003 Rev. 17. See [FND-003](../foundations/fnd-003-governance.md) for the durable protocol.
 
 ## When to file an RFC vs. just a PR
 
