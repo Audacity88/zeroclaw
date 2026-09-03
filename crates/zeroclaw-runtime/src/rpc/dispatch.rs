@@ -1389,10 +1389,11 @@ impl RpcDispatcher {
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
+        // Idle retained sessions may reattach after a transport reconnect.
+        // The turn registration, not agent presence, fences live checkpoints.
         if resuming
             && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
-            && (self.ctx.sessions.get_agent(&session_id).await.is_some()
-                || self.ctx.sessions.has_inflight_turn(&session_id))
+            && self.ctx.sessions.has_inflight_turn(&session_id)
         {
             return Err(rpc_err(SESSION_BUSY, "Session already active"));
         }
@@ -10336,7 +10337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_acp_resume_leaves_pending_checkpoint_for_later_recovery() {
+    async fn inflight_acp_resume_leaves_pending_checkpoint_for_later_recovery() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -10358,6 +10359,8 @@ mod tests {
             .get_agent(sid)
             .await
             .expect("initial session owner must be live");
+        let token = tokio_util::sync::CancellationToken::new();
+        let generation = sessions.register_cancel_token(sid, token.clone());
         acp_store
             .begin_turn_checkpoint(
                 sid,
@@ -10378,8 +10381,10 @@ mod tests {
         let error = dispatcher
             .handle_session_new_for_test(&params)
             .await
-            .expect_err("a live ACP owner must reject duplicate session/new");
+            .expect_err("an inflight ACP owner must reject duplicate session/new");
         assert_eq!(error.code, SESSION_BUSY);
+        assert!(sessions.has_inflight_turn(sid));
+        assert!(!token.is_cancelled());
         let still_live = sessions
             .get_agent(sid)
             .await
@@ -10392,9 +10397,10 @@ mod tests {
                 .unwrap()
                 .messages
                 .is_empty(),
-            "a live session owner must prevent checkpoint promotion"
+            "an inflight turn must prevent checkpoint promotion"
         );
 
+        sessions.remove_cancel_token(sid, generation);
         assert!(sessions.remove(sid).await);
         dispatcher
             .handle_session_new_for_test(&params)
