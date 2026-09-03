@@ -2809,9 +2809,6 @@ impl RpcDispatcher {
         if !acp_session_found {
             // Legacy calls retain the generic backend fallback. Cursor mode
             // returned above so a cursor cannot probe or fall back through it.
-            if cursor_mode {
-                unreachable!();
-            }
             let backend = self
                 .ctx
                 .session_backend
@@ -9806,7 +9803,7 @@ mod tests {
                                 extra_content: None,
                             },
                         ],
-                        reasoning_content: None,
+                        reasoning_content: Some("private reasoning".into()),
                     },
                     ConversationMessage::ToolResults(vec![
                         ToolResultMessage {

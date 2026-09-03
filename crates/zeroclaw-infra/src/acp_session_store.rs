@@ -1067,6 +1067,7 @@ struct ProjectedGroup {
     message_id: i64,
     role: String,
     content: String,
+    reasoning_content: Option<String>,
     has_tool_events: bool,
     input_count: usize,
     unmatched_output_count: usize,
@@ -1193,7 +1194,7 @@ impl ProjectedGroup {
                         arguments,
                         extra_content: None,
                     }],
-                    reasoning_content: None,
+                    reasoning_content: self.reasoning_content.clone(),
                 });
                 if let Some(content) = output {
                     messages.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
@@ -1296,7 +1297,7 @@ fn load_projected_group(
     message_id: i64,
     role: String,
     content: String,
-    _reasoning_content: Option<String>,
+    reasoning_content: Option<String>,
 ) -> Result<ProjectedGroup> {
     let has_tool_events: bool = conn.query_row(
         "SELECT EXISTS(
@@ -1310,6 +1311,7 @@ fn load_projected_group(
             message_id,
             role,
             content,
+            reasoning_content,
             has_tool_events,
             input_count: 0,
             unmatched_output_count: 0,
@@ -1346,6 +1348,7 @@ fn load_projected_group(
         message_id,
         role,
         content,
+        reasoning_content,
         has_tool_events,
         input_count: input_count.max(0) as usize,
         unmatched_output_count: unmatched_output_count.max(0) as usize,
@@ -1769,7 +1772,7 @@ mod tests {
                                 extra_content: None,
                             },
                         ],
-                        reasoning_content: None,
+                        reasoning_content: Some("tool reasoning".into()),
                     },
                     ConversationMessage::ToolResults(vec![
                         ToolResultMessage {
@@ -1804,6 +1807,14 @@ mod tests {
             .unwrap();
         assert!(!second.has_older);
         assert_eq!(second.messages.len(), 3, "narration plus paired first call");
+        for message in first.messages.iter().chain(&second.messages) {
+            if let ConversationMessage::AssistantToolCalls {
+                reasoning_content, ..
+            } = message
+            {
+                assert_eq!(reasoning_content.as_deref(), Some("tool reasoning"));
+            }
+        }
     }
 
     #[test]
