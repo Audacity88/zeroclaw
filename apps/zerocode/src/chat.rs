@@ -9369,8 +9369,12 @@ mod tests {
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Chat);
         chat.activate_session_for_test("sess-1");
-        let mut term: crate::config_manager::Term = ratatui::Terminal::new(
+        // Key dispatch needs a terminal handle, not a live terminal-size query in CI.
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
             crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
         )
         .unwrap();
 
