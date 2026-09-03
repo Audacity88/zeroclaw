@@ -1390,6 +1390,12 @@ struct ResponseMessage {
     content: Option<String>,
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
+    /// Raw gateway `thinking_blocks` array, preserved so
+    /// [`OpenAiCompatibleModelProvider::parse_native_response`] can
+    /// normalize it behind the `thinking_passthrough` flag. Never
+    /// serialized.
+    #[serde(skip_serializing)]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1402,6 +1408,10 @@ struct RawResponseMessage {
     reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+    /// Anthropic thinking blocks forwarded by translating gateways
+    /// (e.g. `thinking_blocks` on LiteLLM / passthrough responses).
+    #[serde(default)]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 impl From<RawResponseMessage> for ResponseMessage {
@@ -1413,6 +1423,7 @@ impl From<RawResponseMessage> for ResponseMessage {
             content: openai_assistant_content_plaintext(raw.content),
             reasoning_content,
             tool_calls: raw.tool_calls,
+            thinking_blocks: raw.thinking_blocks,
         }
     }
 }
@@ -2835,7 +2846,7 @@ impl OpenAiCompatibleModelProvider {
 
     fn parse_native_response(&self, message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
-        let reasoning_content = message.reasoning_content.clone();
+        let reasoning_content = self.capture_reasoning_content(&message);
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = message
             .tool_calls
@@ -2860,6 +2871,61 @@ impl OpenAiCompatibleModelProvider {
             usage: None,
             reasoning_content,
         }
+    }
+
+    /// Flag-gated reasoning capture for a parsed gateway message.
+    ///
+    /// Flag off: today's behavior exactly — the `reasoning_content` string is
+    /// passed through untouched (DeepSeek/GLM/Qwen flows).
+    ///
+    /// Flag on: normalize into the newline-delimited signed-JSON line format
+    /// the native Anthropic provider uses for `reasoning_content` (one
+    /// `{"thinking":..,"signature":..}` line per block). A `thinking_blocks`
+    /// array (signed) wins over a plain reasoning string; a bare string is
+    /// wrapped as a single unsigned line (`signature: ""`), matching how the
+    /// native provider emits signature-less blocks.
+    fn capture_reasoning_content(&self, message: &ResponseMessage) -> Option<String> {
+        if !self.thinking_passthrough {
+            return message.reasoning_content.clone();
+        }
+        if let Some(blocks) = &message.thinking_blocks
+            && let Some(lines) = Self::thinking_blocks_to_reasoning_lines(blocks)
+        {
+            return Some(lines);
+        }
+        message.reasoning_content.as_ref().map(|reasoning| {
+            serde_json::json!({"thinking": reasoning, "signature": ""}).to_string()
+        })
+    }
+
+    /// Convert gateway `thinking_blocks` (Anthropic content-block style) into
+    /// the native signed-JSON line format. Blocks with neither thinking text
+    /// nor a signature are skipped. Returns `None` when no block survives, so
+    /// the caller falls back to the plain reasoning string.
+    ///
+    /// Deliberately mirrors the native Anthropic provider's block emission
+    /// (`crates/zeroclaw-providers/src/anthropic.rs`): same line shape, same
+    /// signature-or-text inclusion rule. Duplicate-with-comment, not a shared
+    /// helper, per the #10530 spec boundary (cross-ref: #10542).
+    fn thinking_blocks_to_reasoning_lines(blocks: &[serde_json::Value]) -> Option<String> {
+        let mut lines: Vec<String> = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let thinking = block
+                .get("thinking")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let signature = block
+                .get("signature")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if thinking.is_empty() && signature.is_empty() {
+                continue;
+            }
+            lines.push(
+                serde_json::json!({"thinking": thinking, "signature": signature}).to_string(),
+            );
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
@@ -6342,6 +6408,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6368,6 +6435,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6456,6 +6524,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6483,6 +6552,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6510,6 +6580,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -6551,6 +6622,7 @@ mod tests {
                 },
             ]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8538,6 +8610,7 @@ mod tests {
                 parameters: None,
                 extra_content: None,
             }]),
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8553,11 +8626,203 @@ mod tests {
             content: Some("hello".to_string()),
             reasoning_content: None,
             tool_calls: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
         assert!(parsed.reasoning_content.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn thinking_passthrough_off_keeps_reasoning_content_raw() {
+        // Flag off = today's behavior: `reasoning_content` passes through
+        // untouched and gateway `thinking_blocks` are ignored entirely.
+        let provider = make_model_provider("test", "https://example.com", None);
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("raw chain of thought".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "signed thought",
+                "signature": "sig"
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("raw chain of thought"),
+            "flag-off capture must not normalize or wrap the reasoning string"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_normalizes_thinking_blocks_to_signed_lines() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "thinking", "thinking": "first", "signature": "sig1"}),
+                serde_json::json!({"type": "thinking", "thinking": "second", "signature": "sig2"}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("blocks must normalize to lines");
+        let lines: Vec<serde_json::Value> = reasoning
+            .split('\n')
+            .map(|line| serde_json::from_str(line).expect("each line must be valid JSON"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                serde_json::json!({"thinking": "first", "signature": "sig1"}),
+                serde_json::json!({"thinking": "second", "signature": "sig2"}),
+            ],
+            "capture must emit one signed-JSON line per thinking block, matching the \
+             native provider's reasoning_content format"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_wraps_bare_reasoning_string_as_unsigned_line() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("plain reasoning".to_string()),
+            tool_calls: None,
+            thinking_blocks: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed.reasoning_content.expect("string must be captured");
+        let line: serde_json::Value =
+            serde_json::from_str(&reasoning).expect("captured string must be a JSON line");
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "plain reasoning", "signature": ""}),
+            "bare reasoning strings normalize to an unsigned envelope line"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_signed_blocks_win_over_plain_string() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("unsigned duplicate".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "thinking": "signed", "signature": "sig"
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("capture must produce lines");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "signed", "signature": "sig"}),
+            "signed thinking_blocks are the authoritative capture source"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_skips_empty_blocks_and_falls_back_to_string() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("fallback thought".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "thinking", "thinking": "", "signature": ""}),
+                serde_json::json!({"type": "text", "text": "not a thinking block"}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed.reasoning_content.expect("fallback capture");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "fallback thought", "signature": ""}),
+            "blocks with neither text nor signature are skipped; bare string is the fallback"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_parses_gateway_thinking_blocks_json() {
+        // End-to-end through the response envelope: a gateway response whose
+        // message carries `thinking_blocks` deserializes into the raw field
+        // that capture normalization reads.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "plain text",
+                    "thinking_blocks": [
+                        {"type": "thinking", "thinking": "block thought", "signature": "sig9"}
+                    ]
+                }
+            }]
+        });
+        let response =
+            parse_chat_response_body("gateway", &body.to_string()).expect("payload parses");
+        let parsed = provider.parse_native_response(
+            response
+                .choices
+                .into_iter()
+                .next()
+                .expect("one choice")
+                .message,
+        );
+        let reasoning = parsed.reasoning_content.expect("capture from gateway JSON");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "block thought", "signature": "sig9"}),
+            "gateway thinking_blocks must reach capture and win over the plain string"
+        );
     }
 
     #[test]
