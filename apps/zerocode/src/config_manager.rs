@@ -352,12 +352,28 @@ pub(crate) struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub(crate) fn new(rpc: Arc<RpcClient>, config_dir: &Path) -> Self {
+        Self::new_with_todo_visibility(
+            rpc,
+            config_dir,
+            crate::todo_tracker::TodoVisibilityHandle::new(),
+        )
+    }
+
+    pub(crate) fn new_with_todo_visibility(
+        rpc: Arc<RpcClient>,
+        config_dir: &Path,
+        todo_visibility: crate::todo_tracker::TodoVisibilityHandle,
+    ) -> Self {
         Self {
             rpc,
             config_dir_display: shorten_home(config_dir),
             section: ConfigSection::Zeroclaw,
-            zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
+            zerocode: crate::zerocode_pane::ZerocodePane::new_with_todo_visibility(
+                config_dir,
+                todo_visibility,
+            ),
             section_tab_area: None,
             screen: Screen::SectionList,
             zeroclaw_pane: ZeroclawPane::Sections,
@@ -427,6 +443,10 @@ impl App {
 
     /// Draw the current screen into the given area, beneath the Config
     /// section sub-tab bar (`zeroclaw` / `zerocode`).
+    pub(crate) fn on_pane_focus(&mut self) {
+        self.zerocode.refresh_tracker();
+    }
+
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
         use ratatui::layout::{Constraint, Direction, Layout};
         let chunks = Layout::default()

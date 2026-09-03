@@ -12,9 +12,17 @@ pub(crate) struct Acp {
 }
 
 impl Acp {
+    #[cfg(test)]
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+        Self::new_with_todo_visibility(rpc, crate::todo_tracker::TodoVisibilityHandle::new())
+    }
+
+    pub(crate) fn new_with_todo_visibility(
+        rpc: Arc<RpcClient>,
+        todo_visibility: crate::todo_tracker::TodoVisibilityHandle,
+    ) -> Self {
         Self {
-            inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
+            inner: chat::Chat::new_with_todo_visibility(rpc, chat::PaneKind::Acp, todo_visibility),
         }
     }
 

@@ -6,6 +6,7 @@
 pub mod keybindings;
 
 use std::collections::HashMap;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -224,6 +225,28 @@ pub(crate) enum TodoTrackerLocation {
     Right,
 }
 
+/// Durable visibility preference for the Todo tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TodoTrackerVisibility {
+    /// Preserve legacy behavior: honor `enabled_at_start` and auto-pop once
+    /// when a session receives its first non-empty plan.
+    #[default]
+    Auto,
+    Hidden,
+    Shown,
+}
+
+impl TodoTrackerVisibility {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Hidden => "hidden",
+            Self::Shown => "shown",
+        }
+    }
+}
+
 /// The `[todotracker]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TodoTrackerSection {
@@ -231,6 +254,8 @@ pub(crate) struct TodoTrackerSection {
     pub enabled: bool,
     #[serde(default)]
     pub enabled_at_start: bool,
+    #[serde(default)]
+    pub visibility: TodoTrackerVisibility,
     #[serde(default)]
     pub location: TodoTrackerLocation,
     #[serde(default = "default_todotracker_width")]
@@ -244,6 +269,7 @@ impl Default for TodoTrackerSection {
         Self {
             enabled: true,
             enabled_at_start: false,
+            visibility: TodoTrackerVisibility::Auto,
             location: TodoTrackerLocation::Right,
             width: default_todotracker_width(),
             max_height: default_todotracker_max_height(),
@@ -281,6 +307,7 @@ impl TodoTrackerSection {
         TodoTrackerSettings {
             enabled: self.enabled,
             enabled_at_start: self.enabled_at_start,
+            visibility: self.visibility,
             location: match self.location {
                 TodoTrackerLocation::Bottom => TodoLocation::Bottom,
                 TodoTrackerLocation::Left => TodoLocation::Left,
@@ -311,6 +338,7 @@ pub(crate) enum TodoLocation {
 pub(crate) struct TodoTrackerSettings {
     pub enabled: bool,
     pub enabled_at_start: bool,
+    pub visibility: TodoTrackerVisibility,
     pub location: TodoLocation,
     pub width: u16,
     pub max_height: u16,
@@ -321,6 +349,7 @@ impl Default for TodoTrackerSettings {
         Self {
             enabled: true,
             enabled_at_start: false,
+            visibility: TodoTrackerVisibility::Auto,
             location: TodoLocation::Right,
             width: default_todotracker_width(),
             max_height: default_todotracker_max_height(),
@@ -675,7 +704,13 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// yields an empty table; any other section the running struct does not
 /// model is carried through untouched so a partial write never clobbers it.
 fn load_document(path: &Path) -> Result<toml::Table> {
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
     if raw.trim().is_empty() {
         return Ok(toml::Table::new());
     }
@@ -688,12 +723,104 @@ fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
 }
 
+fn write_document_atomically(path: &Path, body: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".zerocode-config-")
+        .tempfile_in(parent)
+        .with_context(|| format!("creating temporary config beside {}", path.display()))?;
+    temporary
+        .write_all(body.as_bytes())
+        .with_context(|| format!("writing temporary config beside {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("flushing temporary config beside {}", path.display()))?;
+    temporary.persist(path).map_err(|error| {
+        anyhow::Error::msg(format!("replacing {}: {}", path.display(), error.error))
+    })?;
+    Ok(())
+}
+
 /// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
 fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::Table> {
     doc.entry(key)
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .ok_or_else(|| anyhow::Error::msg(format!("'{key}' is not a table")))
+}
+
+/// Persist only `[todotracker].visibility`, preserving unknown keys and every
+/// unrelated section. Returns whether an environment override shadows the
+/// saved value for the next process launch.
+pub(crate) fn persist_todotracker_visibility(
+    config_dir: &Path,
+    visibility: TodoTrackerVisibility,
+) -> Result<bool> {
+    let path = config_path(config_dir);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let semantic: toml::Table = if raw.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+    };
+    if let Some(value) = semantic.get("todotracker") {
+        value
+            .clone()
+            .try_into::<TodoTrackerSection>()
+            .with_context(|| {
+                format!(
+                    "refusing to update visibility in malformed [todotracker] section in {}",
+                    path.display()
+                )
+            })?
+            .validate()?;
+    }
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing {} for an in-place edit", path.display()))?;
+    let tracker = doc
+        .entry("todotracker")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let tracker = tracker.as_table_like_mut().ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "refusing to update non-table [todotracker] in {}",
+            path.display()
+        ))
+    })?;
+    let mut replacement = toml_edit::value(visibility.as_str());
+    if let Some(existing) = tracker.get_mut("visibility") {
+        if let (Some(existing), Some(replacement)) =
+            (existing.as_value(), replacement.as_value_mut())
+        {
+            *replacement.decor_mut() = existing.decor().clone();
+        }
+        *existing = replacement;
+    } else {
+        tracker.insert("visibility", replacement);
+    }
+    write_document_atomically(&path, &doc.to_string())?;
+    // Only a valid override for this exact leaf can shadow the value just
+    // written. Other environment errors are unrelated to this safe leaf
+    // write, and an invalid enum has no effective resolved value to report.
+    let shadowed = std::env::var("ZEROCODE_todotracker__visibility")
+        .ok()
+        .and_then(|value| {
+            toml::Value::String(value)
+                .try_into::<TodoTrackerVisibility>()
+                .ok()
+        })
+        .is_some_and(|effective| effective != visibility);
+    Ok(shadowed)
 }
 
 /// Persist the selected theme name, editing only the `[theme]` section.
@@ -893,7 +1020,11 @@ pub(crate) fn persist_todotracker_with_intent(
                     path.display()
                 )
             })?;
-            section.clone()
+            // Visibility has its own live leaf writer. An unrelated edit from
+            // a cached Config pane must not undo a more recent close/toggle.
+            let mut merged = section.clone();
+            merged.visibility = current.visibility;
+            merged
         }
         // A repair rebases onto the latest section and applies only the one
         // field the user explicitly edited. Any other field — including one
@@ -1722,6 +1853,7 @@ mod tests {
         let section = TodoTrackerSection {
             enabled: false,
             enabled_at_start: true,
+            visibility: TodoTrackerVisibility::Auto,
             location: TodoTrackerLocation::Left,
             width: 40,
             max_height: 8,
@@ -1743,6 +1875,7 @@ mod tests {
         let section = TodoTrackerSection {
             enabled: false,
             enabled_at_start: true,
+            visibility: TodoTrackerVisibility::Auto,
             location: TodoTrackerLocation::Bottom,
             width: 48,
             max_height: 10,
@@ -1766,6 +1899,151 @@ mod tests {
         persist_todotracker(dir.path(), &section).unwrap();
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["todotracker"]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn absent_visibility_defaults_to_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[todotracker]\nenabled_at_start = true\n");
+        let tracker = load_persisted(dir.path()).unwrap().todotracker;
+        assert_eq!(tracker.visibility, TodoTrackerVisibility::Auto);
+        assert_eq!(tracker.resolve().visibility, TodoTrackerVisibility::Auto);
+    }
+
+    #[test]
+    fn visibility_round_trips_all_serialized_modes() {
+        for expected in [
+            TodoTrackerVisibility::Auto,
+            TodoTrackerVisibility::Hidden,
+            TodoTrackerVisibility::Shown,
+        ] {
+            let body = format!("visibility = \"{}\"\n", expected.as_str());
+            let parsed: TodoTrackerSection = toml::from_str(&body).unwrap();
+            assert_eq!(parsed.visibility, expected);
+            let serialized = toml::to_string(&parsed).unwrap();
+            assert!(serialized.contains(&format!("visibility = \"{}\"", expected.as_str())));
+        }
+    }
+
+    #[test]
+    fn invalid_visibility_is_rejected() {
+        let error = toml::from_str::<TodoTrackerSection>("visibility = \"later\"\n")
+            .expect_err("unknown visibility values must not silently fall back");
+        assert!(error.to_string().contains("visibility"));
+    }
+
+    #[test]
+    fn visibility_leaf_write_preserves_unknown_content() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[future]\nkeep = true\n\n[todotracker]\nwidth = 41\nfuture_key = \"keep-me\"\n",
+        );
+
+        assert!(
+            !persist_todotracker_visibility(dir.path(), TodoTrackerVisibility::Hidden).unwrap()
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert_eq!(doc["todotracker"]["future_key"].as_str(), Some("keep-me"));
+        assert_eq!(doc["todotracker"]["width"].as_integer(), Some(41));
+        assert_eq!(doc["todotracker"]["visibility"].as_str(), Some("hidden"));
+    }
+
+    #[test]
+    fn visibility_leaf_write_preserves_comments_and_unrelated_formatting() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = "# operator note\n[future] # keep this heading\nkeep   =   true # inline note\n\n[todotracker]\n# tracker note\nwidth = 41\nvisibility = \"auto\" # keep tracker adaptive\n";
+        seed(dir.path(), before);
+
+        persist_todotracker_visibility(dir.path(), TodoTrackerVisibility::Hidden).unwrap();
+
+        let after = read(dir.path());
+        assert!(after.contains("# operator note"));
+        assert!(after.contains("[future] # keep this heading"));
+        assert!(after.contains("keep   =   true # inline note"));
+        assert!(after.contains("# tracker note"));
+        assert!(after.contains("visibility = \"hidden\" # keep tracker adaptive"));
+    }
+
+    #[test]
+    fn visibility_leaf_write_supports_inline_table_and_preserves_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "todotracker = { visibility = \"auto\", width = 32, future_key = \"keep-me\" }\n",
+        );
+
+        persist_todotracker_visibility(dir.path(), TodoTrackerVisibility::Shown).unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["todotracker"]["visibility"].as_str(), Some("shown"));
+        assert_eq!(doc["todotracker"]["width"].as_integer(), Some(32));
+        assert_eq!(doc["todotracker"]["future_key"].as_str(), Some("keep-me"));
+    }
+
+    #[test]
+    fn visibility_leaf_write_reports_shadowing_override_without_persisting_it() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _value = EnvVarGuard::set("ZEROCODE_todotracker__visibility", "shown");
+
+        assert!(persist_todotracker_visibility(dir.path(), TodoTrackerVisibility::Hidden).unwrap());
+        assert_eq!(
+            load_persisted(dir.path()).unwrap().todotracker.visibility,
+            TodoTrackerVisibility::Hidden
+        );
+        assert_eq!(
+            ensure_and_load(dir.path()).unwrap().todotracker.visibility,
+            TodoTrackerVisibility::Shown
+        );
+    }
+
+    #[test]
+    fn visibility_leaf_write_does_not_warn_for_equal_override() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[todotracker]\nvisibility = \"hidden\"\n");
+        let _value = EnvVarGuard::set("ZEROCODE_todotracker__visibility", "hidden");
+
+        assert!(
+            !persist_todotracker_visibility(dir.path(), TodoTrackerVisibility::Hidden).unwrap()
+        );
+        assert_eq!(
+            load_persisted(dir.path()).unwrap().todotracker.visibility,
+            TodoTrackerVisibility::Hidden
+        );
+    }
+
+    #[test]
+    fn visibility_leaf_write_refuses_malformed_tracker() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[todotracker]\nwidth = \"bad\"\n");
+        let before = read(dir.path());
+
+        assert!(persist_todotracker_visibility(dir.path(), TodoTrackerVisibility::Hidden).is_err());
+        assert_eq!(read(dir.path()), before);
+    }
+
+    #[test]
+    fn visibility_leaf_write_refuses_non_table_tracker() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = "todotracker = \"not-a-table\"\n";
+        seed(dir.path(), before);
+
+        assert!(persist_todotracker_visibility(dir.path(), TodoTrackerVisibility::Hidden).is_err());
+        assert_eq!(read(dir.path()), before);
+    }
+
+    #[test]
+    fn visibility_leaf_write_refuses_malformed_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = "[todotracker\nvisibility = \"hidden\"\n";
+        seed(dir.path(), before);
+
+        assert!(persist_todotracker_visibility(dir.path(), TodoTrackerVisibility::Hidden).is_err());
+        assert_eq!(read(dir.path()), before);
     }
 
     #[test]

@@ -1,41 +1,105 @@
 //! Read-only TodoWrite tracker widget for the Code pane.
 //!
 //! Holds the last authoritative plan (whole-list replace) and owns the
-//! show/hide state machine: auto-pop once on the first plan of a
-//! session, after which the user's toggle is authoritative; a master
-//! `enabled` flag hard-gates all rendering.
+//! show/hide state machine. Plan auto-pop is session-local, while an explicit
+//! user choice is process-wide; a master `enabled` flag hard-gates rendering.
 //!
 //! The config-derived types this widget is built from
 //! ([`TodoLocation`](crate::config::TodoLocation) and
 //! [`TodoTrackerSettings`](crate::config::TodoTrackerSettings)) live in
 //! [`crate::config`], the single owner of `zerocode-config.toml` parsing.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+
 use crate::wire::{PlanEntry, PlanStatus};
 
 // Re-export the config-owned runtime types so existing `crate::todo_tracker::*`
 // call sites keep resolving after these moved to `crate::config` (their single
 // owner). The widget below is built from them.
-pub(crate) use crate::config::{TodoLocation, TodoTrackerSettings};
+pub(crate) use crate::config::{TodoLocation, TodoTrackerSettings, TodoTrackerVisibility};
+
+const VISIBILITY_UNSET: u8 = 0;
+const VISIBILITY_HIDDEN: u8 = 1;
+const VISIBILITY_SHOWN: u8 = 2;
+const VISIBILITY_AUTO: u8 = 3;
+
+/// One visibility preference shared by every Todo tracker in this process.
+#[derive(Clone, Debug)]
+pub(crate) struct TodoVisibilityHandle(Arc<AtomicU8>);
+
+impl TodoVisibilityHandle {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(VISIBILITY_UNSET)))
+    }
+
+    fn initialize(&self, mode: TodoTrackerVisibility) {
+        if mode == TodoTrackerVisibility::Auto {
+            return;
+        }
+        let _ = self.0.compare_exchange(
+            VISIBILITY_UNSET,
+            Self::encode(mode),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn mode(&self) -> TodoTrackerVisibility {
+        Self::decode(self.0.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_mode(&self, mode: TodoTrackerVisibility) {
+        self.0.store(Self::encode(mode), Ordering::Relaxed);
+    }
+
+    fn encode(mode: TodoTrackerVisibility) -> u8 {
+        match mode {
+            TodoTrackerVisibility::Auto => VISIBILITY_AUTO,
+            TodoTrackerVisibility::Hidden => VISIBILITY_HIDDEN,
+            TodoTrackerVisibility::Shown => VISIBILITY_SHOWN,
+        }
+    }
+
+    fn decode(value: u8) -> TodoTrackerVisibility {
+        match value {
+            VISIBILITY_HIDDEN => TodoTrackerVisibility::Hidden,
+            VISIBILITY_SHOWN => TodoTrackerVisibility::Shown,
+            _ => TodoTrackerVisibility::Auto,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct TodoTracker {
     entries: Vec<PlanEntry>,
-    visible: bool,
     has_ever_popped: bool,
     /// The resolved settings this tracker was built from. Retained so the
     /// active settings can be read back (e.g. as a fallback when a later
     /// config reload fails) without losing `enabled_at_start`.
     settings: TodoTrackerSettings,
+    visibility: TodoVisibilityHandle,
 }
 
 impl TodoTracker {
     /// Construct from parsed `[todotracker]` settings.
+    #[cfg(test)]
     pub(crate) fn from_settings(settings: TodoTrackerSettings) -> Self {
+        Self::from_settings_with_visibility(settings, TodoVisibilityHandle::new())
+    }
+
+    pub(crate) fn from_settings_with_visibility(
+        settings: TodoTrackerSettings,
+        visibility: TodoVisibilityHandle,
+    ) -> Self {
+        visibility.initialize(settings.visibility);
         Self {
             entries: Vec::new(),
-            visible: settings.enabled && settings.enabled_at_start,
             has_ever_popped: false,
             settings,
+            visibility,
         }
     }
 
@@ -73,29 +137,50 @@ impl TodoTracker {
     pub(crate) fn set_plan(&mut self, entries: Vec<PlanEntry>) {
         self.entries = entries;
         if self.settings.enabled && !self.has_ever_popped && !self.entries.is_empty() {
-            self.visible = true;
             self.has_ever_popped = true;
         }
     }
 
     /// Rebuild the tracker for a newly-entered session from freshly resolved
     /// settings. The plan is per-session, so entries are dropped and the
-    /// one-time auto-pop is re-armed; layout/visibility come from `settings`
-    /// so a Config-pane edit takes effect on the next session transition
-    /// (restart or switch), not only on a fresh session.
+    /// one-time auto-pop is re-armed; the process visibility choice survives.
     pub(crate) fn reset_for_session(&mut self, settings: TodoTrackerSettings) {
-        *self = Self::from_settings(settings);
+        let visibility = self.visibility.clone();
+        *self = Self::from_settings_with_visibility(settings, visibility);
     }
 
     /// User show/hide. Inert while master-disabled.
-    pub(crate) fn toggle(&mut self) {
-        if self.settings.enabled {
-            self.visible = !self.visible;
+    pub(crate) fn toggle(&mut self) -> Option<TodoTrackerVisibility> {
+        if !self.settings.enabled {
+            return None;
         }
+        let mode = if self.is_visible() {
+            TodoTrackerVisibility::Hidden
+        } else {
+            TodoTrackerVisibility::Shown
+        };
+        self.visibility.set_mode(mode);
+        Some(mode)
+    }
+
+    /// Explicitly hide the tracker while retaining its current plan.
+    pub(crate) fn hide(&mut self) -> Option<TodoTrackerVisibility> {
+        if !self.settings.enabled {
+            return None;
+        }
+        self.visibility.set_mode(TodoTrackerVisibility::Hidden);
+        Some(TodoTrackerVisibility::Hidden)
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        self.settings.enabled && self.visible
+        if !self.settings.enabled {
+            return false;
+        }
+        match self.visibility.mode() {
+            TodoTrackerVisibility::Auto => self.settings.enabled_at_start || self.has_ever_popped,
+            TodoTrackerVisibility::Hidden => false,
+            TodoTrackerVisibility::Shown => true,
+        }
     }
 
     #[cfg(test)]
@@ -128,7 +213,11 @@ impl TodoTracker {
         }
     }
 
-    pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    pub(crate) fn render(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+    ) -> Option<ratatui::layout::Rect> {
         use ratatui::style::{Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::Paragraph;
@@ -145,6 +234,7 @@ impl TodoTracker {
         // every other split-pane in the Code/Chat view. `fill_style`
         // paints the panel interior with the theme background so the
         // tracker never shows the terminal default through.
+        let close_rect = close_hit_rect(area);
         let block = theme::panel_block(&title).style(theme::fill_style());
 
         if self.entries.is_empty() {
@@ -152,7 +242,14 @@ impl TodoTracker {
                 .style(theme::fill_style())
                 .block(block);
             frame.render_widget(placeholder, area);
-            return;
+            if let Some(rect) = close_rect {
+                frame.render_widget(
+                    Paragraph::new(Span::styled("✕", theme::dim_style()))
+                        .style(theme::fill_style()),
+                    rect,
+                );
+            }
+            return close_rect;
         }
 
         let mut lines: Vec<Line> = Vec::with_capacity(self.entries.len());
@@ -183,7 +280,19 @@ impl TodoTracker {
             .style(theme::fill_style())
             .block(block);
         frame.render_widget(para, area);
+        if let Some(rect) = close_rect {
+            frame.render_widget(
+                Paragraph::new(Span::styled("✕", theme::dim_style())).style(theme::fill_style()),
+                rect,
+            );
+        }
+        close_rect
     }
+}
+
+fn close_hit_rect(area: ratatui::layout::Rect) -> Option<ratatui::layout::Rect> {
+    (area.width >= 3 && area.height > 0)
+        .then(|| ratatui::layout::Rect::new(area.x + area.width - 2, area.y, 1, 1))
 }
 
 #[cfg(test)]
@@ -219,6 +328,7 @@ mod tests {
         let s = TodoTrackerSettings::default();
         assert!(s.enabled);
         assert!(!s.enabled_at_start);
+        assert_eq!(s.visibility, TodoTrackerVisibility::Auto);
         assert_eq!(s.location, TodoLocation::Right);
         assert_eq!(s.width, 32);
         assert_eq!(s.max_height, 5);
@@ -338,9 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_for_session_restores_enabled_at_start_visibility() {
-        // enabled_at_start=true means the tracker shows at each session's
-        // launch, including after a switch.
+    fn reset_for_session_preserves_explicit_hide() {
         let settings = settings_for(TodoLocation::Right, true, true);
         let mut t = TodoTracker::from_settings(settings);
         t.set_plan(vec![entry("A", PlanStatus::Pending)]);
@@ -348,10 +456,93 @@ mod tests {
         assert!(!t.is_visible());
         t.reset_for_session(settings);
         assert!(
-            t.is_visible(),
-            "enabled_at_start restores visibility on the new session"
+            !t.is_visible(),
+            "an explicit hide remains authoritative on the new session"
         );
         assert_eq!(t.total(), 0);
+    }
+
+    #[test]
+    fn shared_visibility_does_not_share_plans() {
+        let visibility = TodoVisibilityHandle::new();
+        let settings = settings_for(TodoLocation::Right, true, false);
+        let mut first = TodoTracker::from_settings_with_visibility(settings, visibility.clone());
+        let mut second = TodoTracker::from_settings_with_visibility(settings, visibility);
+        first.set_plan(vec![entry("first", PlanStatus::Pending)]);
+        second.set_plan(vec![entry("second", PlanStatus::Completed)]);
+
+        first.hide();
+        assert!(!first.is_visible());
+        assert!(!second.is_visible());
+        assert_eq!(first.entries()[0].content, "first");
+        assert_eq!(second.entries()[0].content, "second");
+
+        second.toggle();
+        assert!(first.is_visible());
+        assert!(second.is_visible());
+    }
+
+    #[test]
+    fn persisted_visibility_modes_override_auto_behavior() {
+        let hidden = TodoTrackerSettings {
+            visibility: TodoTrackerVisibility::Hidden,
+            enabled_at_start: true,
+            ..TodoTrackerSettings::default()
+        };
+        let mut tracker = TodoTracker::from_settings(hidden);
+        tracker.set_plan(vec![entry("hidden", PlanStatus::Pending)]);
+        assert!(!tracker.is_visible());
+
+        let shown = TodoTrackerSettings {
+            visibility: TodoTrackerVisibility::Shown,
+            enabled_at_start: false,
+            ..TodoTrackerSettings::default()
+        };
+        assert!(TodoTracker::from_settings(shown).is_visible());
+    }
+
+    #[test]
+    fn explicit_auto_survives_reconstruction_with_older_settings() {
+        let visibility = TodoVisibilityHandle::new();
+        let settings = TodoTrackerSettings {
+            visibility: TodoTrackerVisibility::Hidden,
+            ..TodoTrackerSettings::default()
+        };
+        let mut tracker = TodoTracker::from_settings_with_visibility(settings, visibility.clone());
+        visibility.set_mode(TodoTrackerVisibility::Auto);
+        tracker.reset_for_session(settings);
+        tracker.set_plan(vec![entry("new session", PlanStatus::Pending)]);
+        assert_eq!(visibility.mode(), TodoTrackerVisibility::Auto);
+        assert!(tracker.is_visible());
+    }
+
+    #[test]
+    fn auto_does_not_block_later_explicit_handle_initialization() {
+        let visibility = TodoVisibilityHandle::new();
+        let auto = TodoTrackerSettings::default();
+        let shown = TodoTrackerSettings {
+            visibility: TodoTrackerVisibility::Shown,
+            ..auto
+        };
+
+        let _first = TodoTracker::from_settings_with_visibility(auto, visibility.clone());
+        assert_eq!(visibility.mode(), TodoTrackerVisibility::Auto);
+
+        let _second = TodoTracker::from_settings_with_visibility(shown, visibility.clone());
+        assert_eq!(visibility.mode(), TodoTrackerVisibility::Shown);
+    }
+
+    #[test]
+    fn close_hit_rect_matches_rendered_close_cell() {
+        assert_eq!(
+            close_hit_rect(ratatui::layout::Rect::new(4, 2, 12, 6)),
+            Some(ratatui::layout::Rect::new(14, 2, 1, 1))
+        );
+        assert_eq!(close_hit_rect(ratatui::layout::Rect::new(4, 2, 2, 6)), None);
+        assert_eq!(
+            close_hit_rect(ratatui::layout::Rect::new(4, 2, 12, 0)),
+            None
+        );
     }
 
     #[test]
@@ -361,6 +552,7 @@ mod tests {
         let settings = TodoTrackerSettings {
             enabled: true,
             enabled_at_start: false,
+            visibility: TodoTrackerVisibility::Auto,
             location: TodoLocation::Bottom,
             width: 42,
             max_height: 9,
@@ -426,7 +618,10 @@ mod tests {
     fn render_to_string(t: &TodoTracker, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| t.render(f, Rect::new(0, 0, w, h))).unwrap();
+        term.draw(|f| {
+            t.render(f, Rect::new(0, 0, w, h));
+        })
+        .unwrap();
         let buf = term.backend().buffer().clone();
         buf.content().iter().map(|c| c.symbol()).collect::<String>()
     }
@@ -436,7 +631,10 @@ mod tests {
     fn render_to_buffer(t: &TodoTracker, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| t.render(f, Rect::new(0, 0, w, h))).unwrap();
+        term.draw(|f| {
+            t.render(f, Rect::new(0, 0, w, h));
+        })
+        .unwrap();
         term.backend().buffer().clone()
     }
 
@@ -462,6 +660,13 @@ mod tests {
         assert!(out.contains("Alpha"));
         assert!(out.contains("Beta"));
         assert!(out.contains("Gamma"));
+    }
+
+    #[test]
+    fn renders_the_frozen_close_glyph() {
+        let t = TodoTracker::new(TodoLocation::Right, true, true);
+        let out = render_to_string(&t, 24, 5);
+        assert!(out.contains("✕"));
     }
 
     #[test]

@@ -104,14 +104,16 @@ impl ConnField {
 enum TrackerField {
     Enabled,
     EnabledAtStart,
+    Visibility,
     Location,
     Width,
     MaxHeight,
 }
 
-const TRACKER_FIELDS: [TrackerField; 5] = [
+const TRACKER_FIELDS: [TrackerField; 6] = [
     TrackerField::Enabled,
     TrackerField::EnabledAtStart,
+    TrackerField::Visibility,
     TrackerField::Location,
     TrackerField::Width,
     TrackerField::MaxHeight,
@@ -122,6 +124,7 @@ impl TrackerField {
         match self {
             Self::Enabled => "zc-zerocode-tracker-enabled",
             Self::EnabledAtStart => "zc-zerocode-tracker-enabled-at-start",
+            Self::Visibility => "zc-zerocode-tracker-visibility",
             Self::Location => "zc-zerocode-tracker-location",
             Self::Width => "zc-zerocode-tracker-width",
             Self::MaxHeight => "zc-zerocode-tracker-max-height",
@@ -204,6 +207,7 @@ pub(crate) struct ZerocodePane {
     conn_edit: Option<ConnEdit>,
     // ── UI heading (Task 7) ────────────────────────────────────────
     tracker: TodoTrackerSection,
+    todo_visibility: crate::todo_tracker::TodoVisibilityHandle,
     tracker_cursor: usize,
     tracker_edit: Option<TrackerEdit>,
     /// Set when the persisted `[todotracker]` section exists but does not
@@ -283,7 +287,15 @@ struct TrackerEdit {
 }
 
 impl ZerocodePane {
+    #[cfg(test)]
     pub(crate) fn new(config_dir: &Path) -> Self {
+        Self::new_with_todo_visibility(config_dir, crate::todo_tracker::TodoVisibilityHandle::new())
+    }
+
+    pub(crate) fn new_with_todo_visibility(
+        config_dir: &Path,
+        todo_visibility: crate::todo_tracker::TodoVisibilityHandle,
+    ) -> Self {
         let themes: Vec<String> = theme::theme_names().map(str::to_string).collect();
         let presets: Vec<String> = config::keybindings::preset_names()
             .map(str::to_string)
@@ -356,6 +368,7 @@ impl ZerocodePane {
                 .ok()
                 .and_then(|s| s.clone())
                 .unwrap_or_default(),
+            todo_visibility,
             tracker_cursor: 0,
             tracker_edit: None,
             // Only the *root* cause is displayed. `{e:#}` would render the
@@ -377,6 +390,16 @@ impl ZerocodePane {
         self.rows = collect_binding_rows();
         if self.binding_cursor >= self.rows.len() {
             self.binding_cursor = self.rows.len().saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn refresh_tracker(&mut self) {
+        match config::load_persisted_todotracker_strict(&self.config_dir) {
+            Ok(tracker) => {
+                self.tracker = tracker.unwrap_or_default();
+                self.tracker_load_error = None;
+            }
+            Err(error) => self.tracker_load_error = Some(format!("{error:#}")),
         }
     }
 
@@ -843,6 +866,7 @@ impl ZerocodePane {
                 "false"
             }
             .to_string(),
+            TrackerField::Visibility => self.tracker.visibility.as_str().to_string(),
             TrackerField::Location => match self.tracker.location {
                 config::TodoTrackerLocation::Bottom => "bottom",
                 config::TodoTrackerLocation::Left => "left",
@@ -862,6 +886,7 @@ impl ZerocodePane {
                 TrackerField::Enabled | TrackerField::EnabledAtStart => {
                     crate::i18n::t("zc-zerocode-tracker-edit-bool")
                 }
+                TrackerField::Visibility => crate::i18n::t("zc-zerocode-tracker-edit-visibility"),
                 TrackerField::Location => crate::i18n::t("zc-zerocode-tracker-edit-location"),
                 TrackerField::Width | TrackerField::MaxHeight => {
                     crate::i18n::t("zc-zerocode-tracker-edit-number")
@@ -1472,6 +1497,27 @@ impl ZerocodePane {
                 _ => {}
             }
             self.persist_tracker_candidate(candidate);
+            return;
+        }
+        if field == TrackerField::Visibility {
+            let visibility = match self.tracker.visibility {
+                config::TodoTrackerVisibility::Auto => config::TodoTrackerVisibility::Hidden,
+                config::TodoTrackerVisibility::Hidden => config::TodoTrackerVisibility::Shown,
+                config::TodoTrackerVisibility::Shown => config::TodoTrackerVisibility::Auto,
+            };
+            match config::persist_todotracker_visibility(&self.config_dir, visibility) {
+                Ok(true) => {
+                    self.tracker.visibility = visibility;
+                    self.todo_visibility.set_mode(visibility);
+                    self.status = Some(crate::i18n::t("zc-zerocode-tracker-saved-env-override"));
+                }
+                Ok(false) => {
+                    self.tracker.visibility = visibility;
+                    self.todo_visibility.set_mode(visibility);
+                    self.status = Some(crate::i18n::t("zc-zerocode-tracker-saved"));
+                }
+                Err(error) => self.set_ui_save_error(&error),
+            }
             return;
         }
         // Location cycles on Enter.
@@ -2342,6 +2388,174 @@ mod tests {
             .expect("numeric tracker field opens an editor")
             .buf = value.to_string();
         pane.handle_tracker_edit_key(key(KeyCode::Enter));
+    }
+
+    fn activate_tracker_visibility(pane: &mut ZerocodePane) {
+        pane.tracker_cursor = TRACKER_FIELDS
+            .iter()
+            .position(|candidate| *candidate == TrackerField::Visibility)
+            .expect("visibility tracker field is registered");
+        pane.activate_tracker();
+    }
+
+    #[test]
+    fn tracker_visibility_field_cycles_and_preserves_unknown_keys() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config::config_path(dir.path()),
+            "[todotracker]\nvisibility = \"auto\"\nfuture_key = \"keep-me\"\n",
+        )
+        .unwrap();
+        let visibility = crate::todo_tracker::TodoVisibilityHandle::new();
+        let mut pane = ZerocodePane::new_with_todo_visibility(dir.path(), visibility.clone());
+
+        assert_eq!(pane.tracker_field_value(TrackerField::Visibility), "auto");
+        activate_tracker_visibility(&mut pane);
+        assert_eq!(
+            pane.tracker.visibility,
+            config::TodoTrackerVisibility::Hidden
+        );
+        assert_eq!(visibility.mode(), config::TodoTrackerVisibility::Hidden);
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .visibility,
+            config::TodoTrackerVisibility::Hidden
+        );
+        assert_eq!(
+            toml::from_str::<toml::Table>(
+                &std::fs::read_to_string(config::config_path(dir.path())).unwrap()
+            )
+            .unwrap()["todotracker"]["future_key"]
+                .as_str(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+
+        activate_tracker_visibility(&mut pane);
+        assert_eq!(
+            pane.tracker.visibility,
+            config::TodoTrackerVisibility::Shown
+        );
+        assert_eq!(visibility.mode(), config::TodoTrackerVisibility::Shown);
+        activate_tracker_visibility(&mut pane);
+        assert_eq!(pane.tracker.visibility, config::TodoTrackerVisibility::Auto);
+        assert_eq!(visibility.mode(), config::TodoTrackerVisibility::Auto);
+    }
+
+    #[test]
+    fn tracker_visibility_field_reports_differing_env_override() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let _value =
+            crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__visibility", "shown");
+
+        activate_tracker_visibility(&mut pane);
+
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .visibility,
+            config::TodoTrackerVisibility::Hidden
+        );
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved-env-override").as_str())
+        );
+    }
+
+    #[test]
+    fn tracker_focus_refreshes_visibility_after_chat_toggle() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let visibility = crate::todo_tracker::TodoVisibilityHandle::new();
+        let mut pane = ZerocodePane::new_with_todo_visibility(dir.path(), visibility.clone());
+        pane.refresh_tracker();
+        assert_eq!(pane.tracker_field_value(TrackerField::Visibility), "auto");
+        let mut tracker = crate::todo_tracker::TodoTracker::from_settings_with_visibility(
+            config::TodoTrackerSettings::default(),
+            visibility.clone(),
+        );
+
+        let shown = tracker.toggle().unwrap();
+        config::persist_todotracker_visibility(dir.path(), shown).unwrap();
+        pane.refresh_tracker();
+        assert_eq!(pane.tracker_field_value(TrackerField::Visibility), "shown");
+        activate_tracker_visibility(&mut pane);
+        assert_eq!(visibility.mode(), config::TodoTrackerVisibility::Auto);
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .visibility,
+            config::TodoTrackerVisibility::Auto,
+        );
+    }
+
+    #[test]
+    fn tracker_focus_keeps_persisted_visibility_separate_from_live_override() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let visibility = crate::todo_tracker::TodoVisibilityHandle::new();
+        let mut pane = ZerocodePane::new_with_todo_visibility(dir.path(), visibility.clone());
+        config::persist_todotracker_visibility(dir.path(), config::TodoTrackerVisibility::Hidden)
+            .unwrap();
+        visibility.set_mode(config::TodoTrackerVisibility::Shown);
+        let _value =
+            crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__visibility", "shown");
+
+        pane.refresh_tracker();
+        assert_eq!(pane.tracker_field_value(TrackerField::Visibility), "hidden");
+        assert_eq!(visibility.mode(), config::TodoTrackerVisibility::Shown);
+        std::fs::write(
+            config::config_path(dir.path()),
+            "[todotracker]\nwidth = \"bad\"\n",
+        )
+        .unwrap();
+        pane.refresh_tracker();
+        assert!(pane.tracker_load_error.is_some());
+        activate_tracker_visibility(&mut pane);
+        assert_eq!(visibility.mode(), config::TodoTrackerVisibility::Shown);
+        assert!(
+            std::fs::read_to_string(config::config_path(dir.path()))
+                .unwrap()
+                .contains("bad")
+        );
+    }
+
+    #[test]
+    fn tracker_unrelated_edit_preserves_newer_visibility() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let visibility = crate::todo_tracker::TodoVisibilityHandle::new();
+        let mut pane = ZerocodePane::new_with_todo_visibility(dir.path(), visibility.clone());
+        config::persist_todotracker_visibility(dir.path(), config::TodoTrackerVisibility::Hidden)
+            .unwrap();
+        visibility.set_mode(config::TodoTrackerVisibility::Hidden);
+        let mut candidate = pane.tracker.clone();
+        candidate.location = config::TodoTrackerLocation::Left;
+        pane.persist_tracker_candidate(candidate);
+        assert_eq!(
+            pane.tracker.visibility,
+            config::TodoTrackerVisibility::Hidden
+        );
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .visibility,
+            config::TodoTrackerVisibility::Hidden
+        );
+        assert_eq!(visibility.mode(), config::TodoTrackerVisibility::Hidden);
     }
 
     // Current-head smoke of the Config-pane Todo-tracker save path, driven

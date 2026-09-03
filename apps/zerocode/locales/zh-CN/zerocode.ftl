@@ -507,3 +507,7 @@ zc-config-footer-action-new-line = 换行
 zc-config-field-edit-hint = { $keys } → 按下以编辑
 
 zc-doctor-log-path = 日志：{ $path }
+zc-zerocode-tracker-visibility = 可见性
+zc-zerocode-tracker-edit-visibility = 按 Enter 在 auto / hidden / shown 间切换。
+zc-chat-todo-visibility-save-failed = 本次运行已更改可见性，但无法保存：{ $error }
+zc-chat-todo-visibility-saved-env-override = 可见性已保存，但重启后 ZEROCODE_todotracker__visibility 将优先生效。

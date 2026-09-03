@@ -110,6 +110,7 @@ pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
+    todo_visibility: crate::todo_tracker::TodoVisibilityHandle,
     inbound_rx: broadcast::Receiver<crate::client::RpcInboundRequest>,
     /// Background-fetched git status updates: (session_id, branch, hash).
     git_branch_tx: mpsc::Sender<GitStatusUpdate>,
@@ -209,7 +210,20 @@ fn should_retry_on_entry(phase: &ChatPhase) -> bool {
 }
 
 impl Chat {
+    #[cfg(test)]
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
+        Self::new_with_todo_visibility(
+            rpc,
+            pane_kind,
+            crate::todo_tracker::TodoVisibilityHandle::new(),
+        )
+    }
+
+    pub(crate) fn new_with_todo_visibility(
+        rpc: Arc<RpcClient>,
+        pane_kind: PaneKind,
+        todo_visibility: crate::todo_tracker::TodoVisibilityHandle,
+    ) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
         let (prompt_completion_tx, prompt_completion_rx) = mpsc::channel(4);
@@ -218,6 +232,7 @@ impl Chat {
             rpc_out: rpc.rpc.clone(),
             notif_rx: rpc.subscribe_notifications(),
             inbound_rx: rpc.subscribe_inbound_requests(),
+            todo_visibility,
             git_branch_tx,
             git_branch_rx,
             git_branch_inflight: false,
@@ -239,6 +254,17 @@ impl Chat {
             help_requested: false,
             deferred_elicitations: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn activate_session_for_test(&mut self, session_id: &str) {
+        self.phase = ChatPhase::Active(Box::new(ChatState::with_shared_commands_and_visibility(
+            session_id.to_string(),
+            "test-agent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            &[],
+            self.todo_visibility.clone(),
+        )));
     }
 
     /// Seed a session id to reattach to on the next session start. Used by the
@@ -516,11 +542,12 @@ impl Chat {
                 // `todo_settings` is resolved fresh at this boundary from
                 // `zerocode-config.toml` (the canonical owner); the removed
                 // `self.todo_settings` cache was the stale cross-session copy.
-                let mut state = ChatState::with_shared_commands(
+                let mut state = ChatState::with_shared_commands_and_visibility(
                     session.session_id,
                     agent_alias.to_string(),
                     todo_settings,
                     self.rpc.commands(),
+                    self.todo_visibility.clone(),
                 );
                 state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
@@ -1892,7 +1919,10 @@ impl Chat {
                 state.mark_dirty_full();
             }
             Some(ChatTabAction::TodoToggle) => {
-                state.todo_tracker.toggle();
+                if let Some(mode) = state.todo_tracker.toggle() {
+                    Self::persist_todo_visibility(state, mode);
+                }
+                state.todo_close_hit_rect = None;
                 state.mark_dirty_full();
             }
             Some(ChatTabAction::BrowseEnter) => {
@@ -2359,6 +2389,21 @@ impl Chat {
         };
     }
 
+    fn persist_todo_visibility(state: &mut ChatState, mode: crate::config::TodoTrackerVisibility) {
+        match crate::config::persist_todotracker_visibility(&crate::i18n::config_dir(), mode) {
+            Ok(true) => {
+                state.set_info_notice(crate::i18n::t("zc-chat-todo-visibility-saved-env-override"))
+            }
+            Ok(false) => {}
+            Err(error) => {
+                state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                    "zc-chat-todo-visibility-save-failed",
+                    &[("error", &error.to_string())],
+                )));
+            }
+        }
+    }
+
     pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         // Dir-picker explorer handles its own mouse events.
         if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
@@ -2557,6 +2602,21 @@ impl Chat {
                     | MouseEventKind::Up(MouseButton::Left) => return,
                     _ => {}
                 }
+            }
+
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+                && !state.input_bar.has_attachment_manager()
+                && state.todo_tracker.is_visible()
+                && state
+                    .todo_close_hit_rect
+                    .is_some_and(|rect| mouse::in_rect(mouse.column, mouse.row, rect))
+            {
+                if let Some(mode) = state.todo_tracker.hide() {
+                    Self::persist_todo_visibility(state, mode);
+                }
+                state.todo_close_hit_rect = None;
+                state.mark_dirty_full();
+                return;
             }
 
             let input_bar_consumed = state.input_bar.handle_mouse(mouse);
@@ -3347,9 +3407,10 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
     // rest of the pane (queue sidebar, transcript, input) lays out in the
     // remaining body. When the tracker wants no space, `body == area` and
     // the existing layout is untouched.
+    state.todo_close_hit_rect = None;
     let (area, todo_area) = carve_todo_area(&state.todo_tracker, area);
     if let Some(panel) = todo_area {
-        state.todo_tracker.render(f, panel);
+        state.todo_close_hit_rect = state.todo_tracker.render(f, panel);
     }
 
     let area = if state.queue_sidebar_open() {
@@ -5629,6 +5690,8 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
+    /// Exact close-cell target from the last Todo panel draw.
+    todo_close_hit_rect: Option<ratatui::layout::Rect>,
     /// Live TodoWrite tracker panel for this session. Read-only; fed by
     /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
     todo_tracker: crate::todo_tracker::TodoTracker,
@@ -5644,11 +5707,28 @@ impl ChatState {
         Self::with_shared_commands(session_id, agent_alias, todo_settings, &[])
     }
 
+    #[cfg(test)]
     fn with_shared_commands(
         session_id: String,
         agent_alias: String,
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
         commands: &[crate::wire::CommandDescriptor],
+    ) -> Self {
+        Self::with_shared_commands_and_visibility(
+            session_id,
+            agent_alias,
+            todo_settings,
+            commands,
+            crate::todo_tracker::TodoVisibilityHandle::new(),
+        )
+    }
+
+    fn with_shared_commands_and_visibility(
+        session_id: String,
+        agent_alias: String,
+        todo_settings: crate::todo_tracker::TodoTrackerSettings,
+        commands: &[crate::wire::CommandDescriptor],
+        todo_visibility: crate::todo_tracker::TodoVisibilityHandle,
     ) -> Self {
         Self {
             session_id,
@@ -5717,7 +5797,11 @@ impl ChatState {
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
-            todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
+            todo_close_hit_rect: None,
+            todo_tracker: crate::todo_tracker::TodoTracker::from_settings_with_visibility(
+                todo_settings,
+                todo_visibility,
+            ),
         }
     }
 
@@ -7523,11 +7607,12 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
-        // The TodoWrite plan is per-session; drop it (and its show/hide state)
-        // so a switched-to session doesn't inherit the previous plan's tasks.
+        // Drop the session's plan and auto-pop state, retaining the shared
+        // explicit visibility choice across session transitions.
         // Rebuilding from freshly resolved settings also applies any Config-pane
         // edit made since this pane's `ChatState` was constructed.
         self.todo_tracker.reset_for_session(todo_settings);
+        self.todo_close_hit_rect = None;
         cleanup_report.merge(self.cleanup_active_turn_attachments());
         cleanup_report.merge(self.clear_queue());
         self.surface_cleanup_report(cleanup_report);
@@ -7650,6 +7735,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     /// Async env-lock for `#[tokio::test]` cases that resolve config through
     /// environment variables and hold the guard across await points. Serializes
@@ -7690,6 +7776,67 @@ mod tests {
         );
         state.input_bar.insert_text(command);
         state.input_bar.submit_current_input_for_test()
+    }
+
+    #[test]
+    fn shared_todo_visibility_spans_sessions_without_sharing_plans() {
+        let visibility = crate::todo_tracker::TodoVisibilityHandle::new();
+        let settings = crate::todo_tracker::TodoTrackerSettings::default();
+        let mut focused = ChatState::with_shared_commands_and_visibility(
+            "focused".to_string(),
+            "agent".to_string(),
+            settings,
+            &[],
+            visibility.clone(),
+        );
+        let mut background = ChatState::with_shared_commands_and_visibility(
+            "background".to_string(),
+            "agent".to_string(),
+            settings,
+            &[],
+            visibility.clone(),
+        );
+
+        focused.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
+            content: "focused task".to_string(),
+            status: crate::wire::PlanStatus::Pending,
+            priority: crate::wire::PlanPriority::Medium,
+            active_form: None,
+        }]);
+        background
+            .todo_tracker
+            .set_plan(vec![crate::wire::PlanEntry {
+                content: "background task".to_string(),
+                status: crate::wire::PlanStatus::InProgress,
+                priority: crate::wire::PlanPriority::Medium,
+                active_form: None,
+            }]);
+
+        focused.todo_tracker.hide();
+        assert_eq!(
+            visibility.mode(),
+            crate::config::TodoTrackerVisibility::Hidden
+        );
+        assert!(!focused.todo_tracker.is_visible());
+        assert!(!background.todo_tracker.is_visible());
+        assert_eq!(focused.todo_tracker.entries()[0].content, "focused task");
+        assert_eq!(
+            background.todo_tracker.entries()[0].content,
+            "background task"
+        );
+
+        background.todo_tracker.toggle();
+        assert_eq!(
+            visibility.mode(),
+            crate::config::TodoTrackerVisibility::Shown
+        );
+        assert!(focused.todo_tracker.is_visible());
+        assert!(background.todo_tracker.is_visible());
+
+        focused.reset_for_session("focused-again".to_string(), None, settings);
+        assert_eq!(focused.todo_tracker.total(), 0);
+        assert!(background.todo_tracker.total() == 1);
+        assert!(focused.todo_tracker.is_visible());
     }
 
     #[test]
@@ -9201,12 +9348,236 @@ mod tests {
             &crate::config::TodoTrackerSection {
                 enabled: true,
                 enabled_at_start,
+                visibility: crate::config::TodoTrackerVisibility::Auto,
                 location: crate::config::TodoTrackerLocation::Bottom,
                 width,
                 max_height: 7,
             },
         )
         .expect("test config write should succeed");
+    }
+
+    #[tokio::test]
+    async fn todo_ctrl_p_toggle_persists_the_explicit_mode() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _config = ConfigDirGuard::set(dir.path());
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.activate_session_for_test("sess-1");
+        let mut term: crate::config_manager::Term = ratatui::Terminal::new(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+        )
+        .unwrap();
+
+        for expected in [
+            crate::config::TodoTrackerVisibility::Shown,
+            crate::config::TodoTrackerVisibility::Hidden,
+        ] {
+            assert!(
+                !chat
+                    .handle_key(
+                        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                        &mut term,
+                    )
+                    .await
+            );
+            assert_eq!(chat.todo_visibility.mode(), expected);
+            assert_eq!(
+                crate::config::load_persisted(dir.path())
+                    .unwrap()
+                    .todotracker
+                    .visibility,
+                expected
+            );
+        }
+    }
+
+    fn draw_todo_close(chat: &mut Chat) -> Rect {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| chat.draw(frame, frame.area()))
+            .unwrap();
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected an active session");
+        };
+        let close = state.todo_close_hit_rect.expect("rendered close control");
+        assert_eq!(
+            terminal.backend().buffer()[(close.x, close.y)].symbol(),
+            "✕"
+        );
+        close
+    }
+
+    #[tokio::test]
+    async fn todo_visibility_survives_pane_reconstruction_and_relaunch() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        let visibility = crate::todo_tracker::TodoVisibilityHandle::new();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let mut pane = Chat::new_with_todo_visibility(client.clone(), kind, visibility.clone());
+            pane.activate_session_for_test("first");
+            let ChatPhase::Active(state) = &mut pane.phase else {
+                unreachable!()
+            };
+            state.todo_tracker.hide();
+            assert_eq!(
+                visibility.mode(),
+                crate::config::TodoTrackerVisibility::Hidden
+            );
+
+            let mut rebuilt =
+                Chat::new_with_todo_visibility(client.clone(), kind, visibility.clone());
+            rebuilt.activate_session_for_test("resumed");
+            let ChatPhase::Active(state) = &mut rebuilt.phase else {
+                unreachable!()
+            };
+            state.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
+                content: "retained task".into(),
+                status: crate::wire::PlanStatus::Pending,
+                priority: crate::wire::PlanPriority::Medium,
+                active_form: None,
+            }]);
+            assert!(!state.todo_tracker.is_visible());
+        }
+        crate::config::persist_todotracker_visibility(dir.path(), visibility.mode()).unwrap();
+        let settings = crate::config::resolve_todo_tracker_checked(dir.path()).unwrap();
+        let restarted = ChatState::with_shared_commands_and_visibility(
+            "restarted".into(),
+            "agent".into(),
+            settings,
+            &[],
+            crate::todo_tracker::TodoVisibilityHandle::new(),
+        );
+        assert!(!restarted.todo_tracker.is_visible());
+    }
+
+    #[tokio::test]
+    async fn todo_close_persists_hidden_without_clearing_session_state() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _config = ConfigDirGuard::set(dir.path());
+        write_tracker_config(dir.path(), 32, false);
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.activate_session_for_test("sess-1");
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 1, row: 2 },
+            head: CellPoint { column: 4, row: 2 },
+            dragged: true,
+        };
+        if let ChatPhase::Active(state) = &mut chat.phase {
+            state.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
+                content: "keep this plan".to_string(),
+                status: crate::wire::PlanStatus::Pending,
+                priority: crate::wire::PlanPriority::Medium,
+                active_form: None,
+            }]);
+            state.input_bar.insert_text("keep this input");
+            state.transcript_selection = Some(selection);
+        } else {
+            panic!("test session must be active");
+        }
+
+        let close = draw_todo_close(&mut chat);
+        chat.handle_mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 40),
+        )
+        .await;
+
+        assert_eq!(
+            chat.todo_visibility.mode(),
+            crate::config::TodoTrackerVisibility::Hidden
+        );
+        assert_eq!(
+            crate::config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .visibility,
+            crate::config::TodoTrackerVisibility::Hidden
+        );
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("test session must stay active");
+        };
+        assert_eq!(state.todo_tracker.entries()[0].content, "keep this plan");
+        assert_eq!(state.input_bar.input(), "keep this input");
+        assert_eq!(state.transcript_selection, Some(selection));
+        assert!(state.todo_close_hit_rect.is_none());
+    }
+
+    #[tokio::test]
+    async fn todo_close_keeps_immediate_hide_and_reports_save_failure() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, "untouched").unwrap();
+        let _config = ConfigDirGuard::set(&blocked);
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.activate_session_for_test("sess-1");
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 1, row: 2 },
+            head: CellPoint { column: 4, row: 2 },
+            dragged: true,
+        };
+        if let ChatPhase::Active(state) = &mut chat.phase {
+            state.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
+                content: "keep this plan".to_string(),
+                status: crate::wire::PlanStatus::Pending,
+                priority: crate::wire::PlanPriority::Medium,
+                active_form: None,
+            }]);
+            state.input_bar.insert_text("keep this input");
+            state.transcript_selection = Some(selection);
+        } else {
+            panic!("test session must be active");
+        }
+
+        let close = draw_todo_close(&mut chat);
+        chat.handle_mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 40),
+        )
+        .await;
+
+        assert_eq!(
+            chat.todo_visibility.mode(),
+            crate::config::TodoTrackerVisibility::Hidden
+        );
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("test session must stay active");
+        };
+        assert_eq!(state.todo_tracker.entries()[0].content, "keep this plan");
+        assert_eq!(state.input_bar.input(), "keep this input");
+        assert_eq!(state.transcript_selection, Some(selection));
+        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "untouched");
+        let message = state.info_message.as_ref().expect("save error feedback");
+        assert_eq!(message.kind, crate::widgets::InfoKind::Error);
+        assert!(message.text.contains("Tracker visibility"));
     }
 
     #[tokio::test]
@@ -9348,6 +9719,7 @@ mod tests {
         let current = crate::todo_tracker::TodoTrackerSettings {
             enabled: true,
             enabled_at_start: true,
+            visibility: crate::config::TodoTrackerVisibility::Auto,
             location: crate::todo_tracker::TodoLocation::Bottom,
             width: 44,
             max_height: 7,
@@ -9393,6 +9765,7 @@ mod tests {
         let current = crate::todo_tracker::TodoTrackerSettings {
             enabled: true,
             enabled_at_start: true,
+            visibility: crate::config::TodoTrackerVisibility::Auto,
             location: crate::todo_tracker::TodoLocation::Bottom,
             width: 44,
             max_height: 7,
@@ -9424,6 +9797,7 @@ mod tests {
         let current = crate::todo_tracker::TodoTrackerSettings {
             enabled: true,
             enabled_at_start: true,
+            visibility: crate::config::TodoTrackerVisibility::Auto,
             location: crate::todo_tracker::TodoLocation::Bottom,
             width: 44,
             max_height: 7,
@@ -9449,6 +9823,7 @@ mod tests {
         let current = crate::todo_tracker::TodoTrackerSettings {
             enabled: true,
             enabled_at_start: true,
+            visibility: crate::config::TodoTrackerVisibility::Auto,
             location: crate::todo_tracker::TodoLocation::Bottom,
             width: 44,
             max_height: 7,
