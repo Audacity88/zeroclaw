@@ -105,13 +105,16 @@ pub struct LocaleEntry {
 
 pub fn locale_entries() -> Vec<LocaleEntry> {
     let path = repo_root().join("locales.toml");
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("locales.toml not found at {}", path.display()));
+    let raw = std::fs::read_to_string(&path);
+    // INVARIANT: xtask runs from this workspace and `locales.toml` is a
+    // checked-in repository input exercised by the mdBook contributor gates.
+    let raw = raw.unwrap_or_else(|_| panic!("locales.toml not found at {}", path.display()));
     let table: toml::Table = raw.parse().expect("locales.toml is invalid TOML");
-    table
-        .get("locale")
-        .and_then(|v| v.as_array())
-        .unwrap_or_else(|| panic!("locales.toml missing [[locale]] entries"))
+    let locales = table.get("locale").and_then(|value| value.as_array());
+    // INVARIANT: the checked-in locale registry uses one or more `[[locale]]`
+    // tables; mdBook generation and locale consistency tests enforce the shape.
+    locales
+        .expect("locales.toml missing [[locale]] entries")
         .iter()
         .filter_map(|entry| {
             let code = entry.get("code")?.as_str()?.to_string();
@@ -133,13 +136,25 @@ pub fn require_tool(cmd: &str, install_hint: &str) -> anyhow::Result<()> {
 }
 
 /// Like `require_tool`, but if the binary is a cargo-installable crate that's missing,
-/// auto-install it via `cargo install --locked <crate>`. Idempotent — a no-op when present.
+/// auto-install it. Idempotent — a no-op when present.
+///
+/// `mdbook-mermaid` is pinned separately because its published lockfile still
+/// compiles against mdBook 0.5.0. Resolving its 0.5.x preprocessor dependency
+/// against the pinned mdBook release avoids a protocol-version warning during
+/// the docs build.
 pub fn ensure_cargo_tool(cmd: &str, crate_name: &str) -> anyhow::Result<()> {
     if tool_on_path(cmd) {
         return Ok(());
     }
     println!("==> installing '{crate_name}' (missing '{cmd}')");
-    run_cmd(Command::new("cargo").args(["install", "--locked", crate_name]))
+    let mut install = Command::new("cargo");
+    install.args(["install"]);
+    if cmd == "mdbook-mermaid" {
+        install.args(["--version", "0.17.1", crate_name]);
+    } else {
+        install.args(["--locked", crate_name]);
+    }
+    run_cmd(&mut install)
 }
 
 fn tool_on_path(cmd: &str) -> bool {
@@ -172,7 +187,7 @@ pub fn mdbook_program() -> anyhow::Result<PathBuf> {
         }
     }
     anyhow::bail!(
-        "'mdbook' not found on PATH\n  install: cargo install mdbook --version 0.5.0 --locked"
+        "'mdbook' not found on PATH\n  install: cargo install mdbook --version 0.5.4 --locked"
     )
 }
 

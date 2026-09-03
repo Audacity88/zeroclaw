@@ -150,9 +150,6 @@ pub async fn run_local_listener(
         "RPC local IPC listening"
     );
 
-    let connections_cancel = cancel.child_token();
-    let mut connections = tokio::task::JoinSet::new();
-    let mut listener_result: Result<()> = Ok(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -162,16 +159,6 @@ pub async fn run_local_listener(
                     "RPC local IPC shutting down"
                 );
                 break;
-            }
-            completed = connections.join_next(), if !connections.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        &format!("RPC local IPC connection task failed: {error}")
-                    );
-                }
             }
             accept = platform::accept(&mut listener, &path) => {
                 let stream = match accept {
@@ -191,35 +178,27 @@ pub async fn run_local_listener(
                             tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                             continue;
                         }
-                        listener_result = Err(e).context("local IPC accept error");
-                        break;
+                        return Err(e).context("local IPC accept error");
                     }
                 };
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
-                let connection_cancel = connections_cancel.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                connections.spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     let mut transport = LocalTransport::new(stream);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new_with_cancel(
-                        ctx.clone(),
-                        writer_tx,
-                        peer,
-                        connection_cancel.child_token(),
-                    );
-                    tokio::select! {
-                        _ = connection_cancel.cancelled() => {}
-                        _ = dispatcher.run(&mut transport) => {}
-                    }
-                    dispatcher.shutdown().await;
+                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    dispatcher.run(&mut transport).await;
 
-                    if let Some(tui_id) = dispatcher.tui_id() {
-                        ctx.tui_registry.unregister(tui_id);
+                    // Epoch-checked for the same reason as the WSS teardown: a
+                    // reconnect adopting this TUI id must not be evicted by the
+                    // displaced connection's later cleanup.
+                    if let Some((tui_id, tui_epoch)) = dispatcher.tui_registration() {
+                        ctx.tui_registry.unregister(tui_id, tui_epoch);
                         use ::zeroclaw_log::Instrument as _;
                         let span = ::zeroclaw_log::info_span!(
                             target: "zeroclaw_log_internal_scope",
@@ -245,19 +224,7 @@ pub async fn run_local_listener(
         }
     }
 
-    connections_cancel.cancel();
-    while let Some(completed) = connections.join_next().await {
-        if let Err(error) = completed {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!("RPC local IPC connection task failed during shutdown: {error}")
-            );
-        }
-    }
-
-    listener_result
+    Ok(())
 }
 
 // ── Platform shims ───────────────────────────────────────────────
@@ -327,6 +294,8 @@ mod platform {
                 parent.display()
             )
         })?;
+        // SAFETY: `geteuid` is a parameter-free process query with no pointer
+        // arguments or memory ownership requirements.
         let euid = unsafe { libc::geteuid() };
         let mode = metadata.mode();
         if metadata.uid() != euid && metadata.uid() != 0 {
@@ -365,6 +334,8 @@ mod platform {
                 lock_path.display()
             );
         }
+        // SAFETY: `geteuid` is a parameter-free process query with no pointer
+        // arguments or memory ownership requirements.
         let euid = unsafe { libc::geteuid() };
         if metadata.uid() != euid {
             anyhow::bail!(
@@ -687,80 +658,6 @@ mod tests {
         Arc::new(AtomicUsize::new(0))
     }
 
-    #[cfg(unix)]
-    struct BlockingModelProvider {
-        started: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        starts: Arc<AtomicUsize>,
-    }
-
-    #[cfg(unix)]
-    #[async_trait::async_trait]
-    impl zeroclaw_api::model_provider::ModelProvider for BlockingModelProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            self.starts.fetch_add(1, Ordering::Relaxed);
-            self.started.notify_one();
-            self.release.notified().await;
-            Ok("released".to_string())
-        }
-    }
-
-    #[cfg(unix)]
-    impl zeroclaw_api::attribution::Attributable for BlockingModelProvider {
-        fn role(&self) -> zeroclaw_api::attribution::Role {
-            zeroclaw_api::attribution::Role::Provider(
-                zeroclaw_api::attribution::ProviderKind::Model(
-                    zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-
-        fn alias(&self) -> &str {
-            "blocking-local-test"
-        }
-    }
-
-    #[cfg(unix)]
-    async fn insert_blocking_session(
-        ctx: &Arc<RpcContext>,
-        session_id: &str,
-        started: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        starts: Arc<AtomicUsize>,
-    ) {
-        let agent = crate::agent::agent::Agent::builder()
-            .model_provider(Box::new(BlockingModelProvider {
-                started,
-                release,
-                starts,
-            }))
-            .tools(vec![])
-            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
-            .observer(Arc::new(crate::observability::noop::NoopObserver))
-            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
-            .workspace_dir(std::env::temp_dir())
-            .build()
-            .expect("blocking local test agent should build");
-        ctx.sessions
-            .insert(
-                session_id.to_string(),
-                crate::rpc::session::RpcSession::new(
-                    agent,
-                    "test-agent",
-                    std::env::temp_dir().to_str().unwrap(),
-                    crate::rpc::types::ChatMode::Chat,
-                ),
-            )
-            .await
-            .expect("blocking local test session should insert");
-    }
-
     fn rpc_request<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
         let req = JsonRpcRequest::new(
             method.wire_name(),
@@ -1034,6 +931,7 @@ mod tests {
         let sock_path = tmp.path().join("daemon.sock");
         let stale_listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
         drop(stale_listener);
+        wait_for_stale_socket(&sock_path).await;
 
         let stale_metadata = std::fs::symlink_metadata(&sock_path).unwrap();
         let stale_identity = (stale_metadata.dev(), stale_metadata.ino());
@@ -1065,6 +963,30 @@ mod tests {
 
         drop(listener);
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_stale_socket(path: &std::path::Path) {
+        let started = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+
+        loop {
+            match tokio::net::UnixStream::connect(path).await {
+                Err(error) if error.kind() == ErrorKind::ConnectionRefused => return,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    panic!("synthetic stale endpoint disappeared before cleanup test: {error}");
+                }
+                Err(error) if started.elapsed() >= timeout => {
+                    panic!("synthetic stale endpoint did not settle before cleanup test: {error}");
+                }
+                Ok(_) if started.elapsed() >= timeout => {
+                    panic!("synthetic stale endpoint stayed reachable before cleanup test");
+                }
+                Ok(_) | Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
     }
 
     /// Set on the re-executed child so `endpoint_lock_is_held_through_guard_cleanup`
@@ -1355,8 +1277,8 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let server_count = count.clone();
-        let server = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, server_count, None).await
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
         });
 
         wait_for_socket(&sock_path).await;
@@ -1374,229 +1296,6 @@ mod tests {
         wait_for_client_count(&count, 0).await;
 
         cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .expect("listener should stop after cancellation")
-            .expect("listener task should not panic")
-            .expect("listener should stop cleanly");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancel_closes_and_joins_accepted_local_clients() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(tmp.path());
-        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
-        let cancel = CancellationToken::new();
-        let count = Arc::new(AtomicUsize::new(0));
-
-        let server_cancel = cancel.clone();
-        let server_ctx = ctx.clone();
-        let server_count = count.clone();
-        let server = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, server_count, None).await
-        });
-        wait_for_socket(&sock_path).await;
-
-        let (mut reader, _writer) = do_initialize(&sock_path).await;
-        wait_for_client_count(&count, 1).await;
-        assert_eq!(ctx.tui_registry.list().len(), 1);
-
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .expect("listener should join accepted clients after cancellation")
-            .expect("listener task should not panic")
-            .expect("listener should stop cleanly");
-
-        assert_eq!(count.load(Ordering::Relaxed), 0);
-        assert!(ctx.tui_registry.list().is_empty());
-        let mut line = String::new();
-        let bytes = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
-            .await
-            .expect("cancelled client should observe EOF")
-            .expect("client read should not fail");
-        assert_eq!(bytes, 0, "cancelled connection should be closed");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancel_joins_inflight_local_prompt_before_releasing_connection() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(tmp.path());
-        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
-        let cancel = CancellationToken::new();
-        let count = Arc::new(AtomicUsize::new(0));
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let starts = Arc::new(AtomicUsize::new(0));
-        let session_id = "inflight-local-prompt";
-        insert_blocking_session(
-            &ctx,
-            session_id,
-            Arc::clone(&started),
-            Arc::clone(&release),
-            Arc::clone(&starts),
-        )
-        .await;
-
-        let server_cancel = cancel.clone();
-        let server_ctx = Arc::clone(&ctx);
-        let server_count = Arc::clone(&count);
-        let server = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, server_count, None).await
-        });
-        wait_for_socket(&sock_path).await;
-
-        let (_reader, mut writer) = do_initialize(&sock_path).await;
-        wait_for_client_count(&count, 1).await;
-        writer
-            .write_all(
-                rpc_request(
-                    Method::SessionPrompt,
-                    &serde_json::json!({
-                        "session_id": session_id,
-                        "prompt": "remain in flight until the connection closes",
-                    }),
-                    2,
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), started.notified())
-            .await
-            .expect("local prompt should reach the blocking provider");
-        assert!(ctx.sessions.has_inflight_turn(session_id));
-        writer
-            .write_all(
-                rpc_request(
-                    Method::SessionPrompt,
-                    &serde_json::json!({
-                        "session_id": session_id,
-                        "prompt": "remain queued until the connection closes",
-                    }),
-                    3,
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while ctx.sessions.session_queue.queue_depth(session_id).await < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("second local prompt should register behind the in-flight turn");
-        assert_eq!(starts.load(Ordering::Relaxed), 1);
-
-        // Make permit release and transport teardown ready in the same
-        // scheduler turn. The queued request must resolve the biased
-        // cancellation branch instead of starting a second provider call.
-        release.notify_one();
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .expect("listener should drain the in-flight prompt before returning")
-            .expect("listener task should not panic")
-            .expect("listener should stop cleanly");
-
-        assert_eq!(count.load(Ordering::Relaxed), 0);
-        assert!(!ctx.sessions.has_inflight_turn(session_id));
-        assert_eq!(ctx.sessions.session_queue.queue_depth(session_id).await, 0);
-        assert_eq!(
-            starts.load(Ordering::Relaxed),
-            1,
-            "the queued local prompt must not start during teardown"
-        );
-        assert!(
-            ctx.sessions.get_agent(session_id).await.is_some(),
-            "connection teardown must retain the resumable session"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn completed_prompt_does_not_discard_partial_local_frame() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ctx = test_ctx(tmp.path());
-        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
-        let cancel = CancellationToken::new();
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let starts = Arc::new(AtomicUsize::new(0));
-        let session_id = "partial-frame-after-prompt";
-        insert_blocking_session(
-            &ctx,
-            session_id,
-            Arc::clone(&started),
-            Arc::clone(&release),
-            starts,
-        )
-        .await;
-
-        let server_cancel = cancel.clone();
-        let server_ctx = Arc::clone(&ctx);
-        let server = zeroclaw_spawn::spawn!(async move {
-            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
-        });
-        wait_for_socket(&sock_path).await;
-        let (mut reader, mut writer) = do_initialize(&sock_path).await;
-
-        writer
-            .write_all(
-                rpc_request(
-                    Method::SessionPrompt,
-                    &serde_json::json!({
-                        "session_id": session_id,
-                        "prompt": "finish while the next frame is partial",
-                    }),
-                    2,
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), started.notified())
-            .await
-            .expect("prompt should reach the releasable provider");
-
-        let status = rpc_request(Method::Status, &serde_json::json!({}), 3);
-        let split = status.len() / 2;
-        writer.write_all(&status.as_bytes()[..split]).await.unwrap();
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while ctx.sessions.has_inflight_turn(session_id) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the first prompt should complete while the status frame is partial");
-        writer.write_all(&status.as_bytes()[split..]).await.unwrap();
-
-        let status_response = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).await.unwrap();
-                let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-                if frame["id"] == 3 {
-                    break frame;
-                }
-            }
-        })
-        .await
-        .expect("the split status request should receive a response");
-        assert!(status_response["error"].is_null());
-        assert!(status_response["result"].is_object());
-
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .expect("listener should stop after the framing regression")
-            .expect("listener task should not panic")
-            .expect("listener should stop cleanly");
     }
 
     #[cfg(windows)]
