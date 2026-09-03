@@ -19156,9 +19156,19 @@ impl Default for SecurityOpsConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let home =
-            UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let zeroclaw_dir = home.join(".zeroclaw");
+        // `default_config_dir()` is the canonical resolution for "where does
+        // an unspecified config live": it honors `ZEROCLAW_CONFIG_DIR`, then
+        // a `HOME` env override, before falling back to `UserDirs`. Calling
+        // it here, instead of duplicating a `UserDirs`-only computation,
+        // means a `Config::default()` constructed under an isolated test or
+        // deployment never resolves to the real machine's `~/.zeroclaw`, and
+        // so cannot become a save target pointing at an operator's populated
+        // config.toml.
+        let zeroclaw_dir = default_config_dir().unwrap_or_else(|_| {
+            let home =
+                UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
+            home.join(".zeroclaw")
+        });
 
         Self {
             data_dir: zeroclaw_dir.join("data"),
@@ -23271,6 +23281,18 @@ impl Config {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| std::ffi::OsStr::new("config.toml"));
         let resolved = zeroclaw_dir.join(file_name);
+        if tokio::fs::try_exists(&resolved).await.with_context(|| {
+            format!(
+                "Failed to check resolved config path {}",
+                resolved.display()
+            )
+        })? {
+            anyhow::bail!(
+                "Config path {} has no parent directory and resolves to {}; refusing to overwrite existing config",
+                self.config_path.display(),
+                resolved.display()
+            );
+        }
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": self.config_path.display().to_string(), "resolved": resolved.display().to_string(), "source": source.as_str()})), "Config path missing parent directory; resolving from runtime environment");
         Ok(resolved)
     }
@@ -31384,6 +31406,84 @@ model = "primary-model"
             unsafe { std::env::remove_var("HOME") };
         }
         let _ = tokio::fs::remove_dir_all(temp_home).await;
+    }
+
+    /// `Config::default()` previously computed its `config_path`/`data_dir`
+    /// from `UserDirs::home_dir()` directly, ignoring `ZEROCLAW_CONFIG_DIR`
+    /// entirely -- unlike every other path-resolution entry point in this
+    /// file. A `Config::default()` built under a `ZEROCLAW_CONFIG_DIR`-isolated
+    /// test or deployment therefore still resolved to the real machine's
+    /// `~/.zeroclaw`.
+    #[test]
+    async fn default_config_honors_zeroclaw_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let custom_dir =
+            std::env::temp_dir().join(format!("zeroclaw_test_custom_{}", uuid::Uuid::new_v4()));
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", &custom_dir);
+
+        let config = Config::default();
+
+        assert_eq!(config.config_path, custom_dir.join("config.toml"));
+        assert_eq!(config.data_dir, custom_dir.join("data"));
+    }
+
+    #[test]
+    async fn save_refuses_to_overwrite_existing_runtime_config_from_bare_path() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("workspace");
+        let resolved_config_path = temp_home.join(".zeroclaw").join("config.toml");
+        let original = "schema_version = 5\n\n[operator_only]\nkeep = true\n";
+        tokio::fs::create_dir_all(resolved_config_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&resolved_config_path, original)
+            .await
+            .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: PathBuf::from("config.toml"),
+            ..Default::default()
+        };
+        let save_result = config.save().await;
+        config.mark_dirty("observability.backend");
+        let save_dirty_result = config.save_dirty().await;
+        let written = tokio::fs::read_to_string(&resolved_config_path)
+            .await
+            .unwrap();
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = tokio::fs::remove_dir_all(temp_home).await;
+
+        assert!(
+            save_result
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to overwrite existing config"),
+        );
+        assert!(
+            save_dirty_result
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to overwrite existing config"),
+        );
+        assert_eq!(written, original);
     }
 
     #[test]
