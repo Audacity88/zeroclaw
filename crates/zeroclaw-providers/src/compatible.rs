@@ -62,6 +62,12 @@ pub struct OpenAiCompatibleModelProvider {
     /// assistant history messages. Some providers reject reasoning fields as
     /// input even though they may return them in responses.
     replay_assistant_reasoning: bool,
+    /// When true, forward runtime-supplied native thinking params as an
+    /// Anthropic-shaped `thinking` object in request bodies and normalize
+    /// gateway thinking responses for replay. Requires a gateway that
+    /// translates between OpenAI Chat Completions and the Anthropic API;
+    /// a non-translating upstream rejects the injected object with HTTP 400.
+    thinking_passthrough: bool,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -426,6 +432,9 @@ pub struct OpenAiCompatibleBuilder {
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
     /// preserves the default (replay enabled).
     replay_assistant_reasoning_override: Option<bool>,
+    /// Set to `true` by [`OpenAiCompatibleBuilder::with_thinking_passthrough`].
+    /// Default `false` leaves requests and response handling unchanged.
+    thinking_passthrough: bool,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -554,6 +563,17 @@ impl OpenAiCompatibleBuilder {
     /// history messages.
     pub fn without_assistant_reasoning_replay(mut self) -> Self {
         self.replay_assistant_reasoning_override = Some(false);
+        self
+    }
+
+    /// Forward Anthropic extended thinking through this provider: inject the
+    /// runtime thinking params as an Anthropic-shaped `thinking` request
+    /// object and normalize gateway thinking responses for replay. Only
+    /// meaningful for gateways that translate between OpenAI Chat
+    /// Completions and the Anthropic API (e.g. LiteLLM); a non-translating
+    /// upstream rejects the injected object with HTTP 400. Off by default.
+    pub fn with_thinking_passthrough(mut self) -> Self {
+        self.thinking_passthrough = true;
         self
     }
 
@@ -691,6 +711,7 @@ impl OpenAiCompatibleBuilder {
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
+            thinking_passthrough: self.thinking_passthrough,
             api_path: self.api_path,
             max_tokens: self.max_tokens,
             models_dev_key: self.models_dev_key,
@@ -730,6 +751,7 @@ impl OpenAiCompatibleModelProvider {
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
+            thinking_passthrough: false,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -1087,6 +1109,54 @@ impl OpenAiCompatibleModelProvider {
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
         (reasoning_content, reasoning)
+    }
+
+    /// Anthropic-shaped `thinking` request object for the given runtime
+    /// params, when [`Self::thinking_passthrough`] is on and the runtime
+    /// supplied native thinking params.
+    ///
+    /// The enabled shape deliberately duplicates the native Anthropic
+    /// provider's `NativeThinkingConfig` serialization
+    /// (`crates/zeroclaw-providers/src/anthropic.rs`): sharing a helper
+    /// would couple the two providers, and the adaptive/`display` variants
+    /// only exist on the native #10542 path — extend here when that lands
+    /// (cross-ref: issue #10530).
+    fn thinking_request_object(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<serde_json::Value> {
+        if !self.thinking_passthrough {
+            return None;
+        }
+        let params = thinking?;
+        Some(serde_json::json!({
+            "thinking": {"type": "enabled", "budget_tokens": params.budget_tokens}
+        }))
+    }
+
+    /// Effective `extra_body` for a request body: the injected `thinking`
+    /// object (when any) merged under the configured `extra_body`, whose
+    /// explicit keys always win. With the flag off or no params supplied,
+    /// this is exactly the configured `extra_body` (byte-identical default).
+    fn request_extra_body(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<serde_json::Value> {
+        let Some(mut merged) = self.thinking_request_object(thinking) else {
+            return self.extra_body.clone();
+        };
+        match self.extra_body.as_ref() {
+            None => Some(merged),
+            Some(extra) if extra.is_object() => {
+                if let (Some(base), Some(over)) = (merged.as_object_mut(), extra.as_object()) {
+                    base.extend(over.clone());
+                }
+                Some(merged)
+            }
+            // Non-object `extra_body` cannot be key-merged; the explicit
+            // config value wins outright (preserving its existing behavior).
+            Some(extra) => Some(extra.clone()),
+        }
     }
 }
 
@@ -2233,6 +2303,7 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let tool_choice = has_tool_entries.then(|| "auto".to_string());
@@ -2250,7 +2321,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            extra_body: self.request_extra_body(thinking),
         }
     }
 
@@ -2261,6 +2332,7 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest<&'a [serde_json::Value]> {
         let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
         NativeChatRequest {
@@ -2274,7 +2346,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice: has_tool_entries.then(|| "auto".to_string()),
             max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            extra_body: self.request_extra_body(thinking),
         }
     }
 
@@ -2288,6 +2360,7 @@ impl OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options_enabled: bool,
         merge: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest {
         // Guard on the converted tools being non-empty (not just the raw
         // input being non-empty): convert_tool_specs_for_model can sanitize
@@ -2317,7 +2390,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            extra_body: self.request_extra_body(thinking),
         }
     }
 
@@ -3236,6 +3309,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             model,
             temperature,
             !merge,
+            // Legacy entry point: carries no `ChatRequest`, so no runtime
+            // thinking params are available to forward.
+            None,
         );
         let mut payload = serde_json::to_value(request)?;
         let tools_count = payload
@@ -3352,6 +3428,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             model,
             temperature,
             !merge,
+            request.thinking,
         );
         let mut payload = serde_json::to_value(native_request)?;
         let tools_count = payload
@@ -3497,6 +3574,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
             request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
+        // `NativeThinkingParams` is `Copy`; captured for both streaming
+        // request branches (tool and tool-less) below.
+        let thinking_owned = request.thinking;
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let options_enabled = options.enabled;
@@ -3537,6 +3617,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     temperature,
                     options_enabled,
                     merge,
+                    thinking_owned,
                 ))
             } else {
                 let messages = effective_messages
@@ -3569,7 +3650,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
-                    extra_body: provider.extra_body.clone(),
+                    extra_body: provider.request_extra_body(thinking_owned),
                 })
             };
 
@@ -4330,6 +4411,7 @@ mod tests {
             Some(0.5),
             true,
             false,
+            None,
         ))
         .unwrap();
 
@@ -4361,6 +4443,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         ))
         .unwrap();
         assert!(
@@ -4418,6 +4501,207 @@ mod tests {
     // "When using `tool_choice`, `tools` must be set."). The request builders
     // must omit `tool_choice` whenever the converted tool list is empty.
     #[test]
+    fn thinking_passthrough_flag_off_never_injects_thinking() {
+        // Flag off = today's behavior exactly, regardless of runtime params.
+        // Byte-identical guarantee, asserted two ways: the request payload
+        // carries no `thinking` key (and is identical with params present or
+        // absent), and the extra_body seam returns the configured extra_body
+        // value unchanged.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let with_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        let without_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert!(
+            with_params.get("thinking").is_none(),
+            "flag-off request must never gain a thinking key; got: {with_params}"
+        );
+        assert_eq!(
+            with_params, without_params,
+            "flag-off requests must be byte-identical whether params are present or not"
+        );
+
+        let extra = serde_json::json!({"top_k": 5});
+        let p_with_extra = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .extra_body(extra.clone())
+            .build();
+        assert_eq!(
+            p_with_extra.request_extra_body(Some(params)),
+            Some(extra),
+            "flag-off extra_body seam must return the configured extra_body unchanged"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_injects_enabled_budget_shape() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "passthrough must inject the Anthropic enabled-budget thinking shape"
+        );
+
+        // Streaming builder mirrors the non-streaming injection.
+        let streaming = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            streaming["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "streaming passthrough must inject the same Anthropic thinking shape"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_without_params_sends_no_thinking() {
+        // Flag on but the runtime supplied no native thinking params: nothing
+        // to forward, request must stay free of a thinking key.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req =
+            p.build_native_tool_chat_request(&messages, None, "test-model", None, false, None);
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("thinking").is_none(),
+            "params-None request must not carry a thinking key; got: {value}"
+        );
+        assert!(p.request_extra_body(None).is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_extra_body_keys_win_over_injected_thinking() {
+        // Explicit operator `extra_body` always wins: an extra_body `thinking`
+        // key must fully shadow the injected object.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
+            .build();
+
+        let resolved = p.request_extra_body(Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "off"}),
+            "explicit extra_body thinking key must win over the injected object"
+        );
+        assert!(
+            resolved.get("budget_tokens").is_none(),
+            "injected budget_tokens must not leak to the top level"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_merges_alongside_unrelated_extra_body_keys() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 4_096,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"top_k": 5}))
+            .build();
+
+        let resolved = p.request_extra_body(Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 4_096}),
+            "injected thinking object must ride alongside unrelated extra_body keys"
+        );
+        assert_eq!(resolved["top_k"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn thinking_passthrough_non_object_extra_body_wins_outright() {
+        // A non-object extra_body cannot be key-merged; the explicit config
+        // value wins outright. (Serializing it would fail at the existing
+        // serde(flatten) boundary — unchanged pre-existing behavior — so
+        // this pins the seam, not the wire.)
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!("scalar"))
+            .build();
+
+        assert_eq!(
+            p.request_extra_body(Some(params)),
+            Some(serde_json::json!("scalar")),
+            "non-object extra_body must win outright over the injected thinking object"
+        );
+    }
+
+    #[test]
     fn build_native_tool_chat_request_omits_tool_choice_when_no_tools() {
         let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
         let messages = vec![ChatMessage::user("hello")];
@@ -4428,7 +4712,8 @@ mod tests {
         // directly.
 
         // None tools → no tool_choice key.
-        let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false);
+        let req =
+            p.build_native_tool_chat_request(&messages, None, "test-model", None, false, None);
         let value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("tool_choice").is_none(),
@@ -4436,8 +4721,14 @@ mod tests {
         );
 
         // Empty tools vec → still no tool_choice key.
-        let req_empty =
-            p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false);
+        let req_empty = p.build_native_tool_chat_request(
+            &messages,
+            Some(vec![]),
+            "test-model",
+            None,
+            false,
+            None,
+        );
         let value_empty = serde_json::to_value(&req_empty).unwrap();
         assert!(
             value_empty.get("tool_choice").is_none(),
@@ -4459,8 +4750,14 @@ mod tests {
                 parameters: std::sync::Arc::new(serde_json::json!({})),
             },
         }];
-        let req =
-            p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            Some(tools),
+            "test-model",
+            None,
+            false,
+            None,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value.get("tool_choice").and_then(serde_json::Value::as_str),
@@ -4493,7 +4790,8 @@ mod tests {
             },
         }];
 
-        let req = p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false);
+        let req =
+            p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false, None);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -4518,7 +4816,7 @@ mod tests {
             .build();
         let messages = vec![ChatMessage::user("hello")];
 
-        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false);
+        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false, None);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -7615,6 +7913,7 @@ mod tests {
             "deepseek-v4-flash",
             Some(0.7),
             true,
+            None,
         );
         let value = serde_json::to_value(&request).unwrap();
         let first_message = &value["messages"][0];
@@ -8333,6 +8632,7 @@ mod tests {
             "openai/gpt-oss-120b",
             None,
             true,
+            None,
         );
         let default_message = &default_request.messages[0];
         assert_eq!(default_message.role, "assistant");
@@ -8368,6 +8668,7 @@ mod tests {
             "openai/gpt-oss-120b",
             None,
             true,
+            None,
         );
         let groq_message = &groq_request.messages[0];
         assert_eq!(groq_message.role, "assistant");
