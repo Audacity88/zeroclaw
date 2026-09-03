@@ -1093,13 +1093,45 @@ impl OpenAiCompatibleModelProvider {
             .or_else(|| value.get("reasoning").and_then(serde_json::Value::as_str))
     }
 
-    fn assistant_reasoning_pair_for_replay(
-        &self,
-        value: &serde_json::Value,
-    ) -> (Option<String>, Option<String>) {
+    /// Replay payload for an outbound assistant history message.
+    ///
+    /// Flag off: today's behavior — the stored reasoning strings replay
+    /// verbatim. Flag on: history reasoning is expected as newline-delimited
+    /// signed-JSON envelope lines (the capture format); signed lines
+    /// reconstruct a `thinking_blocks` array and suppress the string fields.
+    /// Unsigned or malformed history sends nothing — blocks are never
+    /// fabricated, and a bare reasoning string is exactly what translating
+    /// gateways reject. `replay_assistant_reasoning = false` still wins:
+    /// nothing at all.
+    fn assistant_thinking_replay(&self, value: &serde_json::Value) -> AssistantThinkingReplay {
         if !self.replay_assistant_reasoning {
-            return (None, None);
+            return AssistantThinkingReplay::none();
         }
+        if !self.thinking_passthrough {
+            let (reasoning_content, reasoning) = Self::assistant_reasoning_pair(value);
+            return AssistantThinkingReplay {
+                reasoning_content,
+                reasoning,
+                thinking_blocks: None,
+            };
+        }
+        let Some(reasoning) = Self::assistant_reasoning_value(value) else {
+            return AssistantThinkingReplay::none();
+        };
+        match Self::reasoning_lines_to_thinking_blocks(reasoning) {
+            Some(blocks) => AssistantThinkingReplay {
+                reasoning_content: None,
+                reasoning: None,
+                thinking_blocks: Some(blocks),
+            },
+            // Unsigned/malformed: documented no-op.
+            None => AssistantThinkingReplay::none(),
+        }
+    }
+
+    /// Field-level reasoning pair, ignoring the replay gate. Shared by the
+    /// flag-off branch of [`Self::assistant_thinking_replay`].
+    fn assistant_reasoning_pair(value: &serde_json::Value) -> (Option<String>, Option<String>) {
         let reasoning_content = value
             .get("reasoning_content")
             .and_then(serde_json::Value::as_str)
@@ -1109,6 +1141,34 @@ impl OpenAiCompatibleModelProvider {
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
         (reasoning_content, reasoning)
+    }
+
+    /// Reconstruct `thinking_blocks` from newline-delimited signed-JSON
+    /// envelope lines. All-or-nothing: every non-empty line must parse as an
+    /// envelope with a non-empty signature, otherwise `None` (the caller
+    /// sends nothing rather than a partial replay). Mirrors the native
+    /// Anthropic provider's replay parsing
+    /// (`crates/zeroclaw-providers/src/anthropic.rs`) — duplicate-with-comment
+    /// per the #10530 spec boundary.
+    fn reasoning_lines_to_thinking_blocks(reasoning: &str) -> Option<Vec<serde_json::Value>> {
+        let mut blocks = Vec::new();
+        for line in reasoning.split('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
+            let thinking = parsed.get("thinking").and_then(serde_json::Value::as_str)?;
+            let signature = parsed
+                .get("signature")
+                .and_then(serde_json::Value::as_str)
+                .filter(|signature| !signature.is_empty())?;
+            blocks.push(serde_json::json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature,
+            }));
+        }
+        (!blocks.is_empty()).then_some(blocks)
     }
 
     /// Anthropic-shaped `thinking` request object for the given runtime
@@ -1589,6 +1649,24 @@ fn ensure_reasoning_effort_none(payload: &mut serde_json::Value) -> bool {
     true
 }
 
+/// Replay fields for an outbound assistant history message — see
+/// [`OpenAiCompatibleModelProvider::assistant_thinking_replay`].
+struct AssistantThinkingReplay {
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    thinking_blocks: Option<Vec<serde_json::Value>>,
+}
+
+impl AssistantThinkingReplay {
+    fn none() -> Self {
+        Self {
+            reasoning_content: None,
+            reasoning: None,
+            thinking_blocks: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct NativeMessage {
     role: String,
@@ -1604,6 +1682,11 @@ struct NativeMessage {
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning")]
     reasoning: Option<String>,
+    /// Reconstructed Anthropic thinking blocks for assistant history replay
+    /// under `thinking_passthrough` (signed envelope lines only). Never
+    /// populated alongside the string reasoning fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
     /// Tool name for `role: "tool"` messages. Groq native tool calling
     /// requires this field on every tool-result message; omitting it causes
     /// HTTP 400 "Tools should have a name!"./
@@ -2599,16 +2682,16 @@ impl OpenAiCompatibleModelProvider {
                                 .then(|| MessageContent::Text(String::new()))
                         });
 
-                    let (reasoning_content, reasoning) =
-                        self.assistant_reasoning_pair_for_replay(&value);
+                    let replay = self.assistant_thinking_replay(&value);
 
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
-                        reasoning_content,
-                        reasoning,
+                        reasoning_content: replay.reasoning_content,
+                        reasoning: replay.reasoning,
+                        thinking_blocks: replay.thinking_blocks,
                         name: None,
                     };
                 }
@@ -2627,16 +2710,16 @@ impl OpenAiCompatibleModelProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
-                    let (reasoning_content, reasoning) =
-                        self.assistant_reasoning_pair_for_replay(&value);
+                    let replay = self.assistant_thinking_replay(&value);
 
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
                         tool_calls: None,
-                        reasoning_content,
-                        reasoning,
+                        reasoning_content: replay.reasoning_content,
+                        reasoning: replay.reasoning,
+                        thinking_blocks: replay.thinking_blocks,
                         name: None,
                     };
                 }
@@ -2707,6 +2790,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content: None,
                         reasoning: None,
+                        thinking_blocks: None,
                         name: tool_name,
                     };
                 }
@@ -2723,6 +2807,7 @@ impl OpenAiCompatibleModelProvider {
                     tool_calls: None,
                     reasoning_content: None,
                     reasoning: None,
+                    thinking_blocks: None,
                     name: None,
                 }
             })
@@ -5756,6 +5841,7 @@ mod tests {
                 tool_calls: None,
                 reasoning_content: None,
                 reasoning: None,
+                thinking_blocks: None,
                 name: None,
             }],
             temperature: Some(0.7),
@@ -7117,6 +7203,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: Some("shell".to_string()),
         };
         let json = serde_json::to_string(&tool_with_name).unwrap();
@@ -7132,6 +7219,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&tool_without_name).unwrap();
@@ -7147,6 +7235,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&assistant_msg).unwrap();
@@ -8783,6 +8872,185 @@ mod tests {
     }
 
     #[test]
+    fn thinking_passthrough_replay_reconstructs_signed_blocks() {
+        // Flag on + signed envelope history (2a capture format) -> outbound
+        // thinking_blocks; string fields suppressed.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"thought one\",\"signature\":\"sig1\"}\n{\"thinking\":\"thought two\",\"signature\":\"sig2\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native.len(), 1);
+        let message = &native[0];
+        assert_eq!(
+            message.reasoning_content, None,
+            "signed replay must suppress the reasoning_content string"
+        );
+        assert_eq!(message.reasoning, None);
+        let blocks = message
+            .thinking_blocks
+            .as_ref()
+            .expect("signed history must reconstruct thinking_blocks");
+        assert_eq!(
+            blocks,
+            &vec![
+                serde_json::json!({"type": "thinking", "thinking": "thought one", "signature": "sig1"}),
+                serde_json::json!({"type": "thinking", "thinking": "thought two", "signature": "sig2"}),
+            ],
+            "reconstructed blocks must be Anthropic content-block shaped"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_signature_only_history_round_trips_probe_shape() {
+        // Live-probe fixture (slice 2b): 2a captures a signature-only block;
+        // replay must reconstruct exactly what the gateway sent.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signature_only = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"\",\"signature\":\"CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ==\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signature_only.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        let blocks = native[0]
+            .thinking_blocks
+            .as_ref()
+            .expect("signature-only history must reconstruct thinking_blocks");
+        assert_eq!(
+            blocks,
+            &vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            })],
+            "signature-only capture must round-trip to the observed gateway block shape"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_unsigned_history_is_noop() {
+        // Unsigned envelope (signature "") and plain unparseable text both
+        // send nothing: blocks are never fabricated, and a bare string is
+        // exactly what translating gateways reject.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content": "a", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"\"}"}"#
+                    .to_string(),
+            ),
+            ChatMessage::assistant(
+                r#"{"content": "b", "reasoning_content": "plain streamed reasoning"}"#.to_string(),
+            ),
+        ];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native.len(), 2);
+        for message in &native {
+            assert_eq!(
+                message.reasoning_content, None,
+                "unsigned history replays nothing"
+            );
+            assert_eq!(message.reasoning, None);
+            assert!(message.thinking_blocks.is_none(), "no fabricated blocks");
+        }
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_mixed_lines_noop_entirely() {
+        // All-or-nothing: one unsigned line in signed history voids the
+        // replay rather than sending a partial block sequence.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let mixed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"signed\",\"signature\":\"sig\"}\n{\"thinking\":\"unsigned\",\"signature\":\"\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(mixed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert!(native[0].thinking_blocks.is_none());
+        assert_eq!(native[0].reasoning_content, None);
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_flag_off_replays_strings_verbatim() {
+        // Flag off = today's behavior: strings replay, no blocks field.
+        let provider = make_model_provider("gateway", "https://example.com", None);
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some(r#"{"thinking":"t","signature":"sig"}"#),
+            "flag-off replay must pass the stored string through untouched"
+        );
+        assert!(native[0].thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_replay_override_wins_over_flag() {
+        // replay_assistant_reasoning = false wins under thinking_passthrough:
+        // providers that reject reasoning input still get nothing.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .without_assistant_reasoning_replay()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native[0].reasoning_content, None);
+        assert_eq!(native[0].reasoning, None);
+        assert!(native[0].thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_blocks_serialize_top_level() {
+        // The reconstructed blocks serialize as a top-level assistant
+        // message field for the gateway to translate.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        let value = serde_json::to_value(&native[0]).unwrap();
+        assert_eq!(
+            value["thinking_blocks"],
+            serde_json::json!([{"type": "thinking", "thinking": "t", "signature": "sig"}]),
+            "thinking_blocks must serialize at the assistant message top level"
+        );
+    }
+
+    #[test]
     fn thinking_passthrough_capture_signature_only_block_survives() {
         // Live-probe fixture (slice 2b, .worktree/probe-truefoundry-2026-09-03.md):
         // TrueFoundry returns thinking blocks with EMPTY text but a valid
@@ -9181,6 +9449,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&msg_without).unwrap();
@@ -9196,6 +9465,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&msg_with).unwrap();
