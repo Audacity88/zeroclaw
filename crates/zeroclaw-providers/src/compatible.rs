@@ -4751,6 +4751,7 @@ mod tests {
         // value unchanged.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 8_192,
+            display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -4801,6 +4802,7 @@ mod tests {
     fn thinking_passthrough_injects_enabled_budget_shape() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 8_192,
+            display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -4873,6 +4875,7 @@ mod tests {
         // key must fully shadow the injected object.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 8_192,
+            display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -4899,6 +4902,7 @@ mod tests {
     fn thinking_passthrough_merges_alongside_unrelated_extra_body_keys() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 4_096,
+            display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -4926,6 +4930,7 @@ mod tests {
         // this pins the seam, not the wire.)
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 8_192,
+            display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
