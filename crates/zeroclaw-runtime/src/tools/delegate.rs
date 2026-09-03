@@ -8695,7 +8695,7 @@ mod tests {
         assert!(result.success, "got: {:?}", result.error);
     }
 
-    // ── bounded sub-delegation (#10534) ──────────────────────────────────
+    // ── bounded sub-delegation gating ─────────────────────────────────────
 
     /// Loop mock for the delegating parent of a bounded sub-delegation: the
     /// first provider call emits one `delegate` tool call, and once a tool
@@ -8930,10 +8930,10 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_delegate_stripped_when_target_policy_forbids_delegation() {
-        // Regression guard for #10534's default: a bounded target whose risk
+        // Regression guard for the bounded-gating default: a target whose risk
         // profile keeps the default `delegation_policy = forbidden` never sees
         // a delegate tool, even when the parent registry carries one. The
-        // zero-config behavior stays identical to pre-#10534.
+        // zero-config behavior stays identical to the previous release.
         let temp = TempDir::new().unwrap();
         let config = bounded_subdelegation_fixture(
             &temp,
@@ -8967,7 +8967,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_delegate_retained_when_target_policy_allows_subdelegation() {
-        // #10534 behavioral option: when the bounded target's own risk profile
+        // Behavioral option: when the bounded target's own risk profile
         // sets `delegation_policy = allow`, a delegate tool joins the bounded
         // set and a one-level sub-delegation succeeds end to end.
         let temp = TempDir::new().unwrap();
