@@ -133,6 +133,13 @@ pub struct DelegateTool {
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
+    /// Binding delegation-depth ceiling for this tool's owner and its whole
+    /// subtree. Source of truth: the owning agent's runtime profile
+    /// `max_delegation_depth`. Each constructed sub-delegate tool carries the
+    /// owner's effective ceiling tightened (min) with the next target's own
+    /// profile cap, so a parent's cap binds its entire subtree and a chain
+    /// can only tighten. `None` resolves per use in `effective_max_depth`.
+    max_delegation_depth: Option<u32>,
     /// Parent tool registry for agentic sub-agents.
     parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Runtime adapter used to build target-owned registries for independent
@@ -273,6 +280,7 @@ impl DelegateTool {
             global_credential,
             provider_runtime_options,
             depth: 0,
+            max_delegation_depth: None,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             runtime: None,
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -321,6 +329,7 @@ impl DelegateTool {
             global_credential,
             provider_runtime_options,
             depth,
+            max_delegation_depth: None,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             runtime: None,
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -893,6 +902,44 @@ impl DelegateTool {
             .unwrap_or(3)
     }
 
+    /// The binding delegation-depth ceiling for this tool's owner.
+    ///
+    /// Source of truth: the owning agent's runtime profile
+    /// `max_delegation_depth`. Sub-delegate tools carry that ceiling tightened
+    /// with each target's own profile cap (`tightened_max_depth`), so a
+    /// parent's cap binds its entire subtree and a chain can only tighten.
+    /// When no ceiling was carried (root tools and bare test constructors),
+    /// the owner's own profile is resolved here; without a resolvable owner,
+    /// the pre-chain fallback applies (the target's profile cap, default 3),
+    /// which keeps legacy `with_depth` constructors on their historical
+    /// semantics.
+    fn effective_max_depth(&self, target_runtime_profile: &str) -> u32 {
+        if let Some(cap) = self.max_delegation_depth {
+            return cap;
+        }
+        if let Some(config) = self.root_config.as_deref()
+            && !self.caller_alias.is_empty()
+        {
+            return config
+                .runtime_profile_for_agent(&self.caller_alias)
+                .map(|profile| profile.max_delegation_depth)
+                .filter(|&cap| cap > 0)
+                .unwrap_or(3);
+        }
+        self.resolve_max_depth(target_runtime_profile)
+    }
+
+    /// The ceiling a constructed sub-delegate tool carries: this tool's
+    /// effective ceiling tightened (min) by the next target's own profile
+    /// cap. A parent's cap therefore binds its whole subtree, while a target
+    /// with a stricter profile tightens the chain from its level down.
+    fn tightened_max_depth(&self, target_runtime_profile: &str) -> u32 {
+        u32::min(
+            self.effective_max_depth(target_runtime_profile),
+            self.resolve_max_depth(target_runtime_profile),
+        )
+    }
+
     /// Resolve per-call delegation timeout from the named runtime profile.
     fn resolve_delegation_timeout(&self, runtime_profile: &str) -> Option<u64> {
         if runtime_profile.is_empty() {
@@ -1331,7 +1378,7 @@ impl DelegateTool {
         };
 
         // Resolve profile references
-        let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
+        let max_depth = self.effective_max_depth(&agent_config.runtime_profile);
         let (legacy_provider_type, credential, _, temperature) =
             self.resolve_brain(&agent_config.model_provider);
         let agentic = self.resolve_agentic(&agent_config.runtime_profile);
@@ -1522,7 +1569,7 @@ impl DelegateTool {
             }
         };
 
-        let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
+        let max_depth = self.effective_max_depth(&agent_config.runtime_profile);
         if self.depth >= max_depth {
             return Ok(ToolResult {
                 success: false,
@@ -1638,11 +1685,13 @@ impl DelegateTool {
         let security = target_policy;
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
-        // Monotonic descent: was `self.depth` (verbatim copy), which left the
-        // `self.depth >= max_depth` check inert — a chain of background delegations never
-        // escalated depth. Matches the documented `with_depth(parent.depth + 1)` intent.
-        // Behavior change: deep background re-delegation now saturates at `max_delegation_depth`.
-        let depth = self.depth + 1;
+        // Depth ownership: a logical hop increments depth exactly once, at the
+        // target-bound sub-delegate tool built in the bounded assembly. This
+        // wrapper re-executes the SAME hop, so it inherits `depth` and the
+        // carried depth ceiling verbatim; incrementing here double-counted
+        // background hops and refused second hops one level early.
+        let depth = self.depth;
+        let max_delegation_depth = self.max_delegation_depth;
         let parent_tools = Arc::clone(&self.parent_tools);
         let runtime = self.runtime.clone();
         let multimodal_config = self.multimodal_config.clone();
@@ -1676,6 +1725,7 @@ impl DelegateTool {
                     global_credential,
                     provider_runtime_options,
                     depth,
+                    max_delegation_depth,
                     parent_tools,
                     runtime,
                     multimodal_config,
@@ -1893,10 +1943,12 @@ impl DelegateTool {
             let security = Arc::clone(&self.security);
             let global_credential = self.global_credential.clone();
             let provider_runtime_options = self.provider_runtime_options.clone();
-            // Monotonic descent on the parallel path — was `self.depth` (verbatim copy),
-            // leaving the `>= max_depth` check inert (see the background path above).
-            // Behavior change: deep parallel re-delegation now saturates at `max_delegation_depth`.
-            let depth = self.depth + 1;
+            // Depth ownership on the parallel path mirrors the background
+            // wrapper: the fan-out task re-executes the SAME hop, so it
+            // inherits `depth` and the carried ceiling verbatim; the single
+            // increment lives in the bounded sub-delegate construction.
+            let depth = self.depth;
+            let max_delegation_depth = self.max_delegation_depth;
             let parent_tools = Arc::clone(&self.parent_tools);
             let runtime = self.runtime.clone();
             let multimodal_config = self.multimodal_config.clone();
@@ -1928,6 +1980,7 @@ impl DelegateTool {
                         global_credential,
                         provider_runtime_options,
                         depth,
+                        max_delegation_depth,
                         parent_tools,
                         runtime,
                         multimodal_config,
@@ -2722,10 +2775,13 @@ impl DelegateTool {
                 // Target-bound delegate tool: its delegation calls must resolve
                 // `delegation_policy`, reachability, and the advertised roster
                 // from the SUB-agent's identity (alias + policy), never the
-                // delegating parent's. Depth is one below this tool's owner,
-                // matching the documented `with_depth(parent.depth + 1)`
-                // monotonic-descent contract; all other fields are inherited
-                // environment (agents map, root config, credentials, profiles).
+                // delegating parent's. Depth ownership: this construction is
+                // the single site that increments depth for a logical hop
+                // (`self.depth + 1`); the background/parallel wrappers inherit
+                // their depth verbatim. The carried ceiling is this tool's
+                // effective ceiling tightened (min) by the target's own
+                // profile cap, so a parent's cap binds the whole subtree
+                // (source of truth: `effective_max_depth`).
                 let sub_delegate_tool = (target_may_subdelegate
                     && self.security.is_tool_allowed(Self::NAME)
                     && Self::delegate_admits_with_mcp(&tool_policy, Self::NAME))
@@ -2736,6 +2792,9 @@ impl DelegateTool {
                         global_credential: self.global_credential.clone(),
                         provider_runtime_options: self.provider_runtime_options.clone(),
                         depth: self.depth + 1,
+                        max_delegation_depth: Some(
+                            self.tightened_max_depth(&agent_config.runtime_profile),
+                        ),
                         parent_tools: Arc::new(RwLock::new(bounded_base_tools.clone())),
                         runtime: self.runtime.clone(),
                         multimodal_config: self.multimodal_config.clone(),
@@ -8697,6 +8756,14 @@ mod tests {
 
     // ── bounded sub-delegation gating ─────────────────────────────────────
 
+    /// How the mock's emitted `delegate` call reaches the sub-agent.
+    #[derive(Clone, Copy)]
+    enum MockDelegationTransport {
+        Sync,
+        Background,
+        Parallel,
+    }
+
     /// Loop mock for the delegating parent of a bounded sub-delegation: the
     /// first provider call emits one `delegate` tool call, and once a tool
     /// result is in history the final text closes the loop. The tool-result
@@ -8704,13 +8771,27 @@ mod tests {
     /// delegation returned to the delegating loop.
     struct DelegateCallThenFinalModelProvider {
         target_agent: &'static str,
+        transport: MockDelegationTransport,
         tool_message: std::sync::Mutex<Option<String>>,
     }
 
     impl DelegateCallThenFinalModelProvider {
         fn new(target_agent: &'static str) -> Self {
+            Self::with_transport(target_agent, MockDelegationTransport::Sync)
+        }
+
+        fn new_background(target_agent: &'static str) -> Self {
+            Self::with_transport(target_agent, MockDelegationTransport::Background)
+        }
+
+        fn new_parallel(target_agent: &'static str) -> Self {
+            Self::with_transport(target_agent, MockDelegationTransport::Parallel)
+        }
+
+        fn with_transport(target_agent: &'static str, transport: MockDelegationTransport) -> Self {
             Self {
                 target_agent,
+                transport,
                 tool_message: std::sync::Mutex::new(None),
             }
         }
@@ -8747,16 +8828,27 @@ mod tests {
                     reasoning_content: None,
                 });
             }
+            let arguments = match self.transport {
+                MockDelegationTransport::Sync => serde_json::json!({
+                    "agent": self.target_agent,
+                    "prompt": "subtask from parent loop"
+                }),
+                MockDelegationTransport::Background => serde_json::json!({
+                    "agent": self.target_agent,
+                    "prompt": "subtask from parent loop",
+                    "background": true
+                }),
+                MockDelegationTransport::Parallel => serde_json::json!({
+                    "parallel": [self.target_agent],
+                    "prompt": "subtask from parent loop"
+                }),
+            };
             Ok(ChatResponse {
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),
                     name: DelegateTool::NAME.to_string(),
-                    arguments: serde_json::json!({
-                        "agent": self.target_agent,
-                        "prompt": "subtask from parent loop"
-                    })
-                    .to_string(),
+                    arguments: arguments.to_string(),
                     extra_content: None,
                 }],
                 usage: None,
@@ -8777,6 +8869,15 @@ mod tests {
         fn alias(&self) -> &str {
             "DelegateCallThenFinalModelProvider"
         }
+    }
+
+    /// Tool results reach the loop as a JSON envelope; decode the content
+    /// field when present so assertions see the text with real quotes.
+    fn decoded_tool_message(tool_message: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(tool_message)
+            .ok()
+            .and_then(|envelope| envelope["content"].as_str().map(str::to_string))
+            .unwrap_or_else(|| tool_message.to_string())
     }
 
     /// Local OpenAI-compatible chat server serving the scripted responses in
@@ -9062,12 +9163,7 @@ mod tests {
         let tool_message = provider
             .tool_message()
             .expect("the refusal must be fed back to middle");
-        // The loop hands tool results back as a JSON envelope; decode it when
-        // present so the assertion sees the refusal text with real quotes.
-        let refusal = serde_json::from_str::<serde_json::Value>(&tool_message)
-            .ok()
-            .and_then(|envelope| envelope["content"].as_str().map(str::to_string))
-            .unwrap_or_else(|| tool_message.clone());
+        let refusal = decoded_tool_message(&tool_message);
         assert!(
             refusal.contains("not reachable from \"middle\""),
             "refusal must resolve the caller as the sub-agent: {tool_message:?}"
@@ -9141,6 +9237,335 @@ mod tests {
         assert!(
             tool_message.contains("leaf finished"),
             "leaf must complete after the refused hop: {tool_message:?}"
+        );
+    }
+
+    /// Depth-matrix config: per-agent `(alias, delegates, runtime_profile)`
+    /// with delegation allowed for every agent and the shared custom provider
+    /// pointing at `nested_provider_uri`. Runtime profile caps are explicit
+    /// so tests can pin parent and child depth ceilings independently.
+    fn bounded_depth_matrix_fixture(
+        temp_dir: &TempDir,
+        nested_provider_uri: &str,
+        agents: &[(&str, &[&str], &str)],
+        runtime_profiles: &[(&str, u32)],
+    ) -> Arc<Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let mut config = Config {
+            data_dir: temp_dir.path().join("data"),
+            config_path: temp_dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(nested_provider_uri.to_string()),
+                    model: Some("test-model".to_string()),
+                    native_tools: Some(true),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        for (profile, cap) in runtime_profiles {
+            config.runtime_profiles.insert(
+                (*profile).to_string(),
+                RuntimeProfileConfig {
+                    agentic: true,
+                    max_delegation_depth: *cap,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+        }
+        for (alias, delegates, runtime_profile) in agents {
+            config.risk_profiles.insert(
+                (*alias).to_string(),
+                RiskProfileConfig {
+                    delegation_policy: DelegationPolicy {
+                        mode: DelegationMode::Allow,
+                    },
+                    ..RiskProfileConfig::default()
+                },
+            );
+            config.agents.insert(
+                (*alias).to_string(),
+                AliasedAgentConfig {
+                    risk_profile: (*alias).into(),
+                    runtime_profile: (*runtime_profile).into(),
+                    model_provider: "custom.local".into(),
+                    delegates: delegates
+                        .iter()
+                        .map(|target| DelegateTargetConfig::bounded(*target))
+                        .collect(),
+                    delegate_same_risk_profile: false,
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn bounded_depth_cap_parent_binds_subtree_against_looser_child_profile() {
+        // Parent runtime profile caps delegation at 1 while the child's own
+        // profile allows 8. The parent's cap must bind its whole subtree:
+        // hop one succeeds, and the child's delegation attempt is refused
+        // with the depth error instead of riding the child's looser cap.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("unreachable").await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap1"),
+                ("middle", &["leaf"], "cap8"),
+                ("leaf", &[], "cap8"),
+            ],
+            &[("cap1", 1), ("cap8", 8)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "one hop only",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the refused second hop must never contact leaf's provider"
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("the depth refusal must be fed back to middle");
+        let refusal = decoded_tool_message(&tool_message);
+        assert!(
+            refusal.contains("Delegation depth limit reached (1/1)"),
+            "second hop must be refused by the parent's binding cap: {tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_depth_cap_tightens_to_stricter_child_profile() {
+        // Inverse matrix: the parent allows 8 but the child's own profile
+        // caps at 1. The carried ceiling must tighten (min), not widen (max):
+        // hop one succeeds, the child's delegation attempt is refused.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("unreachable").await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap8"),
+                ("middle", &["leaf"], "cap1"),
+                ("leaf", &[], "cap1"),
+            ],
+            &[("cap1", 1), ("cap8", 8)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "one hop only",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the refused second hop must never contact leaf's provider"
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("the depth refusal must be fed back to middle");
+        let refusal = decoded_tool_message(&tool_message);
+        assert!(
+            refusal.contains("Delegation depth limit reached (1/1)"),
+            "second hop must be refused by the child's tighter cap: {tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_depth_background_second_hop_succeeds_at_limit_two() {
+        // Depth must increment exactly once per logical hop. With
+        // max_delegation_depth = 2, a two-hop chain whose SECOND hop is
+        // background must succeed (previously the background wrapper
+        // double-counted depth and refused the hop before it ran). The
+        // third hop is still refused at the correct depth (2/2).
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_bounded_bg_depth_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_leaf_bg",
+                serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap2"),
+                ("middle", &["leaf"], "cap2"),
+                ("leaf", &["deep"], "cap2"),
+                ("deep", &[], "cap2"),
+            ],
+            &[("cap2", 2)],
+        );
+        let tool = bounded_subdelegation_tool(&config).with_workspace_dir(workspace.clone());
+        let provider = DelegateCallThenFinalModelProvider::new_background("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "background second hop",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        // The background task's id reached middle's loop in the tool result.
+        let tool_message = provider
+            .tool_message()
+            .expect("the background task receipt must be fed back to middle");
+        let task_id = decoded_tool_message(&tool_message)
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .map(str::trim)
+            .map(str::to_string)
+            .expect("background delegation must report a task_id");
+
+        let waited = wait_for_terminal_background_result(&workspace, &task_id).await;
+        assert_eq!(
+            waited.status,
+            BackgroundTaskStatus::Completed,
+            "the background second hop must succeed: {waited:?}"
+        );
+        assert!(
+            waited
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("leaf finished"),
+            "leaf's turn must run to completion in the background task: {waited:?}"
+        );
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "leaf's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("Delegation depth limit reached (2/2)"),
+            "leaf's own delegation attempt must be refused at the correct depth: {:?}",
+            bodies[1]
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn bounded_depth_parallel_second_hop_succeeds_at_limit_two() {
+        // Same contract as the background case, for the parallel fan-out
+        // path: with max_delegation_depth = 2 the parallel second hop must
+        // succeed and the third hop must be refused at depth (2/2).
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_leaf_par",
+                serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap2"),
+                ("middle", &["leaf"], "cap2"),
+                ("leaf", &["deep"], "cap2"),
+                ("deep", &[], "cap2"),
+            ],
+            &[("cap2", 2)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new_parallel("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "parallel second hop",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        // Parallel fan-out blocks until every child settles, so leaf's
+        // aggregated result is already in middle's captured tool message.
+        let tool_message = provider
+            .tool_message()
+            .expect("leaf's parallel result must be fed back to middle");
+        let aggregated = decoded_tool_message(&tool_message);
+        assert!(
+            aggregated.contains("leaf finished"),
+            "the parallel second hop must succeed: {tool_message:?}"
+        );
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "leaf's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("Delegation depth limit reached (2/2)"),
+            "leaf's own delegation attempt must be refused at the correct depth: {:?}",
+            bodies[1]
         );
     }
 
