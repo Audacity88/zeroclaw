@@ -8783,6 +8783,46 @@ mod tests {
     }
 
     #[test]
+    fn thinking_passthrough_capture_signature_only_block_survives() {
+        // Live-probe fixture (slice 2b, .worktree/probe-truefoundry-2026-09-03.md):
+        // TrueFoundry returns thinking blocks with EMPTY text but a valid
+        // signature. These must survive capture — a text-only gate would drop
+        // them and break replay (the same bug #10542 fixed for the native
+        // provider's signature-only blocks).
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("signature-only block must be captured");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            }),
+            "signature-only blocks (empty thinking text) must survive capture intact"
+        );
+    }
+
+    #[test]
     fn thinking_passthrough_capture_parses_gateway_thinking_blocks_json() {
         // End-to-end through the response envelope: a gateway response whose
         // message carries `thinking_blocks` deserializes into the raw field
