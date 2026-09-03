@@ -224,13 +224,19 @@ fn anthropic_beta_features(is_oauth: bool, thinking_display_beta: bool) -> Optio
 /// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
 /// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
 /// require `adaptive`; budget-based models require `enabled`.
+///
+/// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
+/// same style so gateway requests match the native provider's shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicThinkingStyle {
+pub(crate) enum AnthropicThinkingStyle {
     Budget,
     Adaptive,
 }
 
-fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+/// Substring matching on purpose: gateway model IDs may carry routing
+/// prefixes (`claude-group/claude-opus-4-7`) that must resolve to the same
+/// style as the bare model name.
+pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
     if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
         AnthropicThinkingStyle::Adaptive
     } else {
