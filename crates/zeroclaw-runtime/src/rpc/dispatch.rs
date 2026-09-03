@@ -1389,12 +1389,12 @@ impl RpcDispatcher {
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
-        if resuming && matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-            if self.ctx.sessions.get_agent(&session_id).await.is_some()
-                || self.ctx.sessions.has_inflight_turn(&session_id)
-            {
-                return Err(rpc_err(SESSION_BUSY, "Session already active"));
-            }
+        if resuming
+            && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            && (self.ctx.sessions.get_agent(&session_id).await.is_some()
+                || self.ctx.sessions.has_inflight_turn(&session_id))
+        {
+            return Err(rpc_err(SESSION_BUSY, "Session already active"));
         }
 
         // Validate the durable owner before consuming a checkpoint, including
@@ -2918,17 +2918,14 @@ impl RpcDispatcher {
             }
             let store_for_load = store.clone();
             let session_id_for_load = req.session_id.clone();
-            match run_blocking_rpc(
+            if let Some(data) = run_blocking_rpc(
                 move || store_for_load.load_session(&session_id_for_load),
                 "Failed to load ACP session messages",
             )
             .await?
             {
-                Some(data) => {
-                    acp_session_found = true;
-                    messages = conversation_message_entries(&data.messages);
-                }
-                None => {}
+                acp_session_found = true;
+                messages = conversation_message_entries(&data.messages);
             }
         }
 
