@@ -308,7 +308,7 @@ impl AcpSessionStore {
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or_else(|| anyhow::anyhow!("unknown ACP session: {session_uuid}"))?;
+            .ok_or_else(|| anyhow::Error::msg(format!("unknown ACP session: {session_uuid}")))?;
         let snapshot_max: i64 = conn.query_row(
             "SELECT COALESCE(MAX(id), 0) FROM acp_messages WHERE session_id = ?1",
             params![session_id],
@@ -334,12 +334,12 @@ impl AcpSessionStore {
             || state.next_entry_offset == Some(0)
             || (cursor.is_some() && state.next_message_id == 0)
         {
-            return Err(anyhow::anyhow!("invalid ACP session cursor"));
+            return Err(anyhow::Error::msg("invalid ACP session cursor"));
         }
         if limit == 0 || limit > ACP_SESSION_MAX_PAGE_SIZE {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow::Error::msg(format!(
                 "cursor page limit must be between 1 and {ACP_SESSION_MAX_PAGE_SIZE}"
-            ));
+            )));
         }
         if state.next_message_id == 0 {
             return Ok(AcpSessionPage {
@@ -379,7 +379,7 @@ impl AcpSessionStore {
             let group = load_projected_group(&conn, message_id, role, content, reasoning_content)?;
             let end = end_offset.unwrap_or(group.len());
             if end > group.len() {
-                return Err(anyhow::anyhow!("invalid ACP session cursor offset"));
+                return Err(anyhow::Error::msg("invalid ACP session cursor offset"));
             }
             if group.len() == 0 {
                 group.ensure_well_formed(&conn)?;
@@ -1092,10 +1092,10 @@ impl ProjectedGroup {
             |row| row.get(0),
         )?;
         if malformed {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow::Error::msg(format!(
                 "unknown event_kind in acp_tool_calls for message_id {}",
                 self.message_id
-            ));
+            )));
         }
         Ok(())
     }
@@ -1283,9 +1283,9 @@ impl ProjectedGroup {
                 })
                 .optional()?;
             if let Some(tool_call_id) = reused {
-                return Err(anyhow::anyhow!(
+                return Err(anyhow::Error::msg(format!(
                     "cross-group ACP tool_call_id reuse: {tool_call_id}"
-                ));
+                )));
             }
         }
         Ok(messages)
@@ -1368,16 +1368,16 @@ fn encode_cursor(cursor: AcpSessionCursor) -> Result<String> {
 fn decode_cursor(encoded: &str) -> Result<AcpSessionCursor> {
     let hex = encoded
         .strip_prefix("acp1.")
-        .ok_or_else(|| anyhow::anyhow!("invalid ACP session cursor"))?;
+        .ok_or_else(|| anyhow::Error::msg("invalid ACP session cursor"))?;
     if !hex.is_ascii() || hex.len() % 2 != 0 || hex.len() > 2048 {
-        return Err(anyhow::anyhow!("invalid ACP session cursor"));
+        return Err(anyhow::Error::msg("invalid ACP session cursor"));
     }
     let bytes = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| anyhow::anyhow!("invalid ACP session cursor"))?;
-    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid ACP session cursor"))
+        .map_err(|_| anyhow::Error::msg("invalid ACP session cursor"))?;
+    serde_json::from_slice(&bytes).map_err(|_| anyhow::Error::msg("invalid ACP session cursor"))
 }
 
 fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
