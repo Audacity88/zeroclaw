@@ -36,6 +36,7 @@ use crate::text_selection::{
     TextSnapshot as TranscriptSnapshot, borrow_line, row_breaks_for_lines, wrapped_rows,
 };
 use crate::theme;
+use crate::thought_layout::ThoughtLayout;
 use crate::turn_status::TurnStatus;
 
 // Height of the approval popup anchored to the bottom of the content area.
@@ -4030,6 +4031,7 @@ struct ConversationRenderWork {
     copy_cached_lines_scanned: usize,
     copy_cached_blocks: usize,
     entry_rect_candidates: usize,
+    thought_rows_painted: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4061,14 +4063,11 @@ fn render_conversation(
         state.rebuild_lines(inner_width);
     }
 
-    // Determine transient overlays (live streaming / approval) up front from
-    // cheap state reads. Both frame kinds render only a viewport slice;
-    // transient frames additionally append the uncached overlay lines when
-    // the window reaches past the cached history.
-    let has_stream_text = !state.streaming_text.is_empty();
     let has_stream_thought = state.show_thoughts && !state.streaming_thought.is_empty();
     let has_approval = state.pending_approval().is_some();
-    let transient = has_stream_text || has_stream_thought || has_approval;
+    if has_stream_thought {
+        state.ensure_streaming_thought_layout(inner_width);
+    }
 
     // Reserve a pinned top row inside the panel for the session's first user
     // message — a recovery reminder that stays put across scroll and reload.
@@ -4099,30 +4098,26 @@ fn render_conversation(
         inner.height.saturating_sub(first_row_h),
     );
 
-    // Build the overlay-only line buffer (streaming text / thinking /
-    // approval padding) on transient frames. History is never cloned here —
-    // `visible_transient_slice` slices the cached history the same bounded
-    // way idle frames do and appends this small overlay only once the
-    // viewport window reaches it.
-    let overlay_lines: Vec<Line<'static>> = if transient {
-        state.build_overlay_lines(inner_width)
+    // Message Markdown retains its existing layout. Thoughts are a separate
+    // derived segment so unchanged long text is neither cloned nor rewrapped.
+    let message_lines = state.build_message_overlay_lines(inner_width);
+    let message_rows = Paragraph::new(message_lines.iter().map(borrow_line).collect::<Vec<_>>())
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width) as u16;
+    let message_row_breaks = row_breaks_for_lines(&message_lines, inner_width);
+    let thought_layout = has_stream_thought
+        .then_some(state.streaming_thought_layout.as_ref())
+        .flatten();
+    let thought_rows = thought_layout.map_or(0, ThoughtLayout::row_count);
+    let thought_start = state.cached_total_rows.saturating_add(message_rows);
+    let approval_rows = if has_approval {
+        APPROVAL_OVERLAY_HEIGHT
     } else {
-        Vec::new()
+        0
     };
-    let transient_row_breaks = if transient {
-        row_breaks_for_lines(&overlay_lines, inner_width)
-    } else {
-        Vec::new()
-    };
-
-    let total_rows = if transient {
-        let overlay_rows = Paragraph::new(overlay_lines.iter().map(borrow_line).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .line_count(inner_width) as u16;
-        state.cached_total_rows.saturating_add(overlay_rows)
-    } else {
-        state.cached_total_rows
-    };
+    let total_rows = thought_start
+        .saturating_add(thought_rows)
+        .saturating_add(approval_rows);
     let max_scroll = total_rows.saturating_sub(inner_height);
     let scroll = if state.pinned_to_bottom {
         max_scroll
@@ -4136,20 +4131,11 @@ fn render_conversation(
     #[cfg(test)]
     let transcript_cached_lines = visible_cached_window.lines.len();
 
-    // Both branches now render only the viewport slice, so cached-history
-    // work stays O(log history + visible) instead of O(history), including
-    // on transient frames (live streaming, approval overlay) where only the
-    // small overlay buffer above is materialized in full.
-    let (render_lines, render_scroll) = if transient {
-        state.visible_transient_slice(scroll, inner_height, &visible_cached_window, overlay_lines)
-    } else {
-        state.visible_line_slice(scroll, &visible_cached_window)
-    };
-
     let row_breaks = state
         .cached_row_breaks
         .iter()
-        .chain(&transient_row_breaks)
+        .chain(&message_row_breaks)
+        .chain(thought_layout.map_or(&[][..], ThoughtLayout::row_breaks))
         .copied()
         .skip(usize::from(scroll))
         .take(usize::from(body_area.height))
@@ -4157,10 +4143,64 @@ fn render_conversation(
         .take(usize::from(body_area.height))
         .collect();
 
-    let p = Paragraph::new(render_lines)
-        .wrap(Wrap { trim: false })
-        .scroll((render_scroll, 0));
-    f.render_widget(p, body_area);
+    #[cfg(test)]
+    let mut thought_rows_painted = 0;
+    for line_index in visible_cached_window.lines.clone() {
+        let (start, end) = state.cached_line_screen_ranges[line_index];
+        let Some((rect, local_scroll)) = visible_segment(start, end - start, scroll, body_area)
+        else {
+            continue;
+        };
+        let line = &state.cached_lines[line_index];
+        if let Some(layout) = state.cached_thought_layouts.get(&line_index) {
+            #[cfg(test)]
+            {
+                thought_rows_painted += usize::from(rect.height);
+            }
+            paint_thought_rows(
+                f,
+                layout,
+                rect,
+                local_scroll,
+                line.spans[0].style,
+                line.spans[1].style,
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new(vec![borrow_line(line)])
+                    .wrap(Wrap { trim: false })
+                    .scroll((local_scroll, 0)),
+                rect,
+            );
+        }
+    }
+    if let Some((rect, local_scroll)) =
+        visible_segment(state.cached_total_rows, message_rows, scroll, body_area)
+    {
+        f.render_widget(
+            Paragraph::new(message_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((local_scroll, 0)),
+            rect,
+        );
+    }
+    if let Some(layout) = thought_layout
+        && let Some((rect, local_scroll)) =
+            visible_segment(thought_start, thought_rows, scroll, body_area)
+    {
+        #[cfg(test)]
+        {
+            thought_rows_painted += usize::from(rect.height);
+        }
+        paint_thought_rows(
+            f,
+            layout,
+            rect,
+            local_scroll,
+            theme::thought_style(),
+            theme::dim_style(),
+        );
+    }
     capture_transcript_snapshot(f, state, body_area, row_breaks);
     render_transcript_selection(f, state);
 
@@ -4234,12 +4274,39 @@ fn render_conversation(
             copy_cached_lines_scanned,
             copy_cached_blocks,
             entry_rect_candidates: visible_cached_window.entries.len(),
+            thought_rows_painted,
         }
     }
     #[cfg(not(test))]
     {
         let _ = (copy_cached_lines_scanned, copy_cached_blocks);
     }
+}
+
+fn visible_segment(start: u16, rows: u16, scroll: u16, body: Rect) -> Option<(Rect, u16)> {
+    let lo = start.max(scroll);
+    let hi = start
+        .saturating_add(rows)
+        .min(scroll.saturating_add(body.height));
+    (hi > lo).then(|| {
+        (
+            Rect::new(body.x, body.y + (lo - scroll), body.width, hi - lo),
+            lo - start,
+        )
+    })
+}
+
+fn paint_thought_rows(
+    f: &mut Frame,
+    layout: &ThoughtLayout,
+    rect: Rect,
+    scroll: u16,
+    prefix_style: Style,
+    body_style: Style,
+) {
+    let start = usize::from(scroll);
+    let end = start + usize::from(rect.height);
+    layout.render(start..end, prefix_style, body_style, rect, f.buffer_mut());
 }
 
 fn capture_transcript_snapshot(
@@ -5535,6 +5602,10 @@ pub struct ChatState {
     /// Keeping their full copy text in the render cache avoids rescanning a
     /// large visible fence on every steady-state draw.
     cached_code_blocks: Vec<CachedCodeBlock>,
+    /// Derived physical-row layouts for committed thoughts in the cached entry window.
+    cached_thought_layouts: std::collections::BTreeMap<usize, ThoughtLayout>,
+    /// The current visible streaming thought, invalidated only when its source changes.
+    streaming_thought_layout: Option<ThoughtLayout>,
     /// Fine-grained dirty tracking — see [`LinesDirty`].
     dirty: LinesDirty,
     /// How many entries from `entries[cached_render_start..]` are represented in
@@ -5647,6 +5718,8 @@ impl ChatState {
             cached_line_screen_ranges: Vec::new(),
             cached_screen_ranges: Vec::new(),
             cached_code_blocks: Vec::new(),
+            cached_thought_layouts: std::collections::BTreeMap::new(),
+            streaming_thought_layout: None,
             dirty: LinesDirty::Full,
             cached_entry_count: 0,
             cached_render_start: 0,
@@ -6271,6 +6344,7 @@ impl ChatState {
         }
     }
 
+    #[cfg(test)]
     fn visible_line_slice(
         &self,
         scroll: u16,
@@ -6286,11 +6360,21 @@ impl ChatState {
         )
     }
 
-    /// Builds the transient overlay lines — the live streaming text (with
-    /// its agent label), the thinking line, and the approval padding rows —
-    /// exactly as they are appended below the committed history on transient
-    /// frames. Rebuilt fresh every frame by design; never cached.
-    fn build_overlay_lines(&self, width: u16) -> Vec<Line<'static>> {
+    /// Reuse physical thought rows until the text or available width changes.
+    fn ensure_streaming_thought_layout(&mut self, width: u16) {
+        if self
+            .streaming_thought_layout
+            .as_ref()
+            .is_none_or(|layout| layout.width() != width)
+        {
+            self.streaming_thought_layout = Some(ThoughtLayout::new(
+                Arc::<str>::from(self.streaming_thought.as_str()),
+                width,
+            ));
+        }
+    }
+
+    fn build_message_overlay_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if !self.streaming_text.is_empty() {
             lines.push(Line::from(vec![Span::styled(
@@ -6299,6 +6383,13 @@ impl ChatState {
             )]));
             lines.extend(markdown_to_lines(&self.streaming_text, width));
         }
+        lines
+    }
+
+    // Reference assembly retained for the full-buffer parity tests.
+    #[cfg(test)]
+    fn build_overlay_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.build_message_overlay_lines(width);
         if self.show_thoughts && !self.streaming_thought.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled("(thinking) ", theme::thought_style()),
@@ -6320,6 +6411,7 @@ impl ChatState {
     /// `visible_line_slice` does, and appends the (small) overlay in full
     /// once the viewport window reaches it, letting the `Paragraph`'s local
     /// scroll handle any partial visibility.
+    #[cfg(test)]
     fn visible_transient_slice(
         &self,
         scroll: u16,
@@ -6344,15 +6436,31 @@ impl ChatState {
     /// Cache rebuilds may remain history-sized; steady-state frames use these
     /// ordered indexes without rescanning committed entries or lines.
     fn rebuild_screen_ranges(&mut self, width: u16) {
+        let mut previous = std::mem::take(&mut self.cached_thought_layouts);
+        for &(entry_idx, lo, hi) in &self.cached_line_ranges {
+            if hi == lo + 1
+                && let ChatEntry::AgentThought(text) = &self.entries[entry_idx]
+            {
+                let layout = previous
+                    .remove(&lo)
+                    .filter(|layout| layout.matches(text, width))
+                    .unwrap_or_else(|| ThoughtLayout::new(Arc::clone(text), width));
+                self.cached_thought_layouts.insert(lo, layout);
+            }
+        }
         self.cached_line_screen_ranges.clear();
         self.cached_screen_ranges.clear();
         self.cached_code_blocks.clear();
         let mut screen_cursor = 0u16;
         let mut pending_fence: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
 
-        for line in &self.cached_lines {
+        for (line_index, line) in self.cached_lines.iter().enumerate() {
             let line_start = screen_cursor;
-            screen_cursor = screen_cursor.saturating_add(wrapped_rows(line, width));
+            let rows = self
+                .cached_thought_layouts
+                .get(&line_index)
+                .map_or_else(|| wrapped_rows(line, width), ThoughtLayout::row_count);
+            screen_cursor = screen_cursor.saturating_add(rows);
             self.cached_line_screen_ranges
                 .push((line_start, screen_cursor));
 
@@ -6650,6 +6758,7 @@ impl ChatState {
     /// natural flush points: when a tool call interrupts thinking, and when the
     /// first response text chunk arrives after a thinking phase.
     fn flush_streaming_thought(&mut self) {
+        self.streaming_thought_layout = None;
         let thought = std::mem::take(&mut self.streaming_thought);
         if !thought.is_empty() {
             self.entries
@@ -6708,6 +6817,7 @@ impl ChatState {
                 }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
+                self.streaming_thought_layout = None;
                 self.streaming_thought.push_str(&text);
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::Thinking;
@@ -7394,6 +7504,8 @@ impl ChatState {
         self.entries.clear();
         self.streaming_text.clear();
         self.streaming_thought.clear();
+        self.streaming_thought_layout = None;
+        self.cached_thought_layouts.clear();
         self.cached_lines.clear();
         self.cached_row_breaks.clear();
         self.cached_line_ranges.clear();
@@ -7597,6 +7709,172 @@ mod tests {
         );
         state.input_bar.insert_text(command);
         state.input_bar.submit_current_input_for_test()
+    }
+
+    fn draw_long_thought(state: &mut ChatState, width: u16) -> ConversationRenderWork {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width + 2, 10)).unwrap();
+        let mut work = None;
+        terminal
+            .draw(|frame| {
+                work = Some(render_conversation(frame, state, frame.area()));
+            })
+            .unwrap();
+        assert!(
+            state.input_bar.input().is_empty(),
+            "the composer is not involved"
+        );
+        work.unwrap()
+    }
+
+    #[track_caller]
+    fn assert_thought_snapshot_matches_paragraph(state: &ChatState, text: &str) {
+        let original = Line::from(vec![
+            Span::styled("(thinking) ", theme::thought_style()),
+            Span::styled(text.to_owned(), theme::dim_style()),
+        ]);
+        assert_snapshot_matches_paragraph(state, vec![original]);
+    }
+
+    #[track_caller]
+    fn assert_snapshot_matches_paragraph(state: &ChatState, lines: Vec<Line<'static>>) {
+        let actual = state.transcript_snapshot.as_ref().unwrap();
+        let width = actual.area.width;
+        let breaks: Vec<TranscriptRowBreak> = row_breaks_for_lines(&lines, width)
+            .into_iter()
+            .skip(usize::from(state.scroll_offset))
+            .chain(std::iter::repeat(TranscriptRowBreak::Hard))
+            .take(usize::from(actual.area.height))
+            .collect();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            width,
+            actual.area.height,
+        ))
+        .unwrap();
+        let mut expected = None;
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(lines.clone())
+                        .wrap(Wrap { trim: false })
+                        .scroll((state.scroll_offset, 0)),
+                    frame.area(),
+                );
+                expected = Some(TranscriptSnapshot::capture(
+                    frame,
+                    frame.area(),
+                    breaks.clone(),
+                ));
+            })
+            .unwrap();
+        let expected = expected.unwrap();
+        assert_eq!(actual.cells, expected.cells);
+        assert_eq!(actual.row_breaks, expected.row_breaks);
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint {
+                column: width - 1,
+                row: actual.area.height - 1,
+            },
+            dragged: true,
+        };
+        assert_eq!(
+            actual.selected_text(selection),
+            expected.selected_text(selection)
+        );
+    }
+
+    #[test]
+    fn long_thought_rows_reuse_layout_during_scroll_append_and_finalization() {
+        let mut s = state();
+        s.show_thoughts = true;
+        s.turn_in_flight = true;
+        let mut text = "alpha beta  \u{754c} e\u{301} trailing words ".repeat(2_000);
+        s.apply_update(SessionUpdate::AgentThoughtChunk {
+            session_id: "sess-1".into(),
+            text: text.clone(),
+        });
+        s.pinned_to_bottom = false;
+        draw_long_thought(&mut s, 32);
+        let generation = s.streaming_thought_layout.as_ref().unwrap().generation();
+        for scroll in [0, 17, 500, 11] {
+            s.scroll_offset = scroll;
+            let work = draw_long_thought(&mut s, 32);
+            assert!(work.thought_rows_painted <= 8);
+            assert_eq!(
+                s.streaming_thought_layout.as_ref().unwrap().generation(),
+                generation
+            );
+            assert_thought_snapshot_matches_paragraph(&s, &text);
+        }
+
+        let suffix = " appended suffix";
+        text.push_str(suffix);
+        s.apply_update(SessionUpdate::AgentThoughtChunk {
+            session_id: "sess-1".into(),
+            text: suffix.into(),
+        });
+        assert!(s.streaming_thought_layout.is_none());
+        draw_long_thought(&mut s, 32);
+        assert_ne!(
+            s.streaming_thought_layout.as_ref().unwrap().generation(),
+            generation
+        );
+        assert_thought_snapshot_matches_paragraph(&s, &text);
+        draw_long_thought(&mut s, 19);
+        assert_eq!(s.streaming_thought_layout.as_ref().unwrap().width(), 19);
+        assert_thought_snapshot_matches_paragraph(&s, &text);
+
+        s.commit_turn(String::new(), false);
+        assert!(s.streaming_thought_layout.is_none());
+        draw_long_thought(&mut s, 19);
+        let generation = s.cached_thought_layouts[&0].generation();
+        for scroll in [0, 25, 700, 12] {
+            s.scroll_offset = scroll;
+            let work = draw_long_thought(&mut s, 19);
+            assert!(work.thought_rows_painted <= 8);
+            assert_eq!(s.cached_thought_layouts[&0].generation(), generation);
+            assert_thought_snapshot_matches_paragraph(&s, &text);
+        }
+        assert_eq!(clipboard_text(&s.entries[0]), format!("(thinking) {text}"));
+        draw_long_thought(&mut s, 40);
+        assert_ne!(s.cached_thought_layouts[&0].generation(), generation);
+        assert_thought_snapshot_matches_paragraph(&s, &text);
+    }
+
+    #[test]
+    fn long_thought_rows_match_mixed_history_message_and_approval_boundaries() {
+        let mut s = state();
+        s.show_thoughts = true;
+        s.pinned_to_bottom = false;
+        s.entries.push(ChatEntry::AgentMessage(Arc::from(
+            "History with **bold** words and enough text to wrap.",
+        )));
+        s.entries.push(ChatEntry::AgentThought(Arc::from(
+            "An earlier thought with enough text to cross several rows.",
+        )));
+        s.entries
+            .push(ChatEntry::AgentMessage(Arc::from("History tail.")));
+        s.mark_dirty_full();
+        s.streaming_text = "Live **message** with wrapping.\n\nAnother paragraph.".into();
+        s.streaming_thought = "A long thought with wrapping spaces. ".repeat(40);
+        s.pending_approval = Some(approval());
+
+        for width in [19, 32] {
+            draw_long_thought(&mut s, width);
+            let mut reference = s.cached_lines.clone();
+            reference.extend(s.build_overlay_lines(width));
+            let total = Paragraph::new(reference.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width) as u16;
+            assert_eq!(s.last_total_rows, total);
+            for scroll in 0..=total.saturating_sub(8) {
+                s.scroll_offset = scroll;
+                let work = draw_long_thought(&mut s, width);
+                assert!(work.thought_rows_painted <= 8);
+                assert_snapshot_matches_paragraph(&s, reference.clone());
+            }
+        }
     }
 
     #[test]
@@ -9297,6 +9575,7 @@ mod tests {
                 copy_cached_lines_scanned: 0,
                 copy_cached_blocks: 0,
                 entry_rect_candidates: 0,
+                thought_rows_painted: 0,
             },
             "an overlay-only viewport must not visit, clone, or wrap committed history"
         );
