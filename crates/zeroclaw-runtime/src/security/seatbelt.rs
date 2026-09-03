@@ -1,7 +1,8 @@
 //! macOS sandbox-exec (Seatbelt) sandbox backend.
 
 use crate::security::traits::Sandbox;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, VecDeque};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 pub(super) const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
@@ -42,6 +43,8 @@ impl SeatbeltSandbox {
     /// application layer already resolved, and every path is interpolated
     /// through the Seatbelt string-literal escaping seam so a configured root
     /// cannot break out of its SBPL string literal.
+    /// Existing symlinks are resolved before granting or restricting access;
+    /// missing descendants are retained, but resolution errors are returned.
     pub fn with_roots(
         workspace: Option<&Path>,
         read_write: &[PathBuf],
@@ -55,16 +58,38 @@ impl SeatbeltSandbox {
             ));
         }
 
+        let workspace = match workspace {
+            Some(path) => path.to_path_buf(),
+            None => std::env::current_dir()?,
+        };
+        let mut symlinks = BTreeSet::new();
+        let workspace = resolve_policy_root(&workspace, &mut symlinks)?;
+        let mut resolve_roots = |roots: &[PathBuf]| {
+            roots
+                .iter()
+                .map(|root| resolve_policy_root(root, &mut symlinks))
+                .collect::<std::io::Result<Vec<_>>>()
+        };
+        let read_write = resolve_roots(read_write)?;
+        let read_only = resolve_roots(read_only)?;
+        let write_only = resolve_roots(write_only)?;
+        let mut policy = generate_policy(&workspace, &read_write, &read_only, &write_only);
+        // Traversal must survive tier denials, without granting the contents of
+        // a regular file that replaces a configured symlink after construction.
+        policy.push_str(&ancestor_metadata_rules(
+            symlinks.iter().map(PathBuf::as_path),
+        ));
+        for symlink in &symlinks {
+            let literal = seatbelt_string_literal(&symlink.to_string_lossy());
+            policy.push_str(&format!(
+                "(allow file-read-metadata (require-all (literal \"{literal}\") (vnode-type SYMLINK)))\n"
+            ));
+        }
+
         let policy_dir = std::env::temp_dir().join("zeroclaw-seatbelt");
         std::fs::create_dir_all(&policy_dir)?;
-
         let session_id = uuid::Uuid::new_v4();
         let policy_path = policy_dir.join(format!("{session_id}.sb"));
-
-        let workspace = workspace
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp")));
-        let policy = generate_policy(&workspace, read_write, read_only, write_only);
         std::fs::write(&policy_path, &policy)?;
 
         Ok(Self {
@@ -137,6 +162,53 @@ impl Sandbox for SeatbeltSandbox {
     fn description(&self) -> &str {
         "macOS Seatbelt sandbox (built-in sandbox-exec)"
     }
+}
+
+/// Resolve existing symlinks while retaining absent suffixes for future writes.
+fn resolve_policy_root(path: &Path, symlinks: &mut BTreeSet<PathBuf>) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut pending: VecDeque<_> = absolute
+        .components()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut resolved = PathBuf::new();
+    let mut hops = 0;
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir) => resolved.push(Path::new("/")),
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => {
+                resolved.pop();
+            }
+            Some(Component::Normal(_)) => {
+                let next = resolved.join(&part);
+                match next.symlink_metadata() {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        hops += 1;
+                        if hops > 64 {
+                            return Err(std::io::Error::other(
+                                "Seatbelt root symlink limit exceeded",
+                            ));
+                        }
+                        let target = std::fs::read_link(&next)?;
+                        symlinks.insert(next);
+                        for component in target.components().rev() {
+                            pending.push_front(component.as_os_str().to_owned());
+                        }
+                    }
+                    Ok(_) => resolved = next.canonicalize()?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => resolved = next,
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => return Err(std::io::Error::other("Invalid Seatbelt root component")),
+        }
+    }
+    Ok(resolved)
 }
 
 fn seatbelt_string_literal(value: &str) -> String {
@@ -696,6 +768,148 @@ mod tests {
         );
         // The raw, unescaped path must never be interpolated into the SBPL.
         assert!(!policy.contains("zc\"quote\\slash\nnewline"));
+    }
+
+    #[test]
+    fn resolve_policy_root_follows_alias_chain_and_missing_suffix() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::os::unix::fs::symlink("target", root.join("inner")).unwrap();
+        std::os::unix::fs::symlink("inner", root.join("outer")).unwrap();
+        let mut symlinks = BTreeSet::new();
+        assert_eq!(
+            resolve_policy_root(&root.join("outer/new/child"), &mut symlinks).unwrap(),
+            root.join("target/new/child")
+        );
+        assert_eq!(
+            symlinks,
+            BTreeSet::from([root.join("inner"), root.join("outer")])
+        );
+        std::os::unix::fs::symlink("target/not-created", root.join("dangling")).unwrap();
+        assert_eq!(
+            resolve_policy_root(&root.join("dangling/file"), &mut symlinks).unwrap(),
+            root.join("target/not-created/file")
+        );
+    }
+
+    #[test]
+    fn resolve_policy_root_rejects_symlink_cycles() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cycle = fixture.path().join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        assert!(resolve_policy_root(&cycle, &mut BTreeSet::new()).is_err());
+        if SeatbeltSandbox::is_installed() {
+            assert!(
+                SeatbeltSandbox::with_roots(
+                    Some(fixture.path()),
+                    std::slice::from_ref(&cycle),
+                    &[],
+                    &[],
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn seatbelt_alias_roots_enforce_tiers_at_process_boundary() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let fixture = HomeFixture::new("aliases");
+        let workspace = fixture.child("workspace");
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        // Home proves positive grants are not masked by the baseline. Temp
+        // proves restrictions still override the broad compatibility grants.
+        for parent in [fixture.path.as_path(), temp.path()] {
+            let root = parent.canonicalize().unwrap();
+            let mut canonical = Vec::new();
+            let mut aliases = Vec::new();
+            for tier in ["rw", "ro", "wo"] {
+                let target = root.join(tier);
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("input.txt"), "content").unwrap();
+                let intermediate = root.join(format!("{tier}-intermediate"));
+                std::os::unix::fs::symlink(tier, &intermediate).unwrap();
+                let alias = root.join(format!("{tier}-alias"));
+                std::os::unix::fs::symlink(&intermediate, &alias).unwrap();
+                canonical.push(target);
+                aliases.push(alias);
+            }
+            let sandbox = SeatbeltSandbox::with_roots(
+                Some(&workspace),
+                &aliases[0..1],
+                &aliases[1..2],
+                &aliases[2..3],
+            )
+            .unwrap();
+            for paths in [&canonical, &aliases] {
+                for (index, path) in paths.iter().enumerate() {
+                    let read =
+                        sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &path.join("input.txt"));
+                    assert_eq!(
+                        read.status.success(),
+                        index != 2,
+                        "read tier {index} at {path:?}: {}",
+                        String::from_utf8_lossy(&read.stderr)
+                    );
+                    let write = sandboxed_sh(
+                        &sandbox,
+                        &workspace,
+                        r#"printf x > "$0""#,
+                        &path.join("output.txt"),
+                    );
+                    assert_eq!(
+                        write.status.success(),
+                        index != 1,
+                        "write tier {index} at {path:?}: {}",
+                        String::from_utf8_lossy(&write.stderr)
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::read_to_string(canonical[1].join("input.txt")).unwrap(),
+                "content"
+            );
+            assert!(!canonical[1].join("output.txt").exists());
+        }
+    }
+
+    #[test]
+    fn seatbelt_alias_traversal_does_not_grant_replacement_contents() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let fixture = HomeFixture::new("alias-replacement");
+        let workspace = fixture.child("workspace");
+        let target = fixture.child("target");
+        let outside = fixture.child("outside");
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let alias = fixture.path.join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let sandbox =
+            SeatbeltSandbox::with_roots(Some(&workspace), std::slice::from_ref(&alias), &[], &[])
+                .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::write(&alias, "replacement-secret").unwrap();
+        let out = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &alias);
+        assert!(
+            !out.status.success(),
+            "alias traversal must not authorize replacement file contents"
+        );
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let out = sandboxed_sh(
+            &sandbox,
+            &workspace,
+            r#"cat "$0""#,
+            &alias.join("secret.txt"),
+        );
+        assert!(
+            !out.status.success(),
+            "retargeted alias must not authorize an unlisted root"
+        );
     }
 
     #[test]
