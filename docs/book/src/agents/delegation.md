@@ -239,4 +239,3 @@ them as Fluent keys.
 4. **Streaming progress back to the parent.** The parent sees the child's final response as a single string after completion.
 5. **A `[agents.<alias>].subagent_*` config block.** The validator and override type ship today; the operator-facing config surface that plumbs caller-defined narrowing is not in this release. Both spawn sites pass `SubAgentOverrides::default()` until that surface lands.
 6. **Independent `delegate` targets with `always_ask`.** Independent delegation is blocked when the target agent's risk profile has non-empty `always_ask` entries. The runtime refuses before starting the target, including background and parallel delegation. This blocker remains until approval forwarding for independent child agents is supported by a future ZeroClaw version.
-he target, including background and parallel delegation. This blocker remains until approval forwarding for independent child agents is supported by a future ZeroClaw version.
