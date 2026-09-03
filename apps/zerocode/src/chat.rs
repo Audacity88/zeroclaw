@@ -4022,87 +4022,130 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
-fn url_cell_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlCellRegion> {
+fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLineRegion> {
+    use ratatui::style::Color;
+
     if width == 0 {
         return Vec::new();
     }
     let mut regions = Vec::new();
     let mut screen_row = 0u16;
     for line in lines {
+        let rows = wrapped_rows(line, width);
         let text = line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
         let urls = recognized_url_ranges(&text);
-        let wrapped = crate::input_bar::wrap_visual_lines(&text, width);
-        for (start, end, url) in urls {
-            let occurrence = UrlOccurrenceId {
-                row: screen_row,
-                byte_start: start,
-            };
-            for (visual_row, visual) in wrapped.iter().enumerate() {
-                let segment_start = start.max(visual.start);
-                let segment_end = end.min(visual.end);
-                if segment_end <= segment_start {
-                    continue;
-                }
-                let row = screen_row.saturating_add(visual_row as u16);
-                let col =
-                    crate::display_width::display_width(&text[visual.start..segment_start]) as u16;
-                let cells =
-                    crate::display_width::display_width(&text[segment_start..segment_end]) as u16;
-                if cells > 0 {
-                    regions.push(UrlCellRegion {
-                        row,
-                        col,
-                        cells,
-                        url: url.clone(),
-                        occurrence,
-                    });
-                }
+        if !urls.is_empty() {
+            // Private color tags carry occurrence identity through Paragraph's
+            // actual wrapping and alignment; these colors are never displayed.
+            let mut spans = Vec::new();
+            let mut offset = 0;
+            for (idx, (start, end, _)) in urls.iter().enumerate() {
+                spans.push(Span::raw(text[offset..*start].to_owned()));
+                let tag = u32::try_from(idx).ok().filter(|tag| *tag <= 0x00ff_ffff);
+                let style = tag.map_or_else(Style::default, |tag| {
+                    Style::default().fg(Color::Rgb((tag >> 16) as u8, (tag >> 8) as u8, tag as u8))
+                });
+                spans.push(Span::styled(text[*start..*end].to_owned(), style));
+                offset = *end;
             }
+            spans.push(Span::raw(text[offset..].to_owned()));
+            let mut tagged = Line::from(spans);
+            tagged.alignment = line.alignment;
+
+            regions.push(UrlLineRegion {
+                row: screen_row,
+                rows,
+                tagged,
+                urls,
+            });
         }
-        screen_row = screen_row.saturating_add(wrapped_rows(line, width));
+        screen_row = screen_row.saturating_add(rows);
     }
     regions
 }
 
-fn offset_url_cell_regions(regions: &mut [UrlCellRegion], row_offset: u16) {
+fn offset_url_line_regions(regions: &mut [UrlLineRegion], row_offset: u16) {
     for region in regions {
         region.row = region.row.saturating_add(row_offset);
-        region.occurrence.row = region.occurrence.row.saturating_add(row_offset);
     }
 }
 
 fn project_url_hit_regions(
-    regions: &[UrlCellRegion],
+    regions: &[UrlLineRegion],
     scroll: u16,
     body: Rect,
 ) -> Vec<UrlHitRegion> {
+    use ratatui::{buffer::Buffer, style::Color, widgets::Widget};
+    use unicode_width::UnicodeWidthStr;
+
     if body.width == 0 || body.height == 0 {
         return Vec::new();
     }
-    let first_visible = regions.partition_point(|region| region.row < scroll);
-    regions[first_visible..]
+    let viewport_end = u32::from(scroll) + u32::from(body.height);
+    let first_visible = regions.partition_point(|region| {
+        u32::from(region.row) + u32::from(region.rows) <= u32::from(scroll)
+    });
+    let mut hits: Vec<UrlHitRegion> = Vec::new();
+    for region in regions[first_visible..]
         .iter()
-        .take_while(|region| region.row < scroll.saturating_add(body.height))
-        .filter_map(|region| {
-            if region.col >= body.width {
-                return None;
+        .take_while(|region| u32::from(region.row) < viewport_end)
+    {
+        let start = u32::from(region.row).max(u32::from(scroll));
+        let end = (u32::from(region.row) + u32::from(region.rows)).min(viewport_end);
+        let Some(height) = end.checked_sub(start).filter(|height| *height > 0) else {
+            continue;
+        };
+        // Only a visible line is reflowed, once, into viewport-sized storage.
+        // Never render a tall line in repeated strips from its beginning.
+        let area = Rect::new(0, 0, body.width, height as u16);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(borrow_line(&region.tagged))
+            .wrap(Wrap { trim: false })
+            .scroll(((start - u32::from(region.row)) as u16, 0))
+            .render(area, &mut buffer);
+        for y in 0..area.height {
+            let screen_y = body
+                .y
+                .saturating_add((start - u32::from(scroll)) as u16)
+                .saturating_add(y);
+            let mut col = 0;
+            while col < body.width {
+                let cell = &buffer[(col, y)];
+                let cells = (UnicodeWidthStr::width(cell.symbol()) as u16)
+                    .max(1)
+                    .min(body.width - col);
+                if let Color::Rgb(r, g, b) = cell.fg {
+                    let idx = (usize::from(r) << 16) | (usize::from(g) << 8) | usize::from(b);
+                    if let Some((start, _, url)) = region.urls.get(idx) {
+                        let occurrence = UrlOccurrenceId {
+                            row: region.row,
+                            byte_start: *start,
+                        };
+                        let screen_x = body.x.saturating_add(col);
+                        if let Some(previous) = hits.last_mut()
+                            && previous.rect.y == screen_y
+                            && previous.rect.right() == screen_x
+                            && previous.occurrence == occurrence
+                        {
+                            previous.rect.width += cells;
+                        } else {
+                            hits.push(UrlHitRegion {
+                                rect: Rect::new(screen_x, screen_y, cells, 1),
+                                url: url.clone(),
+                                occurrence,
+                            });
+                        }
+                    }
+                }
+                col += cells;
             }
-            Some(UrlHitRegion {
-                rect: Rect::new(
-                    body.x.saturating_add(region.col),
-                    body.y.saturating_add(region.row - scroll),
-                    region.cells.min(body.width - region.col),
-                    1,
-                ),
-                url: region.url.clone(),
-                occurrence: region.occurrence,
-            })
-        })
-        .collect()
+        }
+    }
+    hits
 }
 
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
@@ -4267,8 +4310,8 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     };
     let transient_url_regions = if transient {
         let mut regions =
-            url_cell_regions_for_lines(&transient_lines[state.cached_lines.len()..], inner_width);
-        offset_url_cell_regions(&mut regions, state.cached_total_rows);
+            url_line_regions_for_lines(&transient_lines[state.cached_lines.len()..], inner_width);
+        offset_url_line_regions(&mut regions, state.cached_total_rows);
         regions
     } else {
         Vec::new()
@@ -5577,12 +5620,11 @@ struct CopyHitRegion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UrlCellRegion {
+struct UrlLineRegion {
     row: u16,
-    col: u16,
-    cells: u16,
-    url: String,
-    occurrence: UrlOccurrenceId,
+    rows: u16,
+    tagged: Line<'static>,
+    urls: Vec<(usize, usize, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5819,9 +5861,9 @@ pub struct ChatState {
     /// URL hit segments projected from the complete wrapped transcript into
     /// the visible body viewport.
     url_hit_regions: Vec<UrlHitRegion>,
-    /// Complete wrapped URL segments in transcript-relative cell coordinates.
+    /// Tagged URL-bearing logical lines with transcript-relative row extents.
     /// Rebuilt with `cached_lines` so idle frames do not repeat recognition.
-    cached_url_regions: Vec<UrlCellRegion>,
+    cached_url_regions: Vec<UrlLineRegion>,
     /// A normal-mode left press that may become a link activation on release.
     pending_url_activation: Option<PendingUrlActivation>,
     /// Full code-block targets used by right-click context-menu resolution.
@@ -6613,8 +6655,8 @@ impl ChatState {
                     .line_count(width) as u16;
             self.cached_row_breaks
                 .extend(row_breaks_for_lines(&new_lines, width));
-            let mut appended_url_regions = url_cell_regions_for_lines(&new_lines, width);
-            offset_url_cell_regions(&mut appended_url_regions, self.cached_total_rows);
+            let mut appended_url_regions = url_line_regions_for_lines(&new_lines, width);
+            offset_url_line_regions(&mut appended_url_regions, self.cached_total_rows);
             self.cached_url_regions.extend(appended_url_regions);
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
@@ -6645,7 +6687,7 @@ impl ChatState {
             }
         }
         self.cached_row_breaks = row_breaks_for_lines(&lines, width);
-        self.cached_url_regions = url_cell_regions_for_lines(&lines, width);
+        self.cached_url_regions = url_line_regions_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
         self.cached_entry_count = total - start;
@@ -8037,9 +8079,118 @@ mod tests {
     }
 
     #[test]
+    fn url_hit_map_wrapping_matches_rendered_cells_while_scrolling() {
+        use ratatui::{buffer::Buffer, widgets::Widget};
+
+        let reproducer = vec![
+            Line::from("https://a.co x https://b.co x https://c.co x https://d.co"),
+            Line::from("https://e.co"),
+        ];
+        let regions = url_line_regions_for_lines(&reproducer, 10);
+        let visible = project_url_hit_regions(&regions, 9, Rect::new(0, 0, 10, 2));
+        assert!(visible.iter().all(|hit| hit.rect.y < 2));
+
+        let lines = vec![
+            Line::from("https://one.example/aaaaa x https://two.example/bbbbbb"),
+            Line::from("https://three.example/end"),
+            Line::from("https://wide.example/\u{754c}e\u{301}").centered(),
+            Line::from("https://right.example/end").right_aligned(),
+        ];
+        for width in [10, 16, 24, 40] {
+            let regions = url_line_regions_for_lines(&lines, width);
+            assert!(
+                regions.windows(2).all(|pair| pair[0].row <= pair[1].row),
+                "URL rows must remain ordered at width {width}: {regions:?}"
+            );
+            let total = Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width) as u16;
+            let full_body = Rect::new(0, 0, width, total);
+            let mut full_buffer = Buffer::empty(full_body);
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .render(full_body, &mut full_buffer);
+            let all = project_url_hit_regions(&regions, 0, full_body);
+            for region in &regions {
+                for (start, _, url) in &region.urls {
+                    let occurrence = UrlOccurrenceId {
+                        row: region.row,
+                        byte_start: *start,
+                    };
+                    let mut visible = String::new();
+                    for hit in all.iter().filter(|hit| hit.occurrence == occurrence) {
+                        let mut x = hit.rect.x;
+                        while x < hit.rect.right() {
+                            use unicode_width::UnicodeWidthStr;
+                            let symbol = full_buffer[(x, hit.rect.y)].symbol();
+                            visible.push_str(symbol);
+                            x += (UnicodeWidthStr::width(symbol) as u16).max(1);
+                        }
+                    }
+                    assert_eq!(
+                        &visible, url,
+                        "all URL cells remain reachable at width {width}"
+                    );
+                }
+            }
+            for scroll in 0..total {
+                let body = Rect::new(2, 3, width, 2);
+                let mut buffer = Buffer::empty(body);
+                Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0))
+                    .render(body, &mut buffer);
+                for hit in project_url_hit_regions(&regions, scroll, body) {
+                    use unicode_width::UnicodeWidthStr;
+                    let mut visible = String::new();
+                    let mut x = hit.rect.x;
+                    while x < hit.rect.right() {
+                        let symbol = buffer[(x, hit.rect.y)].symbol();
+                        visible.push_str(symbol);
+                        x += (UnicodeWidthStr::width(symbol) as u16).max(1);
+                    }
+                    assert!(
+                        !visible.is_empty() && hit.url.contains(&visible),
+                        "phantom URL cells at width {width}, scroll {scroll}: {visible:?}, {hit:?}"
+                    );
+                }
+            }
+
+            let mut appended = url_line_regions_for_lines(&lines[..1], width);
+            let mut tail = url_line_regions_for_lines(&lines[1..], width);
+            offset_url_line_regions(&mut tail, wrapped_rows(&lines[0], width));
+            appended.extend(tail);
+            assert_eq!(appended.len(), regions.len());
+            for (incremental, full) in appended.iter().zip(&regions) {
+                assert_eq!(incremental, full);
+            }
+        }
+    }
+
+    #[test]
+    fn url_hit_map_tall_line_retains_only_visible_cell_regions() {
+        let url = format!("https://example.com/{}", "a".repeat(6_000));
+        let lines = vec![Line::from(url.clone())];
+        let cached = url_line_regions_for_lines(&lines, 10);
+        assert_eq!(
+            cached.len(),
+            1,
+            "cache logical lines, not every wrapped cell"
+        );
+        assert!(cached[0].rows > 256);
+        let body = Rect::new(4, 5, 10, 3);
+        let hits = project_url_hit_regions(&cached, 400, body);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|hit| hit.url == url));
+        assert_eq!(hits[0].rect, Rect::new(4, 5, 10, 1));
+        assert_eq!(hits[2].rect, Rect::new(4, 7, 10, 1));
+        assert!(project_url_hit_regions(&cached, cached[0].rows, body).is_empty());
+    }
+
+    #[test]
     fn url_hit_map_projects_wrapped_wide_cells_and_viewport_rows() {
         let lines = vec![Line::from("界 https://example.com/path")];
-        let logical = url_cell_regions_for_lines(&lines, 10);
+        let logical = url_line_regions_for_lines(&lines, 10);
         let all = project_url_hit_regions(&logical, 0, Rect::new(5, 3, 10, 4));
         assert!(
             all.len() >= 2,
@@ -8056,9 +8207,10 @@ mod tests {
         assert_eq!(clipped[0].rect.y, 3);
 
         let mut offset = logical.clone();
-        offset_url_cell_regions(&mut offset, 7);
+        offset_url_line_regions(&mut offset, 7);
         assert_eq!(offset[0].row, logical[0].row + 7);
-        assert_eq!(offset[0].occurrence.row, logical[0].occurrence.row + 7);
+        let shifted = project_url_hit_regions(&offset, 7, Rect::new(5, 3, 10, 4));
+        assert_eq!(shifted[0].occurrence.row, all[0].occurrence.row + 7);
     }
 
     #[test]
@@ -12686,9 +12838,9 @@ mod tests {
             truncated.style
         );
 
-        let regions = url_cell_regions_for_lines(&lines, 24);
+        let regions = url_line_regions_for_lines(&lines, 24);
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].url, "https://example.org/ok");
+        assert_eq!(regions[0].urls[0].2, "https://example.org/ok");
     }
 
     #[test]
