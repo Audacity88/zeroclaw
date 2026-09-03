@@ -156,6 +156,8 @@ The advertised roster is included in the `agent` parameter description in the to
 
 In bounded agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. An **empty** `allowed_tools` on the target means "inherit": the sub-agent runs with the caller's full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller's registry is the ceiling: a bounded cross-profile target whose risk profile names a tool the caller was never granted does not receive it. Bounded delegation is therefore tool-bounded, not a full `SecurityPolicy::ensure_no_escalation_beyond` check. If that intersection is empty, the target still receives a normal agentic model turn with no tools.
 
+The `delegate` tool itself follows the same bounded shape: it is stripped from the child registry unless the **target's** risk profile sets `delegation_policy mode = "allow"` (the default `"forbidden"` keeps today's no-sub-delegation behavior), and the caller-side gates still apply — the caller's `allowed_tools`/`excluded_tools` must admit `delegate`, and the target's tool policy must not exclude it. When granted, the child's delegate instance is bound to the target's identity: its calls resolve `delegation_policy`, reachability, and the advertised roster from the target's own alias and delegates config, never the delegating parent's, and each granted hop increments the depth counter (see below).
+
 In independent agentic delegation the sub-agent's tools are built from the target agent's own configured policy and runtime registry, like opening a fresh chat with that target. The parent registry is not used as the ceiling. The `delegate` tool is still removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
 
 Depth is capped per the parent's `runtime_profile.max_delegation_depth`. Set it to `1` to allow the top agent a single delegation hop with no further sub-delegation.
@@ -226,7 +228,7 @@ them as Fluent keys.
 | **Spawn depth** | Hard cap at 1 | Up to `runtime_profile.max_delegation_depth` (default 3) |
 | **Background mode** | Not supported | `background: true` returns a `task_id` |
 | **Parallel fan-out** | No built-in argument; multiple calls in one turn run concurrently when `parallel_tools = true` | `parallel: [...]` runs multiple targets concurrently |
-| **Gating** | Non-empty `risk_profile.allowed_tools` must list `spawn_subagent`; `excluded_tools` must not list it | The caller's non-empty `risk_profile.allowed_tools` must list `delegate`; `excluded_tools` must not list it; caller's `delegation_policy mode = "allow"`; and the target is in the caller's reachable set (same-profile peer or explicit `delegates` entry) |
+| **Gating** | Non-empty `risk_profile.allowed_tools` must list `spawn_subagent`; `excluded_tools` must not list it | The caller's non-empty `risk_profile.allowed_tools` must list `delegate`; `excluded_tools` must not list it; caller's `delegation_policy mode = "allow"`; and the target is in the caller's reachable set (same-profile peer or explicit `delegates` entry). A bounded target may itself receive the `delegate` tool only when its own risk profile sets `delegation_policy mode = "allow"` |
 | **Use when** | Internal subtask that should stay within the same identity | Want a different configured specialist (different model, different alias) to own the task under bounded or independent delegation |
 
 ## What's not supported
@@ -237,3 +239,4 @@ them as Fluent keys.
 4. **Streaming progress back to the parent.** The parent sees the child's final response as a single string after completion.
 5. **A `[agents.<alias>].subagent_*` config block.** The validator and override type ship today; the operator-facing config surface that plumbs caller-defined narrowing is not in this release. Both spawn sites pass `SubAgentOverrides::default()` until that surface lands.
 6. **Independent `delegate` targets with `always_ask`.** Independent delegation is blocked when the target agent's risk profile has non-empty `always_ask` entries. The runtime refuses before starting the target, including background and parallel delegation. This blocker remains until approval forwarding for independent child agents is supported by a future ZeroClaw version.
+he target, including background and parallel delegation. This blocker remains until approval forwarding for independent child agents is supported by a future ZeroClaw version.
