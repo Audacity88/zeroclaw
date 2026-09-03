@@ -1310,27 +1310,138 @@ impl OpenAiCompatibleModelProvider {
         (!blocks.is_empty()).then_some(blocks)
     }
 
-    /// Anthropic-shaped `thinking` request object for the given runtime
-    /// params, when [`Self::thinking_passthrough`] is on and the runtime
-    /// supplied native thinking params.
+    /// Anthropic-shaped `thinking` request object for the given model and
+    /// runtime params, when [`Self::thinking_passthrough`] is on and the
+    /// runtime supplied native thinking params.
     ///
-    /// The enabled shape deliberately duplicates the native Anthropic
-    /// provider's `NativeThinkingConfig` serialization
-    /// (`crates/zeroclaw-providers/src/anthropic.rs`): sharing a helper
-    /// would couple the two providers, and the adaptive/`display` variants
-    /// only exist on the native Anthropic provider path; extend here when
-    /// the adaptive/display support lands on master.
+    /// Style resolution is shared with the native Anthropic provider via
+    /// `crate::anthropic::anthropic_thinking_style` (same crate, free
+    /// function): budget models get the fixed-budget `enabled` shape,
+    /// adaptive-only models (Opus 4.7, the whole Fable 5 family) get
+    /// `{"type":"adaptive"}` with no `budget_tokens`, matching the native
+    /// `NativeThinkingConfig` serialization. `params.display` rides on both
+    /// shapes as the snake_case `display` key when present, exactly as the
+    /// native provider emits it. Gateway model IDs may carry routing
+    /// prefixes; the resolver's substring matching handles them.
+    /// History-path chat with optional thinking rethreading. Fallback paths
+    /// that rebuild a tool request as prompt-guided text pass the original
+    /// `request.thinking` so the rebuilt body keeps the same injection the
+    /// primary path would have sent.
+    async fn chat_with_history_inner(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> anyhow::Result<String> {
+        let credential = self.resolve_credential().await?;
+
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
+        let merge = self.effective_merge_system(model);
+        let (effective_messages, _system_merged) =
+            Self::flatten_system_messages(&normalized, merge);
+        // Strip native tool constructs for non-native-tool model_providers.
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
+            })
+            .collect();
+
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: self.max_tokens,
+            extra_body: self.request_extra_body(model, thinking),
+        };
+        // No cache breakpoints here, deliberately: this text-only path
+        // never surfaces response usage to dispatch accounting, so a
+        // premium cache write it triggered could never be accounted for
+        // (fallback re-entries through this path return `usage: None`).
+        // The cache flag is honored on the structured paths (`chat`,
+        // `chat_with_tools`, `stream_chat`), which capture usage; the
+        // provider docs describe this usage-capture boundary.
+
+        let url = self.chat_completions_url();
+        let response = match self
+            .apply_opencode_session_header(self.apply_auth_header(
+                self.http_client().post(&url).json(&request),
+                credential.as_deref(),
+            ))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => return Err(chat_error.into()),
+        };
+
+        if !response.status().is_success() {
+            return Err(super::api_error(&self.name, response).await);
+        }
+
+        let body = response.text().await?;
+        let chat_response = parse_chat_response_body(&self.name, &body)?;
+
+        chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| {
+                if c.message.tool_calls.is_some()
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|t: &Vec<_>| !t.is_empty())
+                {
+                    serde_json::to_string(&c.message)
+                        .unwrap_or_else(|_| c.message.effective_content())
+                } else {
+                    c.message.effective_content()
+                }
+            })
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {}", self.name))
+            })
+    }
+
     fn thinking_request_object(
         &self,
+        model: &str,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> Option<serde_json::Value> {
         if !self.thinking_passthrough {
             return None;
         }
         let params = thinking?;
-        Some(serde_json::json!({
-            "thinking": {"type": "enabled", "budget_tokens": params.budget_tokens}
-        }))
+        let mut object = match crate::anthropic::anthropic_thinking_style(model) {
+            crate::anthropic::AnthropicThinkingStyle::Adaptive => {
+                serde_json::json!({"type": "adaptive"})
+            }
+            crate::anthropic::AnthropicThinkingStyle::Budget => serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": params.budget_tokens
+            }),
+        };
+        if let Some(display) = params.display {
+            object["display"] = serde_json::json!(display.as_str());
+        }
+        Some(serde_json::json!({ "thinking": object }))
     }
 
     /// Effective `extra_body` for a request body: the injected `thinking`
@@ -1339,9 +1450,10 @@ impl OpenAiCompatibleModelProvider {
     /// this is exactly the configured `extra_body` (byte-identical default).
     fn request_extra_body(
         &self,
+        model: &str,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> Option<serde_json::Value> {
-        let Some(mut merged) = self.thinking_request_object(thinking) else {
+        let Some(mut merged) = self.thinking_request_object(model, thinking) else {
             return self.extra_body.clone();
         };
         match self.extra_body.as_ref() {
@@ -2714,7 +2826,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
-            extra_body: self.request_extra_body(thinking),
+            extra_body: self.request_extra_body(model, thinking),
         }
     }
 
@@ -2744,7 +2856,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice: has_tool_entries.then(|| "auto".to_string()),
             max_tokens: self.max_tokens,
-            extra_body: self.request_extra_body(thinking),
+            extra_body: self.request_extra_body(model, thinking),
         }
     }
 
@@ -2792,7 +2904,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
-            extra_body: self.request_extra_body(thinking),
+            extra_body: self.request_extra_body(model, thinking),
         }
     }
 
@@ -3701,90 +3813,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.resolve_credential().await?;
-
-        let normalized = self.normalize_messages_for_upstream(messages).await?;
-        let merge = self.effective_merge_system(model);
-        let (effective_messages, _system_merged) =
-            Self::flatten_system_messages(&normalized, merge);
-        // Strip native tool constructs for non-native-tool model_providers.
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-        let api_messages: Vec<Message> = effective_messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
-            })
-            .collect();
-
-        let request = ApiChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-            stream: Some(false),
-            stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: None,
-            tools: None,
-            tool_choice: None,
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
-        };
-        // No cache breakpoints here, deliberately: this text-only helper
-        // never surfaces response usage to dispatch accounting, so a
-        // premium cache write it triggered could never be accounted for
-        // (fallback re-entries through this path return `usage: None`).
-        // The flag is honored on the structured paths (`chat`,
-        // `chat_with_tools`, `stream_chat`), which capture usage; the
-        // provider docs describe this usage-capture boundary.
-
-        let url = self.chat_completions_url();
-        let response = match self
-            .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            ))
-            .send()
+        self.chat_with_history_inner(messages, model, temperature, None)
             .await
-        {
-            Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
-        };
-
-        if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
-        }
-
-        let body = response.text().await?;
-        let chat_response = parse_chat_response_body(&self.name, &body)?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| {
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|t: &Vec<_>| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.effective_content())
-                } else {
-                    c.message.effective_content()
-                }
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                    "compatible: empty choices in response"
-                );
-                anyhow::Error::msg(format!("No response from {}", self.name))
-            })
     }
 
     async fn chat_with_tools(
@@ -4012,7 +4042,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
-                    .chat_with_history(&fallback_messages, model, temperature)
+                    .chat_with_history_inner(
+                        &fallback_messages,
+                        model,
+                        temperature,
+                        request.thinking,
+                    )
                     .await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
@@ -4168,7 +4203,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
-                    extra_body: provider.request_extra_body(thinking_owned),
+                    extra_body: provider.request_extra_body(&model, thinking_owned),
                 })
             };
 
@@ -5793,7 +5828,7 @@ mod tests {
             .extra_body(extra.clone())
             .build();
         assert_eq!(
-            p_with_extra.request_extra_body(Some(params)),
+            p_with_extra.request_extra_body("test-model", Some(params)),
             Some(extra),
             "flag-off extra_body seam must return the configured extra_body unchanged"
         );
@@ -5850,6 +5885,173 @@ mod tests {
     }
 
     #[test]
+    fn thinking_passthrough_adaptive_model_sends_adaptive_shape_without_budget() {
+        // Adaptive-only models reject the fixed-budget shape with HTTP 400;
+        // the injected object must switch to the bare adaptive shape.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let resolved = p
+            .request_extra_body("claude-opus-4-7", Some(params))
+            .unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "adaptive-only models must receive the adaptive shape"
+        );
+        assert!(
+            resolved["thinking"].get("budget_tokens").is_none(),
+            "adaptive shape must not carry a budget_tokens key"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_budget_model_shape_unchanged_by_style_share() {
+        // A budget model keeps the enabled shape exactly, with no display
+        // key when params.display is None.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "budget models must keep the enabled shape; display None must omit the key"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_display_includes_snake_case_value_on_both_styles() {
+        // params.display rides on both shapes, serialized snake_case like
+        // the native provider's NativeThinkingConfig.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let updates = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
+        };
+        let budget = p.request_extra_body("test-model", Some(updates)).unwrap();
+        assert_eq!(
+            budget["thinking"],
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 8_192,
+                "display": "updates"
+            }),
+            "display Some must emit the snake_case value on the budget shape"
+        );
+
+        let adaptive = p
+            .request_extra_body("claude-opus-4-7", Some(updates))
+            .unwrap();
+        assert_eq!(
+            adaptive["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "display Some must emit the snake_case value on the adaptive shape"
+        );
+
+        let omitted = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
+        };
+        let omitted_body = p.request_extra_body("test-model", Some(omitted)).unwrap();
+        assert_eq!(
+            omitted_body["thinking"]["display"],
+            serde_json::json!("omitted"),
+            "each display variant must serialize to its snake_case name"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_prefixed_adaptive_model_id_resolves_adaptive() {
+        // Gateway routing prefixes model IDs; the shared style resolver
+        // matches on substrings, so a prefixed adaptive-only ID must still
+        // resolve to the adaptive shape (live gateways emit IDs like
+        // "claude-group/claude-fable-5").
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        for model in [
+            "claude-group/claude-opus-4-7",
+            "team-alias/claude-fable-5-1",
+        ] {
+            let resolved = p.request_extra_body(model, Some(params)).unwrap();
+            assert_eq!(
+                resolved["thinking"],
+                serde_json::json!({"type": "adaptive"}),
+                "prefixed adaptive-only ID {model} must resolve to the adaptive shape"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_passthrough_adaptive_shape_flows_through_request_builder() {
+        // End to end through the non-streaming builder: an adaptive-only
+        // gateway model gets the adaptive thinking object at the top level.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            None,
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"}),
+            "the request builder must carry the adaptive plus display shape to the wire"
+        );
+    }
+
+    #[test]
     fn thinking_passthrough_without_params_sends_no_thinking() {
         // Flag on but the runtime supplied no native thinking params: nothing
         // to forward, request must stay free of a thinking key.
@@ -5876,7 +6078,7 @@ mod tests {
             value.get("thinking").is_none(),
             "params-None request must not carry a thinking key; got: {value}"
         );
-        assert!(p.request_extra_body(None).is_none());
+        assert!(p.request_extra_body("test-model", None).is_none());
     }
 
     #[test]
@@ -5896,7 +6098,7 @@ mod tests {
             .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
             .build();
 
-        let resolved = p.request_extra_body(Some(params)).unwrap();
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
         assert_eq!(
             resolved["thinking"],
             serde_json::json!({"type": "off"}),
@@ -5923,7 +6125,7 @@ mod tests {
             .extra_body(serde_json::json!({"top_k": 5}))
             .build();
 
-        let resolved = p.request_extra_body(Some(params)).unwrap();
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
         assert_eq!(
             resolved["thinking"],
             serde_json::json!({"type": "enabled", "budget_tokens": 4_096}),
@@ -5952,7 +6154,7 @@ mod tests {
             .build();
 
         assert_eq!(
-            p.request_extra_body(Some(params)),
+            p.request_extra_body("test-model", Some(params)),
             Some(serde_json::json!("scalar")),
             "non-object extra_body must win outright over the injected thinking object"
         );
@@ -6246,6 +6448,117 @@ mod tests {
             Some("high")
         );
         assert!(bodies[0].get("tools").is_some());
+        server.abort();
+    }
+
+    /// Spawn a mock endpoint that rejects any request carrying `tools` with a
+    /// schema-unsupported error and accepts the tool-less fallback. Returns
+    /// the bound address, the recorded bodies, and the server handle.
+    fn spawn_schema_rejecting_endpoint() -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some();
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "message": "unknown parameter: tools",
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "ok"}}]
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve schema test");
+            });
+            (addr, bodies, server)
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_fallback_rethreads_thinking_params() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint().await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "schema fallback must be a single retry");
+        assert_eq!(
+            bodies[0]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "primary request carries the injected thinking object"
+        );
+        assert!(bodies[0].get("tools").is_some());
+        assert!(
+            bodies[1].get("tools").is_none(),
+            "fallback rebuild drops the tools parameter"
+        );
+        assert_eq!(
+            bodies[1]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "fallback rebuild must rethread the same thinking injection"
+        );
         server.abort();
     }
 

@@ -93,9 +93,16 @@ thinking_passthrough = true
   the whole tool loop on the non-streaming wire, where signed capture and
   replay stay correct. Turn-by-turn streaming resumes when wire-first
   streaming support lands.
-- **Budget shape only.** The injected object uses the fixed-budget
-  `enabled` shape; adaptive-only Claude models reject it the same way the
-  native provider does. Adaptive/`display` passthrough lands with #10542.
+- **Thinking shape follows the model.** The injected object matches the
+  native provider's style resolution: fixed-budget models get
+  `{"type": "enabled", "budget_tokens": N}`, adaptive-only models
+  (Opus 4.7, the whole Fable 5 family) get `{"type": "adaptive"}` with no
+  budget key. Gateway model IDs may carry routing prefixes
+  (`claude-group/...`); resolution matches on substrings, so prefixed IDs
+  resolve to the same shape as bare names. When the runtime requests a
+  display mode, the snake_case `display` key rides on both shapes
+  (`omitted`, `updates`, `summarized`); with no display requested the key
+  is omitted entirely.
 - **Escape hatch**: for shapes this feature does not cover, `provider_extra`
   still merges arbitrary top-level JSON into every request body, including a
   static `thinking` object, at your own risk, with no response handling.
