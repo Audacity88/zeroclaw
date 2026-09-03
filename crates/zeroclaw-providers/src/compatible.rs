@@ -1171,27 +1171,41 @@ impl OpenAiCompatibleModelProvider {
         (!blocks.is_empty()).then_some(blocks)
     }
 
-    /// Anthropic-shaped `thinking` request object for the given runtime
-    /// params, when [`Self::thinking_passthrough`] is on and the runtime
-    /// supplied native thinking params.
+    /// Anthropic-shaped `thinking` request object for the given model and
+    /// runtime params, when [`Self::thinking_passthrough`] is on and the
+    /// runtime supplied native thinking params.
     ///
-    /// The enabled shape deliberately duplicates the native Anthropic
-    /// provider's `NativeThinkingConfig` serialization
-    /// (`crates/zeroclaw-providers/src/anthropic.rs`): sharing a helper
-    /// would couple the two providers, and the adaptive/`display` variants
-    /// only exist on the native Anthropic provider path; extend here when
-    /// the adaptive/display support lands on master.
+    /// Style resolution is shared with the native Anthropic provider via
+    /// `crate::anthropic::anthropic_thinking_style` (same crate, free
+    /// function): budget models get the fixed-budget `enabled` shape,
+    /// adaptive-only models (Opus 4.7, Fable 5.1) get `{"type":"adaptive"}`
+    /// with no `budget_tokens`, matching the native
+    /// `NativeThinkingConfig` serialization. `params.display` rides on both
+    /// shapes as the snake_case `display` key when present, exactly as the
+    /// native provider emits it. Gateway model IDs may carry routing
+    /// prefixes; the resolver's substring matching handles them.
     fn thinking_request_object(
         &self,
+        model: &str,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> Option<serde_json::Value> {
         if !self.thinking_passthrough {
             return None;
         }
         let params = thinking?;
-        Some(serde_json::json!({
-            "thinking": {"type": "enabled", "budget_tokens": params.budget_tokens}
-        }))
+        let mut object = match crate::anthropic::anthropic_thinking_style(model) {
+            crate::anthropic::AnthropicThinkingStyle::Adaptive => {
+                serde_json::json!({"type": "adaptive"})
+            }
+            crate::anthropic::AnthropicThinkingStyle::Budget => serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": params.budget_tokens
+            }),
+        };
+        if let Some(display) = params.display {
+            object["display"] = serde_json::json!(display.as_str());
+        }
+        Some(serde_json::json!({ "thinking": object }))
     }
 
     /// Effective `extra_body` for a request body: the injected `thinking`
@@ -1200,9 +1214,10 @@ impl OpenAiCompatibleModelProvider {
     /// this is exactly the configured `extra_body` (byte-identical default).
     fn request_extra_body(
         &self,
+        model: &str,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> Option<serde_json::Value> {
-        let Some(mut merged) = self.thinking_request_object(thinking) else {
+        let Some(mut merged) = self.thinking_request_object(model, thinking) else {
             return self.extra_body.clone();
         };
         match self.extra_body.as_ref() {
@@ -2415,7 +2430,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
-            extra_body: self.request_extra_body(thinking),
+            extra_body: self.request_extra_body(model, thinking),
         }
     }
 
@@ -2440,7 +2455,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice: has_tool_entries.then(|| "auto".to_string()),
             max_tokens: self.max_tokens,
-            extra_body: self.request_extra_body(thinking),
+            extra_body: self.request_extra_body(model, thinking),
         }
     }
 
@@ -2484,7 +2499,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
-            extra_body: self.request_extra_body(thinking),
+            extra_body: self.request_extra_body(model, thinking),
         }
     }
 
@@ -3801,7 +3816,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
-                    extra_body: provider.request_extra_body(thinking_owned),
+                    extra_body: provider.request_extra_body(&model, thinking_owned),
                 })
             };
 
@@ -4701,7 +4716,7 @@ mod tests {
             .extra_body(extra.clone())
             .build();
         assert_eq!(
-            p_with_extra.request_extra_body(Some(params)),
+            p_with_extra.request_extra_body("test-model", Some(params)),
             Some(extra),
             "flag-off extra_body seam must return the configured extra_body unchanged"
         );
@@ -4756,6 +4771,172 @@ mod tests {
     }
 
     #[test]
+    fn thinking_passthrough_adaptive_model_sends_adaptive_shape_without_budget() {
+        // Adaptive-only models reject the fixed-budget shape with HTTP 400;
+        // the injected object must switch to the bare adaptive shape.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let resolved = p
+            .request_extra_body("claude-opus-4-7", Some(params))
+            .unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "adaptive-only models must receive the adaptive shape"
+        );
+        assert!(
+            resolved["thinking"].get("budget_tokens").is_none(),
+            "adaptive shape must not carry a budget_tokens key"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_budget_model_shape_unchanged_by_style_share() {
+        // A budget model keeps the enabled shape exactly, with no display
+        // key when params.display is None.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "budget models must keep the enabled shape; display None must omit the key"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_display_includes_snake_case_value_on_both_styles() {
+        // params.display rides on both shapes, serialized snake_case like
+        // the native provider's NativeThinkingConfig.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let updates = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
+        };
+        let budget = p.request_extra_body("test-model", Some(updates)).unwrap();
+        assert_eq!(
+            budget["thinking"],
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 8_192,
+                "display": "updates"
+            }),
+            "display Some must emit the snake_case value on the budget shape"
+        );
+
+        let adaptive = p
+            .request_extra_body("claude-opus-4-7", Some(updates))
+            .unwrap();
+        assert_eq!(
+            adaptive["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "display Some must emit the snake_case value on the adaptive shape"
+        );
+
+        let omitted = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
+        };
+        let omitted_body = p.request_extra_body("test-model", Some(omitted)).unwrap();
+        assert_eq!(
+            omitted_body["thinking"]["display"],
+            serde_json::json!("omitted"),
+            "each display variant must serialize to its snake_case name"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_prefixed_adaptive_model_id_resolves_adaptive() {
+        // Gateway routing prefixes model IDs; the shared style resolver
+        // matches on substrings, so a prefixed adaptive-only ID must still
+        // resolve to the adaptive shape (live gateways emit IDs like
+        // "claude-group/claude-fable-5").
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        for model in [
+            "claude-group/claude-opus-4-7",
+            "team-alias/claude-fable-5-1",
+        ] {
+            let resolved = p.request_extra_body(model, Some(params)).unwrap();
+            assert_eq!(
+                resolved["thinking"],
+                serde_json::json!({"type": "adaptive"}),
+                "prefixed adaptive-only ID {model} must resolve to the adaptive shape"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_passthrough_adaptive_shape_flows_through_request_builder() {
+        // End to end through the non-streaming builder: an adaptive-only
+        // gateway model gets the adaptive thinking object at the top level.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            None,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"}),
+            "the request builder must carry the adaptive plus display shape to the wire"
+        );
+    }
+
+    #[test]
     fn thinking_passthrough_without_params_sends_no_thinking() {
         // Flag on but the runtime supplied no native thinking params: nothing
         // to forward, request must stay free of a thinking key.
@@ -4775,7 +4956,7 @@ mod tests {
             value.get("thinking").is_none(),
             "params-None request must not carry a thinking key; got: {value}"
         );
-        assert!(p.request_extra_body(None).is_none());
+        assert!(p.request_extra_body("test-model", None).is_none());
     }
 
     #[test]
@@ -4795,7 +4976,7 @@ mod tests {
             .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
             .build();
 
-        let resolved = p.request_extra_body(Some(params)).unwrap();
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
         assert_eq!(
             resolved["thinking"],
             serde_json::json!({"type": "off"}),
@@ -4822,7 +5003,7 @@ mod tests {
             .extra_body(serde_json::json!({"top_k": 5}))
             .build();
 
-        let resolved = p.request_extra_body(Some(params)).unwrap();
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
         assert_eq!(
             resolved["thinking"],
             serde_json::json!({"type": "enabled", "budget_tokens": 4_096}),
@@ -4851,7 +5032,7 @@ mod tests {
             .build();
 
         assert_eq!(
-            p.request_extra_body(Some(params)),
+            p.request_extra_body("test-model", Some(params)),
             Some(serde_json::json!("scalar")),
             "non-object extra_body must win outright over the injected thinking object"
         );
