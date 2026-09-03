@@ -48,7 +48,6 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 ### Providers and Runtime
 
 - Default newly created persisted OpenAI model slots to the Responses API with native tool calling, without changing existing persisted entries or bare provider references (#9021).
-- Add `thinking_passthrough` on OpenAI-compatible provider entries (#10530): an opt-in flag that forwards runtime thinking as an Anthropic-shaped `thinking` request object through translating gateways, normalizes gateway `thinking_blocks` responses into replayable signed blocks (signature-only blocks preserved), and reconstructs signed blocks on outbound history — unsigned reasoning replays nothing rather than risking a rejected block sequence. Requires a gateway that translates between OpenAI Chat Completions and the Anthropic API; a non-translating upstream rejects the injected object with HTTP 400.
 - Propagate OpenAI Responses usage and carry model context-window metadata from the models.dev catalog (#9360, #9347).
 - Add configurable model vision capabilities and improve provider timeouts, streamed retries, tool-call argument handling, multimodal fallback, and Gemini thought-signature preservation (#9099, #8947, #9113, #9372, #8931, #9102, #8935).
 - Surface direct-turn fallback notices and isolate model and provider changes correctly across live sessions and turns (#8684, #8845, #9232).

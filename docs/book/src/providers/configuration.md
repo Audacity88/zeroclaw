@@ -53,13 +53,13 @@ thinking_passthrough = true
 - **Capture**: gateway thinking responses are normalized into the same
   newline-delimited signed-JSON format the native Anthropic provider stores in
   `reasoning_content` (one `{"thinking": ..., "signature": ...}` line per
-  block). Signature-only blocks (empty text, valid signature — the shape
+  block). Signature-only blocks (empty text, valid signature: the shape
   TrueFoundry emits) are preserved. With the flag off, gateway
   `reasoning_content` / `thinking_blocks` responses flow exactly as before,
   so DeepSeek/GLM/Qwen reasoning behavior is untouched.
 - **Replay**: signed history reconstructs a `thinking_blocks` array on
   outbound assistant messages and suppresses the string fields. The
-  reconstruction is all-or-nothing — see the limitation below. The
+  reconstruction is all-or-nothing; see the limitation below. The
   `replay_assistant_reasoning = false` override still wins: providers that
   reject reasoning input receive nothing under any flag combination.
 
@@ -70,7 +70,7 @@ thinking_passthrough = true
   and the Anthropic Messages API (LiteLLM documents this translation; the
   shape was verified against a live TrueFoundry gateway). Pointed at a
   non-translating upstream, the injected `thinking` object is an unknown
-  parameter and the request fails with **HTTP 400** — that is the designed
+  parameter and the request fails with **HTTP 400**. That is the designed
   failure mode: loud, at the first request, not silent.
 - **Unsigned reasoning replays nothing.** Thinking blocks Anthropic accepts
   on input must carry a valid signature. History whose reasoning is unsigned
@@ -86,7 +86,7 @@ thinking_passthrough = true
   native provider does. Adaptive/`display` passthrough lands with #10542.
 - **Escape hatch**: for shapes this feature does not cover, `provider_extra`
   still merges arbitrary top-level JSON into every request body, including a
-  static `thinking` object — at your own risk, with no response handling.
+  static `thinking` object, at your own risk, with no response handling.
 
 ### See also
 

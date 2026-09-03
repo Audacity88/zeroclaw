@@ -1149,7 +1149,7 @@ impl OpenAiCompatibleModelProvider {
     /// sends nothing rather than a partial replay). Mirrors the native
     /// Anthropic provider's replay parsing
     /// (`crates/zeroclaw-providers/src/anthropic.rs`) — duplicate-with-comment
-    /// per the #10530 spec boundary.
+    /// per the passthrough spec boundary.
     fn reasoning_lines_to_thinking_blocks(reasoning: &str) -> Option<Vec<serde_json::Value>> {
         let mut blocks = Vec::new();
         for line in reasoning.split('\n') {
@@ -1179,8 +1179,8 @@ impl OpenAiCompatibleModelProvider {
     /// provider's `NativeThinkingConfig` serialization
     /// (`crates/zeroclaw-providers/src/anthropic.rs`): sharing a helper
     /// would couple the two providers, and the adaptive/`display` variants
-    /// only exist on the native #10542 path — extend here when that lands
-    /// (cross-ref: issue #10530).
+    /// only exist on the native Anthropic provider path; extend here when
+    /// the adaptive/display support lands on master.
     fn thinking_request_object(
         &self,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
@@ -2991,7 +2991,7 @@ impl OpenAiCompatibleModelProvider {
     /// Deliberately mirrors the native Anthropic provider's block emission
     /// (`crates/zeroclaw-providers/src/anthropic.rs`): same line shape, same
     /// signature-or-text inclusion rule. Duplicate-with-comment, not a shared
-    /// helper, per the #10530 spec boundary (cross-ref: #10542).
+    /// helper, per the passthrough spec boundary (mirrors the native provider).
     fn thinking_blocks_to_reasoning_lines(blocks: &[serde_json::Value]) -> Option<String> {
         let mut lines: Vec<String> = Vec::with_capacity(blocks.len());
         for block in blocks {
@@ -9055,7 +9055,7 @@ mod tests {
         // Live-probe fixture (slice 2b, .worktree/probe-truefoundry-2026-09-03.md):
         // TrueFoundry returns thinking blocks with EMPTY text but a valid
         // signature. These must survive capture — a text-only gate would drop
-        // them and break replay (the same bug #10542 fixed for the native
+        // them and break replay (the same bug previously fixed for the native
         // provider's signature-only blocks).
         let provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
