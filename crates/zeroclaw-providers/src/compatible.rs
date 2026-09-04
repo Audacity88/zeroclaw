@@ -1215,7 +1215,7 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.resolve_credential().await?;
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
@@ -1264,23 +1264,30 @@ impl OpenAiCompatibleModelProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
 
         chat_response
             .choices
             .into_iter()
             .next()
-            .map(|c| {
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|t: &Vec<_>| !t.is_empty())
+            .map(|choice| {
+                let message = choice.message;
+                // Preserve the legacy history-path text contract exactly:
+                // non-empty tool_calls serialize the whole message as JSON
+                // text, everything else reduces to visible content.
+                let legacy_text = if message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|t: &Vec<_>| !t.is_empty())
                 {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.effective_content())
+                    serde_json::to_string(&message).unwrap_or_else(|_| message.effective_content())
                 } else {
-                    c.message.effective_content()
-                }
+                    message.effective_content()
+                };
+                let mut response = self.parse_native_response(message);
+                response.text = Some(legacy_text);
+                response.usage = usage;
+                response
             })
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -3510,8 +3517,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        self.chat_with_history_inner(messages, model, temperature, None)
-            .await
+        let response = self
+            .chat_with_history_inner(messages, model, temperature, None)
+            .await?;
+        Ok(response.text.unwrap_or_default())
     }
 
     async fn chat_with_tools(
@@ -3736,7 +3745,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
-                let text = self
+                let response = self
                     .chat_with_history_inner(
                         &fallback_messages,
                         model,
@@ -3744,12 +3753,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         request.thinking,
                     )
                     .await?;
-                return Ok(ProviderChatResponse {
-                    text: Some(text),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
+                return Ok(response);
             }
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
@@ -5426,7 +5430,18 @@ mod tests {
                                 .into_response();
                         }
                         Json(serde_json::json!({
-                            "choices": [{"message": {"content": "ok"}}]
+                            "choices": [{
+                                "message": {
+                                    "content": "ok",
+                                    "thinking_blocks": [
+                                        {
+                                            "type": "thinking",
+                                            "thinking": "guided fallback thought",
+                                            "signature": "sig_fb"
+                                        }
+                                    ]
+                                }
+                            }]
                         }))
                         .into_response()
                     }
@@ -5476,6 +5491,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.text.as_deref(), Some("ok"));
+        let captured: serde_json::Value = serde_json::from_str(
+            response
+                .reasoning_content
+                .as_deref()
+                .expect("fallback response must capture the returned signed thinking"),
+        )
+        .unwrap();
+        assert_eq!(
+            captured,
+            serde_json::json!({
+                "thinking": "guided fallback thought",
+                "signature": "sig_fb"
+            }),
+            "fallback response must capture the returned signed thinking, not drop it"
+        );
 
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2, "schema fallback must be a single retry");
@@ -5494,7 +5524,38 @@ mod tests {
             serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
             "fallback rebuild must rethread the same thinking injection"
         );
+        drop(bodies);
         server.abort();
+
+        // Two-turn regression: the captured fallback thinking must replay on
+        // the next tool-loop iteration. Simulate turn 2 by appending the
+        // assistant turn (as the runtime persists it) and converting.
+        let assistant_content = serde_json::json!({
+            "content": "ok",
+            "reasoning_content": response.reasoning_content,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"SF\"}",
+                }
+            ],
+        });
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant(assistant_content.to_string()),
+            ChatMessage::tool(r#"{"tool_call_id": "call_1", "content": "72F"}"#.to_string()),
+        ];
+        let native = provider.convert_messages_for_native(&history, false);
+        assert_eq!(
+            native[1].thinking_blocks,
+            Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "guided fallback thought",
+                "signature": "sig_fb"
+            })]),
+            "turn-2 outbound must replay the exact signed blocks captured on the fallback turn"
+        );
     }
 
     #[tokio::test]
