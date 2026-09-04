@@ -62,6 +62,10 @@ pub struct OpenAiCompatibleModelProvider {
     /// assistant history messages. Some providers reject reasoning fields as
     /// input even though they may return them in responses.
     replay_assistant_reasoning: bool,
+    /// Whether Anthropic prompt-cache breakpoints should be injected into
+    /// outbound request bodies (system prompt; rolling last message).
+    /// Drives `capabilities().prompt_caching` and the request-build path.
+    cache_passthrough: bool,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -426,6 +430,9 @@ pub struct OpenAiCompatibleBuilder {
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
     /// preserves the default (replay enabled).
     replay_assistant_reasoning_override: Option<bool>,
+    /// Set by [`OpenAiCompatibleBuilder::with_cache_passthrough`]. Default
+    /// `false`: requests and capability reporting are unchanged.
+    cache_passthrough: bool,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -554,6 +561,17 @@ impl OpenAiCompatibleBuilder {
     /// history messages.
     pub fn without_assistant_reasoning_replay(mut self) -> Self {
         self.replay_assistant_reasoning_override = Some(false);
+        self
+    }
+
+    /// Opt this provider into Anthropic prompt-cache passthrough: request
+    /// bodies gain `cache_control` breakpoints (system prompt; rolling last
+    /// message once the conversation has more than one non-system message),
+    /// mirroring the native Anthropic provider's placement strategy, and
+    /// gateway-reported cache usage is captured. The flag also reports
+    /// `prompt_caching` in the provider capabilities.
+    pub fn with_cache_passthrough(mut self) -> Self {
+        self.cache_passthrough = true;
         self
     }
 
@@ -691,6 +709,7 @@ impl OpenAiCompatibleBuilder {
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
+            cache_passthrough: self.cache_passthrough,
             api_path: self.api_path,
             max_tokens: self.max_tokens,
             models_dev_key: self.models_dev_key,
@@ -730,6 +749,7 @@ impl OpenAiCompatibleModelProvider {
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
+            cache_passthrough: false,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -2823,7 +2843,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         zeroclaw_api::model_provider::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
-            prompt_caching: false,
+            prompt_caching: self.cache_passthrough,
             extended_thinking: false,
         }
     }
@@ -4168,6 +4188,59 @@ mod tests {
         let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
 
         (provider, captured, server)
+    }
+
+    fn make_cache_passthrough_model_provider(
+        name: &str,
+        url: &str,
+    ) -> OpenAiCompatibleModelProvider {
+        OpenAiCompatibleModelProvider::builder("test")
+            .display_name(name)
+            .base_url(url)
+            .auth_style(AuthStyle::Bearer)
+            .with_cache_passthrough()
+            .build()
+    }
+
+    /// Capability pin: the compat provider reports prompt caching exactly
+    /// when the flag is set, so routing and UI gating can trust capability
+    /// reporting instead of probing the wire.
+    #[test]
+    fn cache_passthrough_capability_reports_flag_state() {
+        let off = make_model_provider("custom", "http://127.0.0.1:1", None);
+        assert!(!off.capabilities().prompt_caching);
+        let on = make_cache_passthrough_model_provider("custom", "http://127.0.0.1:1");
+        assert!(on.capabilities().prompt_caching);
+    }
+
+    /// Byte-identity pin for the default path: the flag-off request body is
+    /// fully specified, so any future injection work that leaks into the
+    /// default path fails this test instead of silently changing the wire.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_request_body_is_pinned() {
+        let (provider, captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}]
+        }))
+        .await;
+        let result = provider
+            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .await;
+        server.abort();
+        let result = result.unwrap_or_else(|error| panic!("flag-off request failed: {error}"));
+        assert_eq!(result, "ok");
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "stream": false,
+            }),
+            "flag-off request body must stay byte-identical to the pre-feature wire"
+        );
     }
 
     fn non_streaming_response_cases() -> Vec<(&'static str, serde_json::Value, Option<&'static str>)>
