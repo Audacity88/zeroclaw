@@ -14007,9 +14007,10 @@ mod tests {
 
         let mut chat = chat_with_active_input(PaneKind::Chat);
         assert!(matches!(
-            active_state(&mut chat)
-                .input_bar
-                .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            active_state(&mut chat).input_bar.handle_key(KeyEvent::new(
+                KeyCode::Char('a'),
+                crate::keymap::Chord::primary('a').effective_modifiers(),
+            )),
             InputBarAction::Consumed
         ));
         cases.push(("file explorer", chat));
