@@ -2446,6 +2446,12 @@ impl Chat {
         }
 
         if let ChatPhase::Active(ref mut state) = self.phase {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+                && state.transcript_drag_active
+            {
+                state.finish_transcript_drag();
+            }
+
             // The file explorer renders above every parent overlay.
             if state.input_bar.has_file_explorer() {
                 let consumed = state.input_bar.handle_mouse(mouse);
@@ -8812,6 +8818,43 @@ mod tests {
             })
         ));
         assert!(state.info_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn transcript_drag_finishes_when_mouse_up_lands_in_queue_sidebar() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(1, 1, 40, 8),
+            &["hello                               "],
+        ));
+        assert!(state.begin_transcript_drag(1, 1));
+        assert!(state.update_transcript_drag(2, 1));
+        state.turn_in_flight = true;
+        state
+            .enqueue_message("queued".to_string(), Vec::new())
+            .expect("queue message");
+        state.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 12));
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 45,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(!state.transcript_drag_active);
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("he"));
     }
 
     #[test]
