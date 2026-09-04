@@ -3445,13 +3445,14 @@ mod tests {
         let mut chat = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
         let mut sop = sop_pane::SopPane::new(rpc);
         let mut mode = Mode::Logs;
+        let dispatch_state = PostPollDispatchState::new(ConnectionState::Connected);
 
         tokio::time::timeout(
             Duration::from_millis(100),
             switch_mode(
                 &mut mode,
                 Mode::Chat,
-                &ConnectionState::Connected,
+                &dispatch_state,
                 &mut dashboard,
                 &mut quickstart,
                 &mut acp,
@@ -3485,6 +3486,7 @@ mod tests {
         let mut chat = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
         let mut sop = sop_pane::SopPane::new(Arc::clone(&rpc));
         let mut mode = Mode::Chat;
+        let dispatch_state = PostPollDispatchState::new(ConnectionState::Connected);
 
         chat.start_entry_retry();
         let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -3496,7 +3498,7 @@ mod tests {
         switch_mode(
             &mut mode,
             Mode::Logs,
-            &ConnectionState::Connected,
+            &dispatch_state,
             &mut dashboard,
             &mut quickstart,
             &mut acp,
