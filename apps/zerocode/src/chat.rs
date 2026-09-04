@@ -4388,7 +4388,7 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
     let Some(anchor) = snapshot.selection_anchor_rect(selection) else {
         return;
     };
-    let copy_label = message_copy_label();
+    let copy_label = context_menu_action_label(ChatContextMenuAction::Copy);
     let add_to_chat_label = context_menu_action_label(ChatContextMenuAction::AddToChat);
     let Some(rects) =
         transcript_action_rects(&copy_label, &add_to_chat_label, anchor, snapshot.area)
@@ -8758,6 +8758,14 @@ mod tests {
         assert_eq!(
             terminal.backend().buffer()[(regions[0].rect.x, regions[0].rect.y)].symbol(),
             "┌"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(regions[0].rect.x + 1, regions[0].rect.y + 1)].symbol(),
+            "C"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(regions[1].rect.x + 1, regions[1].rect.y + 1)].symbol(),
+            "A"
         );
         let region = regions
             .iter()
