@@ -5124,7 +5124,7 @@ mod tests {
         let channel = TelegramChannel::new(
             "test-token".into(),
             "default",
-            Arc::new(|| Vec::<String>::new()),
+            Arc::new(Vec::<String>::new),
             false,
         )
         .with_persistence_authority(authority.clone());
@@ -5153,7 +5153,7 @@ mod tests {
         let channel = TelegramChannel::new(
             "test-token".into(),
             "default",
-            Arc::new(|| Vec::<String>::new()),
+            Arc::new(Vec::<String>::new),
             false,
         )
         .with_persistence_authority(authority.clone());

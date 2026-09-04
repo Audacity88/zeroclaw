@@ -2643,7 +2643,7 @@ mod tests {
         let authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
         let channel = WeChatChannel::new(
             "wechat_test_alias",
-            Arc::new(|| Vec::<String>::new()),
+            Arc::new(Vec::<String>::new),
             None,
             None,
             Some(state_dir.path().to_path_buf()),

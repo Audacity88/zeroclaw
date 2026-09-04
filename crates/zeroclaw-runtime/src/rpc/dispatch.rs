@@ -1050,7 +1050,7 @@ impl RpcDispatcher {
             if trimmed.is_empty() {
                 continue;
             }
-            self.process_line(trimmed).await;
+            Box::pin(self.process_line(trimmed)).await;
             while let Some(result) = self.prompt_tasks.try_join_next() {
                 Self::log_prompt_task_failure(result);
             }
@@ -1738,7 +1738,7 @@ impl RpcDispatcher {
     /// the transport `process_line` path.
     #[cfg(test)]
     async fn process_line_for_test(&mut self, line: &str) {
-        self.process_line(line).await;
+        Box::pin(self.process_line(line)).await;
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
@@ -11054,9 +11054,10 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
+            .thread_stack_size(2 * 1024 * 1024)
             .enable_all()
             .build()
-            .expect("default-stack Tokio runtime");
+            .expect("two-megabyte-stack Tokio runtime");
 
         runtime.block_on(async {
             let task = zeroclaw_spawn::spawn!(async {

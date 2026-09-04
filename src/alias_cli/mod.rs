@@ -378,10 +378,10 @@ pub(crate) async fn route_agent_mutation(
                     &config.data_dir,
                 )
                 .map_err(|error| {
-                    anyhow::anyhow!(
+                    anyhow::Error::msg(format!(
                         "daemon endpoint {} is unavailable, but offline config ownership could not be acquired: {error}",
                         path.display()
-                    )
+                    ))
                 })?;
             let expected_path = config.config_path.clone();
             let fresh = Box::pin(Config::load_or_init())
@@ -396,9 +396,9 @@ pub(crate) async fn route_agent_mutation(
             *config = fresh;
             Ok(AgentMutationRoute::Offline(ownership))
         }
-        Err(error) => Err(anyhow::anyhow!(
+        Err(error) => Err(anyhow::Error::msg(format!(
             "refusing offline agent mutation because daemon coordination failed: {error}"
-        )),
+        ))),
     }
 }
 
@@ -1129,9 +1129,10 @@ mod tests {
             ..Config::default()
         };
         config.memory.backend = "sqlite".to_string();
-        config
-            .agents
-            .insert("victim".to_string(), Default::default());
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
 
         let workspace = config.agent_workspace_dir("victim");
         let handles = build_owned_state_handles(&config).unwrap();

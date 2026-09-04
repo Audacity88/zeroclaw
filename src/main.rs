@@ -7186,7 +7186,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
                 let selected_value = if no_interactive {
-                    let val = value.ok_or_else(|| {
+                    value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -7197,8 +7197,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         anyhow::Error::msg(format!(
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         ))
-                    })?;
-                    val
+                    })?
                 } else if Config::prop_is_secret(&path) {
                     if value.is_some() {
                         eprintln!(
@@ -7248,11 +7247,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "  no live catalog for `{provider_type}` — \
                              enter the model id manually."
                         );
-                        let m = Input::<String>::new()
+                        Input::<String>::new()
                             .with_prompt(format!("Model id for {provider_type}"))
                             .allow_empty(false)
-                            .interact_text()?;
-                        m
+                            .interact_text()?
                     }
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
@@ -7301,13 +7299,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let edited = dialoguer::Editor::new()
                             .edit(&editor_content)?
                             .unwrap_or(editor_content);
-                        let val = edited
+                        edited
                             .lines()
                             .map(|l| l.trim())
                             .filter(|l| !l.is_empty())
                             .collect::<Vec<_>>()
-                            .join(", ");
-                        val
+                            .join(", ")
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }

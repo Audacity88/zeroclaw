@@ -621,7 +621,7 @@ pub async fn run_gateway(
 
 /// Run the gateway with the live config authority owned by its daemon
 /// generation.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_gateway_with_authority(
     host: &str,
     port: u16,
@@ -2625,7 +2625,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
         let generation = state.agent_lifecycle.alias_generation(&agent_alias);
         let _turn_lease = state
             .reserve_agent_turn_at(agent_alias.clone(), generation)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?;
         // The first snapshot only identifies the alias. Re-read after admission
         // so a delete/recreate completed just before the lease cannot run with
         // the predecessor generation's agent configuration.
@@ -7890,6 +7890,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,

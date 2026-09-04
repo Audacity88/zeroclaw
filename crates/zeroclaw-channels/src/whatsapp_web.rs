@@ -3386,8 +3386,8 @@ mod tests {
         let channel = WhatsAppWebChannel::new(
             &zeroclaw_config::schema::WhatsAppConfig::default(),
             "default",
-            Arc::new(|| Vec::<String>::new()),
-            Arc::new(|| Vec::<String>::new()),
+            Arc::new(Vec::<String>::new),
+            Arc::new(Vec::<String>::new),
         )
         .with_persistence_authority(authority.clone());
         let stored = channel.persist.as_ref().expect("authority is stored");

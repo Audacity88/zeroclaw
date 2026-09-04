@@ -1179,20 +1179,19 @@ pub async fn handle_delete_map_key(
     } else {
         None
     };
-    match zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
-        Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
-            // Agent deletion is special: it must scrub config references
-            // (heartbeat, peer-groups, delegates, workspace.access, …) via
-            // `delete_with_cascade` and cascade owned non-config state (memory /
-            // cron / acp / session).
-            return delete_agent_cascade(
-                &state,
-                &q.key,
-                agent_lifecycle_lease.expect("agent path acquires lifecycle lease"),
-            )
-            .await;
-        }
-        Some(_) | None => {}
+    if let Some(zeroclaw_config::alias_refs::AliasKind::Agent) =
+        zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path)
+    {
+        // Agent deletion is special: it must scrub config references
+        // (heartbeat, peer-groups, delegates, workspace.access, …) via
+        // `delete_with_cascade` and cascade owned non-config state (memory /
+        // cron / acp / session).
+        return delete_agent_cascade(
+            &state,
+            &q.key,
+            agent_lifecycle_lease.expect("agent path acquires lifecycle lease"),
+        )
+        .await;
     }
     // Acquired before this read-for-modify, threaded into the cascade
     // helpers below, and held through whichever branch's swap runs.
