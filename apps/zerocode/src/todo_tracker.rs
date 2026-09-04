@@ -92,9 +92,6 @@ impl TodoTracker {
     pub(crate) fn toggle(&mut self) {
         if self.settings.enabled {
             self.visible = !self.visible;
-            if !self.visible {
-                self.has_ever_popped = true;
-            }
         }
     }
 
@@ -339,6 +336,21 @@ mod tests {
         t.set_plan(vec![entry("A", PlanStatus::InProgress)]);
 
         assert!(!t.is_visible(), "plan updates respect session dismissal");
+        assert_eq!(t.entries()[0].content, "A");
+    }
+
+    #[test]
+    fn keyboard_toggle_before_first_plan_preserves_existing_autopop() {
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.toggle();
+        assert!(!t.is_visible());
+
+        t.set_plan(vec![entry("A", PlanStatus::InProgress)]);
+
+        assert!(
+            t.is_visible(),
+            "Ctrl+P hide does not consume first auto-pop"
+        );
         assert_eq!(t.entries()[0].content, "A");
     }
 
