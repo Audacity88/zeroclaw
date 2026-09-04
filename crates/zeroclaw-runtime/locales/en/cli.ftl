@@ -816,6 +816,7 @@ cli-desktop-not-installed = ZeroClaw companion app is not installed.
 cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
 cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
+cli-config-initialized-sections = Initialized {$count} section(s) with defaults:
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.

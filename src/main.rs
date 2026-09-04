@@ -7415,7 +7415,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     )
                                 );
                             } else {
-                                println!("Initialized 1 section(s) with defaults:");
+                                println!(
+                                    "{}",
+                                    ta(
+                                        "cli-config-initialized-sections",
+                                        &[("count", "1")],
+                                        "Initialized {$count} section(s) with defaults:"
+                                    )
+                                );
                                 println!("  {}", initialized[0]);
                             }
                             return Ok(());
@@ -7459,8 +7466,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     );
                 } else {
                     println!(
-                        "Initialized {} section(s) with defaults:",
-                        initialized.len()
+                        "{}",
+                        ta(
+                            "cli-config-initialized-sections",
+                            &[("count", &initialized.len().to_string())],
+                            "Initialized {$count} section(s) with defaults:"
+                        )
                     );
                     for name in &initialized {
                         println!("  {name}");
