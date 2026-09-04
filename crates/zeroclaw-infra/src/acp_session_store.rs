@@ -49,6 +49,13 @@ pub enum AcpSessionRestore {
     Restorable(AcpSessionData),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpSessionKillTransition {
+    Marked,
+    AlreadyKilled,
+    Missing,
+}
+
 /// Lightweight summary for the ACP session picker. Avoids loading the full
 /// message history just to render a one-line label per session.
 pub struct AcpSessionSummary {
@@ -1215,21 +1222,61 @@ impl AcpSessionStore {
         Ok(rows)
     }
 
-    /// Persist that an admin intentionally killed this ACP session. The
-    /// transcript stays durable, but runtime rehydration must not revive it.
-    pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
+    /// Atomically persist that an admin intentionally killed this ACP session.
+    /// The transcript and any checkpoint stay durable, but runtime rehydration
+    /// must not revive it.
+    pub fn mark_session_killed_atomic(
+        &self,
+        session_uuid: &str,
+    ) -> Result<AcpSessionKillTransition> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
-        let rows = conn
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin ACP session kill transition")?;
+        let rows = tx
             .execute(
                 "UPDATE acp_sessions
                     SET killed_at = COALESCE(killed_at, ?1),
                         last_activity = ?1
-                  WHERE session_uuid = ?2",
+                  WHERE session_uuid = ?2 AND killed_at IS NULL",
                 params![now, session_uuid],
             )
             .context("Failed to mark ACP session killed")?;
-        Ok(rows > 0)
+        let transition = if rows == 1 {
+            AcpSessionKillTransition::Marked
+        } else {
+            let killed_at: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT killed_at FROM acp_sessions WHERE session_uuid = ?1",
+                    params![session_uuid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("Failed to inspect ACP session kill transition")?;
+            match killed_at {
+                Some(Some(_)) => AcpSessionKillTransition::AlreadyKilled,
+                Some(None) => {
+                    anyhow::bail!("ACP session kill transition made no durable change")
+                }
+                None => AcpSessionKillTransition::Missing,
+            }
+        };
+        tx.commit()
+            .context("Failed to commit ACP session kill transition")?;
+        Ok(transition)
+    }
+
+    /// Persist that an admin intentionally killed this ACP session. The
+    /// transcript stays durable, but runtime rehydration must not revive it.
+    /// This compatibility wrapper retains the original boolean contract for
+    /// existing callers; use `mark_session_killed_atomic` when the distinction
+    /// between marked, already-killed, and missing matters.
+    pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
+        Ok(matches!(
+            self.mark_session_killed_atomic(session_uuid)?,
+            AcpSessionKillTransition::Marked | AcpSessionKillTransition::AlreadyKilled
+        ))
     }
 
     /// Return whether this durable ACP session has been intentionally killed.
@@ -2089,6 +2136,36 @@ mod tests {
         let (_tmp, store) = open_store();
         assert!(!store.mark_session_killed("ghost").unwrap());
         assert!(!store.is_session_killed("ghost").unwrap());
+    }
+
+    #[test]
+    fn atomic_kill_transition_distinguishes_marked_already_killed_and_missing() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-atomic-kill", "alpha", "/tmp/proj")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .mark_session_killed_atomic("sess-atomic-kill")
+                .unwrap(),
+            AcpSessionKillTransition::Marked
+        );
+        assert_eq!(
+            store
+                .mark_session_killed_atomic("sess-atomic-kill")
+                .unwrap(),
+            AcpSessionKillTransition::AlreadyKilled
+        );
+        assert!(
+            store.mark_session_killed("sess-atomic-kill").unwrap(),
+            "the compatibility wrapper must retain its existing-row contract"
+        );
+        assert_eq!(
+            store.mark_session_killed_atomic("ghost").unwrap(),
+            AcpSessionKillTransition::Missing
+        );
+        assert!(store.load_session("sess-atomic-kill").unwrap().is_some());
     }
 
     #[test]

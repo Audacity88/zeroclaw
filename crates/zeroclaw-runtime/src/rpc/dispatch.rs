@@ -1819,12 +1819,7 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
-        let chat_mode = self
-            .ctx
-            .sessions
-            .chat_mode(sid)
-            .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let chat_mode = self.ctx.sessions.chat_mode(sid).await;
 
         let agent_alias = self
             .ctx
@@ -1841,18 +1836,35 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        if matches!(chat_mode, ChatMode::Acp) {
-            let store = self
-                .ctx
-                .acp_session_store
-                .clone()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
+        let live_acp = matches!(chat_mode.as_ref(), Some(ChatMode::Acp));
+        let mut durable_kill = None;
+        if live_acp || chat_mode.is_none() {
+            let store = self.ctx.acp_session_store.clone().ok_or_else(|| {
+                if live_acp {
+                    rpc_err(INTERNAL_ERROR, "ACP session store is not available")
+                } else {
+                    rpc_err(SESSION_NOT_FOUND, "Session not found")
+                }
+            })?;
             let sid_owned = sid.to_string();
-            let marked =
-                tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned)).await;
-            match marked {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => {
+            let transitioned =
+                tokio::task::spawn_blocking(move || store.mark_session_killed_atomic(&sid_owned))
+                    .await;
+            match transitioned {
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionKillTransition::Marked)) => {
+                    durable_kill = Some(true);
+                }
+                Ok(Ok(
+                    zeroclaw_infra::acp_session_store::AcpSessionKillTransition::AlreadyKilled,
+                )) => {
+                    durable_kill = Some(false);
+                }
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionKillTransition::Missing))
+                    if !live_acp =>
+                {
+                    return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                }
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionKillTransition::Missing)) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1876,7 +1888,8 @@ impl RpcDispatcher {
             }
         }
 
-        let killed = self.ctx.sessions.kill_session(sid).await;
+        let live_killed = self.ctx.sessions.kill_session(sid).await;
+        let killed = durable_kill.unwrap_or(live_killed);
         if killed {
             if let Some(ref hooks) = self.ctx.hooks {
                 hooks.fire_session_end(sid, "rpc").await;
@@ -2113,6 +2126,7 @@ impl RpcDispatcher {
                 }
             },
         };
+        let live_agent = Arc::clone(&agent);
 
         // Process inline attachments: upload each, append markers to prompt.
         let mut prompt = req.prompt.clone();
@@ -2348,6 +2362,7 @@ impl RpcDispatcher {
         let cancel_cause = cancel_registration.finish();
 
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+            let live_turn_messages = acp_checkpoint_live_messages(&outcome);
             let checkpoint_result = if let Some(error) = checkpoint_write_error.clone() {
                 Err(error)
             } else if let (Some(store), Some(turn_id)) = (
@@ -2359,7 +2374,26 @@ impl RpcDispatcher {
                 Ok(AcpCheckpointFinish::Finalized)
             };
             match checkpoint_result {
-                Ok(AcpCheckpointFinish::Finalized) => {}
+                Ok(AcpCheckpointFinish::Finalized) => {
+                    if let Some(expected_suffix) = live_turn_messages {
+                        let transcript_suffix = acp_checkpoint_transcript_messages(&outcome)
+                            .unwrap_or_else(|| expected_suffix.clone());
+                        let provider_suffix =
+                            zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+                                &transcript_suffix,
+                            );
+                        let converged = {
+                            let mut agent = live_agent.lock().await;
+                            agent.replace_history_suffix(&expected_suffix, provider_suffix)
+                        };
+                        if !converged {
+                            // Durable state is already provider-safe. Drop a
+                            // structurally divergent live generation so the
+                            // next prompt must rehydrate that state.
+                            self.ctx.sessions.remove(sid).await;
+                        }
+                    }
+                }
                 Ok(AcpCheckpointFinish::RecoveryRequired) => {
                     self.ctx.sessions.remove(sid).await;
                 }
@@ -5459,14 +5493,10 @@ async fn finish_acp_checkpoint(
     turn_id: &str,
     outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
 ) -> Result<AcpCheckpointFinish, String> {
-    let messages = match outcome {
-        Ok(TurnOutcome::Completed { messages, .. }) => Some(messages.clone()),
-        Ok(TurnOutcome::Cancelled { messages, .. }) if !messages.is_empty() => {
-            Some(messages.clone())
-        }
-        Ok(TurnOutcome::Cancelled { .. }) => return Ok(AcpCheckpointFinish::RecoveryRequired),
-        Err(_) => None,
-    };
+    let messages = acp_checkpoint_transcript_messages(outcome);
+    if messages.is_none() && matches!(outcome, Ok(TurnOutcome::Cancelled { .. })) {
+        return Ok(AcpCheckpointFinish::RecoveryRequired);
+    }
     let store = Arc::clone(store);
     let session_id = session_id.to_string();
     let turn_id = turn_id.to_string();
@@ -5480,6 +5510,62 @@ async fn finish_acp_checkpoint(
         Ok(Err(error)) => Err(error.to_string()),
         Err(join) => Err(join.to_string()),
     }
+}
+
+fn acp_checkpoint_transcript_messages(
+    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+) -> Option<Vec<ConversationMessage>> {
+    let messages = match outcome {
+        Ok(TurnOutcome::Completed { messages, .. }) => return Some(messages.clone()),
+        Ok(TurnOutcome::Cancelled { messages, .. }) if !messages.is_empty() => messages.clone(),
+        Ok(TurnOutcome::Cancelled { .. }) | Err(_) => return None,
+    };
+
+    Some(project_acp_transcript_messages(messages))
+}
+
+fn acp_checkpoint_live_messages(
+    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+) -> Option<Vec<ConversationMessage>> {
+    match outcome {
+        Ok(TurnOutcome::Cancelled { messages, .. }) if !messages.is_empty() => {
+            Some(messages.clone())
+        }
+        Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Cancelled { .. }) | Err(_) => None,
+    }
+}
+
+fn project_acp_transcript_messages(
+    mut messages: Vec<ConversationMessage>,
+) -> Vec<ConversationMessage> {
+    // The Agent appends one terminal synthetic marker on cancellation. Remove
+    // exactly that suffix, preserving any preceding provider text (including a
+    // model-authored copy of the same marker), then record neutral provenance.
+    let interruption = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+    let terminal_suffix = format!("\n\n{interruption}");
+    let partial = match messages.last() {
+        Some(ConversationMessage::Chat(chat)) if chat.role == "assistant" => {
+            if chat.content == interruption {
+                Some(String::new())
+            } else {
+                chat.content
+                    .strip_suffix(&terminal_suffix)
+                    .map(ToOwned::to_owned)
+            }
+        }
+        _ => None,
+    };
+    if let Some(partial) = partial {
+        if partial.is_empty() {
+            messages.pop();
+        } else if let Some(ConversationMessage::Chat(chat)) = messages.last_mut() {
+            chat.content = partial;
+        }
+        messages.push(ConversationMessage::Chat(ChatMessage::system(
+            crate::i18n::get_required_cli_string("turn-stream-interrupted"),
+        )));
+    }
+    messages
 }
 
 async fn persist_checkpoint_event_before_notification(
@@ -9493,6 +9579,55 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn acp_cancel_projection_neutralizes_only_the_terminal_synthetic_marker() {
+        let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let neutral = crate::i18n::get_required_cli_string("turn-stream-interrupted");
+        let authored = format!("model-authored {marker}");
+        let outcome = Ok(TurnOutcome::Cancelled {
+            partial_text: format!("{authored}\n\n{marker}"),
+            messages: vec![
+                ConversationMessage::Chat(ChatMessage::user("question")),
+                ConversationMessage::Chat(ChatMessage::assistant(format!(
+                    "{authored}\n\n{marker}"
+                ))),
+            ],
+        });
+
+        let transcript = acp_checkpoint_transcript_messages(&outcome).unwrap();
+        assert!(matches!(
+            transcript.as_slice(),
+            [
+                ..,
+                ConversationMessage::Chat(message),
+                ConversationMessage::Chat(neutral_message)
+            ] if message.role == "assistant"
+                && message.content == authored
+                && neutral_message.role == "system"
+                && neutral_message.content == neutral
+        ));
+        let provider =
+            zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(&transcript);
+        assert!(!provider.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == neutral
+        )));
+
+        let model_authored = vec![
+            ConversationMessage::Chat(ChatMessage::assistant(authored.clone())),
+            ConversationMessage::Chat(ChatMessage::assistant("following text")),
+        ];
+        let preserved = project_acp_transcript_messages(model_authored);
+        assert!(matches!(
+            preserved.as_slice(),
+            [
+                ConversationMessage::Chat(authored_message),
+                ConversationMessage::Chat(following_message)
+            ] if authored_message.content == authored
+                && following_message.content == "following text"
+        ));
+    }
+
     #[tokio::test]
     async fn checkpoint_notification_waits_for_write() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -10590,6 +10725,301 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_cancel_retains_provider_safe_live_history_for_follow_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-cancel-follow-up-history";
+        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+
+        let prior = vec![
+            ConversationMessage::Chat(ChatMessage::user("prior question")),
+            ConversationMessage::Chat(ChatMessage::assistant("prior model answer")),
+        ];
+        acp_store.append_turn(sid, &prior).unwrap();
+
+        let seen_messages = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(AcpHistoryProbeProvider {
+                seen_messages: Arc::clone(&seen_messages),
+                started: started_tx,
+                chunk_seen: chunk_tx,
+                calls,
+                cancel_first: true,
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .unwrap();
+        agent.seed_conversation_history(prior);
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                )
+                .with_owner(Some("history-owner".to_string())),
+            )
+            .await
+            .unwrap();
+
+        dispatcher.set_tui_id_for_test(Some("history-owner".to_string()));
+        let prompt_handle = dispatcher.spawn_handle();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "first prompt",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("the first ACP provider request must be observed");
+        chunk_rx
+            .recv()
+            .await
+            .expect("the first ACP partial response must be observed");
+        tokio::task::yield_now().await;
+
+        let cancelled = dispatcher
+            .handle_session_cancel(&json!({"session_id": sid}))
+            .await
+            .expect("the owning client must be allowed to cancel");
+        assert_eq!(cancelled["cancelled"], json!(true));
+        let first_result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+            .await
+            .expect("cooperative ACP cancellation must settle")
+            .expect("the prompt task must not panic")
+            .expect("the cancelled prompt must return a result");
+        assert_eq!(first_result["stop_reason"], json!("cancelled"));
+
+        let neutral = crate::i18n::get_required_cli_string("turn-stream-interrupted");
+        let synthetic = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let durable = acp_store.load_session(sid).unwrap().unwrap();
+        assert!(durable.messages.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat)
+                if chat.role == "system" && chat.content == neutral
+        )));
+        assert!(!durable.messages.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content.contains(&synthetic)
+        )));
+
+        let follow_up_handle = dispatcher.spawn_handle();
+        let follow_up = zeroclaw_spawn::spawn!(async move {
+            follow_up_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "follow up",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("the follow-up ACP provider request must be observed");
+        let follow_up_result = follow_up.await.expect("follow-up task must not panic");
+        assert!(
+            follow_up_result.is_ok(),
+            "the retained ACP session must accept a follow-up: {follow_up_result:?}"
+        );
+
+        let seen = seen_messages.lock();
+        assert_eq!(seen.len(), 2);
+        let follow_up_request = &seen[1];
+        assert!(follow_up_request.iter().any(|message| matches!(
+            message,
+            chat if chat.content == "prior model answer"
+        )));
+        assert!(follow_up_request.iter().any(|message| matches!(
+            message,
+            chat if chat.content == "partial model answer"
+        )));
+        assert!(!follow_up_request.iter().any(|message| matches!(
+            message,
+            chat if chat.content.contains(&synthetic) || chat.content.contains(&neutral)
+        )));
+
+        drop(seen);
+        assert!(
+            sessions.remove(sid).await,
+            "the live session must be reaped"
+        );
+        let _session_guard = sessions.session_queue.acquire(sid).await.unwrap();
+        let recovered = dispatcher
+            .rehydrate_reaped_session_under_guard(sid)
+            .await
+            .expect("the cancellation-produced ACP row must rehydrate");
+        let rehydrated_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (rehydrated_started_tx, mut rehydrated_started_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (rehydrated_chunk_tx, _rehydrated_chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        recovered
+            .lock()
+            .await
+            .set_model_provider(Box::new(AcpHistoryProbeProvider {
+                seen_messages: Arc::clone(&rehydrated_seen),
+                started: rehydrated_started_tx,
+                chunk_seen: rehydrated_chunk_tx,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                cancel_first: false,
+            }));
+        drop(_session_guard);
+
+        let rehydrated_prompt_handle = dispatcher.spawn_handle();
+        let rehydrated_prompt = zeroclaw_spawn::spawn!(async move {
+            rehydrated_prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "rehydrated follow up",
+                }))
+                .await
+        });
+        rehydrated_started_rx
+            .recv()
+            .await
+            .expect("the rehydrated provider request must be observed");
+        assert!(
+            rehydrated_prompt
+                .await
+                .expect("rehydrated prompt task must not panic")
+                .is_ok()
+        );
+
+        let rehydrated_seen = rehydrated_seen.lock();
+        assert_eq!(rehydrated_seen.len(), 1);
+        assert!(rehydrated_seen[0].iter().any(|message| matches!(
+            message,
+            chat if chat.content == "prior model answer"
+        )));
+        assert!(rehydrated_seen[0].iter().any(|message| matches!(
+            message,
+            chat if chat.content == "partial model answer"
+        )));
+        assert!(!rehydrated_seen[0].iter().any(|message| matches!(
+            message,
+            chat if chat.content.contains(&synthetic) || chat.content.contains(&neutral)
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acp_session_kill_hard_aborts_turn_paused_before_provider() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-hard-kill-entry-pause";
+        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+        let (entry_pause, entered, _release) = crate::agent::agent::TestTurnEntryPause::new();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(FailingProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .test_turn_entry_pause(entry_pause)
+            .build()
+            .unwrap();
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "pause before provider",
+                }))
+                .await
+        });
+        entered.notified().await;
+        assert!(
+            !prompt_task.is_finished(),
+            "the prompt must remain paused after acquiring the Agent"
+        );
+
+        let kill_handle = dispatcher.spawn_handle();
+        let kill_task = zeroclaw_spawn::spawn!(async move {
+            kill_handle
+                .handle_session_kill(&json!({"session_id": sid}))
+                .await
+        });
+        assert!(dispatcher.ctx.sessions.signal_session_kill(sid));
+        tokio::task::yield_now().await;
+        assert!(!prompt_task.is_finished());
+        assert!(
+            !kill_task.is_finished(),
+            "session/kill must wait for the admitted turn before durable fallback"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let prompt_result = prompt_task
+            .await
+            .expect("hard-aborted prompt task must not panic")
+            .expect("hard-aborted prompt must return a cancellation result");
+        assert_eq!(prompt_result["stop_reason"], json!("cancelled"));
+        assert_eq!(prompt_result["content"], json!(""));
+
+        let killed = kill_task
+            .await
+            .expect("session/kill task must not panic")
+            .expect("session/kill durable fallback must succeed");
+        assert_eq!(killed["killed"], json!(true));
+        assert!(sessions.get_agent(sid).await.is_none());
+        assert!(acp_store.is_session_killed(sid).unwrap());
+        assert!(
+            !acp_store
+                .recover_turn_checkpoint(sid, "must not promote after hard kill")
+                .unwrap(),
+            "a killed session must reject checkpoint promotion"
+        );
+
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await;
+        assert!(
+            resumed.is_err(),
+            "a hard-killed ACP session must not resume"
+        );
+    }
+
+    #[tokio::test]
     async fn killed_acp_session_does_not_rehydrate_from_durable_store() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -10641,6 +11071,46 @@ mod tests {
         assert!(
             sessions.get_agent(sid).await.is_none(),
             "failed rehydrate must leave the session absent from memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_kill_uses_durable_fallback_after_live_acp_session_is_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-kill-after-reap-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP row");
+        assert!(
+            sessions.remove(sid).await,
+            "test reaper removes the live owner"
+        );
+
+        let killed = dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("durable ACP fallback should mark the row");
+        assert_eq!(killed["killed"], json!(true));
+        assert!(acp_store.is_session_killed(sid).unwrap());
+
+        let repeated = dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("repeated kill should be idempotent");
+        assert_eq!(
+            repeated["killed"],
+            json!(false),
+            "an already-killed durable row is not a new kill"
         );
     }
 
@@ -13451,6 +13921,97 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "gated-provider"
+        }
+    }
+
+    struct AcpHistoryProbeProvider {
+        seen_messages: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        chunk_seen: tokio::sync::mpsc::UnboundedSender<()>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        cancel_first: bool,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for AcpHistoryProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("fallback".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+
+            self.seen_messages.lock().push(request.messages.to_vec());
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let _ = self.started.send(());
+            if self.cancel_first && call == 1 {
+                let chunk_seen = self.chunk_seen.clone();
+                let first = futures_util::stream::once(async move {
+                    let _ = chunk_seen.send(());
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk::delta("partial model answer"),
+                    ))
+                });
+                return first.chain(futures_util::stream::pending()).boxed();
+            }
+            let chunk_seen = self.chunk_seen.clone();
+            futures_util::stream::iter(vec![
+                Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk::delta("follow-up answer"),
+                )),
+                Ok(zeroclaw_providers::traits::StreamEvent::Final),
+            ])
+            .inspect(move |_| {
+                let _ = chunk_seen.send(());
+            })
+            .boxed()
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for AcpHistoryProbeProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "acp-history-probe"
         }
     }
 
