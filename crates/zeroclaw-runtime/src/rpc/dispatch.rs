@@ -1050,7 +1050,7 @@ impl RpcDispatcher {
             if trimmed.is_empty() {
                 continue;
             }
-            Box::pin(self.process_line(trimmed)).await;
+            self.process_line(trimmed).await;
             while let Some(result) = self.prompt_tasks.try_join_next() {
                 Self::log_prompt_task_failure(result);
             }
@@ -1169,17 +1169,28 @@ impl RpcDispatcher {
             return;
         }
 
-        // Exhaustive match — compiler enforces every Method has a handler.
+        Box::pin(self.dispatch_method(method, &req.params, req_id, is_notification)).await;
+    }
+
+    async fn dispatch_method(
+        &mut self,
+        method: Method,
+        params: &Value,
+        req_id: Value,
+        is_notification: bool,
+    ) {
+        // Keep the exhaustive handler future behind one fixed-size pointer so
+        // adding a handler cannot enlarge every RPC transport worker's stack.
         let result = match method {
             // Core
-            Method::Initialize => self.handle_initialize(&req.params).await,
+            Method::Initialize => self.handle_initialize(params).await,
             Method::Status => self.handle_status().await,
             Method::Health => self.handle_health(),
             Method::DoctorRun => self.handle_doctor_run().await,
 
             // Sessions
-            Method::SessionNew => Box::pin(self.handle_session_new(&req.params)).await,
-            Method::SessionClose => self.handle_session_close(&req.params).await,
+            Method::SessionNew => self.handle_session_new(params).await,
+            Method::SessionClose => self.handle_session_close(params).await,
             Method::SessionPrompt => {
                 // Always spawn — turn completion is signaled by a
                 // TurnComplete notification, not by this method's response.
@@ -1187,7 +1198,7 @@ impl RpcDispatcher {
                 // request-form callers don't park forever.
                 let handle = self.spawn_handle();
                 let id_clone = req_id.clone();
-                let params_clone = req.params.clone();
+                let params_clone = params.clone();
                 let is_notif = is_notification;
                 self.prompt_tasks.spawn(async move {
                     let result = handle.handle_session_prompt(&params_clone).await;
@@ -1200,120 +1211,118 @@ impl RpcDispatcher {
                 });
                 return;
             }
-            Method::SessionConfigure => self.handle_session_configure(&req.params).await,
-            Method::SessionCancel => self.handle_session_cancel(&req.params).await,
-            Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
-            Method::SessionList => self.handle_session_list(&req.params).await,
-            Method::SessionListAcp => self.handle_session_list_acp(&req.params).await,
-            Method::SessionMessages => self.handle_session_messages(&req.params).await,
-            Method::SessionState => self.handle_session_state(&req.params).await,
-            Method::SessionDelete => self.handle_session_delete(&req.params).await,
-            Method::SessionApprove => self.handle_session_approve(&req.params),
-            Method::SessionKill => self.handle_session_kill(&req.params).await,
+            Method::SessionConfigure => self.handle_session_configure(params).await,
+            Method::SessionCancel => self.handle_session_cancel(params).await,
+            Method::SessionGitBranch => self.handle_session_git_branch(params).await,
+            Method::SessionList => self.handle_session_list(params).await,
+            Method::SessionListAcp => self.handle_session_list_acp(params).await,
+            Method::SessionMessages => self.handle_session_messages(params).await,
+            Method::SessionState => self.handle_session_state(params).await,
+            Method::SessionDelete => self.handle_session_delete(params).await,
+            Method::SessionApprove => self.handle_session_approve(params),
+            Method::SessionKill => self.handle_session_kill(params).await,
 
             // Memory
-            Method::MemoryList => self.handle_memory_list(&req.params).await,
-            Method::MemorySearch => self.handle_memory_search(&req.params).await,
-            Method::MemoryGet => self.handle_memory_get(&req.params).await,
-            Method::MemoryStore => self.handle_memory_store(&req.params).await,
-            Method::MemoryDelete => self.handle_memory_delete(&req.params).await,
+            Method::MemoryList => self.handle_memory_list(params).await,
+            Method::MemorySearch => self.handle_memory_search(params).await,
+            Method::MemoryGet => self.handle_memory_get(params).await,
+            Method::MemoryStore => self.handle_memory_store(params).await,
+            Method::MemoryDelete => self.handle_memory_delete(params).await,
 
             // Cron
             Method::CronList => self.handle_cron_list().await,
-            Method::CronGet => self.handle_cron_get(&req.params).await,
-            Method::CronAdd => self.handle_cron_add(&req.params).await,
-            Method::CronPatch => self.handle_cron_patch(&req.params).await,
-            Method::CronDelete => self.handle_cron_delete(&req.params).await,
-            Method::CronRuns => self.handle_cron_runs(&req.params).await,
-            Method::CronTrigger => self.handle_cron_trigger(&req.params).await,
-            Method::CronSettings => self.handle_cron_settings(&req.params).await,
+            Method::CronGet => self.handle_cron_get(params).await,
+            Method::CronAdd => self.handle_cron_add(params).await,
+            Method::CronPatch => self.handle_cron_patch(params).await,
+            Method::CronDelete => self.handle_cron_delete(params).await,
+            Method::CronRuns => self.handle_cron_runs(params).await,
+            Method::CronTrigger => self.handle_cron_trigger(params).await,
+            Method::CronSettings => self.handle_cron_settings(params).await,
 
             // Config
-            Method::ConfigGet => self.handle_config_get(&req.params),
-            Method::ConfigSet => self.handle_config_set(&req.params).await,
+            Method::ConfigGet => self.handle_config_get(params),
+            Method::ConfigSet => self.handle_config_set(params).await,
             Method::ConfigValidate => self.handle_config_validate(),
             Method::ConfigReload => self.handle_config_reload(),
-            Method::ConfigList => self.handle_config_list(&req.params),
-            Method::ConfigDelete => self.handle_config_delete(&req.params).await,
-            Method::ConfigMapKeys => self.handle_config_map_keys(&req.params),
-            Method::ConfigResolveAliasSource => {
-                self.handle_config_resolve_alias_source(&req.params)
-            }
-            Method::ConfigMapKeyCreate => self.handle_config_map_key_create(&req.params).await,
-            Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(&req.params).await,
-            Method::ConfigMapKeyRename => self.handle_config_map_key_rename(&req.params).await,
+            Method::ConfigList => self.handle_config_list(params),
+            Method::ConfigDelete => self.handle_config_delete(params).await,
+            Method::ConfigMapKeys => self.handle_config_map_keys(params),
+            Method::ConfigResolveAliasSource => self.handle_config_resolve_alias_source(params),
+            Method::ConfigMapKeyCreate => self.handle_config_map_key_create(params).await,
+            Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(params).await,
+            Method::ConfigMapKeyRename => self.handle_config_map_key_rename(params).await,
             Method::ConfigTemplates => self.handle_config_templates(),
 
             // Agents
             Method::AgentsList => self.handle_agents_list(),
             Method::AgentsStatus => self.handle_agents_status().await,
-            Method::AgentDeletePreview => self.handle_agent_delete_preview(&req.params).await,
-            Method::AgentDelete => Box::pin(self.handle_agent_delete(&req.params)).await,
+            Method::AgentDeletePreview => self.handle_agent_delete_preview(params).await,
+            Method::AgentDelete => self.handle_agent_delete(params).await,
 
             // Cost
-            Method::CostQuery => self.handle_cost_query(&req.params),
+            Method::CostQuery => self.handle_cost_query(params),
             Method::CostOrg => self.handle_cost_org(),
 
             // Skills
             Method::SkillsBundles => self.handle_skills_bundles(),
-            Method::SkillsList => self.handle_skills_list(&req.params),
-            Method::SkillsRead => self.handle_skills_read(&req.params),
-            Method::SkillsWrite => self.handle_skills_write(&req.params),
-            Method::SkillsDelete => self.handle_skills_delete(&req.params),
+            Method::SkillsList => self.handle_skills_list(params),
+            Method::SkillsRead => self.handle_skills_read(params),
+            Method::SkillsWrite => self.handle_skills_write(params),
+            Method::SkillsDelete => self.handle_skills_delete(params),
 
             // Personality
-            Method::PersonalityList => self.handle_personality_list(&req.params),
-            Method::PersonalityGet => self.handle_personality_get(&req.params),
-            Method::PersonalityPut => self.handle_personality_put(&req.params),
-            Method::PersonalityTemplates => self.handle_personality_templates(&req.params),
+            Method::PersonalityList => self.handle_personality_list(params),
+            Method::PersonalityGet => self.handle_personality_get(params),
+            Method::PersonalityPut => self.handle_personality_put(params),
+            Method::PersonalityTemplates => self.handle_personality_templates(params),
 
             // Config introspection
             Method::ConfigSections => self.handle_config_sections(),
             Method::ConfigStatus => self.handle_config_status(),
             Method::ConfigCatalog => self.handle_config_catalog(),
-            Method::ConfigCatalogModels => self.handle_config_catalog_models(&req.params).await,
+            Method::ConfigCatalogModels => self.handle_config_catalog_models(params).await,
 
             // Logs
             Method::LogsSubscribe => self.handle_logs_subscribe().await,
-            Method::LogsQuery => self.handle_logs_query(&req.params).await,
-            Method::LogsGet => self.handle_logs_get(&req.params).await,
+            Method::LogsQuery => self.handle_logs_query(params).await,
+            Method::LogsGet => self.handle_logs_get(params).await,
 
             // TUI
             Method::TuiList => self.handle_tui_list(),
 
             // Files
-            Method::FileAttach => self.handle_file_attach(&req.params).await,
-            Method::FsListDir => super::fs::handle_fs_list_dir(&req.params).await,
+            Method::FileAttach => self.handle_file_attach(params).await,
+            Method::FsListDir => super::fs::handle_fs_list_dir(params).await,
 
             // Locales
             Method::LocalesList => super::locales::handle_locales_list(self.tui_id()),
             Method::LocalesFetch => {
-                super::locales::handle_locales_fetch(&req.params, self.tui_id()).await
+                super::locales::handle_locales_fetch(params, self.tui_id()).await
             }
 
             // Quickstart
             Method::QuickstartState => self.handle_quickstart_state(),
-            Method::QuickstartFields => self.handle_quickstart_fields(&req.params),
-            Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
-            Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
-            Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
-            Method::CertRenew => self.handle_renew_cert(&req.params).await,
+            Method::QuickstartFields => self.handle_quickstart_fields(params),
+            Method::QuickstartValidate => self.handle_quickstart_validate(params),
+            Method::QuickstartApply => self.handle_quickstart_apply(params).await,
+            Method::QuickstartDismiss => self.handle_quickstart_dismiss(params),
+            Method::CertRenew => self.handle_renew_cert(params).await,
 
             Method::SopsList => self.handle_sops_list(),
-            Method::SopsGet => self.handle_sops_get(&req.params),
-            Method::SopsGraph => self.handle_sops_graph(&req.params),
-            Method::SopsRun => self.handle_sops_run(&req.params).await,
-            Method::SopsRuns => self.handle_sops_runs(&req.params),
-            Method::SopsRunOverlay => self.handle_sops_run_overlay(&req.params),
-            Method::SopsValidate => self.handle_sops_validate(&req.params),
-            Method::SopsSave => self.handle_sops_save(&req.params),
-            Method::SopsCreate => self.handle_sops_create(&req.params),
-            Method::SopsDelete => self.handle_sops_delete(&req.params),
-            Method::SopsDecide => self.handle_sops_decide(&req.params).await,
-            Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
-            Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
+            Method::SopsGet => self.handle_sops_get(params),
+            Method::SopsGraph => self.handle_sops_graph(params),
+            Method::SopsRun => self.handle_sops_run(params).await,
+            Method::SopsRuns => self.handle_sops_runs(params),
+            Method::SopsRunOverlay => self.handle_sops_run_overlay(params),
+            Method::SopsValidate => self.handle_sops_validate(params),
+            Method::SopsSave => self.handle_sops_save(params),
+            Method::SopsCreate => self.handle_sops_create(params),
+            Method::SopsDelete => self.handle_sops_delete(params),
+            Method::SopsDecide => self.handle_sops_decide(params).await,
+            Method::SopsWireDraft => self.handle_sops_wire_draft(params),
+            Method::SopsGraphDraft => self.handle_sops_graph_draft(params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
-            Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
+            Method::ToolsParamOptions => self.handle_tools_param_options(params),
         };
 
         if is_notification {
@@ -1738,7 +1747,7 @@ impl RpcDispatcher {
     /// the transport `process_line` path.
     #[cfg(test)]
     async fn process_line_for_test(&mut self, line: &str) {
-        Box::pin(self.process_line(line)).await;
+        self.process_line(line).await;
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
