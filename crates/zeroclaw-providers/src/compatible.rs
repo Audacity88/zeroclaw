@@ -1144,15 +1144,16 @@ impl OpenAiCompatibleModelProvider {
     }
 
     /// Reconstruct `thinking_blocks` from newline-delimited signed-JSON
-    /// envelope lines. All-or-nothing: every non-empty line must be either a
-    /// signed thinking envelope or a non-`thinking`-typed block (e.g.
-    /// `redacted_thinking`, replayed verbatim — the API requires these
-    /// unchanged and they legitimately carry no signature), otherwise `None`
-    /// (the caller sends nothing rather than a partial replay). Thinking
-    /// lines without a signature void the replay: Anthropic rejects unsigned
-    /// thinking blocks on input. Mirrors the native Anthropic provider's
-    /// replay parsing (`crates/zeroclaw-providers/src/anthropic.rs`) —
-    /// duplicate-with-comment per the passthrough spec boundary.
+    /// envelope lines. Replay whitelist mirrors capture: signed `thinking`
+    /// envelopes and well-formed `redacted_thinking` lines (opaque `data`
+    /// replayed verbatim, signature-less by design) are forwarded; well-formed
+    /// lines of any other type are skipped, not forwarded. Lines that fail to
+    /// parse and thinking lines without a signature void the whole replay:
+    /// Anthropic rejects unsigned thinking blocks on input, and the caller
+    /// sends nothing rather than fabricating or forwarding a partial
+    /// sequence. Mirrors the native Anthropic provider's replay parsing
+    /// (`crates/zeroclaw-providers/src/anthropic.rs`) — duplicate-with-comment
+    /// per the passthrough spec boundary.
     fn reasoning_lines_to_thinking_blocks(reasoning: &str) -> Option<Vec<serde_json::Value>> {
         let mut blocks = Vec::new();
         for line in reasoning.split('\n') {
@@ -1164,8 +1165,17 @@ impl OpenAiCompatibleModelProvider {
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("thinking");
+            if block_type == "redacted_thinking" {
+                let has_data = parsed
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| !data.is_empty());
+                if has_data {
+                    blocks.push(parsed);
+                }
+                continue;
+            }
             if block_type != "thinking" {
-                blocks.push(parsed);
                 continue;
             }
             let thinking = parsed.get("thinking").and_then(serde_json::Value::as_str)?;
@@ -3108,10 +3118,14 @@ impl OpenAiCompatibleModelProvider {
     /// signature-or-text inclusion rule. Duplicate-with-comment, not a shared
     /// helper, per the passthrough spec boundary (mirrors the native provider).
     ///
-    /// Blocks typed other than `thinking` (e.g. `redacted_thinking`, whose
-    /// opaque `data` field carries no signature) are preserved verbatim as
-    /// raw JSON lines: they must replay unchanged for the API to accept the
-    /// trajectory, so the empty-empty skip must never swallow them.
+    /// Block-type whitelist: only `thinking` and `redacted_thinking` are
+    /// captured. `redacted_thinking` is preserved verbatim (it must replay
+    /// unchanged and carries no signature by design) but only when its
+    /// required opaque `data` field is a non-empty string. Every other type
+    /// is skipped, not stored: accepting gateway-controlled JSON blocks of
+    /// unknown shape into replay history would be an unvalidated
+    /// network-to-request channel. Skipping keeps a novel-but-harmless block
+    /// type from bricking the turn.
     fn thinking_blocks_to_reasoning_lines(blocks: &[serde_json::Value]) -> Option<String> {
         let mut lines: Vec<String> = Vec::with_capacity(blocks.len());
         for block in blocks {
@@ -3119,8 +3133,17 @@ impl OpenAiCompatibleModelProvider {
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("thinking");
+            if block_type == "redacted_thinking" {
+                let has_data = block
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| !data.is_empty());
+                if has_data {
+                    lines.push(block.to_string());
+                }
+                continue;
+            }
             if block_type != "thinking" {
-                lines.push(block.to_string());
                 continue;
             }
             let thinking = block
@@ -9508,6 +9531,127 @@ mod tests {
             vec![thinking, redacted],
             "replay must emit the thinking block canonical and the redacted block verbatim"
         );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_skips_hostile_block_types() {
+        // Whitelist enforcement: only thinking and redacted_thinking are
+        // captured. A gateway-controlled text/tool_use/unknown-typed block
+        // must not become stored replay material.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "text", "text": "hostile text block"}),
+                serde_json::json!({
+                    "type": "tool_use",
+                    "id": "call_x",
+                    "name": "get_weather",
+                    "input": {"city": "SF"}
+                }),
+                serde_json::json!({"type": "totally_novel", "payload": "???"}),
+                serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "real thought",
+                    "signature": "sig1"
+                }),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("the thinking block must be captured");
+        let lines: Vec<&str> = reasoning.split('\n').collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "hostile block types must not reach replay history"
+        );
+        assert!(lines[0].contains("real thought"));
+        assert!(!lines[0].contains("hostile"));
+        assert!(!lines[0].contains("tool_use"));
+        assert!(!lines[0].contains("totally_novel"));
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_rejects_malformed_redacted_blocks() {
+        // redacted_thinking without a non-empty data field fails validation
+        // and is skipped, not stored verbatim.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "redacted_thinking"}),
+                serde_json::json!({"type": "redacted_thinking", "data": ""}),
+                serde_json::json!({"type": "redacted_thinking", "data": "ErUBCkEIRAP"}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("the well-formed block must be captured");
+        let lines: Vec<&str> = reasoning.split('\n').collect();
+        assert_eq!(lines.len(), 1, "only the validated redacted block survives");
+        assert!(lines[0].contains("ErUBCkEIRAP"));
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_does_not_forward_hostile_lines() {
+        // History written before the whitelist (or tampered) must not forward
+        // unknown-typed blocks into outbound thinking_blocks. Well-formed
+        // siblings still replay.
+        let reasoning = format!(
+            "{}\n{}\n{}",
+            r#"{"type":"text","text":"hostile"}"#,
+            r#"{"type":"tool_use","id":"call_x","name":"f","input":{}}"#,
+            r#"{"type":"thinking","thinking":"real","signature":"sig1"}"#
+        );
+
+        let blocks = OpenAiCompatibleModelProvider::reasoning_lines_to_thinking_blocks(&reasoning)
+            .expect("a valid signed line exists");
+        assert_eq!(
+            blocks,
+            vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "real",
+                "signature": "sig1"
+            })],
+            "hostile typed lines must be skipped, valid thinking forwarded"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_skips_malformed_redacted_lines() {
+        // A redacted line without data cannot come from fixed capture; it
+        // must not forward. Signed thinking siblings still replay.
+        let reasoning = format!(
+            "{}\n{}",
+            r#"{"type":"redacted_thinking"}"#,
+            r#"{"type":"thinking","thinking":"t","signature":"sig"}"#
+        );
+
+        let blocks = OpenAiCompatibleModelProvider::reasoning_lines_to_thinking_blocks(&reasoning)
+            .expect("a valid signed line exists");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], serde_json::json!("thinking"));
     }
 
     #[tokio::test]
