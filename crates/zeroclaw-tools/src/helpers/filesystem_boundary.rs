@@ -245,9 +245,11 @@ fn replace_open_file(
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
     };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     let mut components = destination.components();
     let Some(Component::Normal(file_name)) = components.next() else {
@@ -268,16 +270,18 @@ fn replace_open_file(
         .len()
         .checked_mul(size_of::<u16>())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?;
-    let info_len = offset_of!(FILE_RENAME_INFO, FileName)
+    let info_len = offset_of!(FILE_RENAME_INFORMATION, FileName)
         .checked_add(byte_len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?;
     let word_len = info_len.div_ceil(size_of::<usize>());
     let mut storage = vec![0usize; word_len];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut io_status = IO_STATUS_BLOCK::default();
 
     // SAFETY: `storage` is pointer-aligned and sized for the fixed header plus
-    // the complete UTF-16 child name. Both handles remain live for the call.
-    let succeeded = unsafe {
+    // the complete UTF-16 child name. Both handles and `io_status` remain live
+    // for the call, and the kernel does not retain either pointer.
+    let status = unsafe {
         (*info).Anonymous.ReplaceIfExists = true;
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = u32::try_from(byte_len)
@@ -287,17 +291,19 @@ fn replace_open_file(
             std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
             wide_name.len(),
         );
-        SetFileInformationByHandle(
+        NtSetInformationFile(
             source_file.as_raw_handle(),
-            FileRenameInfo,
+            &mut io_status,
             info.cast(),
             u32::try_from(info_len).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "file name is too long")
             })?,
+            FileRenameInformation,
         )
     };
-    if succeeded == 0 {
-        Err(io::Error::last_os_error())
+    if status < 0 {
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(error as i32))
     } else {
         Ok(())
     }

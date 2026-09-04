@@ -55,7 +55,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 webpki-roots = "1.0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 # `O_NONBLOCK` for the MCP custom-CA loader, so a special file substituted at a
 # configured `tls_ca_cert_path` cannot block MCP registry startup.
