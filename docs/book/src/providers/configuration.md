@@ -150,9 +150,20 @@ ignores this field.
 With the flag on, requests gain at most two `cache_control` breakpoints,
 placed the same way the native Anthropic provider places them: one on the
 system prompt, and one rolling breakpoint on the last message once the
-conversation has more than one non-system message. Only messages carrying
-a breakpoint change serialization. With the flag off (the default),
-request bodies are byte-identical to previous versions.
+conversation has more than one non-system message. With
+`merge_system_into_user` the system role never reaches the wire, so the
+merged first user message (or the synthetic user carrying the system text)
+carries the system-equivalent breakpoint instead. Only breakpoint-carrying
+messages change serialization.
+
+The flag also scopes to the structured request paths: agent turns, tool
+calls, and structured streaming. The text-only helpers (`chat_with_system`,
+`chat_with_history`, the legacy chunk-stream APIs) deliberately emit no
+breakpoints even with the flag on, because their responses drop token usage
+entirely; a premium cache write they triggered could never show up in
+accounting. On those helpers the flag is inert, which also means fallback
+re-entries that route through them send unmarked requests. With the flag
+off (the default), request bodies are byte-identical to previous versions.
 
 ```toml
 [providers.models.custom.claude-via-gateway]
@@ -193,7 +204,15 @@ Requirements and caveats:
   in token usage and cost reporting, and `cache_creation_input_tokens` is
   written to the debug log with counts only. A response that reports zero
   cache reads keeps the cached figure at zero rather than substituting the
-  OpenAI-shaped counter.
+  OpenAI-shaped counter. This accounting covers the structured paths only,
+  which is exactly why the helpers without usage capture stay inert above.
+- **Tool definitions are not separately marked.** The native Anthropic
+  provider additionally marks the last tool definition, which covers
+  tool-schema tokens when no system prompt exists. This flag does not mark
+  tool definitions; requests with tools but no system prompt cache only the
+  rolling message breakpoint. The live gateway qualification showed that
+  with a system prompt present, tool-schema tokens sit inside the cached
+  prefix anyway.
 
 ## Per-family knobs: worked examples
 

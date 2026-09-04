@@ -784,7 +784,13 @@ impl OpenAiCompatibleModelProvider {
     /// Collect all `system` role messages and keep them in a provider-safe
     /// shape. Strict OpenAI-compatible endpoints accept a leading system
     /// message but reject system messages later in the history.
-    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
+    /// Flatten system messages per `merge`. Returns the flattened list plus
+    /// whether the system content was merged INTO a user message (or a
+    /// synthetic user inserted for it): that first user message is the
+    /// system-equivalent carrier and the only place a system-role
+    /// breakpoint can ride when merging is on. `false` means a system-role
+    /// message still exists on the wire (or there never was one).
+    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> (Vec<ChatMessage>, bool) {
         let mut saw_system = false;
         let mut system_content = String::new();
         let mut result: Vec<ChatMessage> = Vec::with_capacity(messages.len());
@@ -804,28 +810,26 @@ impl OpenAiCompatibleModelProvider {
         }
 
         if !saw_system {
-            return messages.to_vec();
+            return (messages.to_vec(), false);
         }
 
         if system_content.is_empty() {
-            return result;
+            return (result, false);
         }
 
         if !merge {
             result.insert(0, ChatMessage::system(system_content));
-            return result;
+            return (result, false);
         }
 
         if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
-            if !system_content.is_empty() {
-                first_user.content = format!("{system_content}\n\n{}", first_user.content);
-            }
+            first_user.content = format!("{system_content}\n\n{}", first_user.content);
         } else {
             // No user message found: insert a synthetic user message with system content
             result.insert(0, ChatMessage::user(&system_content));
         }
 
-        result
+        (result, true)
     }
 
     fn http_client(&self) -> Client {
@@ -979,21 +983,40 @@ impl OpenAiCompatibleModelProvider {
     /// The native Anthropic provider is the source of truth for placement:
     /// `AnthropicModelProvider::should_cache_conversation` and
     /// `apply_cache_to_last_message` in `anthropic.rs`. (a) The system prompt
-    /// always carries a breakpoint when one exists on the wire. (b) The last
-    /// message's trailing text part carries a rolling breakpoint once the
-    /// conversation has more than one non-system message, the same gate the
-    /// native provider applies before `apply_cache_to_last_message`. At most
-    /// two breakpoints per request; only breakpoint-carrying messages convert
-    /// from string content to block form, every other message serializes
-    /// exactly as before.
-    fn apply_cache_breakpoints<T: CacheBreakpointMessage>(&self, messages: &mut [T]) {
+    /// always carries a breakpoint when one exists on the wire. With
+    /// `merge_system_into_user`, the system role disappears from the wire,
+    /// so the carrier index of the merged system content (the first user
+    /// message, or the synthetic user carrying it) takes over that role and
+    /// is marked unconditionally. (b) The last message's trailing text part
+    /// carries a rolling breakpoint once the conversation has more than one
+    /// non-system message, the same gate the native provider applies before
+    /// `apply_cache_to_last_message`. At most two breakpoints per request;
+    /// only breakpoint-carrying messages convert from string content to
+    /// block form, every other message serializes exactly as before.
+    fn apply_cache_breakpoints<T: CacheBreakpointMessage>(
+        &self,
+        messages: &mut [T],
+        merged_system_carrier: Option<usize>,
+    ) {
         if !self.cache_passthrough {
             return;
         }
-        if let Some(system) = messages.iter_mut().find(|m| m.cache_role() == "system")
-            && let Some(content) = system.cache_content()
-        {
-            content.apply_cache_control();
+        let carrier = merged_system_carrier.and_then(|idx| {
+            (idx < messages.len() && messages[idx].cache_role() != "system").then_some(idx)
+        });
+        match carrier {
+            Some(idx) => {
+                if let Some(content) = messages[idx].cache_content() {
+                    content.apply_cache_control();
+                }
+            }
+            None => {
+                if let Some(system) = messages.iter_mut().find(|m| m.cache_role() == "system")
+                    && let Some(content) = system.cache_content()
+                {
+                    content.apply_cache_control();
+                }
+            }
         }
         let non_system_count = messages
             .iter()
@@ -1005,6 +1028,19 @@ impl OpenAiCompatibleModelProvider {
             && let Some(content) = last.cache_content()
         {
             content.apply_cache_control();
+        }
+    }
+
+    /// Index of the merged system-content carrier (the first user message)
+    /// when `flatten_system_messages` reported a merge, else `None`.
+    fn merged_system_carrier_index<T: CacheBreakpointMessage>(
+        messages: &[T],
+        system_merged: bool,
+    ) -> Option<usize> {
+        if system_merged {
+            messages.iter().position(|m| m.cache_role() == "user")
+        } else {
+            None
         }
     }
 
@@ -2377,12 +2413,14 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
+        system_merged: bool,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let tool_choice = has_tool_entries.then(|| "auto".to_string());
         let mut messages =
             self.convert_messages_for_native(effective_messages, allow_user_image_parts);
-        self.apply_cache_breakpoints(&mut messages);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
 
         NativeChatRequest {
             model: model.to_string(),
@@ -2408,11 +2446,13 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
+        system_merged: bool,
     ) -> NativeChatRequest<&'a [serde_json::Value]> {
         let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
         let mut messages =
             self.convert_messages_for_native(effective_messages, allow_user_image_parts);
-        self.apply_cache_breakpoints(&mut messages);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
         NativeChatRequest {
             model: model.to_string(),
             messages,
@@ -2438,6 +2478,7 @@ impl OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options_enabled: bool,
         merge: bool,
+        system_merged: bool,
     ) -> NativeChatRequest {
         // Guard on the converted tools being non-empty (not just the raw
         // input being non-empty): convert_tool_specs_for_model can sanitize
@@ -2448,7 +2489,8 @@ impl OpenAiCompatibleModelProvider {
             .as_ref()
             .and_then(|t| (!t.is_empty()).then(|| "auto".to_string()));
         let mut messages = self.convert_messages_for_native(effective_messages, !merge);
-        self.apply_cache_breakpoints(&mut messages);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
         NativeChatRequest {
             model: model.to_string(),
             messages,
@@ -3213,7 +3255,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             });
         }
 
-        let mut request = ApiChatRequest {
+        let request = ApiChatRequest {
             model: model.to_string(),
             messages,
             temperature,
@@ -3226,7 +3268,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
-        self.apply_cache_breakpoints(&mut request.messages);
+        // No cache breakpoints here, deliberately: this text-only helper
+        // never surfaces response usage to dispatch accounting, so a
+        // premium cache write it triggered could never be accounted for
+        // (fallback re-entries through this path return `usage: None`).
+        // The flag is honored on the structured paths (`chat`,
+        // `chat_with_tools`, `stream_chat`), which capture usage; the
+        // provider docs describe this usage-capture boundary.
 
         let url = self.chat_completions_url();
 
@@ -3293,7 +3341,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let (effective_messages, _system_merged) =
+            Self::flatten_system_messages(&normalized, merge);
         // Strip native tool constructs for non-native-tool model_providers.
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
@@ -3304,7 +3353,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             })
             .collect();
 
-        let mut request = ApiChatRequest {
+        let request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
             temperature,
@@ -3317,7 +3366,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
-        self.apply_cache_breakpoints(&mut request.messages);
+        // No cache breakpoints here, deliberately: this text-only helper
+        // never surfaces response usage to dispatch accounting, so a
+        // premium cache write it triggered could never be accounted for
+        // (fallback re-entries through this path return `usage: None`).
+        // The flag is honored on the structured paths (`chat`,
+        // `chat_with_tools`, `stream_chat`), which capture usage; the
+        // provider docs describe this usage-capture boundary.
 
         let url = self.chat_completions_url();
         let response = match self
@@ -3379,7 +3434,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
             effective_messages
         } else {
@@ -3391,6 +3446,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             model,
             temperature,
             !merge,
+            system_merged,
         );
         let mut payload = serde_json::to_value(request)?;
         let tools_count = payload
@@ -3493,7 +3549,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .normalize_messages_for_upstream(request.messages)
             .await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
             effective_messages
         } else {
@@ -3507,6 +3563,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             model,
             temperature,
             !merge,
+            system_merged,
         );
         let mut payload = serde_json::to_value(native_request)?;
         let tools_count = payload
@@ -3673,7 +3730,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let merge = provider.effective_merge_system(&model);
-            let effective_messages = Self::flatten_system_messages(&normalized, merge);
+            let (effective_messages, system_merged) =
+                Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
             let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
             let tools_count = tools.as_ref().map_or(0, Vec::len);
@@ -3692,6 +3750,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     temperature,
                     options_enabled,
                     merge,
+                    system_merged,
                 ))
             } else {
                 let mut messages: Vec<Message> = effective_messages
@@ -3706,7 +3765,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         ),
                     })
                     .collect();
-                provider.apply_cache_breakpoints(&mut messages);
+                let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+                provider.apply_cache_breakpoints(&mut messages, carrier);
 
                 serde_json::to_value(ApiChatRequest {
                     model: model.clone(),
@@ -3906,7 +3966,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 });
             }
 
-            let mut request = ApiChatRequest {
+            let request = ApiChatRequest {
                 model: model.clone(),
                 messages,
                 temperature,
@@ -3921,7 +3981,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
-            provider.apply_cache_breakpoints(&mut request.messages);
+            // No cache breakpoints here, deliberately: this legacy chunk
+            // stream never converts the final usage chunk into a
+            // `TokenUsage`, so a premium cache write it triggered could
+            // never be accounted for. The flag is honored on the structured
+            // streaming path (`stream_chat`), which emits
+            // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
@@ -4014,7 +4079,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let merge = provider.effective_merge_system(&model);
-            let effective_messages = Self::flatten_system_messages(&normalized, merge);
+            let (effective_messages, _system_merged) =
+                Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
             let api_messages: Vec<Message> = effective_messages
                 .iter()
@@ -4024,7 +4090,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 })
                 .collect();
 
-            let mut request = ApiChatRequest {
+            let request = ApiChatRequest {
                 model: model.clone(),
                 messages: api_messages,
                 temperature,
@@ -4039,7 +4105,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
-            provider.apply_cache_breakpoints(&mut request.messages);
+            // No cache breakpoints here, deliberately: this legacy chunk
+            // stream never converts the final usage chunk into a
+            // `TokenUsage`, so a premium cache write it triggered could
+            // never be accounted for. The flag is honored on the structured
+            // streaming path (`stream_chat`), which emits
+            // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
@@ -4447,8 +4518,17 @@ mod tests {
     #[tokio::test]
     async fn cache_passthrough_system_breakpoint_serializes_block_form() {
         let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![ChatMessage::system("be brief"), ChatMessage::user("hello")];
         let result = provider
-            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
             .await;
         server.abort();
         result.unwrap_or_else(|error| panic!("flag-on request failed: {error}"));
@@ -4489,7 +4569,15 @@ mod tests {
             ChatMessage::user("bye"),
         ];
         let result = provider
-            .chat_with_history(&messages, "test-model", None)
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
             .await;
         server.abort();
         result.unwrap_or_else(|error| panic!("flag-on history request failed: {error}"));
@@ -4528,7 +4616,15 @@ mod tests {
             ChatMessage::user("hi"),
         ];
         let result = provider
-            .chat_with_history(&messages, "test-model", None)
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
             .await;
         server.abort();
         result.unwrap_or_else(|error| panic!("flag-on history request failed: {error}"));
@@ -4554,9 +4650,12 @@ mod tests {
 
         let (provider, captured, server) = mock_streaming_cache_capture(true).await;
         let events = provider
-            .stream_chat_with_system(
-                Some("be brief"),
-                "hello",
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
                 "test-model",
                 None,
                 StreamOptions {
@@ -4599,9 +4698,12 @@ mod tests {
 
         let (provider, captured, server) = mock_streaming_cache_capture(false).await;
         let events = provider
-            .stream_chat_with_system(
-                Some("be brief"),
-                "hello",
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
                 "test-model",
                 None,
                 StreamOptions {
@@ -4830,6 +4932,7 @@ mod tests {
             Some(0.5),
             true,
             false,
+            false,
         ))
         .unwrap();
 
@@ -4860,6 +4963,7 @@ mod tests {
             Some(vec![]),
             None,
             true,
+            false,
             false,
         ))
         .unwrap();
@@ -4928,7 +5032,8 @@ mod tests {
         // directly.
 
         // None tools → no tool_choice key.
-        let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false);
+        let req =
+            p.build_native_tool_chat_request(&messages, None, "test-model", None, false, false);
         let value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("tool_choice").is_none(),
@@ -4936,8 +5041,14 @@ mod tests {
         );
 
         // Empty tools vec → still no tool_choice key.
-        let req_empty =
-            p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false);
+        let req_empty = p.build_native_tool_chat_request(
+            &messages,
+            Some(vec![]),
+            "test-model",
+            None,
+            false,
+            false,
+        );
         let value_empty = serde_json::to_value(&req_empty).unwrap();
         assert!(
             value_empty.get("tool_choice").is_none(),
@@ -4959,8 +5070,14 @@ mod tests {
                 parameters: std::sync::Arc::new(serde_json::json!({})),
             },
         }];
-        let req =
-            p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            Some(tools),
+            "test-model",
+            None,
+            false,
+            false,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value.get("tool_choice").and_then(serde_json::Value::as_str),
@@ -4993,7 +5110,8 @@ mod tests {
             },
         }];
 
-        let req = p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false);
+        let req =
+            p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false, false);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -5018,7 +5136,7 @@ mod tests {
             .build();
         let messages = vec![ChatMessage::user("hello")];
 
-        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false);
+        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false, false);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -7372,7 +7490,9 @@ mod tests {
             ChatMessage::assistant("post-user"),
         ];
 
-        let output = OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        let (output, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        assert!(system_merged, "merged into the existing user message");
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].role, "assistant");
         assert_eq!(output[0].content, "ack");
@@ -7390,7 +7510,9 @@ mod tests {
             ChatMessage::assistant("ack"),
         ];
 
-        let output = OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        let (output, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        assert!(system_merged, "synthetic user inserted as the carrier");
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].role, "user");
         assert_eq!(output[0].content, "core policy");
@@ -8115,6 +8237,7 @@ mod tests {
             "deepseek-v4-flash",
             Some(0.7),
             true,
+            false,
         );
         let value = serde_json::to_value(&request).unwrap();
         let first_message = &value["messages"][0];
@@ -8151,7 +8274,9 @@ mod tests {
             ChatMessage::tool(r#"{"ok":true}"#),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        assert!(system_merged);
         assert_eq!(flattened.len(), 3);
         assert_eq!(flattened[0].role, "assistant");
         assert_eq!(
@@ -8173,7 +8298,9 @@ mod tests {
             ChatMessage::user("Follow-up"),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        assert!(!system_merged);
         assert_eq!(
             flattened
                 .iter()
@@ -8200,7 +8327,9 @@ mod tests {
             ChatMessage::system(""),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        assert!(!system_merged, "empty system content merged nothing");
 
         assert_eq!(flattened.len(), 1);
         assert_eq!(flattened[0].role, "user");
@@ -8214,7 +8343,9 @@ mod tests {
             ChatMessage::system("Synthetic system"),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        assert!(system_merged);
         assert_eq!(flattened.len(), 2);
         assert_eq!(flattened[0].role, "user");
         assert_eq!(flattened[0].content, "Synthetic system");
@@ -8876,8 +9007,10 @@ mod tests {
     /// Flag interaction: the thinking object reaches the wire through
     /// `extra_body` (the same surface the thinking-passthrough feature
     /// uses), and it must ride alongside the cache breakpoints in one
-    /// request: neither injection disturbs the other, and both land
-    /// together on real deployments that enable both flags.
+    /// request: neither injection disturbs the other. This proves generic
+    /// flattened-body coexistence on the structured path; full proof that
+    /// the two operator flags compose awaits the thinking-passthrough
+    /// provider flag landing in this tree.
     #[tokio::test]
     async fn cache_breakpoints_coexist_with_thinking_object_in_one_request() {
         let (provider, captured, server) = mock_streaming_cache_capture(true).await;
@@ -8897,7 +9030,15 @@ mod tests {
             ChatMessage::user("bye"),
         ];
         let result = provider
-            .chat_with_history(&messages, "test-model", None)
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
             .await;
         server.abort();
         result.unwrap_or_else(|error| panic!("combined request failed: {error}"));
@@ -8925,6 +9066,300 @@ mod tests {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // merged-system carrier + usage-capture boundary tests (audit repairs)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Audit blocker 2, single-turn: with `merge_system_into_user`, the
+    /// system role never reaches the wire, so the merged first user message
+    /// is the only system-equivalent carrier and must carry the breakpoint
+    /// unconditionally. Before the repair this shape sent zero breakpoints.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_marks_first_user_single_turn() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("merged single-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "merged user message is the system-equivalent carrier and must be marked"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "single exchange carries exactly the carrier breakpoint"
+        );
+    }
+
+    /// Audit blocker 2, multi-turn: the carrier keeps the system breakpoint
+    /// and the rolling breakpoint still lands on the last message, exactly
+    /// two total, middle messages untouched.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_carrier_plus_rolling_multi_turn() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("merged multi-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhi",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "bye",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "merged carrier and rolling breakpoint with middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "merged multi-turn must carry exactly two breakpoints"
+        );
+    }
+
+    /// Audit blocker 2, assistant-first history: the merged user is not
+    /// message zero; the carrier index must follow the first user wherever
+    /// it sits.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_marks_first_user_after_assistant() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::assistant("ack"),
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("assistant-first merged request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "carrier breakpoint lands on the merged user, not on message zero"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "assistant + merged user is a single exchange: no rolling breakpoint"
+        );
+    }
+
+    /// Streaming twin of the merged-carrier pin.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_streaming_matches_non_streaming() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "merged streaming request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "be brief\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "streaming merged carrier carries the breakpoint identically"
+        );
+    }
+
+    /// Flag-off merged: the merge behavior is unchanged and the wire stays
+    /// free of markers.
+    #[tokio::test]
+    async fn cache_passthrough_merged_flag_off_body_unmarked() {
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-off merged request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "core policy\n\nhello"},
+            ]),
+            "flag-off merged body must be byte-identical to the pre-feature wire"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off merged request must carry no cache markers"
+        );
+    }
+
+    /// Audit blocker 1 regression: the text-only helpers must never emit
+    /// cache breakpoints even with the flag on, because their responses
+    /// drop usage and could never account for the premium.
+    #[tokio::test]
+    async fn cache_passthrough_simple_paths_emit_no_breakpoints_even_when_enabled() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let _ = provider
+            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let _ = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await;
+        server.abort();
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (index, request) in requests.iter().enumerate() {
+            assert!(
+                !request.to_string().contains("cache_control"),
+                "simple path {index} must not emit cache breakpoints: {request}"
+            );
+        }
+    }
+
+    /// Audit blocker 1 regression, streaming side: the legacy chunk stream
+    /// drops usage, so it must not trigger premium writes either.
+    #[tokio::test]
+    async fn cache_passthrough_legacy_stream_emits_no_breakpoints_even_when_enabled() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let events = provider
+            .stream_chat_with_system(
+                Some("be brief"),
+                "hello",
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        let _ = events;
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "legacy chunk stream must carry no cache markers even with the flag on"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -9043,6 +9478,7 @@ mod tests {
             "openai/gpt-oss-120b",
             None,
             true,
+            false,
         );
         let default_message = &default_request.messages[0];
         assert_eq!(default_message.role, "assistant");
@@ -9078,6 +9514,7 @@ mod tests {
             "openai/gpt-oss-120b",
             None,
             true,
+            false,
         );
         let groq_message = &groq_request.messages[0];
         assert_eq!(groq_message.role, "assistant");
