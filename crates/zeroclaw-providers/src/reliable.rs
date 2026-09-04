@@ -3203,14 +3203,18 @@ impl ModelProvider for ReliableModelProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        // Capabilities describe the served route: the configured primary
-        // (first entry) defines the request's transport. The previous any()
-        // aggregation let a streaming fallback silently bypass a selected
-        // primary that disclaims streaming, inverting the operator's
-        // entry ranking.
+        // Aggregation stays any(): a streaming-capable fallback may serve a
+        // turn whose selected primary disclaims streaming, surfacing the
+        // standard fallback notice (runtime contract, verified by
+        // streamed_turn_surfaces_streaming_provider_fallback_notice). The
+        // audit's stream-into-disclaiming-route hazard is closed at the
+        // dispatch layer instead: RouterModelProvider never streams a
+        // resolved route that disclaims streaming, and the passthrough
+        // leaf's streaming builders never attach thinking params to the
+        // streamed wire (unverified SSE frames, no signed capture there).
         self.model_providers
-            .first()
-            .is_some_and(|entry| entry.provider().supports_streaming())
+            .iter()
+            .any(|entry| entry.provider().supports_streaming())
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
@@ -8745,112 +8749,6 @@ mod tests {
         }
     }
 
-    struct AlwaysStreamingMock;
-
-    #[async_trait]
-    impl ModelProvider for AlwaysStreamingMock {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            Ok("ok".to_string())
-        }
-
-        fn supports_streaming(&self) -> bool {
-            true
-        }
-    }
-    impl ::zeroclaw_api::attribution::Attributable for AlwaysStreamingMock {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Model(
-                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-        fn alias(&self) -> &str {
-            "AlwaysStreamingMock"
-        }
-    }
-
-    struct NeverStreamingMock;
-
-    #[async_trait]
-    impl ModelProvider for NeverStreamingMock {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            Ok("ok".to_string())
-        }
-
-        fn supports_streaming(&self) -> bool {
-            false
-        }
-    }
-    impl ::zeroclaw_api::attribution::Attributable for NeverStreamingMock {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Model(
-                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-        fn alias(&self) -> &str {
-            "NeverStreamingMock"
-        }
-    }
-
-    #[test]
-    fn supports_streaming_follows_configured_primary_not_any_fallback() {
-        // Composite capabilities describe the served route: the configured
-        // primary defines the request transport. The previous any()
-        // aggregation let a streaming fallback silently bypass a selected
-        // primary that disclaims streaming.
-        let non_streaming_primary = ReliableModelProvider::new(
-            "reliable",
-            vec![
-                (
-                    "primary".to_string(),
-                    Box::new(NeverStreamingMock) as Box<dyn ModelProvider>,
-                ),
-                (
-                    "fallback".to_string(),
-                    Box::new(AlwaysStreamingMock) as Box<dyn ModelProvider>,
-                ),
-            ],
-            1,
-            50,
-        );
-        assert!(
-            !non_streaming_primary.supports_streaming(),
-            "a non-streaming primary must report the composite non-streaming"
-        );
-
-        let streaming_primary = ReliableModelProvider::new(
-            "reliable",
-            vec![
-                (
-                    "primary".to_string(),
-                    Box::new(AlwaysStreamingMock) as Box<dyn ModelProvider>,
-                ),
-                (
-                    "fallback".to_string(),
-                    Box::new(NeverStreamingMock) as Box<dyn ModelProvider>,
-                ),
-            ],
-            1,
-            50,
-        );
-        assert!(streaming_primary.supports_streaming());
-    }
-
     #[async_trait]
     impl ModelProvider for StreamingToolEventMock {
         async fn chat_with_system(
@@ -9814,85 +9712,15 @@ mod tests {
         assert_eq!(later_chat_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// Primary that claims streaming but fails every stream and chat, so the
-    /// stream-recovery path through the router stays exercised under the
-    /// capabilities-describe-the-served-route policy.
-    struct FailingStreamPrimaryMock {
-        stream_calls: Arc<AtomicUsize>,
-        chat_calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl ModelProvider for FailingStreamPrimaryMock {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            self.chat_calls.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("earlier failure");
-        }
-
-        async fn chat_with_history(
-            &self,
-            _messages: &[ChatMessage],
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            self.chat_calls.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("earlier failure");
-        }
-
-        fn supports_streaming(&self) -> bool {
-            true
-        }
-
-        fn stream_chat(
-            &self,
-            _request: ChatRequest<'_>,
-            _model: &str,
-            _temperature: Option<f64>,
-            _options: StreamOptions,
-        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-            self.stream_calls.fetch_add(1, Ordering::SeqCst);
-            stream::once(async {
-                Err(zeroclaw_api::model_provider::StreamError::ModelProvider(
-                    "stream failure".to_string(),
-                ))
-            })
-            .boxed()
-        }
-    }
-    impl ::zeroclaw_api::attribution::Attributable for FailingStreamPrimaryMock {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Model(
-                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-        fn alias(&self) -> &str {
-            "FailingStreamPrimaryMock"
-        }
-    }
-
     #[tokio::test]
     async fn router_preserves_exact_stream_recovery_identity() {
         let earlier_chat_calls = Arc::new(AtomicUsize::new(0));
         let failed_stream_calls = Arc::new(AtomicUsize::new(0));
+        let failed_chat_calls = Arc::new(AtomicUsize::new(0));
         let later_chat_calls = Arc::new(AtomicUsize::new(0));
         let reliable = ReliableModelProvider::new(
             "inner",
             vec![
-                (
-                    "duplicate-display".into(),
-                    Box::new(FailingStreamPrimaryMock {
-                        stream_calls: Arc::clone(&failed_stream_calls),
-                        chat_calls: Arc::new(AtomicUsize::new(0)),
-                    }) as Box<dyn ModelProvider>,
-                ),
                 (
                     "duplicate-display".into(),
                     Box::new(MockModelProvider {
@@ -9900,6 +9728,13 @@ mod tests {
                         fail_until_attempt: usize::MAX,
                         response: "never",
                         error: "earlier failure",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "duplicate-display".into(),
+                    Box::new(StreamErrorNoChatReplayMock {
+                        stream_calls: Arc::clone(&failed_stream_calls),
+                        chat_calls: Arc::clone(&failed_chat_calls),
                     }) as Box<dyn ModelProvider>,
                 ),
                 (
@@ -9961,6 +9796,7 @@ mod tests {
         assert_eq!(response.unwrap().text.as_deref(), Some("later response"));
         assert_eq!(earlier_chat_calls.load(Ordering::SeqCst), 1);
         assert_eq!(failed_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_chat_calls.load(Ordering::SeqCst), 0);
         assert_eq!(later_chat_calls.load(Ordering::SeqCst), 1);
     }
 

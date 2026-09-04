@@ -2576,6 +2576,25 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
+    /// Thinking params for a STREAMING request body. Passthrough never
+    /// attaches thinking to the streamed wire: gateway SSE thinking frames
+    /// are unverified territory (the live probe was non-streaming), and a
+    /// streamed response cannot feed signed capture. This is defense in
+    /// depth for a wrapper that streams this leaf despite the
+    /// [`ModelProvider::supports_streaming`] disclaimer: such a request
+    /// behaves like thinking-off for that turn instead of producing an
+    /// uncapturable trajectory. Flag off keeps legacy streaming untouched.
+    fn streaming_thinking_params(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<zeroclaw_api::model_provider::NativeThinkingParams> {
+        if self.thinking_passthrough {
+            None
+        } else {
+            thinking
+        }
+    }
+
     /// Streaming counterpart of [`Self::build_native_tool_chat_request`],
     /// used by `stream_chat` when native tools are present.
     fn build_streaming_native_tool_request(
@@ -2616,7 +2635,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
-            extra_body: self.request_extra_body(model, thinking),
+            extra_body: self.request_extra_body(model, self.streaming_thinking_params(thinking)),
         }
     }
 
@@ -3894,7 +3913,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: None,
                     tool_choice: None,
                     max_tokens: provider.max_tokens,
-                    extra_body: provider.request_extra_body(&model, thinking_owned),
+                    extra_body: provider.request_extra_body(
+                        &model,
+                        provider.streaming_thinking_params(thinking_owned),
+                    ),
                 })
             };
 
@@ -4830,7 +4852,10 @@ mod tests {
             "passthrough must inject the Anthropic enabled-budget thinking shape"
         );
 
-        // Streaming builder mirrors the non-streaming injection.
+        // Streaming builder mirrors the non-streaming injection... except it
+        // must NOT: passthrough never attaches thinking to the streamed wire
+        // (unverified SSE frames, no signed capture on streamed responses).
+        // The streamed body behaves like thinking-off for that turn.
         let streaming = serde_json::to_value(p.build_streaming_native_tool_request(
             "test-model",
             &messages,
@@ -4841,10 +4866,55 @@ mod tests {
             Some(params),
         ))
         .unwrap();
-        assert_eq!(
-            streaming["thinking"],
-            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
-            "streaming passthrough must inject the same Anthropic thinking shape"
+        assert!(
+            streaming.get("thinking").is_none(),
+            "streamed requests under passthrough must never carry the thinking object: {streaming}"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_streaming_builder_drops_thinking_display_variants_too() {
+        // Defense in depth: every display variant is equally withheld from
+        // the streamed wire under passthrough.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        };
+
+        let with_tools = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert!(with_tools.get("thinking").is_none());
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off streaming never injected thinking and must stay that way"
         );
     }
 
