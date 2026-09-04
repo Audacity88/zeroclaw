@@ -11164,23 +11164,23 @@ mod tests {
             "the retained ACP session must accept a follow-up: {follow_up_result:?}"
         );
 
-        let seen = seen_messages.lock();
-        assert_eq!(seen.len(), 2);
-        let follow_up_request = &seen[1];
-        assert!(follow_up_request.iter().any(|message| matches!(
-            message,
-            chat if chat.content == "prior model answer"
-        )));
-        assert!(follow_up_request.iter().any(|message| matches!(
-            message,
-            chat if chat.content == "partial model answer"
-        )));
-        assert!(!follow_up_request.iter().any(|message| matches!(
-            message,
-            chat if chat.content.contains(&synthetic) || chat.content.contains(&neutral)
-        )));
-
-        drop(seen);
+        {
+            let seen = seen_messages.lock();
+            assert_eq!(seen.len(), 2);
+            let follow_up_request = &seen[1];
+            assert!(follow_up_request.iter().any(|message| matches!(
+                message,
+                chat if chat.content == "prior model answer"
+            )));
+            assert!(follow_up_request.iter().any(|message| matches!(
+                message,
+                chat if chat.content == "partial model answer"
+            )));
+            assert!(!follow_up_request.iter().any(|message| matches!(
+                message,
+                chat if chat.content.contains(&synthetic) || chat.content.contains(&neutral)
+            )));
+        }
         assert!(
             sessions.remove(sid).await,
             "the live session must be reaped"
