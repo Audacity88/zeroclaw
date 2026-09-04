@@ -7656,7 +7656,10 @@ mod tests {
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
-        assert!(error.to_string().contains("does not support vision input"));
+        let capability_error = error
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.capability, "vision");
         assert_old_trim_test_turn_was_removed(&agent);
         assert_eq!(
             capturing
@@ -7686,7 +7689,10 @@ mod tests {
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
-        assert!(error.to_string().contains("does not support vision input"));
+        let capability_error = error
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.capability, "vision");
         assert_old_trim_test_turn_was_removed(&agent);
         assert_eq!(drain_history_trim_events(&mut event_rx), 1);
     }
@@ -9332,6 +9338,7 @@ mod tests {
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 1_024,
+                    display: None,
                 }),
                 agent_a.turn("same request"),
             )
@@ -9341,6 +9348,7 @@ mod tests {
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 2_048,
+                    display: None,
                 }),
                 agent_b.turn("same request"),
             )
