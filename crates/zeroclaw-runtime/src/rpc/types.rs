@@ -194,6 +194,10 @@ rpc_type! {
         pub exclude_memory: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub chat_mode: Option<ChatMode>,
+        /// Closed user-facing harness identifier. The daemon validates this
+        /// value and resolves all descriptive claims from host-owned state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
         /// When true, skip the same-mode idle-sibling eviction normally
         /// performed on `session/new` for the calling TUI. Sent by
         /// multi-session-aware clients that manage sibling session lifecycle
@@ -1596,12 +1600,30 @@ mod tests {
     }
 
     #[test]
+    fn interaction_surface_is_closed_and_snake_case() {
+        use crate::agent::prompt::InteractionSurface;
+
+        assert_eq!(
+            serde_json::to_value(InteractionSurface::ZerocodeCode).unwrap(),
+            json!("zerocode_code")
+        );
+        assert_eq!(
+            serde_json::from_value::<InteractionSurface>(json!("zerocode_code")).unwrap(),
+            InteractionSurface::ZerocodeCode
+        );
+        assert!(
+            serde_json::from_value::<InteractionSurface>(json!("client_authored_claims")).is_err()
+        );
+    }
+
+    #[test]
     fn session_new_params_keep_siblings_round_trips_and_defaults_absent() {
         // Older clients omit the field entirely: it must parse as None and
         // serialize back out without a `keep_siblings` key.
         let legacy: SessionNewParams =
             serde_json::from_value(json!({ "agent_alias": "a" })).unwrap();
         assert_eq!(legacy.keep_siblings, None);
+        assert_eq!(legacy.interaction_surface, None);
         let wire = serde_json::to_value(&legacy).unwrap();
         assert!(wire.get("keep_siblings").is_none());
 

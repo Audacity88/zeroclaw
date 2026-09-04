@@ -2336,6 +2336,7 @@ impl RpcClient {
                 "tui_id": tui_id,
                 "exclude_memory": true,
                 "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
             }),
         )
         .await
@@ -4746,6 +4747,43 @@ mod session_method_tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.session_id, "s42");
+    }
+
+    #[tokio::test]
+    async fn session_new_acp_declares_closed_zerocode_code_surface() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client
+                .session_new_acp("my-agent", Some("/tmp/work"), Some("s-acp"))
+                .await
+        });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_new_acp must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/new");
+        assert_eq!(req["params"]["chat_mode"], "acp");
+        assert_eq!(req["params"]["interaction_surface"], "zerocode_code");
+        assert!(
+            req["params"].get("interaction_context").is_none(),
+            "ZeroCode must not send prompt prose or capability claims"
+        );
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s-acp","workspace_dir":"/tmp/work"})),
+            None,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_new_acp must resolve")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
