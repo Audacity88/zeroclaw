@@ -306,3 +306,25 @@ fn replace_open_file(
 pub(crate) fn write_file_atomic(parent: &Dir, destination: &Path, bytes: &[u8]) -> io::Result<()> {
     copy_file_atomic(parent, destination, &mut io::Cursor::new(bytes), None)
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_file_atomic_replaces_existing_file_through_open_parent() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let destination = root.path().join("existing.txt");
+        std::fs::write(&destination, b"old")?;
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+
+        write_file_atomic(&parent, Path::new("existing.txt"), b"new")?;
+
+        assert_eq!(std::fs::read(destination)?, b"new");
+        let names = std::fs::read_dir(root.path())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        assert_eq!(names, [OsString::from("existing.txt")]);
+        Ok(())
+    }
+}
