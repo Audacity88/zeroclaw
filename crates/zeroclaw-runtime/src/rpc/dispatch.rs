@@ -11749,7 +11749,8 @@ mod tests {
     #[tokio::test]
     async fn config_set_still_materializes_operator_chosen_alias() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let (dispatcher, clears) =
+            make_supervised_generation_dispatcher(make_secret_test_config(&tmp));
         let res = dispatcher
             .handle_config_set(&json!({
                 "prop": "channels.telegram.newbot.bot_token",
@@ -11769,6 +11770,7 @@ mod tests {
                 .telegram
                 .contains_key("newbot")
         );
+        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
