@@ -593,7 +593,7 @@ Ordinary author revisions and clarifications during discussion do not restart th
      b. Fewer than two explicit ballots        -> DEFERRED
      c. Quorum met and any final ballot REJECT -> REJECTED
      d. Quorum met, no REJECT, and the
-        applicable threshold, required explicit
+        applicable threshold or required explicit
         approvals remain missing              -> DEFERRED
      e. Quorum met, no REJECT, applicable
         threshold satisfied                    -> ACCEPTED
