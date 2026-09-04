@@ -67,6 +67,7 @@ fn test_state(config: Config) -> AppState {
     AppState {
         config: Arc::new(RwLock::new(config)),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        agent_lifecycle: Default::default(),
         model_provider: Arc::new(MockModelProvider),
         model: "test-model".into(),
         temperature: None,
@@ -871,4 +872,69 @@ fn config_init_channel_alias_survives_config_reload() {
         }),
         "the initialized channel alias must remain addressable after Config reload",
     );
+}
+
+#[cfg(feature = "agent-runtime")]
+#[test]
+fn agent_targeting_config_commands_fail_closed_while_daemon_owns_config() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.7"}]"#,
+    );
+    let data_dir = config_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create resolved config data directory");
+    let _owner = zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(&data_dir)
+        .expect("hold daemon config ownership");
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+
+    let commands: &[(&[&str], Option<&[u8]>)] = &[
+        (
+            &[
+                "config",
+                "set",
+                "--no-interactive",
+                "agents.recreated.enabled",
+                "true",
+            ],
+            None,
+        ),
+        (&["config", "init", "agents.recreated", "--json"], None),
+        (
+            &["config", "patch", "--json", "-"],
+            Some(br#"[{"op":"add","path":"/agents/recreated/enabled","value":true}]"#),
+        ),
+    ];
+
+    for (args, stdin) in commands {
+        let mut child = Command::new(bin)
+            .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+            .env("RUST_LOG", "off")
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn agent-targeting config command");
+        if let Some(stdin) = stdin {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("child stdin")
+                .write_all(stdin)
+                .expect("write patch body");
+        }
+        let output = child.wait_with_output().expect("wait for config command");
+        assert!(
+            !output.status.success(),
+            "agent-targeting command must fail closed while config is owned: {:?}",
+            args
+        );
+    }
+
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read config after refused commands");
+    let config: Config = toml::from_str(&saved).expect("config should remain valid");
+    assert!(!config.agents.contains_key("recreated"));
 }

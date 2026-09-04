@@ -4957,9 +4957,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }));
 
             // Register channel map factory for late-bound tool handle population.
-            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
-                let config_clone = config.clone();
-                move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::build_channel_map_for_agent(
+                        config,
+                        agent_alias,
+                    )
+                },
+            ));
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|config| {
+                zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
             Box::pin(agent::run(
@@ -5335,6 +5342,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // Cron delivery is registered earlier (before the command match)
             // so it works for both `daemon` and `gateway start`.
 
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::live_channel_map_for_agent(config, agent_alias)
+                },
+            ));
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|_| {
+                zeroclaw_channels::orchestrator::live_channel_map()
+            }));
+
             let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
@@ -5368,6 +5386,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "agent-runtime")]
+                registry.register_channel_registry_clearer(std::sync::Arc::new(|| {
+                    zeroclaw_channels::orchestrator::prepare_live_channel_registry(true);
+                }));
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
@@ -5401,12 +5423,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
+                    move |host,
+                          port,
+                          config,
+                          authority,
+                          tx,
+                          reload_controls,
+                          tui_registry,
+                          ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway_with_authority(
                                 &host,
                                 port,
                                 config,
@@ -5417,6 +5446,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 sop_engine,
                                 sop_audit,
                                 ready_tx,
+                                authority,
                             ))
                             .await
                         })
@@ -5426,18 +5456,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |config, cancel| {
+                    move |authority, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
-                                config,
-                                Some(canvas_store),
-                                cancel,
-                                sop_engine,
-                                sop_audit,
-                            ))
+                            Box::pin(
+                                zeroclaw_channels::orchestrator::start_channels_with_authority(
+                                    authority,
+                                    Some(canvas_store),
+                                    cancel,
+                                    sop_engine,
+                                    sop_audit,
+                                ),
+                            )
                             .await
                         })
                     }
@@ -5476,13 +5508,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
+                let local_session_channel_factory: zeroclaw_runtime::rpc::dispatch::LocalRpcSessionChannelFactory =
+                    std::sync::Arc::new(|config, agent_alias| {
+                        zeroclaw_channels::orchestrator::build_local_rpc_session_channels(
+                            config,
+                            agent_alias,
+                        )
+                    });
+                registry.register_socket(Box::new(move |ctx, cancel, client_count, ready_tx| {
+                    let local_session_channel_factory =
+                        std::sync::Arc::clone(&local_session_channel_factory);
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(
+                        zeroclaw_runtime::rpc::local::run_local_listener_with_factory(
                             ctx,
                             cancel,
                             client_count,
                             ready_tx,
+                            Some(local_session_channel_factory),
                         )
                         .await
                     })
@@ -7135,7 +7177,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 comment,
                 json,
             } => {
-                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let known_paths: Vec<String> =
                     config.prop_fields().into_iter().map(|f| f.name).collect();
                 let mut path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
@@ -7144,7 +7185,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         config.prop_fields().into_iter().map(|f| f.name).collect();
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
-                if no_interactive {
+                let selected_value = if no_interactive {
                     let val = value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -7157,7 +7198,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         ))
                     })?;
-                    config.set_prop_persistent(&path, &val)?;
+                    val
                 } else if Config::prop_is_secret(&path) {
                     if value.is_some() {
                         eprintln!(
@@ -7173,9 +7214,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
-                    config.set_prop_persistent(&path, &secret_value)?;
+                    secret_value
                 } else if let Some(val) = value {
-                    config.set_prop_persistent(&path, &val)?;
+                    val
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
                     let provider_ref = path
@@ -7201,7 +7242,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         else {
                             anyhow::bail!("cancelled");
                         };
-                        config.set_prop_persistent(&path, &models[idx])?;
+                        models[idx].clone()
                     } else {
                         eprintln!(
                             "  no live catalog for `{provider_type}` — \
@@ -7211,7 +7252,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .with_prompt(format!("Model id for {provider_type}"))
                             .allow_empty(false)
                             .interact_text()?;
-                        config.set_prop_persistent(&path, &m)?;
+                        m
                     }
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
@@ -7230,7 +7271,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .items(&variants)
                             .default(current_index)
                             .interact()?;
-                        config.set_prop_persistent(&path, &variants[selected])?;
+                        variants[selected].clone()
                     } else if field_info
                         .as_ref()
                         .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
@@ -7266,11 +7307,57 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .filter(|l| !l.is_empty())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        config.set_prop_persistent(&path, &val)?;
+                        val
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
+                };
+
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership =
+                    if zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).is_some() {
+                        match crate::alias_cli::route_agent_mutation(
+                            &mut config,
+                            "config/set",
+                            serde_json::json!({
+                                "prop": path,
+                                "value": selected_value,
+                                "comment": comment,
+                            }),
+                        )
+                        .await?
+                        {
+                            crate::alias_cli::AgentMutationRoute::Daemon(_) => {
+                                if json {
+                                    let envelope = if Config::prop_is_secret(&path) {
+                                        serde_json::json!({"path": path, "populated": true})
+                                    } else {
+                                        serde_json::json!({"path": path, "value": selected_value})
+                                    };
+                                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                                } else {
+                                    println!(
+                                        "{}",
+                                        ta("cli-config-updated", &[("path", &path)], "updated")
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            crate::alias_cli::AgentMutationRoute::Offline(ownership) => {
+                                Some(ownership)
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+                if ensure_map_key_for_prop_path(&mut config, &path)? {
+                    let known_paths: Vec<String> =
+                        config.prop_fields().into_iter().map(|f| f.name).collect();
+                    path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
+                config.set_prop_persistent(&path, &selected_value)?;
                 Box::pin(config.save_dirty()).await?;
                 if let Some(c) = comment.as_ref()
                     && !c.is_empty()
@@ -7294,6 +7381,53 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Init { section, json } => {
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership = if let Some(("agents", alias)) = section
+                    .as_deref()
+                    .and_then(|arg| alias_target_for_path(arg, map_key_for_section_arg))
+                {
+                    match crate::alias_cli::route_agent_mutation(
+                        &mut config,
+                        "config/map-key-create",
+                        serde_json::json!({ "path": "agents", "key": alias }),
+                    )
+                    .await?
+                    {
+                        crate::alias_cli::AgentMutationRoute::Daemon(value) => {
+                            let result: zeroclaw_runtime::rpc::types::ConfigMapKeyCreateResult =
+                                serde_json::from_value(value)
+                                    .context("decode daemon config-init response")?;
+                            let initialized = result
+                                .created
+                                .then(|| format!("{}.{}", result.path, result.key))
+                                .into_iter()
+                                .collect::<Vec<_>>();
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(
+                                        &serde_json::json!({"initialized": initialized})
+                                    )?
+                                );
+                            } else if initialized.is_empty() {
+                                println!(
+                                    "{}",
+                                    t(
+                                        "cli-config-all-configured",
+                                        "All sections already configured."
+                                    )
+                                );
+                            } else {
+                                println!("Initialized 1 section(s) with defaults:");
+                                println!("  {}", initialized[0]);
+                            }
+                            return Ok(());
+                        }
+                        crate::alias_cli::AgentMutationRoute::Offline(ownership) => Some(ownership),
+                    }
+                } else {
+                    None
+                };
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
@@ -7411,7 +7545,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Patch { input, json } => {
-                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let body = match input.as_deref() {
                     None | Some("-") => {
                         use std::io::Read;
@@ -7484,6 +7617,36 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // patch that leaves an already-enabled section alone.
                 #[cfg(feature = "agent-runtime")]
                 let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
+
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership = if ops.iter().any(|op| {
+                    let op_name = op.get("op").and_then(|value| value.as_str());
+                    let path = op.get("path").and_then(|value| value.as_str()).map(|path| {
+                        path.strip_prefix('/')
+                            .map_or_else(|| path.to_string(), |path| path.replace('/', "."))
+                    });
+                    matches!(op_name, Some("add" | "replace" | "remove"))
+                        && path.as_deref().is_some_and(|path| {
+                            zeroclaw_config::alias_refs::agent_alias_for_prop_path(path).is_some()
+                        })
+                }) {
+                    match crate::alias_cli::route_agent_mutation(
+                        &mut config,
+                        "config/get",
+                        serde_json::json!({}),
+                    )
+                    .await?
+                    {
+                        crate::alias_cli::AgentMutationRoute::Daemon(_) => anyhow::bail!(
+                            "refusing agent-targeting config patch while the daemon owns config; use the daemon-backed config API"
+                        ),
+                        crate::alias_cli::AgentMutationRoute::Offline(ownership) => Some(ownership),
+                    }
+                } else {
+                    None
+                };
+
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
 
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
