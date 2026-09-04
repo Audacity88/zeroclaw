@@ -1304,6 +1304,18 @@ struct UsageInfo {
     prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     prompt_cache_hit_tokens: Option<u64>,
+    /// Anthropic-shaped cache counters, forwarded by translating gateways
+    /// on Anthropic-backed routes. `cache_read_input_tokens` is the
+    /// authoritative cached-read count (it comes from the upstream API
+    /// itself), so it takes precedence over the gateway-accounted OpenAI
+    /// and DeepSeek shapes.
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_read_input_tokens: Option<u64>,
+    /// Anthropic-shaped cache-write counter. Not part of `TokenUsage`
+    /// (cached reads are the billing-relevant figure there); logged so
+    /// write-premium spend is visible in logs.
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1313,15 +1325,33 @@ struct PromptTokensDetails {
 }
 
 impl UsageInfo {
+    /// Cached-read tokens across the three coexisting provider shapes.
+    /// Precedence: Anthropic `cache_read_input_tokens` (upstream-reported
+    /// on translated routes) over DeepSeek `prompt_cache_hit_tokens` over
+    /// OpenAI `prompt_tokens_details.cached_tokens` (gateway-accounted).
     fn cached_input_tokens(&self) -> Option<u64> {
-        self.prompt_cache_hit_tokens.or_else(|| {
-            self.prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens)
-        })
+        self.cache_read_input_tokens
+            .or(self.prompt_cache_hit_tokens)
+            .or_else(|| {
+                self.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+            })
     }
 
     fn into_provider_usage(self) -> zeroclaw_api::model_provider::TokenUsage {
+        if let Some(creation) = self.cache_creation_input_tokens.filter(|count| *count > 0) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "cache_creation_input_tokens": creation,
+                        "cache_read_input_tokens": self.cache_read_input_tokens,
+                    })),
+                "gateway-reported Anthropic cache write (billed at the write premium)"
+            );
+        }
         let cached_input_tokens = self.cached_input_tokens();
         zeroclaw_api::model_provider::TokenUsage {
             input_tokens: self.prompt_tokens,
@@ -8678,6 +8708,169 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(13313));
         assert_eq!(usage.output_tokens, Some(175));
         assert_eq!(usage.cached_input_tokens, Some(384));
+    }
+
+    #[test]
+    fn api_response_parses_anthropic_cache_read_tokens() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 4802,
+                "cache_creation_input_tokens": 0
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(4863));
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+    }
+
+    /// All three cached-token shapes on one response: the Anthropic fields
+    /// are upstream-reported and win over the gateway-accounted DeepSeek
+    /// and OpenAI shapes, which keep their existing relative order.
+    #[test]
+    fn api_response_prefers_anthropic_cache_read_across_all_shapes() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 4802,
+                "prompt_cache_hit_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+    }
+
+    /// An upstream-reported zero is authoritative, not missing data: when
+    /// the Anthropic shape says zero reads, the gateway-accounted OpenAI
+    /// figure must NOT be substituted (that would double-count gateway-side
+    /// accounting against the upstream's authoritative answer).
+    #[test]
+    fn api_response_anthropic_zero_read_blocks_openai_fallback() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn stream_chunk_parses_anthropic_cache_read_tokens() {
+        let json = r#"{
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 99,
+                "completion_tokens": 11,
+                "cache_read_input_tokens": 42,
+                "cache_creation_input_tokens": 0
+            }
+        }"#;
+        let chunk: StreamChunkResponse = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(99));
+        assert_eq!(usage.output_tokens, Some(11));
+        assert_eq!(usage.cached_input_tokens, Some(42));
+    }
+
+    /// Cache-write tokens are logged for write-premium visibility. The log
+    /// must carry the counts, not the prompt content.
+    #[test]
+    fn cache_creation_tokens_are_logged_with_counts_only() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_creation_input_tokens": 4803
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        // Write-only response: upstream reported no cache read, so the
+        // cached-token figure stays unset.
+        assert_eq!(usage.cached_input_tokens, None);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let found = 'search: loop {
+            while let Ok(event) = rx.try_recv() {
+                let matches_message = event.get("message").and_then(|value| value.as_str())
+                    == Some("gateway-reported Anthropic cache write (billed at the write premium)");
+                let matches_counts = event
+                    .get("attributes")
+                    .and_then(|attributes| attributes.get("cache_creation_input_tokens"))
+                    == Some(&serde_json::json!(4803));
+                if matches_message && matches_counts && matches_source_file(&event) {
+                    break 'search true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break 'search false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(found, "cache-write log record with counts must be emitted");
+    }
+
+    fn matches_source_file(event: &serde_json::Value) -> bool {
+        event
+            .get("attributes")
+            .and_then(|attributes| attributes.get("_file"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|file| file.ends_with("compatible.rs"))
+    }
+
+    /// End to end on the tools path: a translated-gateway response carrying
+    /// Anthropic-shaped usage populates `TokenUsage.cached_input_tokens`.
+    /// Parsing is flag-independent (the gateway sends these fields on
+    /// Anthropic-backed routes regardless of the client flag).
+    #[tokio::test]
+    async fn chat_with_tools_surfaces_anthropic_cache_read_tokens() {
+        let (provider, _captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 4,
+                "cache_read_input_tokens": 4802,
+                "cache_creation_input_tokens": 0
+            }
+        }))
+        .await;
+        let messages = vec![ChatMessage::user("hi")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let response = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        let response = response.unwrap_or_else(|error| panic!("tools request failed: {error}"));
+        let usage = response.usage.expect("usage must be captured");
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+        assert_eq!(usage.input_tokens, Some(4863));
     }
 
     #[test]
