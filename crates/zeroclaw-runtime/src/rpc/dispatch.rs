@@ -11059,7 +11059,7 @@ mod tests {
             .expect("default-stack Tokio runtime");
 
         runtime.block_on(async {
-            let task = tokio::spawn(async {
+            let task = zeroclaw_spawn::spawn!(async {
                 let tmp = tempfile::TempDir::new().expect("temporary config root");
                 let mut config = make_secret_test_config(&tmp);
                 config

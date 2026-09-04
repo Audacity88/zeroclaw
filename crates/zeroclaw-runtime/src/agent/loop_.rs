@@ -3130,7 +3130,7 @@ pub async fn process_message(
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
             &config,
-            &agent_alias,
+            agent_alias,
             &ask_user_handle,
             &channel_room_handle,
             &reaction_handle,

@@ -355,7 +355,7 @@ mod tests {
             }
         });
 
-        let _ = gateway(
+        std::mem::drop(gateway(
             String::new(),
             0,
             Config::default(),
@@ -364,7 +364,7 @@ mod tests {
             None,
             None,
             None,
-        );
-        let _ = channels(authority, CancellationToken::new());
+        ));
+        std::mem::drop(channels(authority, CancellationToken::new()));
     }
 }

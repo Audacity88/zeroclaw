@@ -209,9 +209,23 @@ impl ConfigOwnershipGuard {
                         format!("confirming config lifecycle lock {}", path.display())
                     })?;
                     if locked.dev() != current.dev() || locked.ino() != current.ino() {
-                        return Err(ConfigOwnershipError::Unavailable(anyhow::anyhow!(
-                            "config lifecycle lock {} was replaced while being acquired",
-                            path.display()
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({ "path": path.display().to_string() })
+                            ),
+                            "config lifecycle lock was replaced while being acquired"
+                        );
+                        return Err(ConfigOwnershipError::Unavailable(anyhow::Error::msg(
+                            format!(
+                                "config lifecycle lock {} was replaced while being acquired",
+                                path.display()
+                            ),
                         )));
                     }
                 }
@@ -238,7 +252,7 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         let _leases = leases;
         future.await
     })
@@ -830,8 +844,10 @@ mod tests {
     #[tokio::test]
     async fn generation_drain_retains_process_ownership_until_cleanup_finishes() {
         let temp = tempfile::TempDir::new().unwrap();
-        let mut config = Config::default();
-        config.data_dir = temp.path().to_path_buf();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
         let authority = LiveConfigAuthority::new_owned(config).unwrap();
         let lease = authority.agent_lifecycle().begin_delete("alpha").unwrap();
         let release = Arc::new(tokio::sync::Semaphore::new(0));
