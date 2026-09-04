@@ -974,6 +974,40 @@ impl OpenAiCompatibleModelProvider {
         })
     }
 
+    /// Inject Anthropic prompt-cache breakpoints behind `cache_passthrough`.
+    ///
+    /// The native Anthropic provider is the source of truth for placement:
+    /// `AnthropicModelProvider::should_cache_conversation` and
+    /// `apply_cache_to_last_message` in `anthropic.rs`. (a) The system prompt
+    /// always carries a breakpoint when one exists on the wire. (b) The last
+    /// message's trailing text part carries a rolling breakpoint once the
+    /// conversation has more than one non-system message, the same gate the
+    /// native provider applies before `apply_cache_to_last_message`. At most
+    /// two breakpoints per request; only breakpoint-carrying messages convert
+    /// from string content to block form, every other message serializes
+    /// exactly as before.
+    fn apply_cache_breakpoints<T: CacheBreakpointMessage>(&self, messages: &mut [T]) {
+        if !self.cache_passthrough {
+            return;
+        }
+        if let Some(system) = messages.iter_mut().find(|m| m.cache_role() == "system")
+            && let Some(content) = system.cache_content()
+        {
+            content.apply_cache_control();
+        }
+        let non_system_count = messages
+            .iter()
+            .filter(|m| m.cache_role() != "system")
+            .count();
+        if non_system_count > 1
+            && let Some(last) = messages.last_mut()
+            && last.cache_role() != "system"
+            && let Some(content) = last.cache_content()
+        {
+            content.apply_cache_control();
+        }
+    }
+
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
     /// This allows custom model_providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
@@ -1160,11 +1194,71 @@ enum MessageContent {
     Parts(Vec<MessagePart>),
 }
 
+impl MessageContent {
+    /// Mark this content as an Anthropic prompt-cache breakpoint: plain
+    /// string content converts to the single-text-block wire form (block
+    /// conversion touches only breakpoint-carrying messages); block-form
+    /// content gains the marker on its trailing text part. Trailing
+    /// non-text parts (images) are left unmarked, mirroring the native
+    /// Anthropic provider's placement, which never marks image blocks.
+    fn apply_cache_control(&mut self) {
+        match self {
+            MessageContent::Text(text) => {
+                *self = MessageContent::Parts(vec![MessagePart::Text {
+                    text: std::mem::take(text),
+                    cache_control: Some(crate::anthropic::CacheControl::ephemeral()),
+                }]);
+            }
+            MessageContent::Parts(parts) => {
+                if let Some(MessagePart::Text { cache_control, .. }) = parts.last_mut() {
+                    *cache_control = Some(crate::anthropic::CacheControl::ephemeral());
+                }
+            }
+        }
+    }
+}
+
+/// Uniform (role, content) access over the two wire message shapes so one
+/// breakpoint-injection routine serves both the no-tools and the native-tools
+/// request types.
+trait CacheBreakpointMessage {
+    fn cache_role(&self) -> &str;
+    fn cache_content(&mut self) -> Option<&mut MessageContent>;
+}
+
+impl CacheBreakpointMessage for Message {
+    fn cache_role(&self) -> &str {
+        &self.role
+    }
+
+    fn cache_content(&mut self) -> Option<&mut MessageContent> {
+        Some(&mut self.content)
+    }
+}
+
+impl CacheBreakpointMessage for NativeMessage {
+    fn cache_role(&self) -> &str {
+        &self.role
+    }
+
+    fn cache_content(&mut self) -> Option<&mut MessageContent> {
+        self.content.as_mut()
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MessagePart {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrlPart },
+    Text {
+        text: String,
+        /// Anthropic prompt-cache breakpoint, injected only behind
+        /// `cache_passthrough` and only on breakpoint-carrying messages.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<crate::anthropic::CacheControl>,
+    },
+    ImageUrl {
+        image_url: ImageUrlPart,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -2256,10 +2350,13 @@ impl OpenAiCompatibleModelProvider {
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let tool_choice = has_tool_entries.then(|| "auto".to_string());
+        let mut messages =
+            self.convert_messages_for_native(effective_messages, allow_user_image_parts);
+        self.apply_cache_breakpoints(&mut messages);
 
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
+            messages,
             temperature,
             stream: Some(false),
             // Non-streaming path; `usage` is on the final response body, not
@@ -2283,9 +2380,12 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
     ) -> NativeChatRequest<&'a [serde_json::Value]> {
         let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
+        let mut messages =
+            self.convert_messages_for_native(effective_messages, allow_user_image_parts);
+        self.apply_cache_breakpoints(&mut messages);
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
+            messages,
             temperature,
             stream: Some(false),
             stream_options: None,
@@ -2317,9 +2417,11 @@ impl OpenAiCompatibleModelProvider {
         let tool_choice = tools
             .as_ref()
             .and_then(|t| (!t.is_empty()).then(|| "auto".to_string()));
+        let mut messages = self.convert_messages_for_native(effective_messages, !merge);
+        self.apply_cache_breakpoints(&mut messages);
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, !merge),
+            messages,
             temperature,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: if options_enabled {
@@ -2391,6 +2493,7 @@ impl OpenAiCompatibleModelProvider {
         if !trimmed_text.is_empty() {
             parts.push(MessagePart::Text {
                 text: trimmed_text.to_string(),
+                cache_control: None,
             });
         }
 
@@ -3080,7 +3183,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             });
         }
 
-        let request = ApiChatRequest {
+        let mut request = ApiChatRequest {
             model: model.to_string(),
             messages,
             temperature,
@@ -3093,6 +3196,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
+        self.apply_cache_breakpoints(&mut request.messages);
 
         let url = self.chat_completions_url();
 
@@ -3170,7 +3274,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             })
             .collect();
 
-        let request = ApiChatRequest {
+        let mut request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
             temperature,
@@ -3183,6 +3287,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
+        self.apply_cache_breakpoints(&mut request.messages);
 
         let url = self.chat_completions_url();
         let response = match self
@@ -3559,7 +3664,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     merge,
                 ))
             } else {
-                let messages = effective_messages
+                let mut messages: Vec<Message> = effective_messages
                     .iter()
                     .map(|message| Message {
                         role: message.role.clone(),
@@ -3571,6 +3676,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         ),
                     })
                     .collect();
+                provider.apply_cache_breakpoints(&mut messages);
 
                 serde_json::to_value(ApiChatRequest {
                     model: model.clone(),
@@ -3770,7 +3876,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 });
             }
 
-            let request = ApiChatRequest {
+            let mut request = ApiChatRequest {
                 model: model.clone(),
                 messages,
                 temperature,
@@ -3785,6 +3891,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
+            provider.apply_cache_breakpoints(&mut request.messages);
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
@@ -3887,7 +3994,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 })
                 .collect();
 
-            let request = ApiChatRequest {
+            let mut request = ApiChatRequest {
                 model: model.clone(),
                 messages: api_messages,
                 temperature,
@@ -3902,6 +4009,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
+            provider.apply_cache_breakpoints(&mut request.messages);
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
@@ -4240,6 +4348,295 @@ mod tests {
                 "stream": false,
             }),
             "flag-off request body must stay byte-identical to the pre-feature wire"
+        );
+    }
+
+    /// Streaming capture mock: records every request body, answers with a
+    /// minimal SSE stream. Returns the provider built with or without the
+    /// cache flag so tests can pin both wire paths.
+    async fn mock_streaming_cache_capture(
+        cache_passthrough: bool,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    captured.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut builder = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer);
+        if cache_passthrough {
+            builder = builder.with_cache_passthrough();
+        }
+        let provider = builder.build();
+
+        (provider, captured, server)
+    }
+
+    /// D3 wire shape: behind the flag, the system prompt converts from
+    /// string content to the single-text-block form carrying
+    /// `cache_control`, while every other message keeps its existing
+    /// serialization untouched.
+    #[tokio::test]
+    async fn cache_passthrough_system_breakpoint_serializes_block_form() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let result = provider
+            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "be brief",
+                         "cache_control": {"type": "ephemeral"}},
+                    ]},
+                    {"role": "user", "content": "hello"},
+                ],
+                "stream": false,
+            }),
+            "system prompt must serialize as a cache_control text block; other messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "single exchange must carry exactly one breakpoint"
+        );
+    }
+
+    /// Rolling breakpoint: once the conversation has more than one
+    /// non-system message (the native provider's gate), the last message
+    /// gains the second breakpoint and converts to block form; messages in
+    /// between serialize exactly as before.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_after_first_exchange() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on history request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "bye",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "system and last message carry the breakpoints; middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "rolling breakpoint must never exceed two per request"
+        );
+    }
+
+    /// The rolling breakpoint follows the native provider's gate: a
+    /// conversation with only one non-system message gets the system
+    /// breakpoint alone.
+    #[tokio::test]
+    async fn cache_passthrough_single_exchange_skips_rolling_breakpoint() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on history request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "one non-system message means no rolling breakpoint"
+        );
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            serde_json::json!("hi"),
+            "first user message must stay a plain string"
+        );
+    }
+
+    /// Streaming twin of the system-breakpoint pin: the injection must be
+    /// identical on the streaming path (a previous feature shipped the
+    /// non-streaming path and silently missed streaming).
+    #[tokio::test]
+    async fn cache_passthrough_streaming_system_breakpoint_matches_non_streaming() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let events = provider
+            .stream_chat_with_system(
+                Some("be brief"),
+                "hello",
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "streaming request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"][0],
+            serde_json::json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "be brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ],
+            }),
+            "streaming path must inject the system breakpoint identically"
+        );
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            serde_json::json!("hello"),
+            "streaming user message must stay a plain string"
+        );
+    }
+
+    /// Flag-off streaming twin: the default path stays byte-identical on
+    /// the streaming wire too.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_streaming_body_unmarked() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let events = provider
+            .stream_chat_with_system(
+                Some("be brief"),
+                "hello",
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(events.iter().all(Result::is_ok));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"][0]["content"],
+            serde_json::json!("be brief"),
+            "flag-off system message must stay a plain string"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off streaming body must carry no cache markers"
+        );
+    }
+
+    /// Native-tools path: the same two-breakpoint placement applies to the
+    /// native-tools request builder, so tool-bearing agent loops get the
+    /// same caching shape as plain conversations.
+    #[tokio::test]
+    async fn cache_passthrough_tools_path_rolls_breakpoint_onto_last_message() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let result = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on tools request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "tools path must carry at most the two standard breakpoints"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "system breakpoint present on the tools path"
+        );
+        assert_eq!(
+            requests[0]["messages"].as_array().unwrap().last().unwrap()["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling breakpoint lands on the last message of the tools path"
         );
     }
 
