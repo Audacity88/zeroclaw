@@ -144,33 +144,44 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
             ));
         }
     };
-    let line = match frame {
-        Ok(Some(line)) => line,
-        Ok(None) => {
-            let status = child.try_wait()?;
-            let detail = status
-                .map(|status| format!("desktop supervisor exited before readiness ({status})"))
-                .unwrap_or_else(|| "desktop supervisor closed readiness pipe".to_string());
-            let startup_error = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, detail);
-            return Err(attach_cleanup_error(
-                startup_error,
-                terminate_supervisor_tree(&mut child),
-            ));
-        }
-        Err(error) => {
-            return Err(attach_cleanup_error(
-                error,
-                terminate_supervisor_tree(&mut child),
-            ));
-        }
-    };
-    match parse_readiness_line(&line) {
+    match validate_readiness_frame(frame, || child.try_wait()) {
         Ok(()) => Ok(child),
-        Err(detail) => Err(attach_cleanup_error(
-            std::io::Error::other(detail),
+        Err(startup_error) => Err(attach_cleanup_error(
+            startup_error,
             terminate_supervisor_tree(&mut child),
         )),
     }
+}
+
+fn validate_readiness_frame<F>(
+    frame: std::io::Result<Option<String>>,
+    status_probe: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce() -> std::io::Result<Option<std::process::ExitStatus>>,
+{
+    let line = match frame {
+        Ok(Some(line)) => line,
+        Ok(None) => {
+            let status = status_probe().map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to inspect desktop supervisor after readiness pipe closed: {error}"
+                    ),
+                )
+            })?;
+            let detail = status
+                .map(|status| format!("desktop supervisor exited before readiness ({status})"))
+                .unwrap_or_else(|| "desktop supervisor closed readiness pipe".to_string());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                detail,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    parse_readiness_line(&line).map_err(std::io::Error::other)
 }
 
 fn ensure_desktop_supervisor_capability(binary: &Path) -> std::io::Result<()> {
@@ -719,6 +730,25 @@ mod tests {
         let error = read_readiness_frame(b"READY".as_slice()).expect_err("unterminated frame");
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(error.to_string().contains("newline"));
+    }
+
+    #[test]
+    fn readiness_frame_preserves_status_probe_error() {
+        let error = validate_readiness_frame(Ok(None), || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated status probe failure",
+            ))
+        })
+        .expect_err("status-probe failure must reject readiness");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("failed to inspect desktop supervisor after readiness pipe closed")
+        );
+        assert!(error.to_string().contains("simulated status probe failure"));
     }
 
     #[test]
