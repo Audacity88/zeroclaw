@@ -32,16 +32,27 @@ pub(crate) fn validate_url(input: &str) -> anyhow::Result<String> {
 
 pub(crate) fn launch_spec(input: &str) -> anyhow::Result<LaunchSpec> {
     let argument = validate_url(input)?;
+    let program = platform_program()?;
+
+    Ok(LaunchSpec { program, argument })
+}
+
+fn platform_program() -> anyhow::Result<&'static str> {
     #[cfg(target_os = "macos")]
     let program = "/usr/bin/open";
     #[cfg(target_os = "linux")]
     let program = "xdg-open";
     #[cfg(target_os = "windows")]
     let program = "explorer.exe";
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    anyhow::bail!("opening links is unsupported on this platform");
 
-    Ok(LaunchSpec { program, argument })
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        Ok(program)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!("opening links is unsupported on this platform")
+    }
 }
 
 /// Spawn the platform browser launcher without blocking the TUI event loop.
@@ -96,5 +107,15 @@ mod tests {
         assert_eq!(spec.program, "xdg-open");
         #[cfg(target_os = "windows")]
         assert_eq!(spec.program, "explorer.exe");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn rejects_launches_on_unsupported_platforms() {
+        let error = launch_spec("https://example.com").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "opening links is unsupported on this platform"
+        );
     }
 }
