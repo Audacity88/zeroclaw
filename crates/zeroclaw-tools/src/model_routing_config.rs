@@ -189,6 +189,20 @@ impl ModelRoutingConfigTool {
         Ok(value.to_string())
     }
 
+    fn reject_unknown_model_provider_family(family: &str, name: &str) -> anyhow::Result<()> {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider_family": family,
+                    "name": name,
+                })),
+            "model_routing_config: unknown model_provider family"
+        );
+        anyhow::bail!("unknown model_provider type `{family}`. no typed slot in ModelProviders")
+    }
+
     fn parse_optional_string_update(args: &Value, field: &str) -> anyhow::Result<MaybeSet<String>> {
         let Some(raw) = args.get(field) else {
             return Ok(MaybeSet::Unset);
@@ -927,9 +941,7 @@ impl ModelRoutingConfigTool {
         // Validate the provider route before mutating any provider, profile, or agent state.
         let agent_model_provider_ref = if let Some((family, alias)) = provider_ref_parts {
             if !zeroclaw_config::providers::ModelProviders::slot_names().contains(&family) {
-                anyhow::bail!(
-                    "unknown model_provider type `{family}`. no typed slot in ModelProviders"
-                );
+                Self::reject_unknown_model_provider_family(family, &name)?;
             }
             if cfg.providers.models.find(family, alias).is_none() {
                 anyhow::bail!(
@@ -941,19 +953,7 @@ impl ModelRoutingConfigTool {
             if !zeroclaw_config::providers::ModelProviders::slot_names()
                 .contains(&model_provider.as_str())
             {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "model_provider_family": &model_provider,
-                            "name": &name,
-                        })),
-                    "model_routing_config: unknown model_provider family"
-                );
-                anyhow::bail!(
-                    "unknown model_provider type `{model_provider}`. no typed slot in ModelProviders"
-                );
+                Self::reject_unknown_model_provider_family(&model_provider, &name)?;
             }
             format!("{model_provider}.{name}")
         };
@@ -1493,6 +1493,7 @@ mod tests {
     async fn upsert_agent_rejects_invalid_provider_requests_without_mutation() {
         let cases = [
             ("unknown family", json!("unknown"), true),
+            ("unknown dotted family", json!("unknown.alias"), false),
             ("missing dotted alias", json!("custom.missing"), false),
             ("bare family without model", json!("custom"), false),
         ];
