@@ -579,17 +579,37 @@ impl DelegateTool {
             // compares it against the invoking policy's own ceiling, so a
             // target with a looser profile ceiling would outspend the
             // caller's budget - the escalation `ensure_no_escalation_beyond`
-            // already rejects for child ceilings. Tighten both ceilings to
-            // the caller's; the caller's ceiling is itself the tightened
-            // chain value, so the bound holds for the whole subtree. The
-            // schema defines `0` as a hard zero budget (not "unlimited"),
-            // so a numeric min is exact.
+            // already rejects for child ceilings. The caller's ceiling is
+            // itself the tightened chain value, so the bound holds for the
+            // whole subtree.
+            //
+            // The two fields have DIFFERENT zero semantics in the schema.
+            // `max_actions_per_hour`: `0` is a hard zero budget, so a numeric
+            // min is exact. `max_cost_per_day_cents`: `0` inherits the global
+            // limit, so a raw min could turn an unset target value into an
+            // "inherit-global" child cap looser than the caller's explicit
+            // cap. Combine cost so the result is never looser than the
+            // caller's effective ceiling: both explicit -> min, one unset ->
+            // carry the explicit one, both unset -> inherit (0).
+            //
+            // Enforcement status: the ACTION ceiling is enforced at every
+            // admission through the shared tracker. The COST ceiling is
+            // carried faithfully but NOT enforced on delegated runs today -
+            // delegated loops run without cost-tracking scope - so this
+            // clamp is future-proofing for cost enforcement, not live
+            // enforcement. See the follow-up on threading cost context into
+            // child loops.
             target_policy.max_actions_per_hour = target_policy
                 .max_actions_per_hour
                 .min(self.security.max_actions_per_hour);
-            target_policy.max_cost_per_day_cents = target_policy
-                .max_cost_per_day_cents
-                .min(self.security.max_cost_per_day_cents);
+            target_policy.max_cost_per_day_cents = match (
+                self.security.max_cost_per_day_cents,
+                target_policy.max_cost_per_day_cents,
+            ) {
+                (0, target) => target,
+                (caller, 0) => caller,
+                (caller, target) => caller.min(target),
+            };
 
             if self.security.risk_profile_name == target_policy.risk_profile_name {
                 target_policy.workspace_dir = self.security.workspace_dir.clone();
@@ -8068,6 +8088,71 @@ mod tests {
         DelegateTool::new(config.agents.clone(), None, caller_policy)
             .with_root_config(config)
             .with_caller_alias("caller")
+    }
+
+    #[tokio::test]
+    async fn bounded_cost_ceiling_combines_per_schema_zero_semantics() {
+        // `max_actions_per_hour` treats 0 as a hard zero, but
+        // `max_cost_per_day_cents` treats 0 as "inherit the global limit".
+        // The bounded clamp must therefore never turn an unset (0) target or
+        // caller cost value into a binding that is looser than the explicit
+        // values. Asserted on the resolved policy directly: cost is declared
+        // but not yet enforced on delegated runs.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let build = |caller_cost: u32, target_cost: u32| {
+            let mut config = Config::default();
+            for (profile, cost) in [
+                ("caller_profile", caller_cost),
+                ("target_profile", target_cost),
+            ] {
+                config.runtime_profiles.insert(
+                    profile.to_string(),
+                    RuntimeProfileConfig {
+                        max_cost_per_day_cents: cost,
+                        ..RuntimeProfileConfig::default()
+                    },
+                );
+            }
+            for alias in ["caller", "target"] {
+                config.risk_profiles.insert(
+                    format!("{alias}_profile"),
+                    RiskProfileConfig {
+                        delegation_policy: DelegationPolicy {
+                            mode: DelegationMode::Allow,
+                        },
+                        ..RiskProfileConfig::default()
+                    },
+                );
+                config.agents.insert(
+                    alias.to_string(),
+                    AliasedAgentConfig {
+                        risk_profile: format!("{alias}_profile").into(),
+                        runtime_profile: format!("{alias}_profile").into(),
+                        model_provider: "ollama.x".into(),
+                        delegates: vec![DelegateTargetConfig::bounded("target")],
+                        ..AliasedAgentConfig::default()
+                    },
+                );
+            }
+            let config = Arc::new(config);
+            let tool = delegate_tool_for_config(Arc::clone(&config));
+            let target_policy = tool.policy_for_target("target").expect("target policy");
+            target_policy.max_cost_per_day_cents
+        };
+
+        // Both explicit: the stricter wins (min).
+        assert_eq!(build(100, 30), 30, "both explicit -> min");
+        // Target unset (0 = inherit global): carry the caller's explicit cap
+        // rather than letting the child fall back to inherit-global.
+        assert_eq!(build(100, 0), 100);
+        // Caller unset (inherits global): the target's explicit cap stands.
+        assert_eq!(build(0, 30), 30);
+        // Both unset: inherit (0) on both levels.
+        assert_eq!(build(0, 0), 0);
     }
 
     #[tokio::test]
