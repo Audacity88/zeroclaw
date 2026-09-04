@@ -8873,6 +8873,53 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(4863));
     }
 
+    /// Flag interaction: the thinking object reaches the wire through
+    /// `extra_body` (the same surface the thinking-passthrough feature
+    /// uses), and it must ride alongside the cache breakpoints in one
+    /// request: neither injection disturbs the other, and both land
+    /// together on real deployments that enable both flags.
+    #[tokio::test]
+    async fn cache_breakpoints_coexist_with_thinking_object_in_one_request() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        // Builder-level extra_body mirrors what provider_extra supplies for
+        // thinking-capable gateways; swap in the flag-side equivalent when
+        // the thinking-passthrough provider flag lands in this tree.
+        let provider = OpenAiCompatibleModelProvider {
+            extra_body: Some(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+            })),
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("combined request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+            "the thinking object must ride at the top level untouched"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "system cache breakpoint present alongside the thinking object"
+        );
+        assert_eq!(
+            requests[0]["messages"][3]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling cache breakpoint present alongside the thinking object"
+        );
+    }
+
     #[test]
     fn api_response_parses_without_usage() {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
