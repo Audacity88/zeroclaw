@@ -77,9 +77,15 @@ thinking_passthrough = true
   (streamed text, or a gateway that strips signatures) sends no reasoning at
   all rather than fabricating blocks a gateway would reject. If any line of a
   message's stored reasoning is unsigned or malformed, the whole message
-  replays without reasoning (no partial block sequences). Opaque
-  `redacted_thinking` blocks are the exception: they carry no signature by
-  design and replay verbatim, both on capture and on reconstruction.
+  replays without reasoning (no partial block sequences). The captured block
+  whitelist is exactly `thinking` (text and/or signature required) and
+  `redacted_thinking` (opaque `data` required, replayed verbatim and
+  signature-less by design); any other block type a gateway emits is skipped
+  on capture and never forwarded on replay.
+- **Nested content blocks are not captured.** Only top-level
+  `reasoning_content`, `reasoning`, and `thinking_blocks` fields are read.
+  Anthropic-shaped blocks nested inside a `content` array are not captured;
+  file an issue with a wire sample if your gateway emits them.
 - **Passthrough disables streaming.** Capture normalization applies to
   non-streaming responses, and gateway SSE thinking frames are unverified
   territory, so the flag reports the provider as non-streaming: agents run
