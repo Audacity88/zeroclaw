@@ -507,7 +507,3 @@ zc-config-footer-action-new-line = 改行
 zc-config-field-edit-hint = { $keys } → 押して編集
 
 zc-doctor-log-path = log: { $path }
-zc-zerocode-tracker-visibility = 表示状態
-zc-zerocode-tracker-edit-visibility = Enter で auto / hidden / shown を切り替えます。
-zc-chat-todo-visibility-save-failed = この実行では表示状態を変更しましたが、保存できませんでした: { $error }
-zc-chat-todo-visibility-saved-env-override = 表示状態を保存しましたが、再起動後は ZEROCODE_todotracker__visibility が優先されます。

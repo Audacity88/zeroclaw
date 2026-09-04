@@ -1,105 +1,41 @@
 //! Read-only TodoWrite tracker widget for the Code pane.
 //!
 //! Holds the last authoritative plan (whole-list replace) and owns the
-//! show/hide state machine. Plan auto-pop is session-local, while an explicit
-//! user choice is process-wide; a master `enabled` flag hard-gates rendering.
+//! show/hide state machine: auto-pop once on the first plan of a
+//! session, after which the user's toggle is authoritative; a master
+//! `enabled` flag hard-gates all rendering.
 //!
 //! The config-derived types this widget is built from
 //! ([`TodoLocation`](crate::config::TodoLocation) and
 //! [`TodoTrackerSettings`](crate::config::TodoTrackerSettings)) live in
 //! [`crate::config`], the single owner of `zerocode-config.toml` parsing.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU8, Ordering},
-};
-
 use crate::wire::{PlanEntry, PlanStatus};
 
 // Re-export the config-owned runtime types so existing `crate::todo_tracker::*`
 // call sites keep resolving after these moved to `crate::config` (their single
 // owner). The widget below is built from them.
-pub(crate) use crate::config::{TodoLocation, TodoTrackerSettings, TodoTrackerVisibility};
-
-const VISIBILITY_UNSET: u8 = 0;
-const VISIBILITY_HIDDEN: u8 = 1;
-const VISIBILITY_SHOWN: u8 = 2;
-const VISIBILITY_AUTO: u8 = 3;
-
-/// One visibility preference shared by every Todo tracker in this process.
-#[derive(Clone, Debug)]
-pub(crate) struct TodoVisibilityHandle(Arc<AtomicU8>);
-
-impl TodoVisibilityHandle {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(VISIBILITY_UNSET)))
-    }
-
-    fn initialize(&self, mode: TodoTrackerVisibility) {
-        if mode == TodoTrackerVisibility::Auto {
-            return;
-        }
-        let _ = self.0.compare_exchange(
-            VISIBILITY_UNSET,
-            Self::encode(mode),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
-
-    pub(crate) fn mode(&self) -> TodoTrackerVisibility {
-        Self::decode(self.0.load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn set_mode(&self, mode: TodoTrackerVisibility) {
-        self.0.store(Self::encode(mode), Ordering::Relaxed);
-    }
-
-    fn encode(mode: TodoTrackerVisibility) -> u8 {
-        match mode {
-            TodoTrackerVisibility::Auto => VISIBILITY_AUTO,
-            TodoTrackerVisibility::Hidden => VISIBILITY_HIDDEN,
-            TodoTrackerVisibility::Shown => VISIBILITY_SHOWN,
-        }
-    }
-
-    fn decode(value: u8) -> TodoTrackerVisibility {
-        match value {
-            VISIBILITY_HIDDEN => TodoTrackerVisibility::Hidden,
-            VISIBILITY_SHOWN => TodoTrackerVisibility::Shown,
-            _ => TodoTrackerVisibility::Auto,
-        }
-    }
-}
+pub(crate) use crate::config::{TodoLocation, TodoTrackerSettings};
 
 #[derive(Debug)]
 pub(crate) struct TodoTracker {
     entries: Vec<PlanEntry>,
+    visible: bool,
     has_ever_popped: bool,
     /// The resolved settings this tracker was built from. Retained so the
     /// active settings can be read back (e.g. as a fallback when a later
     /// config reload fails) without losing `enabled_at_start`.
     settings: TodoTrackerSettings,
-    visibility: TodoVisibilityHandle,
 }
 
 impl TodoTracker {
     /// Construct from parsed `[todotracker]` settings.
-    #[cfg(test)]
     pub(crate) fn from_settings(settings: TodoTrackerSettings) -> Self {
-        Self::from_settings_with_visibility(settings, TodoVisibilityHandle::new())
-    }
-
-    pub(crate) fn from_settings_with_visibility(
-        settings: TodoTrackerSettings,
-        visibility: TodoVisibilityHandle,
-    ) -> Self {
-        visibility.initialize(settings.visibility);
         Self {
             entries: Vec::new(),
+            visible: settings.enabled && settings.enabled_at_start,
             has_ever_popped: false,
             settings,
-            visibility,
         }
     }
 
@@ -133,54 +69,45 @@ impl TodoTracker {
     }
 
     /// Replace the plan wholesale. On the first non-empty plan of the
-    /// session, auto-pop into view exactly once (unless master-disabled).
+    /// session, auto-pop into view exactly once (unless master-disabled or the
+    /// user already dismissed the tracker in this session).
     pub(crate) fn set_plan(&mut self, entries: Vec<PlanEntry>) {
         self.entries = entries;
         if self.settings.enabled && !self.has_ever_popped && !self.entries.is_empty() {
+            self.visible = true;
             self.has_ever_popped = true;
         }
     }
 
     /// Rebuild the tracker for a newly-entered session from freshly resolved
     /// settings. The plan is per-session, so entries are dropped and the
-    /// one-time auto-pop is re-armed; the process visibility choice survives.
+    /// one-time auto-pop is re-armed; layout/visibility come from `settings`
+    /// so a Config-pane edit takes effect on the next session transition
+    /// (restart or switch), not only on a fresh session.
     pub(crate) fn reset_for_session(&mut self, settings: TodoTrackerSettings) {
-        let visibility = self.visibility.clone();
-        *self = Self::from_settings_with_visibility(settings, visibility);
+        *self = Self::from_settings(settings);
     }
 
     /// User show/hide. Inert while master-disabled.
-    pub(crate) fn toggle(&mut self) -> Option<TodoTrackerVisibility> {
-        if !self.settings.enabled {
-            return None;
+    pub(crate) fn toggle(&mut self) {
+        if self.settings.enabled {
+            self.visible = !self.visible;
+            if !self.visible {
+                self.has_ever_popped = true;
+            }
         }
-        let mode = if self.is_visible() {
-            TodoTrackerVisibility::Hidden
-        } else {
-            TodoTrackerVisibility::Shown
-        };
-        self.visibility.set_mode(mode);
-        Some(mode)
     }
 
-    /// Explicitly hide the tracker while retaining its current plan.
-    pub(crate) fn hide(&mut self) -> Option<TodoTrackerVisibility> {
-        if !self.settings.enabled {
-            return None;
+    /// Explicitly hide the tracker while retaining the current plan.
+    pub(crate) fn hide(&mut self) {
+        if self.settings.enabled {
+            self.visible = false;
+            self.has_ever_popped = true;
         }
-        self.visibility.set_mode(TodoTrackerVisibility::Hidden);
-        Some(TodoTrackerVisibility::Hidden)
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        if !self.settings.enabled {
-            return false;
-        }
-        match self.visibility.mode() {
-            TodoTrackerVisibility::Auto => self.settings.enabled_at_start || self.has_ever_popped,
-            TodoTrackerVisibility::Hidden => false,
-            TodoTrackerVisibility::Shown => true,
-        }
+        self.settings.enabled && self.visible
     }
 
     #[cfg(test)]
@@ -328,7 +255,6 @@ mod tests {
         let s = TodoTrackerSettings::default();
         assert!(s.enabled);
         assert!(!s.enabled_at_start);
-        assert_eq!(s.visibility, TodoTrackerVisibility::Auto);
         assert_eq!(s.location, TodoLocation::Right);
         assert_eq!(s.width, 32);
         assert_eq!(s.max_height, 5);
@@ -405,6 +331,30 @@ mod tests {
     }
 
     #[test]
+    fn dismissal_before_first_plan_prevents_update_from_reopening() {
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.hide();
+        assert!(!t.is_visible());
+
+        t.set_plan(vec![entry("A", PlanStatus::InProgress)]);
+
+        assert!(!t.is_visible(), "plan updates respect session dismissal");
+        assert_eq!(t.entries()[0].content, "A");
+    }
+
+    #[test]
+    fn toggle_reopens_dismissed_plan_unchanged() {
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.set_plan(vec![entry("A", PlanStatus::Pending)]);
+        t.hide();
+
+        t.toggle();
+
+        assert!(t.is_visible());
+        assert_eq!(t.entries()[0].content, "A");
+    }
+
+    #[test]
     fn visible_at_start_when_enabled_at_start_true() {
         let t = TodoTracker::new(TodoLocation::Right, true, true);
         assert!(t.is_visible());
@@ -448,7 +398,9 @@ mod tests {
     }
 
     #[test]
-    fn reset_for_session_preserves_explicit_hide() {
+    fn reset_for_session_restores_enabled_at_start_visibility() {
+        // enabled_at_start=true means the tracker shows at each session's
+        // launch, including after a switch.
         let settings = settings_for(TodoLocation::Right, true, true);
         let mut t = TodoTracker::from_settings(settings);
         t.set_plan(vec![entry("A", PlanStatus::Pending)]);
@@ -456,93 +408,27 @@ mod tests {
         assert!(!t.is_visible());
         t.reset_for_session(settings);
         assert!(
-            !t.is_visible(),
-            "an explicit hide remains authoritative on the new session"
+            t.is_visible(),
+            "enabled_at_start restores visibility on the new session"
         );
         assert_eq!(t.total(), 0);
     }
 
     #[test]
-    fn shared_visibility_does_not_share_plans() {
-        let visibility = TodoVisibilityHandle::new();
+    fn reset_for_session_clears_dismissal_and_rearms_autopop() {
         let settings = settings_for(TodoLocation::Right, true, false);
-        let mut first = TodoTracker::from_settings_with_visibility(settings, visibility.clone());
-        let mut second = TodoTracker::from_settings_with_visibility(settings, visibility);
-        first.set_plan(vec![entry("first", PlanStatus::Pending)]);
-        second.set_plan(vec![entry("second", PlanStatus::Completed)]);
+        let mut t = TodoTracker::from_settings(settings);
+        t.set_plan(vec![entry("old", PlanStatus::Pending)]);
+        t.hide();
 
-        first.hide();
-        assert!(!first.is_visible());
-        assert!(!second.is_visible());
-        assert_eq!(first.entries()[0].content, "first");
-        assert_eq!(second.entries()[0].content, "second");
+        t.reset_for_session(settings);
+        t.set_plan(vec![entry("new", PlanStatus::Pending)]);
 
-        second.toggle();
-        assert!(first.is_visible());
-        assert!(second.is_visible());
-    }
-
-    #[test]
-    fn persisted_visibility_modes_override_auto_behavior() {
-        let hidden = TodoTrackerSettings {
-            visibility: TodoTrackerVisibility::Hidden,
-            enabled_at_start: true,
-            ..TodoTrackerSettings::default()
-        };
-        let mut tracker = TodoTracker::from_settings(hidden);
-        tracker.set_plan(vec![entry("hidden", PlanStatus::Pending)]);
-        assert!(!tracker.is_visible());
-
-        let shown = TodoTrackerSettings {
-            visibility: TodoTrackerVisibility::Shown,
-            enabled_at_start: false,
-            ..TodoTrackerSettings::default()
-        };
-        assert!(TodoTracker::from_settings(shown).is_visible());
-    }
-
-    #[test]
-    fn explicit_auto_survives_reconstruction_with_older_settings() {
-        let visibility = TodoVisibilityHandle::new();
-        let settings = TodoTrackerSettings {
-            visibility: TodoTrackerVisibility::Hidden,
-            ..TodoTrackerSettings::default()
-        };
-        let mut tracker = TodoTracker::from_settings_with_visibility(settings, visibility.clone());
-        visibility.set_mode(TodoTrackerVisibility::Auto);
-        tracker.reset_for_session(settings);
-        tracker.set_plan(vec![entry("new session", PlanStatus::Pending)]);
-        assert_eq!(visibility.mode(), TodoTrackerVisibility::Auto);
-        assert!(tracker.is_visible());
-    }
-
-    #[test]
-    fn auto_does_not_block_later_explicit_handle_initialization() {
-        let visibility = TodoVisibilityHandle::new();
-        let auto = TodoTrackerSettings::default();
-        let shown = TodoTrackerSettings {
-            visibility: TodoTrackerVisibility::Shown,
-            ..auto
-        };
-
-        let _first = TodoTracker::from_settings_with_visibility(auto, visibility.clone());
-        assert_eq!(visibility.mode(), TodoTrackerVisibility::Auto);
-
-        let _second = TodoTracker::from_settings_with_visibility(shown, visibility.clone());
-        assert_eq!(visibility.mode(), TodoTrackerVisibility::Shown);
-    }
-
-    #[test]
-    fn close_hit_rect_matches_rendered_close_cell() {
-        assert_eq!(
-            close_hit_rect(ratatui::layout::Rect::new(4, 2, 12, 6)),
-            Some(ratatui::layout::Rect::new(14, 2, 1, 1))
+        assert!(
+            t.is_visible(),
+            "a reconstructed session auto-shows normally"
         );
-        assert_eq!(close_hit_rect(ratatui::layout::Rect::new(4, 2, 2, 6)), None);
-        assert_eq!(
-            close_hit_rect(ratatui::layout::Rect::new(4, 2, 12, 0)),
-            None
-        );
+        assert_eq!(t.entries()[0].content, "new");
     }
 
     #[test]
@@ -552,7 +438,6 @@ mod tests {
         let settings = TodoTrackerSettings {
             enabled: true,
             enabled_at_start: false,
-            visibility: TodoTrackerVisibility::Auto,
             location: TodoLocation::Bottom,
             width: 42,
             max_height: 9,
@@ -663,10 +548,20 @@ mod tests {
     }
 
     #[test]
-    fn renders_the_frozen_close_glyph() {
+    fn rendered_close_control_matches_hit_target() {
         let t = TodoTracker::new(TodoLocation::Right, true, true);
-        let out = render_to_string(&t, 24, 5);
-        assert!(out.contains("✕"));
+        let backend = TestBackend::new(24, 5);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut rendered_close = None;
+
+        term.draw(|f| {
+            rendered_close = t.render(f, Rect::new(0, 0, 24, 5));
+        })
+        .unwrap();
+
+        let close = rendered_close.expect("close target for visible panel");
+        assert_eq!(close, Rect::new(22, 0, 1, 1));
+        assert_eq!(term.backend().buffer()[(close.x, close.y)].symbol(), "✕");
     }
 
     #[test]

@@ -507,7 +507,3 @@ zc-config-footer-action-new-line = nouvelle ligne
 zc-config-field-edit-hint = { $keys } → appuyez pour modifier
 
 zc-doctor-log-path = log : { $path }
-zc-zerocode-tracker-visibility = Visibilité
-zc-zerocode-tracker-edit-visibility = Entrée parcourt auto / masqué / affiché.
-zc-chat-todo-visibility-save-failed = La visibilité a changé pour cette exécution, mais n’a pas pu être enregistrée : { $error }
-zc-chat-todo-visibility-saved-env-override = La visibilité a été enregistrée, mais ZEROCODE_todotracker__visibility sera prioritaire au prochain lancement.

@@ -540,7 +540,6 @@ async fn switch_mode(
     next: Mode,
     conn_state: &ConnectionState,
     dashboard_pane: &mut dashboard::Dashboard,
-    config_app: &mut config_manager::App,
     quickstart: &mut quickstart_pane::QuickstartPane,
     acp_pane: &mut acp::Acp,
     chat_pane: &mut chat::Chat,
@@ -554,9 +553,6 @@ async fn switch_mode(
     }
     if *mode == Mode::Sop && next != Mode::Sop {
         sop_pane.on_pane_blur();
-    }
-    if *mode != Mode::Config && next == Mode::Config {
-        config_app.on_pane_focus();
     }
     if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
         match next {
@@ -645,7 +641,6 @@ pub async fn run(
     // The live client handle. Reassigned in place on a successful
     // reconnect so every rebuilt pane talks to the recovered daemon.
     let mut rpc = rpc;
-    let todo_visibility = crate::todo_tracker::TodoVisibilityHandle::new();
 
     macro_rules! build_panes {
         ($resume_chat:expr, $resume_acp:expr) => {
@@ -653,26 +648,17 @@ pub async fn run(
                 let mut dashboard_pane =
                     dashboard::Dashboard::new(rpc.clone(), connect_label, insecure_tls);
                 dashboard_pane.init().await?;
-                let mut config_app = config_manager::App::new_with_todo_visibility(
-                    rpc.clone(),
-                    config_dir,
-                    todo_visibility.clone(),
-                );
+                let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
-                let mut acp_pane =
-                    acp::Acp::new_with_todo_visibility(rpc.clone(), todo_visibility.clone());
+                let mut acp_pane = acp::Acp::new(rpc.clone());
                 // Carry the pre-disconnect session across a reconnect rebuild so
                 // the rebuilt pane resumes the daemon-retained session
                 // instead of minting a fresh one. None on first build.
                 acp_pane.set_resume_session_id($resume_acp.0);
                 acp_pane.set_resume_agent_alias($resume_acp.1);
                 acp_pane.init().await?;
-                let mut chat_pane = chat::Chat::new_with_todo_visibility(
-                    rpc.clone(),
-                    chat::PaneKind::Chat,
-                    todo_visibility.clone(),
-                );
+                let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
                 chat_pane.set_resume_session_id($resume_chat.0);
                 chat_pane.set_resume_agent_alias($resume_chat.1);
                 chat_pane.init().await?;
@@ -1191,7 +1177,6 @@ pub async fn run(
                         next,
                         &conn_state,
                         &mut dashboard_pane,
-                        &mut config_app,
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
@@ -1242,7 +1227,6 @@ pub async fn run(
                         Mode::Dashboard,
                         &conn_state,
                         &mut dashboard_pane,
-                        &mut config_app,
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
@@ -1283,7 +1267,6 @@ pub async fn run(
                         next,
                         &conn_state,
                         &mut dashboard_pane,
-                        &mut config_app,
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
@@ -2638,8 +2621,6 @@ mod tests {
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
         let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
         let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
-        let config_dir = tempfile::tempdir().unwrap();
-        let mut config_app = config_manager::App::new(Arc::clone(&rpc), config_dir.path());
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         tokio::time::timeout(
@@ -2649,7 +2630,6 @@ mod tests {
                 Mode::Sop,
                 &conn_state,
                 &mut dashboard_pane,
-                &mut config_app,
                 &mut quickstart,
                 &mut acp_pane,
                 &mut chat_pane,
@@ -2681,8 +2661,6 @@ mod tests {
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
         let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
         let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
-        let config_dir = tempfile::tempdir().unwrap();
-        let mut config_app = config_manager::App::new(Arc::clone(&rpc), config_dir.path());
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         switch_mode(
@@ -2690,7 +2668,6 @@ mod tests {
             Mode::Sop,
             &conn_state,
             &mut dashboard_pane,
-            &mut config_app,
             &mut quickstart,
             &mut acp_pane,
             &mut chat_pane,
@@ -2706,7 +2683,6 @@ mod tests {
             Mode::Config,
             &conn_state,
             &mut dashboard_pane,
-            &mut config_app,
             &mut quickstart,
             &mut acp_pane,
             &mut chat_pane,
@@ -2718,7 +2694,6 @@ mod tests {
             Mode::Sop,
             &conn_state,
             &mut dashboard_pane,
-            &mut config_app,
             &mut quickstart,
             &mut acp_pane,
             &mut chat_pane,
@@ -2793,8 +2768,6 @@ mod tests {
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
         let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
         let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
-        let config_dir = tempfile::tempdir().unwrap();
-        let mut config_app = config_manager::App::new(Arc::clone(&rpc), config_dir.path());
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         tokio::time::timeout(
@@ -2804,7 +2777,6 @@ mod tests {
                 Mode::Sop,
                 &conn_state,
                 &mut dashboard_pane,
-                &mut config_app,
                 &mut quickstart,
                 &mut acp_pane,
                 &mut chat_pane,

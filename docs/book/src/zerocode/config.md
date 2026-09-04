@@ -39,17 +39,14 @@ so it is owned by zerocode:
 [todotracker]
 enabled = true           # master switch; when false the tracker never renders
 enabled_at_start = false # visible at launch, before the first plan arrives
-visibility = "auto"      # "auto", "hidden", or "shown"; explicit display preference
 location = "right"       # "bottom", "left", or "right"
 width = 32               # side-panel target column width (left/right)
 max_height = 5           # bottom-strip maximum height in rows
 ```
 
-Tracker settings other than visibility are re-read at each session boundary, so Config edits apply to the next session you start, restart, or switch to without restarting zerocode.
-
-Visibility is shared by Chat and Code panes and can be changed immediately in Config. Closing the tracker selects `hidden`; Ctrl+P toggles between `hidden` and `shown`. These choices are saved without changing the plan and survive session changes, reconnects and relaunches. `auto` keeps the original `enabled_at_start` and first-plan display behavior. `enabled = false` overrides every visibility mode.
-
-Once you make an explicit visibility choice, later session changes keep that live choice instead of replacing it from disk. Restart zerocode to adopt an externally edited visibility preference. If a close or Ctrl+P save fails, the choice still applies for the current run and an error explains that it was not saved.
+Values are re-read at every session boundary, so an edit made in the Config pane
+applies to the next session you start, restart, or switch to, with no zerocode
+restart needed.
 
 ### Environment overrides
 
@@ -65,8 +62,6 @@ ZEROCODE_todotracker__location=bottom zerocode
 These overrides are process-transient: they affect the running instance only and
 are never written back to `zerocode-config.toml`. Saving an unrelated field in
 the Config pane will not bake an env-injected value into the file.
-
-`ZEROCODE_todotracker__visibility` accepts `auto`, `hidden` or `shown` for a new process. A later UI choice can change the current run and the saved preference, but the environment override applies again after relaunch. Saving a different value reports that distinction.
 
 ### Upgrading from a daemon-owned `[todotracker]`
 
