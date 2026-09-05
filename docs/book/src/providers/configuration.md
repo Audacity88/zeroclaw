@@ -72,26 +72,35 @@ thinking_passthrough = true
   non-translating upstream, the injected `thinking` object is an unknown
   parameter and the request fails with **HTTP 400**. That is the designed
   failure mode: loud, at the first request, not silent.
-- **Unsigned reasoning replays nothing.** Thinking blocks Anthropic accepts
+- **Unsigned thinking voids the replay.** Thinking blocks Anthropic accepts
   on input must carry a valid signature. History whose reasoning is unsigned
   (streamed text, or a gateway that strips signatures) sends no reasoning at
-  all rather than fabricating blocks a gateway would reject. If any line of a
-  message's stored reasoning is unsigned or malformed, the whole message
-  replays without reasoning (no partial block sequences). The captured block
-  whitelist is exactly `thinking` (text and/or signature required) and
-  `redacted_thinking` (opaque `data` required, replayed verbatim and
-  signature-less by design); any other block type a gateway emits is skipped
-  on capture and never forwarded on replay.
+  all rather than fabricating blocks a gateway would reject: any unparseable
+  line or signature-less thinking line voids the whole message's replay (no
+  partial sequences). Structurally invalid `redacted_thinking` blocks (no
+  data payload) are omitted individually while their valid siblings replay.
+  The captured block whitelist is exactly `thinking` (text and/or signature
+  required) and `redacted_thinking` (opaque `data` required, replayed
+  verbatim and signature-less by design); any other block type a gateway
+  emits is skipped on capture and never forwarded on replay. The
+  prompt-guided fallback path replays the same validated blocks, so a second
+  schema fallback does not drop the signed trajectory.
 - **Nested content blocks are not captured.** Only top-level
   `reasoning_content`, `reasoning`, and `thinking_blocks` fields are read.
   Anthropic-shaped blocks nested inside a `content` array are not captured;
   file an issue with a wire sample if your gateway emits them.
-- **Passthrough disables streaming.** Capture normalization applies to
-  non-streaming responses, and gateway SSE thinking frames are unverified
-  territory, so the flag reports the provider as non-streaming: agents run
-  the whole tool loop on the non-streaming wire, where signed capture and
-  replay stay correct. Turn-by-turn streaming resumes when wire-first
-  streaming support lands.
+- **Passthrough disables streaming on the leaf.** Capture normalization
+  applies to non-streaming responses, and gateway SSE thinking frames are
+  unverified territory, so the provider reports itself as non-streaming:
+  when it is the serving provider, the whole tool loop runs on the
+  non-streaming wire, where signed capture and replay stay correct. Two
+  boundary cases: a Router that resolves this provider dispatches its
+  non-streaming path and synthesizes the standard stream events, and a
+  reliability domain containing a streaming-capable fallback may serve the
+  turn on that fallback (surfacing the standard fallback notice), so
+  operators who require every turn on the opted-in provider should configure
+  an all-non-streaming domain. Turn-by-turn streaming on the leaf resumes
+  when wire-first streaming support lands.
 - **Thinking shape follows the model.** The injected object matches the
   native provider's style resolution: fixed-budget models get
   `{"type": "enabled", "budget_tokens": N}`, adaptive-only models

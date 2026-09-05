@@ -1143,6 +1143,23 @@ impl OpenAiCompatibleModelProvider {
         (reasoning_content, reasoning)
     }
 
+    /// Signed-block replay for the history fallback builder. Mirrors the
+    /// native request converter's assistant handling: when the stored
+    /// content is the runtime's reasoning envelope (a JSON object carrying
+    /// `reasoning_content`), run the same validated reconstruction and
+    /// attach the resulting `thinking_blocks`. Gated by the same provider
+    /// flags as the converter, so flag-off history produces no field.
+    fn fallback_thinking_replay(&self, message: &ChatMessage) -> Option<Vec<serde_json::Value>> {
+        if !self.thinking_passthrough || !self.replay_assistant_reasoning {
+            return None;
+        }
+        if message.role != "assistant" {
+            return None;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(&message.content).ok()?;
+        self.assistant_thinking_replay(&value).thinking_blocks
+    }
+
     /// Reconstruct `thinking_blocks` from newline-delimited signed-JSON
     /// envelope lines. Replay whitelist mirrors capture: signed `thinking`
     /// envelopes and well-formed `redacted_thinking` lines (opaque `data`
@@ -1228,6 +1245,7 @@ impl OpenAiCompatibleModelProvider {
             .map(|m| Message {
                 role: m.role.clone(),
                 content: self.message_content_for_role(&m.role, &m.content, !merge, false),
+                thinking_blocks: self.fallback_thinking_replay(m),
             })
             .collect();
 
@@ -1393,6 +1411,16 @@ struct StreamOptionsBody {
 struct Message {
     role: String,
     content: MessageContent,
+    /// Anthropic `thinking_blocks` replay on assistant turns, populated only
+    /// when the passthrough flag is on and the stored content is a runtime
+    /// reasoning envelope with validated signed blocks: the same
+    /// reconstruction the native request converter performs. Absent
+    /// otherwise, keeping flag-off fallback requests byte-identical. This is
+    /// what keeps the second schema-fallback turn's signed trajectory
+    /// intact: the two-field fallback builder must replay what the primary
+    /// converter would have replayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2617,7 +2645,21 @@ impl OpenAiCompatibleModelProvider {
             .and_then(|t| (!t.is_empty()).then(|| "auto".to_string()));
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, !merge),
+            // Streamed requests are thinking-off under passthrough (see
+            // streaming_thinking_params). History replay blocks require the
+            // request thinking object, so strip them here: a hypothetical
+            // wrapper streaming this leaf gets a thinking-off request, not a
+            // blocks-without-thinking-object 400.
+            messages: {
+                let mut native_messages =
+                    self.convert_messages_for_native(effective_messages, !merge);
+                if self.thinking_passthrough {
+                    for message in &mut native_messages {
+                        message.thinking_blocks = None;
+                    }
+                }
+                native_messages
+            },
             temperature,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: if options_enabled {
@@ -3447,17 +3489,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             messages.push(Message {
                 role: "user".to_string(),
                 content: Self::to_message_content("user", &content, !merge),
+                thinking_blocks: None,
             });
         } else {
             if let Some(sys) = system_prompt {
                 messages.push(Message {
                     role: "system".to_string(),
                     content: MessageContent::Text(sys.to_string()),
+                    thinking_blocks: None,
                 });
             }
             messages.push(Message {
                 role: "user".to_string(),
                 content: Self::to_message_content("user", &normalized_message, true),
+                thinking_blocks: None,
             });
         }
 
@@ -3892,7 +3937,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             &message.content,
                             !merge,
                             false,
+                            // Streamed requests are thinking-off under
+                            // passthrough (see streaming_thinking_params):
+                            // history replay blocks require the request
+                            // thinking object, so they never ride the
+                            // streamed wire.
                         ),
+                        thinking_blocks: None,
                     })
                     .collect();
 
@@ -4083,17 +4134,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 messages.push(Message {
                     role: "user".to_string(),
                     content: Self::to_message_content("user", &content, !merge),
+                    thinking_blocks: None,
                 });
             } else {
                 if let Some(sys) = system_prompt_owned {
                     messages.push(Message {
                         role: "system".to_string(),
                         content: MessageContent::Text(sys),
+                        thinking_blocks: None,
                     });
                 }
                 messages.push(Message {
                     role: "user".to_string(),
                     content: Self::to_message_content("user", &normalized_message_content, !merge),
+                    thinking_blocks: None,
                 });
             }
 
@@ -4211,6 +4265,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .map(|m| Message {
                     role: m.role.clone(),
                     content: provider.message_content_for_role(&m.role, &m.content, !merge, false),
+                    thinking_blocks: None,
                 })
                 .collect();
 
@@ -5526,6 +5581,227 @@ mod tests {
         }
     }
 
+    /// Schema-rejecting endpoint whose tool-less fallback responses carry
+    /// signed thinking blocks, so the first fallback turn produces captured
+    /// reasoning for the second turn's history.
+    fn spawn_schema_rejecting_endpoint_with_signed_fallback() -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some();
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "message": "unknown parameter: tools" }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "ok",
+                                    "thinking_blocks": [
+                                        {"type": "thinking", "thinking": "visible", "signature": "sig1"},
+                                        {"type": "thinking", "thinking": "", "signature": "sig-only"},
+                                        {"type": "redacted_thinking", "data": "ErUBCkEIRAP...opaque"}
+                                    ]
+                                }
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve signed fallback test");
+            });
+            (addr, bodies, server)
+        }
+    }
+
+    #[tokio::test]
+    async fn second_schema_fallback_replays_signed_history() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint_with_signed_fallback().await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        // Turn 1: schema rejected, prompt-guided fallback succeeds and its
+        // response carries signed thinking blocks, which capture converts
+        // into replay lines.
+        let turn_one = vec![ChatMessage::user("What is the weather in SF?")];
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &turn_one,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        let captured = response
+            .reasoning_content
+            .expect("fallback thinking captured");
+        let captured_lines: Vec<&str> = captured.split('\n').collect();
+        assert_eq!(captured_lines.len(), 3, "signed, signature-only, redacted");
+
+        // Turn 2: history carries the runtime-persisted reasoning envelope;
+        // the gateway rejects the schema again, so this request also goes
+        // through the fallback history builder.
+        let envelope = serde_json::json!({
+            "content": "ok",
+            "reasoning_content": captured,
+        });
+        let turn_two = vec![
+            ChatMessage::user("What is the weather in SF?"),
+            ChatMessage::assistant(envelope.to_string()),
+            ChatMessage::user("And the forecast for tomorrow?"),
+        ];
+        provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &turn_two,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        // Each chat call records its rejected primary request plus its
+        // fallback request: [primary-1, fallback-1, primary-2, fallback-2].
+        assert_eq!(bodies.len(), 4, "two calls, primary plus fallback each");
+        assert!(
+            bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message.get("thinking_blocks").is_none()),
+            "turn-1 history carries no reasoning yet"
+        );
+
+        let assistant = bodies[3]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant turn in second request");
+        assert_eq!(
+            assistant["thinking_blocks"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "visible", "signature": "sig1"},
+                {"type": "thinking", "thinking": "", "signature": "sig-only"},
+                {"type": "redacted_thinking", "data": "ErUBCkEIRAP...opaque"}
+            ]),
+            "the second fallback request must replay the exact signed blocks"
+        );
+        assert_eq!(
+            bodies[3]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "fallback request keeps the thinking request object"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_history_replay_is_flag_gated() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint_with_signed_fallback().await;
+
+        // Same envelope history, flag OFF: the fallback wire must stay
+        // byte-identical to the pre-passthrough behavior, so the assistant
+        // message carries no thinking_blocks field at all.
+        let provider = make_model_provider("test", &format!("http://{addr}"), None);
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let messages = vec![
+            ChatMessage::user("What is the weather in SF?"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "ok",
+                    "reasoning_content": "{\"thinking\":\"visible\",\"signature\":\"sig1\"}"
+                })
+                .to_string(),
+            ),
+            ChatMessage::user("And the forecast?"),
+        ];
+
+        provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "primary plus fallback");
+        let assistant = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant turn");
+        assert!(
+            assistant.get("thinking_blocks").is_none(),
+            "flag-off fallback wire must not grow a thinking_blocks field"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn schema_fallback_rethreads_thinking_params() {
         let (addr, bodies, server) = spawn_schema_rejecting_endpoint().await;
@@ -6491,10 +6767,12 @@ mod tests {
                 Message {
                     role: "system".to_string(),
                     content: MessageContent::Text("You are ZeroClaw".to_string()),
+                    thinking_blocks: None,
                 },
                 Message {
                     role: "user".to_string(),
                     content: MessageContent::Text("hello".to_string()),
+                    thinking_blocks: None,
                 },
             ],
             temperature: Some(0.4),
@@ -8333,6 +8611,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("What is the weather?".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -8358,6 +8637,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -8394,6 +8674,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -10858,6 +11139,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
+                thinking_blocks: None,
             }],
             temperature,
             stream: None,
