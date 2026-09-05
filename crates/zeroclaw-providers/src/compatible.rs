@@ -9069,10 +9069,10 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // merged-system carrier + usage-capture boundary tests (audit repairs)
+    // merged-system carrier + usage-capture boundary tests
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Audit blocker 2, single-turn: with `merge_system_into_user`, the
+    /// Merged-carrier, single-turn: with `merge_system_into_user`, the
     /// system role never reaches the wire, so the merged first user message
     /// is the only system-equivalent carrier and must carry the breakpoint
     /// unconditionally. Before the repair this shape sent zero breakpoints.
@@ -9119,7 +9119,7 @@ mod tests {
         );
     }
 
-    /// Audit blocker 2, multi-turn: the carrier keeps the system breakpoint
+    /// Merged-carrier, multi-turn: the carrier keeps the system breakpoint
     /// and the rolling breakpoint still lands on the last message, exactly
     /// two total, middle messages untouched.
     #[tokio::test]
@@ -9171,7 +9171,7 @@ mod tests {
         );
     }
 
-    /// Audit blocker 2, assistant-first history: the merged user is not
+    /// Merged-carrier, assistant-first history: the merged user is not
     /// message zero; the carrier index must follow the first user wherever
     /// it sits.
     #[tokio::test]
@@ -9303,7 +9303,7 @@ mod tests {
         );
     }
 
-    /// Audit blocker 1 regression: the text-only helpers must never emit
+    /// Capture-boundary regression: the text-only helpers must never emit
     /// cache breakpoints even with the flag on, because their responses
     /// drop usage and could never account for the premium.
     #[tokio::test]
@@ -9332,7 +9332,7 @@ mod tests {
         }
     }
 
-    /// Audit blocker 1 regression, streaming side: the legacy chunk stream
+    /// Capture-boundary regression, streaming side: the legacy chunk stream
     /// drops usage, so it must not trigger premium writes either.
     #[tokio::test]
     async fn cache_passthrough_legacy_stream_emits_no_breakpoints_even_when_enabled() {
