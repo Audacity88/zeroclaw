@@ -12483,7 +12483,11 @@ command = "rm independent-delegate-marker"
             .unwrap();
             assert_eq!(
                 artifact.output.as_deref(),
-                if cancel { None } else { Some("finished") }
+                if cancel {
+                    None
+                } else {
+                    Some("[Agent 'target' (custom.primary/primary-model)]\nfinished")
+                }
             );
             assert_eq!(terminal.output.is_some(), !cancel);
             assert!(lifecycle.begin_delete("target").is_ok());
