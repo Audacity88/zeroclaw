@@ -969,7 +969,7 @@ mod tests {
         let mut seen = HashSet::new();
         let mut prompt_seen = HashSet::new();
 
-        // Round 0: the normal call is retained; the shell call is denied by the
+        // First round: the normal call is retained; the shell call is denied by the
         // (non-interactive) gate and abandoned — but its prompt signature is
         // already recorded for the turn.
         let round0 = [
@@ -990,7 +990,7 @@ mod tests {
         .expect("round 0 prepares");
         assert_eq!(prepared0.executable_indices, vec![0]);
 
-        // Round 1: a new normal call is retained, then the SAME prompt-required
+        // Second round: a new normal call is retained, then the SAME prompt-required
         // shell call aborts the whole preparation batch.
         let round1 = [
             parsed_call("normal_tool", serde_json::json!({"n": 2}), "call-3"),
