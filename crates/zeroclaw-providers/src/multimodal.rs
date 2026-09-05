@@ -3,11 +3,14 @@ use reqwest::Client;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use zeroclaw_api::media::{
+    PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension, image_mime_from_magic,
+    is_provider_image_mime,
+};
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
@@ -123,7 +126,7 @@ pub(crate) enum ImageDataUriRejection {
     NotADataUri,
     /// A `data:` URI whose header does not declare `;base64`.
     NotBase64Encoded,
-    /// Media type outside [`ALLOWED_IMAGE_MIME_TYPES`].
+    /// Media type outside [`PROVIDER_IMAGE_MIME_TYPES`].
     UnsupportedMediaType,
     /// Payload is empty or is not canonical padded base64.
     MalformedBase64,
@@ -189,7 +192,7 @@ pub(crate) fn split_base64_image_data_uri(
     }
 
     let media_type = header.split(';').next().unwrap_or_default().trim();
-    if !ALLOWED_IMAGE_MIME_TYPES
+    if !PROVIDER_IMAGE_MIME_TYPES
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(media_type))
     {
@@ -448,7 +451,7 @@ pub fn strip_media_markers(text: &str) -> String {
             r"(?i)\[(?:{}):[^\]]*\]",
             MEDIA_MARKER_KINDS.join("|")
         ))
-        .unwrap()
+        .expect("static media-marker regex must compile")
     });
     RE.replace_all(text, "[media attachment]").into_owned()
 }
@@ -460,7 +463,7 @@ static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock:
         r"(?i)\[(?:{}):([^\]]*)\]",
         AUDIO_MARKER_KINDS.join("|")
     ))
-    .unwrap()
+    .expect("static audio-marker regex must compile")
 });
 
 /// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
@@ -911,8 +914,12 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .collect()
 }
 
-/// Strip image markers from older messages (oldest first) until total image
+/// Strip image markers from older messages (oldest first) until the total image
 /// count is within `max_images`. Keeps the text content of each message.
+///
+/// Eviction is per image, not per message: exactly `total - max_images` images
+/// are dropped, so a message holding more images than the budget allows keeps
+/// its newest ones instead of losing all of them.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
     let latest_tool_indices = latest_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
@@ -932,36 +939,80 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
     let total: usize = image_positions.iter().map(|(_, c)| c).sum();
     let mut to_drop = total.saturating_sub(max_images);
 
-    // Collect indices of messages whose images should be stripped.
-    let mut strip_indices = std::collections::HashSet::new();
+    // Record how many images to drop per message, oldest first. A message is
+    // only partially trimmed when it holds more images than remain to drop:
+    // marking the whole message would evict images the budget still allows and
+    // leave the request under `max_images` (a single message holding more than
+    // `max_images` would otherwise lose all of them).
+    let mut drop_counts = std::collections::HashMap::new();
     for &(idx, count) in &image_positions {
         if to_drop == 0 {
             break;
         }
-        strip_indices.insert(idx);
-        to_drop = to_drop.saturating_sub(count);
+        let drop_here = to_drop.min(count);
+        drop_counts.insert(idx, drop_here);
+        to_drop -= drop_here;
     }
 
     messages
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if strip_indices.contains(&i) {
-                let (cleaned, _) = parse_image_markers(&m.content);
-                let text = if cleaned.trim().is_empty() {
-                    "[image removed from history]".to_string()
-                } else {
-                    cleaned
-                };
-                ChatMessage {
-                    role: m.role.clone(),
-                    content: text,
-                }
-            } else {
-                replay_message_without_stale_tool_images(i, m, &latest_tool_indices)
-            }
+            let Some(&drop_here) = drop_counts.get(&i) else {
+                return replay_message_without_stale_tool_images(i, m, &latest_tool_indices);
+            };
+
+            trim_message_images(m, drop_here)
         })
         .collect()
+}
+
+/// Drop the `drop_here` oldest image markers from `text`, keeping the newest.
+fn trim_image_markers(text: &str, drop_here: usize) -> String {
+    let (cleaned, refs) = parse_image_markers(text);
+    // Newest images within the message survive, matching the oldest-first
+    // eviction order across messages.
+    let retained = refs.get(drop_here..).unwrap_or(&[]);
+    if retained.is_empty() {
+        if cleaned.trim().is_empty() {
+            "[image removed from history]".to_string()
+        } else {
+            cleaned
+        }
+    } else {
+        compose_multimodal_message(&cleaned, retained)
+    }
+}
+
+/// Apply [`trim_image_markers`] to a message, keeping a native tool-result JSON
+/// envelope intact.
+///
+/// A `role = "tool"` message may carry a serialized `{"tool_call_id": ..,
+/// "content": ..}` object. Trimming the serialized form would strip markers out
+/// of the JSON *and* append the retained ones after the closing brace, leaving
+/// text that no longer parses — the provider serializers then lose
+/// `tool_call_id` and cannot emit a native tool result. Unwrap first, trim the
+/// inner `content`, and re-serialize with the rest of the envelope untouched,
+/// mirroring [`strip_tool_result_image_markers`] and
+/// [`normalize_native_tool_result_json`].
+fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
+    if message.role == "tool"
+        && let Ok(serde_json::Value::Object(mut obj)) =
+            serde_json::from_str::<serde_json::Value>(&message.content)
+        && let Some(serde_json::Value::String(inner)) = obj.get("content").cloned()
+    {
+        let trimmed = trim_image_markers(&inner, drop_here);
+        obj.insert("content".to_string(), serde_json::Value::String(trimmed));
+        return ChatMessage {
+            role: message.role.clone(),
+            content: serde_json::Value::Object(obj).to_string(),
+        };
+    }
+
+    ChatMessage {
+        role: message.role.clone(),
+        content: trim_image_markers(&message.content, drop_here),
+    }
 }
 
 fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
@@ -1396,7 +1447,7 @@ fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::R
 }
 
 fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
-    if ALLOWED_IMAGE_MIME_TYPES.contains(&mime) {
+    if is_provider_image_mime(mime) {
         return Ok(());
     }
 
@@ -1418,52 +1469,17 @@ fn detect_mime(
 
     if let Some(path) = path
         && let Some(ext) = path.extension().and_then(|value| value.to_str())
-        && let Some(mime) = mime_from_extension(ext)
+        && let Some(mime) = image_mime_from_extension(ext)
     {
         return Some(mime.to_string());
     }
 
-    mime_from_magic(bytes).map(ToString::to_string)
+    image_mime_from_magic(bytes).map(ToString::to_string)
 }
 
 fn normalize_content_type(content_type: &str) -> Option<String> {
     let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
     if mime.is_empty() { None } else { Some(mime) }
-}
-
-fn mime_from_extension(ext: &str) -> Option<&'static str> {
-    match ext.to_ascii_lowercase().as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        "gif" => Some("image/gif"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
-    }
-}
-
-fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
-        return Some("image/png");
-    }
-
-    if bytes.len() >= 3 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        return Some("image/jpeg");
-    }
-
-    if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
-        return Some("image/gif");
-    }
-
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-
-    if bytes.len() >= 2 && bytes.starts_with(b"BM") {
-        return Some("image/bmp");
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -1504,7 +1520,7 @@ mod tests {
 
     #[test]
     fn split_data_uri_accepts_every_allowlisted_media_type() {
-        for mime in ALLOWED_IMAGE_MIME_TYPES {
+        for mime in PROVIDER_IMAGE_MIME_TYPES {
             let uri = format!("data:{mime};base64,{CANONICAL_PNG_B64}");
             let (media_type, _) = split_base64_image_data_uri(&uri, TEN_MB)
                 .unwrap_or_else(|reason| panic!("{mime} rejected: {reason}"));
@@ -1985,6 +2001,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_messages_keeps_native_tool_result_json_valid_when_over_the_image_cap() {
+        // Regression: partial trimming used to parse markers out of the whole
+        // serialized envelope and append the retained ones after the closing
+        // brace, so the tool result stopped being JSON and the provider
+        // serializers lost `tool_call_id`. Five images against the default cap
+        // of four is enough to force a partial trim.
+        let temp = tempfile::tempdir().unwrap();
+        let mut markers = Vec::new();
+        for index in 0..5 {
+            let image_path = temp.path().join(format!("shot-{index}.png"));
+            std::fs::write(
+                &image_path,
+                [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            )
+            .unwrap();
+            markers.push(format!("[IMAGE:{}]", image_path.display()));
+        }
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc-overflow",
+            "tool_name": "screenshot",
+            "content": format!("captured five {}", markers.join(" ")),
+        })
+        .to_string();
+
+        let config = MultimodalConfig::default();
+        let prepared =
+            prepare_messages_for_provider(&[ChatMessage::tool(native_tool_content)], &config)
+                .await
+                .expect("preparation should succeed for an over-cap native tool result");
+
+        assert_eq!(prepared.messages[0].role, "tool");
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("an over-cap tool result must still be valid JSON");
+
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc-overflow"),
+            "tool_call_id must survive trimming so the provider can emit a native tool result"
+        );
+        assert_eq!(
+            value.get("tool_name").and_then(|v| v.as_str()),
+            Some("screenshot"),
+            "other envelope metadata must survive trimming"
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content must remain a JSON string");
+        assert!(
+            inner.contains("captured five"),
+            "surrounding text must survive trimming"
+        );
+
+        let (_, refs) = parse_image_markers(inner);
+        assert_eq!(
+            refs.len(),
+            config.max_images,
+            "exactly the budgeted images are retained, and they live inside `content`"
+        );
+        assert!(
+            refs.iter()
+                .all(|reference| reference.starts_with("data:image/png;base64,")),
+            "retained images stay normalized data URIs"
+        );
+    }
+
+    #[tokio::test]
     async fn prepare_messages_preserves_native_tool_result_json_shape() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("native-tool-result.png");
@@ -2365,11 +2450,10 @@ mod tests {
     }
 
     #[test]
-    fn trim_old_images_multi_image_message_stripped_as_unit() {
-        // A single message has 3 images. We need to drop 2 to reach max=1.
-        // But trimming works at message granularity — the entire message gets
-        // stripped (all 3 images removed), which over-trims to 0. The newest
-        // message (text-only) is untouched.
+    fn trim_old_images_partially_trims_a_multi_image_message() {
+        // A single message has 3 images and the budget is 1, so exactly 2 must
+        // be dropped. Evicting the message as a unit would remove all three and
+        // leave zero images, spending none of the budget the operator allowed.
         let messages = vec![
             ChatMessage::user(
                 "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nThree pics"
@@ -2380,12 +2464,51 @@ mod tests {
 
         let trimmed = trim_old_images(&messages, 1);
         assert_eq!(trimmed.len(), 2);
-        // All images in the first message are gone, but text remains
+        // The newest image in the message survives; the two older ones go.
         let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty());
+        assert_eq!(refs0, vec!["/tmp/c.png".to_string()]);
         assert!(trimmed[0].content.contains("Three pics"));
         // Second message unchanged
         assert_eq!(trimmed[1].content, "Just text, no images");
+    }
+
+    #[test]
+    fn trim_old_images_drops_exactly_the_overflow() {
+        // The invariant the cap exists to enforce: whatever the per-message
+        // distribution, the survivors equal the budget rather than undershoot.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\nPair".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/c.png]\nSingle".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/d.png]\n[IMAGE:/tmp/e.png]\nAnother pair".to_string()),
+        ];
+
+        for max_images in 1..=5 {
+            let trimmed = trim_old_images(&messages, max_images);
+            assert_eq!(
+                count_image_markers(&trimmed),
+                max_images,
+                "max_images={max_images} must keep exactly that many images"
+            );
+        }
+    }
+
+    #[test]
+    fn trim_old_images_keeps_the_newest_images_across_messages() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\nOld".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/c.png]\n[IMAGE:/tmp/d.png]\nNew".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 3);
+
+        // Oldest single image evicted; everything newer survives.
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert_eq!(refs0, vec!["/tmp/b.png".to_string()]);
+        let (_, refs1) = parse_image_markers(&trimmed[1].content);
+        assert_eq!(
+            refs1,
+            vec!["/tmp/c.png".to_string(), "/tmp/d.png".to_string()]
+        );
     }
 
     #[test]
