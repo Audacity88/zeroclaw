@@ -472,6 +472,7 @@ cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gate
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.

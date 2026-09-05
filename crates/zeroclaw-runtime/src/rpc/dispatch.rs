@@ -1930,7 +1930,12 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let execution_capability =
+            crate::live_config_authority::AgentExecutionCapability::from_parts(
+                Arc::clone(&self.ctx.config),
+                self.ctx.agent_lifecycle.clone(),
+            );
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env_with_capability(
             Arc::clone(&self.ctx.config),
             &req.agent_alias,
             cwd_path,
@@ -1939,6 +1944,7 @@ impl RpcDispatcher {
             tui_env,
             self.ctx.sop_engine.clone(),
             self.ctx.sop_audit.clone(),
+            Some(execution_capability),
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
@@ -2456,7 +2462,12 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let execution_capability =
+            crate::live_config_authority::AgentExecutionCapability::from_parts(
+                Arc::clone(&self.ctx.config),
+                self.ctx.agent_lifecycle.clone(),
+            );
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env_with_capability(
             Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
@@ -2465,6 +2476,7 @@ impl RpcDispatcher {
             tui_env,
             self.ctx.sop_engine.clone(),
             self.ctx.sop_audit.clone(),
+            Some(execution_capability),
         )
         .await
         .ok()?;
@@ -3707,15 +3719,21 @@ impl RpcDispatcher {
 
     async fn handle_cron_trigger(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
+        let selection = crate::live_config_authority::AgentExecutionCapability::from_parts(
+            Arc::clone(&self.ctx.config),
+            self.ctx.agent_lifecycle.clone(),
+        )
+        .capture_selection();
         let config = self.ctx.config.read().clone();
         let job = crate::cron::get_job(&config, &req.id)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
         let event_tx = self.ctx.event_tx.clone();
-        let result = crate::cron::scheduler::run_manual_job(
+        let result = crate::cron::scheduler::run_manual_job_with_selection(
             &config,
             &job,
             crate::cron::scheduler::CronDeliveryContext::RpcManual,
             &event_tx,
+            Some(selection),
         )
         .await;
         to_result(CronTriggerResult {
@@ -4176,6 +4194,11 @@ impl RpcDispatcher {
 
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
+        let _agent_config_reservation =
+            zeroclaw_config::alias_refs::agent_alias_for_prop_path(&req.prop)
+                .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
+                .transpose()
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let refresh_channel_agent = agent_alias_from_channel_auth_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
@@ -5676,12 +5699,18 @@ impl RpcDispatcher {
         }
 
         if let Some(outcome) = resolved_outcome {
-            let config = self.ctx.config.read();
-            crate::sop::drive_resumed_broker_action(
+            let config = self.ctx.config.read().clone();
+            crate::sop::drive_resumed_broker_action_with_capability(
                 &config,
                 Arc::clone(&engine),
                 self.ctx.sop_audit.clone(),
                 &outcome,
+                Some(
+                    crate::live_config_authority::AgentExecutionCapability::from_parts(
+                        Arc::clone(&self.ctx.config),
+                        self.ctx.agent_lifecycle.clone(),
+                    ),
+                ),
             );
         }
 
@@ -11375,6 +11404,49 @@ mod tests {
     // isolation of its own, and a successful `config/set` falls through to
     // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
     // (`make_secret_test_config`), never a bare `Config::default()`.
+
+    #[tokio::test]
+    async fn config_delete_refuses_agent_alias_under_destructive_lease_without_live_or_disk_mutation()
+     {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config.create_map_key("agents", "blocked").unwrap();
+        config
+            .set_prop_persistent("agents.blocked.enabled", "true")
+            .unwrap();
+        config.save().await.unwrap();
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let config_path = dispatcher.ctx.config.read().config_path.clone();
+        let live_before = toml::to_string(&*dispatcher.ctx.config.read()).unwrap();
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let _cleanup = dispatcher
+            .ctx
+            .agent_lifecycle
+            .begin_delete("blocked")
+            .unwrap();
+
+        let result = dispatcher
+            .handle_config_delete(&json!({
+                "prop": "agents.blocked.enabled",
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "RPC property DELETE must refuse while the alias is under destructive cleanup"
+        );
+        assert_eq!(
+            toml::to_string(&*dispatcher.ctx.config.read()).unwrap(),
+            live_before,
+            "refused property DELETE must not change serialized live config"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            disk_before,
+            "refused property DELETE must not change config.toml bytes"
+        );
+        assert!(dispatcher.ctx.config.read().agents["blocked"].enabled);
+    }
 
     #[test]
     fn agent_delete_rpc_persists_on_default_worker_stack() {

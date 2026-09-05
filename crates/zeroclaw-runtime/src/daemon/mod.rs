@@ -617,7 +617,7 @@ pub async fn run(
     mut config: Config,
     host: String,
     port: u16,
-    mut registry: DaemonRegistry,
+    registry: DaemonRegistry,
     ephemeral: bool,
     startup_feedback_enabled: bool,
 ) -> Result<DaemonExit> {
@@ -626,7 +626,27 @@ pub async fn run(
         config.gateway.port = port;
     }
     let live_config_authority = crate::LiveConfigAuthority::new_owned(config.clone())?;
+    run_with_authority(
+        live_config_authority,
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    )
+    .await
+}
 
+/// Use the authority acquired before constructing producers such as SOP maintenance.
+pub async fn run_with_authority(
+    live_config_authority: crate::LiveConfigAuthority,
+    host: String,
+    port: u16,
+    mut registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<DaemonExit> {
+    let config = live_config_authority.config().read().clone();
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -1113,8 +1133,11 @@ pub async fn run(
         crate::health::mark_component_ok("mqtt");
     }
 
+    let daemon_execution_capability = live_config_authority.execution_capability();
+
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let heartbeat_execution_capability = daemon_execution_capability.clone();
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
@@ -1122,7 +1145,8 @@ pub async fn run(
             channels_cancel.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg)).await }
+                let execution_capability = heartbeat_execution_capability.clone();
+                async move { Box::pin(run_heartbeat_worker(cfg, execution_capability)).await }
             },
         ));
     }
@@ -1140,7 +1164,16 @@ pub async fn run(
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
                 let cancel = scheduler_cancel.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx), cancel)).await }
+                let execution_capability = daemon_execution_capability.clone();
+                async move {
+                    Box::pin(crate::cron::scheduler::run_with_capability(
+                        cfg,
+                        Some(tx),
+                        cancel,
+                        Some(execution_capability),
+                    ))
+                    .await
+                }
             },
         ));
     } else {
@@ -1957,7 +1990,10 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
+async fn run_heartbeat_worker(
+    config: Config,
+    execution_capability: crate::live_config_authority::AgentExecutionCapability,
+) -> Result<()> {
     use crate::heartbeat::engine::{
         HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
     };
@@ -2119,6 +2155,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+                    execution_capability: Some(execution_capability.clone()),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
             ));
@@ -2240,6 +2277,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+                    execution_capability: Some(execution_capability.clone()),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
             ));

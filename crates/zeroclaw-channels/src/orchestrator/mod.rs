@@ -8114,6 +8114,7 @@ struct AgentRouter {
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    execution_capability: Option<zeroclaw_runtime::live_config_authority::AgentExecutionCapability>,
     turn_generations: Arc<HashMap<String, u64>>,
 }
 
@@ -8127,6 +8128,7 @@ impl AgentRouter {
             sop_engine: None,
             sop_audit: None,
             agent_lifecycle: Default::default(),
+            execution_capability: None,
             turn_generations: Arc::new(HashMap::new()),
         }
     }
@@ -8144,6 +8146,7 @@ impl AgentRouter {
             sop_engine,
             sop_audit,
             agent_lifecycle: Default::default(),
+            execution_capability: None,
             turn_generations: Arc::new(HashMap::new()),
         }
     }
@@ -8159,6 +8162,14 @@ impl AgentRouter {
                 .collect(),
         );
         self.agent_lifecycle = agent_lifecycle;
+        self
+    }
+
+    fn with_execution_capability(
+        mut self,
+        execution_capability: zeroclaw_runtime::live_config_authority::AgentExecutionCapability,
+    ) -> Self {
+        self.execution_capability = Some(execution_capability);
         self
     }
 
@@ -8501,11 +8512,12 @@ async fn dispatch_channel_sop_gate(
     };
     match outcome {
         Ok(outcome) => {
-            zeroclaw_runtime::sop::drive_resumed_broker_action(
+            zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
                 config,
                 Arc::clone(engine),
                 router.sop_audit.clone(),
                 &outcome,
+                router.execution_capability.clone(),
             );
             ::zeroclaw_log::record!(
                 INFO,
@@ -12749,7 +12761,7 @@ pub async fn start_channels_with_authority(
         let skills =
             zeroclaw_runtime::skills::load_skills_for_agent(&workspace, &config, agent_alias);
 
-        let all_tools_result_ch = tools::all_tools_with_runtime(
+        let all_tools_result_ch = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -12771,6 +12783,7 @@ pub async fn start_channels_with_authority(
             sop_engine.clone(),
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
+            Some(authority.execution_capability()),
         );
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
@@ -13351,7 +13364,8 @@ pub async fn start_channels_with_authority(
     }
 
     let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit)
-        .with_agent_lifecycle(authority.agent_lifecycle());
+        .with_agent_lifecycle(authority.agent_lifecycle())
+        .with_execution_capability(authority.execution_capability());
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -36099,6 +36113,7 @@ Done."#;
             sop_engine: None,
             sop_audit: None,
             agent_lifecycle: Default::default(),
+            execution_capability: None,
             turn_generations: Arc::new(HashMap::new()),
         }
     }
@@ -36204,6 +36219,7 @@ Done."#;
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,
             agent_lifecycle: Default::default(),
+            execution_capability: None,
             turn_generations: Arc::new(HashMap::new()),
         };
         (router, engine, run_id)

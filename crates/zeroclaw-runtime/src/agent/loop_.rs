@@ -1,4 +1,5 @@
 use crate::approval::ApprovalManager;
+use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 
 /// Format token count with thousands separators.
 fn format_tokens(n: u64) -> String {
@@ -1187,6 +1188,8 @@ pub struct AgentRunOverrides {
     /// cron job configured with `uses_memory = false`). Default `false`.
     pub suppress_memory_inject: bool,
     pub memory_free: bool,
+    /// Per-run restriction applied after selecting an authoritative config.
+    pub suppress_memory_auto_save: bool,
     /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
     /// worker constructs this once at worker start and shares it across
     /// every tick so that stdio MCP children live for the daemon's
@@ -1197,6 +1200,11 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// Shared authority used to admit this run's target before construction.
+    pub execution_capability: Option<AgentExecutionCapability>,
+    /// An already-admitted target lease supplied by a caller that must retain
+    /// it through delivery or persistence after this run returns.
+    pub execution_admission: Option<AgentExecutionAdmission>,
 }
 
 fn agent_provider_composite(
@@ -1286,7 +1294,7 @@ fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error 
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
-    config: Config,
+    mut config: Config,
     agent_alias: &str,
     message: Option<String>,
     provider_override: Option<String>,
@@ -1297,9 +1305,31 @@ pub async fn run(
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
-    overrides: AgentRunOverrides,
+    mut overrides: AgentRunOverrides,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    let execution_admission = if let Some(admission) = overrides.execution_admission.take() {
+        Some(admission)
+    } else if let Some(capability) = overrides.execution_capability.as_ref() {
+        Some(capability.admit(agent_alias)?)
+    } else {
+        None
+    };
+    let execution_capability = execution_admission
+        .as_ref()
+        .map(AgentExecutionAdmission::capability)
+        .or_else(|| overrides.execution_capability.clone());
+    if let Some(admission) = execution_admission.as_ref() {
+        admission.revalidate()?;
+        anyhow::ensure!(
+            admission.alias() == agent_alias,
+            "agent execution admission alias changed during construction"
+        );
+        config = admission.config().as_ref().clone();
+    }
+    if overrides.suppress_memory_auto_save {
+        config.memory.auto_save = false;
+    }
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
@@ -1337,6 +1367,7 @@ pub async fn run(
         memory_namespace = %memory_composite,
     );
     let __zc_body = async move {
+        let _execution_admission = execution_admission;
         let agent_alias: &str = __zc_alias.as_str();
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
@@ -1432,19 +1463,20 @@ pub async fn run(
         let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) = crate::sop::build_sop_engine(
+            let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
+                execution_capability.clone(),
             );
             (Some(engine), Some(audit))
         } else {
             (None, None)
         };
 
-        let all_tools_result = tools::all_tools_with_runtime(
+        let all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -1465,7 +1497,10 @@ pub async fn run(
             None,
             sop_engine,
             sop_audit,
-            None,
+            execution_capability
+                .as_ref()
+                .map(AgentExecutionCapability::config_handle),
+            execution_capability.clone(),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -2946,7 +2981,58 @@ pub async fn process_message(
     session_id: Option<&str>,
     origin: TurnOrigin,
 ) -> Result<String> {
+    process_message_with_capability(config, agent_alias, message, session_id, origin, None).await
+}
+
+/// Process a message after admitting its target through the daemon-owned
+/// authority. The compatibility wrapper above remains for source-only and
+/// test callers that do not participate in managed lifecycle state.
+pub async fn process_message_with_capability(
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    execution_capability: Option<AgentExecutionCapability>,
+) -> Result<String> {
+    let execution_admission = execution_capability
+        .as_ref()
+        .map(|capability| capability.admit(agent_alias))
+        .transpose()?;
+    process_message_with_admission(
+        config,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        execution_admission,
+    )
+    .await
+}
+
+/// Process a message with a lease admitted by the caller. Detached producers
+/// use this form so the original admission remains owned through delivery and
+/// any caller-side persistence instead of being reacquired from a stale input.
+pub async fn process_message_with_admission(
+    mut config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    execution_admission: Option<AgentExecutionAdmission>,
+) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    if let Some(admission) = execution_admission.as_ref() {
+        admission.revalidate()?;
+        anyhow::ensure!(
+            admission.alias() == agent_alias,
+            "agent execution admission alias changed during construction"
+        );
+        config = admission.config().as_ref().clone();
+    }
+    let execution_capability = execution_admission
+        .as_ref()
+        .map(AgentExecutionAdmission::capability);
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
@@ -2986,6 +3072,7 @@ pub async fn process_message(
         memory_namespace = %memory_composite,
     );
     let __zc_body = async move {
+        let _execution_admission = execution_admission;
         let agent_alias: &str = __zc_alias.as_str();
         let message: &str = __zc_message.as_str();
         let session_id: Option<&str> = __zc_session_id.as_deref();
@@ -3046,19 +3133,20 @@ pub async fn process_message(
         let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) = crate::sop::build_sop_engine(
+            let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
+                execution_capability.clone(),
             );
             (Some(engine), Some(audit))
         } else {
             (None, None)
         };
 
-        let all_tools_result_pm = tools::all_tools_with_runtime(
+        let all_tools_result_pm = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -3081,7 +3169,10 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
-            None,
+            execution_capability
+                .as_ref()
+                .map(AgentExecutionCapability::config_handle),
+            execution_capability.clone(),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {

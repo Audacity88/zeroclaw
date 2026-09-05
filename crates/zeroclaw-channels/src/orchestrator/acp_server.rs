@@ -72,8 +72,8 @@ enum ConfigSource {
 }
 
 pub struct AcpServer {
-    /// The sole authority for `Config`-backed settings. Standalone ACP owns an
-    /// immutable config; gateway ACP resolves the shared daemon config.
+    /// The sole authority for `Config`-backed settings. Managed stdio and
+    /// gateway ACP resolve their shared authority's config.
     config_source: ConfigSource,
     agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     acp_config: AcpServerConfig,
@@ -108,6 +108,23 @@ pub struct AcpServer {
 }
 
 impl AcpServer {
+    /// Create a stdio server retaining the caller's config and lifecycle authority.
+    pub fn new_stdio_with_authority(
+        authority: &zeroclaw_runtime::LiveConfigAuthority,
+        acp_config: AcpServerConfig,
+        store: Option<Arc<AcpSessionStore>>,
+    ) -> Self {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
+        Self::with_writer(
+            ConfigSource::Live(authority.config()),
+            authority.agent_lifecycle(),
+            acp_config,
+            writer_tx,
+            Some(writer_rx),
+            store,
+        )
+    }
+
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self::with_writer(
@@ -264,7 +281,11 @@ impl AcpServer {
         enable_mcp: bool,
     ) -> Result<Agent> {
         if let ConfigSource::Live(live_config) = &self.config_source {
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+            let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                Arc::clone(live_config),
+                self.agent_lifecycle.clone(),
+            );
+            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
                 Arc::clone(live_config),
                 agent_alias,
                 Some(workspace_dir),
@@ -275,6 +296,7 @@ impl AcpServer {
                 self.sop_engine.clone(),
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
+                Some(execution_capability),
             )
             .await
         } else {

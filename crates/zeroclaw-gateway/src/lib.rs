@@ -2621,15 +2621,19 @@ pub(crate) async fn run_gateway_chat_with_tools(
     #[cfg(not(test))]
     {
         let initial_config = state.config.read().clone();
-        let agent_alias = require_gateway_chat_agent_alias(&initial_config, agent_override)?;
-        let generation = state.agent_lifecycle.alias_generation(&agent_alias);
-        let _turn_lease = state
-            .reserve_agent_turn_at(agent_alias.clone(), generation)
+        let requested_alias = require_gateway_chat_agent_alias(&initial_config, agent_override)?;
+        let execution_capability =
+            zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                std::sync::Arc::clone(&state.config),
+                state.agent_lifecycle.clone(),
+            );
+        let execution_admission = execution_capability
+            .resolve_and_admit(&requested_alias)
             .map_err(|error| anyhow::Error::msg(error.to_string()))?;
-        // The first snapshot only identifies the alias. Re-read after admission
-        // so a delete/recreate completed just before the lease cannot run with
-        // the predecessor generation's agent configuration.
-        let config = state.config.read().clone();
+        let agent_alias = execution_admission.alias().to_string();
+        let config = execution_admission.config().as_ref().clone();
+        // The admission snapshot is authoritative for both the alias and the
+        // target config, so a delete/recreate cannot run with predecessor data.
         let current_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
         anyhow::ensure!(
             current_alias == agent_alias,
@@ -2661,12 +2665,13 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(
+                zeroclaw_runtime::agent::loop_::process_message_with_admission(
                     config,
                     &agent_alias,
                     message,
                     session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    Some(execution_admission),
                 ),
             ),
         ))

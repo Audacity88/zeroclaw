@@ -20,7 +20,6 @@ pub struct LiveConfigAuthority {
     config: Arc<RwLock<Config>>,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
     agent_lifecycle: AgentLifecycleCoordinator,
-    _ownership: Option<Arc<ConfigOwnershipGuard>>,
 }
 
 impl LiveConfigAuthority {
@@ -30,19 +29,25 @@ impl LiveConfigAuthority {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
-            _ownership: None,
         }
     }
 
     /// Create an authority that exclusively owns this config across processes.
     pub fn new_owned(config: Config) -> Result<Self> {
         let ownership = ConfigOwnershipGuard::acquire(&config.data_dir)?;
-        Ok(Self {
+        Ok(Self::new_with_ownership(config, ownership))
+    }
+
+    /// Create an authority from a guard acquired by a caller that resolved the
+    /// config identity before loading the executable config. The guard is
+    /// transferred into the authority and shared by every derived capability.
+    pub fn new_with_ownership(config: Config, ownership: ConfigOwnershipGuard) -> Self {
+        let ownership = Arc::new(ownership);
+        Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: AgentLifecycleCoordinator::default(),
-            _ownership: Some(Arc::new(ownership)),
-        })
+            agent_lifecycle: AgentLifecycleCoordinator::with_ownership(ownership),
+        }
     }
 
     /// Pair an existing live config handle with a local mutation witness.
@@ -55,7 +60,6 @@ impl LiveConfigAuthority {
             config,
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
-            _ownership: None,
         }
     }
 
@@ -72,6 +76,17 @@ impl LiveConfigAuthority {
     /// Return the alias-scoped lifecycle authority shared by this daemon run.
     pub fn agent_lifecycle(&self) -> AgentLifecycleCoordinator {
         self.agent_lifecycle.clone()
+    }
+
+    /// Bind target execution admission to this authority's live config and
+    /// alias lifecycle coordinator. Callers keep the returned capability and
+    /// pass it into the target factory or detached task; it is not a registry
+    /// and does not create another config owner.
+    pub fn execution_capability(&self) -> AgentExecutionCapability {
+        AgentExecutionCapability {
+            config: self.config(),
+            agent_lifecycle: self.agent_lifecycle(),
+        }
     }
 
     /// Close lifecycle admission for this daemon generation.
@@ -114,6 +129,224 @@ pub enum ConfigOwnershipError {
     AlreadyOwned { path: PathBuf },
     #[error(transparent)]
     Unavailable(#[from] anyhow::Error),
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AgentExecutionError {
+    #[error(transparent)]
+    Admission(#[from] AgentAdmissionError),
+    #[error("agent `{alias}` is not configured in the live authority")]
+    UnknownAlias { alias: String },
+}
+
+/// Explicit capability for admitting work against the authority-owned live
+/// config. The capability is cheap to clone; each call to `admit` owns a
+/// distinct alias lease, while the config snapshot is taken only after that
+/// lease is acquired.
+#[derive(Clone)]
+pub struct AgentExecutionCapability {
+    config: Arc<RwLock<Config>>,
+    agent_lifecycle: AgentLifecycleCoordinator,
+}
+
+/// An admitted target snapshot and its owned lifecycle lease. Clones share
+/// this one logical lease so detached continuations can outlive their caller
+/// without releasing admission early.
+#[derive(Clone)]
+pub struct AgentExecutionAdmission {
+    config: Arc<Config>,
+    lease: Arc<AgentTurnLease>,
+    capability: AgentExecutionCapability,
+    alias: String,
+    generation: u64,
+}
+
+/// Immutable generation witness for one selection of work whose target is
+/// learned from storage. Capture before reading the payload, not when the
+/// selected work is eventually polled. This is not a live config registry.
+#[derive(Clone)]
+pub struct AgentExecutionSelection {
+    capability: AgentExecutionCapability,
+    generations: HashMap<String, Result<u64, AgentAdmissionError>>,
+    closing: bool,
+}
+
+impl AgentExecutionSelection {
+    pub fn config_handle(&self) -> Arc<RwLock<Config>> {
+        self.capability.config_handle()
+    }
+
+    pub fn resolve_and_admit(
+        &self,
+        requested_alias: &str,
+    ) -> Result<AgentExecutionAdmission, AgentExecutionError> {
+        if self.closing {
+            return Err(AgentAdmissionError::GenerationClosing.into());
+        }
+        let canonical = self
+            .generations
+            .keys()
+            .find(|alias| alias.eq_ignore_ascii_case(requested_alias.trim()))
+            .cloned()
+            .unwrap_or_else(|| requested_alias.trim().to_string());
+        let generation = self.generations.get(&canonical).cloned().ok_or_else(|| {
+            AgentExecutionError::UnknownAlias {
+                alias: canonical.clone(),
+            }
+        })??;
+        self.capability.admit_at(&canonical, generation)
+    }
+}
+
+impl AgentExecutionCapability {
+    pub fn capture_selection(&self) -> AgentExecutionSelection {
+        // Never nest the lifecycle mutex and config lock. A mutation between
+        // these reads changes the generation and is rejected at admission.
+        let (generations, closing) = {
+            let state = self.agent_lifecycle.state.lock();
+            let generations: HashMap<_, _> = state
+                .aliases
+                .iter()
+                .map(|(alias, lifecycle)| {
+                    let generation = if lifecycle.deleting {
+                        Err(AgentAdmissionError::Deleting {
+                            alias: alias.clone(),
+                        })
+                    } else {
+                        Ok(lifecycle.generation)
+                    };
+                    (alias.clone(), generation)
+                })
+                .collect();
+            (generations, state.closing)
+        };
+        let generations = self
+            .config
+            .read()
+            .agents
+            .keys()
+            .map(|alias| {
+                (
+                    alias.clone(),
+                    generations.get(alias).cloned().unwrap_or(Ok(0)),
+                )
+            })
+            .collect();
+        AgentExecutionSelection {
+            capability: self.clone(),
+            generations,
+            closing,
+        }
+    }
+
+    pub fn from_parts(
+        config: Arc<RwLock<Config>>,
+        agent_lifecycle: AgentLifecycleCoordinator,
+    ) -> Self {
+        Self {
+            config,
+            agent_lifecycle,
+        }
+    }
+
+    pub fn config_handle(&self) -> Arc<RwLock<Config>> {
+        Arc::clone(&self.config)
+    }
+
+    pub fn agent_lifecycle_generation(&self, alias: &str) -> u64 {
+        self.agent_lifecycle.alias_generation(alias)
+    }
+
+    /// Resolve a case-insensitive alias from the authoritative snapshot and
+    /// admit the canonical alias before taking the usable target snapshot.
+    pub fn resolve_and_admit(
+        &self,
+        requested_alias: &str,
+    ) -> Result<AgentExecutionAdmission, AgentExecutionError> {
+        let requested_alias = requested_alias.trim();
+        let canonical = self
+            .config
+            .read()
+            .agents
+            .keys()
+            .find(|alias| alias.eq_ignore_ascii_case(requested_alias))
+            .cloned()
+            .unwrap_or_else(|| requested_alias.to_string());
+        self.admit(&canonical)
+    }
+
+    /// Admit the current generation for a target alias.
+    pub fn admit(&self, alias: &str) -> Result<AgentExecutionAdmission, AgentExecutionError> {
+        let generation = self.agent_lifecycle.alias_generation(alias);
+        self.admit_at(alias, generation)
+    }
+
+    /// Admit a queued producer against the generation it carried when it was
+    /// created. This deliberately does not mint a new generation for stale
+    /// queued work.
+    pub fn admit_at(
+        &self,
+        alias: &str,
+        generation: u64,
+    ) -> Result<AgentExecutionAdmission, AgentExecutionError> {
+        let lease = self
+            .agent_lifecycle
+            .reserve_turn_at(alias.to_string(), generation)?;
+        let snapshot = self.config.read().clone();
+        if snapshot.agent(alias).is_none() {
+            drop(lease);
+            return Err(AgentExecutionError::UnknownAlias {
+                alias: alias.to_string(),
+            });
+        }
+        Ok(AgentExecutionAdmission {
+            config: Arc::new(snapshot),
+            lease: Arc::new(lease),
+            capability: self.clone(),
+            alias: alias.to_string(),
+            generation,
+        })
+    }
+}
+
+impl AgentExecutionAdmission {
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config)
+    }
+
+    pub fn capability(&self) -> AgentExecutionCapability {
+        self.capability.clone()
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn lease(&self) -> Arc<AgentTurnLease> {
+        Arc::clone(&self.lease)
+    }
+
+    /// Re-check the generation immediately before a queued admission begins
+    /// target construction. Holding the turn lease keeps deletion out, but a
+    /// daemon shutdown may close the generation while a detached worker is
+    /// still queued; that worker must fail before provider, tool, or target
+    /// persistence work starts.
+    pub fn revalidate(&self) -> Result<(), AgentExecutionError> {
+        self.capability
+            .agent_lifecycle
+            .validate_turn_at(&self.alias, self.generation)
+            .map_err(AgentExecutionError::Admission)?;
+        if self.capability.config.read().agent(&self.alias).is_none() {
+            return Err(AgentExecutionError::UnknownAlias {
+                alias: self.alias.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Cross-process witness for config and alias lifecycle ownership.
@@ -278,6 +511,9 @@ struct AgentLifecycleState {
 pub struct AgentLifecycleCoordinator {
     state: Arc<parking_lot::Mutex<AgentLifecycleState>>,
     destructive_idle: Arc<tokio::sync::Notify>,
+    /// Every capability and lease retains this coordinator, keeping the
+    /// process lock held until the last admitted continuation finishes.
+    _ownership: Option<Arc<ConfigOwnershipGuard>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +543,8 @@ impl std::fmt::Display for AgentAdmissionError {
         }
     }
 }
+
+impl std::error::Error for AgentAdmissionError {}
 
 impl std::fmt::Display for AgentDeleteBlocker {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -353,6 +591,14 @@ pub struct AgentDeleteLease {
 }
 
 impl AgentLifecycleCoordinator {
+    fn with_ownership(ownership: Arc<ConfigOwnershipGuard>) -> Self {
+        Self {
+            state: Arc::new(parking_lot::Mutex::new(AgentLifecycleState::default())),
+            destructive_idle: Arc::new(tokio::sync::Notify::new()),
+            _ownership: Some(ownership),
+        }
+    }
+
     fn delete_blocker_locked(
         state: &AgentLifecycleState,
         alias: &str,
@@ -464,6 +710,27 @@ impl AgentLifecycleCoordinator {
             alias,
             active: true,
         })
+    }
+
+    fn validate_turn_at(&self, alias: &str, generation: u64) -> Result<(), AgentAdmissionError> {
+        let state = self.state.lock();
+        if state.closing {
+            return Err(AgentAdmissionError::GenerationClosing);
+        }
+        let lifecycle = state.aliases.get(alias).map_or(Ok(()), |lifecycle| {
+            if lifecycle.deleting {
+                Err(AgentAdmissionError::Deleting {
+                    alias: alias.to_string(),
+                })
+            } else if lifecycle.generation != generation {
+                Err(AgentAdmissionError::StaleGeneration {
+                    alias: alias.to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        });
+        lifecycle
     }
 
     /// Enter destructive work for one alias after proving no admission or
@@ -707,6 +974,96 @@ mod tests {
         ConfigOwnershipGuard::acquire(temp.path()).unwrap();
     }
 
+    #[test]
+    fn execution_admission_blocks_delete_until_final_work_drops() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let capability = authority.execution_capability();
+        let admission = capability.admit("alpha").unwrap();
+
+        assert_eq!(admission.alias(), "alpha");
+        assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 1);
+        assert!(matches!(
+            authority.agent_lifecycle().begin_delete("alpha"),
+            Err(AgentDeleteBlocker::ActiveTurns { .. })
+        ));
+
+        drop(admission);
+        assert!(authority.agent_lifecycle().begin_delete("alpha").is_ok());
+    }
+
+    #[test]
+    fn stale_execution_generation_is_rejected_before_target_admission() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let capability = authority.execution_capability();
+        let generation = capability.agent_lifecycle_generation("alpha");
+        let delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+        drop(delete);
+
+        assert_eq!(
+            capability.admit_at("alpha", generation).err(),
+            Some(AgentExecutionError::Admission(
+                AgentAdmissionError::StaleGeneration {
+                    alias: "alpha".to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn selection_during_delete_cannot_be_used_after_recreation() {
+        let mut config = Config::default();
+        config.agents.insert("alpha".into(), Default::default());
+        let authority = LiveConfigAuthority::new(config);
+        let deletion = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+        let selection = authority.execution_capability().capture_selection();
+        drop(deletion);
+        assert!(matches!(
+            selection.resolve_and_admit("alpha"),
+            Err(AgentExecutionError::Admission(
+                AgentAdmissionError::Deleting { .. }
+            ))
+        ));
+        authority
+            .config()
+            .write()
+            .agents
+            .insert("new".into(), Default::default());
+        assert!(matches!(
+            selection.resolve_and_admit("new"),
+            Err(AgentExecutionError::UnknownAlias { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_admitted_execution_rejects_closed_generation_before_construction() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let admission = authority.execution_capability().admit("alpha").unwrap();
+
+        authority.close_agent_lifecycle();
+
+        assert_eq!(
+            admission.revalidate().err(),
+            Some(AgentExecutionError::Admission(
+                AgentAdmissionError::GenerationClosing
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn detached_lifecycle_job_retains_alias_exclusion() {
         let lifecycle = AgentLifecycleCoordinator::default();
@@ -874,5 +1231,25 @@ mod tests {
 
         drop(authority);
         ConfigOwnershipGuard::acquire(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn execution_capability_retains_process_ownership_after_authority_drop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let authority = LiveConfigAuthority::new_owned(config).unwrap();
+        let capability =
+            AgentExecutionCapability::from_parts(authority.config(), authority.agent_lifecycle());
+        drop(authority);
+
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(temp.path()),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
+        drop(capability);
+        assert!(ConfigOwnershipGuard::acquire(temp.path()).is_ok());
     }
 }

@@ -4689,8 +4689,73 @@ async fn async_main(command: clap::Command) -> Result<()> {
         return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
     }
 
+    // Standalone execution must resolve and acquire the actual runtime
+    // data directory before loading the executable config. This avoids both a
+    // stale pre-lock snapshot and refusing an independent ZEROCLAW_DATA_DIR
+    // merely because the default instance is running.
+    #[cfg(feature = "agent-runtime")]
+    let standalone_command = match &cli.command {
+        Commands::Agent { .. } => Some("agent"),
+        #[cfg(feature = "channel-acp-server")]
+        Commands::Acp { .. } => Some("acp"),
+        _ => None,
+    };
+    #[cfg(feature = "agent-runtime")]
+    let standalone_ownership_path = if standalone_command.is_some() {
+        let (_, data_dir) = zeroclaw_config::schema::resolve_runtime_dirs().await?;
+        Some(data_dir)
+    } else {
+        None
+    };
+    #[cfg(feature = "agent-runtime")]
+    let standalone_ownership = if let (Some(command), Some(data_dir)) =
+        (standalone_command, standalone_ownership_path.as_ref())
+    {
+        Some(
+            zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(data_dir)
+                .map_err(|error| {
+                    if !matches!(
+                        error,
+                        zeroclaw_runtime::live_config_authority::ConfigOwnershipError::AlreadyOwned { .. }
+                    ) {
+                        return anyhow::Error::from(error);
+                    }
+                    anyhow::anyhow!(
+                        "{}",
+                        ta(
+                            "cli-standalone-daemon-owned",
+                            &[("command", command), ("path", &data_dir.display().to_string())],
+                            &format!(
+                                "Cannot run `zeroclaw {command}` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
+                                data_dir.display()
+                            ),
+                        )
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    #[cfg(feature = "agent-runtime")]
+    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+        let ownership = standalone_ownership
+            .ok_or_else(|| anyhow::anyhow!("standalone ownership was not acquired"))?;
+        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+            config.clone(),
+            ownership,
+        ))
+    } else {
+        None
+    };
     for section in config
         .degraded_sections
         .iter()
@@ -4981,7 +5046,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 session_state_file,
                 None,
                 zeroclaw_api::ingress::TurnOrigin::Interactive,
-                zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
+                zeroclaw_runtime::agent::loop_::AgentRunOverrides {
+                    execution_capability: standalone_authority
+                        .as_ref()
+                        .map(|authority| authority.execution_capability()),
+                    ..Default::default()
+                },
             ))
             .await
             .map(|_| ())
@@ -4993,6 +5063,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
         } => {
             #[cfg(feature = "channel-acp-server")]
             {
+                let authority = standalone_authority
+                    .ok_or_else(|| anyhow::anyhow!("standalone ACP ownership was not acquired"))?;
                 let mut acp_config = channels::acp_server::AcpServerConfig {
                     max_sessions: config.acp.max_sessions,
                     session_timeout_secs: config.acp.session_timeout_secs,
@@ -5019,13 +5091,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             );
                         })
                         .ok();
-                let server = if let Some(store) = store {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                        config, acp_config, store,
-                    ))
-                } else {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
-                };
+                let server =
+                    std::sync::Arc::new(channels::acp_server::AcpServer::new_stdio_with_authority(
+                        &authority, acp_config, store,
+                    ));
                 server.run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
@@ -5391,6 +5460,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     zeroclaw_channels::orchestrator::prepare_live_channel_registry(true);
                 }));
 
+                let mut iteration_config = current_config.clone();
+                iteration_config.gateway.host = host.clone();
+                if port != 0 {
+                    iteration_config.gateway.port = port;
+                }
+                let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(iteration_config)?;
+
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
                 // operator opts in by setting a directory.
@@ -5399,12 +5475,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
                     let sop_adapters = build_sop_adapters(&current_config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
                         current_config.sop.clone(),
                         &current_config.data_dir,
                         &current_config.install_root_dir(),
                         mem,
                         sop_adapters,
+                        Some(authority.execution_capability()),
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -5983,8 +6060,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // RpcContext (RPC/TUI agent sessions) can share it.
                 registry.set_sop_engine(sop_engine, sop_audit);
 
-                let exit = Box::pin(daemon::run(
-                    current_config.clone(),
+                let exit = Box::pin(daemon::run_with_authority(
+                    authority,
                     host.clone(),
                     port,
                     registry,
@@ -5994,6 +6071,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 .await;
                 if let Some(handle) = sop_maintenance {
                     handle.abort();
+                    let _ = handle.await;
                 }
                 let exit = exit?;
                 match exit {
@@ -6666,16 +6744,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
+                let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
                 let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
                     let sop_adapters = build_sop_adapters(&config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
                         config.sop.clone(),
                         &config.data_dir,
                         &config.install_root_dir(),
                         mem,
                         sop_adapters,
+                        Some(authority.execution_capability()),
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -6687,12 +6767,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
                 );
-                let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                let result = Box::pin(channels::start_channels_with_authority(
+                    authority, None, cancel, sop_engine, sop_audit,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
                     handle.abort();
+                    let _ = handle.await;
                 }
                 result
             }

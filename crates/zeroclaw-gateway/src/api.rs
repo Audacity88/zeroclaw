@@ -601,6 +601,11 @@ pub async fn handle_api_cron_run(
         return e.into_response();
     }
 
+    let selection = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+        std::sync::Arc::clone(&state.config),
+        state.agent_lifecycle.clone(),
+    )
+    .capture_selection();
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -615,11 +620,12 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
+        Some(selection),
     )
     .await;
 

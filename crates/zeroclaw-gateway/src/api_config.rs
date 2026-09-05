@@ -910,6 +910,19 @@ pub async fn handle_prop_delete(
         return e.into_response();
     }
 
+    let _agent_config_reservation =
+        match zeroclaw_config::alias_refs::agent_alias_for_prop_path(&q.path)
+            .map(|alias| state.agent_lifecycle.reserve_config_mutation(alias))
+            .transpose()
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                        .with_path(&q.path),
+                );
+            }
+        };
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut new_config = state.config.read().clone();
     let info = match lookup_prop_field(&new_config, &q.path) {
@@ -3081,6 +3094,49 @@ mod tests {
                 .openai
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn prop_delete_refuses_agent_alias_under_destructive_lease_without_live_or_disk_mutation()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.create_map_key("agents", "blocked").unwrap();
+        config
+            .set_prop_persistent("agents.blocked.enabled", "true")
+            .unwrap();
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let config_path = state.config.read().config_path.clone();
+        let live_before = toml::to_string(&*state.config.read()).unwrap();
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let _cleanup = test_agent_delete_lease(&state, "blocked");
+
+        let (status, json) = response_json(
+            handle_prop_delete(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(PropQuery {
+                    path: "agents.blocked.enabled".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "validation_failed");
+        assert_eq!(
+            toml::to_string(&*state.config.read()).unwrap(),
+            live_before,
+            "refused property DELETE must not change serialized live config"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            disk_before,
+            "refused property DELETE must not change config.toml bytes"
+        );
+        assert!(state.config.read().agents["blocked"].enabled);
     }
 
     #[tokio::test]
