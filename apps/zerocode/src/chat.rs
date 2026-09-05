@@ -4117,9 +4117,9 @@ fn transcript_action_rects(
         .saturating_add(1)
         .saturating_add(add_to_chat_width);
     let (button_width, button_height, horizontal) = if horizontal_width <= body.width {
-        (horizontal_width, 1, true)
+        (horizontal_width, 3, true)
     } else {
-        (copy_width.max(add_to_chat_width), 2, false)
+        (copy_width.max(add_to_chat_width), 7, false)
     };
     if button_width > body.width || button_height > body.height {
         return None;
@@ -4139,20 +4139,20 @@ fn transcript_action_rects(
         .saturating_add(body.width.saturating_sub(button_width) / 2);
 
     if horizontal {
-        let copy_rect = Rect::new(x, y, copy_width, 1);
+        let copy_rect = Rect::new(x, y, copy_width, 3);
         let add_to_chat_rect = Rect::new(
             x.saturating_add(copy_width).saturating_add(1),
             y,
             add_to_chat_width,
-            1,
+            3,
         );
         Some([
             (copy_rect, CopyHitAction::Copy),
             (add_to_chat_rect, CopyHitAction::AddToChat),
         ])
     } else {
-        let copy_rect = Rect::new(x, y, copy_width, 1);
-        let add_to_chat_rect = Rect::new(x, y.saturating_add(1), add_to_chat_width, 1);
+        let copy_rect = Rect::new(x, y, copy_width, 3);
+        let add_to_chat_rect = Rect::new(x, y.saturating_add(4), add_to_chat_width, 3);
         Some([
             (copy_rect, CopyHitAction::Copy),
             (add_to_chat_rect, CopyHitAction::AddToChat),
@@ -4418,9 +4418,14 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 label,
-                theme::accent_style().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                theme::accent_style().add_modifier(Modifier::BOLD),
             )))
-            .alignment(Alignment::Center),
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::accent_style()),
+            ),
             rect,
         );
     }
@@ -7623,6 +7628,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::style::Print(crate::config_manager::mouse_shift_capture_sequence(false)),
         crossterm::terminal::LeaveAlternateScreen
     );
 
@@ -7636,6 +7642,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
+        crossterm::style::Print(crate::config_manager::mouse_shift_capture_sequence(true)),
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
     );
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
@@ -8778,13 +8785,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(regions.len(), 2);
         assert!(regions.iter().all(|region| region.text == "he"));
-        assert!(regions.iter().all(|region| region.rect.height == 1));
+        assert!(regions.iter().all(|region| region.rect.height == 3));
         assert_eq!(
-            terminal.backend().buffer()[(regions[0].rect.x + 1, regions[0].rect.y)].symbol(),
+            terminal.backend().buffer()[(regions[0].rect.x, regions[0].rect.y)].symbol(),
+            "┌"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(regions[0].rect.x + 1, regions[0].rect.y + 1)].symbol(),
             "C"
         );
         assert_eq!(
-            terminal.backend().buffer()[(regions[1].rect.x + 1, regions[1].rect.y)].symbol(),
+            terminal.backend().buffer()[(regions[1].rect.x + 1, regions[1].rect.y + 1)].symbol(),
             "A"
         );
         let region = regions
@@ -8874,12 +8885,12 @@ mod tests {
         let above = transcript_action_rects(
             "Copy",
             "Add to Chat",
-            Rect::new(0, 9, 20, 1),
+            Rect::new(0, 8, 20, 1),
             Rect::new(0, 0, 40, 10),
         )
         .expect("buttons fit above");
-        assert_eq!(above[0].0.y, 8);
-        assert_eq!(above[1].0.y, 8);
+        assert_eq!(above[0].0.y, 5);
+        assert_eq!(above[1].0.y, 5);
     }
 
     #[test]
@@ -8891,10 +8902,10 @@ mod tests {
             Rect::new(0, 0, 14, 10),
         )
         .expect("stacked buttons fit");
-        assert_eq!(buttons[0].0.y + 1, buttons[1].0.y);
+        assert_eq!(buttons[0].0.y + 4, buttons[1].0.y);
         assert_eq!(buttons[0].0.x, buttons[1].0.x);
-        assert_eq!(buttons[0].0.height, 1);
-        assert_eq!(buttons[1].0.height, 1);
+        assert_eq!(buttons[0].0.height, 3);
+        assert_eq!(buttons[1].0.height, 3);
     }
 
     #[tokio::test]
