@@ -1407,7 +1407,7 @@ impl RpcDispatcher {
             return Err(rpc_err(SESSION_BUSY, "Session already active"));
         }
 
-        // Validate the durable owner before consuming a checkpoint, including
+        // Validate the durable owner and surface before consuming a checkpoint, including
         // resumes with an explicit cwd. Reload after recovery so the restored
         // agent sees the promoted history, not the pre-recovery snapshot. The
         // durable row also owns the original workspace and interaction surface.
@@ -1418,20 +1418,10 @@ impl RpcDispatcher {
         {
             let store_cloned = store.clone();
             let sid = session_id.clone();
-            let alias = req.agent_alias.clone();
-            let marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
-            match tokio::task::spawn_blocking(move || {
-                let loaded = store_cloned.load_session_for_restore(&sid)?;
-                if matches!(&loaded, zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data) if data.agent_alias == alias) {
-                    store_cloned.recover_turn_checkpoint(&sid, &marker)?;
-                    return store_cloned.load_session_for_restore(&sid);
-                }
-                Ok(loaded)
-            }).await
+            match tokio::task::spawn_blocking(move || store_cloned.load_session_for_restore(&sid))
+                .await
             {
-                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
-                    mut data,
-                ))) => {
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => {
                     if data.agent_alias != req.agent_alias {
                         return Err(rpc_err(
                             INVALID_PARAMS,
@@ -1489,12 +1479,39 @@ impl RpcDispatcher {
                                         "ACP session belongs to a different interaction surface",
                                     ));
                                 }
-                                data.interaction_surface = Some(durable);
                                 resolved_interaction_surface = Some(requested);
                             }
                         }
                     }
-                    preloaded_acp = Some(data);
+                    let store_cloned = store.clone();
+                    let sid = session_id.clone();
+                    let marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
+                    let recovered = tokio::task::spawn_blocking(move || {
+                        store_cloned.recover_turn_checkpoint(&sid, &marker)?;
+                        store_cloned.load_session_for_restore(&sid)
+                    })
+                    .await
+                    .map_err(|join| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to recover ACP session: {join}"),
+                        )
+                    })?
+                    .map_err(|e| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to recover ACP session: {e}"),
+                        )
+                    })?;
+                    match recovered {
+                        zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data) => {
+                            preloaded_acp = Some(data);
+                        }
+                        zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing
+                        | zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
+                            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                        }
+                    }
                 }
                 Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => {}
                 Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
@@ -9732,6 +9749,148 @@ mod tests {
         assert_eq!(err.code, INVALID_PARAMS);
         assert!(err.message.contains("different interaction surface"));
         assert!(sessions.get_agent("surface-mismatch").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_resume_rejects_surface_before_checkpoint_recovery() {
+        for (requested, expected_error) in [
+            (Some("zerocode_code"), "different interaction surface"),
+            (None, "unsupported interaction surface"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, _chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "surface-checkpoint-rejection";
+            acp_store
+                .create_session_with_interaction_surface(
+                    sid,
+                    "test-agent",
+                    "/tmp/test-agent",
+                    Some("another_surface"),
+                )
+                .unwrap();
+            let history = vec![ConversationMessage::Chat(ChatMessage::user(
+                "saved question",
+            ))];
+            acp_store.append_turn(sid, &history).unwrap();
+            let pending = ConversationMessage::Chat(ChatMessage::user("pending question"));
+            acp_store
+                .begin_turn_checkpoint(sid, "pending-turn", std::slice::from_ref(&pending))
+                .unwrap();
+
+            for cwd in [None, Some("/tmp/explicit-resume-cwd")] {
+                let err = dispatcher
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias": "test-agent",
+                        "chat_mode": "acp",
+                        "session_id": sid,
+                        "interaction_surface": requested,
+                        "cwd": cwd,
+                    }))
+                    .await
+                    .expect_err("surface rejection must precede checkpoint recovery");
+                assert_eq!(err.code, INVALID_PARAMS);
+                assert!(err.message.contains(expected_error));
+                assert!(sessions.get_agent(sid).await.is_none());
+                let saved = acp_store.load_session(sid).unwrap().unwrap();
+                assert_eq!(
+                    saved.interaction_surface.as_deref(),
+                    Some("another_surface")
+                );
+                assert_eq!(
+                    serde_json::to_value(&saved.messages).unwrap(),
+                    serde_json::to_value(&history).unwrap(),
+                    "rejection must leave saved history unchanged"
+                );
+            }
+            assert!(
+                acp_store
+                    .recover_turn_checkpoint(sid, "test recovery")
+                    .unwrap()
+            );
+            let recovered = acp_store.load_session(sid).unwrap().unwrap();
+            assert_eq!(recovered.messages.len(), history.len() + 2);
+            assert_eq!(
+                serde_json::to_value(&recovered.messages[history.len()]).unwrap(),
+                serde_json::to_value(&pending).unwrap(),
+                "rejection must preserve the pending checkpoint content"
+            );
+            assert!(
+                !acp_store
+                    .recover_turn_checkpoint(sid, "test recovery")
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_resume_recovers_checkpoint_after_surface_validation() {
+        for (stored, requested) in [
+            (Some("zerocode_code"), Some("zerocode_code")),
+            (Some("zerocode_code"), None),
+            (None, Some("zerocode_code")),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, _chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "surface-checkpoint-recovery";
+            acp_store
+                .create_session_with_interaction_surface(
+                    sid,
+                    "test-agent",
+                    "/tmp/test-agent",
+                    stored,
+                )
+                .unwrap();
+            let pending = ConversationMessage::Chat(ChatMessage::user("pending question"));
+            acp_store
+                .begin_turn_checkpoint(sid, "pending-turn", std::slice::from_ref(&pending))
+                .unwrap();
+            let params = json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+                "interaction_surface": requested,
+            });
+            dispatcher
+                .handle_session_new_for_test(&params)
+                .await
+                .unwrap();
+            let recovered = acp_store.load_session(sid).unwrap().unwrap();
+            assert_eq!(
+                recovered.interaction_surface.as_deref(),
+                Some("zerocode_code")
+            );
+            assert_eq!(recovered.messages.len(), 2);
+            assert_eq!(
+                serde_json::to_value(&recovered.messages[0]).unwrap(),
+                serde_json::to_value(&pending).unwrap()
+            );
+            let agent = sessions.get_agent(sid).await.unwrap();
+            assert!(agent.lock().await.history().iter().any(|message| {
+                serde_json::to_value(message).unwrap() == serde_json::to_value(&pending).unwrap()
+            }));
+            assert!(
+                !acp_store
+                    .recover_turn_checkpoint(sid, "test recovery")
+                    .unwrap()
+            );
+            assert!(sessions.remove(sid).await);
+            dispatcher
+                .handle_session_new_for_test(&params)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(acp_store.load_session(sid).unwrap().unwrap().messages)
+                    .unwrap(),
+                serde_json::to_value(&recovered.messages).unwrap(),
+                "reattachment must not duplicate recovered history"
+            );
+        }
     }
 
     #[tokio::test]
