@@ -269,9 +269,10 @@ impl WebhookAuditHook {
         }
 
         let args_value = if self.config.include_args {
-            raw_args
-                .map(|args| prepare_args_for_export(args, self.config.max_args_bytes))
-                .unwrap_or(Value::Null)
+            // Arguments were already scrubbed and truncated before they entered
+            // pending state (see `before_tool_call_with_context`); raw arguments
+            // are never retained, so the popped value is exported as-is.
+            raw_args.unwrap_or(Value::Null)
         } else {
             Value::Null
         };
@@ -329,15 +330,42 @@ impl HookHandler for WebhookAuditHook {
                 "capturing args for audit"
             );
             let invocation_id = context.invocation_id().to_string();
-            let args_snapshot = args.clone();
+            // Scrub and truncate BEFORE the arguments enter pending state: a
+            // call that later cannot reach its after phase still abandons, and
+            // raw arguments must never sit in retained audit state regardless
+            // of which terminal operation closes the context.
+            let prepared_args = prepare_args_for_export(args.clone(), self.config.max_args_bytes);
             let evicted = self
                 .pending_args
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(invocation_id, args_snapshot);
+                .push(invocation_id, prepared_args);
             drop(evicted);
         }
         HookResult::Continue((name, args))
+    }
+
+    async fn on_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+        // Abandonment is not execution completion: no audit event is sent.
+        // The only obligation is releasing the correlated pending entry so
+        // scrubbed-but-unreported arguments do not linger in retained state.
+        if !context.is_correlated() {
+            return;
+        }
+        let removed = self
+            .pending_args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop(context.invocation_id());
+        if removed.is_some() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_attrs(::serde_json::json!({"hook": "webhook-audit", "tool": tool})),
+                "discarded pending audit args for abandoned tool call"
+            );
+        }
     }
 
     async fn on_after_tool_call_with_context(
@@ -701,6 +729,151 @@ mod tests {
         assert_eq!(evicted["args"], Value::Null);
         assert_eq!(retained_b["args"], serde_json::json!({"call": "b"}));
         assert_eq!(retained_c["args"], serde_json::json!({"call": "c"}));
+        assert!(hook.pending_args.lock().unwrap().is_empty());
+    }
+
+    // ── Pending-state scrubbing and abandonment tests ────────────
+
+    #[tokio::test]
+    async fn pending_args_are_scrubbed_before_entering_retained_state() {
+        let hook = make_hook(vec!["Bash"], true);
+        let secret = "SUPERSECRETPENDINGVALUE42";
+        let args = serde_json::json!({"command": format!("echo api_key={secret}")});
+
+        hook.before_tool_call_with_context(&hook_context("call-a"), "Bash".into(), args.clone())
+            .await;
+
+        // Raw arguments must never sit in pending state: the retained value is
+        // already scrubbed, independent of which terminal operation follows.
+        let pending = hook.pending_args.lock().unwrap();
+        let stored = pending.peek("call-a").expect("matching call stored");
+        assert!(
+            !stored.to_string().contains(secret),
+            "pending state must hold scrubbed args, got {stored}"
+        );
+        assert_eq!(
+            stored["command"],
+            prepare_args_for_export(args, 0)["command"],
+            "stored value must equal the prepared-for-export value"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandonment_removes_only_the_correlated_pending_entry() {
+        let hook = make_hook(vec!["Bash"], true);
+        let args_a = serde_json::json!({"command": "first"});
+        let args_b = serde_json::json!({"command": "second"});
+        hook.before_tool_call_with_context(&hook_context("call-a"), "Bash".into(), args_a)
+            .await;
+        hook.before_tool_call_with_context(&hook_context("call-b"), "Bash".into(), args_b)
+            .await;
+
+        // Abandon call-a: exactly its entry goes; call-b's survives untouched.
+        hook.on_tool_call_abandoned(&hook_context("call-a"), "Bash")
+            .await;
+        assert_eq!(
+            hook.pending_args.lock().unwrap().len(),
+            1,
+            "only the abandoned call's entry must be removed"
+        );
+        assert!(
+            hook.pending_args.lock().unwrap().contains("call-b"),
+            "the sibling call's pending entry must survive"
+        );
+
+        // Abandon call-b: pending state fully drained.
+        hook.on_tool_call_abandoned(&hook_context("call-b"), "Bash")
+            .await;
+        assert!(hook.pending_args.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandonment_is_idempotent_for_already_completed_calls() {
+        let hook = make_hook(vec!["Bash"], true);
+        let context = hook_context("call-a");
+        hook.before_tool_call_with_context(
+            &context,
+            "Bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )
+        .await;
+
+        // Completion consumed the entry; a late abandonment removes nothing.
+        hook.on_after_tool_call_with_context(
+            &context,
+            "Bash",
+            &ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert!(hook.pending_args.lock().unwrap().is_empty());
+
+        hook.on_tool_call_abandoned(&context, "Bash").await;
+        assert!(hook.pending_args.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn uncorrelated_abandonment_cannot_remove_correlated_entry() {
+        let hook = make_hook(vec!["Bash"], true);
+        let exact = hook_context("shared-id");
+        hook.before_tool_call_with_context(
+            &exact,
+            "Bash".into(),
+            serde_json::json!({"command": "private"}),
+        )
+        .await;
+
+        // An uncorrelated context carrying the same id string must stay
+        // fail-closed on abandonment, exactly as it is on completion.
+        let uncorrelated = ToolCallHookContext::uncorrelated("shared-id");
+        hook.on_tool_call_abandoned(&uncorrelated, "Bash").await;
+        assert!(
+            hook.pending_args.lock().unwrap().contains("shared-id"),
+            "uncorrelated abandonment must not consume the correlated entry"
+        );
+
+        // The exact correlated context removes it.
+        hook.on_tool_call_abandoned(&exact, "Bash").await;
+        assert!(hook.pending_args.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandonment_never_sends_a_webhook_event() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut hook = make_hook(vec!["Bash"], true);
+        hook.config.url = server.uri();
+        let context = hook_context("call-a");
+        hook.before_tool_call_with_context(
+            &context,
+            "Bash".into(),
+            serde_json::json!({"command": "ls"}),
+        )
+        .await;
+
+        hook.on_tool_call_abandoned(&context, "Bash").await;
+
+        // Give any (incorrectly dispatched) fire-and-forget POST time to land.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let received = server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        assert!(
+            received.is_empty(),
+            "abandonment must not synthesize an audit event, got {received:?}"
+        );
         assert!(hook.pending_args.lock().unwrap().is_empty());
     }
 

@@ -168,6 +168,33 @@ impl HookRunner {
         join_all(futs).await;
     }
 
+    /// Fire the abandonment callback for a tool-call context that will never
+    /// reach its after phase.
+    ///
+    /// Dispatched in parallel with the same per-handler panic isolation as the
+    /// other void hooks: a panicking abandonment handler is caught and logged,
+    /// and the remaining handlers still run, so every handler that retained
+    /// per-invocation state gets the chance to release it.
+    pub async fn fire_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+        let futs = self.handlers.iter().map(|h| async move {
+            let hook_name = h.name();
+            if AssertUnwindSafe(h.on_tool_call_abandoned(context, tool))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"hook": hook_name})),
+                    "tool_call_abandoned hook panicked; continuing with remaining handlers"
+                );
+            }
+        });
+        join_all(futs).await;
+    }
+
     pub async fn fire_message_sent(&self, channel: &str, recipient: &str, content: &str) {
         let futs: Vec<_> = self
             .handlers
@@ -1004,6 +1031,140 @@ mod tests {
             .await;
 
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn abandonment_dispatches_to_all_handlers_with_context() {
+        struct AbandonRecorder {
+            name: String,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for AbandonRecorder {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            async fn on_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+                self.events.lock().unwrap().push(format!(
+                    "{}:{}:{}",
+                    self.name,
+                    tool,
+                    context.invocation_id()
+                ));
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(AbandonRecorder {
+            name: "first".into(),
+            events: Arc::clone(&events),
+        }));
+        runner.register(Box::new(AbandonRecorder {
+            name: "second".into(),
+            events: Arc::clone(&events),
+        }));
+
+        let context = tool_call_hook_context("turn-a", 2, 1);
+        runner.fire_tool_call_abandoned(&context, "shell").await;
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            *events,
+            vec![
+                "first:shell:turn-a:2:1".to_string(),
+                "second:shell:turn-a:2:1".to_string(),
+            ],
+            "every handler must observe the abandonment with the shared context"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_abandonment_handler_does_not_break_subsequent_handler() {
+        struct PanickingAbandonHook;
+        #[async_trait]
+        impl HookHandler for PanickingAbandonHook {
+            fn name(&self) -> &str {
+                "panicking-abandon"
+            }
+
+            fn priority(&self) -> i32 {
+                10
+            }
+
+            async fn on_tool_call_abandoned(&self, _context: &ToolCallHookContext, _tool: &str) {
+                panic!("simulated on_tool_call_abandoned panic");
+            }
+        }
+
+        struct CountingAbandonHook(Arc<AtomicU32>);
+        #[async_trait]
+        impl HookHandler for CountingAbandonHook {
+            fn name(&self) -> &str {
+                "counting-abandon"
+            }
+
+            async fn on_tool_call_abandoned(&self, _context: &ToolCallHookContext, _tool: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count = Arc::new(AtomicU32::new(0));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(PanickingAbandonHook));
+        runner.register(Box::new(CountingAbandonHook(Arc::clone(&count))));
+
+        runner
+            .fire_tool_call_abandoned(&tool_call_hook_context("turn-a", 0, 0), "shell")
+            .await;
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the handler after a panicking abandonment handler must still run"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandonment_on_legacy_only_handler_is_a_noop() {
+        // A pre-existing handler that implements only legacy methods keeps
+        // compiling unchanged and must not observe abandonment events.
+        struct LegacyOnlyHook {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for LegacyOnlyHook {
+            fn name(&self) -> &str {
+                "legacy-only"
+            }
+
+            async fn on_after_tool_call(
+                &self,
+                tool: &str,
+                _result: &ToolResult,
+                _duration: Duration,
+            ) {
+                self.calls.lock().unwrap().push(format!("after:{tool}"));
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(LegacyOnlyHook {
+            calls: Arc::clone(&calls),
+        }));
+
+        runner
+            .fire_tool_call_abandoned(&tool_call_hook_context("turn-a", 0, 0), "shell")
+            .await;
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the default abandonment implementation must be a no-op"
+        );
     }
 
     #[tokio::test]

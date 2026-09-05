@@ -91,6 +91,16 @@ pub trait HookHandler: Send + Sync {
     ) {
         self.on_after_tool_call(tool, result, duration).await;
     }
+    /// Observe that a tool-call context will never reach its after phase.
+    ///
+    /// Fired exactly once per correlated context whose before phase ran, when
+    /// the call cannot complete: the before hook chain cancelled it, approval
+    /// denied or replaced it, duplicate suppression skipped it, or execution
+    /// failed or was interrupted before post-execution handling. Handlers that
+    /// retained per-invocation state under `context.invocation_id()` must
+    /// release it here. Abandonment is NOT execution completion — handlers
+    /// must never synthesize a tool result from it.
+    async fn on_tool_call_abandoned(&self, _context: &ToolCallHookContext, _tool: &str) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
 
@@ -279,5 +289,24 @@ mod tests {
         assert!(exact.is_correlated());
         assert!(!unavailable.is_correlated());
         assert_eq!(unavailable.invocation_id(), "legacy");
+    }
+
+    #[tokio::test]
+    async fn default_abandonment_hook_compiles_and_is_a_noop() {
+        // A pre-existing handler shape: implements only `name`. It must keep
+        // compiling unchanged and the default abandonment must be a no-op.
+        struct MinimalHook;
+        #[async_trait]
+        impl HookHandler for MinimalHook {
+            fn name(&self) -> &str {
+                "minimal"
+            }
+        }
+
+        let hook = MinimalHook;
+        hook.on_tool_call_abandoned(&ToolCallHookContext::new("invocation"), "shell")
+            .await;
+        hook.on_tool_call_abandoned(&ToolCallHookContext::uncorrelated("legacy"), "shell")
+            .await;
     }
 }
