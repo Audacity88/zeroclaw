@@ -605,7 +605,9 @@ pub(crate) fn build_approve_deny_approval_prompt(
 }
 
 #[cfg(any(
+    feature = "channel-discord",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     test
@@ -617,7 +619,9 @@ pub(crate) struct PendingApproval {
 }
 
 #[cfg(any(
+    feature = "channel-discord",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     test
@@ -631,7 +635,9 @@ pub(crate) enum PendingApprovalResolution {
 }
 
 #[cfg(any(
+    feature = "channel-discord",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     test
@@ -643,7 +649,13 @@ impl PendingApprovalResolution {
     }
 }
 
-#[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    test
+))]
 pub(crate) async fn resolve_pending_approval(
     pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
     token: &str,
@@ -663,7 +675,9 @@ pub(crate) async fn resolve_pending_approval(
 }
 
 #[cfg(any(
+    feature = "channel-discord",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     test
