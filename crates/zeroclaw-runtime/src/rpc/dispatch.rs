@@ -2177,24 +2177,16 @@ impl RpcDispatcher {
         // Admission fences the complete session incarnation: agent, mode,
         // attachments, durable writes, and terminal state are all resolved
         // while same-ID replacement is excluded.
-        let _guard = self
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_guard, cancel_registration) = self
             .ctx
             .sessions
-            .session_queue
-            .acquire(sid)
+            .acquire_prompt(sid, cancel.clone())
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
-        // Registration is the first operation after admission and the RAII
-        // handle removes this exact generation on every exit path. Removal
-        // handlers signal before waiting on the same queue, so they cannot
-        // lose cancellation while setup awaits agent lookup, attachments, or
-        // persistence.
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_registration = self
-            .ctx
-            .sessions
-            .register_cancel_token_guard(sid, cancel.clone());
+        // Admission and token registration share the cancellation lock. The
+        // RAII handle removes this exact generation on every exit path.
         self.ctx
             .sessions
             .wait_test_prompt_registration_pause()
