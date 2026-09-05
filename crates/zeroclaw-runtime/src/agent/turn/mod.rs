@@ -4579,4 +4579,201 @@ mod tool_lifecycle_abandonment_tests {
             "every executable context of the interrupted batch gets exactly one abandonment; none reaches after"
         );
     }
+
+    /// Tool that never completes on its own: the containing wrapper decides
+    /// the turn's fate, not the tool.
+    struct HangingTool {
+        name: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for HangingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for HangingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "sleeps far past any test timeout"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(crate::tools::ToolResult::ok("never observed"))
+        }
+    }
+
+    /// Hook that retains per-invocation state in the before phase and releases
+    /// it on after/abandonment — the integrator pattern the abandonment API
+    /// documents as cooperative-path-only. Used to pin what a hard future drop
+    /// does and does not deliver.
+    struct RetainingHook {
+        events: Arc<Mutex<Vec<String>>>,
+        retained: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for RetainingHook {
+        fn name(&self) -> &str {
+            "retaining-hook"
+        }
+
+        async fn before_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("before:{}:{}", name, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .push(context.invocation_id().to_string());
+            crate::hooks::HookResult::Continue((name, args))
+        }
+
+        async fn on_after_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            tool: &str,
+            _result: &zeroclaw_api::tool::ToolResult,
+            _duration: Duration,
+        ) {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("after:{}:{}", tool, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .retain(|id| id != context.invocation_id());
+        }
+
+        async fn on_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("abandoned:{}:{}", tool, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .retain(|id| id != context.invocation_id());
+        }
+    }
+
+    #[tokio::test]
+    async fn outer_turn_drop_fires_no_lifecycle_callbacks() {
+        // Mirrors the channel orchestrator's containing-future race
+        // (orchestrator/mod.rs): the whole turn future is wrapped in a
+        // timeout and raced against the turn's cancellation token. A winning
+        // outer branch DROPS the turn future, so awaited cooperative cleanup
+        // inside the loop never runs. This pins the documented lifecycle
+        // boundary: after and abandonment fire on awaited non-completion
+        // paths only; a hard drop fires neither, and stateful hooks must
+        // design for that (the webhook audit hook retains no arguments at
+        // all, so a drop leaves nothing behind).
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let retained = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(RetainingHook {
+            events: Arc::clone(&events),
+            retained: Arc::clone(&retained),
+        }));
+        let token = CancellationToken::new();
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call(
+                    "call-a",
+                    "hang_tool",
+                    serde_json::json!({"n": 1}),
+                )],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![Box::new(HangingTool {
+            name: "hang_tool".to_string(),
+        })]);
+        let mut history = vec![ChatMessage::user("hang forever".to_string())];
+
+        let turn_future = run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-drop",
+            false,
+            Some(token.clone()),
+            &mut history,
+        );
+        let outcome = tokio::select! {
+            () = token.cancelled() => "cancelled",
+            result = tokio::time::timeout(Duration::from_millis(300), turn_future) => {
+                match result {
+                    Ok(_) => "completed",
+                    Err(_elapsed) => "timeout",
+                }
+            }
+        };
+        assert_eq!(
+            outcome, "timeout",
+            "the outer timeout must win while the tool hangs"
+        );
+
+        // The dropped turn fired exactly its before phase: neither the after
+        // hook nor abandonment can run inside a dropped future.
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["before:hang_tool:turn-drop:0:0".to_string()],
+            "a hard future drop must fire no after or abandonment callback"
+        );
+        // The hook's own retained entry survives the drop — the runtime makes
+        // no callback promise under hard drop, which is why argument-carrying
+        // completion exists: hooks that must not leak retain nothing.
+        assert_eq!(
+            retained.lock().unwrap().len(),
+            1,
+            "the retained entry documents the hard-drop boundary; release is the hook's design obligation"
+        );
+
+        // The runner itself is unharmed by the dropped turn: a direct
+        // cooperative dispatch still reaches the hook and releases the entry.
+        runner
+            .fire_tool_call_abandoned(
+                &zeroclaw_api::hook::ToolCallHookContext::new("turn-drop:0:0"),
+                "hang_tool",
+            )
+            .await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:hang_tool:turn-drop:0:0".to_string(),
+                "abandoned:hang_tool:turn-drop:0:0".to_string(),
+            ],
+            "cooperative abandonment still works after a dropped turn"
+        );
+        assert!(
+            retained.lock().unwrap().is_empty(),
+            "the cooperative dispatch releases exactly the retained entry"
+        );
+    }
 }

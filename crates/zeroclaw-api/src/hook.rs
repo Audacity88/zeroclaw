@@ -91,15 +91,42 @@ pub trait HookHandler: Send + Sync {
     ) {
         self.on_after_tool_call(tool, result, duration).await;
     }
+    /// Observe tool completion with explicit correlation context and the
+    /// arguments that were actually dispatched.
+    ///
+    /// Runners that know the final prepared arguments dispatch this variant
+    /// instead of [`HookHandler::on_after_tool_call_with_context`]; the
+    /// default delegates there, dropping the arguments. Handlers that audit
+    /// arguments should override this variant so their export reflects what
+    /// was dispatched — and so they never need to retain arguments between
+    /// the before and after phases.
+    async fn on_after_tool_call_with_context_and_args(
+        &self,
+        context: &ToolCallHookContext,
+        tool: &str,
+        _args: &Value,
+        result: &ToolResult,
+        duration: Duration,
+    ) {
+        self.on_after_tool_call_with_context(context, tool, result, duration)
+            .await;
+    }
     /// Observe that a tool-call context will never reach its after phase.
     ///
     /// Fired exactly once per correlated context whose before phase ran, when
     /// the call cannot complete: the before hook chain cancelled it, approval
     /// denied or replaced it, duplicate suppression skipped it, or execution
-    /// failed or was interrupted before post-execution handling. Handlers that
-    /// retained per-invocation state under `context.invocation_id()` must
-    /// release it here. Abandonment is NOT execution completion — handlers
-    /// must never synthesize a tool result from it.
+    /// failed or was interrupted before post-execution handling. Abandonment
+    /// is NOT execution completion — handlers must never synthesize a tool
+    /// result from it.
+    ///
+    /// Best-effort by nature: the runner dispatches abandonment on every
+    /// awaited non-completion path, but a turn future dropped outright (an
+    /// outer timeout, outer cancellation, or hard task abort) cannot run any
+    /// async callback, abandonment included. Handlers must therefore avoid
+    /// retaining safety-critical state between the before and after phases in
+    /// the first place, and treat abandonment as a best-effort release signal
+    /// rather than a guarantee.
     async fn on_tool_call_abandoned(&self, _context: &ToolCallHookContext, _tool: &str) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
@@ -289,6 +316,59 @@ mod tests {
         assert!(exact.is_correlated());
         assert!(!unavailable.is_correlated());
         assert_eq!(unavailable.invocation_id(), "legacy");
+    }
+
+    #[tokio::test]
+    async fn args_carrying_after_variant_defaults_to_context_variant() {
+        use std::sync::{Arc, Mutex};
+
+        struct ContextOnlyHook {
+            seen: Arc<Mutex<Option<(String, String, bool)>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for ContextOnlyHook {
+            fn name(&self) -> &str {
+                "context-only"
+            }
+
+            async fn on_after_tool_call_with_context(
+                &self,
+                context: &ToolCallHookContext,
+                tool: &str,
+                result: &ToolResult,
+                _duration: Duration,
+            ) {
+                *self.seen.lock().unwrap() = Some((
+                    context.invocation_id().to_string(),
+                    tool.to_string(),
+                    result.success,
+                ));
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let hook = ContextOnlyHook {
+            seen: Arc::clone(&seen),
+        };
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+        hook.on_after_tool_call_with_context_and_args(
+            &ToolCallHookContext::new("invocation"),
+            "shell",
+            &serde_json::json!({"command": "ls"}),
+            &result,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(("invocation".to_string(), "shell".to_string(), true)),
+            "the args-carrying default must land in the context-aware variant"
+        );
     }
 
     #[tokio::test]

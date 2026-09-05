@@ -195,6 +195,38 @@ impl HookRunner {
         join_all(futs).await;
     }
 
+    /// Fire tool completion with the correlation context and the arguments
+    /// that were actually dispatched. Same parallel, per-handler panic
+    /// isolation as the other void hooks.
+    pub async fn fire_after_tool_call_with_context_and_args(
+        &self,
+        context: &ToolCallHookContext,
+        tool: &str,
+        args: &Value,
+        result: &ToolResult,
+        duration: Duration,
+    ) {
+        let futs = self.handlers.iter().map(|h| async move {
+            let hook_name = h.name();
+            if AssertUnwindSafe(
+                h.on_after_tool_call_with_context_and_args(context, tool, args, result, duration),
+            )
+            .catch_unwind()
+            .await
+            .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"hook": hook_name})),
+                    "after_tool_call hook panicked; continuing with remaining handlers"
+                );
+            }
+        });
+        join_all(futs).await;
+    }
+
     pub async fn fire_message_sent(&self, channel: &str, recipient: &str, content: &str) {
         let futs: Vec<_> = self
             .handlers
@@ -1031,6 +1063,65 @@ mod tests {
             .await;
 
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn args_carrying_completion_dispatches_with_final_arguments() {
+        struct ArgsRecorder {
+            name: String,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for ArgsRecorder {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            async fn on_after_tool_call_with_context_and_args(
+                &self,
+                context: &ToolCallHookContext,
+                tool: &str,
+                args: &Value,
+                _result: &ToolResult,
+                _duration: Duration,
+            ) {
+                self.events.lock().unwrap().push(format!(
+                    "{}:{}:{}:{}",
+                    self.name,
+                    tool,
+                    context.invocation_id(),
+                    args
+                ));
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(ArgsRecorder {
+            name: "audit".into(),
+            events: Arc::clone(&events),
+        }));
+
+        runner
+            .fire_after_tool_call_with_context_and_args(
+                &tool_call_hook_context("turn-a", 0, 2),
+                "shell",
+                &serde_json::json!({"command": "final"}),
+                &ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    error: None,
+                },
+                Duration::ZERO,
+            )
+            .await;
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["audit:shell:turn-a:0:2:{\"command\":\"final\"}".to_string()],
+            "the completion dispatch must carry the arguments that were dispatched"
+        );
     }
 
     #[tokio::test]

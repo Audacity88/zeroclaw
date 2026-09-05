@@ -61,10 +61,14 @@ pub(crate) async fn record_executed_outcomes(
                 output: outcome.output.clone().into(),
                 error: None,
             };
+            // The prepared arguments travel with the completion call so
+            // argument-auditing hooks export what was actually dispatched and
+            // never need to retain arguments between the hook phases.
             hooks
-                .fire_after_tool_call_with_context(
+                .fire_after_tool_call_with_context_and_args(
                     &hook_context,
                     &call.name,
+                    &call.arguments,
                     &tool_result_obj,
                     outcome.duration,
                 )
