@@ -546,6 +546,7 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::model_provider::{TokenUsage, ToolCall};
     use zeroclaw_api::tool::ToolSpec;
 
     struct MockModelProvider {
@@ -1474,6 +1475,186 @@ mod tests {
         fn alias(&self) -> &str {
             "NonStreamingChatMock"
         }
+    }
+
+    /// Non-streaming leaf whose chat response carries a tool call, usage,
+    /// and signed reasoning: the full payload a synthesized sequence must
+    /// preserve through nested wrappers.
+    struct NonStreamingToolCallMock {
+        chat_calls: Arc<AtomicUsize>,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    impl NonStreamingToolCallMock {
+        fn new() -> Self {
+            Self {
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for NonStreamingToolCallMock {
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: r#"{"city": "SF"}"#.to_string(),
+                    extra_content: None,
+                }],
+                usage: Some(TokenUsage {
+                    input_tokens: Some(13),
+                    output_tokens: Some(7),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: Some(r#"{"thinking":"t","signature":"sig"}"#.to_string()),
+            })
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::once(async {
+                Err(StreamError::ModelProvider(
+                    "non-streaming leaf must never be streamed".to_string(),
+                ))
+            })
+            .boxed()
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for NonStreamingToolCallMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NonStreamingToolCallMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_router_reliable_synthesizes_full_payload_without_streaming_leg() {
+        // Production shape: Router → Reliable → leaf, where the resolved
+        // reliability domain is all-non-streaming while an unrelated route
+        // streams. The router must serve the resolved domain non-streaming
+        // and synthesize the complete event sequence, tool calls and usage
+        // included, with every streaming leg idle.
+        let leaf = Arc::new(NonStreamingToolCallMock::new());
+        let streaming = Arc::new(ToolEventStreamingMockModelProvider::new());
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "leaf".into(),
+                Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "reliable".into(),
+                    Box::new(reliable) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "route".to_string(),
+                crate::router::Route {
+                    provider_name: "reliable".to_string(),
+                    model: "inner-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+
+        assert!(router.supports_streaming());
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let events: Vec<_> = router
+            .stream_chat(request, "hint:route", None, StreamOptions::new(true))
+            .collect()
+            .await;
+
+        assert_eq!(
+            events.len(),
+            5,
+            "synthesized: reasoning, text, tool call, usage, final"
+        );
+        assert!(events.iter().all(Result::is_ok));
+        assert!(
+            matches!(&events[0], Ok(StreamEvent::ReasoningFinalized(reasoning)) if reasoning.contains("sig")),
+            "durable signed reasoning must survive the nested synthesis"
+        );
+        assert!(matches!(&events[1], Ok(StreamEvent::TextDelta(chunk)) if chunk.delta == "ok"),);
+        assert!(
+            matches!(&events[2], Ok(StreamEvent::ToolCall(call))
+                if call.id == "call_1" && call.name == "get_weather" && call.arguments.contains("SF")),
+            "the tool call must reach consumers intact through the nesting"
+        );
+        assert!(
+            matches!(&events[3], Ok(StreamEvent::Usage(usage))
+                if usage.input_tokens == Some(13) && usage.output_tokens == Some(7)),
+            "usage must reach consumers intact through the nesting"
+        );
+        assert!(matches!(&events[4], Ok(StreamEvent::Final)));
+
+        assert_eq!(
+            leaf.chat_calls.load(Ordering::SeqCst),
+            1,
+            "the nested non-streaming leaf must serve the request"
+        );
+        assert_eq!(
+            leaf.stream_calls.load(Ordering::SeqCst),
+            0,
+            "the nested leaf must never be streamed"
+        );
+        assert_eq!(
+            streaming.stream_calls.load(Ordering::SeqCst),
+            0,
+            "the unrelated streaming route must stay idle"
+        );
     }
 
     #[tokio::test]
