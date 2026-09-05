@@ -15,11 +15,13 @@ mod direct_cli_terminal_completion;
 mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;
+mod hardware_probe_feature_graph;
 mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
 mod provider_resolution;
 mod provider_schema;
 mod reply_target_field_regression;
+mod schema_export_feature_graph;
 mod security;
 mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
