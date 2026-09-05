@@ -319,8 +319,8 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `anchore/sbom-action` (`v0.24.0`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
 | `aquasecurity/trivy-action` (`v0.36.0`) | `docker-image-pr.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | Report-only container vulnerability scanning |
 | `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml`, `trivy-scheduled.yml`, `ci-code-analysis.yml` | Upload Trivy and Semgrep SARIF reports to the Security tab |
-| `github/codeql-action/init` (`v3.36.2`) | `codeql.yml` | Initialize CodeQL analysis (Rust and JS/TS) |
-| `github/codeql-action/analyze` (`v3.36.2`) | `codeql.yml` | Upload CodeQL SARIF to the Security tab |
+| `github/codeql-action/init` (`v4.37.8`) | `codeql.yml` | Initialize CodeQL analysis (Rust and JS/TS) |
+| `github/codeql-action/analyze` (`v4.37.8`) | `codeql.yml` | Upload CodeQL SARIF to the Security tab |
 
 The GitHub Release itself is created with `gh release create` inside the `publish` job, not a release action.
 
