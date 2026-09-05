@@ -53,23 +53,17 @@ impl DataManagementTool {
         }
     }
 
-    fn open_workspace(&self) -> anyhow::Result<Dir> {
+    fn open_workspace(&self) -> anyhow::Result<(PathBuf, Dir)> {
         let canonical = std::fs::canonicalize(&self.data_root)?;
-        if !self.security.is_resolved_path_readable(&canonical) {
-            return Err(data_boundary_violation(tool_text_arg(
-                "tool-data-management-error-read-blocked",
-                "path",
-                &canonical.display().to_string(),
-            )));
-        }
-        Ok(open_absolute_dir_nofollow(&canonical)?)
+        ensure_readable(&self.security, &canonical)?;
+        Ok((canonical.clone(), open_absolute_dir_nofollow(&canonical)?))
     }
 
     fn cmd_retention_status(&self) -> anyhow::Result<ToolResult> {
         let cutoff = retention_cutoff(self.retention_days);
         let cutoff_ts = cutoff.timestamp().try_into().unwrap_or(0u64);
-        let workspace = self.open_workspace()?;
-        let (count, _) = retention_summary(&workspace, cutoff_ts)?;
+        let (workspace_path, workspace) = self.open_workspace()?;
+        let (count, _) = retention_summary(&workspace, &workspace_path, cutoff_ts, &self.security)?;
 
         Ok(ToolResult {
             success: true,
@@ -87,8 +81,9 @@ impl DataManagementTool {
     fn cmd_purge_preview(&self) -> anyhow::Result<ToolResult> {
         let cutoff = retention_cutoff(self.retention_days);
         let cutoff_ts: u64 = cutoff.timestamp().try_into().unwrap_or(0);
-        let workspace = self.open_workspace()?;
-        let (files, bytes) = retention_summary(&workspace, cutoff_ts)?;
+        let (workspace_path, workspace) = self.open_workspace()?;
+        let (files, bytes) =
+            retention_summary(&workspace, &workspace_path, cutoff_ts, &self.security)?;
 
         Ok(ToolResult {
             success: true,
@@ -105,8 +100,9 @@ impl DataManagementTool {
     }
 
     fn cmd_stats(&self) -> anyhow::Result<ToolResult> {
-        let workspace = self.open_workspace()?;
-        let (total_files, total_bytes, breakdown) = dir_stats(&workspace)?;
+        let (workspace_path, workspace) = self.open_workspace()?;
+        let (total_files, total_bytes, breakdown) =
+            dir_stats(&workspace, &workspace_path, &self.security)?;
         Ok(ToolResult {
             success: true,
             output: json!({
@@ -228,6 +224,17 @@ fn data_boundary_violation(message: impl Into<String>) -> anyhow::Error {
     DataBoundaryViolation(message.into()).into()
 }
 
+fn ensure_readable(security: &SecurityPolicy, path: &Path) -> anyhow::Result<()> {
+    if !security.is_resolved_path_readable(path) {
+        return Err(data_boundary_violation(tool_text_arg(
+            "tool-data-management-error-read-blocked",
+            "path",
+            &path.display().to_string(),
+        )));
+    }
+    Ok(())
+}
+
 fn confirmed_purge_unavailable() -> ToolResult {
     ToolResult {
         success: false,
@@ -278,20 +285,32 @@ fn retention_cutoff(retention_days: u64) -> chrono::DateTime<chrono::Utc> {
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
 }
 
-fn retention_summary(dir: &Dir, cutoff_epoch: u64) -> anyhow::Result<(usize, u64)> {
+fn retention_summary(
+    dir: &Dir,
+    absolute_path: &Path,
+    cutoff_epoch: u64,
+    security: &SecurityPolicy,
+) -> anyhow::Result<(usize, u64)> {
+    ensure_readable(security, absolute_path)?;
     let mut count = 0;
     let mut bytes = 0;
     for entry in dir.entries()? {
         let entry = entry?;
         let name = entry.file_name();
+        let child_path = absolute_path.join(&name);
         let metadata = dir.symlink_metadata(&name)?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             continue;
         }
+        ensure_readable(security, &child_path)?;
         if file_type.is_dir() {
-            let (child_count, child_bytes) =
-                retention_summary(&open_dir_nofollow(dir, Path::new(&name))?, cutoff_epoch)?;
+            let (child_count, child_bytes) = retention_summary(
+                &open_dir_nofollow(dir, Path::new(&name))?,
+                &child_path,
+                cutoff_epoch,
+                security,
+            )?;
             count += child_count;
             bytes += child_bytes;
         } else if file_type.is_file() {
@@ -311,7 +330,12 @@ fn retention_summary(dir: &Dir, cutoff_epoch: u64) -> anyhow::Result<(usize, u64
     Ok((count, bytes))
 }
 
-fn dir_stats(root: &Dir) -> anyhow::Result<(usize, u64, serde_json::Value)> {
+fn dir_stats(
+    root: &Dir,
+    absolute_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<(usize, u64, serde_json::Value)> {
+    ensure_readable(security, absolute_path)?;
     let mut total_files = 0usize;
     let mut total_bytes = 0u64;
     let mut breakdown = serde_json::Map::new();
@@ -319,14 +343,20 @@ fn dir_stats(root: &Dir) -> anyhow::Result<(usize, u64, serde_json::Value)> {
     for entry in root.entries()? {
         let entry = entry?;
         let name = entry.file_name();
+        let child_path = absolute_path.join(&name);
         let metadata = root.symlink_metadata(&name)?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             continue;
         }
+        ensure_readable(security, &child_path)?;
         if file_type.is_dir() {
             let display_name = name.to_string_lossy().to_string();
-            let (f, b) = count_dir_contents(&open_dir_nofollow(root, Path::new(&name))?)?;
+            let (f, b) = count_dir_contents(
+                &open_dir_nofollow(root, Path::new(&name))?,
+                &child_path,
+                security,
+            )?;
             total_files += f;
             total_bytes += b;
             breakdown.insert(
@@ -345,19 +375,30 @@ fn dir_stats(root: &Dir) -> anyhow::Result<(usize, u64, serde_json::Value)> {
     ))
 }
 
-fn count_dir_contents(dir: &Dir) -> anyhow::Result<(usize, u64)> {
+fn count_dir_contents(
+    dir: &Dir,
+    absolute_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<(usize, u64)> {
+    ensure_readable(security, absolute_path)?;
     let mut files = 0usize;
     let mut bytes = 0u64;
     for entry in dir.entries()? {
         let entry = entry?;
         let name = entry.file_name();
+        let child_path = absolute_path.join(&name);
         let metadata = dir.symlink_metadata(&name)?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
             continue;
         }
+        ensure_readable(security, &child_path)?;
         if file_type.is_dir() {
-            let (f, b) = count_dir_contents(&open_dir_nofollow(dir, Path::new(&name))?)?;
+            let (f, b) = count_dir_contents(
+                &open_dir_nofollow(dir, Path::new(&name))?,
+                &child_path,
+                security,
+            )?;
             files += f;
             bytes += b;
         } else if file_type.is_file() {
@@ -537,5 +578,26 @@ mod tests {
         assert!(res.success);
         let v: serde_json::Value = serde_json::from_str(&res.output).unwrap();
         assert_eq!(v["total_files"], 3);
+    }
+
+    #[tokio::test]
+    async fn reporting_fails_closed_when_nested_read_is_denied() {
+        let tmp = TempDir::new().unwrap();
+        let denied = tmp.path().join("config/private");
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::write(denied.join("secret.txt"), "secret").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            forbidden_paths: vec![denied.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        });
+        let tool = DataManagementTool::new_with_security(90, security);
+
+        for command in ["stats", "retention_status", "purge"] {
+            let result = tool.execute(json!({"command": command})).await.unwrap();
+            assert!(!result.success, "command {command} reported denied data");
+            assert!(result.error.is_some());
+            assert!(result.output.is_empty());
+        }
     }
 }

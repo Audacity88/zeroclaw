@@ -66,13 +66,6 @@ impl BackupTool {
     }
 
     fn cmd_create(&self) -> anyhow::Result<ToolResult> {
-        if self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "backup create")
-            .is_err()
-        {
-            return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
-        }
         if self.max_keep == 0 {
             return Ok(rejected(tool_text("tool-backup-error-max-keep")));
         }
@@ -88,25 +81,36 @@ impl BackupTool {
         let mut sources = Vec::new();
         for sub in &self.include_dirs {
             let relative = contained_relative_path(sub)?.to_path_buf();
-            if relative.starts_with("backups") || Path::new("backups").starts_with(&relative) {
+            if overlaps_backups_output(&relative) {
                 return Ok(rejected(tool_text_arg(
                     "tool-backup-error-source-overlap",
                     "path",
                     &relative.display().to_string(),
                 )));
             }
-            if let Some(src) = open_dir_no_symlinks(&workspace, &relative)? {
-                validate_tree_no_symlinks(&src, &relative)?;
+            let source_path = workspace_path.join(&relative);
+            if let Some(src) = open_dir_no_symlinks_checked(
+                &workspace,
+                &relative,
+                &workspace_path,
+                &self.security,
+            )? {
+                validate_tree_no_symlinks(&src, &relative, &source_path, &self.security)?;
                 sources.push((relative, src));
             }
         }
 
         #[cfg(windows)]
         {
-            let existing = open_dir_no_symlinks(&workspace, Path::new("backups"))?
-                .map(|backups| list_backup_names(&backups))
-                .transpose()?
-                .map_or(0, |names| names.len());
+            let existing = open_dir_no_symlinks_checked(
+                &workspace,
+                Path::new("backups"),
+                &workspace_path,
+                &self.security,
+            )?
+            .map(|backups| list_backup_names(&backups, &backups_path, &self.security))
+            .transpose()?
+            .map_or(0, |names| names.len());
             if existing >= self.max_keep {
                 return Err(boundary_violation(tool_text(
                     "tool-backup-error-rotation-platform",
@@ -114,18 +118,42 @@ impl BackupTool {
             }
         }
 
+        let backup_path = backups_path.join(&name);
+        self.authorize_write(&backup_path)?;
+        self.authorize_write(&backup_path.join("manifest.json"))?;
+        for (relative, src) in &sources {
+            self.authorize_write_prefixes(&backup_path, relative)?;
+            validate_copy_destination(
+                src,
+                None,
+                relative,
+                &workspace_path.join(relative),
+                &backup_path.join(relative),
+                &self.security,
+            )?;
+        }
+
         let backups = create_dir_path_nofollow(&workspace, Path::new("backups"))?;
         backups.create_dir(&name)?;
         let backup = open_dir_nofollow(&backups, Path::new(&name))?;
 
         for (relative, src) in sources {
+            let destination_path = backup_path.join(&relative);
+            self.authorize_write_prefixes(&backup_path, &relative)?;
             let dst = create_dir_path_nofollow(&backup, &relative)?;
-            copy_dir_recursive(&src, &dst)?;
+            copy_dir_recursive(
+                &src,
+                &workspace_path.join(&relative),
+                &dst,
+                &destination_path,
+                &self.security,
+            )?;
         }
 
-        let checksums = compute_checksums(&backup)?;
+        let checksums = compute_checksums(&backup, &backup_path, &self.security)?;
         let file_count = checksums.len();
         let manifest = serde_json::to_string_pretty(&checksums)?;
+        self.authorize_write(&backup_path.join("manifest.json"))?;
         write_file_atomic(&backup, Path::new("manifest.json"), manifest.as_bytes())?;
 
         // Enforce max_keep: remove oldest backups beyond the limit.
@@ -144,11 +172,16 @@ impl BackupTool {
     }
 
     fn enforce_max_keep(&self, backups_dir: &Dir, backups_path: &Path) -> anyhow::Result<()> {
-        let mut backups = list_backup_names(backups_dir)?;
+        let mut backups = list_backup_names(backups_dir, backups_path, &self.security)?;
         // Sorted newest-first; drop excess from the tail.
         while backups.len() > self.max_keep {
             if let Some(old) = backups.pop() {
-                self.authorize_write(&backups_path.join(&old))?;
+                authorize_deletion_tree(
+                    backups_dir,
+                    Path::new(&old),
+                    &backups_path.join(&old),
+                    &self.security,
+                )?;
                 #[cfg(not(windows))]
                 backups_dir.remove_dir_all(old)?;
                 #[cfg(windows)]
@@ -186,22 +219,51 @@ impl BackupTool {
         Ok(())
     }
 
+    fn authorize_read(&self, path: &Path) -> anyhow::Result<()> {
+        ensure_readable(&self.security, path)
+    }
+
+    fn authorize_write_prefixes(&self, root: &Path, relative: &Path) -> anyhow::Result<()> {
+        let mut path = root.to_path_buf();
+        for component in relative.components() {
+            path.push(component);
+            self.authorize_write(&path)?;
+        }
+        Ok(())
+    }
+
     fn cmd_list(&self) -> anyhow::Result<ToolResult> {
-        let (_, workspace) = self.open_workspace()?;
-        let Some(backups) = open_dir_no_symlinks(&workspace, Path::new("backups"))? else {
+        let (workspace_path, workspace) = self.open_workspace()?;
+        let backups_path = workspace_path.join("backups");
+        let Some(backups) = open_dir_no_symlinks_checked(
+            &workspace,
+            Path::new("backups"),
+            &workspace_path,
+            &self.security,
+        )?
+        else {
             return Ok(ToolResult {
                 success: true,
                 output: "[]".into(),
                 error: None,
             });
         };
-        let dirs = list_backup_names(&backups)?;
+        let dirs = list_backup_names(&backups, &backups_path, &self.security)?;
         let mut items = Vec::new();
         for name in dirs {
-            let backup = open_named_backup(&backups, &name)?;
+            let backup_path = backups_path.join(&name);
+            let backup = open_named_backup(&backups, &name, &backup_path, &self.security)?;
+            self.authorize_read(&backup_path)?;
             let file_count = match backup.symlink_metadata("manifest.json") {
                 Ok(meta) if meta.is_file() && !meta.is_symlink() => {
-                    let data = read_file_to_string_nofollow(&backup, Path::new("manifest.json"))?;
+                    let manifest_path = backup_path.join("manifest.json");
+                    self.authorize_read(&manifest_path)?;
+                    let data = read_file_to_string_nofollow(
+                        &backup,
+                        Path::new("manifest.json"),
+                        &manifest_path,
+                        &self.security,
+                    )?;
                     let map: HashMap<String, String> =
                         serde_json::from_str(&data).unwrap_or_default();
                     map.len()
@@ -233,15 +295,23 @@ impl BackupTool {
         if let Err(error) = validate_backup_name(backup_name) {
             return Ok(rejected(error.to_string()));
         }
-        let (_, workspace) = self.open_workspace()?;
-        let Some(backups) = open_dir_no_symlinks(&workspace, Path::new("backups"))? else {
+        let (workspace_path, workspace) = self.open_workspace()?;
+        let backups_path = workspace_path.join("backups");
+        let Some(backups) = open_dir_no_symlinks_checked(
+            &workspace,
+            Path::new("backups"),
+            &workspace_path,
+            &self.security,
+        )?
+        else {
             return Ok(rejected(tool_text_arg(
                 "tool-backup-error-not-found",
                 "name",
                 backup_name,
             )));
         };
-        let backup = match open_named_backup(&backups, backup_name) {
+        let backup_path = backups_path.join(backup_name);
+        let backup = match open_named_backup(&backups, backup_name, &backup_path, &self.security) {
             Ok(dir) => dir,
             Err(error) if is_not_found(&error) => {
                 return Ok(rejected(tool_text_arg(
@@ -252,10 +322,17 @@ impl BackupTool {
             }
             Err(error) => return Err(error),
         };
+        let manifest_path = backup_path.join("manifest.json");
         reject_symlink(&backup, Path::new("manifest.json"))?;
-        let data = read_file_to_string_nofollow(&backup, Path::new("manifest.json"))?;
+        self.authorize_read(&manifest_path)?;
+        let data = read_file_to_string_nofollow(
+            &backup,
+            Path::new("manifest.json"),
+            &manifest_path,
+            &self.security,
+        )?;
         let expected: HashMap<String, String> = serde_json::from_str(&data)?;
-        let actual = compute_checksums(&backup)?;
+        let actual = compute_checksums(&backup, &backup_path, &self.security)?;
 
         let mut mismatches = Vec::new();
         for (path, expected_hash) in &expected {
@@ -301,23 +378,23 @@ impl BackupTool {
         if let Err(error) = validate_backup_name(backup_name) {
             return Ok(rejected(error.to_string()));
         }
-        if confirm
-            && self
-                .security
-                .enforce_tool_operation(ToolOperation::Act, "backup restore")
-                .is_err()
-        {
-            return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
-        }
         let (workspace_path, workspace) = self.open_workspace()?;
-        let Some(backups) = open_dir_no_symlinks(&workspace, Path::new("backups"))? else {
+        let backups_path = workspace_path.join("backups");
+        let Some(backups) = open_dir_no_symlinks_checked(
+            &workspace,
+            Path::new("backups"),
+            &workspace_path,
+            &self.security,
+        )?
+        else {
             return Ok(rejected(tool_text_arg(
                 "tool-backup-error-not-found",
                 "name",
                 backup_name,
             )));
         };
-        let backup = match open_named_backup(&backups, backup_name) {
+        let backup_path = backups_path.join(backup_name);
+        let backup = match open_named_backup(&backups, backup_name, &backup_path, &self.security) {
             Ok(dir) => dir,
             Err(error) if is_not_found(&error) => {
                 return Ok(rejected(tool_text_arg(
@@ -329,6 +406,7 @@ impl BackupTool {
             Err(error) => return Err(error),
         };
 
+        self.authorize_read(&backup_path)?;
         // Collect restorable subdirectories (skip manifest.json).
         let mut restore_items: Vec<String> = Vec::new();
         for entry in backup.entries()? {
@@ -339,6 +417,15 @@ impl BackupTool {
                 .map_err(|_| boundary_violation(tool_text("tool-backup-error-non-utf8")))?;
             if name == "manifest.json" {
                 continue;
+            }
+            let source_path = backup_path.join(&name);
+            self.authorize_read(&source_path)?;
+            if overlaps_backups_output(Path::new(&name)) {
+                return Ok(rejected(tool_text_arg(
+                    "tool-backup-error-source-overlap",
+                    "path",
+                    &name,
+                )));
             }
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
@@ -352,10 +439,13 @@ impl BackupTool {
                 validate_tree_no_symlinks(
                     &open_dir_nofollow(&backup, Path::new(&name))?,
                     Path::new(&name),
+                    &source_path,
+                    &self.security,
                 )?;
                 restore_items.push(name);
             }
         }
+        restore_items.sort();
 
         if !confirm {
             return Ok(ToolResult {
@@ -375,18 +465,39 @@ impl BackupTool {
         // directory so a stable destination symlink cannot cause a partial
         // restore before rejection.
         for sub in &restore_items {
-            self.authorize_write(&workspace_path.join(sub))?;
-            let src = open_dir_no_symlinks(&backup, Path::new(sub))?
-                .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
-            let destination = open_dir_no_symlinks(&workspace, Path::new(sub))?;
-            validate_copy_destination(&src, destination.as_ref(), Path::new(sub))?;
+            let destination_path = workspace_path.join(sub);
+            self.authorize_write(&destination_path)?;
+            let src = open_dir_no_symlinks_checked(
+                &backup,
+                Path::new(sub),
+                &backup_path,
+                &self.security,
+            )?
+            .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
+            let destination = open_restore_destination(&workspace, sub, &destination_path)?;
+            validate_copy_destination(
+                &src,
+                destination.as_ref(),
+                Path::new(sub),
+                &backup_path.join(sub),
+                &destination_path,
+                &self.security,
+            )?;
         }
 
         for sub in &restore_items {
-            let src = open_dir_no_symlinks(&backup, Path::new(sub))?
-                .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
+            let src = open_dir_no_symlinks_checked(
+                &backup,
+                Path::new(sub),
+                &backup_path,
+                &self.security,
+            )?
+            .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
+            let source_path = backup_path.join(sub);
+            let destination_path = workspace_path.join(sub);
+            self.authorize_write(&destination_path)?;
             let dst = create_dir_path_nofollow(&workspace, Path::new(sub))?;
-            copy_dir_recursive(&src, &dst)?;
+            copy_dir_recursive(&src, &source_path, &dst, &destination_path, &self.security)?;
         }
         Ok(ToolResult {
             success: true,
@@ -447,6 +558,13 @@ impl Tool for BackupTool {
 
         let result = match command {
             "create" => {
+                if self
+                    .security
+                    .enforce_tool_operation(ToolOperation::Act, "backup create")
+                    .is_err()
+                {
+                    return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
+                }
                 let tool = self.clone();
                 tokio::task::spawn_blocking(move || tool.cmd_create()).await?
             }
@@ -503,6 +621,17 @@ impl Tool for BackupTool {
                     .get("confirm")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if let Err(error) = validate_backup_name(&name) {
+                    return Ok(rejected(error.to_string()));
+                }
+                if confirm
+                    && self
+                        .security
+                        .enforce_tool_operation(ToolOperation::Act, "backup restore")
+                        .is_err()
+                {
+                    return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
+                }
                 let tool = self.clone();
                 tokio::task::spawn_blocking(move || tool.cmd_restore(&name, confirm)).await?
             }
@@ -576,8 +705,15 @@ fn rejected(error: String) -> ToolResult {
     }
 }
 
-fn read_file_to_string_nofollow(dir: &Dir, path: &Path) -> anyhow::Result<String> {
+fn read_file_to_string_nofollow(
+    dir: &Dir,
+    path: &Path,
+    absolute_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<String> {
+    ensure_readable(security, absolute_path)?;
     let mut file = open_file_nofollow(dir, path)?;
+    ensure_readable(security, absolute_path)?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     Ok(content)
@@ -611,6 +747,26 @@ fn validate_backup_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn overlaps_backups_output(path: &Path) -> bool {
+    let Some(std::path::Component::Normal(first)) = path.components().next() else {
+        return false;
+    };
+    // Keep the reserved output name conservative on case-sensitive volumes too;
+    // another platform may alias `Backups` and `backups`.
+    first.to_string_lossy().eq_ignore_ascii_case("backups")
+}
+
+fn ensure_readable(security: &SecurityPolicy, path: &Path) -> anyhow::Result<()> {
+    if !security.is_resolved_path_readable(path) {
+        return Err(boundary_violation(tool_text_arg(
+            "tool-backup-error-read-blocked",
+            "path",
+            &path.display().to_string(),
+        )));
+    }
+    Ok(())
+}
+
 fn reject_symlink(dir: &Dir, path: &Path) -> anyhow::Result<()> {
     match dir.symlink_metadata(path) {
         Ok(metadata) if metadata.is_symlink() => {
@@ -627,8 +783,14 @@ fn reject_symlink(dir: &Dir, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn open_dir_no_symlinks(root: &Dir, relative: &Path) -> anyhow::Result<Option<Dir>> {
+fn open_dir_no_symlinks_checked(
+    root: &Dir,
+    relative: &Path,
+    absolute_root: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<Option<Dir>> {
     let mut current = root.try_clone()?;
+    let mut current_path = absolute_root.to_path_buf();
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
             return Err(boundary_violation(tool_text_arg(
@@ -637,6 +799,7 @@ fn open_dir_no_symlinks(root: &Dir, relative: &Path) -> anyhow::Result<Option<Di
                 &relative.display().to_string(),
             )));
         };
+        let path = current_path.join(name);
         let metadata = match current.symlink_metadata(name) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -652,14 +815,22 @@ fn open_dir_no_symlinks(root: &Dir, relative: &Path) -> anyhow::Result<Option<Di
         if !metadata.is_dir() {
             return Ok(None);
         }
+        ensure_readable(security, &path)?;
         current = open_dir_nofollow(&current, Path::new(name))?;
+        current_path = path;
     }
     Ok(Some(current))
 }
 
-fn open_named_backup(backups: &Dir, name: &str) -> anyhow::Result<Dir> {
+fn open_named_backup(
+    backups: &Dir,
+    name: &str,
+    absolute_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<Dir> {
     validate_backup_name(name)?;
     reject_symlink(backups, Path::new(name))?;
+    ensure_readable(security, absolute_path)?;
     let metadata = backups.symlink_metadata(name)?;
     if !metadata.is_dir() {
         return Err(boundary_violation(tool_text_arg(
@@ -671,7 +842,36 @@ fn open_named_backup(backups: &Dir, name: &str) -> anyhow::Result<Dir> {
     Ok(open_dir_nofollow(backups, Path::new(name))?)
 }
 
-fn list_backup_names(backups: &Dir) -> anyhow::Result<Vec<String>> {
+fn open_restore_destination(
+    workspace: &Dir,
+    name: &str,
+    absolute_path: &Path,
+) -> anyhow::Result<Option<Dir>> {
+    match workspace.symlink_metadata(name) {
+        Ok(metadata) if metadata.is_symlink() => Err(boundary_violation(tool_text_arg(
+            "tool-backup-error-symlink",
+            "path",
+            &absolute_path.display().to_string(),
+        ))),
+        Ok(metadata) if metadata.is_dir() => {
+            Ok(Some(open_dir_nofollow(workspace, Path::new(name))?))
+        }
+        Ok(_) => Err(boundary_violation(tool_text_arg(
+            "tool-backup-error-not-directory",
+            "path",
+            &absolute_path.display().to_string(),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn list_backup_names(
+    backups: &Dir,
+    absolute_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<Vec<String>> {
+    ensure_readable(security, absolute_path)?;
     let mut names = Vec::new();
     for entry in backups.entries()? {
         let entry = entry?;
@@ -680,6 +880,7 @@ fn list_backup_names(backups: &Dir) -> anyhow::Result<Vec<String>> {
         };
         let file_type = entry.file_type()?;
         if !file_type.is_symlink() && file_type.is_dir() && validate_backup_name(&name).is_ok() {
+            ensure_readable(security, &absolute_path.join(&name))?;
             names.push(name);
         }
     }
@@ -688,10 +889,75 @@ fn list_backup_names(backups: &Dir) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-fn copy_dir_recursive(src: &Dir, dst: &Dir) -> anyhow::Result<()> {
+fn authorize_deletion_tree(
+    dir: &Dir,
+    relative: &Path,
+    absolute_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<()> {
+    ensure_readable(security, absolute_path)?;
+    if !security.is_resolved_path_allowed(absolute_path)
+        || security.is_runtime_config_path(absolute_path)
+    {
+        return Err(boundary_violation(tool_text_arg(
+            "tool-backup-error-write-blocked",
+            "path",
+            &absolute_path.display().to_string(),
+        )));
+    }
+    let backup = open_dir_nofollow(dir, relative)?;
+    for entry in backup.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let child_path = absolute_path.join(&name);
+        ensure_readable(security, &child_path)?;
+        if !security.is_resolved_path_allowed(&child_path)
+            || security.is_runtime_config_path(&child_path)
+        {
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-write-blocked",
+                "path",
+                &child_path.display().to_string(),
+            )));
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-symlink",
+                "path",
+                &child_path.display().to_string(),
+            )));
+        }
+        if file_type.is_dir() {
+            authorize_deletion_tree(&backup, Path::new(&name), &child_path, security)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(
+    src: &Dir,
+    src_path: &Path,
+    dst: &Dir,
+    dst_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<()> {
+    ensure_readable(security, src_path)?;
     for entry in src.entries()? {
         let entry = entry?;
         let name = entry.file_name();
+        let source_child_path = src_path.join(&name);
+        let destination_child_path = dst_path.join(&name);
+        ensure_readable(security, &source_child_path)?;
+        if !security.is_resolved_path_allowed(&destination_child_path)
+            || security.is_runtime_config_path(&destination_child_path)
+        {
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-write-blocked",
+                "path",
+                &destination_child_path.display().to_string(),
+            )));
+        }
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             return Err(boundary_violation(tool_text_arg(
@@ -724,10 +990,18 @@ fn copy_dir_recursive(src: &Dir, dst: &Dir) -> anyhow::Result<()> {
             }
             let src_child = open_dir_nofollow(src, Path::new(&name))?;
             let dst_child = open_dir_nofollow(dst, Path::new(&name))?;
-            copy_dir_recursive(&src_child, &dst_child)?;
+            copy_dir_recursive(
+                &src_child,
+                &source_child_path,
+                &dst_child,
+                &destination_child_path,
+                security,
+            )?;
         } else if file_type.is_file() {
             reject_symlink(dst, Path::new(&name))?;
+            ensure_readable(security, &source_child_path)?;
             let mut input = open_file_nofollow(src, Path::new(&name))?;
+            ensure_readable(security, &source_child_path)?;
             let permissions = input.metadata()?.permissions();
             copy_file_atomic(dst, Path::new(&name), &mut input, Some(permissions))?;
         } else {
@@ -741,11 +1015,18 @@ fn copy_dir_recursive(src: &Dir, dst: &Dir) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_tree_no_symlinks(dir: &Dir, relative: &Path) -> anyhow::Result<()> {
+fn validate_tree_no_symlinks(
+    dir: &Dir,
+    relative: &Path,
+    absolute_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<()> {
+    ensure_readable(security, absolute_path)?;
     for entry in dir.entries()? {
         let entry = entry?;
         let name = entry.file_name();
         let path = relative.join(&name);
+        let child_path = absolute_path.join(&name);
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             return Err(boundary_violation(tool_text_arg(
@@ -754,8 +1035,14 @@ fn validate_tree_no_symlinks(dir: &Dir, relative: &Path) -> anyhow::Result<()> {
                 &path.display().to_string(),
             )));
         }
+        ensure_readable(security, &child_path)?;
         if file_type.is_dir() {
-            validate_tree_no_symlinks(&open_dir_nofollow(dir, Path::new(&name))?, &path)?;
+            validate_tree_no_symlinks(
+                &open_dir_nofollow(dir, Path::new(&name))?,
+                &path,
+                &child_path,
+                security,
+            )?;
         } else if !file_type.is_file() {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-special-file",
@@ -767,11 +1054,31 @@ fn validate_tree_no_symlinks(dir: &Dir, relative: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_copy_destination(src: &Dir, dst: Option<&Dir>, relative: &Path) -> anyhow::Result<()> {
+fn validate_copy_destination(
+    src: &Dir,
+    dst: Option<&Dir>,
+    relative: &Path,
+    src_path: &Path,
+    dst_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<()> {
+    ensure_readable(security, src_path)?;
     for entry in src.entries()? {
         let entry = entry?;
         let name = entry.file_name();
         let path = relative.join(&name);
+        let source_child_path = src_path.join(&name);
+        let destination_child_path = dst_path.join(&name);
+        ensure_readable(security, &source_child_path)?;
+        if !security.is_resolved_path_allowed(&destination_child_path)
+            || security.is_runtime_config_path(&destination_child_path)
+        {
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-write-blocked",
+                "path",
+                &destination_child_path.display().to_string(),
+            )));
+        }
         let file_type = entry.file_type()?;
         let destination_metadata = match dst {
             Some(dir) => match dir.symlink_metadata(&name) {
@@ -809,6 +1116,9 @@ fn validate_copy_destination(src: &Dir, dst: Option<&Dir>, relative: &Path) -> a
                 &open_dir_nofollow(src, Path::new(&name))?,
                 destination_child.as_ref(),
                 &path,
+                &source_child_path,
+                &destination_child_path,
+                security,
             )?;
         } else if file_type.is_file()
             && destination_metadata
@@ -825,21 +1135,29 @@ fn validate_copy_destination(src: &Dir, dst: Option<&Dir>, relative: &Path) -> a
     Ok(())
 }
 
-fn compute_checksums(dir: &Dir) -> anyhow::Result<HashMap<String, String>> {
+fn compute_checksums(
+    dir: &Dir,
+    absolute_path: &Path,
+    security: &SecurityPolicy,
+) -> anyhow::Result<HashMap<String, String>> {
     let mut map = HashMap::new();
-    walk_and_hash(dir, Path::new(""), &mut map)?;
+    walk_and_hash(dir, Path::new(""), absolute_path, &mut map, security)?;
     Ok(map)
 }
 
 fn walk_and_hash(
     dir: &Dir,
     relative: &Path,
+    absolute_path: &Path,
     map: &mut HashMap<String, String>,
+    security: &SecurityPolicy,
 ) -> anyhow::Result<()> {
+    ensure_readable(security, absolute_path)?;
     for entry in dir.entries()? {
         let entry = entry?;
         let name = entry.file_name();
         let path = relative.join(&name);
+        let child_path = absolute_path.join(&name);
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             return Err(boundary_violation(tool_text_arg(
@@ -848,15 +1166,17 @@ fn walk_and_hash(
                 &path.display().to_string(),
             )));
         }
+        ensure_readable(security, &child_path)?;
         if file_type.is_dir() {
             let child = open_dir_nofollow(dir, Path::new(&name))?;
-            walk_and_hash(&child, &path, map)?;
+            walk_and_hash(&child, &path, &child_path, map, security)?;
         } else if file_type.is_file() {
             let rel = path.to_string_lossy().replace('\\', "/");
             if rel == "manifest.json" {
                 continue;
             }
             let mut input = open_file_nofollow(dir, Path::new(&name))?;
+            ensure_readable(security, &child_path)?;
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; 64 * 1024];
             loop {
@@ -969,6 +1289,30 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_case_aliases_of_backup_output_before_mutation() {
+        for include in ["Backups", "BACKUPS", "Backups/sub"] {
+            let tmp = TempDir::new().unwrap();
+            let tool = BackupTool::new(tmp.path().to_path_buf(), vec![include.to_string()], 10);
+
+            let result = tool.execute(json!({"command": "create"})).await.unwrap();
+
+            assert!(
+                !result.success,
+                "include path unexpectedly accepted: {include}"
+            );
+            assert_eq!(
+                result.error,
+                Some(tool_text_arg(
+                    "tool-backup-error-source-overlap",
+                    "path",
+                    include
+                ))
+            );
+            assert!(!tmp.path().join("backups").exists());
+        }
     }
 
     #[tokio::test]
@@ -1176,28 +1520,97 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let agent_workspace = tmp.path().join("agent-workspace");
         std::fs::create_dir_all(&agent_workspace).unwrap();
+        let sender_a_root = tmp.path().join("sender-a");
+        let sender_b_root = tmp.path().join("sender-b");
+        let global_root = tmp.path().join("global");
+        std::fs::create_dir_all(&sender_a_root).unwrap();
+        std::fs::create_dir_all(&sender_b_root).unwrap();
+        std::fs::create_dir_all(&global_root).unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: agent_workspace,
             max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
-        let tool = BackupTool::new_with_data_root_and_security(
-            tmp.path().to_path_buf(),
+        let sender_a_tool = BackupTool::new_with_data_root_and_security(
+            sender_a_root,
             vec!["config".into()],
             10,
-            security.clone(),
+            Arc::clone(&security),
         );
-        security
-            .enforce_tool_operation(ToolOperation::Act, "test setup")
+        let sender_b_tool = BackupTool::new_with_data_root_and_security(
+            sender_b_root,
+            vec!["config".into()],
+            10,
+            Arc::clone(&security),
+        );
+        let global_tool = BackupTool::new_with_data_root_and_security(
+            global_root,
+            vec!["config".into()],
+            10,
+            Arc::clone(&security),
+        );
+        zeroclaw_api::TOOL_LOOP_THREAD_ID
+            .scope(Some("sender-a".to_string()), async {
+                security.enforce_tool_operation(ToolOperation::Act, "test setup")
+            })
+            .await
             .unwrap();
 
-        let result = tool.execute(json!({"command": "create"})).await.unwrap();
+        let result = zeroclaw_api::TOOL_LOOP_THREAD_ID
+            .scope(
+                Some("sender-a".to_string()),
+                sender_a_tool.execute(json!({"command": "create"})),
+            )
+            .await
+            .unwrap();
 
         assert!(!result.success);
         let action_blocked = tool_text("tool-backup-error-action-blocked");
         assert_eq!(result.error.as_deref(), Some(action_blocked.as_str()));
-        assert!(!tmp.path().join("backups").exists());
+
+        let independent = zeroclaw_api::TOOL_LOOP_THREAD_ID
+            .scope(
+                Some("sender-b".to_string()),
+                sender_b_tool.execute(json!({"command": "create"})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            independent.success,
+            "independent sender failed: {independent:?}"
+        );
+
+        let global = zeroclaw_api::TOOL_LOOP_THREAD_ID
+            .scope(None, global_tool.execute(json!({"command": "create"})))
+            .await
+            .unwrap();
+        assert!(global.success, "global bucket failed: {global:?}");
+
+        let name: serde_json::Value = serde_json::from_str(&independent.output).unwrap();
+        let name = name["backup"].as_str().unwrap();
+        for command in ["create", "restore"] {
+            let denied = zeroclaw_api::TOOL_LOOP_THREAD_ID
+                .scope(
+                    Some("sender-b".into()),
+                    sender_b_tool
+                        .execute(json!({"command": command, "backup_name": name, "confirm": true})),
+                )
+                .await
+                .unwrap();
+            assert!(!denied.success);
+            assert_eq!(denied.error.as_deref(), Some(action_blocked.as_str()));
+        }
+        for command in ["list", "verify", "restore"] {
+            let read = zeroclaw_api::TOOL_LOOP_THREAD_ID
+                .scope(
+                    Some("sender-b".into()),
+                    sender_b_tool.execute(json!({"command": command, "backup_name": name})),
+                )
+                .await
+                .unwrap();
+            assert!(read.success, "read-only {command} was blocked: {read:?}");
+        }
     }
 
     #[cfg(unix)]
@@ -1288,6 +1701,233 @@ mod tests {
             "current"
         );
         assert!(!outside.path().join("value.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_present_file_destination_before_other_root_writes() {
+        let workspace = TempDir::new().unwrap();
+        for directory in ["config", "memory"] {
+            std::fs::create_dir_all(workspace.path().join(directory)).unwrap();
+            std::fs::write(workspace.path().join(directory).join("value.txt"), "backup").unwrap();
+        }
+        let tool = make_tool(&workspace);
+        let created = tool.execute(json!({"command": "create"})).await.unwrap();
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        let backup_name = created["backup"].as_str().unwrap();
+
+        std::fs::remove_dir_all(workspace.path().join("memory")).unwrap();
+        std::fs::write(workspace.path().join("memory"), "current").unwrap();
+        std::fs::write(workspace.path().join("config/value.txt"), "current").unwrap();
+
+        let result = tool
+            .execute(json!({
+                "command": "restore",
+                "backup_name": backup_name,
+                "confirm": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("memory")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("config/value.txt")).unwrap(),
+            "current"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_create_rejects_denied_descendant_before_output_creation() {
+        let root = TempDir::new().unwrap();
+        let data = root.path().join("data");
+        let denied = data.join("config/private");
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::write(denied.join("value.txt"), "private fixture").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: root.path().join("agent-workspace"),
+            forbidden_paths: vec![denied.display().to_string()],
+            ..SecurityPolicy::default()
+        });
+        let tool = BackupTool::new_with_data_root_and_security(
+            data.clone(),
+            vec!["config".into()],
+            10,
+            security,
+        );
+
+        let result = tool.execute(json!({"command": "create"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert!(!data.join("backups").exists());
+        assert_eq!(
+            std::fs::read_to_string(denied.join("value.txt")).unwrap(),
+            "private fixture"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_preflights_denied_output_parent_despite_allowed_leaf() {
+        // The public command chooses a second-resolution archive name. Retry only
+        // if the clock crosses that boundary while the fixture is being used.
+        for _ in 0..3 {
+            let root = TempDir::new().unwrap();
+            let data = root.path().canonicalize().unwrap();
+            std::fs::create_dir_all(data.join("config/public")).unwrap();
+            std::fs::write(data.join("config/public/value.txt"), "fixture").unwrap();
+            let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let output_parent = data.join(format!("backups/backup-{timestamp}/config"));
+            let allowed_leaf = output_parent.join("public");
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: data.clone(),
+                forbidden_paths: vec![output_parent.display().to_string()],
+                allowed_roots: vec![allowed_leaf.clone()],
+                ..SecurityPolicy::default()
+            });
+            assert!(!security.is_resolved_path_allowed(&output_parent));
+            assert!(security.is_resolved_path_allowed(&allowed_leaf));
+            let tool = BackupTool::new_with_security(vec!["config/public".into()], 10, security);
+            let result = tool.execute(json!({"command": "create"})).await.unwrap();
+            if chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string() != timestamp {
+                continue;
+            }
+            assert!(!result.success);
+            assert_eq!(
+                result.error,
+                Some(tool_text_arg(
+                    "tool-backup-error-write-blocked",
+                    "path",
+                    &output_parent.display().to_string()
+                ))
+            );
+            assert!(!data.join("backups").exists());
+            return;
+        }
+        panic!("could not observe backup creation within one timestamp interval");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rotation_preserves_non_utf8_descendant_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = TempDir::new().unwrap();
+        let old = root.path().join("backups/backup-00000000T000000Z");
+        let child = old.join(std::ffi::OsString::from_vec(b"private-\xff".to_vec()));
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("value.txt"), "fixture").unwrap();
+        let tool = make_tool_at_with_max_keep(root.path(), AutonomyLevel::Supervised, 1);
+        let result = tool.execute(json!({"command": "create"})).await.unwrap();
+        assert!(result.success, "rotation failed: {result:?}");
+        assert!(!old.exists());
+    }
+
+    #[tokio::test]
+    async fn backup_read_commands_enforce_archive_descendant_policy() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("config/private")).unwrap();
+        std::fs::write(
+            root.path().join("config/private/value.txt"),
+            "archive value",
+        )
+        .unwrap();
+        let tool = make_tool(&root);
+        let created = tool.execute(json!({"command": "create"})).await.unwrap();
+        assert!(created.success);
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        let name = created["backup"].as_str().unwrap();
+        let archive = root.path().join("backups").join(name);
+        for (denied, commands) in [
+            (archive.join("config/private"), vec!["verify", "restore"]),
+            (archive.join("manifest.json"), vec!["list", "verify"]),
+        ] {
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: root.path().to_path_buf(),
+                forbidden_paths: vec![denied.display().to_string()],
+                ..SecurityPolicy::default()
+            });
+            let restricted = BackupTool::new_with_security(vec!["config".into()], 10, security);
+            for command in commands {
+                let result = restricted
+                    .execute(json!({"command": command, "backup_name": name}))
+                    .await
+                    .unwrap();
+                assert!(
+                    !result.success,
+                    "command {command} read a denied archive path"
+                );
+                assert!(result.error.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_preflights_descendant_write_and_runtime_config_denials() {
+        for protect_runtime_config in [false, true] {
+            let root = TempDir::new().unwrap();
+            std::fs::create_dir_all(root.path().join("config")).unwrap();
+            std::fs::create_dir_all(root.path().join("memory/private")).unwrap();
+            let earlier = root.path().join("config/value.txt");
+            let denied = root.path().join("memory/private/config.toml");
+            std::fs::write(&earlier, "archive value").unwrap();
+            std::fs::write(&denied, "archive value").unwrap();
+            let created = make_tool(&root)
+                .execute(json!({"command": "create"}))
+                .await
+                .unwrap();
+            assert!(created.success);
+            let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+            let name = created["backup"].as_str().unwrap();
+            std::fs::write(&earlier, "live value").unwrap();
+            std::fs::write(&denied, "live value").unwrap();
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: root.path().to_path_buf(),
+                config_path: protect_runtime_config.then(|| denied.clone()),
+                forbidden_paths: if protect_runtime_config {
+                    vec![]
+                } else {
+                    vec![denied.parent().unwrap().display().to_string()]
+                },
+                ..SecurityPolicy::default()
+            });
+            let restricted =
+                BackupTool::new_with_security(vec!["config".into(), "memory".into()], 10, security);
+            let result = restricted
+                .execute(json!({"command": "restore", "backup_name": name, "confirm": true}))
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(result.error.is_some());
+            assert_eq!(std::fs::read_to_string(&earlier).unwrap(), "live value");
+            assert_eq!(std::fs::read_to_string(&denied).unwrap(), "live value");
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_case_alias_of_output_before_writes() {
+        let root = TempDir::new().unwrap();
+        let archive = root.path().join("backups/backup-fixture");
+        std::fs::create_dir_all(archive.join("Backups")).unwrap();
+        std::fs::write(archive.join("Backups/value.txt"), "fixture").unwrap();
+        let result = make_tool(&root)
+            .execute(
+                json!({"command": "restore", "backup_name": "backup-fixture", "confirm": true}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            result.error,
+            Some(tool_text_arg(
+                "tool-backup-error-source-overlap",
+                "path",
+                "Backups"
+            ))
+        );
+        assert!(!root.path().join("backups/value.txt").exists());
     }
 
     #[cfg(unix)]
