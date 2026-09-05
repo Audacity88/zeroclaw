@@ -1,7 +1,8 @@
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
+    TOOL_LOOP_SESSION_KEY, TOOL_LOOP_THREAD_ID, ToolLoop, apply_text_tool_prompt_policy,
+    run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::{ApprovalManager, ApprovalRequirement};
@@ -1859,10 +1860,17 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        // Sender-bucket continuity (same rationale as the parallel spawn):
+        // capture the originating sender scope so every admission inside the
+        // detached task charges the caller's bucket, not the fallback
+        // __global__ budget.
+        let parent_thread_id = TOOL_LOOP_THREAD_ID.try_with(|v| v.clone()).ok().flatten();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, async move {
+            TOOL_LOOP_THREAD_ID.scope(
+                parent_thread_id,
+                scope_delegate_session_key(parent_session_key, async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1975,7 +1983,8 @@ impl DelegateTool {
                 Self::background_task_cancels()
                     .lock()
                     .remove(&task_id_clone);
-            })
+                }),
+            )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
             ))
@@ -1983,11 +1992,20 @@ impl DelegateTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!(
-                "Background task started for agent '{agent_name}'.\n\
-                 task_id: {task_id}\n\
-                 Use action='check_result' with task_id='{task_id}' to retrieve the result."
-            )
+            output: if self.background_task_management {
+                format!(
+                    "Background task started for agent '{agent_name}'.\n\
+                     task_id: {task_id}\n\
+                     Use action='check_result' with task_id='{task_id}' to retrieve the result."
+                )
+            } else {
+                format!(
+                    "Background task started for agent '{agent_name}'.\n\
+                     task_id: {task_id}\n\
+                     This tool cannot check task results; report task_id='{task_id}' back to the \
+                     delegating agent so it can retrieve the result with action='check_result'."
+                )
+            }
             .into(),
             error: None,
         })
@@ -2084,6 +2102,12 @@ impl DelegateTool {
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
+        // Sender-bucket continuity: spawned tasks start with empty
+        // task-locals, so a worker that restores only the session key would
+        // charge the fallback __global__ bucket and escape the originating
+        // sender's action budget. Capture the sender scope before spawning
+        // and restore it around each worker's entire execution.
+        let parent_thread_id = TOOL_LOOP_THREAD_ID.try_with(|v| v.clone()).ok().flatten();
         for agent_name in &agent_names {
             let agents = Arc::clone(&self.agents);
             let security = Arc::clone(&self.security);
@@ -2117,6 +2141,7 @@ impl DelegateTool {
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let thread_scope = parent_thread_id.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -2147,15 +2172,23 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, async move {
-                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                            .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                    let result = TOOL_LOOP_THREAD_ID
+                        .scope(
+                            thread_scope,
+                            scope_delegate_session_key(session_key, async move {
+                                crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                    .scope(receipt_scope, async move {
+                                        Box::pin(inner.execute_sync(
+                                            &agent_name,
+                                            &prompt,
+                                            &args_clone,
+                                        ))
+                                        .await
+                                    })
                                     .await
-                            })
-                            .await
-                    })
-                    .await;
+                            }),
+                        )
+                        .await;
                     (agent_name_for_return, result)
                 }
                 .instrument(::zeroclaw_log::attribution_span!(
@@ -10295,6 +10328,185 @@ mod tests {
             "the parallel second hop must fail rather than run: {:?}",
             bodies[1]
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_parallel_worker_charges_originating_sender_bucket() {
+        // Channel turns run under a sender scope; spawned parallel workers
+        // must charge the SAME bucket. Regression for the round-3 re-review
+        // blocker: the worker previously lost TOOL_LOOP_THREAD_ID across the
+        // spawn and admitted the second hop against the unused __global__
+        // bucket, escaping the parent's budget. The unscoped parallel budget
+        // test above cannot see this: unscoped, every bucket is __global__.
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_1",
+                serde_json::json!({"parallel": ["leaf"], "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget1"),
+                ("middle", &["leaf"], "budget100"),
+                ("leaf", &[], "budget100"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+
+        let execution = tool.execute(json!({"agent": "middle", "prompt": "parallel fan out"}));
+        let result = crate::agent::loop_::scope_thread_id(Some("sender-a".to_string()), execution)
+            .await
+            .unwrap();
+
+        assert!(result.success, "hop one must succeed: {:?}", result.error);
+        let bodies = captured.lock().unwrap();
+        // Leaf must never be contacted: the parallel worker must charge the
+        // sender's exhausted bucket, not a fresh __global__ one (a worker
+        // that escapes the bucket runs leaf and adds two more requests).
+        assert_eq!(
+            bodies.len(),
+            2,
+            "middle's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("One or more parallel agents failed"),
+            "the parallel second hop must fail rather than run: {:?}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_background_worker_charges_originating_sender_bucket() {
+        // Background variant of the same boundary: the caller's pre-spawn
+        // admission charges the sender bucket, and the spawned worker that
+        // runs the child's own delegation must charge the same bucket rather
+        // than admitting against the fallback __global__ budget.
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_bounded_bg_budget_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_bg",
+                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget1"),
+                ("middle", &["leaf"], "budget100"),
+                ("leaf", &[], "budget100"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config).with_workspace_dir(workspace.clone());
+
+        let execution = tool
+            .execute(json!({"agent": "middle", "prompt": "background hop", "background": true}));
+        let result = crate::agent::loop_::scope_thread_id(Some("sender-a".to_string()), execution)
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "background hop one must succeed: {:?}",
+            result.error
+        );
+        let task_id = result
+            .output
+            .to_string()
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .map(str::trim)
+            .map(str::to_string)
+            .expect("background delegation must report a task_id");
+        let waited = wait_for_terminal_background_result(&workspace, &task_id).await;
+        assert_eq!(
+            waited.status,
+            BackgroundTaskStatus::Completed,
+            "the background worker must complete: {waited:?}"
+        );
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "middle's background turn makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("action budget exhausted"),
+            "the child's own delegation must be refused by the sender's exhausted bucket: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_sender_buckets_do_not_merge() {
+        // Distinct senders hold distinct buckets: exhausting sender-a's
+        // budget must leave sender-b's untouched. This pins the repair
+        // against collapsing scopes onto one key; it passes before the
+        // bucket-continuity fix too, because synchronous hops never spawn.
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_a",
+                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_b",
+                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget1"),
+                ("middle", &["leaf"], "budget100"),
+                ("leaf", &[], "budget100"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+
+        for (run, sender) in ["sender-a", "sender-b"].into_iter().enumerate() {
+            let execution = tool.execute(json!({"agent": "middle", "prompt": "one action"}));
+            let result = crate::agent::loop_::scope_thread_id(Some(sender.to_string()), execution)
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "{sender} hop one must succeed: {:?}",
+                result.error
+            );
+            let bodies = captured.lock().unwrap();
+            assert_eq!(
+                bodies.len(),
+                2 * (run + 1),
+                "{sender}'s turn makes exactly two provider requests: {bodies:?}"
+            );
+            assert!(
+                bodies[2 * run + 1].contains("action budget exhausted"),
+                "{sender}'s own second hop must be refused by its own exhausted bucket: {bodies:?}"
+            );
+        }
     }
 
     #[tokio::test]
