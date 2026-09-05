@@ -6142,18 +6142,15 @@ impl ChatState {
 
     fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
         let action = self.context_menu.as_ref()?.selected_action()?;
-        if action == ChatContextMenuAction::AddToChat {
-            let ChatContextMenuTarget::Transcript(target) = &self.context_menu.as_ref()?.target
-            else {
-                return None;
-            };
-            return (target.kind == CopyHitKind::Transcript)
-                .then(|| ChatContextMenuRequest::AddToChat(target.clone()));
-        }
         let menu = self.context_menu.take()?;
         match (menu.target, action) {
             (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
                 Some(ChatContextMenuRequest::CopyTranscript(target))
+            }
+            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::AddToChat)
+                if target.kind == CopyHitKind::Transcript =>
+            {
+                Some(ChatContextMenuRequest::AddToChat(target))
             }
             (ChatContextMenuTarget::Queue(id), action) => {
                 Some(ChatContextMenuRequest::Queue { id, action })
@@ -8385,6 +8382,35 @@ mod tests {
                 text,
                 ..
             }) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn add_to_chat_context_menu_request_dismisses_the_menu() {
+        let mut state = state();
+        state.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 16, 4),
+            target: ChatContextMenuTarget::Transcript(CopyHitRegion {
+                rect: Rect::new(0, 0, 5, 1),
+                text: "hello".to_string(),
+                kind: CopyHitKind::Transcript,
+                group: 0,
+                action: CopyHitAction::Copy,
+            }),
+            selected: CHARACTER_SELECTION_CONTEXT_ACTIONS
+                .iter()
+                .position(|action| *action == ChatContextMenuAction::AddToChat)
+                .expect("character selection menu includes Add to Chat"),
+        });
+
+        let request = state
+            .take_context_menu_request()
+            .expect("add-to-chat request");
+
+        assert!(state.context_menu.is_none());
+        assert!(matches!(
+            request,
+            ChatContextMenuRequest::AddToChat(CopyHitRegion { text, .. }) if text == "hello"
         ));
     }
 
