@@ -150,34 +150,28 @@ pub(crate) async fn resolve_routed_approval(
             // `Some(Deny)` (its inner timeout firing before this outer one), that
             // is a runtime denial and must not be relabelled as the approver's
             // decision just because a response came back.
-            match tokio::time::timeout(
-                dur,
-                channel.request_approval_attributed(approver_recipient, request),
-            )
-            .await
+            match channel
+                .request_approval_attributed_with_timeout(approver_recipient, request, dur)
+                .await
             {
-                Ok(Ok(Some(attributed))) if attributed.source.is_runtime_fail_closed() => (
+                Ok(Some(attributed)) if attributed.source.is_runtime_fail_closed() => (
                     "approver returned a runtime fail-closed response",
                     attributed.source,
                 ),
-                Ok(Ok(Some(attributed))) => {
+                Ok(Some(attributed)) => {
                     return RoutedApproval::Decided {
                         response: attributed.response,
                         decider: Some(channel_name),
                         source: attributed.source,
                     };
                 }
-                Ok(Ok(None)) => (
+                Ok(None) => (
                     "approver returned no decision",
                     zeroclaw_api::channel::ApprovalSource::Unreachable,
                 ),
-                Ok(Err(_)) => (
+                Err(_) => (
                     "approver channel unreachable",
                     zeroclaw_api::channel::ApprovalSource::Unreachable,
-                ),
-                Err(_) => (
-                    "approver timed out",
-                    zeroclaw_api::channel::ApprovalSource::TimedOut,
                 ),
             }
         } else if approver_recipient.is_none() {
@@ -12099,6 +12093,7 @@ mod approval_route_tests {
         name: String,
         behavior: StubBehavior,
         seen_recipient: Arc<parking_lot::Mutex<Option<String>>>,
+        seen_route_timeout: Option<Arc<parking_lot::Mutex<Option<std::time::Duration>>>>,
     }
 
     impl zeroclaw_api::attribution::Attributable for StubChannel {
@@ -12163,6 +12158,31 @@ mod approval_route_tests {
                     response.map(zeroclaw_api::channel::AttributedApprovalResponse::operator)
                 })
         }
+
+        async fn request_approval_attributed_with_timeout(
+            &self,
+            recipient: &str,
+            request: &ChannelApprovalRequest,
+            timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+            if let Some(seen) = &self.seen_route_timeout {
+                *seen.lock() = Some(timeout);
+            }
+            match tokio::time::timeout(
+                timeout,
+                self.request_approval_attributed(recipient, request),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ),
+                )),
+            }
+        }
     }
 
     fn registry(channels: Vec<StubChannel>) -> tools::PerToolChannelHandle {
@@ -12199,6 +12219,7 @@ mod approval_route_tests {
             name: name.into(),
             behavior,
             seen_recipient: seen_recipient(),
+            seen_route_timeout: None,
         }
     }
 
@@ -12248,6 +12269,30 @@ mod approval_route_tests {
             Some("configured-approver-recipient"),
             "the approver hop must not reuse the origin recipient"
         );
+    }
+
+    #[tokio::test]
+    async fn routed_approval_delegates_the_configured_timeout_to_the_channel() {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let mut approver = stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        );
+        approver.seen_route_timeout = Some(Arc::clone(&seen));
+        let h = registry(vec![approver]);
+
+        let out =
+            resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "origin", &req()).await;
+
+        assert!(matches!(
+            out,
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Approve,
+                source: zeroclaw_api::channel::ApprovalSource::Operator,
+                ..
+            }
+        ));
+        assert_eq!(*seen.lock(), Some(std::time::Duration::from_secs(1)));
     }
 
     #[tokio::test]
