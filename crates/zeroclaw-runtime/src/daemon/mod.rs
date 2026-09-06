@@ -1241,10 +1241,8 @@ pub async fn run_with_authority(
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
     }
 
-    // Freeze lifecycle admission before stopping ingress. Existing ordinary
-    // turns lose their leases when component workers drain or are aborted;
-    // destructive leases remain registered through detached post-commit
-    // cleanup and are drained below before cross-process ownership can drop.
+    // Freeze admission before stopping ingress; detached final writes must
+    // drain as well as component workers before process ownership is released.
     live_config_authority.close_agent_lifecycle();
     channels_cancel.cancel();
 
@@ -1271,6 +1269,7 @@ pub async fn run_with_authority(
         let _ = handle.await;
     }
 
+    drop(rpc_ctx);
     live_config_authority.drain_agent_lifecycle().await;
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -3951,6 +3950,150 @@ mod tests {
             attempts.load(Ordering::SeqCst) >= 2,
             "socket supervisor should retry after a post-readiness AddrInUse"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_waits_for_detached_write_before_releasing_process_ownership() {
+        use std::sync::Arc;
+
+        use crate::live_config_authority::{
+            AgentAdmissionError, AgentExecutionError, ConfigOwnershipError, ConfigOwnershipGuard,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let authority = crate::LiveConfigAuthority::new_owned(config.clone()).unwrap();
+        let stale_capability = authority.execution_capability();
+        let turn = authority.agent_lifecycle().reserve_turn("alpha").unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let result_path = config.data_dir.join("final-result");
+        let write_path = result_path.clone();
+        let background = zeroclaw_spawn::spawn!(async move {
+            release_rx.await.unwrap();
+            tokio::fs::write(write_path, b"finished").await.unwrap();
+            drop(turn);
+        });
+        let (reload_sent_tx, reload_sent_rx) = tokio::sync::oneshot::channel();
+        let reload_sent = Arc::new(parking_lot::Mutex::new(Some(reload_sent_tx)));
+        let session_ready = Arc::new(tokio::sync::Semaphore::new(0));
+        let socket_session_ready = session_ready.clone();
+        let (sessions_tx, mut sessions_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |ctx, cancel, _count, readiness| {
+            let session_ready = socket_session_ready.clone();
+            let sessions_tx = sessions_tx.clone();
+            Box::pin(async move {
+                let lease = ctx
+                    .agent_lifecycle
+                    .reserve_admission("idle-session")
+                    .unwrap()
+                    .publish()
+                    .unwrap();
+                let agent = crate::agent::agent::Agent::builder()
+                    .model_provider(
+                        zeroclaw_providers::create_model_provider("ollama", None).unwrap(),
+                    )
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![],
+                    ))
+                    .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                    .observer(Arc::new(crate::observability::noop::NoopObserver))
+                    .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                    .workspace_dir(std::env::temp_dir())
+                    .build()
+                    .unwrap();
+                ctx.sessions
+                    .insert(
+                        "idle-session".into(),
+                        crate::rpc::session::RpcSession::new(
+                            agent,
+                            "idle-session",
+                            ".",
+                            crate::rpc::types::ChatMode::Chat,
+                        )
+                        .with_lifecycle_lease(lease),
+                    )
+                    .await
+                    .unwrap();
+                sessions_tx.send(Arc::downgrade(&ctx.sessions)).unwrap();
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                session_ready.add_permits(1);
+                cancel.cancelled().await;
+                Ok(())
+            })
+        }));
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _authority, _events, controls, _tui, _ready| {
+                let reload_sent = reload_sent.clone();
+                let session_ready = session_ready.clone();
+                Box::pin(async move {
+                    session_ready.acquire().await.unwrap().forget();
+                    controls.unwrap().reload_tx.send(true).unwrap();
+                    if let Some(sent) = reload_sent.lock().take() {
+                        sent.send(()).unwrap();
+                    }
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+        let mut daemon = zeroclaw_spawn::spawn!(run_with_authority(
+            authority,
+            "127.0.0.1".to_string(),
+            0,
+            registry,
+            false,
+            false,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), reload_sent_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let sessions = sessions_rx.recv().await.unwrap();
+        // Exceed component shutdown's grace window while the detached write is held.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut daemon)
+                .await
+                .is_err()
+        );
+        assert!(sessions.upgrade().is_none(), "idle RPC registry must drain");
+        assert!(!result_path.exists());
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(&config.data_dir),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
+        assert!(matches!(
+            stale_capability.admit("alpha"),
+            Err(AgentExecutionError::Admission(
+                AgentAdmissionError::GenerationClosing
+            ))
+        ));
+
+        release_tx.send(()).unwrap();
+        background.await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), daemon)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            DaemonExit::Reload
+        );
+        assert_eq!(tokio::fs::read(&result_path).await.unwrap(), b"finished");
+        let next = crate::LiveConfigAuthority::new_owned(config.clone()).unwrap();
+        assert!(next.agent_lifecycle().reserve_turn("alpha").is_ok());
+        assert!(matches!(
+            stale_capability.admit("alpha"),
+            Err(AgentExecutionError::Admission(
+                AgentAdmissionError::GenerationClosing
+            ))
+        ));
+        drop(stale_capability);
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(&config.data_dir),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
     }
 
     #[tokio::test]

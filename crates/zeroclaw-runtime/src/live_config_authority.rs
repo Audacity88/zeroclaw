@@ -42,7 +42,6 @@ impl LiveConfigAuthority {
     /// config identity before loading the executable config. The guard is
     /// transferred into the authority and shared by every derived capability.
     pub fn new_with_ownership(config: Config, ownership: ConfigOwnershipGuard) -> Self {
-        let ownership = Arc::new(ownership);
         Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -94,20 +93,21 @@ impl LiveConfigAuthority {
         self.agent_lifecycle.close_generation();
     }
 
-    /// Wait for post-commit agent cleanup admitted by this generation.
+    /// Drain a closed generation and release its process ownership.
     pub async fn drain_agent_lifecycle(&self) {
+        self.close_agent_lifecycle();
         const DIAGNOSTIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
         loop {
             if tokio::time::timeout(
                 DIAGNOSTIC_INTERVAL,
-                self.agent_lifecycle.drain_destructive_work(),
+                self.agent_lifecycle.drain_closed_generation(),
             )
             .await
             .is_ok()
             {
                 return;
             }
-            let aliases = self.agent_lifecycle.pending_destructive_aliases();
+            let aliases = self.agent_lifecycle.pending_work_aliases();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -117,7 +117,7 @@ impl LiveConfigAuthority {
                         "pending_aliases": aliases,
                         "waited_seconds": DIAGNOSTIC_INTERVAL.as_secs(),
                     })),
-                "daemon generation remains fail-closed while agent cleanup is still running"
+                "daemon generation remains fail-closed while admitted agent work is still running"
             );
         }
     }
@@ -500,20 +500,28 @@ struct AliasLifecycleState {
     deleting: bool,
 }
 
+impl AliasLifecycleState {
+    fn is_idle(&self) -> bool {
+        self.reservations == 0
+            && self.live_sessions == 0
+            && self.active_turns == 0
+            && !self.deleting
+    }
+}
+
 #[derive(Default)]
 struct AgentLifecycleState {
     aliases: HashMap<String, AliasLifecycleState>,
     closing: bool,
+    // Retained across ordinary drops, but released once a closed generation drains.
+    ownership: Option<ConfigOwnershipGuard>,
 }
 
 /// Coordinates slow session admission with destructive alias mutations.
 #[derive(Clone, Default)]
 pub struct AgentLifecycleCoordinator {
     state: Arc<parking_lot::Mutex<AgentLifecycleState>>,
-    destructive_idle: Arc<tokio::sync::Notify>,
-    /// Every capability and lease retains this coordinator, keeping the
-    /// process lock held until the last admitted continuation finishes.
-    _ownership: Option<Arc<ConfigOwnershipGuard>>,
+    idle: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -591,11 +599,13 @@ pub struct AgentDeleteLease {
 }
 
 impl AgentLifecycleCoordinator {
-    fn with_ownership(ownership: Arc<ConfigOwnershipGuard>) -> Self {
+    fn with_ownership(ownership: ConfigOwnershipGuard) -> Self {
         Self {
-            state: Arc::new(parking_lot::Mutex::new(AgentLifecycleState::default())),
-            destructive_idle: Arc::new(tokio::sync::Notify::new()),
-            _ownership: Some(ownership),
+            state: Arc::new(parking_lot::Mutex::new(AgentLifecycleState {
+                ownership: Some(ownership),
+                ..AgentLifecycleState::default()
+            })),
+            idle: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -759,13 +769,13 @@ impl AgentLifecycleCoordinator {
         Self::delete_blocker_locked(&self.state.lock(), alias)
     }
 
-    pub fn pending_destructive_aliases(&self) -> Vec<String> {
-        let mut aliases: Vec<String> = self
+    fn pending_work_aliases(&self) -> Vec<String> {
+        let mut aliases: Vec<_> = self
             .state
             .lock()
             .aliases
             .iter()
-            .filter(|(_, lifecycle)| lifecycle.deleting)
+            .filter(|(_, lifecycle)| !lifecycle.is_idle())
             .map(|(alias, _)| alias.clone())
             .collect();
         aliases.sort();
@@ -794,19 +804,19 @@ impl AgentLifecycleCoordinator {
         self.state.lock().closing = true;
     }
 
-    /// Wait until every destructive lease admitted before generation close has
-    /// left its detached post-commit cleanup task.
-    pub async fn drain_destructive_work(&self) {
+    /// Closed capabilities cannot admit new work, so idle clones need not keep
+    /// the process lock after the last admitted continuation has finished.
+    async fn drain_closed_generation(&self) {
         loop {
-            let notified = self.destructive_idle.notified();
-            if self
-                .state
-                .lock()
-                .aliases
-                .values()
-                .all(|lifecycle| !lifecycle.deleting)
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
-                return;
+                let mut state = self.state.lock();
+                if state.closing && state.aliases.values().all(AliasLifecycleState::is_idle) {
+                    drop(state.ownership.take());
+                    return;
+                }
             }
             notified.await;
         }
@@ -825,9 +835,11 @@ impl AgentAdmissionReservation {
         lifecycle.reservations = lifecycle.reservations.saturating_sub(1);
         self.active = false;
         if closing {
+            self.coordinator.idle.notify_waiters();
             return Err(AgentAdmissionError::GenerationClosing);
         }
         if lifecycle.deleting || lifecycle.generation != self.generation {
+            self.coordinator.idle.notify_waiters();
             return Err(AgentAdmissionError::StaleGeneration {
                 alias: self.alias.clone(),
             });
@@ -849,6 +861,7 @@ impl Drop for AgentAdmissionReservation {
         if let Some(lifecycle) = self.coordinator.state.lock().aliases.get_mut(&self.alias) {
             lifecycle.reservations = lifecycle.reservations.saturating_sub(1);
         }
+        self.coordinator.idle.notify_waiters();
     }
 }
 
@@ -860,6 +873,7 @@ impl Drop for AgentSessionLease {
         if let Some(lifecycle) = self.coordinator.state.lock().aliases.get_mut(&self.alias) {
             lifecycle.live_sessions = lifecycle.live_sessions.saturating_sub(1);
         }
+        self.coordinator.idle.notify_waiters();
     }
 }
 
@@ -871,6 +885,7 @@ impl Drop for AgentTurnLease {
         if let Some(lifecycle) = self.coordinator.state.lock().aliases.get_mut(&self.alias) {
             lifecycle.active_turns = lifecycle.active_turns.saturating_sub(1);
         }
+        self.coordinator.idle.notify_waiters();
     }
 }
 
@@ -882,7 +897,7 @@ impl Drop for AgentDeleteLease {
         if let Some(lifecycle) = self.coordinator.state.lock().aliases.get_mut(&self.alias) {
             lifecycle.deleting = false;
         }
-        self.coordinator.destructive_idle.notify_waiters();
+        self.coordinator.idle.notify_waiters();
     }
 }
 
@@ -1132,14 +1147,15 @@ mod tests {
     }
 
     #[test]
-    fn pending_destructive_aliases_are_stable_for_diagnostics() {
+    fn pending_work_aliases_are_stable_for_diagnostics() {
         let lifecycle = AgentLifecycleCoordinator::default();
         let _zeta = lifecycle.begin_delete("zeta").unwrap();
         let _alpha = lifecycle.begin_delete("alpha").unwrap();
+        let _beta = lifecycle.reserve_turn("beta").unwrap();
 
         assert_eq!(
-            lifecycle.pending_destructive_aliases(),
-            ["alpha".to_string(), "zeta".to_string()]
+            lifecycle.pending_work_aliases(),
+            ["alpha".to_string(), "beta".to_string(), "zeta".to_string()]
         );
     }
 
@@ -1148,6 +1164,13 @@ mod tests {
         let authority = LiveConfigAuthority::new(Config::default());
         let lifecycle = authority.agent_lifecycle();
         let lease = lifecycle.begin_delete("alpha").unwrap();
+        let reservation = lifecycle.reserve_admission("pending").unwrap();
+        let session = lifecycle
+            .reserve_admission("session")
+            .unwrap()
+            .publish()
+            .unwrap();
+        let turn = lifecycle.reserve_turn("turn").unwrap();
         let release = Arc::new(tokio::sync::Notify::new());
         let task_release = Arc::clone(&release);
         let handle = spawn_agent_lifecycle_job(vec![lease], async move {
@@ -1176,6 +1199,27 @@ mod tests {
                 .is_err()
         );
         release.notify_waiters();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                .await
+                .is_err()
+        );
+        drop(turn);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                .await
+                .is_err()
+        );
+        drop(session);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reservation.publish().err(),
+            Some(AgentAdmissionError::GenerationClosing)
+        );
         tokio::time::timeout(std::time::Duration::from_secs(1), drain)
             .await
             .expect("generation drain completes after detached cleanup");
@@ -1224,12 +1268,10 @@ mod tests {
         release.add_permits(1);
         cleanup.await.unwrap();
         authority.drain_agent_lifecycle().await;
-        assert!(matches!(
-            ConfigOwnershipGuard::acquire(temp.path()),
-            Err(ConfigOwnershipError::AlreadyOwned { .. })
-        ));
-
-        drop(authority);
+        assert_eq!(
+            authority.agent_lifecycle().reserve_turn("alpha").err(),
+            Some(AgentAdmissionError::GenerationClosing)
+        );
         ConfigOwnershipGuard::acquire(temp.path()).unwrap();
     }
 
