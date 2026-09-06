@@ -4663,18 +4663,22 @@ mod tests {
                      "cache_control": {"type": "ephemeral"}},
                 ]},
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
                 {"role": "user", "content": [
                     {"type": "text", "text": "bye",
                      "cache_control": {"type": "ephemeral"}},
                 ]},
             ]),
-            "system and last message carry the breakpoints; middle messages untouched"
+            "system, previous turn's last message, and current last message carry the \
+             breakpoints; earlier messages untouched"
         );
         assert_eq!(
             requests[0].to_string().matches("cache_control").count(),
-            2,
-            "rolling breakpoint must never exceed two per request"
+            3,
+            "two-turn history must carry the system, prior-turn, and rolling breakpoints"
         );
     }
 
@@ -4830,8 +4834,8 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].to_string().matches("cache_control").count(),
-            2,
-            "tools path must carry at most the two standard breakpoints"
+            3,
+            "tools path must carry at most the three standard breakpoints"
         );
         assert_eq!(
             requests[0]["messages"][0]["content"][0]["cache_control"],
@@ -9192,9 +9196,10 @@ mod tests {
         );
     }
 
-    /// Merged-carrier, multi-turn: the carrier keeps the system breakpoint
-    /// and the rolling breakpoint still lands on the last message, exactly
-    /// two total, middle messages untouched.
+    /// Merged-carrier, multi-turn: the carrier keeps the system breakpoint,
+    /// the previous turn's last message takes the prior-turn breakpoint
+    /// after it, and the rolling breakpoint still lands on the last message,
+    /// exactly three total, earlier messages untouched.
     #[tokio::test]
     async fn cache_passthrough_merged_system_carrier_plus_rolling_multi_turn() {
         let (provider, captured, server) = mock_streaming_cache_capture(true).await;
@@ -9229,18 +9234,222 @@ mod tests {
                     {"type": "text", "text": "core policy\n\nhi",
                      "cache_control": {"type": "ephemeral"}},
                 ]},
-                {"role": "assistant", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
                 {"role": "user", "content": [
                     {"type": "text", "text": "bye",
                      "cache_control": {"type": "ephemeral"}},
                 ]},
             ]),
-            "merged carrier and rolling breakpoint with middle messages untouched"
+            "merged carrier, prior-turn, and rolling breakpoint with earlier messages untouched"
         );
         assert_eq!(
             requests[0].to_string().matches("cache_control").count(),
+            3,
+            "merged multi-turn must carry exactly three breakpoints"
+        );
+    }
+
+    /// Single completed turn: the rolling breakpoint lands on the assistant
+    /// reply, and the prior-turn rule stays silent because the only user
+    /// message opens the turn. Exactly two markers.
+    #[tokio::test]
+    async fn cache_passthrough_single_turn_carries_two_markers() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on single-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
             2,
-            "merged multi-turn must carry exactly two breakpoints"
+            "a single turn carries the system and rolling breakpoints only"
+        );
+        assert_eq!(
+            requests[0]["messages"][2]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling breakpoint lands on the assistant reply"
+        );
+    }
+
+    /// Two-turn tool-heavy history: the prior-turn marker lands on the
+    /// previous turn's final assistant text even though tool traffic fills
+    /// the middle. Three markers total; the tool-call carrier and the tool
+    /// result inside the turns carry none.
+    #[tokio::test]
+    async fn cache_passthrough_two_turn_tool_history_marks_prior_assistant_text() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("list the files"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "name": "list_files", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool("a.txt\nb.txt"),
+            ChatMessage::assistant("two files: a.txt and b.txt"),
+            ChatMessage::user("which is larger?"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let result = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on tool history request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        let wire_messages = requests[0]["messages"].as_array().unwrap();
+        assert_eq!(
+            wire_messages.len(),
+            6,
+            "tool history wire shape changed: {wire_messages:?}"
+        );
+        let marked: Vec<usize> = wire_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.to_string().contains("cache_control"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![0, 4, 5],
+            "system, previous turn's last assistant text, and current last message carry \
+             the markers"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            3,
+            "never more than three breakpoints per request"
+        );
+    }
+
+    /// The previous turn was cut short after its tool result: the prior-turn
+    /// marker lands on the tool result message itself.
+    #[tokio::test]
+    async fn cache_passthrough_prior_turn_marker_lands_on_tool_result() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("list the files"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "name": "list_files", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool("a.txt\nb.txt"),
+            ChatMessage::user("which is larger?"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let result = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on interrupted-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        let wire_messages = requests[0]["messages"].as_array().unwrap();
+        let marked: Vec<usize> = wire_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.to_string().contains("cache_control"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![0, 3, 4],
+            "system, the trailing tool result of the interrupted turn, and the current last \
+             message carry the markers"
+        );
+    }
+
+    /// An orphaned tool-call carrier sits between the previous user message
+    /// and the new turn: the carrier is breakpoint-transparent (the tool_use
+    /// analog), so the marker walks back onto the previous user message.
+    #[tokio::test]
+    async fn cache_passthrough_prior_turn_walks_back_off_tool_call_carrier() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("list the files"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "name": "list_files", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user("never mind, which files exist?"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": "List files",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let result = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on orphaned-carrier request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        let wire_messages = requests[0]["messages"].as_array().unwrap();
+        let marked: Vec<usize> = wire_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.to_string().contains("cache_control"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![0, 1, 3],
+            "the marker steps back off the carrier onto the previous user message"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            3,
+            "the walk-back still stays inside the three-marker cap"
         );
     }
 

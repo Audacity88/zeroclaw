@@ -4417,6 +4417,295 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(messages.is_empty());
     }
 
+    /// Native text message with one unmarked text block.
+    fn native_text_message(role: &str, text: &str) -> NativeMessage {
+        NativeMessage {
+            role: role.to_string(),
+            content: vec![NativeContentOut::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// Native assistant message whose trailing block is a tool call, the
+    /// shape `parse_assistant_tool_call_message` always produces (text
+    /// precedes the calls).
+    fn native_tool_call_carrier() -> NativeMessage {
+        NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![NativeContentOut::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// Native user message carrying one tool result, the wire shape of
+    /// `tool_result_message`.
+    fn native_tool_result_carrier() -> NativeMessage {
+        NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: ToolResultContent::Text("result".to_string()),
+                cache_control: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_lands_on_previous_assistant_text() {
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(1),
+            "the message before the last user message is the previous turn's last message"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_is_none_without_a_previous_turn() {
+        let single_exchange = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&single_exchange),
+            None,
+            "the only user message opens the turn, so nothing sits before it"
+        );
+        let single_message = vec![native_text_message("user", "q1")];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&single_message),
+            None
+        );
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&[]),
+            None,
+            "empty history has no placement"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_lands_on_tool_result() {
+        // The previous turn was cut short after its tool result.
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_tool_call_carrier(),
+            native_tool_result_carrier(),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(2),
+            "a trailing tool_result block is cacheable, the same gate the rolling marker uses"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_walks_back_over_tool_call_carrier() {
+        // Mid-loop: the last user-role message is the tool-result carrier, so
+        // the first candidate is the tool-call carrier; the rule steps back
+        // onto the turn's opening user message.
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+            native_tool_call_carrier(),
+            native_tool_result_carrier(),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_gives_up_after_two_walk_back_steps() {
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_tool_call_carrier(),
+            native_tool_call_carrier(),
+            native_tool_call_carrier(),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            None,
+            "candidates three, two, and one are all carriers; the search stops after two \
+             walk-back steps instead of landing further back"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_skips_trailing_image() {
+        let image_only = NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![NativeContentOut::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                },
+            }],
+        };
+        let messages = vec![
+            native_text_message("user", "q1"),
+            image_only,
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            None,
+            "a message ending on an image block is breakpoint-transparent; walking back \
+             reaches index zero, which is out of bounds"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_places_marker_for_plain_keys() {
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            false,
+            true,
+            &mut messages,
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_skips_oauth_tool_requests() {
+        // OAuth prefix (1) + system text (1) + last tool definition (1) +
+        // rolling marker (1) = 4: the cap is already spent, so the marker
+        // must be skipped rather than 400 the request.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            true,
+            &mut messages,
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_allows_oauth_without_tools() {
+        // OAuth prefix (1) + system text (1) + rolling marker (1) = 3: one
+        // slot left, so the marker lands.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            false,
+            &mut messages,
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_counts_only_landed_rolling_marker() {
+        // The last message ends on a tool call, so the rolling marker never
+        // landed: OAuth prefix (1) + system text (1) + tools (1) = 3, one
+        // slot free, and the prior-turn rule still finds a candidate.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+            native_tool_call_carrier(),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            true,
+            &mut messages,
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn marked_system_block_count_reads_block_markers() {
+        assert_eq!(AnthropicModelProvider::marked_system_block_count(None), 0);
+        assert_eq!(
+            AnthropicModelProvider::marked_system_block_count(Some(&SystemPrompt::String(
+                "be brief".to_string()
+            ))),
+            0
+        );
+        let marked = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        assert_eq!(
+            AnthropicModelProvider::marked_system_block_count(marked.as_ref()),
+            1
+        );
+    }
+
     /// Provider instance for `convert_tools` tests — conversion is a `&self`
     /// method so each schema is cleaned once through the provider's memo.
     fn make_convert_provider() -> AnthropicModelProvider {
@@ -4837,6 +5126,128 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(
             api_tools[0]["input_schema"].is_object(),
             "Missing input_schema"
+        );
+
+        server_handle.abort();
+    }
+
+    /// OAuth setup token, tools, and multi-turn history: the request already
+    /// spends all four breakpoint slots (identity prefix, system text, last
+    /// tool definition, rolling marker), so the prior-turn marker must be
+    /// skipped rather than exceed the API's four-block cap and 400 every
+    /// request.
+    #[tokio::test]
+    async fn oauth_tool_request_stays_inside_four_breakpoint_cap() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    Json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "claude-opus-4-6",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 100, "output_tokens": 20}
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let model_provider = AnthropicModelProvider {
+            alias: "test".to_string(),
+            // Setup-token shape: routes through the OAuth system prefix.
+            credential: Some("sk-ant-oat01-test".to_string()),
+            base_url: format!("http://{addr}"),
+            max_tokens: 4096,
+            timeout_secs: 120,
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
+        };
+
+        let messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("gen a 2 sum in golang"),
+            ChatMessage::assistant("here is the code"),
+            ChatMessage::user("what's meaning of make here?"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"}
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+
+        let result = model_provider
+            .chat_with_tools(&messages, &tools, "claude-opus-4-6", None)
+            .await;
+        assert!(result.is_ok(), "chat_with_tools failed: {:?}", result.err());
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+
+        // Total markers: OAuth prefix + system text + last tool + rolling.
+        // The prior-turn slot is the one the budget skips.
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            4,
+            "OAuth tool request must carry exactly the four committed breakpoints: {body}"
+        );
+
+        // The system field carries both the identity prefix and the system
+        // text markers.
+        let system_blocks = body["system"].as_array().expect("system blocks");
+        assert_eq!(system_blocks.len(), 2, "OAuth prefix must be present");
+        assert!(
+            system_blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are Claude Code"),
+            "identity prefix must stay first"
+        );
+        assert_eq!(
+            system_blocks[0]["cache_control"]["type"], "ephemeral",
+            "prefix block keeps its marker"
+        );
+        assert_eq!(
+            system_blocks[1]["cache_control"]["type"], "ephemeral",
+            "system text block keeps its marker"
+        );
+
+        // The middle assistant message (the previous turn's last message)
+        // carries no marker: the budget skipped the prior-turn placement.
+        let wire_messages = body["messages"].as_array().unwrap();
+        let assistant_message = &wire_messages[1];
+        assert_eq!(assistant_message["role"], "assistant");
+        assert!(
+            !assistant_message.to_string().contains("cache_control"),
+            "prior-turn marker must be skipped on the OAuth tool path: {assistant_message}"
         );
 
         server_handle.abort();
