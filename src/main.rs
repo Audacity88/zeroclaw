@@ -4720,17 +4720,28 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     ) {
                         return anyhow::Error::from(error);
                     }
-                    anyhow::anyhow!(
-                        "{}",
-                        ta(
-                            "cli-standalone-daemon-owned",
-                            &[("command", command), ("path", &data_dir.display().to_string())],
-                            &format!(
-                                "Cannot run `zeroclaw {command}` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
-                                data_dir.display()
-                            ),
+                    let message = ta(
+                        "cli-standalone-daemon-owned",
+                        &[("command", command), ("path", &data_dir.display().to_string())],
+                        &format!(
+                            "Cannot run `zeroclaw {command}` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
+                            data_dir.display()
+                        ),
+                    );
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Reject
                         )
-                    )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": command,
+                            "path": data_dir.display().to_string(),
+                        })),
+                        "standalone command refused because config state is already owned"
+                    );
+                    anyhow::Error::msg(message)
                 })?,
         )
     } else {
@@ -4747,8 +4758,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
             expected_data_dir.display(),
             config.data_dir.display()
         );
-        let ownership = standalone_ownership
-            .ok_or_else(|| anyhow::anyhow!("standalone ownership was not acquired"))?;
+        let ownership = standalone_ownership.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": expected_data_dir.display().to_string(),
+                    })),
+                "standalone config ownership invariant failed"
+            );
+            anyhow::Error::msg("standalone ownership was not acquired")
+        })?;
         Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
             config.clone(),
             ownership,
@@ -5063,8 +5084,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
         } => {
             #[cfg(feature = "channel-acp-server")]
             {
-                let authority = standalone_authority
-                    .ok_or_else(|| anyhow::anyhow!("standalone ACP ownership was not acquired"))?;
+                let authority = standalone_authority.ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "standalone ACP config ownership invariant failed"
+                    );
+                    anyhow::Error::msg("standalone ACP ownership was not acquired")
+                })?;
                 let mut acp_config = channels::acp_server::AcpServerConfig {
                     max_sessions: config.acp.max_sessions,
                     session_timeout_secs: config.acp.session_timeout_secs,

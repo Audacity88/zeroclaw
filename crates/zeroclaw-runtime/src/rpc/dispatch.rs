@@ -1257,7 +1257,7 @@ impl RpcDispatcher {
             Method::AgentsList => self.handle_agents_list(),
             Method::AgentsStatus => self.handle_agents_status().await,
             Method::AgentDeletePreview => self.handle_agent_delete_preview(params).await,
-            Method::AgentDelete => self.handle_agent_delete(params).await,
+            Method::AgentDelete => Box::pin(self.handle_agent_delete(params)).await,
 
             // Cost
             Method::CostQuery => self.handle_cost_query(params),
