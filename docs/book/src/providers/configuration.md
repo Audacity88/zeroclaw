@@ -22,7 +22,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
-- `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
+- `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most three `cache_control` breakpoints per request (system, previous turn's last message, current last message) and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -147,14 +147,21 @@ Chat Completions into the Anthropic Messages API (LiteLLM, TrueFoundry,
 and similar); the native Anthropic family already caches by default and
 ignores this field.
 
-With the flag on, requests gain at most two `cache_control` breakpoints,
+With the flag on, requests gain at most three `cache_control` breakpoints,
 placed the same way the native Anthropic provider places them: one on the
-system prompt, and one rolling breakpoint on the last message once the
-conversation has more than one non-system message. With
-`merge_system_into_user` the system role never reaches the wire, so the
-merged first user message (or the synthetic user carrying the system text)
-carries the system-equivalent breakpoint instead. Only breakpoint-carrying
-messages change serialization.
+system prompt, one on the previous turn's last message, and one rolling
+breakpoint on the last message once the conversation has more than one
+non-system message. Turn-boundary cache misses fall back to the previous
+turn instead of the system prompt. On the native provider the prior-turn
+marker is placed only when the request's breakpoint budget allows it:
+Anthropic caps a request at four breakpoints counting tools, system, and
+messages together, so OAuth requests, which mark both the identity prefix
+and the system text, skip it when tool definitions spend the last slot.
+Compat requests never mark tool definitions, so all three markers always
+fit. With `merge_system_into_user` the system role never reaches the wire,
+so the merged first user message (or the synthetic user carrying the system
+text) carries the system-equivalent breakpoint instead. Only
+breakpoint-carrying messages change serialization.
 
 The flag also scopes to the structured request paths: agent turns, tool
 calls, and structured streaming. The text-only helpers (`chat_with_system`,
