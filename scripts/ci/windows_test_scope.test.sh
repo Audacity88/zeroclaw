@@ -129,6 +129,12 @@ assert_selection "package locale resource" scoped '["zeroclaw","zeroclaw-channel
 printf '%s\n' 'crates/zeroclaw-runtime/locales/en/cli.ftl' > "$paths_file"
 assert_selection "plugin-host package locale resource" scoped '["zeroclaw","zeroclaw-runtime"]' '' "$paths_file" true
 
+printf '%s\n' 'locales/en/cli.ftl' > "$paths_file"
+assert_selection "root package locale resource" full '[]' '' "$paths_file"
+
+printf '%s\n' 'crates/zeroclaw-channels/assets/locales/en/cli.ftl' > "$paths_file"
+assert_selection "nested locale-like resource" full '[]' '' "$paths_file"
+
 printf '%s\n' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
 assert_selection "dynamically consumed plugin fixture" full '[]' 'Dynamically consumed plugin test fixtures require the full suite.' "$paths_file" true
 
