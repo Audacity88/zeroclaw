@@ -32,10 +32,7 @@ fn report(root: &Dir, name: &str, baseline_identity: Identity) {
     match root.open_dir_nofollow(name) {
         Ok(opened) => {
             let marker = opened.read_to_string("probe-marker.txt");
-            let opened_identity = opened
-                .into_std_file()
-                .metadata()
-                .map(|metadata| identity(&metadata));
+            let opened_identity = opened.dir_metadata().map(|metadata| identity(&metadata));
             println!(
                 "  open_dir_nofollow=ok identity={opened_identity:?} same_as_backups={} marker={marker:?}",
                 opened_identity
@@ -66,7 +63,7 @@ fn main() -> io::Result<()> {
     root.create_dir("backups")?;
     root.write("backups/probe-marker.txt", b"zeroclaw-windows-alias-probe")?;
     let baseline = root.open_dir_nofollow("backups")?;
-    let baseline_identity = identity(&baseline.into_std_file().metadata()?);
+    let baseline_identity = identity(&baseline.dir_metadata()?);
 
     println!("fixture={}", fixture.display());
     println!("baseline_identity={baseline_identity:?}");
