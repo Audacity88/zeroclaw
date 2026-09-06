@@ -596,6 +596,59 @@ impl RpcDispatcher {
         }
     }
 
+    async fn restore_acp_plan(
+        &self,
+        session_id: &str,
+        store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) {
+        let sid = session_id.to_string();
+        let plan = tokio::task::spawn_blocking(move || store.get_plan(&sid).unwrap_or_default())
+            .await
+            .unwrap_or_default();
+        if plan.is_empty() {
+            return;
+        }
+        self.ctx.sessions.set_plan(session_id, plan.clone()).await;
+        if let Some(notification) = plan_replay_notification(session_id, &plan) {
+            let _ = self.rpc.send_raw(notification).await;
+        }
+    }
+
+    async fn resolve_reaped_session_mode(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ChatMode>, JsonRpcError> {
+        let store = self.ctx.acp_session_store.clone();
+        let backend = self.ctx.session_backend.clone();
+        let sid = session_id.to_string();
+        let (has_acp, has_chat) = run_blocking_rpc(
+            move || {
+                let has_acp = match store {
+                    Some(store) => store.contains_session(&sid)?,
+                    None => false,
+                };
+                let has_chat = backend.is_some_and(|backend| {
+                    [sid.clone(), format!("rpc_{sid}"), format!("gw_{sid}")]
+                        .iter()
+                        .any(|key| backend.session_exists(key))
+                });
+                Ok((has_acp, has_chat))
+            },
+            "Failed to identify durable session owner",
+        )
+        .await?;
+
+        match (has_acp, has_chat) {
+            (true, false) => Ok(Some(ChatMode::Acp)),
+            (false, true) => Ok(Some(ChatMode::Chat)),
+            (true, true) => Err(rpc_err(
+                INVALID_PARAMS,
+                "Session ID matches both ACP and Chat durable history; reconnect the intended session before mutating it",
+            )),
+            (false, false) => Ok(None),
+        }
+    }
+
     /// Flush dirty config paths to disk.
     ///
     /// `_guard` is never read — it is a witness reminding the caller to
@@ -1729,19 +1782,7 @@ impl RpcDispatcher {
                         // model round-trip. Robust against tmux detach, socket
                         // drop, suspend/resume, and daemon restart.
                         if let Some(ref store) = self.ctx.acp_session_store {
-                            let store = store.clone();
-                            let sid = session_id.clone();
-                            let plan = tokio::task::spawn_blocking(move || {
-                                store.get_plan(&sid).unwrap_or_default()
-                            })
-                            .await
-                            .unwrap_or_default();
-                            if !plan.is_empty() {
-                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
-                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
-                                    let _ = self.rpc.send_raw(n).await;
-                                }
-                            }
+                            self.restore_acp_plan(&session_id, Arc::clone(store)).await;
                         }
                     }
                     Ok(Ok(AcpSessionNewLoad::Created)) => {}
@@ -1900,6 +1941,20 @@ impl RpcDispatcher {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
 
+        // A hard-cancelled ACP prompt can remove its live owner before this
+        // handler acquires admission. Preserve the mode that the caller
+        // targeted instead of guessing from whichever durable rows remain.
+        let requested_generation = self.ctx.sessions.get_generation(sid).await;
+        let requested_mode = self.ctx.sessions.chat_mode(sid).await;
+        if self.ctx.sessions.get_generation(sid).await != requested_generation
+            || requested_mode.is_some() != requested_generation.is_some()
+        {
+            return Err(rpc_err(
+                SESSION_BUSY,
+                "Session changed while preparing to kill it",
+            ));
+        }
+
         // Preserve kill semantics by signalling the admitted prompt first,
         // then wait for its finalization before reading mode or tombstoning
         // and removing this exact session incarnation.
@@ -1912,7 +1967,21 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
-        let chat_mode = self.ctx.sessions.chat_mode(sid).await;
+        let admitted_generation = self.ctx.sessions.get_generation(sid).await;
+        if admitted_generation.is_some() && admitted_generation != requested_generation {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session was replaced"));
+        }
+
+        let chat_mode = match requested_mode {
+            Some(mode) => mode,
+            None => match self.ctx.sessions.chat_mode(sid).await {
+                Some(mode) => mode,
+                None => self
+                    .resolve_reaped_session_mode(sid)
+                    .await?
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?,
+            },
+        };
 
         let agent_alias = self
             .ctx
@@ -1929,16 +1998,18 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        let live_acp = matches!(chat_mode.as_ref(), Some(ChatMode::Acp));
+        if matches!(chat_mode, ChatMode::Chat) && self.ctx.sessions.get_agent(sid).await.is_none() {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+
+        let target_is_acp = matches!(chat_mode, ChatMode::Acp);
         let mut durable_kill = None;
-        if live_acp || chat_mode.is_none() {
-            let store = self.ctx.acp_session_store.clone().ok_or_else(|| {
-                if live_acp {
-                    rpc_err(INTERNAL_ERROR, "ACP session store is not available")
-                } else {
-                    rpc_err(SESSION_NOT_FOUND, "Session not found")
-                }
-            })?;
+        if target_is_acp {
+            let store = self
+                .ctx
+                .acp_session_store
+                .clone()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
             let sid_owned = sid.to_string();
             let transitioned =
                 tokio::task::spawn_blocking(move || store.mark_session_killed_atomic(&sid_owned))
@@ -1952,18 +2023,13 @@ impl RpcDispatcher {
                 )) => {
                     durable_kill = Some(false);
                 }
-                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionKillTransition::Missing))
-                    if !live_acp =>
-                {
-                    return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-                }
                 Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionKillTransition::Missing)) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "session/kill: live ACP session had no durable row to tombstone"
+                        "session/kill: selected ACP session had no durable row to tombstone"
                     );
                 }
                 Ok(Err(e)) => {
@@ -2208,6 +2274,7 @@ impl RpcDispatcher {
             .seed_conversation_history_with_event(sid, provider_history)
             .await;
         self.forward_seed_event(sid, seed_event).await;
+        self.restore_acp_plan(sid, Arc::clone(&store)).await;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -3107,14 +3174,30 @@ impl RpcDispatcher {
                 if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
                     && !self.ctx.sessions.has_inflight_turn(&req.session_id)
                 {
-                    recover_acp_checkpoint(Arc::clone(store), &req.session_id)
-                        .await
-                        .map_err(|error| {
-                            rpc_err(
-                                INTERNAL_ERROR,
-                                format!("Failed to recover interrupted ACP turn: {error}"),
-                            )
-                        })?;
+                    let store_for_surface = Arc::clone(store);
+                    let sid = req.session_id.clone();
+                    let supported = run_blocking_rpc(
+                        move || {
+                            Ok(store_for_surface.load_session(&sid)?.is_none_or(|data| {
+                                data.interaction_surface.as_deref().is_none_or(|value| {
+                                    crate::agent::prompt::InteractionSurface::from_persisted(value)
+                                        .is_some()
+                                })
+                            }))
+                        },
+                        "Failed to validate ACP interaction surface",
+                    )
+                    .await?;
+                    if supported {
+                        recover_acp_checkpoint(Arc::clone(store), &req.session_id)
+                            .await
+                            .map_err(|error| {
+                                rpc_err(
+                                    INTERNAL_ERROR,
+                                    format!("Failed to recover interrupted ACP turn: {error}"),
+                                )
+                            })?;
+                    }
                 }
             }
             let store_for_load = store.clone();
@@ -3220,6 +3303,19 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        // Preserve the targeted live domain across hard-cancel finalization.
+        // If no live owner exists, resolve a single durable domain below and
+        // reject collisions instead of deleting from both stores.
+        let requested_generation = self.ctx.sessions.get_generation(&req.session_id).await;
+        let requested_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+        if self.ctx.sessions.get_generation(&req.session_id).await != requested_generation
+            || requested_mode.is_some() != requested_generation.is_some()
+        {
+            return Err(rpc_err(
+                SESSION_BUSY,
+                "Session changed while preparing to delete it",
+            ));
+        }
         self.ctx.sessions.signal_session_removal(&req.session_id);
         let _guard = self
             .ctx
@@ -3229,24 +3325,28 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
-        let chat_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
-        if let Some(store) = self.ctx.acp_session_store.clone() {
+        let admitted_generation = self.ctx.sessions.get_generation(&req.session_id).await;
+        if admitted_generation.is_some() && admitted_generation != requested_generation {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session was replaced"));
+        }
+
+        let chat_mode = match requested_mode {
+            Some(mode) => Some(mode),
+            None => match self.ctx.sessions.chat_mode(&req.session_id).await {
+                Some(mode) => Some(mode),
+                None => self.resolve_reaped_session_mode(&req.session_id).await?,
+            },
+        };
+        if matches!(chat_mode, Some(ChatMode::Acp))
+            && let Some(store) = self.ctx.acp_session_store.clone()
+        {
             let session_id = req.session_id.clone();
-            tokio::task::spawn_blocking(move || {
-                let should_delete = match chat_mode {
-                    Some(crate::rpc::types::ChatMode::Acp) => true,
-                    Some(crate::rpc::types::ChatMode::Chat) => false,
-                    None => store.contains_session(&session_id)?,
-                };
-                if should_delete {
-                    store.delete_session(&session_id)
-                } else {
-                    Ok(false)
-                }
-            })
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to delete ACP session: {e}")))?
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to delete ACP session: {e}")))?;
+            tokio::task::spawn_blocking(move || store.delete_session(&session_id))
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to delete ACP session: {e}")))?
+                .map_err(|e| {
+                    rpc_err(INTERNAL_ERROR, format!("Failed to delete ACP session: {e}"))
+                })?;
         }
 
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
@@ -3260,8 +3360,11 @@ impl RpcDispatcher {
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
-        // Remove from persistent backend — try raw id, then prefixed variants.
-        if let Some(ref backend) = self.ctx.session_backend {
+        // Remove only the selected Chat durable owner. ACP and Chat rows may
+        // legitimately share the caller-supplied id.
+        if matches!(chat_mode, Some(ChatMode::Chat))
+            && let Some(ref backend) = self.ctx.session_backend
+        {
             for key in &[
                 req.session_id.clone(),
                 format!("rpc_{}", req.session_id),
@@ -10974,7 +11077,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("Failed to load ACP session messages")
+                .contains("Failed to validate ACP interaction surface")
         );
     }
 
@@ -11198,6 +11301,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reaped_acp_session_restores_and_replays_durable_plan() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-plan-replay".into());
+
+        let sid = "acp-reaped-plan";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+        let plan = vec![PlanEntry {
+            content: "Resume durable work".to_string(),
+            status: PlanStatus::InProgress,
+            priority: PlanPriority::High,
+            active_form: Some("Resuming durable work".to_string()),
+        }];
+        acp_store.set_plan(sid, &plan).unwrap();
+        assert!(sessions.remove(sid).await);
+
+        let _guard = sessions.session_queue.acquire(sid).await.unwrap();
+        assert!(
+            dispatcher
+                .rehydrate_reaped_session_under_guard(sid)
+                .await
+                .is_some()
+        );
+        assert_eq!(sessions.get_plan(sid).await.unwrap(), plan);
+
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("plan replay notification should arrive")
+            .expect("RPC writer should remain open");
+        let notification: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(notification["params"]["type"], "plan");
+        assert_eq!(notification["params"]["session_id"], sid);
+        assert_eq!(
+            notification["params"]["entries"][0]["content"],
+            "Resume durable work"
+        );
+    }
+
+    #[tokio::test]
     async fn rehydrate_rejects_unsupported_surface_without_promoting_checkpoint() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -11256,6 +11422,45 @@ mod tests {
             serde_json::to_value(&recovered.messages[history.len()]).unwrap(),
             serde_json::to_value(&pending).unwrap(),
             "manual recovery must retain the pending checkpoint content"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_messages_leaves_unsupported_surface_checkpoint_pending() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-messages-unsupported-surface";
+        acp_store
+            .create_session_with_interaction_surface(
+                sid,
+                "test-agent",
+                "/tmp/test-agent",
+                Some("unsupported_surface"),
+            )
+            .unwrap();
+        let history = ConversationMessage::Chat(ChatMessage::assistant("existing history"));
+        acp_store
+            .append_turn(sid, std::slice::from_ref(&history))
+            .unwrap();
+        let pending = ConversationMessage::Chat(ChatMessage::user("pending question"));
+        acp_store
+            .begin_turn_checkpoint(sid, "pending-turn", std::slice::from_ref(&pending))
+            .unwrap();
+
+        let result = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect("existing durable history should remain readable");
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["messages"][0]["content"], "existing history");
+        assert!(
+            acp_store
+                .recover_turn_checkpoint(sid, "manual recovery")
+                .unwrap(),
+            "unsupported surface reads must leave the checkpoint recoverable"
         );
     }
 
@@ -11348,6 +11553,247 @@ mod tests {
                 .is_some(),
             "durable deletion failure must preserve the RPC channel registration"
         );
+    }
+
+    #[tokio::test]
+    async fn acp_session_delete_preserves_colliding_chat_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "delete-live-acp-chat-collision";
+        let chat_key = format!("rpc_{sid}");
+        chat_backend
+            .set_session_agent_alias(&chat_key, "test-agent")
+            .unwrap();
+        chat_backend
+            .append(&chat_key, &ChatMessage::user("retained chat history"))
+            .unwrap();
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("ACP session/new should succeed");
+
+        dispatcher
+            .handle_session_delete(&json!({ "session_id": sid }))
+            .await
+            .expect("live ACP delete should succeed");
+
+        assert!(acp_store.load_session(sid).unwrap().is_none());
+        assert!(chat_backend.session_exists(&chat_key));
+        assert_eq!(
+            chat_backend.load(&chat_key)[0].content,
+            "retained chat history"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_delete_rejects_ambiguous_reaped_durable_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "delete-reaped-owner-collision";
+        let chat_key = format!("rpc_{sid}");
+        chat_backend
+            .set_session_agent_alias(&chat_key, "test-agent")
+            .unwrap();
+        chat_backend
+            .append(&chat_key, &ChatMessage::user("retained chat history"))
+            .unwrap();
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent")
+            .unwrap();
+
+        let error = dispatcher
+            .handle_session_delete(&json!({ "session_id": sid }))
+            .await
+            .expect_err("ambiguous reaped delete must fail closed");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(acp_store.load_session(sid).unwrap().is_some());
+        assert!(chat_backend.session_exists(&chat_key));
+    }
+
+    #[tokio::test]
+    async fn acp_session_kill_rejects_ambiguous_reaped_durable_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "kill-reaped-owner-collision";
+        let chat_key = format!("rpc_{sid}");
+        chat_backend
+            .set_session_agent_alias(&chat_key, "test-agent")
+            .unwrap();
+        chat_backend
+            .append(&chat_key, &ChatMessage::user("retained chat history"))
+            .unwrap();
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent")
+            .unwrap();
+
+        let error = dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect_err("ambiguous reaped kill must fail closed");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(!acp_store.is_session_killed(sid).unwrap());
+        assert!(chat_backend.session_exists(&chat_key));
+    }
+
+    #[tokio::test]
+    async fn acp_session_kill_preserves_target_after_owner_disappears() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "kill-live-acp-chat-collision";
+        let chat_key = format!("rpc_{sid}");
+        chat_backend
+            .set_session_agent_alias(&chat_key, "test-agent")
+            .unwrap();
+        chat_backend
+            .append(&chat_key, &ChatMessage::user("retained chat history"))
+            .unwrap();
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("ACP session/new should succeed");
+
+        let guard = sessions.session_queue.acquire(sid).await.unwrap();
+        let kill_handle = dispatcher.spawn_handle();
+        let sid_for_kill = sid.to_string();
+        let kill_task = zeroclaw_spawn::spawn!(async move {
+            kill_handle
+                .handle_session_kill(&json!({ "session_id": sid_for_kill }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if sessions.session_queue.queue_depth(sid).await == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("kill must queue after capturing the live ACP mode");
+
+        assert!(
+            sessions.remove(sid).await,
+            "simulate hard-cancel live removal"
+        );
+        drop(guard);
+        let result = kill_task
+            .await
+            .expect("kill task must not panic")
+            .expect("captured ACP kill should succeed after live removal");
+        assert_eq!(result["killed"], true);
+        assert!(acp_store.is_session_killed(sid).unwrap());
+        assert!(chat_backend.session_exists(&chat_key));
+        assert_eq!(
+            chat_backend.load(&chat_key)[0].content,
+            "retained chat history"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_removals_reject_replaced_live_generation() {
+        for method in ["kill", "delete"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, _chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = format!("acp-replaced-before-{method}");
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "acp",
+                    "session_id": sid,
+                }))
+                .await
+                .expect("initial ACP session/new should succeed");
+
+            let original_generation = sessions.get_generation(&sid).await.unwrap();
+            let held = sessions.session_queue.acquire(&sid).await.unwrap();
+            let replacement_handle = dispatcher.spawn_handle();
+            let replacement_sid = sid.clone();
+            let replacement = zeroclaw_spawn::spawn!(async move {
+                replacement_handle
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias": "test-agent",
+                        "chat_mode": "chat",
+                        "session_id": replacement_sid,
+                    }))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while sessions.session_queue.queue_depth(&sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("replacement must queue ahead of removal");
+
+            let removal_handle = dispatcher.spawn_handle();
+            let removal_sid = sid.clone();
+            let removal = zeroclaw_spawn::spawn!(async move {
+                if method == "kill" {
+                    removal_handle
+                        .handle_session_kill(&json!({ "session_id": removal_sid }))
+                        .await
+                } else {
+                    removal_handle
+                        .handle_session_delete(&json!({ "session_id": removal_sid }))
+                        .await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while sessions.session_queue.queue_depth(&sid).await < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removal must queue after capturing the ACP generation");
+
+            drop(held);
+            replacement
+                .await
+                .expect("replacement task must not panic")
+                .expect("replacement Chat session/new should succeed");
+            let error = removal
+                .await
+                .expect("removal task must not panic")
+                .expect_err("stale removal must reject a replacement generation");
+            assert_eq!(error.code, SESSION_NOT_FOUND);
+            assert_ne!(
+                sessions.get_generation(&sid).await,
+                Some(original_generation),
+                "replacement must install a distinct generation"
+            );
+            assert_eq!(sessions.chat_mode(&sid).await, Some(ChatMode::Chat));
+            assert!(
+                acp_store.load_session(&sid).unwrap().is_some(),
+                "stale {method} must preserve the original ACP durable row"
+            );
+            assert!(
+                !acp_store.is_session_killed(&sid).unwrap(),
+                "stale {method} must not tombstone the original ACP durable row"
+            );
+        }
     }
 
     #[tokio::test]
