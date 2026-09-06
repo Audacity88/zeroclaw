@@ -725,6 +725,9 @@ async fn send(
 async fn dial_pinned(addresses: &[SocketAddr], deadline: Instant) -> Result<TcpStream, ErrorCode> {
     let mut attempted = false;
     for address in addresses {
+        if Instant::now() >= deadline {
+            return Err(ErrorCode::ConnectionTimeout);
+        }
         attempted = true;
         match timeout_at(deadline, TcpStream::connect(*address)).await {
             Ok(Ok(stream)) => return Ok(stream),
