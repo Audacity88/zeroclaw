@@ -7292,12 +7292,13 @@ mod tests {
             sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
             ..SopConfig::default()
         };
-        let config = Config {
+        let mut config = Config {
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             sop: sop_config.clone(),
             ..Config::default()
         };
+        config.agents.insert("alpha".into(), Default::default());
         let sop = Sop {
             name: "rpc-resumed-execute".to_string(),
             description: "RPC resume driver regression".to_string(),
@@ -7321,7 +7322,9 @@ mod tests {
         };
         crate::sop::save_sop(&sops_dir, &sop).expect("save temporary SOP");
 
-        let mut engine = crate::sop::SopEngine::new(sop_config);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let mut engine = crate::sop::SopEngine::new(sop_config)
+            .with_execution_capability(authority.execution_capability());
         engine.reload(tmp.path());
         let engine = Arc::new(Mutex::new(engine));
         let run_id = {
