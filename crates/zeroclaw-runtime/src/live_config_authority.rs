@@ -727,7 +727,7 @@ impl AgentLifecycleCoordinator {
         if state.closing {
             return Err(AgentAdmissionError::GenerationClosing);
         }
-        let lifecycle = state.aliases.get(alias).map_or(Ok(()), |lifecycle| {
+        state.aliases.get(alias).map_or(Ok(()), |lifecycle| {
             if lifecycle.deleting {
                 Err(AgentAdmissionError::Deleting {
                     alias: alias.to_string(),
@@ -739,8 +739,7 @@ impl AgentLifecycleCoordinator {
             } else {
                 Ok(())
             }
-        });
-        lifecycle
+        })
     }
 
     /// Enter destructive work for one alias after proving no admission or

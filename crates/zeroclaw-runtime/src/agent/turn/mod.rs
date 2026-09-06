@@ -1965,7 +1965,23 @@ async fn drive_live_sop_actions(
                         .as_ref()
                         .map(|witness| {
                             let alias = step.agent.as_deref().or(agent_alias).ok_or_else(|| {
-                                anyhow::anyhow!("managed SOP step has no executing agent")
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "run_id": run_id,
+                                            "step": step.number,
+                                        })
+                                    ),
+                                    "managed SOP step has no executing agent"
+                                );
+                                anyhow::Error::msg("managed SOP step has no executing agent")
                             })?;
                             witness.admit(alias).map_err(anyhow::Error::from)
                         })
