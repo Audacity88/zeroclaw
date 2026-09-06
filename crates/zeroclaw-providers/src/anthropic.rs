@@ -712,6 +712,52 @@ impl AnthropicModelProvider {
         None
     }
 
+    /// Place the prior-turn breakpoint when the request's marker budget
+    /// allows it.
+    ///
+    /// Anthropic caps a request at four `cache_control` blocks counting
+    /// tools, system, and messages together. OAuth requests spend two system
+    /// slots (the identity prefix and the system text) and tool-bearing
+    /// requests spend one on the last tool definition, so the prior-turn
+    /// marker is placed only when those committed markers plus the rolling
+    /// marker leave a free slot. Placing past the cap would 400 every
+    /// request in that configuration, so the marker is skipped there instead;
+    /// the rolling breakpoint still covers the newest history.
+    fn apply_prior_turn_breakpoint_within_budget(
+        system: Option<&SystemPrompt>,
+        is_oauth: bool,
+        has_tools: bool,
+        messages: &mut [NativeMessage],
+    ) {
+        let committed_markers = Self::marked_system_block_count(system)
+            + usize::from(is_oauth)
+            + usize::from(has_tools)
+            + usize::from(
+                messages
+                    .last()
+                    .is_some_and(Self::has_cacheable_trailing_block),
+            );
+        if committed_markers >= 4 {
+            return;
+        }
+        if let Some(index) = Self::prior_turn_breakpoint_index(messages) {
+            Self::apply_cache_to_message_at(messages, index);
+        }
+    }
+
+    /// Number of system blocks that already carry a marker. The converted
+    /// system prompt is a single marked block today, so this is 0 or 1; the
+    /// count reads the blocks rather than assuming that shape.
+    fn marked_system_block_count(system: Option<&SystemPrompt>) -> usize {
+        match system {
+            Some(SystemPrompt::Blocks(blocks)) => blocks
+                .iter()
+                .filter(|block| block.cache_control.is_some())
+                .count(),
+            _ => 0,
+        }
+    }
+
     fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
@@ -2550,9 +2596,12 @@ impl ModelProvider for AnthropicModelProvider {
         // Auto-cache last message if conversation is long
         if Self::should_cache_conversation(request.messages) {
             Self::apply_cache_to_last_message(&mut messages);
-            if let Some(index) = Self::prior_turn_breakpoint_index(&messages) {
-                Self::apply_cache_to_message_at(&mut messages, index);
-            }
+            Self::apply_prior_turn_breakpoint_within_budget(
+                system_prompt.as_ref(),
+                Self::is_setup_token(credential),
+                request.tools.is_some_and(|tools| !tools.is_empty()),
+                &mut messages,
+            );
         }
 
         // Check for tool_choice override from the agent loop (e.g. "any"
@@ -2755,9 +2804,12 @@ impl ModelProvider for AnthropicModelProvider {
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
         if Self::should_cache_conversation(request.messages) {
             Self::apply_cache_to_last_message(&mut messages);
-            if let Some(index) = Self::prior_turn_breakpoint_index(&messages) {
-                Self::apply_cache_to_message_at(&mut messages, index);
-            }
+            Self::apply_prior_turn_breakpoint_within_budget(
+                system_prompt.as_ref(),
+                Self::is_setup_token(&credential),
+                request.tools.is_some_and(|tools| !tools.is_empty()),
+                &mut messages,
+            );
         }
 
         let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
