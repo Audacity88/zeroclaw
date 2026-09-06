@@ -2027,19 +2027,12 @@ impl RpcDispatcher {
         if self.ctx.sessions.get_agent(sid).await.is_some() {
             return None;
         }
-        if let Err(error) = recover_acp_checkpoint(Arc::clone(&store), sid).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"session_id": sid, "error": error})),
-                "Failed to recover interrupted ACP turn before rehydration"
-            );
-            return None;
-        }
         let sid_owned = sid.to_string();
-        let loaded =
-            tokio::task::spawn_blocking(move || store.load_session_for_restore(&sid_owned)).await;
+        let store_for_load = Arc::clone(&store);
+        let loaded = tokio::task::spawn_blocking(move || {
+            store_for_load.load_session_for_restore(&sid_owned)
+        })
+        .await;
         let data = match loaded {
             Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
             Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
@@ -2083,10 +2076,83 @@ impl RpcDispatcher {
             }
         };
 
+        if let Some(value) = data.interaction_surface.as_deref()
+            && crate::agent::prompt::InteractionSurface::from_persisted(value).is_none()
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": sid,
+                        "interaction_surface": value,
+                    })),
+                "session/prompt: refusing to rehydrate an unsupported interaction surface"
+            );
+            return None;
+        }
+
+        if let Err(error) = recover_acp_checkpoint(Arc::clone(&store), sid).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"session_id": sid, "error": error})),
+                "Failed to recover interrupted ACP turn before rehydration"
+            );
+            return None;
+        }
+
+        let sid_owned = sid.to_string();
+        let store_for_reload = Arc::clone(&store);
+        let loaded = tokio::task::spawn_blocking(move || {
+            store_for_reload.load_session_for_restore(&sid_owned)
+        })
+        .await;
+        let data = match loaded {
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => return None,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+            Ok(Err(error)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": error.to_string(),
+                        })),
+                    "session/prompt: failed to reload ACP session after checkpoint recovery"
+                );
+                return None;
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": error.to_string(),
+                        })),
+                    "session/prompt: failed to reload ACP session after checkpoint recovery"
+                );
+                return None;
+            }
+        };
+
         let provider_history =
             zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
                 &data.messages,
             );
+        let interaction_context = match data.interaction_surface.as_deref() {
+            Some(value) => crate::agent::prompt::InteractionSurface::from_persisted(value)
+                .map(|surface| surface.resolve()),
+            None => None,
+        };
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
@@ -2107,26 +2173,6 @@ impl RpcDispatcher {
         )
         .await
         .ok()?;
-        let interaction_context = match data.interaction_surface.as_deref() {
-            Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
-                Some(surface) => Some(surface.resolve()),
-                None => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read,)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "session_id": sid,
-                                "interaction_surface": value,
-                            })),
-                        "session/prompt: refusing to rehydrate an unsupported interaction surface"
-                    );
-                    return None;
-                }
-            },
-            None => None,
-        };
         agent.set_interaction_context(interaction_context);
 
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
@@ -2191,6 +2237,8 @@ impl RpcDispatcher {
             ));
         }
 
+        let live_generation_at_entry = self.ctx.sessions.get_generation(sid).await;
+
         // Admission fences the complete session incarnation: agent, mode,
         // attachments, durable writes, and terminal state are all resolved
         // while same-ID replacement is excluded.
@@ -2208,6 +2256,18 @@ impl RpcDispatcher {
             .sessions
             .wait_test_prompt_registration_pause()
             .await;
+
+        if let Some(live_generation_at_entry) = live_generation_at_entry
+            && self.ctx.sessions.get_generation(sid).await != Some(live_generation_at_entry)
+        {
+            self.emit_turn_complete(
+                sid,
+                crate::rpc::types::TurnCompletionOutcome::Failed,
+                "turn cancelled by daemon: stale_session_prompt".to_string(),
+            )
+            .await;
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
 
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
@@ -3168,6 +3228,27 @@ impl RpcDispatcher {
             .acquire(&req.session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
+        let chat_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+        if let Some(store) = self.ctx.acp_session_store.clone() {
+            let session_id = req.session_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let should_delete = match chat_mode {
+                    Some(crate::rpc::types::ChatMode::Acp) => true,
+                    Some(crate::rpc::types::ChatMode::Chat) => false,
+                    None => store.contains_session(&session_id)?,
+                };
+                if should_delete {
+                    store.delete_session(&session_id)
+                } else {
+                    Ok(false)
+                }
+            })
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to delete ACP session: {e}")))?
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to delete ACP session: {e}")))?;
+        }
+
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -11114,6 +11195,242 @@ mod tests {
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
         );
+    }
+
+    #[tokio::test]
+    async fn rehydrate_rejects_unsupported_surface_without_promoting_checkpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-rehydrate-unsupported-surface";
+        acp_store
+            .create_session_with_interaction_surface(
+                sid,
+                "test-agent",
+                "/tmp/test-agent",
+                Some("unsupported_surface"),
+            )
+            .unwrap();
+        let history = vec![ConversationMessage::Chat(ChatMessage::assistant(
+            "existing history",
+        ))];
+        acp_store.append_turn(sid, &history).unwrap();
+        let pending = ConversationMessage::Chat(ChatMessage::user("pending question"));
+        acp_store
+            .begin_turn_checkpoint(sid, "pending-turn", std::slice::from_ref(&pending))
+            .unwrap();
+
+        let _guard = sessions.session_queue.acquire(sid).await.unwrap();
+        assert!(
+            dispatcher
+                .rehydrate_reaped_session_under_guard(sid)
+                .await
+                .is_none(),
+            "unsupported persisted surfaces must not rehydrate"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "rejected rehydration must not install a live successor"
+        );
+        let unchanged = acp_store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&unchanged.messages).unwrap(),
+            serde_json::to_value(&history).unwrap(),
+            "rejected rehydration must leave existing history unchanged"
+        );
+        assert!(
+            acp_store
+                .recover_turn_checkpoint(sid, "test recovery")
+                .unwrap(),
+            "rejected rehydration must leave the checkpoint recoverable"
+        );
+        let recovered = acp_store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&recovered.messages[0]).unwrap(),
+            serde_json::to_value(&history[0]).unwrap(),
+            "manual recovery must retain the original history"
+        );
+        assert_eq!(
+            serde_json::to_value(&recovered.messages[history.len()]).unwrap(),
+            serde_json::to_value(&pending).unwrap(),
+            "manual recovery must retain the pending checkpoint content"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_delete_acp_removes_durable_history_and_checkpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-delete-durable-history";
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": sid,
+        });
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("ACP session/new should succeed");
+        let pending = ConversationMessage::Chat(ChatMessage::user("pending question"));
+        acp_store
+            .begin_turn_checkpoint(sid, "pending-turn", std::slice::from_ref(&pending))
+            .unwrap();
+
+        dispatcher
+            .handle_session_delete(&json!({ "session_id": sid }))
+            .await
+            .expect("ACP session/delete should succeed");
+        assert!(sessions.get_agent(sid).await.is_none());
+        assert!(acp_store.load_session(sid).unwrap().is_none());
+        assert!(
+            !acp_store
+                .recover_turn_checkpoint(sid, "must not recover")
+                .unwrap()
+        );
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("same-ID ACP session/new should create a fresh row");
+        assert!(
+            acp_store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "same-ID explicit ACP reuse must begin with empty history"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_delete_acp_storage_failure_preserves_live_session() {
+        use rusqlite::Connection;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-delete-storage-failure";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("ACP session/new should succeed");
+
+        let db = Connection::open(data_dir.join("sessions/acp-sessions.db")).unwrap();
+        db.execute("ALTER TABLE acp_sessions RENAME TO acp_sessions_broken", [])
+            .unwrap();
+
+        let error = dispatcher
+            .handle_session_delete(&json!({ "session_id": sid }))
+            .await
+            .expect_err("a broken ACP table must fail session/delete");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        let live = sessions
+            .get_agent(sid)
+            .await
+            .expect("durable deletion failure must preserve the live session");
+        assert!(
+            live.lock()
+                .await
+                .channel_handles()
+                .get_channel("rpc")
+                .is_some(),
+            "durable deletion failure must preserve the RPC channel registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_acp_prompt_rejects_after_ahead_close_removes_its_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-stale-queued-prompt";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("ACP session/new should succeed");
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "test requires durable ACP state that close leaves resumable"
+        );
+
+        let ctx = Arc::clone(&dispatcher.ctx);
+        let (tx, mut updates) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-stale-prompt".into());
+
+        let held = sessions.session_queue.acquire(sid).await.unwrap();
+        let removal_dispatcher = dispatcher.spawn_handle();
+        let removal_sid = sid.to_string();
+        let removal = zeroclaw_spawn::spawn!(async move {
+            removal_dispatcher
+                .handle_session_close(&json!({ "session_id": removal_sid }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sessions.session_queue.queue_depth(sid).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("removal must queue ahead of the prompt");
+
+        let prompt_dispatcher = dispatcher.spawn_handle();
+        let prompt_sid = sid.to_string();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_dispatcher
+                .handle_session_prompt(&json!({
+                    "session_id": prompt_sid,
+                    "prompt": "must not run after removal",
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sessions.session_queue.queue_depth(sid).await < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prompt must queue behind the removal");
+
+        drop(held);
+        removal
+            .await
+            .expect("removal task must not panic")
+            .expect("removal must succeed");
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "session/close must leave the ACP row available to expose stale rehydration"
+        );
+        let error = prompt
+            .await
+            .expect("prompt task must not panic")
+            .expect_err("queued prompt must reject the removed generation");
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+        let raw = updates
+            .try_recv()
+            .expect("stale prompt rejection must emit terminal session/update");
+        let update: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(update["method"], notification::SESSION_UPDATE);
+        assert_eq!(update["params"]["session_id"], sid);
+        assert_eq!(update["params"]["outcome"], "failed");
+        assert!(sessions.get_agent(sid).await.is_none());
     }
 
     #[tokio::test]
