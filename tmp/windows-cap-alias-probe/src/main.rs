@@ -1,28 +1,16 @@
 #[cfg(not(windows))]
 compile_error!("this probe must run on Windows");
 
-use cap_fs_ext::DirExt;
-use cap_primitives::fs::MetadataExt as CapMetadataExt;
+use cap_fs_ext::{DirExt, MetadataExt};
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, Metadata as CapMetadata};
+use cap_std::fs::Dir;
 use std::io;
-use std::os::windows::fs::MetadataExt as StdMetadataExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-type Identity = (Option<u32>, Option<u64>);
+type Identity = (u64, u64);
 
-fn cap_identity(metadata: &CapMetadata) -> Identity {
-    (
-        CapMetadataExt::volume_serial_number(metadata),
-        CapMetadataExt::file_index(metadata),
-    )
-}
-
-fn std_identity(metadata: &std::fs::Metadata) -> Identity {
-    (
-        StdMetadataExt::volume_serial_number(metadata),
-        StdMetadataExt::file_index(metadata),
-    )
+fn identity(metadata: &impl MetadataExt) -> Identity {
+    (metadata.dev(), metadata.ino())
 }
 
 fn report(root: &Dir, name: &str, baseline_identity: Identity) {
@@ -31,8 +19,8 @@ fn report(root: &Dir, name: &str, baseline_identity: Identity) {
         Ok(metadata) => println!(
             "  symlink_metadata=ok is_dir={} identity={:?} same_as_backups={}",
             metadata.is_dir(),
-            cap_identity(&metadata),
-            cap_identity(&metadata) == baseline_identity
+            identity(&metadata),
+            identity(&metadata) == baseline_identity
         ),
         Err(error) => println!(
             "  symlink_metadata=err kind={:?} raw_os_error={:?}",
@@ -47,7 +35,7 @@ fn report(root: &Dir, name: &str, baseline_identity: Identity) {
             let opened_identity = opened
                 .into_std_file()
                 .metadata()
-                .map(|metadata| std_identity(&metadata));
+                .map(|metadata| identity(&metadata));
             println!(
                 "  open_dir_nofollow=ok identity={opened_identity:?} same_as_backups={} marker={marker:?}",
                 opened_identity
@@ -78,7 +66,7 @@ fn main() -> io::Result<()> {
     root.create_dir("backups")?;
     root.write("backups/probe-marker.txt", b"zeroclaw-windows-alias-probe")?;
     let baseline = root.open_dir_nofollow("backups")?;
-    let baseline_identity = std_identity(&baseline.into_std_file().metadata()?);
+    let baseline_identity = identity(&baseline.into_std_file().metadata()?);
 
     println!("fixture={}", fixture.display());
     println!("baseline_identity={baseline_identity:?}");
