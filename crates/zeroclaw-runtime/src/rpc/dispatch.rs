@@ -791,7 +791,18 @@ impl RpcDispatcher {
             return;
         }
 
-        // Exhaustive match — compiler enforces every Method has a handler.
+        Box::pin(self.dispatch_method(method, &req, req_id, is_notification)).await;
+    }
+
+    async fn dispatch_method(
+        &mut self,
+        method: Method,
+        req: &zeroclaw_api::jsonrpc::JsonRpcRequest,
+        req_id: Value,
+        is_notification: bool,
+    ) {
+        // Keep the exhaustive handler future behind one fixed-size pointer so
+        // adding a handler cannot enlarge every RPC transport worker's stack.
         let result = match method {
             // Core
             Method::Initialize => self.handle_initialize(&req.params).await,
@@ -12380,6 +12391,21 @@ mod tests {
             .expect("stack regression thread should spawn")
             .join()
             .expect("session/new should not exhaust a two-megabyte stack");
+    }
+
+    #[test]
+    fn process_line_future_keeps_handler_dispatch_off_the_transport_stack() {
+        let (mut dispatcher, _rx) = make_bidi_test_dispatcher();
+        let future = dispatcher
+            .process_line_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"status","params":{}}"#);
+        let future_size = std::mem::size_of_val(&future);
+        drop(future);
+
+        assert!(
+            future_size < 64 * 1024,
+            "process_line future is {future_size} bytes; keep the exhaustive handler dispatch \
+             behind a fixed-size pointer"
+        );
     }
 
     #[tokio::test]
