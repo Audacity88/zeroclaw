@@ -773,14 +773,13 @@ impl Channel for SignalChannel {
                                         for msg in messages {
                                             if let Some(resolution) =
                                                 self.resolve_approval_reply(&msg).await
-                                            {
-                                                if !matches!(
+                                                && !matches!(
                                                     resolution,
                                                     crate::util::PendingApprovalResolution::NotFound
-                                                ) {
-                                                    consumed_as_approval = true;
-                                                    continue;
-                                                }
+                                                )
+                                            {
+                                                consumed_as_approval = true;
+                                                continue;
                                             }
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
@@ -1904,22 +1903,10 @@ mod tests {
     #[tokio::test]
     async fn approval_reply_uses_canonical_group_destination_and_rejects_replay() {
         let ch = make_channel();
-        let group_envelope = Envelope {
-            source: Some("+1111111111".to_string()),
-            source_number: Some("+1111111111".to_string()),
-            data_message: Some(DataMessage {
-                message: Some("abc123 deny".to_string()),
-                timestamp: Some(1_700_000_000_000),
-                group_info: Some(GroupInfo {
-                    group_id: Some("group123".to_string()),
-                }),
-                attachments: None,
-                poll_answer: None,
-                poll_vote: None,
-            }),
-            story_message: None,
-            timestamp: Some(1_700_000_000_000),
-        };
+        let mut group_envelope = make_envelope(Some("+1111111111"), Some("abc123 deny"));
+        group_envelope.data_message.as_mut().unwrap().group_info = Some(GroupInfo {
+            group_id: Some("group123".to_string()),
+        });
         let (approval_tx, mut approval_rx) = oneshot::channel();
         ch.pending_approvals.lock().await.insert(
             "abc123".to_string(),
