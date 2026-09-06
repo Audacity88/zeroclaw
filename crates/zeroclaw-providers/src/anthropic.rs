@@ -2550,6 +2550,9 @@ impl ModelProvider for AnthropicModelProvider {
         // Auto-cache last message if conversation is long
         if Self::should_cache_conversation(request.messages) {
             Self::apply_cache_to_last_message(&mut messages);
+            if let Some(index) = Self::prior_turn_breakpoint_index(&messages) {
+                Self::apply_cache_to_message_at(&mut messages, index);
+            }
         }
 
         // Check for tool_choice override from the agent loop (e.g. "any"
@@ -2752,6 +2755,9 @@ impl ModelProvider for AnthropicModelProvider {
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
         if Self::should_cache_conversation(request.messages) {
             Self::apply_cache_to_last_message(&mut messages);
+            if let Some(index) = Self::prior_turn_breakpoint_index(&messages) {
+                Self::apply_cache_to_message_at(&mut messages, index);
+            }
         }
 
         let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE

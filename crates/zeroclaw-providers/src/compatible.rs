@@ -990,9 +990,13 @@ impl OpenAiCompatibleModelProvider {
     /// is marked unconditionally. (b) The last message's trailing text part
     /// carries a rolling breakpoint once the conversation has more than one
     /// non-system message, the same gate the native provider applies before
-    /// `apply_cache_to_last_message`. At most two breakpoints per request;
-    /// only breakpoint-carrying messages convert from string content to
-    /// block form, every other message serializes exactly as before.
+    /// `apply_cache_to_last_message`. (c) The previous turn's last message
+    /// (the index before the last user message) carries the prior-turn
+    /// breakpoint under the shared placement rule, so turn-boundary cache
+    /// misses fall back to the previous turn instead of the system prompt.
+    /// At most three breakpoints per request; only breakpoint-carrying
+    /// messages convert from string content to block form, every other
+    /// message serializes exactly as before.
     fn apply_cache_breakpoints<T: CacheBreakpointMessage>(
         &self,
         messages: &mut [T],
@@ -1026,6 +1030,11 @@ impl OpenAiCompatibleModelProvider {
             && let Some(last) = messages.last_mut()
             && last.cache_role() != "system"
             && let Some(content) = last.cache_content()
+        {
+            content.apply_cache_control();
+        }
+        if let Some(index) = Self::prior_turn_breakpoint_index(messages, carrier)
+            && let Some(content) = messages[index].cache_content()
         {
             content.apply_cache_control();
         }
