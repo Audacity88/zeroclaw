@@ -12,6 +12,7 @@ repo_root="${fixture_dir}/repo"
 mkdir -p "$repo_root/crates/zeroclaw-channels" \
     "$repo_root/crates/zeroclaw-api" \
     "$repo_root/crates/zeroclaw-plugins" \
+    "$repo_root/crates/zeroclaw-runtime" \
     "$repo_root/crates/zeroclaw-gateway" \
     "$repo_root/crates/zeroclaw-providers" \
     "$repo_root/crates/zeroclaw-plugins/tests/fixtures/channel-fixture" \
@@ -24,6 +25,7 @@ cat > "$metadata_file" <<EOF
     {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "name": "zeroclaw-api", "manifest_path": "crates/zeroclaw-api/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "name": "zeroclaw-channels", "manifest_path": "crates/zeroclaw-channels/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "name": "zeroclaw-plugins", "manifest_path": "crates/zeroclaw-plugins/Cargo.toml"},
+    {"id": "path+file://${repo_root}/crates/zeroclaw-runtime#zeroclaw-runtime 0.8.4", "name": "zeroclaw-runtime", "manifest_path": "crates/zeroclaw-runtime/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4", "name": "zeroclaw-gateway", "manifest_path": "crates/zeroclaw-gateway/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "name": "zeroclaw-providers", "manifest_path": "crates/zeroclaw-providers/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "name": "zeroclaw-channel-plugin-fixture", "manifest_path": "crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml"},
@@ -34,6 +36,7 @@ cat > "$metadata_file" <<EOF
     "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4",
+    "path+file://${repo_root}/crates/zeroclaw-runtime#zeroclaw-runtime 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0",
@@ -41,10 +44,11 @@ cat > "$metadata_file" <<EOF
   ],
   "resolve": {
     "nodes": [
-      {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
+      {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-runtime#zeroclaw-runtime 0.8.4"}]},
       {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}]},
+      {"id": "path+file://${repo_root}/crates/zeroclaw-runtime#zeroclaw-runtime 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
       {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "deps": []},
@@ -118,6 +122,12 @@ assert_selection "deduplication" scoped '["zeroclaw","zeroclaw-channels"]' '' "$
 
 printf '%s\n' 'crates/zeroclaw-channels/tests/fixture.md' > "$paths_file"
 assert_selection "test fixture" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
+
+printf '%s\n' 'crates/zeroclaw-channels/locales/en/cli.ftl' > "$paths_file"
+assert_selection "package locale resource" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
+
+printf '%s\n' 'crates/zeroclaw-runtime/locales/en/cli.ftl' > "$paths_file"
+assert_selection "plugin-host package locale resource" scoped '["zeroclaw","zeroclaw-runtime"]' '' "$paths_file" true
 
 printf '%s\n' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
 assert_selection "dynamically consumed plugin fixture" full '[]' 'Dynamically consumed plugin test fixtures require the full suite.' "$paths_file" true

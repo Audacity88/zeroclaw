@@ -214,6 +214,8 @@ def is_package_test_path(path: str, package: Package, repo_root: Path) -> bool:
         return True
     if relative_path.parts and relative_path.parts[0] in {"src", "tests", "benches", "examples"}:
         return True
+    if package.root != repo_root and relative_path.parts and relative_path.parts[0] == "locales":
+        return True
     return package.root != repo_root and relative_path.suffix.lower() == ".rs"
 
 
