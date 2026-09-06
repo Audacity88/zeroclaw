@@ -11532,7 +11532,8 @@ mod tests {
         // is owned by the CHILD's caller identity ("middle"), not the root's:
         // the background spawn ran on middle's delegate tool. The reader below
         // models that owner; the root tool would be filtered out as a
-        // non-owner (the retrieval gap for bounded chains is #10644).
+        // non-owner; the retrieval gap for bounded chains is tracked as a
+        // follow-up issue on the repository issue tracker.
         let reader = bounded_subdelegation_tool(&config)
             .with_workspace_dir(workspace.clone())
             .with_task_control_plane(task_control_plane(task_store))
