@@ -1044,6 +1044,45 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
+    /// Index of the prior turn's final message for the third cache
+    /// breakpoint, or `None` when no valid placement exists.
+    ///
+    /// The last user message starts the current turn, so the message before
+    /// it is the previous turn's last message (usually the assistant's final
+    /// text), and every request within the current turn shares the wire
+    /// prefix through that index byte-for-byte. The candidate is rejected
+    /// when it sits at the system/carrier position or carries no markable
+    /// content; rejection walks back at most two steps (tool-call carriers
+    /// and trailing-image messages are breakpoint-transparent) and then gives
+    /// up, because a marker placed further back would not survive the turn
+    /// and prefix stability is worth more than the extra cache hit. The
+    /// candidate can never be the final message: it starts at least one index
+    /// before the last user message and only moves backwards, so it never
+    /// collides with the rolling marker.
+    ///
+    /// Twin of `AnthropicModelProvider::prior_turn_breakpoint_index` in
+    /// `anthropic.rs`; duplicated because a shared trait would drag the two
+    /// providers' wire message types across module boundaries.
+    fn prior_turn_breakpoint_index<T: CacheBreakpointMessage>(
+        messages: &[T],
+        carrier: Option<usize>,
+    ) -> Option<usize> {
+        let last_user = messages.iter().rposition(|m| m.cache_role() == "user")?;
+        let mut candidate = last_user.checked_sub(1)?;
+        for _ in 0..3 {
+            let after_carrier = carrier.is_none_or(|idx| candidate > idx);
+            if candidate > 0
+                && after_carrier
+                && messages[candidate].cache_role() != "system"
+                && messages[candidate].has_cacheable_content()
+            {
+                return Some(candidate);
+            }
+            candidate = candidate.checked_sub(1)?;
+        }
+        None
+    }
+
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
     /// This allows custom model_providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
@@ -1252,6 +1291,17 @@ impl MessageContent {
             }
         }
     }
+
+    /// Whether `apply_cache_control` would actually land a marker: plain
+    /// text always, block form only when it ends on a text part (trailing
+    /// image parts are left unmarked, mirroring the native Anthropic
+    /// provider's block-type gate).
+    fn cacheable(&self) -> bool {
+        match self {
+            MessageContent::Text(_) => true,
+            MessageContent::Parts(parts) => matches!(parts.last(), Some(MessagePart::Text { .. })),
+        }
+    }
 }
 
 /// Uniform (role, content) access over the two wire message shapes so one
@@ -1260,6 +1310,12 @@ impl MessageContent {
 trait CacheBreakpointMessage {
     fn cache_role(&self) -> &str;
     fn cache_content(&mut self) -> Option<&mut MessageContent>;
+    /// Whether a breakpoint on this message would actually land. Tool-call
+    /// carriers are the `tool_use` analog: on the native wire those blocks
+    /// always trail the message, so the native placement match skips them,
+    /// and the field-form carrier is skipped for the same reason even when
+    /// incidental text rides along.
+    fn has_cacheable_content(&self) -> bool;
 }
 
 impl CacheBreakpointMessage for Message {
@@ -1270,6 +1326,10 @@ impl CacheBreakpointMessage for Message {
     fn cache_content(&mut self) -> Option<&mut MessageContent> {
         Some(&mut self.content)
     }
+
+    fn has_cacheable_content(&self) -> bool {
+        self.content.cacheable()
+    }
 }
 
 impl CacheBreakpointMessage for NativeMessage {
@@ -1279,6 +1339,10 @@ impl CacheBreakpointMessage for NativeMessage {
 
     fn cache_content(&mut self) -> Option<&mut MessageContent> {
         self.content.as_mut()
+    }
+
+    fn has_cacheable_content(&self) -> bool {
+        self.tool_calls.is_none() && self.content.as_ref().is_some_and(MessageContent::cacheable)
     }
 }
 

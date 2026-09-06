@@ -643,8 +643,18 @@ impl AnthropicModelProvider {
 
     /// Apply cache control to the last message content block
     fn apply_cache_to_last_message(messages: &mut [NativeMessage]) {
-        if let Some(last_msg) = messages.last_mut()
-            && let Some(last_content) = last_msg.content.last_mut()
+        if let Some(index) = messages.len().checked_sub(1) {
+            Self::apply_cache_to_message_at(messages, index);
+        }
+    }
+
+    /// Apply the conversation cache breakpoint to the final cacheable block
+    /// of `messages[index]`, with the same block-type gate
+    /// `apply_cache_to_last_message` applies to the final message.
+    fn apply_cache_to_message_at(messages: &mut [NativeMessage], index: usize) {
+        if let Some(last_content) = messages
+            .get_mut(index)
+            .and_then(|message| message.content.last_mut())
         {
             match last_content {
                 NativeContentOut::Text { cache_control, .. }
@@ -656,6 +666,50 @@ impl AnthropicModelProvider {
                 | NativeContentOut::Thinking { .. } => {}
             }
         }
+    }
+
+    /// Whether a breakpoint would land on this message: the trailing block
+    /// must be text or a tool result, the same gate `apply_cache_to_last_message`
+    /// applies to the final message. Assistant tool-call carriers always end
+    /// on a `tool_use` block (text precedes the calls in the converted
+    /// block order), so they are never cacheable.
+    fn has_cacheable_trailing_block(message: &NativeMessage) -> bool {
+        matches!(
+            message.content.last(),
+            Some(NativeContentOut::Text { .. } | NativeContentOut::ToolResult { .. })
+        )
+    }
+
+    /// Index of the prior turn's final message for the third cache
+    /// breakpoint, or `None` when no valid placement exists.
+    ///
+    /// The last user message starts the current turn, so the message before
+    /// it is the previous turn's last message (usually the assistant's final
+    /// text), and every request within the current turn shares the wire
+    /// prefix through that index byte-for-byte. A candidate with no markable
+    /// trailing block is rejected, walking back at most two steps
+    /// (tool-call carriers and image-only messages are breakpoint-transparent)
+    /// before giving up, because a marker placed further back would not
+    /// survive the turn and prefix stability is worth more than the extra
+    /// cache hit. The candidate can never be the final message: it starts at
+    /// least one index before the last user message and only moves backwards,
+    /// so it never collides with the rolling marker. The system prompt is a
+    /// separate request field here, never a list element, so the shared
+    /// rule's system/carrier clause is vacuous on this side.
+    ///
+    /// Twin of `prior_turn_breakpoint_index` in `compatible.rs`; duplicated
+    /// because a shared trait would drag the two providers' wire message
+    /// types across module boundaries.
+    fn prior_turn_breakpoint_index(messages: &[NativeMessage]) -> Option<usize> {
+        let last_user = messages.iter().rposition(|m| m.role == "user")?;
+        let mut candidate = last_user.checked_sub(1)?;
+        for _ in 0..3 {
+            if candidate > 0 && Self::has_cacheable_trailing_block(&messages[candidate]) {
+                return Some(candidate);
+            }
+            candidate = candidate.checked_sub(1)?;
+        }
+        None
     }
 
     fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
