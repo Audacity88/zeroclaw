@@ -75,6 +75,8 @@ struct Envelope {
     source: Option<String>,
     #[serde(rename = "sourceNumber", default)]
     source_number: Option<String>,
+    #[serde(rename = "sourceUuid", default)]
+    source_uuid: Option<String>,
     #[serde(rename = "dataMessage", default)]
     data_message: Option<DataMessage>,
     #[serde(rename = "storyMessage", default)]
@@ -192,12 +194,20 @@ impl SignalChannel {
         builder.build().expect("Signal HTTP client should build")
     }
 
-    /// Effective sender: prefer `sourceNumber` (E.164), fall back to `source`.
+    /// Effective sender: prefer `sourceNumber` (E.164), then `source`, then `sourceUuid`.
     fn sender(envelope: &Envelope) -> Option<String> {
         envelope
             .source_number
             .as_deref()
-            .or(envelope.source.as_deref())
+            .filter(|sender| !sender.is_empty())
+            .or(envelope
+                .source
+                .as_deref()
+                .filter(|sender| !sender.is_empty()))
+            .or(envelope
+                .source_uuid
+                .as_deref()
+                .filter(|sender| !sender.is_empty()))
             .map(String::from)
     }
 
@@ -445,6 +455,11 @@ impl SignalChannel {
         }
 
         let Some(sender) = Self::sender(envelope) else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "dropping Signal envelope without a resolvable sender identity"
+            );
             return Vec::new();
         };
 
@@ -993,6 +1008,7 @@ mod tests {
         Envelope {
             source: source_number.map(String::from),
             source_number: source_number.map(String::from),
+            source_uuid: None,
             data_message: message.map(|m| DataMessage {
                 message: Some(m.to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -1393,6 +1409,7 @@ mod tests {
         let env = Envelope {
             source: Some("uuid-123".to_string()),
             source_number: Some("+1111111111".to_string()),
+            source_uuid: Some("uuid-456".to_string()),
             data_message: None,
             story_message: None,
             timestamp: Some(1000),
@@ -1405,6 +1422,7 @@ mod tests {
         let env = Envelope {
             source: Some("uuid-123".to_string()),
             source_number: None,
+            source_uuid: Some("uuid-456".to_string()),
             data_message: None,
             story_message: None,
             timestamp: Some(1000),
@@ -1431,6 +1449,7 @@ mod tests {
         let env = Envelope {
             source: Some(uuid.to_string()),
             source_number: None,
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("Hello from privacy user".to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -1488,6 +1507,7 @@ mod tests {
         let env = Envelope {
             source: Some(uuid.to_string()),
             source_number: None,
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("Group msg from privacy user".to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -1513,15 +1533,75 @@ mod tests {
     }
 
     #[test]
-    fn sender_none_when_both_missing() {
-        let env = Envelope {
-            source: None,
-            source_number: None,
-            data_message: None,
-            story_message: None,
-            timestamp: None,
-        };
+    fn sender_falls_back_to_source_uuid() {
+        let env: Envelope = serde_json::from_str(
+            r#"{
+                "source": "",
+                "sourceNumber": "",
+                "sourceUuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            SignalChannel::sender(&env),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn sender_none_when_all_sources_missing() {
+        let env: Envelope = serde_json::from_str(
+            r#"{
+                "source": "",
+                "sourceNumber": null,
+                "sourceUuid": "",
+                "dataMessage": {
+                    "message": "unattributed",
+                    "timestamp": 1700000000000
+                }
+            }"#,
+        )
+        .unwrap();
+
         assert_eq!(SignalChannel::sender(&env), None);
+        assert!(make_channel().process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_source_uuid_respects_allowlist() {
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let raw = format!(
+            r#"{{
+                "source": null,
+                "sourceNumber": null,
+                "sourceUuid": "{uuid}",
+                "timestamp": 1700000000000,
+                "dataMessage": {{
+                    "message": "Hello from sourceUuid",
+                    "timestamp": 1700000000000
+                }}
+            }}"#
+        );
+        let env: Envelope = serde_json::from_str(&raw).unwrap();
+
+        let allowed = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(move || vec![uuid.to_string()]),
+            false,
+            false,
+        );
+        let denied = make_channel();
+
+        let messages = allowed.process_envelope(&env);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender, uuid);
+        assert_eq!(messages[0].content, "Hello from sourceUuid");
+        assert!(denied.process_envelope(&env).is_empty());
     }
 
     #[test]
@@ -1658,6 +1738,7 @@ mod tests {
         let env = Envelope {
             source: Some("+1111111111".to_string()),
             source_number: Some("+1111111111".to_string()),
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: None,
                 timestamp: Some(1_700_000_000_000),
@@ -1690,6 +1771,7 @@ mod tests {
         let env = Envelope {
             source: Some("+1111111111".to_string()),
             source_number: Some("+1111111111".to_string()),
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("group hello".to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -1746,6 +1828,7 @@ mod tests {
         let env = Envelope {
             source: Some("+1111111111".to_string()),
             source_number: Some("+1111111111".to_string()),
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("group hello".to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -2054,6 +2137,7 @@ mod tests {
         let env = Envelope {
             source: Some(uuid.to_string()),
             source_number: None,
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("hi".to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -2131,6 +2215,7 @@ mod tests {
         Envelope {
             source: sender.map(String::from),
             source_number: sender.map(String::from),
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: None,
                 timestamp: Some(1_700_000_000_000),
@@ -2152,6 +2237,7 @@ mod tests {
         Envelope {
             source: sender.map(String::from),
             source_number: sender.map(String::from),
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: None,
                 timestamp: Some(1_700_000_000_000),
