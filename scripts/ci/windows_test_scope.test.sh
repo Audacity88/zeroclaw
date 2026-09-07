@@ -143,6 +143,9 @@ assert_selection "package locale resource" scoped '["zeroclaw","zeroclaw-channel
 printf '%s\n' 'crates/zeroclaw-channels/build.rs' > "$paths_file"
 assert_selection "package build script" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
 
+printf '%s\n' 'build.rs' > "$paths_file"
+assert_selection "root build script" full '[]' '' "$paths_file"
+
 printf '%s\n' 'crates/zeroclaw-runtime/locales/en/cli.ftl' > "$paths_file"
 assert_selection "plugin-host package locale resource" scoped '["zeroclaw","zeroclaw-runtime"]' '' "$paths_file" true
 
@@ -168,7 +171,6 @@ for plugin_path in \
     'crates/zeroclaw-plugins/src/lib.rs' \
     'crates/zeroclaw-runtime/src/lib.rs' \
     'crates/zeroclaw-config/src/lib.rs' \
-    'wit/zeroclaw-plugin.wit' \
     'tests/plugin_channel_runtime_e2e.rs' \
     'Cargo.toml' \
     'Cargo.lock' \
@@ -212,6 +214,9 @@ assert_selection "cargo configuration" full '[]' '' "$paths_file" true
 
 printf '%s\n' '.github/actions/rust-cache/action.yml' > "$paths_file"
 assert_selection "workflow action" full '[]' '' "$paths_file" true
+
+printf '%s\n' 'wit/zeroclaw-plugin.wit' > "$paths_file"
+assert_selection "WIT interface" full '[]' '' "$paths_file" true
 
 printf '%s\n' 'rust-toolchain.toml' > "$paths_file"
 assert_selection "Rust toolchain" full '[]' '' "$paths_file" true

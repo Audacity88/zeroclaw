@@ -227,6 +227,8 @@ def classify_package_path(path: str, package: Package, repo_root: Path) -> PathC
     if relative_path == Path("Cargo.toml"):
         return PathClassification("scoped", "package-manifest")
     if relative_path == Path("build.rs"):
+        if package.root == repo_root:
+            return PathClassification("full", "root-build-script")
         return PathClassification("scoped", "package-build-script")
     if relative_path.parts and relative_path.parts[0] in {"src", "tests", "benches", "examples"}:
         return PathClassification("scoped", "package-rust-tree")
