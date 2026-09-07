@@ -42,6 +42,16 @@ fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool)
     )
 }
 
+/// The pair of policy values a whole-turn trim resolves at use time: the
+/// effective message cap and the low-water fraction applied to it. Resolved
+/// together from one config read so a concurrent profile edit cannot mix
+/// revisions of the two halves of the same trim decision.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HistoryTrimLimits {
+    pub max_messages: usize,
+    pub low_water: f32,
+}
+
 /// Compute the hysteresis low-water target for a whole-turn trim: the
 /// largest number of non-system messages a trim should leave behind.
 /// `low_water` of 1.0 (or anything non-finite, zero, or negative) keeps the
