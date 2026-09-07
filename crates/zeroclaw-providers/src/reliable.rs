@@ -1764,9 +1764,17 @@ impl ReliableModelProvider {
     }
 
     /// Admit an entry with its configured retry budget, except for the exact
-    /// semantic-empty stream entry, which receives one atomic non-stream
-    /// recovery attempt when the configured budget permits it.
-    fn effective_retry_limit(&self, model_slot: usize, entry_index: usize) -> Option<u32> {
+    /// stream-failed entry, which is skipped to avoid replaying it — with two
+    /// one-shot exceptions, both granting a single atomic non-stream attempt:
+    /// the semantic-empty entry (when the budget permits it), and the
+    /// single-candidate case (no other candidate exists, so a non-stream retry
+    /// of the same entry is recovery, not replay).
+    fn effective_retry_limit(
+        &self,
+        model_slot: usize,
+        entry_index: usize,
+        has_other_candidate: bool,
+    ) -> Option<u32> {
         let max_retries = self.max_retries;
         RELIABLE_CALL_ACCOUNTING
             .try_with(|accounting| {
@@ -1777,11 +1785,19 @@ impl ReliableModelProvider {
                 if !exact_failed_entry {
                     return Some(max_retries);
                 }
-                if max_retries == 0 || !accounting.stream_recovery_semantic_empty_permission {
-                    return None;
+                if max_retries > 0 && accounting.stream_recovery_semantic_empty_permission {
+                    accounting.stream_recovery_semantic_empty_permission = false;
+                    return Some(0);
                 }
-                accounting.stream_recovery_semantic_empty_permission = false;
-                Some(0)
+                // Single-candidate stream failure: no alternative entry exists,
+                // so one non-stream attempt of the same entry is the only
+                // recovery path. Consume the resume marker so this grants
+                // exactly one attempt; subsequent calls proceed normally.
+                if !has_other_candidate {
+                    accounting.stream_resume_after = None;
+                    return Some(0);
+                }
+                None
             })
             .unwrap_or(Some(max_retries))
     }
@@ -2625,11 +2641,13 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause = None;
         let mut final_cause_provider = None;
 
-        let _has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
-                let Some(retry_limit) = self.effective_retry_limit(model_slot, entry_index) else {
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
                     final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 };
@@ -2928,11 +2946,13 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause = None;
         let mut final_cause_provider = None;
 
-        let _has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
-                let Some(retry_limit) = self.effective_retry_limit(model_slot, entry_index) else {
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
                     final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 };
@@ -9744,15 +9764,21 @@ mod tests {
             activate_stream_recovery_after_first_poll(3, 4);
             mark_stream_recovery_semantic_empty();
 
-            assert_eq!(provider.effective_retry_limit(3, 3), Some(2));
-            assert_eq!(provider.effective_retry_limit(2, 4), Some(2));
-            assert_eq!(provider.effective_retry_limit(3, 4), Some(0));
-            assert_eq!(provider.effective_retry_limit(3, 4), None);
+            assert_eq!(provider.effective_retry_limit(3, 3, true), Some(2));
+            assert_eq!(provider.effective_retry_limit(2, 4, true), Some(2));
+            assert_eq!(provider.effective_retry_limit(3, 4, true), Some(0));
+            assert_eq!(provider.effective_retry_limit(3, 4, true), None);
 
             activate_stream_recovery_after_first_poll(5, 6);
             mark_stream_recovery_semantic_empty();
-            assert_eq!(zero_budget.effective_retry_limit(5, 6), None);
+            assert_eq!(zero_budget.effective_retry_limit(5, 6, true), None);
             assert!(stream_recovery_was_semantic_empty());
+
+            // Single-candidate stream failure grants one non-stream recovery
+            // attempt even with zero budget; the marker is consumed one-shot.
+            activate_stream_recovery_after_first_poll(7, 8);
+            assert_eq!(zero_budget.effective_retry_limit(7, 8, false), Some(0));
+            assert_eq!(zero_budget.effective_retry_limit(7, 8, false), Some(0));
         })
         .await;
     }
