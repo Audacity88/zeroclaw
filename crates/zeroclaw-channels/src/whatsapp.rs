@@ -18,6 +18,33 @@ type PendingApprovalsMap = Mutex<HashMap<String, PendingApproval>>;
 static PENDING_APPROVALS: LazyLock<Arc<PendingApprovalsMap>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// Register a pending WhatsApp approval for a cross-crate boundary test.
+///
+/// This uses the production process-wide registry so gateway tests exercise
+/// the same alias, responder, and destination binding as real approvals.
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub async fn register_pending_approval_for_test(
+    token: &str,
+    alias: &str,
+    destination: &str,
+) -> oneshot::Receiver<ChannelApprovalResponse> {
+    use std::collections::hash_map::Entry;
+
+    let (sender, receiver) = oneshot::channel();
+    match PENDING_APPROVALS.lock().await.entry(token.to_string()) {
+        Entry::Vacant(entry) => {
+            entry.insert(PendingApproval {
+                sender,
+                alias: alias.to_string(),
+                destination: WhatsAppChannel::canonical_approval_destination(destination),
+            });
+        }
+        Entry::Occupied(_) => panic!("test approval token must not replace an existing request"),
+    }
+    receiver
+}
+
 /// Removes a parked approval token when the requesting future goes away.
 ///
 /// `request_approval_attributed` registers a token in [`PENDING_APPROVALS`]
