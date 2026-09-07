@@ -1949,6 +1949,7 @@ impl Agent {
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "max_history_messages": max,
+                        "trim_target": target,
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
@@ -7844,6 +7845,14 @@ mod tests {
         );
         assert_eq!(event.zeroclaw.get("channel"), None);
         assert_eq!(event.trace_id.as_deref(), Some("trim-test-turn"));
+        assert_eq!(
+            event
+                .attributes
+                .get("trim_target")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "cap 2 with the default 0.7 fraction floors to a target of 1"
+        );
         assert!(event.attributes.get("agent_alias").is_none());
         assert!(event.attributes.get("channel").is_none());
         assert!(event.attributes.get("turn_id").is_none());
