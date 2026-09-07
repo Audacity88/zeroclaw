@@ -262,8 +262,36 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.generation)
     }
 
-    /// Await the test-only pause gate before validating generation in
-    /// `set_overrides_gated` and `apply_model_provider`. Returns the
+    /// Snapshot the live session identity under one map lock.
+    pub async fn generation_and_mode(
+        &self,
+        id: &str,
+    ) -> Option<(u64, crate::rpc::types::ChatMode)> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| (session.generation, session.chat_mode.clone()))
+    }
+
+    /// Return whether `id` still names the captured live incarnation.
+    pub async fn matches_generation_and_mode(
+        &self,
+        id: &str,
+        expected: &(u64, crate::rpc::types::ChatMode),
+    ) -> bool {
+        #[cfg(test)]
+        let done = self.wait_test_gate().await;
+        let matches = self.sessions.lock().await.get(id).is_some_and(|session| {
+            session.generation == expected.0 && session.chat_mode == expected.1
+        });
+        #[cfg(test)]
+        self.signal_test_gate_done(done);
+        matches
+    }
+
+    /// Await the test-only pause gate before validating a captured session
+    /// identity or generation. Returns the
     /// `done` notifier which must be signalled after the generation check
     /// (and any apply attempt) completes so tests don't observe the
     /// successor before the stale work has run its course.

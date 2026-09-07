@@ -3155,8 +3155,8 @@ impl RpcDispatcher {
         // supplied ID, so ACP presence alone must not win. A reaped ID that
         // exists in both stores is ambiguous and is rejected by the resolver
         // before any checkpoint recovery or transcript read can mutate state.
-        let initial_live_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
-        let mut session_guard = if initial_live_mode.is_none() {
+        let initial_live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        let mut session_guard = if initial_live_identity.is_none() {
             Some(
                 self.ctx
                     .sessions
@@ -3168,8 +3168,8 @@ impl RpcDispatcher {
         } else {
             None
         };
-        let mut live_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
-        if live_mode.is_none() && session_guard.is_none() {
+        let mut live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        if live_identity.is_none() && session_guard.is_none() {
             session_guard = Some(
                 self.ctx
                     .sessions
@@ -3178,11 +3178,11 @@ impl RpcDispatcher {
                     .await
                     .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
             );
-            live_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+            live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
         }
-        debug_assert!(live_mode.is_some() || session_guard.is_some());
-        let owner_mode = match live_mode.as_ref() {
-            Some(mode) => Some(mode.clone()),
+        debug_assert!(live_identity.is_some() || session_guard.is_some());
+        let owner_mode = match live_identity.as_ref() {
+            Some((_, mode)) => Some(mode.clone()),
             None => self.resolve_reaped_session_mode(&req.session_id).await?,
         };
 
@@ -3191,7 +3191,7 @@ impl RpcDispatcher {
         {
             // Live transcript reads must not queue behind the active turn.
             // Only orphan recovery mutates history; recheck ownership under its guard.
-            if live_mode.is_none() && !self.ctx.sessions.has_inflight_turn(&req.session_id) {
+            if live_identity.is_none() && !self.ctx.sessions.has_inflight_turn(&req.session_id) {
                 let store_for_surface = Arc::clone(store);
                 let sid = req.session_id.clone();
                 let supported = run_blocking_rpc(
@@ -3268,6 +3268,19 @@ impl RpcDispatcher {
                     break;
                 }
             }
+        }
+
+        if let Some(identity) = live_identity.as_ref()
+            && !self
+                .ctx
+                .sessions
+                .matches_generation_and_mode(&req.session_id, identity)
+                .await
+        {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session was replaced while reading messages",
+            ));
         }
 
         let total = messages.len();
@@ -11063,6 +11076,115 @@ mod tests {
 
         assert_eq!(parsed.total, 1);
         assert_eq!(parsed.messages[0].content, "canonical Chat history");
+    }
+
+    async fn assert_live_session_messages_rejects_replacement(
+        initial_mode: crate::rpc::types::ChatMode,
+        replacement_mode: crate::rpc::types::ChatMode,
+        sid: &'static str,
+    ) {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let mut initial_params = json!({
+            "agent_alias": "test-agent",
+            "session_id": sid,
+        });
+        if matches!(&initial_mode, crate::rpc::types::ChatMode::Acp) {
+            initial_params["chat_mode"] = json!("acp");
+        }
+        dispatcher
+            .handle_session_new_for_test(&initial_params)
+            .await
+            .expect("initial session/new should succeed");
+        match &initial_mode {
+            crate::rpc::types::ChatMode::Chat => chat_backend
+                .append(
+                    &format!("rpc_{sid}"),
+                    &ChatMessage::assistant("stale Chat history"),
+                )
+                .unwrap(),
+            crate::rpc::types::ChatMode::Acp => acp_store
+                .append_turn(
+                    sid,
+                    &[ConversationMessage::Chat(ChatMessage::assistant(
+                        "stale ACP history",
+                    ))],
+                )
+                .unwrap(),
+        }
+
+        let (entered, release, _done) = sessions.set_test_gated_op_pause();
+        let messages_handle = dispatcher.spawn_handle();
+        let messages_task = zeroclaw_spawn::spawn!(async move {
+            messages_handle
+                .handle_session_messages_for_test(&json!({ "session_id": sid }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("session/messages should pause after loading the initial history");
+
+        dispatcher
+            .handle_session_close(&json!({ "session_id": sid }))
+            .await
+            .expect("initial session/close should succeed");
+        let mut replacement_params = json!({
+            "agent_alias": "test-agent",
+            "session_id": sid,
+        });
+        if matches!(&replacement_mode, crate::rpc::types::ChatMode::Acp) {
+            replacement_params["chat_mode"] = json!("acp");
+        }
+        dispatcher
+            .handle_session_new_for_test(&replacement_params)
+            .await
+            .expect("same-ID replacement session/new should succeed");
+
+        release.notify_one();
+        let error = messages_task
+            .await
+            .expect("session/messages task must not panic")
+            .expect_err("session/messages must reject history from a replaced owner");
+        sessions.clear_test_gated_op_pause();
+
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+        assert!(error.message.contains("replaced while reading messages"));
+        assert_eq!(sessions.chat_mode(sid).await, Some(replacement_mode));
+    }
+
+    #[tokio::test]
+    async fn live_chat_session_messages_rejects_acp_replacement_before_return() {
+        assert_live_session_messages_rejects_replacement(
+            crate::rpc::types::ChatMode::Chat,
+            crate::rpc::types::ChatMode::Acp,
+            "live-chat-replaced-by-acp",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn live_acp_session_messages_rejects_chat_replacement_before_return() {
+        assert_live_session_messages_rejects_replacement(
+            crate::rpc::types::ChatMode::Acp,
+            crate::rpc::types::ChatMode::Chat,
+            "live-acp-replaced-by-chat",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn live_chat_session_messages_rejects_same_mode_replacement_before_return() {
+        assert_live_session_messages_rejects_replacement(
+            crate::rpc::types::ChatMode::Chat,
+            crate::rpc::types::ChatMode::Chat,
+            "live-chat-replaced-by-chat",
+        )
+        .await;
     }
 
     #[tokio::test]
