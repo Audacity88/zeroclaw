@@ -479,7 +479,8 @@ mod tests {
         });
         let executor =
             RuntimeCodingCliExecutor::shared(runtime, Arc::new(ReplacingPwdSandbox), true);
-        let command = CodingCliCommand::new("/bin/false", workspace_path.clone(), 5);
+        let executable = std::env::current_exe().expect("current test executable");
+        let command = CodingCliCommand::new(executable, workspace_path.clone(), 5);
 
         let output = executor
             .output(command)

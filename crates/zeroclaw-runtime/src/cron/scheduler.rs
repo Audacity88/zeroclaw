@@ -3059,11 +3059,34 @@ mod tests {
         config.runtime.docker.network = "none".into();
         config.runtime.docker.mount_workspace = false;
 
-        let cmd =
-            build_configured_shell_command(&config, "echo cron-docker", &std::env::temp_dir())
-                .unwrap();
-        let expected =
-            zeroclaw_config::platform::resolve_executable(std::ffi::OsStr::new("docker")).unwrap();
+        #[cfg(unix)]
+        let launcher_dir = tempfile::tempdir().expect("launcher tempdir");
+        #[cfg(unix)]
+        let (runtime, expected) = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let launcher = launcher_dir.path().join("docker");
+            std::fs::write(&launcher, "#!/bin/sh\n").expect("write Docker launcher");
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+                .expect("make Docker launcher executable");
+            let path = std::env::join_paths([launcher_dir.path()]).expect("launcher PATH");
+            let runtime =
+                crate::platform::create_runtime_with_path(&config.runtime, Some(path.as_os_str()))
+                    .expect("Docker runtime");
+            (
+                runtime,
+                launcher.canonicalize().expect("canonical launcher"),
+            )
+        };
+        #[cfg(not(unix))]
+        let (runtime, expected) = (
+            crate::platform::create_runtime(&config.runtime).expect("Docker runtime"),
+            std::path::PathBuf::from("docker"),
+        );
+
+        let cmd = runtime
+            .build_shell_command("echo cron-docker", &std::env::temp_dir())
+            .unwrap();
         let debug = format!("{cmd:?}");
 
         assert_eq!(cmd.as_std().get_program(), expected.as_os_str(), "{debug}");

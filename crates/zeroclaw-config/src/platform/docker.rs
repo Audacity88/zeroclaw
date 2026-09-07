@@ -98,12 +98,29 @@ impl DockerRuntime {
         Ok(resolved)
     }
 
+    fn validated_workspace_mount(&self, workspace_dir: &Path) -> Result<Option<PathBuf>> {
+        if !self.config.mount_workspace {
+            return Ok(None);
+        }
+
+        self.workspace_mount_path(workspace_dir)
+            .with_context(|| {
+                format!(
+                    "Failed to validate workspace mount path {}",
+                    workspace_dir.display()
+                )
+            })
+            .map(Some)
+    }
+
     fn build_shell_command_inner(
         &self,
         command: &str,
         workspace_dir: &Path,
         env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
+        let host_workspace = self.validated_workspace_mount(workspace_dir)?;
+
         #[cfg(unix)]
         let docker = if let Some(resolved_launcher) = &self.resolved_launcher {
             resolved_launcher.clone()
@@ -117,13 +134,18 @@ impl DockerRuntime {
         #[cfg(not(unix))]
         let docker = PathBuf::from("docker");
 
-        self.build_shell_command_with_launcher(command, workspace_dir, env_keys, &docker)
+        self.build_shell_command_with_launcher(
+            command,
+            host_workspace.as_deref(),
+            env_keys,
+            &docker,
+        )
     }
 
     fn build_shell_command_with_launcher(
         &self,
         command: &str,
-        workspace_dir: &Path,
+        host_workspace: Option<&Path>,
         env_keys: &[&OsStr],
         docker: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
@@ -156,14 +178,7 @@ impl DockerRuntime {
             process.arg("--env").arg(key);
         }
 
-        if self.config.mount_workspace {
-            let host_workspace = self.workspace_mount_path(workspace_dir).with_context(|| {
-                format!(
-                    "Failed to validate workspace mount path {}",
-                    workspace_dir.display()
-                )
-            })?;
-
+        if let Some(host_workspace) = host_workspace {
             process
                 .arg("--volume")
                 .arg(format!("{}:/workspace:rw", host_workspace.display()))
@@ -186,7 +201,13 @@ impl DockerRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        self.build_shell_command_with_launcher(command, workspace_dir, &[], Path::new("docker"))
+        let host_workspace = self.validated_workspace_mount(workspace_dir)?;
+        self.build_shell_command_with_launcher(
+            command,
+            host_workspace.as_deref(),
+            &[],
+            Path::new("docker"),
+        )
     }
 
     #[cfg(test)]
@@ -196,9 +217,10 @@ impl DockerRuntime {
         workspace_dir: &Path,
         env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
+        let host_workspace = self.validated_workspace_mount(workspace_dir)?;
         self.build_shell_command_with_launcher(
             command,
-            workspace_dir,
+            host_workspace.as_deref(),
             env_keys,
             Path::new("docker"),
         )
@@ -271,6 +293,7 @@ impl RuntimeAdapter for DockerRuntime {
     ) -> anyhow::Result<tokio::process::Command> {
         #[cfg(unix)]
         if let Some(path) = effective_path {
+            let host_workspace = self.validated_workspace_mount(workspace_dir)?;
             let resolved_launcher = crate::platform::resolve_executable_with_path(
                 OsStr::new("docker"),
                 std::env::split_paths(path),
@@ -282,7 +305,7 @@ impl RuntimeAdapter for DockerRuntime {
             })?;
             return self.build_shell_command_with_launcher(
                 command,
-                workspace_dir,
+                host_workspace.as_deref(),
                 &[],
                 &resolved_launcher,
             );
