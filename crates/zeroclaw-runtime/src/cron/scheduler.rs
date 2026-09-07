@@ -2605,16 +2605,19 @@ mod tests {
             let authority = crate::LiveConfigAuthority::new(config.clone());
             let selection = authority.execution_capability().capture_selection();
             let selected_job = cron::get_job(&config, &job.id).unwrap();
-            let old_alias = {
+            let (old_alias, mut delete) = {
                 let lifecycle = authority.agent_lifecycle();
-                let _delete = lifecycle.begin_delete(TEST_AGENT).unwrap();
-                authority
+                let delete = lifecycle.begin_delete(TEST_AGENT).unwrap();
+                let old_alias = authority
                     .config()
                     .write()
                     .agents
                     .remove(TEST_AGENT)
-                    .unwrap()
+                    .unwrap();
+                (old_alias, delete)
             };
+            delete.commit_destructive_mutation();
+            drop(delete);
             authority
                 .config()
                 .write()

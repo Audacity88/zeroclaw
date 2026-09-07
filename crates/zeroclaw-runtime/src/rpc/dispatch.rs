@@ -12046,7 +12046,7 @@ mod tests {
                 "generation advances exactly once across the committed deletion"
             );
             assert!(!workspace.exists(), "workspace cleanup still runs");
-            let _ = result_rx; // the aborted request never observes a response
+            drop(result_rx); // the aborted request never observes a response
         });
     }
 

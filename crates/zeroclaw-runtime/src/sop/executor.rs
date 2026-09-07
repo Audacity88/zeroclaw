@@ -736,7 +736,9 @@ mod tests {
             if closed {
                 authority.close_agent_lifecycle();
             } else {
-                drop(authority.agent_lifecycle().begin_delete("alpha").unwrap());
+                let mut delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+                delete.commit_destructive_mutation();
+                drop(delete);
             }
             let before = serde_json::to_value(engine.get_run(&run_id).unwrap()).unwrap();
             let engine = Arc::new(Mutex::new(engine));
