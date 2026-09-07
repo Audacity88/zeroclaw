@@ -396,9 +396,8 @@ def emit_package_args(raw_packages: str) -> int:
         return 2
     if len(set(packages)) != len(packages):
         return 2
-    for package in packages:
-        print("-p")
-        print(package)
+    args = [argument for package in packages for argument in ("-p", package)]
+    sys.stdout.buffer.write(("\n".join(args) + "\n").encode("ascii"))
     return 0
 
 

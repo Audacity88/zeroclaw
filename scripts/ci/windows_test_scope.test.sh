@@ -298,6 +298,17 @@ printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
 package_args="$(python3 "$selector" --package-args-json '["zeroclaw","zeroclaw-channels"]')"
 test "$package_args" = $'-p\nzeroclaw\n-p\nzeroclaw-channels'
 
+package_args_file="$repo_root/package-args"
+python3 "$selector" --package-args-json '["zeroclaw","zeroclaw-channels"]' > "$package_args_file"
+PACKAGE_ARGS_FILE="$package_args_file" python3 - <<'PY'
+import os
+from pathlib import Path
+
+actual = Path(os.environ["PACKAGE_ARGS_FILE"]).read_bytes()
+expected = b"-p\nzeroclaw\n-p\nzeroclaw-channels\n"
+assert actual == expected, actual
+PY
+
 for invalid_packages in '[]' '{}' '["zeroclaw",""]' '["zeroclaw","zeroclaw"]' '["$(touch unsafe)"]'; do
     if python3 "$selector" --package-args-json "$invalid_packages" >/dev/null 2>&1; then
         echo "FAIL: invalid package JSON was accepted: $invalid_packages" >&2
