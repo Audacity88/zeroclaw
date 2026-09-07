@@ -3150,54 +3150,71 @@ impl RpcDispatcher {
         let mut messages = Vec::new();
         let mut acp_session_found = false;
 
-        if let Some(store) = self.ctx.acp_session_store.as_ref() {
-            let store_for_contains = store.clone();
-            let session_id_for_contains = req.session_id.clone();
-            let contains = run_blocking_rpc(
-                move || store_for_contains.contains_session(&session_id_for_contains),
-                "Failed to identify ACP session",
-            )
-            .await?;
-            // Live transcript reads must not queue behind the active turn.
-            // Only orphan recovery mutates history; recheck ownership under its guard.
-            if contains
-                && self.ctx.sessions.get_agent(&req.session_id).await.is_none()
-                && !self.ctx.sessions.has_inflight_turn(&req.session_id)
-            {
-                let _session_guard = self
-                    .ctx
+        // Resolve the canonical owner before reading either durable store.
+        // ACP rows can outlive a Chat session that reused the same caller-
+        // supplied ID, so ACP presence alone must not win. A reaped ID that
+        // exists in both stores is ambiguous and is rejected by the resolver
+        // before any checkpoint recovery or transcript read can mutate state.
+        let initial_live_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+        let mut session_guard = if initial_live_mode.is_none() {
+            Some(
+                self.ctx
                     .sessions
                     .session_queue
                     .acquire(&req.session_id)
                     .await
-                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
-                if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
-                    && !self.ctx.sessions.has_inflight_turn(&req.session_id)
-                {
-                    let store_for_surface = Arc::clone(store);
-                    let sid = req.session_id.clone();
-                    let supported = run_blocking_rpc(
-                        move || {
-                            Ok(store_for_surface.load_session(&sid)?.is_none_or(|data| {
-                                data.interaction_surface.as_deref().is_none_or(|value| {
-                                    crate::agent::prompt::InteractionSurface::from_persisted(value)
-                                        .is_some()
-                                })
-                            }))
-                        },
-                        "Failed to validate ACP interaction surface",
-                    )
-                    .await?;
-                    if supported {
-                        recover_acp_checkpoint(Arc::clone(store), &req.session_id)
-                            .await
-                            .map_err(|error| {
-                                rpc_err(
-                                    INTERNAL_ERROR,
-                                    format!("Failed to recover interrupted ACP turn: {error}"),
-                                )
-                            })?;
-                    }
+                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+            )
+        } else {
+            None
+        };
+        let mut live_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+        if live_mode.is_none() && session_guard.is_none() {
+            session_guard = Some(
+                self.ctx
+                    .sessions
+                    .session_queue
+                    .acquire(&req.session_id)
+                    .await
+                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+            );
+            live_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+        }
+        debug_assert!(live_mode.is_some() || session_guard.is_some());
+        let owner_mode = match live_mode.as_ref() {
+            Some(mode) => Some(mode.clone()),
+            None => self.resolve_reaped_session_mode(&req.session_id).await?,
+        };
+
+        if matches!(owner_mode, Some(ChatMode::Acp))
+            && let Some(store) = self.ctx.acp_session_store.as_ref()
+        {
+            // Live transcript reads must not queue behind the active turn.
+            // Only orphan recovery mutates history; recheck ownership under its guard.
+            if live_mode.is_none() && !self.ctx.sessions.has_inflight_turn(&req.session_id) {
+                let store_for_surface = Arc::clone(store);
+                let sid = req.session_id.clone();
+                let supported = run_blocking_rpc(
+                    move || {
+                        Ok(store_for_surface.load_session(&sid)?.is_none_or(|data| {
+                            data.interaction_surface.as_deref().is_none_or(|value| {
+                                crate::agent::prompt::InteractionSurface::from_persisted(value)
+                                    .is_some()
+                            })
+                        }))
+                    },
+                    "Failed to validate ACP interaction surface",
+                )
+                .await?;
+                if supported {
+                    recover_acp_checkpoint(Arc::clone(store), &req.session_id)
+                        .await
+                        .map_err(|error| {
+                            rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Failed to recover interrupted ACP turn: {error}"),
+                            )
+                        })?;
                 }
             }
             let store_for_load = store.clone();
@@ -10878,9 +10895,18 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
 
         let sid = "acp-resume-7799";
-        acp_store
-            .create_session(sid, "test-agent", "/tmp/ws")
-            .expect("ACP session row");
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("live ACP session/new should succeed");
+        chat_backend
+            .append(sid, &ChatMessage::assistant("stale backend collision"))
+            .expect("seed colliding unified backend row");
         acp_store
             .append_turn(
                 sid,
@@ -10927,15 +10953,6 @@ mod tests {
             )
             .expect("append turn");
 
-        chat_backend
-            .append(sid, &ChatMessage::assistant("stale backend collision"))
-            .expect("seed colliding unified backend row");
-
-        assert_eq!(chat_backend.load(sid).len(), 1);
-        for key in [format!("rpc_{sid}"), format!("gw_{sid}")] {
-            assert!(chat_backend.load(&key).is_empty());
-        }
-
         let result = dispatcher
             .handle_session_messages_for_test(&json!({ "session_id": sid }))
             .await
@@ -10981,7 +10998,6 @@ mod tests {
                 .all(|entry| !entry.content.contains("stale backend collision")),
             "a colliding generic backend row must not override canonical ACP history"
         );
-
         let page = dispatcher
             .handle_session_messages_for_test(&json!({
                 "session_id": sid,
@@ -10996,6 +11012,206 @@ mod tests {
         assert_eq!(page.messages.len(), 2);
         assert_eq!(page.messages[0].content, "let me check the logs");
         assert_eq!(page.messages[1].tool_call_id.as_deref(), Some("tc-1"));
+    }
+
+    #[tokio::test]
+    async fn live_chat_session_messages_prefer_chat_over_retained_acp_row() {
+        use serde_json::from_value;
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "live-chat-acp-collision";
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("Chat session/new should succeed");
+        chat_backend
+            .append(
+                &format!("rpc_{sid}"),
+                &ChatMessage::assistant("canonical Chat history"),
+            )
+            .unwrap();
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "stale ACP history",
+                ))],
+            )
+            .unwrap();
+
+        assert_eq!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat)
+        );
+        let result = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect("live Chat session/messages should succeed");
+        let parsed: SessionMessagesResult = from_value(result).unwrap();
+
+        assert_eq!(parsed.total, 1);
+        assert_eq!(parsed.messages[0].content, "canonical Chat history");
+    }
+
+    #[tokio::test]
+    async fn reaped_chat_acp_collision_fails_closed_without_consuming_acp_checkpoint() {
+        use rusqlite::{Connection, params};
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "reaped-chat-acp-collision";
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("Chat session/new should succeed");
+        chat_backend
+            .append(
+                &format!("rpc_{sid}"),
+                &ChatMessage::assistant("canonical Chat history"),
+            )
+            .unwrap();
+        assert!(sessions.remove(sid).await, "simulate a reaped Chat owner");
+
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .unwrap();
+        let acp_history = ConversationMessage::Chat(ChatMessage::assistant("ACP history"));
+        acp_store
+            .append_turn(sid, std::slice::from_ref(&acp_history))
+            .unwrap();
+        let pending = ConversationMessage::Chat(ChatMessage::user("pending question"));
+        acp_store
+            .begin_turn_checkpoint(sid, "pending-turn", std::slice::from_ref(&pending))
+            .unwrap();
+
+        let checkpoint_snapshot = || {
+            let conn = Connection::open(data_dir.join("sessions/acp-sessions.db")).unwrap();
+            conn.query_row(
+                "SELECT c.turn_id, e.payload
+                 FROM acp_turn_checkpoints c
+                 JOIN acp_sessions s ON s.id = c.session_id
+                 JOIN acp_turn_checkpoint_events e ON e.session_id = c.session_id
+                 WHERE s.session_uuid = ?1
+                 ORDER BY e.id ASC
+                 LIMIT 1",
+                params![sid],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap()
+        };
+        let transcript_before = acp_store.load_session(sid).unwrap().unwrap().messages;
+        let checkpoint_before = checkpoint_snapshot();
+
+        let error = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect_err("reaped Chat/ACP collisions must fail closed");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("matches both ACP and Chat"));
+
+        let transcript_after = acp_store.load_session(sid).unwrap().unwrap().messages;
+        assert_eq!(
+            serde_json::to_value(transcript_after).unwrap(),
+            serde_json::to_value(transcript_before).unwrap(),
+            "collision rejection must not mutate ACP transcript"
+        );
+        assert_eq!(
+            checkpoint_snapshot(),
+            checkpoint_before,
+            "collision rejection must not consume the pending ACP checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_messages_rechecks_queued_chat_owner_before_reaped_acp_read() {
+        use serde_json::from_value;
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "queued-chat-owner-race";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "stale ACP history",
+                ))],
+            )
+            .unwrap();
+        chat_backend
+            .append(
+                &format!("rpc_{sid}"),
+                &ChatMessage::assistant("queued Chat history"),
+            )
+            .unwrap();
+
+        let queue_guard = sessions.session_queue.acquire(sid).await.unwrap();
+        let chat_handle = dispatcher.spawn_handle();
+        let chat_task = zeroclaw_spawn::spawn!(async move {
+            chat_handle
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid,
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sessions.session_queue.queue_depth(sid).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued Chat owner should register before the read");
+
+        let messages_handle = dispatcher.spawn_handle();
+        let messages_task = zeroclaw_spawn::spawn!(async move {
+            messages_handle
+                .handle_session_messages_for_test(&json!({ "session_id": sid }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sessions.session_queue.queue_depth(sid).await < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reaped read should queue behind the pending Chat owner");
+
+        drop(queue_guard);
+        chat_task.await.unwrap().expect("queued Chat session/new");
+        let result = messages_task
+            .await
+            .unwrap()
+            .expect("session/messages should use the queued Chat owner");
+        let parsed: SessionMessagesResult = from_value(result).unwrap();
+        assert_eq!(parsed.total, 1);
+        assert_eq!(parsed.messages[0].content, "queued Chat history");
     }
 
     #[tokio::test]
@@ -11031,12 +11247,12 @@ mod tests {
     #[tokio::test]
     async fn session_messages_does_not_mask_malformed_acp_history_with_backend_fallback() {
         use rusqlite::{Connection, params};
-        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
+        use zeroclaw_api::model_provider::{ConversationMessage, ToolCall};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let (dispatcher, _sessions, chat_backend, acp_store) =
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "acp-malformed-history";
 
@@ -11058,10 +11274,6 @@ mod tests {
                 }],
             )
             .unwrap();
-        chat_backend
-            .append(sid, &ChatMessage::assistant("stale backend collision"))
-            .unwrap();
-
         let conn = Connection::open(data_dir.join("sessions/acp-sessions.db")).unwrap();
         conn.execute(
             "UPDATE acp_tool_calls SET event_kind = 'malformed' WHERE tool_call_id = ?1",
