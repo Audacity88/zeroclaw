@@ -18,7 +18,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
-use zeroclaw_config::schema::ToolResultImagePolicy;
+use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
 /// Maximum silence between body reads for OpenAI-compatible SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -66,6 +66,10 @@ pub struct OpenAiCompatibleModelProvider {
     /// outbound request bodies (system prompt; rolling last message).
     /// Drives `capabilities().prompt_caching` and the request-build path.
     cache_passthrough: bool,
+    /// Cache entry lifetime carried by every breakpoint injected behind
+    /// `cache_passthrough`. One TTL per request by design. Inert without
+    /// passthrough: no markers are placed, so nothing carries a TTL.
+    cache_ttl: Option<CacheTtl>,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -433,6 +437,9 @@ pub struct OpenAiCompatibleBuilder {
     /// Set by [`OpenAiCompatibleBuilder::with_cache_passthrough`]. Default
     /// `false`: requests and capability reporting are unchanged.
     cache_passthrough: bool,
+    /// Set by [`OpenAiCompatibleBuilder::with_cache_ttl`]. Default `None`:
+    /// breakpoints keep the 5-minute API default.
+    cache_ttl: Option<CacheTtl>,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -575,6 +582,17 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
+    /// Request the given cache entry lifetime on every breakpoint injected
+    /// behind `cache_passthrough`. Effective only together with
+    /// [`Self::with_cache_passthrough`]: without passthrough no breakpoints
+    /// are placed, so the setting is inert (no parse-time warning — an
+    /// operator may stage the value before switching passthrough on).
+    /// Defaults to the 5-minute API default when unset.
+    pub fn with_cache_ttl(mut self, cache_ttl: CacheTtl) -> Self {
+        self.cache_ttl = Some(cache_ttl);
+        self
+    }
+
     /// Set a custom API path suffix for this model_provider.
     pub fn api_path(mut self, api_path: Option<String>) -> Self {
         self.api_path = api_path;
@@ -710,6 +728,7 @@ impl OpenAiCompatibleBuilder {
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             cache_passthrough: self.cache_passthrough,
+            cache_ttl: self.cache_ttl,
             api_path: self.api_path,
             max_tokens: self.max_tokens,
             models_dev_key: self.models_dev_key,
@@ -750,6 +769,7 @@ impl OpenAiCompatibleModelProvider {
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
             cache_passthrough: false,
+            cache_ttl: None,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -1001,20 +1021,24 @@ impl OpenAiCompatibleModelProvider {
         if !self.cache_passthrough {
             return;
         }
+        // One TTL per request: every breakpoint this pass places carries
+        // the same configured lifetime. `None` resolves to the 5-minute
+        // API default, whose markers serialize without a `ttl` field.
+        let cache_ttl = self.cache_ttl.unwrap_or_default();
         let carrier = merged_system_carrier.and_then(|idx| {
             (idx < messages.len() && messages[idx].cache_role() != "system").then_some(idx)
         });
         match carrier {
             Some(idx) => {
                 if let Some(content) = messages[idx].cache_content() {
-                    content.apply_cache_control();
+                    content.apply_cache_control(cache_ttl);
                 }
             }
             None => {
                 if let Some(system) = messages.iter_mut().find(|m| m.cache_role() == "system")
                     && let Some(content) = system.cache_content()
                 {
-                    content.apply_cache_control();
+                    content.apply_cache_control(cache_ttl);
                 }
             }
         }
@@ -1027,7 +1051,7 @@ impl OpenAiCompatibleModelProvider {
             && last.cache_role() != "system"
             && let Some(content) = last.cache_content()
         {
-            content.apply_cache_control();
+            content.apply_cache_control(cache_ttl);
         }
     }
 
@@ -1237,17 +1261,22 @@ impl MessageContent {
     /// content gains the marker on its trailing text part. Trailing
     /// non-text parts (images) are left unmarked, mirroring the native
     /// Anthropic provider's placement, which never marks image blocks.
-    fn apply_cache_control(&mut self) {
+    /// The marker carries the configured cache entry lifetime.
+    fn apply_cache_control(&mut self, cache_ttl: CacheTtl) {
         match self {
             MessageContent::Text(text) => {
                 *self = MessageContent::Parts(vec![MessagePart::Text {
                     text: std::mem::take(text),
-                    cache_control: Some(crate::anthropic::CacheControl::ephemeral()),
+                    cache_control: Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
+                        cache_ttl,
+                    )),
                 }]);
             }
             MessageContent::Parts(parts) => {
                 if let Some(MessagePart::Text { cache_control, .. }) = parts.last_mut() {
-                    *cache_control = Some(crate::anthropic::CacheControl::ephemeral());
+                    *cache_control = Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
+                        cache_ttl,
+                    ));
                 }
             }
         }
