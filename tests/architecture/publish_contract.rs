@@ -691,6 +691,23 @@ const ESCAPE_EXCEPTIONS: &[(&str, &str)] = &[(
     "../../web/dist",
 )];
 
+fn is_escape_exception(source: &Path, include: &str) -> bool {
+    ESCAPE_EXCEPTIONS
+        .iter()
+        .any(|(exception_source, exception_include)| {
+            source == Path::new(exception_source) && include == *exception_include
+        })
+}
+
+#[cfg(windows)]
+#[test]
+fn escape_exception_matches_windows_path_separators() {
+    assert!(is_escape_exception(
+        Path::new(r"crates\zeroclaw-gateway\src\static_files.rs"),
+        "../../web/dist",
+    ));
+}
+
 #[test]
 fn published_crates_never_include_files_outside_their_own_directory() {
     let mut violations = Vec::new();
@@ -735,12 +752,8 @@ fn published_crates_never_include_files_outside_their_own_directory() {
                 let resolved = normalize(&base, &include.path);
                 let rel = source_path
                     .strip_prefix(repo_root())
-                    .unwrap_or(&source_path)
-                    .to_string_lossy()
-                    .into_owned();
-                let excepted = ESCAPE_EXCEPTIONS
-                    .iter()
-                    .any(|(f, p)| *f == rel && *p == include.path);
+                    .unwrap_or(&source_path);
+                let excepted = is_escape_exception(rel, &include.path);
 
                 // Inside the crate directory is necessary but not sufficient. When
                 // the manifest has an `include` allowlist, the file must also fall
