@@ -1905,9 +1905,14 @@ impl Agent {
         if self.history.len() <= max {
             return None;
         }
+        let target = crate::agent::history_trim::history_trim_target(
+            max,
+            self.config.resolved.history_trim_low_water,
+        );
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
             max,
+            target,
             self.history_has_trim_breadcrumb,
         );
         self.history = result.history;
