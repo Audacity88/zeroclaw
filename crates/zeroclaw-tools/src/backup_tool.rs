@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
@@ -65,7 +66,11 @@ impl BackupTool {
         }
     }
 
-    fn cmd_create(&self) -> anyhow::Result<ToolResult> {
+    fn cmd_create(
+        &self,
+        cancellation: &BlockingOperationCancellation,
+    ) -> anyhow::Result<ToolResult> {
+        cancellation.checkpoint()?;
         if self.max_keep == 0 {
             return Ok(rejected(tool_text("tool-backup-error-max-keep")));
         }
@@ -133,13 +138,17 @@ impl BackupTool {
             )?;
         }
 
+        cancellation.checkpoint()?;
         let backups = create_dir_path_nofollow(&workspace, Path::new("backups"))?;
+        cancellation.checkpoint()?;
         backups.create_dir(&name)?;
         let backup = open_dir_nofollow(&backups, Path::new(&name))?;
 
         for (relative, src) in sources {
+            cancellation.checkpoint()?;
             let destination_path = backup_path.join(&relative);
             self.authorize_write_prefixes(&backup_path, &relative)?;
+            cancellation.checkpoint()?;
             let dst = create_dir_path_nofollow(&backup, &relative)?;
             copy_dir_recursive(
                 &src,
@@ -147,17 +156,20 @@ impl BackupTool {
                 &dst,
                 &destination_path,
                 &self.security,
+                cancellation,
             )?;
         }
 
+        cancellation.checkpoint()?;
         let checksums = compute_checksums(&backup, &backup_path, &self.security)?;
         let file_count = checksums.len();
         let manifest = serde_json::to_string_pretty(&checksums)?;
         self.authorize_write(&backup_path.join("manifest.json"))?;
+        cancellation.checkpoint()?;
         write_file_atomic(&backup, Path::new("manifest.json"), manifest.as_bytes())?;
 
         // Enforce max_keep: remove oldest backups beyond the limit.
-        self.enforce_max_keep(&backups, &backups_path)?;
+        self.enforce_max_keep(&backups, &backups_path, cancellation)?;
 
         Ok(ToolResult {
             success: true,
@@ -171,10 +183,16 @@ impl BackupTool {
         })
     }
 
-    fn enforce_max_keep(&self, backups_dir: &Dir, backups_path: &Path) -> anyhow::Result<()> {
+    fn enforce_max_keep(
+        &self,
+        backups_dir: &Dir,
+        backups_path: &Path,
+        cancellation: &BlockingOperationCancellation,
+    ) -> anyhow::Result<()> {
         let mut backups = list_backup_names(backups_dir, backups_path, &self.security)?;
         // Sorted newest-first; drop excess from the tail.
         while backups.len() > self.max_keep {
+            cancellation.checkpoint()?;
             if let Some(old) = backups.pop() {
                 authorize_deletion_tree(
                     backups_dir,
@@ -182,6 +200,7 @@ impl BackupTool {
                     &backups_path.join(&old),
                     &self.security,
                 )?;
+                cancellation.checkpoint()?;
                 #[cfg(not(windows))]
                 backups_dir.remove_dir_all(old)?;
                 #[cfg(windows)]
@@ -374,7 +393,12 @@ impl BackupTool {
         })
     }
 
-    fn cmd_restore(&self, backup_name: &str, confirm: bool) -> anyhow::Result<ToolResult> {
+    fn cmd_restore(
+        &self,
+        backup_name: &str,
+        confirm: bool,
+        cancellation: Option<&BlockingOperationCancellation>,
+    ) -> anyhow::Result<ToolResult> {
         if let Err(error) = validate_backup_name(backup_name) {
             return Ok(rejected(error.to_string()));
         }
@@ -460,6 +484,9 @@ impl BackupTool {
                 error: None,
             });
         }
+        let cancellation = cancellation.ok_or_else(|| {
+            anyhow::Error::msg("confirmed restore requires a cancellation handle")
+        })?;
 
         // Validate every source/destination pair before restoring the first
         // directory so a stable destination symlink cannot cause a partial
@@ -486,6 +513,7 @@ impl BackupTool {
         }
 
         for sub in &restore_items {
+            cancellation.checkpoint()?;
             let src = open_dir_no_symlinks_checked(
                 &backup,
                 Path::new(sub),
@@ -496,8 +524,16 @@ impl BackupTool {
             let source_path = backup_path.join(sub);
             let destination_path = workspace_path.join(sub);
             self.authorize_write(&destination_path)?;
+            cancellation.checkpoint()?;
             let dst = create_dir_path_nofollow(&workspace, Path::new(sub))?;
-            copy_dir_recursive(&src, &source_path, &dst, &destination_path, &self.security)?;
+            copy_dir_recursive(
+                &src,
+                &source_path,
+                &dst,
+                &destination_path,
+                &self.security,
+                cancellation,
+            )?;
         }
         Ok(ToolResult {
             success: true,
@@ -566,7 +602,8 @@ impl Tool for BackupTool {
                     return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
                 }
                 let tool = self.clone();
-                tokio::task::spawn_blocking(move || tool.cmd_create()).await?
+                spawn_cancellable_blocking(move |cancellation| tool.cmd_create(&cancellation))
+                    .await?
             }
             "list" => {
                 let tool = self.clone();
@@ -633,7 +670,15 @@ impl Tool for BackupTool {
                     return Ok(rejected(tool_text("tool-backup-error-action-blocked")));
                 }
                 let tool = self.clone();
-                tokio::task::spawn_blocking(move || tool.cmd_restore(&name, confirm)).await?
+                if confirm {
+                    spawn_cancellable_blocking(move |cancellation| {
+                        tool.cmd_restore(&name, true, Some(&cancellation))
+                    })
+                    .await?
+                } else {
+                    tokio::task::spawn_blocking(move || tool.cmd_restore(&name, false, None))
+                        .await?
+                }
             }
             other => Ok(ToolResult {
                 success: false,
@@ -655,6 +700,76 @@ impl Tool for BackupTool {
             },
         }
     }
+}
+
+#[derive(Clone, Default)]
+struct BlockingOperationCancellation {
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    after_file_copy: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+}
+
+impl BlockingOperationCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn checkpoint(&self) -> anyhow::Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(BlockingOperationCancelled.into());
+        }
+        Ok(())
+    }
+
+    fn after_file_copy(&self, path: &Path) {
+        #[cfg(test)]
+        if let Some(hook) = &self.after_file_copy {
+            hook(path);
+        }
+        #[cfg(not(test))]
+        let _ = path;
+    }
+}
+
+struct CancelBlockingOperationOnDrop {
+    cancellation: BlockingOperationCancellation,
+    armed: bool,
+}
+
+impl Drop for CancelBlockingOperationOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BlockingOperationCancelled;
+
+impl std::fmt::Display for BlockingOperationCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("backup operation cancelled")
+    }
+}
+
+impl std::error::Error for BlockingOperationCancelled {}
+
+async fn spawn_cancellable_blocking<F>(
+    task: F,
+) -> Result<anyhow::Result<ToolResult>, tokio::task::JoinError>
+where
+    F: FnOnce(BlockingOperationCancellation) -> anyhow::Result<ToolResult> + Send + 'static,
+{
+    let cancellation = BlockingOperationCancellation::default();
+    let worker_cancellation = cancellation.clone();
+    let mut cancel_on_drop = CancelBlockingOperationOnDrop {
+        cancellation,
+        armed: true,
+    };
+    let result = tokio::task::spawn_blocking(move || task(worker_cancellation)).await;
+    cancel_on_drop.armed = false;
+    result
 }
 
 // -- Helpers ------------------------------------------------------------------
@@ -941,9 +1056,11 @@ fn copy_dir_recursive(
     dst: &Dir,
     dst_path: &Path,
     security: &SecurityPolicy,
+    cancellation: &BlockingOperationCancellation,
 ) -> anyhow::Result<()> {
     ensure_readable(security, src_path)?;
     for entry in src.entries()? {
+        cancellation.checkpoint()?;
         let entry = entry?;
         let name = entry.file_name();
         let source_child_path = src_path.join(&name);
@@ -984,6 +1101,7 @@ fn copy_dir_recursive(
                     )));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    cancellation.checkpoint()?;
                     dst.create_dir(&name)?;
                 }
                 Err(error) => return Err(error.into()),
@@ -996,6 +1114,7 @@ fn copy_dir_recursive(
                 &dst_child,
                 &destination_child_path,
                 security,
+                cancellation,
             )?;
         } else if file_type.is_file() {
             reject_symlink(dst, Path::new(&name))?;
@@ -1003,7 +1122,9 @@ fn copy_dir_recursive(
             let mut input = open_file_nofollow(src, Path::new(&name))?;
             ensure_readable(security, &source_child_path)?;
             let permissions = input.metadata()?.permissions();
+            cancellation.checkpoint()?;
             copy_file_atomic(dst, Path::new(&name), &mut input, Some(permissions))?;
+            cancellation.after_file_copy(&destination_child_path);
         } else {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-special-file",
@@ -1237,6 +1358,73 @@ mod tests {
             ..SecurityPolicy::default()
         });
         BackupTool::new_with_security(vec!["config".into(), "memory".into()], max_keep, security)
+    }
+
+    #[test]
+    fn dropping_blocking_operation_guard_signals_cancellation() {
+        let cancellation = BlockingOperationCancellation::default();
+        {
+            let _guard = CancelBlockingOperationOnDrop {
+                cancellation: cancellation.clone(),
+                armed: true,
+            };
+            assert!(cancellation.checkpoint().is_ok());
+        }
+        assert!(cancellation.checkpoint().is_err());
+    }
+
+    #[test]
+    fn confirmed_restore_cancellation_stops_before_later_root_mutation() {
+        let workspace = TempDir::new().unwrap();
+        for directory in ["config", "memory"] {
+            std::fs::create_dir_all(workspace.path().join(directory)).unwrap();
+            std::fs::write(workspace.path().join(directory).join("value.txt"), "backup").unwrap();
+        }
+        let tool = make_tool(&workspace);
+        let created = tool
+            .cmd_create(&BlockingOperationCancellation::default())
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        let backup_name = created["backup"].as_str().unwrap().to_owned();
+        std::fs::write(workspace.path().join("config/value.txt"), "current-config").unwrap();
+        std::fs::write(workspace.path().join("memory/value.txt"), "current-memory").unwrap();
+
+        let (copied_tx, copied_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let copied_tx = std::sync::Mutex::new(Some(copied_tx));
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let cancellation = BlockingOperationCancellation {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            after_file_copy: Some(Arc::new(move |path| {
+                if path.ends_with("config/value.txt")
+                    && let Some(tx) = copied_tx.lock().unwrap().take()
+                {
+                    tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            })),
+        };
+        let worker_cancellation = cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            tool.cmd_restore(&backup_name, true, Some(&worker_cancellation))
+        });
+
+        copied_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("restore should reach the first copied file");
+        cancellation.cancel();
+        release_tx.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+
+        assert!(error.downcast_ref::<BlockingOperationCancelled>().is_some());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("config/value.txt")).unwrap(),
+            "backup"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("memory/value.txt")).unwrap(),
+            "current-memory"
+        );
     }
 
     #[tokio::test]

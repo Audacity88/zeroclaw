@@ -270,9 +270,10 @@ fn replace_open_file(
         .len()
         .checked_mul(size_of::<u16>())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?;
-    let info_len = offset_of!(FILE_RENAME_INFORMATION, FileName)
+    let name_end = offset_of!(FILE_RENAME_INFORMATION, FileName)
         .checked_add(byte_len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?;
+    let info_len = name_end.max(size_of::<FILE_RENAME_INFORMATION>());
     let word_len = info_len.div_ceil(size_of::<usize>());
     let mut storage = vec![0usize; word_len];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
@@ -331,6 +332,20 @@ mod tests {
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<io::Result<Vec<_>>>()?;
         assert_eq!(names, [OsString::from("existing.txt")]);
+        Ok(())
+    }
+
+    #[test]
+    fn write_file_atomic_creates_and_replaces_one_character_name() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let destination = root.path().join("x");
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+
+        write_file_atomic(&parent, Path::new("x"), b"first")?;
+        assert_eq!(std::fs::read(&destination)?, b"first");
+
+        write_file_atomic(&parent, Path::new("x"), b"second")?;
+        assert_eq!(std::fs::read(destination)?, b"second");
         Ok(())
     }
 }
