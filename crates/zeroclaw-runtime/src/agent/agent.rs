@@ -336,10 +336,13 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
-    /// Resolves the structured-history cap from canonical config at use time.
-    /// Daemon-backed sessions capture the shared live config handle so reloads
-    /// affect existing sessions without duplicating config-derived state.
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// Resolves the structured-history trim policy from canonical config at
+    /// use time: the effective cap and the low-water fraction, as one pair.
+    /// Daemon-backed sessions capture the shared live config handle so
+    /// reloads affect existing sessions without duplicating config-derived
+    /// state. Both halves resolve together so a reload cannot mix revisions.
+    structured_history_limits_resolver:
+        Option<Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>>,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
@@ -520,7 +523,8 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_limits_resolver:
+        Option<Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
@@ -574,7 +578,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_history_cap_resolver: None,
+            structured_history_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
@@ -666,17 +670,26 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_cap_resolver(
+    fn structured_history_limits_resolver(
         mut self,
-        resolver: Arc<dyn Fn() -> usize + Send + Sync>,
+        resolver: Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>,
     ) -> Self {
-        self.structured_history_cap_resolver = Some(resolver);
+        self.structured_history_limits_resolver = Some(resolver);
         self
     }
 
+    /// Test convenience pinning the structured cap. The low-water fraction
+    /// stays at the crate default inside the pinned resolver; tests that
+    /// need a specific fraction must drive it through a runtime profile and
+    /// the live resolver path instead.
     #[cfg(test)]
     fn structured_max_history_messages(self, max: usize) -> Self {
-        self.structured_history_cap_resolver(Arc::new(move || max))
+        self.structured_history_limits_resolver(Arc::new(move || {
+            crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: max,
+                low_water: zeroclaw_config::schema::DEFAULT_HISTORY_TRIM_LOW_WATER,
+            }
+        }))
     }
 
     pub fn multimodal_config(
@@ -958,7 +971,7 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_cap_resolver: self.structured_history_cap_resolver,
+            structured_history_limits_resolver: self.structured_history_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             model_provider_name: self
@@ -1811,18 +1824,28 @@ impl Agent {
             ApprovalManager::for_non_interactive(risk_profile)
         };
 
-        let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
-                let cap_agent_alias = agent_alias.to_string();
-                Arc::new(move || {
-                    cap_config
-                        .read()
-                        .effective_structured_max_history_messages(&cap_agent_alias)
-                })
-            } else {
-                let max = config.effective_structured_max_history_messages(agent_alias);
-                Arc::new(move || max)
+        let structured_history_limits_resolver: Arc<
+            dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync,
+        > = if let Some(cap_config) = live_config {
+            let cap_agent_alias = agent_alias.to_string();
+            // One read guard covers both halves: the cap and the low-water
+            // fraction are one trim decision and must come from one config
+            // revision even under a concurrent profile edit.
+            Arc::new(move || {
+                let config = cap_config.read();
+                crate::agent::history_trim::HistoryTrimLimits {
+                    max_messages: config
+                        .effective_structured_max_history_messages(&cap_agent_alias),
+                    low_water: config.effective_history_trim_low_water(&cap_agent_alias),
+                }
+            })
+        } else {
+            let limits = crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: config.effective_structured_max_history_messages(agent_alias),
+                low_water: config.effective_history_trim_low_water(agent_alias),
             };
+            Arc::new(move || limits)
+        };
 
         let builder = Agent::builder();
         #[cfg(test)]
@@ -1847,7 +1870,7 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_history_cap_resolver(structured_history_cap_resolver)
+            .structured_history_limits_resolver(structured_history_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
@@ -1896,19 +1919,18 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max = self
-            .structured_history_cap_resolver
-            .as_ref()
-            .map_or(self.config.resolved.max_history_messages, |resolve| {
-                resolve()
-            });
+        let limits = self.structured_history_limits_resolver.as_ref().map_or(
+            crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: self.config.resolved.max_history_messages,
+                low_water: self.config.resolved.history_trim_low_water,
+            },
+            |resolve| resolve(),
+        );
+        let max = limits.max_messages;
         if self.history.len() <= max {
             return None;
         }
-        let target = crate::agent::history_trim::history_trim_target(
-            max,
-            self.config.resolved.history_trim_low_water,
-        );
+        let target = crate::agent::history_trim::history_trim_target(max, limits.low_water);
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
             max,
