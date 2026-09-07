@@ -1164,20 +1164,25 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
+            let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
+            // If narration wasn't streamed live, send the unforwarded remainder
+            // now as a post-hoc Chunk. Gated on event_tx independently of
+            // on_delta (never nested — §8.4).
+            if !remainder.is_empty() && !response_streamed_live && !protocol_suppressed {
+                events::emit_posthoc_turn_chunk(event_tx.as_ref(), remainder).await;
+            }
             // `protocol_suppressed` withholds the whole turn; the empty-remainder
             // skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
+                && !remainder.is_empty()
                 && let Some(ref tx) = on_delta
             {
-                let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
-                if !remainder.is_empty() {
-                    let mut narration = remainder.to_string();
-                    if !narration.ends_with('\n') {
-                        narration.push('\n');
-                    }
-                    let _ = tx.send(StreamDelta::Text(narration)).await;
+                let mut narration = remainder.to_string();
+                if !narration.ends_with('\n') {
+                    narration.push('\n');
                 }
+                let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 eprint!("{display_text}");
