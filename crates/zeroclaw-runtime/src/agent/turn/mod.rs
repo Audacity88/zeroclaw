@@ -582,11 +582,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         sop_reassembly,
     } = p;
     let mut loop_local_image_cache = None;
+    let mut loop_local_image_quarantine = ProviderImageQuarantine::default();
     let mut image_cache = Some(match image_cache {
         Some(cache) => cache,
-        None => {
-            loop_local_image_cache.insert(zeroclaw_providers::multimodal::LocalImageCache::new())
-        }
+        None => ToolLoopImageState {
+            cache: loop_local_image_cache
+                .insert(zeroclaw_providers::multimodal::LocalImageCache::new()),
+            quarantine: &mut loop_local_image_quarantine,
+        },
     });
     let ResolvedAgentExecution {
         model_access:
