@@ -7291,8 +7291,8 @@ impl ChatState {
             self.turn_had_streaming_text = true;
         }
         self.flush_streaming_thought();
-        self.turn_had_streaming_text = false;
-        self.turn_had_tool_calls = false;
+        // Preserve per-turn provenance for a delayed terminal notification;
+        // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
         self.settle_turn_lifecycle(false);
     }
@@ -14635,6 +14635,60 @@ mod tests {
                 .iter()
                 .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
             "the lifecycle fence must not invent the dropped final transcript content"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_before_turn_complete_does_not_duplicate_streamed_text() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_queue();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "sess-1",
+                    "text": "streamed reply"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+        respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "streamed reply"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        let replies = active_state(&mut chat)
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(entry, ChatEntry::AgentMessage(text) if text.as_ref() == "streamed reply")
+            })
+            .count();
+        assert_eq!(
+            replies, 1,
+            "a delayed terminal frame must not duplicate text committed by response settlement"
         );
     }
 
