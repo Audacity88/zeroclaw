@@ -223,7 +223,7 @@ When passing review to another maintainer or agent mid-flight, include:
 
 This keeps context loss low and avoids the next reviewer redoing the same fetches you already did.
 
-Core reviewers aim to review pull requests in their area within five business days, as defined by [FND-003](../foundations/fnd-003-governance.md). If a requested review remains unanswered after that window, ping the reviewer or request another qualified reviewer and provide the handoff above. Reassignment changes who performs the next review; it does not clear an active changes-requested review. The replacement reviewer must inspect the current head and reconcile every live concern. Elapsed time never clears a security or other critical concern.
+Core reviewers aim to review pull requests in their area within five business days, as defined by [FND-003](../foundations/fnd-003-governance.md). If a requested review remains unanswered after that window, request another qualified reviewer and provide the handoff above. Reassignment changes who performs the next review; it does not clear an active changes-requested review. The replacement reviewer must inspect the current head and reconcile every live concern. Elapsed time never clears a security or other critical concern.
 
 ## Weekly queue hygiene
 
