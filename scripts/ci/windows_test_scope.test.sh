@@ -224,6 +224,15 @@ assert_selection "Rust toolchain" full '[]' '' "$paths_file" true
 printf '%s\n' '.github/workflows/ci.yml' > "$paths_file"
 assert_selection "workflow itself exercises plugin host path" full '[]' '' "$paths_file" true
 
+printf '%s\n' '.github/workflows/pr-size-labeler.yml' > "$paths_file"
+assert_selection "known independent workflow only" skip '[]' 'No covered Rust compilation or test paths changed.' "$paths_file"
+
+printf '%s\n' '.github/workflows/pr-size-labeler.yml' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
+assert_selection "known independent workflow with package source" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
+
+printf '%s\n' '.github/workflows/new-reusable-workflow.yml' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
+assert_selection "unknown workflow with package source remains full" full '[]' '' "$paths_file"
+
 printf '%s\n' 'scripts/ci/windows_test_scope.py' > "$paths_file"
 assert_selection "selector itself exercises plugin host path" full '[]' '' "$paths_file" true
 

@@ -23,6 +23,9 @@ FULL_PATHS = {
     "scripts/ci/windows_test_scope.test.sh",
     "Cargo.toml",
 }
+IRRELEVANT_WORKFLOW_PATHS = {
+    ".github/workflows/pr-size-labeler.yml",
+}
 FULL_PATH_PREFIXES = (".github/actions/", "wit/")
 PLUGIN_HOST_PATH_PREFIXES = (
     "crates/zeroclaw-plugins/",
@@ -306,6 +309,8 @@ def select_pull_request(
                 "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
                 needs_plugin_host,
             )
+        if path in IRRELEVANT_WORKFLOW_PATHS:
+            continue
         if path.startswith(".github/workflows/") or path.startswith("scripts/ci/"):
             return full(
                 "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
