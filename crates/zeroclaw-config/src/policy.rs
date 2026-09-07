@@ -1486,6 +1486,15 @@ fn git_command_is_write(args: &[String]) -> bool {
         return true;
     }
 
+    if matches!(
+        subcommand.to_ascii_lowercase().as_str(),
+        "diff" | "log" | "show"
+    ) && git_args_before_pathspec(args, subcommand_idx + 1)
+        .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--output"))
+    {
+        return true;
+    }
+
     git_arg_eq(subcommand, "worktree")
         && git_first_non_option_before_pathspec(args, subcommand_idx + 1)
             .is_some_and(|action| !git_arg_eq(action, "list"))
@@ -1834,41 +1843,17 @@ fn git_archive_remote_selects_helper(args: &[String]) -> bool {
         {
             return true;
         }
-        let separated_remote =
-            !arg.contains('=') && git_arg_is_long_option_or_abbreviation(arg, "--remote");
-        if separated_remote {
+        if !arg.contains('=') && git_arg_is_long_option_or_abbreviation(arg, "--remote") {
             match args.get(idx + 1).map(String::as_str) {
                 Some(value) if git_arg_selects_remote_helper(value) => return true,
                 _ => {}
             }
-        }
-        idx += if separated_remote
-            || (!arg.contains('=')
-                && [
-                    "--add-file",
-                    "--add-virtual-file",
-                    "--format",
-                    "--output",
-                    "--prefix",
-                    "-o",
-                ]
-                .iter()
-                .any(|option| git_arg_is_option_or_abbreviation(arg, option)))
-        {
-            2
+            idx += 2;
         } else {
-            1
-        };
+            idx += 1;
+        }
     }
     false
-}
-
-fn git_arg_is_option_or_abbreviation(arg: &str, option: &str) -> bool {
-    if option.starts_with("--") {
-        git_arg_is_long_option_or_abbreviation(arg, option)
-    } else {
-        git_arg_eq(arg, option)
-    }
 }
 
 fn git_arg_opens_files_in_pager(arg: &str) -> bool {
@@ -5685,6 +5670,68 @@ mod tests {
     }
 
     #[test]
+    fn git_archive_remote_and_output_writes_enforce_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git archive --format --remote=ext::helper HEAD",
+            "git archive --prefix --remote=ext::helper HEAD",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("archive helper remotes must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        for command in [
+            "git archive --format --remote=https://example.invalid/repo HEAD",
+            "git archive --prefix --remote=https://example.invalid/repo HEAD",
+            "git archive -- --remote=ext::helper",
+        ] {
+            let risk = p
+                .validate_command_execution(command, false)
+                .expect("safe remotes and operands must remain allowed");
+            assert_eq!(risk, CommandRiskLevel::Low, "{command}");
+        }
+
+        for command in [
+            "git diff --output=./review-output.patch",
+            "git diff --output ./review-output.patch",
+            "git log --output=./review-output.log -1",
+            "git show --output ./review-output.txt HEAD",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("Git output-file options must require approval");
+            assert!(err.contains("medium-risk operation"), "{command}: {err}");
+
+            let risk = p
+                .validate_command_execution(command, true)
+                .expect("approved Git output-file options must remain available");
+            assert_eq!(risk, CommandRiskLevel::Medium, "{command}");
+        }
+
+        for command in [
+            "git diff -- --output=./review-output.patch",
+            "git log -- --output=./review-output.log",
+            "git show -- --output=./review-output.txt",
+        ] {
+            let risk = p
+                .validate_command_execution(command, false)
+                .expect("output-looking operands after -- must remain allowed");
+            assert_eq!(risk, CommandRiskLevel::Low, "{command}");
+        }
+    }
+
+    #[test]
     fn shell_environment_assignments_rejected_at_policy_boundary() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -5914,7 +5961,6 @@ mod tests {
             "git clone https://example.invalid/repo evil://dst",
             "git submodule status ./evil://path",
             "git submodule add https://example.invalid/repo evil://path",
-            "git archive --format --remote=ext::helper HEAD",
             "git archive -- --remote=ext::helper",
             "git archive --remote=https://example.invalid/repo --remote=ssh://example.invalid/repo HEAD",
         ] {
