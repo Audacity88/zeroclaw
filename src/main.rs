@@ -5562,7 +5562,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // is transferred back here on every reload), so this generation
                 // adopts a snapshot that no offline mutation can have raced.
                 let (expected_data_dir, ownership) = daemon_ownership.take().ok_or_else(|| {
-                    anyhow::anyhow!("daemon config ownership was not held for this generation")
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "daemon config ownership invariant failed"
+                    );
+                    anyhow::Error::msg("daemon config ownership was not held for this generation")
                 })?;
                 let authority = zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
                     iteration_config,
@@ -6194,7 +6200,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         daemon_ownership = Some((
                             expected_data_dir,
                             transferred_ownership.ok_or_else(|| {
-                                anyhow::anyhow!("daemon reload did not retain config ownership")
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                    "daemon reload ownership transfer invariant failed"
+                                );
+                                anyhow::Error::msg("daemon reload did not retain config ownership")
                             })?,
                         ));
                         current_config = Box::pin(Config::load_or_init()).await?;

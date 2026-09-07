@@ -20055,8 +20055,8 @@ pub mod test_post_replace_pause_gate {
             let first = arm(first_path.clone());
             let second = arm(second_path.clone());
 
-            let first_save = tokio::spawn(async move { pause(&first_path).await });
-            let second_save = tokio::spawn(async move { pause(&second_path).await });
+            let first_save = ::zeroclaw_spawn::spawn!(async move { pause(&first_path).await });
+            let second_save = ::zeroclaw_spawn::spawn!(async move { pause(&second_path).await });
             first.wait_paused().await;
             second.wait_paused().await;
 
@@ -20082,7 +20082,7 @@ pub mod test_post_replace_pause_gate {
             let path = PathBuf::from("test-post-replace-next-save.toml");
             let gate = arm(path.clone());
             let first_path = path.clone();
-            let first_save = tokio::spawn(async move { pause(&first_path).await });
+            let first_save = ::zeroclaw_spawn::spawn!(async move { pause(&first_path).await });
             gate.wait_paused().await;
 
             tokio::time::timeout(Duration::from_secs(1), pause(&path))
