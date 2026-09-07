@@ -223,6 +223,8 @@ When passing review to another maintainer or agent mid-flight, include:
 
 This keeps context loss low and avoids the next reviewer redoing the same fetches you already did.
 
+Core reviewers aim to review pull requests in their area within five business days, as defined by [FND-003](../foundations/fnd-003-governance.md). If a requested review remains unanswered after that window, ping the reviewer or request another qualified reviewer and provide the handoff above. Reassignment changes who performs the next review; it does not clear an active changes-requested review. The replacement reviewer must inspect the current head and reconcile every live concern, and a maintainer with the required repository permission may dismiss an obsolete review only after its underlying blockers are demonstrably resolved. Elapsed time never clears a security or other critical concern.
+
 ## Weekly queue hygiene
 
 - Walk the stale queue. Apply `status:no-stale` only under the rules in the [Project board contract](./pr-workflow.md#issue-routing-evidence): when accepted or otherwise long-lived work has a recorded reason to stay open, contributor-visible routing evidence, and no other stale exclusion already applies. Active release trackers and active RFC or design trackers may keep stale protection by default when the issue itself clearly identifies the active coordination or decision surface; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Until the stale-exemption audit lands, treat existing `status:no-stale` issues missing those facts as audit findings rather than automatic stale candidates.
