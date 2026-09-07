@@ -12611,6 +12611,7 @@ mod tests {
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
             2,
+            crate::agent::history_trim::history_trim_target(2, 1.0),
             false,
         );
         assert!(active.trimmed);
