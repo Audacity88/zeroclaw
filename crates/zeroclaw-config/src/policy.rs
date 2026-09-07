@@ -1486,13 +1486,30 @@ fn git_command_is_write(args: &[String]) -> bool {
         return true;
     }
 
-    if matches!(
-        subcommand.to_ascii_lowercase().as_str(),
-        "diff" | "log" | "show"
-    ) && git_args_before_pathspec(args, subcommand_idx + 1)
-        .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--output"))
-    {
-        return true;
+    match subcommand.to_ascii_lowercase().as_str() {
+        "archive" => {
+            if git_args_before_pathspec(args, subcommand_idx + 1).any(|arg| {
+                arg.starts_with("-o") || git_arg_is_long_option_or_abbreviation(arg, "--output")
+            }) {
+                return true;
+            }
+        }
+        "bundle" => {
+            if git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+                .is_some_and(|action| git_arg_eq(action, "create"))
+            {
+                return true;
+            }
+        }
+        "diff" | "log" | "show" => {
+            if git_args_before_pathspec(args, subcommand_idx + 1)
+                .any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--output"))
+            {
+                return true;
+            }
+        }
+        "format-patch" => return true,
+        _ => {}
     }
 
     git_arg_eq(subcommand, "worktree")
@@ -5616,10 +5633,8 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        #[cfg(not(target_os = "windows"))]
-        assert!(p.is_command_allowed("c\\at ./src/main.rs"));
-        #[cfg(target_os = "windows")]
-        assert!(!p.is_command_allowed("c\\at ./src/main.rs"));
+        assert!(p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::Posix,));
+        assert!(!p.is_command_allowed_for_shell("c\\at ./src/main.rs", ShellDialect::WindowsCmd,));
 
         assert!(!p.is_command_allowed("find . '-exec' echo"));
         assert_eq!(p.forbidden_path_argument("cat './src/main.rs'"), None);
@@ -5703,8 +5718,18 @@ mod tests {
         }
 
         for command in [
+            "git archive --output=./archive.tar HEAD",
+            "git archive --output ./archive.tar HEAD",
+            "git archive --out=./archive.tar HEAD",
+            "git archive -o ./archive.tar HEAD",
+            "git archive -o./archive.tar HEAD",
+            "git bundle create ./repo.bundle HEAD",
             "git diff --output=./review-output.patch",
             "git diff --output ./review-output.patch",
+            "git format-patch -1 HEAD",
+            "git format-patch --output-directory=./patches -1 HEAD",
+            "git format-patch --output-directory ./patches -1 HEAD",
+            "git format-patch -o ./patches -1 HEAD",
             "git log --output=./review-output.log -1",
             "git show --output ./review-output.txt HEAD",
         ] {
@@ -5720,6 +5745,8 @@ mod tests {
         }
 
         for command in [
+            "git archive HEAD",
+            "git archive -- --output=./archive.tar",
             "git diff -- --output=./review-output.patch",
             "git log -- --output=./review-output.log",
             "git show -- --output=./review-output.txt",
@@ -6176,7 +6203,6 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn windows_backslash_executable_is_not_normalized_to_allowlisted_command() {
         let p = SecurityPolicy {
@@ -6185,7 +6211,11 @@ mod tests {
         };
 
         let err = p
-            .validate_command_execution("c\\at ./src/main.rs", false)
+            .validate_command_execution_for_shell(
+                "c\\at ./src/main.rs",
+                false,
+                ShellDialect::WindowsCmd,
+            )
             .expect_err("Windows path separators must not become allowlisted command text");
         assert!(
             err.contains("Command not allowed by security policy"),
