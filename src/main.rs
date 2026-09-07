@@ -135,7 +135,16 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+        // i18n-exempt: English fallback when Fluent (agent-runtime) is
+        // disabled. The fallback still carries `{$name}` placeholders, so
+        // substitute them here — without this, every argument-bearing
+        // message prints its placeholder literally (e.g. "Initialized
+        // {$count} section(s)").
+        let mut rendered = fallback.to_string();
+        for (name, value) in args {
+            rendered = rendered.replace(&format!("{{${name}}}"), value);
+        }
+        rendered
     }
 }
 
@@ -4748,8 +4757,64 @@ async fn async_main(command: clap::Command) -> Result<()> {
         None
     };
 
+    // The daemon must own the config lifecycle before the executable config is
+    // loaded: a supported offline mutation committing between the config read
+    // and a post-load lock acquisition would otherwise be silently shadowed by
+    // the stale startup snapshot. Resolve the runtime identity first, acquire
+    // process ownership, then load the fresh protected snapshot. The guard
+    // transfers continuously across reload generations in the daemon loop.
+    #[cfg(feature = "agent-runtime")]
+    let mut daemon_ownership = if matches!(&cli.command, Commands::Daemon { .. }) {
+        let (_, data_dir) = zeroclaw_config::schema::resolve_runtime_dirs().await?;
+        Some((
+            data_dir.clone(),
+            zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(&data_dir)
+                .map_err(|error| {
+                    if !matches!(
+                        error,
+                        zeroclaw_runtime::live_config_authority::ConfigOwnershipError::AlreadyOwned { .. }
+                    ) {
+                        return anyhow::Error::from(error);
+                    }
+                    let message = ta(
+                        "cli-standalone-daemon-owned",
+                        &[("command", "daemon"), ("path", &data_dir.display().to_string())],
+                        &format!(
+                            "Cannot run `zeroclaw daemon` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
+                            data_dir.display()
+                        ),
+                    );
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Reject
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": "daemon",
+                            "path": data_dir.display().to_string(),
+                        })),
+                        "daemon refused because config state is already owned"
+                    );
+                    anyhow::Error::msg(message)
+                })?,
+        ))
+    } else {
+        None
+    };
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    #[cfg(feature = "agent-runtime")]
+    if let Some((expected_data_dir, _)) = daemon_ownership.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during daemon startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
         anyhow::ensure!(
@@ -5493,7 +5558,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 if port != 0 {
                     iteration_config.gateway.port = port;
                 }
-                let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(iteration_config)?;
+                // The ownership guard was acquired before the config load (and
+                // is transferred back here on every reload), so this generation
+                // adopts a snapshot that no offline mutation can have raced.
+                let (expected_data_dir, ownership) = daemon_ownership.take().ok_or_else(|| {
+                    anyhow::anyhow!("daemon config ownership was not held for this generation")
+                })?;
+                let authority = zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+                    iteration_config,
+                    ownership,
+                );
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
@@ -6101,7 +6175,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     handle.abort();
                     let _ = handle.await;
                 }
-                let exit = exit?;
+                let (exit, transferred_ownership) = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
@@ -6113,6 +6187,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ),
                             "🔄 Daemon reload — re-reading config from disk"
                         );
+                        // Continuous ownership: the previous generation drained
+                        // with the guard retained and returned it; the fresh
+                        // snapshot below is loaded while this process still owns
+                        // the config lifecycle.
+                        daemon_ownership = Some((
+                            expected_data_dir,
+                            transferred_ownership.ok_or_else(|| {
+                                anyhow::anyhow!("daemon reload did not retain config ownership")
+                            })?,
+                        ));
                         current_config = Box::pin(Config::load_or_init()).await?;
                         #[cfg(feature = "agent-runtime")]
                         observability::runtime_trace::init_from_config(

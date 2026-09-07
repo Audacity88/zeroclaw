@@ -121,6 +121,46 @@ impl LiveConfigAuthority {
             );
         }
     }
+
+    /// Drain a closed generation while RETAINING process ownership, so a
+    /// daemon reload can transfer the guard into the next generation without
+    /// an unlocked read/reacquire interval. Pair with
+    /// [`Self::take_process_ownership`] once the drain completes.
+    pub async fn drain_agent_lifecycle_retaining_ownership(&self) {
+        self.close_agent_lifecycle();
+        const DIAGNOSTIC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+        loop {
+            if tokio::time::timeout(
+                DIAGNOSTIC_INTERVAL,
+                self.agent_lifecycle
+                    .drain_closed_generation_retaining_ownership(),
+            )
+            .await
+            .is_ok()
+            {
+                return;
+            }
+            let aliases = self.agent_lifecycle.pending_work_aliases();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "pending_aliases": aliases,
+                        "waited_seconds": DIAGNOSTIC_INTERVAL.as_secs(),
+                    })),
+                "daemon generation remains fail-closed while admitted agent work is still running"
+            );
+        }
+    }
+
+    /// Transfer the process-ownership guard out of this authority. Returns
+    /// `None` when ownership was already released by a completed drain or
+    /// never acquired.
+    pub fn take_process_ownership(&self) -> Option<ConfigOwnershipGuard> {
+        self.agent_lifecycle.take_ownership()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -473,22 +513,21 @@ impl ConfigOwnershipGuard {
     }
 }
 
-/// Detach post-commit lifecycle work while retaining alias exclusion.
+/// Detach retained lifecycle work without exposing it to request
+/// cancellation.
 ///
-/// Dropping the returned handle does not cancel the task, so request
-/// cancellation cannot release the leases while cleanup is still running.
-pub fn spawn_agent_lifecycle_job<F, T>(
-    leases: Vec<AgentDeleteLease>,
-    future: F,
-) -> tokio::task::JoinHandle<T>
+/// The owned future captures its destructive leases itself and releases them
+/// only when it completes; dropping the returned handle does not cancel the
+/// task, so request cancellation cannot release the leases while the
+/// transaction or cleanup is still running. The future may commit its
+/// reservations mid-flight (see
+/// [`AgentDeleteLease::commit_destructive_mutation`]).
+pub fn spawn_agent_lifecycle_job<F, T>(future: F) -> tokio::task::JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    zeroclaw_spawn::spawn!(async move {
-        let _leases = leases;
-        future.await
-    })
+    zeroclaw_spawn::spawn!(future)
 }
 
 #[derive(Default)]
@@ -596,6 +635,33 @@ pub struct AgentDeleteLease {
     coordinator: AgentLifecycleCoordinator,
     alias: String,
     active: bool,
+    committed: bool,
+}
+
+impl AgentDeleteLease {
+    /// Transition a reserved destructive mutation into committed destructive
+    /// ownership: advance the alias generation exactly once under the
+    /// coordinator lock. Call only after the config mutation is durably
+    /// persisted, and retain the lease in a continuation that cannot be
+    /// cancelled with the request until cleanup finishes. Dropping the lease
+    /// without committing rolls the reservation back and leaves the alias
+    /// generation (and every producer pinned to it) unchanged.
+    pub fn commit_destructive_mutation(&mut self) {
+        if !self.active || self.committed {
+            return;
+        }
+        let mut state = self.coordinator.state.lock();
+        // The alias entry created at reservation is never removed while the
+        // lease is live, so the lookup cannot fail (same invariant as
+        // `AgentAdmissionReservation::publish`).
+        let lifecycle = state
+            .aliases
+            .get_mut(&self.alias)
+            .expect("delete reservation must retain alias state");
+        debug_assert!(lifecycle.deleting);
+        lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        self.committed = true;
+    }
 }
 
 impl AgentLifecycleCoordinator {
@@ -742,9 +808,14 @@ impl AgentLifecycleCoordinator {
         })
     }
 
-    /// Enter destructive work for one alias after proving no admission or
-    /// published session is using it. The returned lease keeps the alias
-    /// unavailable until cleanup finishes.
+    /// Reserve destructive work for one alias after proving no admission or
+    /// published session is using it. The reservation blocks new admission by
+    /// marking the alias changing, but does not advance the alias generation:
+    /// a refused or failed mutation drops the lease and leaves existing
+    /// producers usable. Only after the config mutation is durably committed
+    /// does the caller call [`AgentDeleteLease::commit_destructive_mutation`],
+    /// which advances the generation exactly once and hands destructive
+    /// ownership to the retained continuation.
     pub fn begin_delete(
         &self,
         alias: impl Into<String>,
@@ -756,11 +827,11 @@ impl AgentLifecycleCoordinator {
         }
         let lifecycle = state.aliases.entry(alias.clone()).or_default();
         lifecycle.deleting = true;
-        lifecycle.generation = lifecycle.generation.wrapping_add(1);
         Ok(AgentDeleteLease {
             coordinator: self.clone(),
             alias,
             active: true,
+            committed: false,
         })
     }
 
@@ -819,6 +890,31 @@ impl AgentLifecycleCoordinator {
             }
             notified.await;
         }
+    }
+
+    /// Wait until the closed generation is idle WITHOUT releasing process
+    /// ownership. Used by daemon reload, which transfers the guard into the
+    /// next generation instead of releasing it between generations.
+    async fn drain_closed_generation_retaining_ownership(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.state.lock();
+                if state.closing && state.aliases.values().all(AliasLifecycleState::is_idle) {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Transfer the process-ownership guard out of this coordinator. Returns
+    /// `None` when ownership was already released by a completed drain or
+    /// never acquired.
+    fn take_ownership(&self) -> Option<ConfigOwnershipGuard> {
+        self.state.lock().ownership.take()
     }
 }
 
@@ -1020,7 +1116,10 @@ mod tests {
         let authority = LiveConfigAuthority::new(config);
         let capability = authority.execution_capability();
         let generation = capability.agent_lifecycle_generation("alpha");
-        let delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+        let mut delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+        // A committed deletion advances the generation; a reservation alone
+        // does not (see the refusal rollback regression below).
+        delete.commit_destructive_mutation();
         drop(delete);
 
         assert_eq!(
@@ -1084,7 +1183,8 @@ mod tests {
         let lease = lifecycle.begin_delete("alpha").unwrap();
         let release = Arc::new(tokio::sync::Notify::new());
         let task_release = Arc::clone(&release);
-        let handle = spawn_agent_lifecycle_job(vec![lease], async move {
+        let handle = spawn_agent_lifecycle_job(async move {
+            let _lease = lease;
             task_release.notified().await;
         });
         drop(handle);
@@ -1121,7 +1221,15 @@ mod tests {
 
         drop(turn);
         assert_eq!(lifecycle.active_turn_count("alpha"), 0);
+        // Dropping the reservation without committing is a rollback: the old
+        // generation and its producers stay usable.
         let delete = lifecycle.begin_delete("alpha").unwrap();
+        drop(delete);
+        assert!(lifecycle.reserve_turn_at("alpha", generation).is_ok());
+        // Committing advances the generation exactly once; producers pinned to
+        // the old generation are rejected afterwards.
+        let mut delete = lifecycle.begin_delete("alpha").unwrap();
+        delete.commit_destructive_mutation();
         drop(delete);
         assert_eq!(
             lifecycle.reserve_turn_at("alpha", generation).err(),
@@ -1172,7 +1280,8 @@ mod tests {
         let turn = lifecycle.reserve_turn("turn").unwrap();
         let release = Arc::new(tokio::sync::Notify::new());
         let task_release = Arc::clone(&release);
-        let handle = spawn_agent_lifecycle_job(vec![lease], async move {
+        let handle = spawn_agent_lifecycle_job(async move {
+            let _lease = lease;
             task_release.notified().await;
         });
         drop(handle);
@@ -1228,7 +1337,8 @@ mod tests {
     async fn lifecycle_job_panic_releases_generation_drain() {
         let authority = LiveConfigAuthority::new(Config::default());
         let lease = authority.agent_lifecycle().begin_delete("alpha").unwrap();
-        let handle = spawn_agent_lifecycle_job(vec![lease], async move {
+        let handle = spawn_agent_lifecycle_job(async move {
+            let _lease = lease;
             panic!("test cleanup panic");
         });
         authority.close_agent_lifecycle();
@@ -1252,7 +1362,8 @@ mod tests {
         let lease = authority.agent_lifecycle().begin_delete("alpha").unwrap();
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let task_release = Arc::clone(&release);
-        let cleanup = spawn_agent_lifecycle_job(vec![lease], async move {
+        let cleanup = spawn_agent_lifecycle_job(async move {
+            let _lease = lease;
             let _permit = task_release
                 .acquire_owned()
                 .await
@@ -1291,6 +1402,113 @@ mod tests {
             Err(ConfigOwnershipError::AlreadyOwned { .. })
         ));
         drop(capability);
+        assert!(ConfigOwnershipGuard::acquire(temp.path()).is_ok());
+    }
+
+    #[test]
+    fn refused_destructive_mutation_preserves_generation_and_producers() {
+        let lifecycle = AgentLifecycleCoordinator::default();
+        let generation = lifecycle.alias_generation("alpha");
+
+        // A reserved-but-uncommitted delete (hard-reference refusal, config
+        // save failure, or request cancellation before commit) rolls back
+        // cleanly: admission is blocked only while reserved.
+        let lease = lifecycle.begin_delete("alpha").unwrap();
+        assert!(lifecycle.reserve_turn("alpha").is_err());
+        drop(lease);
+        assert_eq!(lifecycle.alias_generation("alpha"), generation);
+        let producer = lifecycle.reserve_turn_at("alpha", generation).unwrap();
+        drop(producer);
+
+        // The equivalent rename reservation pair rolls back both aliases.
+        let from = lifecycle.begin_delete("from").unwrap();
+        let to = lifecycle.begin_delete("to").unwrap();
+        drop(from);
+        drop(to);
+        assert_eq!(lifecycle.alias_generation("from"), 0);
+        assert_eq!(lifecycle.alias_generation("to"), 0);
+    }
+
+    #[test]
+    fn committed_destructive_mutation_advances_generation_exactly_once() {
+        let lifecycle = AgentLifecycleCoordinator::default();
+        let generation = lifecycle.alias_generation("alpha");
+        let mut lease = lifecycle.begin_delete("alpha").unwrap();
+        lease.commit_destructive_mutation();
+        lease.commit_destructive_mutation();
+        drop(lease);
+
+        assert_eq!(
+            lifecycle.alias_generation("alpha"),
+            generation.wrapping_add(1)
+        );
+        assert_eq!(
+            lifecycle.reserve_turn_at("alpha", generation).err(),
+            Some(AgentAdmissionError::StaleGeneration {
+                alias: "alpha".to_string(),
+            })
+        );
+        assert!(lifecycle.reserve_turn("alpha").is_ok());
+    }
+
+    #[test]
+    fn rename_reservation_pair_commits_together() {
+        let lifecycle = AgentLifecycleCoordinator::default();
+        let from_generation = lifecycle.alias_generation("from");
+        let to_generation = lifecycle.alias_generation("to");
+        let mut leases = vec![
+            lifecycle.begin_delete("from").unwrap(),
+            lifecycle.begin_delete("to").unwrap(),
+        ];
+        for lease in &mut leases {
+            lease.commit_destructive_mutation();
+        }
+        drop(leases);
+
+        assert_eq!(
+            lifecycle.alias_generation("from"),
+            from_generation.wrapping_add(1)
+        );
+        assert_eq!(
+            lifecycle.alias_generation("to"),
+            to_generation.wrapping_add(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_transfers_process_ownership_without_release() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let authority = LiveConfigAuthority::new_owned(config).unwrap();
+
+        authority.close_agent_lifecycle();
+        authority.drain_agent_lifecycle_retaining_ownership().await;
+        let guard = authority
+            .take_process_ownership()
+            .expect("reload drain retains ownership for transfer");
+
+        // Ownership never left this process across the reload boundary: a
+        // competing acquirer is refused for the whole interval.
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(temp.path()),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
+
+        // The next generation adopts the transferred guard together with a
+        // freshly loaded protected snapshot and admits new work.
+        let mut next_config = Config {
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        next_config
+            .agents
+            .insert("alpha".into(), Default::default());
+        let next = LiveConfigAuthority::new_with_ownership(next_config, guard);
+        assert!(next.agent_lifecycle().reserve_turn("alpha").is_ok());
+        drop(next);
         assert!(ConfigOwnershipGuard::acquire(temp.path()).is_ok());
     }
 }

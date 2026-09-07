@@ -2440,6 +2440,39 @@ impl DelegateTool {
             });
         };
 
+        // Retain the caller's workspace owner through terminal settlement:
+        // the detached task writes its terminal artifact into the caller's
+        // `workspace/delegate_results`, so deletion or rename of the caller
+        // alias must stay blocked until that write completes. The target
+        // admission alone cannot protect it. Same-alias delegation reuses the
+        // target admission instead of double-retaining one alias.
+        let caller_execution_admission = match execution_admission.as_ref() {
+            Some(target)
+                if target
+                    .alias()
+                    .eq_ignore_ascii_case(self.caller_alias.trim()) =>
+            {
+                None
+            }
+            _ => match self
+                .execution_capability
+                .as_ref()
+                .map(|capability| capability.admit(&self.caller_alias))
+            {
+                Some(Ok(admission)) => Some(admission),
+                Some(Err(error)) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Cannot start background delegation: caller admission failed: {error}"
+                        )),
+                    });
+                }
+                None => None,
+            },
+        };
+
         let task_control_plane = match self.background_control_plane().await {
             Ok(handle) => handle,
             Err(error) => {
@@ -2648,6 +2681,11 @@ impl DelegateTool {
                     terminal_owner_boot_id,
                 )
                 .await;
+                // Release both admissions only after the terminal result write
+                // completed (success, failure, or cancellation settlement):
+                // until now they blocked delete/rename of the target and of the
+                // caller workspace owner this task writes into.
+                drop(caller_execution_admission);
                 drop(target_execution_admission);
             })
             .instrument(::zeroclaw_log::attribution_span!(
@@ -12399,6 +12437,14 @@ command = "rm independent-delegate-marker"
                 lifecycle.begin_delete("target"),
                 Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
             ));
+            // The caller workspace owner is retained alongside the target:
+            // the terminal artifact is written into the caller's
+            // `workspace/delegate_results`, so caller delete/rename must stay
+            // blocked while the detached task runs.
+            assert!(matches!(
+                lifecycle.begin_delete("caller"),
+                Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+            ));
             if cancel {
                 tool.cancellation_token().cancel();
             } else {
@@ -12424,6 +12470,12 @@ command = "rm independent-delegate-marker"
             );
             assert!(matches!(
                 lifecycle.begin_delete("target"),
+                Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+            ));
+            // The caller admission survives terminal persistence (including
+            // the cancelled settlement path), not just the live turn.
+            assert!(matches!(
+                lifecycle.begin_delete("caller"),
                 Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
             ));
             assert!(
@@ -12490,6 +12542,16 @@ command = "rm independent-delegate-marker"
                 }
             );
             assert_eq!(terminal.output.is_some(), !cancel);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while lifecycle.active_turn_count("caller") != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // Terminal result write completed (success and cancelled
+            // settlement): the caller workspace owner is mutable again.
+            assert!(lifecycle.begin_delete("caller").is_ok());
             assert!(lifecycle.begin_delete("target").is_ok());
             if cancel {
                 release.notify_one();
@@ -12497,6 +12559,14 @@ command = "rm independent-delegate-marker"
             server.await.unwrap();
         }
     }
+
+    // NOTE on same-alias background delegation: it is structurally excluded
+    // upstream — `reachable_delegate_target_configs` skips the caller's own
+    // alias and target-policy resolution refuses it — so the double-retain
+    // scenario cannot occur through production paths. `execute_background`'s
+    // caller-admission dedup remains as a defensive invariant for that case;
+    // distinct caller/target retention is proven by
+    // `background_delegate_retains_admission_through_terminal_persistence`.
 
     #[tokio::test]
     async fn delegate_honors_parent_excluded_tools() {

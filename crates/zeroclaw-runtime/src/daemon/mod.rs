@@ -626,7 +626,7 @@ pub async fn run(
         config.gateway.port = port;
     }
     let live_config_authority = crate::LiveConfigAuthority::new_owned(config.clone())?;
-    run_with_authority(
+    let (exit, ownership) = run_with_authority(
         live_config_authority,
         host,
         port,
@@ -634,10 +634,20 @@ pub async fn run(
         ephemeral,
         startup_feedback_enabled,
     )
-    .await
+    .await?;
+    // `run` owns its guard for one invocation: shutdown released it inside
+    // `run_with_authority`, and a reload releases it here — the caller re-enters
+    // `run` (and re-acquires) for the next generation.
+    drop(ownership);
+    Ok(exit)
 }
 
 /// Use the authority acquired before constructing producers such as SOP maintenance.
+///
+/// On `DaemonExit::Reload` the process-ownership guard is drained with
+/// ownership retained and returned to the caller, so the next daemon
+/// generation can adopt it without an unlocked read/reacquire interval. On
+/// shutdown or error the guard is released here.
 pub async fn run_with_authority(
     live_config_authority: crate::LiveConfigAuthority,
     host: String,
@@ -645,7 +655,10 @@ pub async fn run_with_authority(
     mut registry: DaemonRegistry,
     ephemeral: bool,
     startup_feedback_enabled: bool,
-) -> Result<DaemonExit> {
+) -> Result<(
+    DaemonExit,
+    Option<crate::live_config_authority::ConfigOwnershipGuard>,
+)> {
     let config = live_config_authority.config().read().clone();
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
@@ -1270,7 +1283,18 @@ pub async fn run_with_authority(
     }
 
     drop(rpc_ctx);
-    live_config_authority.drain_agent_lifecycle().await;
+    // A reload transfers process ownership continuously into the next daemon
+    // generation: drain with the guard retained and hand it back to the
+    // caller. Shutdown and errors release ownership here, as before.
+    let transferred_ownership = if matches!(&exit_result, Ok(DaemonExit::Reload)) {
+        live_config_authority
+            .drain_agent_lifecycle_retaining_ownership()
+            .await;
+        live_config_authority.take_process_ownership()
+    } else {
+        live_config_authority.drain_agent_lifecycle().await;
+        None
+    };
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: glibc's parameter-free process allocator trim may release free
@@ -1280,7 +1304,7 @@ pub async fn run_with_authority(
         libc::malloc_trim(0);
     }
 
-    exit_result
+    exit_result.map(|exit| (exit, transferred_ownership))
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
@@ -4072,16 +4096,22 @@ mod tests {
 
         release_tx.send(()).unwrap();
         background.await.unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), daemon)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-            DaemonExit::Reload
-        );
+        let (exit, transferred_ownership) = tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit, DaemonExit::Reload);
         assert_eq!(tokio::fs::read(&result_path).await.unwrap(), b"finished");
-        let next = crate::LiveConfigAuthority::new_owned(config.clone()).unwrap();
+        // Continuous ownership across reload generations: the guard returns
+        // from `run_with_authority` instead of being released, and the next
+        // generation adopts it without an unlocked reacquire interval.
+        let ownership = transferred_ownership.expect("reload transfers process ownership");
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(&config.data_dir),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
+        let next = crate::LiveConfigAuthority::new_with_ownership(config.clone(), ownership);
         assert!(next.agent_lifecycle().reserve_turn("alpha").is_ok());
         assert!(matches!(
             stale_capability.admit("alpha"),
@@ -4094,6 +4124,33 @@ mod tests {
             ConfigOwnershipGuard::acquire(&config.data_dir),
             Err(ConfigOwnershipError::AlreadyOwned { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn daemon_preload_ownership_blocks_offline_mutation_before_fresh_load() {
+        use crate::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        // Daemon startup: the data-directory identity is resolved and process
+        // ownership is acquired BEFORE the executable config is loaded.
+        let ownership = ConfigOwnershipGuard::acquire(&config.data_dir).unwrap();
+
+        // A supported offline mutation cannot commit while startup holds the
+        // guard, so the loaded snapshot can never be older than a mutation
+        // that committed after the identity resolution.
+        assert!(matches!(
+            ConfigOwnershipGuard::acquire(&config.data_dir),
+            Err(ConfigOwnershipError::AlreadyOwned { .. })
+        ));
+
+        // The fresh protected snapshot loads under the held guard and becomes
+        // the generation's authority without reacquiring the lock.
+        let mut fresh = test_config(&tmp);
+        fresh.agents.insert("alpha".into(), Default::default());
+        let authority = crate::LiveConfigAuthority::new_with_ownership(fresh, ownership);
+        assert!(authority.agent_lifecycle().reserve_turn("alpha").is_ok());
     }
 
     #[tokio::test]

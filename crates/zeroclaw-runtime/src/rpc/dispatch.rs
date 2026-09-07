@@ -530,6 +530,87 @@ struct PreparedChannelGenerationMutation {
     drain: crate::daemon::PreparedChannelGenerationDrain,
 }
 
+/// Save one prepared config snapshot and install the matching live snapshot
+/// without a dispatcher instance. Used by the retained destructive
+/// transaction, whose task holds the config write guard across the whole
+/// persistence-to-cleanup sequence. The caller must hold the config write
+/// lock while awaiting this.
+async fn save_and_swap_config_detached(
+    config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    mut snapshot: zeroclaw_config::schema::Config,
+) -> Result<(), JsonRpcError> {
+    Box::pin(snapshot.save_dirty())
+        .await
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+    *config.write() = snapshot;
+    Ok(())
+}
+
+/// Dispatch a daemon reload without a dispatcher instance. Extracted so the
+/// retained lifecycle continuation (which owns destructive cleanup after the
+/// config commit) and the dispatcher share one implementation.
+fn schedule_daemon_reload_from_parts(
+    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    surface: &'static str,
+) -> bool {
+    let Some(reload_tx) = reload_tx else {
+        return false;
+    };
+    zeroclaw_spawn::spawn!(async move {
+        tokio::time::sleep(RPC_RELOAD_REPLY_FLUSH_DELAY).await;
+        if let Some(gateway_shutdown_tx) = gateway_shutdown_tx {
+            let _ = gateway_shutdown_tx.send(true);
+            tokio::time::sleep(RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY).await;
+        }
+        let _ = reload_tx.send(true);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({ "surface": surface })),
+            "daemon reload dispatched"
+        );
+    });
+    true
+}
+
+/// Retire a prepared channel generation without a dispatcher instance. Used by
+/// the retained destructive-mutation continuation: the continuation owns
+/// channel-generation draining after the config commit, so request
+/// cancellation cannot drop the lifecycle lease or skip the drain.
+async fn drain_channel_generation_without_dispatcher(
+    sessions: Arc<crate::rpc::session::SessionStore>,
+    prepared: Option<PreparedChannelGenerationMutation>,
+    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+) {
+    let Some(prepared) = prepared else {
+        return;
+    };
+    let drain_wait = prepared.drain.begin();
+    sessions
+        .cancel_all_inflight_and_wait(crate::rpc::session::CancelCause::ChannelGeneration)
+        .await;
+    for session_id in sessions.list_ids().await {
+        let Some(agent) = sessions.get_agent(&session_id).await else {
+            continue;
+        };
+        let agent = agent.lock().await;
+        let handles = agent.channel_handles();
+        crate::agent::loop_::refresh_channel_handles(
+            &prepared.configured,
+            &handles.ask_user,
+            &handles.channel_room,
+            &handles.reaction,
+            &handles.poll,
+            &handles.escalate,
+        );
+    }
+    drain_wait.wait().await;
+    schedule_daemon_reload_from_parts(reload_tx, gateway_shutdown_tx, "config-channel-generation");
+}
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -802,33 +883,15 @@ impl RpcDispatcher {
 
     async fn finish_channel_generation_mutation(
         &self,
-        prepared: Option<&PreparedChannelGenerationMutation>,
+        prepared: Option<PreparedChannelGenerationMutation>,
     ) {
-        let Some(prepared) = prepared else {
-            return;
-        };
-        let drain_wait = prepared.drain.begin();
-        self.ctx
-            .sessions
-            .cancel_all_inflight_and_wait(crate::rpc::session::CancelCause::ChannelGeneration)
-            .await;
-        for session_id in self.ctx.sessions.list_ids().await {
-            let Some(agent) = self.ctx.sessions.get_agent(&session_id).await else {
-                continue;
-            };
-            let agent = agent.lock().await;
-            let handles = agent.channel_handles();
-            crate::agent::loop_::refresh_channel_handles(
-                &prepared.configured,
-                &handles.ask_user,
-                &handles.channel_room,
-                &handles.reaction,
-                &handles.poll,
-                &handles.escalate,
-            );
-        }
-        drain_wait.wait().await;
-        self.schedule_daemon_reload("config-channel-generation");
+        drain_channel_generation_without_dispatcher(
+            Arc::clone(&self.ctx.sessions),
+            prepared,
+            self.ctx.reload_tx.clone(),
+            self.ctx.gateway_shutdown_tx.clone(),
+        )
+        .await;
     }
 
     async fn refresh_live_channel_handles_between_configs(
@@ -982,18 +1045,14 @@ impl RpcDispatcher {
     /// flight.
     async fn save_and_swap_config(
         &self,
-        mut snapshot: zeroclaw_config::schema::Config,
+        snapshot: zeroclaw_config::schema::Config,
         _guard: &ConfigWriteGuard,
     ) -> Result<(), JsonRpcError> {
         debug_assert!(
             self.ctx.config_write_lock.try_lock().is_err(),
             "save_and_swap_config caller must hold ctx.config_write_lock"
         );
-        Box::pin(snapshot.save_dirty())
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-        *self.ctx.config.write() = snapshot;
-        Ok(())
+        save_and_swap_config_detached(Arc::clone(&self.ctx.config), snapshot).await
     }
 
     async fn agent_rename_residue_exists(
@@ -3870,7 +3929,7 @@ impl RpcDispatcher {
                 );
             }
         }
-        self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
+        self.finish_channel_generation_mutation(channel_generation_revocation)
             .await;
         if let Some(agent_alias) = refresh_channel_agent.as_deref() {
             let new_config = self.ctx.config.read().clone();
@@ -4147,26 +4206,11 @@ impl RpcDispatcher {
     }
 
     fn schedule_daemon_reload(&self, surface: &'static str) -> bool {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
-            return false;
-        };
-        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(RPC_RELOAD_REPLY_FLUSH_DELAY).await;
-            if let Some(gateway_shutdown_tx) = gateway_shutdown_tx {
-                let _ = gateway_shutdown_tx.send(true);
-                tokio::time::sleep(RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY).await;
-            }
-            let _ = reload_tx.send(true);
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({ "surface": surface })),
-                "daemon reload dispatched"
-            );
-        });
-        true
+        schedule_daemon_reload_from_parts(
+            self.ctx.reload_tx.clone(),
+            self.ctx.gateway_shutdown_tx.clone(),
+            surface,
+        )
     }
 
     fn handle_config_list(&self, params: &Value) -> RpcResult {
@@ -4213,7 +4257,7 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
         self.save_and_swap_config(working, &config_write_guard)
             .await?;
-        self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
+        self.finish_channel_generation_mutation(channel_generation_revocation)
             .await;
         if let Some(agent_alias) = refresh_channel_agent.as_deref() {
             let new_config = self.ctx.config.read().clone();
@@ -4322,7 +4366,7 @@ impl RpcDispatcher {
             working.mark_dirty(&format!("{}.{}", req.path, req.key));
             self.save_and_swap_config(working, &config_write_guard)
                 .await?;
-            self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
+            self.finish_channel_generation_mutation(channel_generation_revocation)
                 .await;
         }
         to_result(ConfigMapKeyDeleteResult {
@@ -4408,7 +4452,7 @@ impl RpcDispatcher {
                 working.mark_dirty(&format!("{}.{}", req.path, req.to));
                 self.save_and_swap_config(working, &config_write_guard)
                     .await?;
-                self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
+                self.finish_channel_generation_mutation(channel_generation_revocation)
                     .await;
             }
             to_result(ConfigMapKeyRenameResult {
@@ -4427,7 +4471,7 @@ impl RpcDispatcher {
         req: ConfigMapKeyRenameParams,
         kind: zeroclaw_config::alias_refs::AliasKind,
         config_write_guard: ConfigWriteGuard,
-        agent_lifecycle_leases: Vec<crate::live_config_authority::AgentDeleteLease>,
+        mut agent_lifecycle_leases: Vec<crate::live_config_authority::AgentDeleteLease>,
         channel_generation_revocation: Option<PreparedChannelGenerationMutation>,
     ) -> BoxRpcFuture<'a> {
         Box::pin(async move {
@@ -4464,6 +4508,10 @@ impl RpcDispatcher {
                 && working.agent(&req.to).is_some()
                 && self.agent_rename_residue_exists(&working, &req.from).await;
 
+            // Cascade the prepared config WITHOUT persisting: the save moves
+            // into the retained transaction task below so request cancellation
+            // cannot land between the atomic config replacement and the
+            // generation commit.
             let rewritten = if !resume_committed_to {
                 let report = zeroclaw_config::alias_refs::rename_with_cascade(
                     &mut working,
@@ -4475,40 +4523,70 @@ impl RpcDispatcher {
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
-                self.save_and_swap_config(working.clone(), &config_write_guard)
-                    .await?;
                 report.dirty_paths.len()
             } else {
                 0
             };
-            self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
-                .await;
-            // Config is committed (saved + swapped, or already committed by a
-            // prior crashed run). Release before the post-commit side effects
-            // below: workspace moves and the memory/cron/ACP/session-backend
-            // cascade can be slow or wedge, and holding the lock across them
-            // would stall every config-mutating RPC daemon-wide.
-            drop(config_write_guard);
             let new_workspace = is_agent.then(|| working.agent_workspace_dir(&req.to));
 
-            let warnings = if let (Some(old_workspace), Some(new_workspace)) =
-                (old_workspace, new_workspace)
-            {
-                let memory = self.ctx.memory.clone();
-                let session_backend = self.ctx.session_backend.clone();
-                let cleanup_config = working.clone();
+            let warnings = if is_agent {
+                // Agent rename: spawn the retained transaction before the
+                // first persistence await. The config write guard, both
+                // uncommitted reservations, the prepared config, and the
+                // prepared channel-generation control all live in a task that
+                // request cancellation cannot abort.
+                let live_config = Arc::clone(&self.ctx.config);
+                let cleanup_sessions = Arc::clone(&self.ctx.sessions);
+                let cleanup_reload_tx = self.ctx.reload_tx.clone();
+                let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
                 let from = req.from.clone();
                 let to = req.to.clone();
-                crate::live_config_authority::spawn_agent_lifecycle_job(
-                    agent_lifecycle_leases,
-                    async move {
+                let memory = self.ctx.memory.clone();
+                let session_backend = self.ctx.session_backend.clone();
+                // Same ownership-boundary boxing as the delete transaction:
+                // the rename future carries the same capture shape (prepared
+                // config, channel maps, guard, both leases) and is constructed
+                // directly into its heap allocation off the 2 MiB worker's
+                // dispatcher frame.
+                let cleanup =
+                    crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+                        // Save the prepared config and install the matching
+                        // live snapshot; a true pre-commit save error ends the
+                        // task with the reservations uncommitted and both
+                        // generations unchanged. A resume run (config already
+                        // committed `from -> to` by a prior crashed attempt)
+                        // skips straight to the commit below.
+                        if !resume_committed_to {
+                            save_and_swap_config_detached(live_config, working.clone()).await?;
+                        }
+                        // Committed: advance both alias generations exactly
+                        // once — synchronous, no await since the live swap.
+                        for lease in &mut agent_lifecycle_leases {
+                            lease.commit_destructive_mutation();
+                        }
+                        // Retire and await the channel generation while still
+                        // holding the config write guard, then schedule reload.
+                        drain_channel_generation_without_dispatcher(
+                            cleanup_sessions,
+                            channel_generation_revocation,
+                            cleanup_reload_tx,
+                            cleanup_gateway_shutdown_tx,
+                        )
+                        .await;
+                        // Release the daemon-wide config mutation lock before
+                        // slow cleanup.
+                        drop(config_write_guard);
                         let mut warnings: Vec<String> =
-                            move_renamed_agent_workspace(&old_workspace, &new_workspace)
-                                .await
-                                .into_iter()
-                                .collect();
+                            if let (Some(old_ws), Some(new_ws)) = (old_workspace, new_workspace) {
+                                move_renamed_agent_workspace(&old_ws, &new_ws)
+                                    .await
+                                    .into_iter()
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
                         let owned = crate::agent_lifecycle::cascade_rename_agent(
-                            &cleanup_config,
+                            &working,
                             memory.as_ref(),
                             session_backend.as_ref(),
                             &from,
@@ -4516,17 +4594,27 @@ impl RpcDispatcher {
                         )
                         .await;
                         warnings.extend(owned.warnings);
-                        warnings
-                    },
-                )
-                .await
-                .map_err(|error| {
+                        // Both committed leases release only when this future
+                        // completes.
+                        Ok(warnings)
+                    }));
+
+                cleanup.await.map_err(|error| {
                     rpc_err(
                         INTERNAL_ERROR,
                         format!("Agent rename cleanup task failed: {error}"),
                     )
-                })?
+                })??
             } else {
+                // Non-agent alias renames hold no lifecycle lease: unchanged
+                // inline save-and-drain sequence.
+                if !resume_committed_to {
+                    self.save_and_swap_config(working, &config_write_guard)
+                        .await?;
+                }
+                self.finish_channel_generation_mutation(channel_generation_revocation)
+                    .await;
+                drop(config_write_guard);
                 Vec::new()
             };
 
@@ -4645,7 +4733,7 @@ impl RpcDispatcher {
     async fn handle_agent_delete(&self, params: &Value) -> RpcResult {
         let req: AgentDeleteParams = parse_params(params)?;
         let alias = req.alias;
-        let lifecycle_lease = self
+        let mut lifecycle_lease = self
             .ctx
             .agent_lifecycle
             .begin_delete(alias.clone())
@@ -4697,11 +4785,6 @@ impl RpcDispatcher {
         for path in report.dirty_paths() {
             working.mark_dirty(&path);
         }
-        self.save_and_swap_config(working.clone(), &config_write_guard)
-            .await?;
-        self.finish_channel_generation_mutation(channel_generation_revocation.as_ref())
-            .await;
-        drop(config_write_guard);
 
         let workspace = preflight
             .workspace
@@ -4714,9 +4797,46 @@ impl RpcDispatcher {
         let memory_unavailable = self.ctx.memory.is_none();
         let session_backend = self.ctx.session_backend.clone();
         let cleanup_alias = alias.clone();
-        let cleanup = crate::live_config_authority::spawn_agent_lifecycle_job(
-            vec![lifecycle_lease],
-            async move {
+        let cleanup_sessions = Arc::clone(&self.ctx.sessions);
+        let cleanup_reload_tx = self.ctx.reload_tx.clone();
+        let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+        let live_config = Arc::clone(&self.ctx.config);
+        // Spawn the retained transaction BEFORE the first persistence await.
+        // Config persistence becomes externally visible when config.toml is
+        // atomically renamed, before `save_dirty` returns, so the config write
+        // guard, the uncommitted reservation, the prepared config, and the
+        // prepared channel-generation control must all live in a task that
+        // request cancellation cannot abort. The request only awaits the
+        // handle; dropping it must not abort the task.
+        // The transaction future is boxed at this ownership boundary so its
+        // captures (prepared config, channel maps, guard, lease) are
+        // constructed directly into its heap allocation instead of
+        // materializing in the dispatcher's poll frame: production Tokio
+        // workers run at the default 2 MiB stack, and the pinned
+        // `agent_delete_rpc_persists_on_default_worker_stack` regression
+        // guards that boundary.
+        let cleanup =
+            crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+                // Save the prepared config and install the matching live
+                // snapshot. A true pre-commit save error rolls back disk
+                // state, and this task then ends: the guard and the
+                // uncommitted reservation drop with generations unchanged.
+                save_and_swap_config_detached(live_config, working.clone()).await?;
+                // Committed: advance the alias generation exactly once.
+                // Synchronous — no await between the live swap and this commit.
+                lifecycle_lease.commit_destructive_mutation();
+                // Retire and await the existing channel generation while
+                // still holding the config write guard, then schedule the
+                // daemon reload.
+                drain_channel_generation_without_dispatcher(
+                    cleanup_sessions,
+                    channel_generation_revocation,
+                    cleanup_reload_tx,
+                    cleanup_gateway_shutdown_tx,
+                )
+                .await;
+                // Release the daemon-wide config mutation lock before slow cleanup.
+                drop(config_write_guard);
                 let archive = crate::agent_lifecycle::archive_agent_workspace(
                     &working,
                     &cleanup_alias,
@@ -4738,15 +4858,15 @@ impl RpcDispatcher {
                 )
                 .await;
                 warnings.extend(owned.warnings);
-                warnings
-            },
-        );
+                // The committed lease releases only when this future completes.
+                Ok(warnings)
+            }));
         let warnings = cleanup.await.map_err(|error| {
             rpc_err(
                 INTERNAL_ERROR,
                 format!("Agent delete cleanup task failed: {error}"),
             )
-        })?;
+        })??;
 
         to_result(AgentDeleteResult {
             alias,
@@ -11455,6 +11575,9 @@ mod tests {
     fn agent_delete_rpc_persists_on_default_worker_stack() {
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
+        // Deliberately the DEFAULT 2 MiB worker stack: this regression pins
+        // the delete-RPC path to the stack every Tokio worker gets on Windows
+        // CI, where the production default applies.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_stack_size(2 * 1024 * 1024)
@@ -11553,46 +11676,136 @@ mod tests {
         drop(reservation);
     }
 
-    #[tokio::test]
-    async fn agent_delete_retires_the_old_channel_generation() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_secret_test_config(&tmp);
-        config
-            .create_map_key("agents", "delete_channel_owner")
-            .unwrap();
-        config.save().await.unwrap();
-        let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+    #[test]
+    fn agent_delete_retires_the_old_channel_generation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("four-megabyte-stack Tokio runtime");
 
-        let result = dispatcher
-            .handle_agent_delete(&json!({"alias": "delete_channel_owner"}))
-            .await
-            .unwrap();
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_secret_test_config(&tmp);
+            config
+                .create_map_key("agents", "delete_channel_owner")
+                .unwrap();
+            config.save().await.unwrap();
+            let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
 
-        assert_eq!(result["deleted"], true);
-        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let result = dispatcher
+                .handle_agent_delete(&json!({"alias": "delete_channel_owner"}))
+                .await
+                .unwrap();
+
+            assert_eq!(result["deleted"], true);
+            assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn agent_rename_retires_the_old_channel_generation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("four-megabyte-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_secret_test_config(&tmp);
+            config
+                .create_map_key("agents", "rename_channel_owner")
+                .unwrap();
+            config.save().await.unwrap();
+            let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+            let from_generation = dispatcher
+                .ctx
+                .agent_lifecycle
+                .alias_generation("rename_channel_owner");
+            let to_generation = dispatcher
+                .ctx
+                .agent_lifecycle
+                .alias_generation("renamed_channel_owner");
+
+            let result = dispatcher
+                .handle_config_map_key_rename(&json!({
+                    "path": "agents",
+                    "from": "rename_channel_owner",
+                    "to": "renamed_channel_owner",
+                }))
+                .await
+                .unwrap();
+
+            assert_eq!(result["renamed"], true);
+            assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+            // The same transaction mechanism commits the rename: both alias
+            // generations advance exactly once after the config commit.
+            assert_eq!(
+                dispatcher
+                    .ctx
+                    .agent_lifecycle
+                    .alias_generation("rename_channel_owner"),
+                from_generation.wrapping_add(1)
+            );
+            assert_eq!(
+                dispatcher
+                    .ctx
+                    .agent_lifecycle
+                    .alias_generation("renamed_channel_owner"),
+                to_generation.wrapping_add(1)
+            );
+        });
     }
 
     #[tokio::test]
-    async fn agent_rename_retires_the_old_channel_generation() {
+    async fn agent_rename_refusal_preserves_both_generations() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_secret_test_config(&tmp);
-        config
-            .create_map_key("agents", "rename_channel_owner")
-            .unwrap();
+        config.create_map_key("agents", "rename_from").unwrap();
         config.save().await.unwrap();
-        let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let from_generation = dispatcher
+            .ctx
+            .agent_lifecycle
+            .alias_generation("rename_from");
+        // A busy target alias refuses the rename reservation after the source
+        // alias is already reserved.
+        let busy_target = dispatcher
+            .ctx
+            .agent_lifecycle
+            .reserve_turn("rename_to")
+            .unwrap();
 
-        let result = dispatcher
+        let error = dispatcher
             .handle_config_map_key_rename(&json!({
                 "path": "agents",
-                "from": "rename_channel_owner",
-                "to": "renamed_channel_owner",
+                "from": "rename_from",
+                "to": "rename_to",
             }))
             .await
-            .unwrap();
+            .expect_err("rename must refuse a busy target alias");
 
-        assert_eq!(result["renamed"], true);
-        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(error.message.contains("active turn"));
+        // The source reservation dropped without committing: the old
+        // generation and its producers stay usable.
+        assert_eq!(
+            dispatcher
+                .ctx
+                .agent_lifecycle
+                .alias_generation("rename_from"),
+            from_generation
+        );
+        drop(busy_target);
+        assert!(
+            dispatcher
+                .ctx
+                .agent_lifecycle
+                .reserve_turn_at("rename_from", from_generation)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -11634,6 +11847,7 @@ mod tests {
             .expect("create disposable agent");
         config.agents.get_mut("preserve").unwrap().workspace.path = Some(workspace.clone());
         let dispatcher = make_config_set_test_dispatcher(config);
+        let generation = dispatcher.ctx.agent_lifecycle.alias_generation("preserve");
 
         dispatcher
             .handle_agent_delete(&json!({ "alias": "preserve" }))
@@ -11642,6 +11856,338 @@ mod tests {
 
         assert!(dispatcher.ctx.config.read().agents.contains_key("preserve"));
         assert!(workspace.exists());
+        // A failed config save must roll the reservation back: the old
+        // generation and its producers stay usable.
+        assert_eq!(
+            dispatcher.ctx.agent_lifecycle.alias_generation("preserve"),
+            generation
+        );
+        let producer = dispatcher
+            .ctx
+            .agent_lifecycle
+            .reserve_turn("preserve")
+            .unwrap();
+        drop(producer);
+        assert!(
+            dispatcher
+                .ctx
+                .agent_lifecycle
+                .reserve_turn_at("preserve", generation)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_delete_hard_reference_refusal_preserves_generation_and_producers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config
+            .create_map_key("agents", "referenced")
+            .expect("create referenced agent");
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = "referenced".to_string();
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let generation = dispatcher
+            .ctx
+            .agent_lifecycle
+            .alias_generation("referenced");
+
+        let result = dispatcher
+            .handle_agent_delete(&json!({ "alias": "referenced" }))
+            .await
+            .expect("hard-reference refusal reports a deleted:false result");
+
+        assert_eq!(result["deleted"], false);
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .agents
+                .contains_key("referenced")
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .agent_lifecycle
+                .alias_generation("referenced"),
+            generation
+        );
+        // An old-generation producer admits once the reservation rolled back.
+        let producer = dispatcher
+            .ctx
+            .agent_lifecycle
+            .reserve_turn("referenced")
+            .unwrap();
+        drop(producer);
+        assert!(
+            dispatcher
+                .ctx
+                .agent_lifecycle
+                .reserve_turn_at("referenced", generation)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn agent_delete_cancelled_after_commit_still_drains_and_cleans_up() {
+        // The restructured delete handler future exceeds the default
+        // #[tokio::test] worker stack on macOS; give the runtime the same
+        // raised worker stack as `agent_delete_rpc_persists_on_default_worker_stack`.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("four-megabyte-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_secret_test_config(&tmp);
+            config
+                .create_map_key("agents", "cancel_delete")
+                .expect("create disposable agent");
+            let workspace = tmp.path().join("cancel-workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("note.txt"), "data").unwrap();
+            config
+                .agents
+                .get_mut("cancel_delete")
+                .unwrap()
+                .workspace
+                .path = Some(workspace.clone());
+            config.save().await.unwrap();
+
+            let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+            let ctx = Arc::clone(&dispatcher.ctx);
+            let generation_before = dispatcher
+                .ctx
+                .agent_lifecycle
+                .alias_generation("cancel_delete");
+
+            // Keep one in-flight turn registration alive past its cancellation so
+            // the retained continuation's channel drain pends deterministically
+            // while the request is cancelled.
+            let inflight_token = tokio_util::sync::CancellationToken::new();
+            let inflight_generation = ctx
+                .sessions
+                .register_cancel_token("inflight", inflight_token.clone());
+            let sessions_for_gate = Arc::clone(&ctx.sessions);
+            let reached_gate = Arc::new(tokio::sync::Notify::new());
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let reached_gate_task = Arc::clone(&reached_gate);
+            let gate_task = Arc::clone(&gate);
+            zeroclaw_spawn::spawn!(async move {
+                inflight_token.cancelled().await;
+                reached_gate_task.notify_one();
+                gate_task.notified().await;
+                sessions_for_gate.remove_cancel_token("inflight", inflight_generation);
+            });
+
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let handler = zeroclaw_spawn::spawn!(async move {
+                let result = dispatcher
+                    .handle_agent_delete(&json!({ "alias": "cancel_delete" }))
+                    .await;
+                let _ = result_tx.send(result);
+            });
+
+            // Wait for the config commit. The lease is already owned by the
+            // retained continuation at this point (the drain is pended on the
+            // gated in-flight registration above).
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if !ctx.config.read().agents.contains_key("cancel_delete") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("deletion commits");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), reached_gate.notified())
+                .await
+                .expect("drain reaches the gated in-flight turn");
+
+            // Cancel the request after the committed deletion. This must not
+            // release the lifecycle lease or skip the drain/cleanup owned by the
+            // retained continuation.
+            handler.abort();
+            assert_eq!(
+                clears.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "channel generation retirement is owned by the continuation"
+            );
+            assert!(matches!(
+                ctx.agent_lifecycle.delete_blocker("cancel_delete"),
+                Some(crate::live_config_authority::AgentDeleteBlocker::Deleting { .. })
+            ));
+
+            gate.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if ctx
+                        .agent_lifecycle
+                        .delete_blocker("cancel_delete")
+                        .is_none()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("retained continuation completes cleanup and releases the lease");
+
+            assert_eq!(
+                ctx.agent_lifecycle.alias_generation("cancel_delete"),
+                generation_before.wrapping_add(1),
+                "generation advances exactly once across the committed deletion"
+            );
+            assert!(!workspace.exists(), "workspace cleanup still runs");
+            let _ = result_rx; // the aborted request never observes a response
+        });
+    }
+
+    #[test]
+    fn agent_delete_cancelled_during_persistence_still_completes_transaction() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("four-megabyte-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_secret_test_config(&tmp);
+            config
+                .create_map_key("agents", "persist_cancel")
+                .expect("create disposable agent");
+            let workspace = tmp.path().join("persist-cancel-workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("note.txt"), "data").unwrap();
+            config
+                .agents
+                .get_mut("persist_cancel")
+                .unwrap()
+                .workspace
+                .path = Some(workspace.clone());
+            config.save().await.unwrap();
+            let config_path = config.config_path.clone();
+
+            // Arm the test-only post-atomic-rename gate BEFORE spawning the
+            // request: the retained task's save will pause inside the
+            // visibility window (new config already on disk, live snapshot
+            // not yet swapped), which is the exact interval the correction
+            // closes.
+            let save_gate =
+                zeroclaw_config::schema::test_post_replace_pause_gate::arm(config_path.clone());
+
+            let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+            let ctx = Arc::clone(&dispatcher.ctx);
+            let generation_before = dispatcher
+                .ctx
+                .agent_lifecycle
+                .alias_generation("persist_cancel");
+
+            // Keep one in-flight turn registration alive past its cancellation so
+            // the retained task's channel drain pends deterministically while the
+            // request is cancelled.
+            let inflight_token = tokio_util::sync::CancellationToken::new();
+            let inflight_generation = ctx
+                .sessions
+                .register_cancel_token("inflight", inflight_token.clone());
+            let sessions_for_gate = Arc::clone(&ctx.sessions);
+            let reached_gate = Arc::new(tokio::sync::Notify::new());
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let reached_gate_task = Arc::clone(&reached_gate);
+            let gate_task = Arc::clone(&gate);
+            zeroclaw_spawn::spawn!(async move {
+                inflight_token.cancelled().await;
+                reached_gate_task.notify_one();
+                gate_task.notified().await;
+                sessions_for_gate.remove_cancel_token("inflight", inflight_generation);
+            });
+
+            let handler = zeroclaw_spawn::spawn!(async move {
+                dispatcher
+                    .handle_agent_delete(&json!({ "alias": "persist_cancel" }))
+                    .await
+            });
+
+            // Pause the save INSIDE the post-rename visibility window, then
+            // cancel the request there. Under the pre-correction shape the
+            // request itself owned this interval and cancelling it left the
+            // new disk config committed with no live swap, generation commit,
+            // drain, or cleanup; the retained task must carry it to completion.
+            tokio::time::timeout(std::time::Duration::from_secs(5), save_gate.wait_paused())
+                .await
+                .expect("save pauses after the atomic replacement is visible");
+
+            // Exact window proof: the new disk config is externally visible
+            // while the live snapshot still names the agent.
+            let disk = std::fs::read_to_string(&config_path).unwrap();
+            assert!(
+                !disk.contains("persist_cancel"),
+                "atomic replacement must be visible on disk inside the window: {disk}"
+            );
+            assert!(
+                ctx.config.read().agents.contains_key("persist_cancel"),
+                "live snapshot must not yet be swapped inside the window"
+            );
+            handler.abort();
+
+            // The retained task holds the destructive reservation across the
+            // cancelled request: ownership is not released mid-transaction.
+            assert!(matches!(
+                ctx.agent_lifecycle.delete_blocker("persist_cancel"),
+                Some(crate::live_config_authority::AgentDeleteBlocker::Deleting { .. })
+            ));
+
+            // Let the paused save complete, then let the gated drain finish.
+            save_gate.release();
+            gate.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if ctx
+                        .agent_lifecycle
+                        .delete_blocker("persist_cancel")
+                        .is_none()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("retained task completes the transaction and releases the lease");
+
+            // The full transaction followed despite the cancellation: live
+            // snapshot installed, generation advanced exactly once, channel
+            // generation retired by the retained task, and cleanup ran.
+            assert!(
+                !ctx.config.read().agents.contains_key("persist_cancel"),
+                "live snapshot must be installed by the retained task"
+            );
+            let disk = std::fs::read_to_string(&config_path).unwrap();
+            assert!(
+                !disk.contains("persist_cancel"),
+                "persisted config must not name the deleted agent: {disk}"
+            );
+            assert_eq!(
+                ctx.agent_lifecycle.alias_generation("persist_cancel"),
+                generation_before.wrapping_add(1),
+                "generation advances exactly once across the committed deletion"
+            );
+            assert_eq!(
+                clears.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "channel generation retirement is owned by the retained task"
+            );
+            assert!(!workspace.exists(), "workspace cleanup still runs");
+        });
     }
 
     #[tokio::test]
@@ -11973,11 +12519,12 @@ mod tests {
         let cfg = make_secret_test_config(&tmp);
         cfg.save().await.expect("seed config");
         let dispatcher = make_config_set_test_dispatcher(cfg);
-        let _cleanup = dispatcher
+        let mut cleanup = dispatcher
             .ctx
             .agent_lifecycle
             .begin_delete("recreated")
             .expect("hold destructive cleanup lease");
+        cleanup.commit_destructive_mutation();
 
         let result = dispatcher
             .handle_config_set(&json!({
@@ -12006,11 +12553,12 @@ mod tests {
         let cfg = make_secret_test_config(&tmp);
         cfg.save().await.expect("seed config");
         let dispatcher = make_config_set_test_dispatcher(cfg);
-        let _cleanup = dispatcher
+        let mut cleanup = dispatcher
             .ctx
             .agent_lifecycle
             .begin_delete("recreated")
             .expect("hold destructive cleanup lease");
+        cleanup.commit_destructive_mutation();
 
         let result = dispatcher
             .handle_config_map_key_create(&json!({

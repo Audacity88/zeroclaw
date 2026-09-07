@@ -445,10 +445,9 @@ async fn rollback_config_disk_state(config_path: &std::path::Path, snapshot: Con
 }
 
 fn schedule_channel_generation_reload(
-    state: &AppState,
+    pending_reload: Arc<std::sync::atomic::AtomicBool>,
     controls: zeroclaw_runtime::daemon::GatewayReloadControls,
 ) {
-    let pending_reload = Arc::clone(&state.pending_reload);
     zeroclaw_spawn::spawn!(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         pending_reload.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -459,19 +458,50 @@ fn schedule_channel_generation_reload(
 
 async fn persist_and_swap(
     state: &AppState,
-    mut new_config: zeroclaw_config::schema::Config,
+    new_config: zeroclaw_config::schema::Config,
     _guard: &ConfigWriteGuard,
 ) -> Result<(), ConfigApiError> {
     debug_assert!(
         state.config_write_lock.try_lock().is_err(),
         "persist_and_swap caller must hold state.config_write_lock"
     );
+    let prepared = persist_and_swap_prepared(
+        Arc::clone(&state.config),
+        Arc::clone(&state.pending_reload),
+        state.reload_tx.clone(),
+        new_config,
+    )
+    .await?;
+    finish_prepared_channel_generation(prepared, Arc::clone(&state.pending_reload)).await;
+    Ok(())
+}
+
+/// Save-and-swap half of the config persistence sequence, split from the
+/// channel-generation drain so the retained destructive transaction can commit
+/// the alias generation synchronously after the live swap and before the
+/// drain. Returns the prepared (not yet begun) channel-generation drain when
+/// the mutation changed the channel-generation projection.
+///
+/// On a pre-commit save error the disk state is rolled back and the live
+/// snapshot is left untouched. The caller must hold the config write lock.
+async fn persist_and_swap_prepared(
+    config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    pending_reload: Arc<std::sync::atomic::AtomicBool>,
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
+    mut new_config: zeroclaw_config::schema::Config,
+) -> Result<
+    Option<(
+        zeroclaw_runtime::daemon::PreparedChannelGenerationDrain,
+        zeroclaw_runtime::daemon::GatewayReloadControls,
+    )>,
+    ConfigApiError,
+> {
     let channel_generation_changed = {
-        let current = state.config.read();
+        let current = config.read();
         channel_generation_projection(&current) != channel_generation_projection(&new_config)
     };
     let prepared_channel_generation = if channel_generation_changed {
-        match state.reload_tx.clone() {
+        match reload_controls {
             Some(controls) => Some((
                 controls
                     .prepare_channel_generation()
@@ -503,15 +533,25 @@ async fn persist_and_swap(
         ));
     }
 
-    *state.config.write() = new_config;
-    state
-        .pending_reload
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Some((prepared, controls)) = prepared_channel_generation {
+    *config.write() = new_config;
+    pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(prepared_channel_generation)
+}
+
+/// Drain the prepared channel generation and schedule the daemon reload. The
+/// caller holds the config write lock across this, preserving the historical
+/// serialization boundary between config commits and channel retirement.
+async fn finish_prepared_channel_generation(
+    prepared: Option<(
+        zeroclaw_runtime::daemon::PreparedChannelGenerationDrain,
+        zeroclaw_runtime::daemon::GatewayReloadControls,
+    )>,
+    pending_reload: Arc<std::sync::atomic::AtomicBool>,
+) {
+    if let Some((prepared, controls)) = prepared {
         prepared.begin().wait().await;
-        schedule_channel_generation_reload(state, controls);
+        schedule_channel_generation_reload(pending_reload, controls);
     }
-    Ok(())
 }
 
 /// `POST /api/channels/bind` request body. The GUI/HTTP equivalent of
@@ -630,7 +670,7 @@ pub async fn handle_api_channel_bind(
         .store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some((prepared, controls)) = prepared_channel_generation {
         prepared.begin().wait().await;
-        schedule_channel_generation_reload(&state, controls);
+        schedule_channel_generation_reload(Arc::clone(&state.pending_reload), controls);
     }
 
     Json(serde_json::json!({
@@ -1244,7 +1284,7 @@ pub async fn handle_delete_map_key(
 async fn delete_agent_cascade(
     state: &AppState,
     alias: &str,
-    lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentDeleteLease,
+    mut lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentDeleteLease,
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
 
@@ -1305,46 +1345,57 @@ async fn delete_agent_cascade(
     for path in cascade.dirty_paths() {
         working.mark_dirty(&path);
     }
-    if let Err(e) = persist_and_swap(state, working, &guard).await {
-        return error_response(e);
-    }
-    // Config is committed (saved + swapped). Release before the post-commit
-    // side effects below: workspace archive and the memory/cron/ACP/session
-    // cascade can be slow or wedge, and holding the lock across them would
-    // stall every other gateway config write process-wide.
-    drop(guard);
-    // Config is durably committed: the agent is GONE from the persisted config.
-    // Read it back from the (now-swapped) AppState for the side-effects below.
-    let committed = state.config.read().clone();
 
+    // Config is about to become externally visible: spawn the retained
+    // transaction BEFORE the first persistence await. The config write guard,
+    // the uncommitted reservation, the prepared config, and the prepared
+    // channel-generation control all live in a task that request cancellation
+    // cannot abort; the request only awaits the handle.
     let memory = Arc::clone(&state.mem);
     let session_backend = state.session_backend.clone();
+    let live_config = Arc::clone(&state.config);
+    let pending_reload = Arc::clone(&state.pending_reload);
+    let reload_controls = state.reload_tx.clone();
     let cleanup_alias = alias.to_string();
-    let cleanup = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(
-        vec![lifecycle_lease],
-        async move {
-            let archive = crate::agent_owned_state::archive_agent_workspace(
-                &committed,
-                &cleanup_alias,
-                &workspace,
-            )
-            .await;
-            let archive_dir = archive.archive_dir;
-            let mut warnings = archive.warnings;
-            let owned = crate::agent_owned_state::cascade_owned_state(
-                &committed,
-                &memory,
-                session_backend.as_ref(),
-                &cleanup_alias,
-                &archive_dir,
-            )
-            .await;
-            warnings.extend(owned.warnings.iter().cloned());
-            (archive_dir, warnings, owned)
-        },
-    );
+    let cleanup = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(async move {
+        // Save the prepared config and install the matching live snapshot;
+        // a true pre-commit save error rolls back disk state and ends this
+        // task with the reservation uncommitted and generations unchanged.
+        let prepared = persist_and_swap_prepared(
+            live_config,
+            pending_reload.clone(),
+            reload_controls,
+            working.clone(),
+        )
+        .await?;
+        // Committed: advance the alias generation exactly once.
+        // Synchronous — no await between the live swap and this commit.
+        lifecycle_lease.commit_destructive_mutation();
+        // Retire and await the channel generation while still holding the
+        // config write guard, then schedule the daemon reload.
+        finish_prepared_channel_generation(prepared, pending_reload).await;
+        // Release the gateway-wide config write lock before slow cleanup.
+        drop(guard);
+        let archive =
+            crate::agent_owned_state::archive_agent_workspace(&working, &cleanup_alias, &workspace)
+                .await;
+        let archive_dir = archive.archive_dir;
+        let mut warnings = archive.warnings;
+        let owned = crate::agent_owned_state::cascade_owned_state(
+            &working,
+            &memory,
+            session_backend.as_ref(),
+            &cleanup_alias,
+            &archive_dir,
+        )
+        .await;
+        warnings.extend(owned.warnings.iter().cloned());
+        // The committed lease releases only when this future completes.
+        Ok((archive_dir, warnings, owned))
+    });
     let (archive_dir, warnings, owned) = match cleanup.await {
-        Ok(result) => result,
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return error_response(error),
         Err(error) => {
             return error_response(ConfigApiError::new(
                 ConfigApiCode::InternalError,
@@ -1900,7 +1951,7 @@ async fn rename_agent_cascade(
     mut working: zeroclaw_config::schema::Config,
     body: &RenameMapKeyBody,
     guard: ConfigWriteGuard,
-    lifecycle_leases: Vec<zeroclaw_runtime::live_config_authority::AgentDeleteLease>,
+    mut lifecycle_leases: Vec<zeroclaw_runtime::live_config_authority::AgentDeleteLease>,
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind};
     let (from, to) = (&body.from, &body.to);
@@ -1910,7 +1961,8 @@ async fn rename_agent_cascade(
     let old_ws = working.agent_workspace_dir(from);
 
     let committed_to = working.agent(from).is_none() && working.agent(to).is_some();
-    let dirty_count = if committed_to && rename_residue_exists(state, &working, from).await {
+    let skip_persist = committed_to && rename_residue_exists(state, &working, from).await;
+    let dirty_count = if skip_persist {
         0
     } else {
         match alias_refs::rename_with_cascade(&mut working, &AliasKind::Agent, from, to) {
@@ -1918,54 +1970,77 @@ async fn rename_agent_cascade(
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
-                let dirty_count = report.dirty_paths.len();
-                if let Err(e) = persist_and_swap(state, working, &guard).await {
-                    return error_response(e);
-                }
-                dirty_count
+                report.dirty_paths.len()
             }
             Err(e) => return rename_error_response(&body.path, from, e),
         }
     };
-    // Config is committed (saved + swapped, or already committed by a prior
-    // crashed run). Release before the post-commit side effects below:
-    // workspace move and the memory/cron/ACP/session-backend cascade can be
-    // slow or wedge, and holding the lock across them would stall every
-    // other gateway config write process-wide.
-    drop(guard);
+    // The NEW workspace path off the prepared config (the rewritten `to`);
+    // identical to the post-swap live config once persistence lands.
+    let new_ws = working.agent_workspace_dir(to);
 
-    let cfg = state.config.read().clone();
-    // The NEW workspace path off the committed config (the rewritten `to`).
-    let new_ws = cfg.agent_workspace_dir(to);
-
+    // Config is about to become externally visible: spawn the retained
+    // transaction BEFORE the first persistence await. The config write guard,
+    // both uncommitted reservations, the prepared config, and the prepared
+    // channel-generation control all live in a task that request cancellation
+    // cannot abort; the request only awaits the handle.
+    //
     // Move the workspace dir. For the default per-alias location this is
     // `<install>/agents/<from>/workspace` → `…/<to>/workspace`. A custom
     // workspace path is alias-independent, so `old_ws == new_ws` and we skip.
     let ws_existed = old_ws != new_ws && old_ws.exists();
     let memory = Arc::clone(&state.mem);
     let session_backend = state.session_backend.clone();
+    let live_config = Arc::clone(&state.config);
+    let pending_reload = Arc::clone(&state.pending_reload);
+    let reload_controls = state.reload_tx.clone();
     let cleanup_from = from.clone();
     let cleanup_to = to.clone();
-    let cleanup = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(
-        lifecycle_leases,
-        async move {
-            let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
-            let workspace_moved = ws_existed && move_warning.is_none();
-            let mut warnings: Vec<String> = move_warning.into_iter().collect();
-            let owned = crate::agent_owned_state::cascade_rename_agent(
-                &cfg,
-                Some(&memory),
-                session_backend.as_ref(),
-                &cleanup_from,
-                &cleanup_to,
+    let cleanup = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(async move {
+        // Save the prepared config and install the matching live
+        // snapshot; a true pre-commit save error rolls back disk state
+        // and ends this task with both reservations uncommitted and
+        // generations unchanged. A resume run (config already committed
+        // `from -> to` by a prior crashed attempt) skips the persist.
+        let prepared = if !skip_persist {
+            persist_and_swap_prepared(
+                live_config,
+                pending_reload.clone(),
+                reload_controls,
+                working.clone(),
             )
-            .await;
-            warnings.extend(owned.warnings.iter().cloned());
-            (workspace_moved, warnings, owned)
-        },
-    );
+            .await?
+        } else {
+            None
+        };
+        // Committed: advance both alias generations exactly once.
+        // Synchronous — no await between the live swap and this commit.
+        for lease in &mut lifecycle_leases {
+            lease.commit_destructive_mutation();
+        }
+        // Retire and await the channel generation while still holding the
+        // config write guard, then schedule the daemon reload.
+        finish_prepared_channel_generation(prepared, pending_reload).await;
+        // Release the gateway-wide config write lock before slow cleanup.
+        drop(guard);
+        let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
+        let workspace_moved = ws_existed && move_warning.is_none();
+        let mut warnings: Vec<String> = move_warning.into_iter().collect();
+        let owned = crate::agent_owned_state::cascade_rename_agent(
+            &working,
+            Some(&memory),
+            session_backend.as_ref(),
+            &cleanup_from,
+            &cleanup_to,
+        )
+        .await;
+        warnings.extend(owned.warnings.iter().cloned());
+        // Both committed leases release only when this future completes.
+        Ok((workspace_moved, warnings, owned))
+    });
     let (workspace_moved, warnings, owned) = match cleanup.await {
-        Ok(result) => result,
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return error_response(error),
         Err(error) => {
             return error_response(ConfigApiError::new(
                 ConfigApiCode::InternalError,
@@ -3202,10 +3277,11 @@ mod tests {
     async fn prop_put_cannot_recreate_agent_during_destructive_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(temp_config(&tmp));
-        let _cleanup = state
+        let mut cleanup = state
             .agent_lifecycle
             .begin_delete("recreated")
             .expect("hold destructive cleanup lease");
+        cleanup.commit_destructive_mutation();
 
         let (status, _json) = response_json(
             handle_prop_put(
@@ -3229,10 +3305,11 @@ mod tests {
     async fn patch_cannot_recreate_agent_during_destructive_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(temp_config(&tmp));
-        let _cleanup = state
+        let mut cleanup = state
             .agent_lifecycle
             .begin_delete("recreated")
             .expect("hold destructive cleanup lease");
+        cleanup.commit_destructive_mutation();
 
         let (status, _json) = response_json(
             handle_patch(
@@ -3256,10 +3333,11 @@ mod tests {
     async fn map_key_create_cannot_recreate_agent_during_destructive_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(temp_config(&tmp));
-        let _cleanup = state
+        let mut cleanup = state
             .agent_lifecycle
             .begin_delete("recreated")
             .expect("hold destructive cleanup lease");
+        cleanup.commit_destructive_mutation();
 
         let (status, _json) = response_json(
             handle_map_key(
@@ -4548,6 +4626,7 @@ mod tests {
         );
 
         let state = crate::api::test_state(config.clone());
+        let generation_before = state.agent_lifecycle.alias_generation("victim");
         let resp =
             delete_agent_cascade(&state, "victim", test_agent_delete_lease(&state, "victim")).await;
 
@@ -4576,6 +4655,65 @@ mod tests {
         );
         // In-memory config was never swapped: still names `victim`.
         assert!(state.config.read().agents.contains_key("victim"));
+        // The reservation rolled back: the old generation stays usable.
+        assert_eq!(
+            state.agent_lifecycle.alias_generation("victim"),
+            generation_before
+        );
+        let producer = state.agent_lifecycle.reserve_turn("victim").unwrap();
+        drop(producer);
+        assert!(
+            state
+                .agent_lifecycle
+                .reserve_turn_at("victim", generation_before)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_delete_hard_reference_refusal_preserves_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.agents.insert(
+            "victim".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = "victim".to_string();
+
+        let state = crate::api::test_state(config.clone());
+        let generation_before = state.agent_lifecycle.alias_generation("victim");
+
+        let resp =
+            delete_agent_cascade(&state, "victim", test_agent_delete_lease(&state, "victim")).await;
+
+        assert!(
+            !resp.status().is_success(),
+            "a hard reference must refuse the delete"
+        );
+        assert!(state.config.read().agents.contains_key("victim"));
+        // The dropped reservation left the generation and producers untouched:
+        // an old-generation producer admits after the rollback.
+        assert_eq!(
+            state.agent_lifecycle.alias_generation("victim"),
+            generation_before
+        );
+        let producer = state.agent_lifecycle.reserve_turn("victim").unwrap();
+        drop(producer);
+        assert!(
+            state
+                .agent_lifecycle
+                .reserve_turn_at("victim", generation_before)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -4604,6 +4742,7 @@ mod tests {
             .expect("seed cron job");
 
         let state = crate::api::test_state(config.clone());
+        let generation_before = state.agent_lifecycle.alias_generation("victim");
         let resp =
             delete_agent_cascade(&state, "victim", test_agent_delete_lease(&state, "victim")).await;
         assert!(resp.status().is_success(), "a clean delete returns success");
@@ -4612,6 +4751,11 @@ mod tests {
         assert!(
             !state.config.read().agents.contains_key("victim"),
             "agent removed from persisted config"
+        );
+        // The committed deletion advanced the generation exactly once.
+        assert_eq!(
+            state.agent_lifecycle.alias_generation("victim"),
+            generation_before.wrapping_add(1)
         );
         // Cron job purged: the cascade ran after a successful persist.
         assert!(
