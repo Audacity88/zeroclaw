@@ -598,7 +598,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "original");
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "original"
+        );
 
         tokio::fs::remove_file(&target).await.unwrap();
         let result = tool
