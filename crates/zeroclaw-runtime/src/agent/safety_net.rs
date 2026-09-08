@@ -2481,3 +2481,83 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
         "event channel must receive the narration exactly once"
     );
 }
+
+#[tokio::test]
+async fn safety_net_terminal_malformed_fallback_reaches_event_consumer_after_tool() {
+    // A narrated valid tool round, then the malformed-protocol retry budget
+    // exhausts. The terminal fallback is the turn's last word on the event
+    // channel: it must be emitted as a Chunk after the ToolResult, because a
+    // client that already flushed streamed narration hides the TurnComplete
+    // payload and would otherwise settle the turn with no explanation.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![
+            narrated_tool_response("let me check that for you", "tc-1", "echo"),
+            text_response(r#"{"toolcalls":[{"call_id":"call_1","arguments":{"value":"X"}}]}"#),
+            text_response(r#"{"toolcalls":[{"call_id":"call_2","arguments":{"value":"Y"}}]}"#),
+            text_response(r#"{"toolcalls":[{"call_id":"call_3","arguments":{"value":"Z"}}]}"#),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("narrate then break", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("turn should end with the safe fallback");
+
+    let fallback_text =
+        crate::i18n::get_english_cli_string_with_args("channel-runtime-malformed-tool-output", &[]);
+    let pos_narration = events
+        .iter()
+        .position(|e| {
+            matches!(e, TurnEvent::Chunk { delta } if delta.contains("let me check that for you"))
+        })
+        .expect("pre-tool narration must be emitted as a Chunk");
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("the valid tool call must emit its ToolCall event");
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { id, .. } if id == "tc-1"))
+        .expect("the valid tool call must emit its ToolResult event");
+    let pos_fallback = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains(&fallback_text)))
+        .expect("terminal malformed-output fallback must reach the event consumer as a Chunk");
+
+    assert!(
+        pos_narration < pos_tool_call,
+        "narration Chunk must precede that round's ToolCall event"
+    );
+    assert!(
+        pos_tool_result < pos_fallback,
+        "the terminal fallback must follow the tool result"
+    );
+    let fallback_chunks = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains(&fallback_text)))
+        .count();
+    assert_eq!(
+        fallback_chunks, 1,
+        "the terminal fallback must be emitted exactly once"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the valid tool round must have executed exactly once"
+    );
+}

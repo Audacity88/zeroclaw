@@ -1066,6 +1066,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let fallback =
                 crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
             accumulated_display_text.push_str(&fallback);
+            // The fallback is synthesized here, never streamed live, and is the
+            // turn's only visible output on this exit: an event consumer that
+            // already flushed streamed narration would otherwise hide the
+            // TurnComplete payload. Same rationale as the max-iteration emit.
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &fallback).await;
             if let Some(ref tx) = on_delta {
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
