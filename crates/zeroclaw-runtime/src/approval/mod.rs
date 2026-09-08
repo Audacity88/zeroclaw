@@ -226,6 +226,20 @@ impl ApprovalManager {
         ApprovalRequirement::Prompt
     }
 
+    /// Whether an approval channel that explicitly reports no approval support
+    /// may hand a shell call back to the shell tool's own policy checks.
+    ///
+    /// This is intentionally narrower than `Prompt`: explicit `always_ask`
+    /// policy must remain fail-closed when no operator can answer.
+    pub(crate) fn unsupported_backchannel_may_fall_back(&self, tool_name: &str) -> bool {
+        self.non_interactive
+            && self.non_interactive_shell_requires_approval
+            && tool_name == "shell"
+            && !self.always_ask.contains("*")
+            && !self.always_ask.contains(tool_name)
+            && self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
+    }
+
     /// Record an approval decision and update session state.
     pub fn record_decision(
         &self,
@@ -789,6 +803,25 @@ mod tests {
         let mgr = ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default());
         assert!(mgr.is_non_interactive());
         assert!(mgr.needs_approval("shell"));
+        assert!(mgr.unsupported_backchannel_may_fall_back("shell"));
+    }
+
+    #[test]
+    fn unsupported_backchannel_fallback_never_bypasses_explicit_always_ask() {
+        for always_ask in [vec!["shell".into()], vec!["*".into()]] {
+            let risk = RiskProfileConfig {
+                always_ask,
+                ..RiskProfileConfig::default()
+            };
+            let mgr = ApprovalManager::for_non_interactive_backchannel(&risk);
+
+            assert!(mgr.needs_approval("shell"));
+            assert!(!mgr.unsupported_backchannel_may_fall_back("shell"));
+        }
+        assert!(
+            !ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default())
+                .unsupported_backchannel_may_fall_back("file_write")
+        );
     }
 
     #[test]

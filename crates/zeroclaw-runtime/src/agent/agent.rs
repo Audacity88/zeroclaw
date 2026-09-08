@@ -337,10 +337,27 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
                     .with_decider_opt(decider),
             )),
             RoutedApproval::Fallthrough => match self.origin.as_ref() {
-                Some(origin) => origin.request_approval_attributed(recipient, request).await,
-                // No originating channel to inherit on this path; let the gate
-                // apply the non-interactive default (auto-deny).
-                None => Ok(None),
+                Some(origin) => match origin
+                    .request_approval_attributed(recipient, request)
+                    .await?
+                {
+                    Some(response) => Ok(Some(response)),
+                    None => Ok(Some(
+                        zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                            zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                            zeroclaw_api::channel::ApprovalSource::Unavailable,
+                        ),
+                    )),
+                },
+                // An explicit inherit-originator route with no usable origin
+                // is still a routed approval failure, not a direct channel's
+                // declaration that it lacks approval support.
+                None => Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unavailable,
+                    ),
+                )),
             },
         }
     }
@@ -12580,6 +12597,28 @@ mod approval_route_tests {
     }
 
     #[tokio::test]
+    async fn routed_channel_inherit_fails_closed_when_origin_has_no_decision() {
+        let origin = Arc::new(stub("origin", StubBehavior::NoDecision));
+        let bridge = routed_approval_channel(
+            registry(vec![]),
+            route("ops", OnNoApprover::InheritOriginator),
+            Some(origin),
+        );
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("an unsupported origin must become a runtime denial");
+
+        assert_eq!(out.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            out.source,
+            zeroclaw_api::channel::ApprovalSource::Unavailable
+        );
+        assert!(out.decided_by.is_none());
+    }
+
+    #[tokio::test]
     async fn routed_channel_fails_closed_when_approver_unregistered() {
         let bridge = RoutedApprovalChannel::new(registry(vec![]), route("ops", OnNoApprover::Deny));
         let out = bridge
@@ -12599,15 +12638,21 @@ mod approval_route_tests {
     }
 
     #[tokio::test]
-    async fn routed_channel_inherit_returns_none_on_channelless_path() {
+    async fn routed_channel_inherit_fails_closed_on_channelless_path() {
         let bridge = RoutedApprovalChannel::new(
             registry(vec![]),
             route("ops", OnNoApprover::InheritOriginator),
         );
-        let out = bridge.request_approval("r", &req()).await.unwrap();
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("a missing origin must become a runtime denial");
+        assert_eq!(out.response, ChannelApprovalResponse::Deny);
         assert_eq!(
-            out, None,
-            "no originator to inherit; gate applies the non-interactive auto-deny"
+            out.source,
+            zeroclaw_api::channel::ApprovalSource::Unavailable
         );
+        assert!(out.decided_by.is_none());
     }
 }

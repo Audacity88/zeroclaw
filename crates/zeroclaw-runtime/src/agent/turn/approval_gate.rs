@@ -50,6 +50,9 @@ pub(crate) async fn gate_tool_approval(
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
                 match ch.request_approval_attributed(recipient, &ch_request).await {
                     Ok(Some(a)) => Some(a),
+                    Ok(None) if mgr.unsupported_backchannel_may_fall_back(tool_name) => {
+                        return ApprovalGateOutcome::Proceed { approved: false };
+                    }
                     Ok(None) => None,
                     Err(e) => {
                         ::zeroclaw_log::record!(
