@@ -4110,6 +4110,197 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(json, r#"{"type":"ephemeral"}"#);
     }
 
+    /// D5 pin: the default (5m) lifetime serializes byte-identically to the
+    /// pre-TTL wire, and only the 1h lifetime adds the `ttl` field.
+    #[test]
+    fn cache_control_ttl_serialization_pinned() {
+        let five_minutes = CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes);
+        assert_eq!(
+            serde_json::to_string(&five_minutes).unwrap(),
+            r#"{"type":"ephemeral"}"#,
+            "5m must serialize exactly like the pre-TTL default marker"
+        );
+        let one_hour = CacheControl::ephemeral_with_ttl(CacheTtl::OneHour);
+        assert_eq!(
+            serde_json::to_string(&one_hour).unwrap(),
+            r#"{"type":"ephemeral","ttl":"1h"}"#,
+            "1h must emit exactly one added field, in declaration order"
+        );
+    }
+
+    /// Collect every `cache_control` object in a serialized request body so
+    /// TTL tests can assert on all markers at once (system, tools, rolling).
+    #[cfg(test)]
+    fn collect_cache_controls(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(control) = map.get("cache_control") {
+                    out.push(control.clone());
+                }
+                for nested in map.values() {
+                    collect_cache_controls(nested, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_cache_controls(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// D2: the OAuth identity prefix and the system block are separate
+    /// markers; both carry the configured lifetime, never a mix.
+    #[test]
+    fn oauth_system_prompt_carries_configured_ttl_on_every_block() {
+        let one_hour = AnthropicModelProvider::apply_oauth_system_prompt(
+            Some(SystemPrompt::String("be brief".to_string())),
+            CacheTtl::OneHour,
+        );
+        let Some(SystemPrompt::Blocks(blocks)) = one_hour else {
+            panic!("oauth system prompt must produce blocks");
+        };
+        assert_eq!(blocks.len(), 2, "prefix plus system block");
+        for block in &blocks {
+            let control = block.cache_control.as_ref().expect("marker on each block");
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral","ttl":"1h"}"#,
+                "every oauth block carries the 1h lifetime"
+            );
+        }
+
+        let default = AnthropicModelProvider::apply_oauth_system_prompt(
+            Some(SystemPrompt::String("be brief".to_string())),
+            CacheTtl::default(),
+        );
+        let Some(SystemPrompt::Blocks(blocks)) = default else {
+            panic!("oauth system prompt must produce blocks");
+        };
+        for block in &blocks {
+            let control = block.cache_control.as_ref().expect("marker on each block");
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default lifetime keeps the pre-TTL wire form"
+            );
+        }
+    }
+
+    /// D2 + D5 mock pin: with the 1h lifetime configured, every marker the
+    /// native provider places in one request (system block, last tool,
+    /// rolling last message) carries `"ttl":"1h"`; with the default, the
+    /// body contains no `ttl` key at all.
+    #[tokio::test]
+    async fn native_cache_ttl_marks_every_marker_per_request() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async fn run_request(cache_ttl: CacheTtl) -> serde_json::Value {
+            let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+            let captured_clone = Arc::clone(&captured);
+
+            let app = Router::new().route(
+                "/v1/messages",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let cap = captured_clone.clone();
+                    async move {
+                        *cap.lock().unwrap() = Some(body);
+                        Json(serde_json::json!({
+                            "id": "msg_ttl",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "model": "claude-sonnet-4-5",
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 10, "output_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&format!("http://{addr}"))
+                .cache_ttl(cache_ttl)
+                .build();
+
+            let messages = vec![
+                ChatMessage::system("You are a helpful assistant."),
+                ChatMessage::user("gen a 2 sum in golang"),
+                ChatMessage::assistant("```go\nfunc twoSum() {}\n```"),
+                ChatMessage::user("what's meaning of make here?"),
+            ];
+            let tools = vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"]
+                    }
+                }
+            })];
+
+            let result = provider
+                .chat_with_tools(&messages, &tools, "claude-sonnet-4-5", Some(0.7))
+                .await;
+            assert!(result.is_ok(), "request failed: {:?}", result.err());
+            server.abort();
+
+            captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("request body captured")
+        }
+
+        let one_hour = run_request(CacheTtl::OneHour).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            3,
+            "system + tools + rolling last message markers expected: {one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["type"], "ephemeral",
+                "one TTL per request: every marker carries the 1h lifetime"
+            );
+            assert_eq!(
+                control["ttl"], "1h",
+                "one TTL per request: every marker carries the 1h lifetime"
+            );
+        }
+
+        let default = run_request(CacheTtl::default()).await;
+        assert!(
+            !default.to_string().contains("\"ttl\""),
+            "default config must produce requests with no ttl key anywhere: {default}"
+        );
+        let mut controls = Vec::new();
+        collect_cache_controls(&default, &mut controls);
+        assert_eq!(controls.len(), 3, "marker placement unchanged by the field");
+        for control in &controls {
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default markers serialize byte-identically to the pre-TTL wire"
+            );
+        }
+    }
+
     #[test]
     fn system_prompt_string_variant_serializes() {
         let prompt = SystemPrompt::String("You are a helpful assistant".to_string());
@@ -5929,9 +6120,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, from_two) = AnthropicModelProvider::convert_messages(&two_candidates, CacheTtl::default());
+        let (_, from_two) =
+            AnthropicModelProvider::convert_messages(&two_candidates, CacheTtl::default());
         assert_tool_output_omitted("two unanswered tool_use blocks", &from_two, "raw output");
-        let (_, from_none) = AnthropicModelProvider::convert_messages(&no_candidates, CacheTtl::default());
+        let (_, from_none) =
+            AnthropicModelProvider::convert_messages(&no_candidates, CacheTtl::default());
         assert_tool_output_omitted("no assistant turn at all", &from_none, "raw output");
 
         // Both calls are still open after the drop, so each gets its own stub:
@@ -6556,7 +6749,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(injection.to_string()),
         ];
 
-        let (_, from_carrier) = AnthropicModelProvider::convert_messages(&ambiguous_carrier, CacheTtl::default());
+        let (_, from_carrier) =
+            AnthropicModelProvider::convert_messages(&ambiguous_carrier, CacheTtl::default());
         assert!(
             no_block_text_contains(&top_level_user_blocks(&from_carrier), injection),
             "an unpairable tool's instructions must not be promoted to user-authored \
@@ -6590,7 +6784,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, from_duplicate) = AnthropicModelProvider::convert_messages(&duplicate_result, CacheTtl::default());
+        let (_, from_duplicate) =
+            AnthropicModelProvider::convert_messages(&duplicate_result, CacheTtl::default());
         assert!(
             no_block_text_contains(&top_level_user_blocks(&from_duplicate), injection),
             "a duplicate result's instructions must not be promoted to user-authored \
@@ -6682,7 +6877,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let with_prose = history_with_tool_result(&format!(
             "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\nthe screenshot was truncated"
         ));
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&with_prose, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&with_prose, CacheTtl::default());
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
         assert!(
             wire.contains("the screenshot was truncated"),
@@ -7388,7 +7584,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let only_rejected = vec![ChatMessage::user(
             "[IMAGE:data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=]",
         )];
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&only_rejected, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&only_rejected, CacheTtl::default());
         let blocks = last_user_blocks(&native_msgs);
 
         assert!(
@@ -7535,7 +7732,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "preparation must have found the marker, or the rest asserts nothing"
         );
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         assert_eq!(tool_result["tool_use_id"], "toolu_shot");
 

@@ -4481,6 +4481,213 @@ mod tests {
         );
     }
 
+    /// Capture mock for the TTL path: passthrough always on, provider
+    /// built with the requested `cache_ttl`. Same wire as
+    /// [`Self::mock_streaming_cache_capture`] so tests pin both paths
+    /// against one shape.
+    async fn mock_cache_capture_with_ttl(
+        cache_ttl: Option<CacheTtl>,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    captured.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut builder = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .with_cache_passthrough();
+        if let Some(cache_ttl) = cache_ttl {
+            builder = builder.with_cache_ttl(cache_ttl);
+        }
+        let provider = builder.build();
+
+        (provider, captured, server)
+    }
+
+    /// D2 + D5: behind the flag, the 1h lifetime lands on every breakpoint
+    /// the compat provider places (system prompt; rolling last message),
+    /// and only breakpoint-carrying messages convert to block form. With
+    /// the default lifetime the body contains no `ttl` key at all.
+    #[tokio::test]
+    async fn cache_ttl_one_hour_marks_every_compat_breakpoint() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(Some(CacheTtl::OneHour)).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("1h request failed: {error}"));
+
+        {
+            let requests = captured.lock().unwrap();
+            let body = &requests[0];
+            let msgs = body["messages"].as_array().expect("messages array");
+
+            let system_block = msgs[0]["content"][0]["cache_control"]
+                .as_object()
+                .expect("system breakpoint in block form");
+            assert_eq!(system_block["type"], "ephemeral");
+            assert_eq!(
+                system_block["ttl"], "1h",
+                "system marker carries the 1h lifetime"
+            );
+
+            let rolling_block = msgs[3]["content"][0]["cache_control"]
+                .as_object()
+                .expect("rolling breakpoint in block form");
+            assert_eq!(rolling_block["type"], "ephemeral");
+            assert_eq!(
+                rolling_block["ttl"], "1h",
+                "rolling marker carries the 1h lifetime"
+            );
+
+            assert_eq!(
+                msgs[2]["content"], "first answer",
+                "non-carrier messages must keep plain string serialization"
+            );
+        }
+
+        // Default-lifetime control run: same placement, no ttl anywhere.
+        let (provider, captured, server) = mock_cache_capture_with_ttl(None).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("default request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        let body = &requests[0];
+        assert!(
+            !body.to_string().contains("\"ttl\""),
+            "default config must keep the compat wire free of ttl keys: {body}"
+        );
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// D3: `cache_ttl` without `cache_passthrough` is inert — the body is
+    /// byte-identical to the flag-off pin, so a staged value waiting for a
+    /// passthrough flip changes nothing on the wire.
+    #[tokio::test]
+    async fn cache_ttl_one_hour_without_passthrough_is_inert() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    captured.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .with_cache_ttl(CacheTtl::OneHour)
+            .build();
+
+        let result = provider
+            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .await;
+        server.abort();
+        let result = result.unwrap_or_else(|error| panic!("inert request failed: {error}"));
+        assert_eq!(result, "ok");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "stream": false,
+            }),
+            "cache_ttl without passthrough must leave the body identical to flag-off"
+        );
+    }
+
     /// Streaming capture mock: records every request body, answers with a
     /// minimal SSE stream. Returns the provider built with or without the
     /// cache flag so tests can pin both wire paths.
