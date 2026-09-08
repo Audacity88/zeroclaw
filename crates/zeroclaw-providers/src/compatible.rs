@@ -1252,7 +1252,7 @@ impl OpenAiCompatibleModelProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
-            temperature,
+            temperature: self.resolve_effective_temperature(model, thinking, temperature),
             stream: Some(false),
             stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
@@ -1366,6 +1366,35 @@ impl OpenAiCompatibleModelProvider {
             // Non-object `extra_body` cannot be key-merged; the explicit
             // config value wins outright (preserving its existing behavior).
             Some(extra) => Some(extra.clone()),
+        }
+    }
+
+    /// Effective sampling temperature for a request body. Anthropic rejects
+    /// extended thinking combined with a modified temperature, so whenever
+    /// this request injects the thinking object (same predicate
+    /// [`Self::request_extra_body`] uses: passthrough on, params present)
+    /// the caller's temperature is replaced with 1.0, matching the native
+    /// provider's behavior for both thinking styles. Otherwise the incoming
+    /// temperature passes through unchanged, which keeps flag-off requests
+    /// byte-identical; an operator's configured `extra_body` carrying its
+    /// own `thinking` key with the flag off is that explicit request and is
+    /// left alone.
+    fn resolve_effective_temperature(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        temperature: Option<f64>,
+    ) -> Option<f64> {
+        if self.thinking_request_object(model, thinking).is_some() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"model": model})),
+                "Passthrough extended thinking enabled; forcing temperature=1.0"
+            );
+            Some(1.0)
+        } else {
+            temperature
         }
     }
 }
@@ -2565,7 +2594,7 @@ impl OpenAiCompatibleModelProvider {
         NativeChatRequest {
             model: model.to_string(),
             messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
-            temperature,
+            temperature: self.resolve_effective_temperature(model, thinking, temperature),
             stream: Some(false),
             // Non-streaming path; `usage` is on the final response body, not
             // gated on `stream_options.include_usage`.
@@ -2592,7 +2621,7 @@ impl OpenAiCompatibleModelProvider {
         NativeChatRequest {
             model: model.to_string(),
             messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
-            temperature,
+            temperature: self.resolve_effective_temperature(model, thinking, temperature),
             stream: Some(false),
             stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
@@ -2660,7 +2689,11 @@ impl OpenAiCompatibleModelProvider {
                 }
                 native_messages
             },
-            temperature,
+            temperature: self.resolve_effective_temperature(
+                model,
+                self.streaming_thinking_params(thinking),
+                temperature,
+            ),
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: if options_enabled {
                 self.tool_stream_for_tools(true)
@@ -3950,7 +3983,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 serde_json::to_value(ApiChatRequest {
                     model: model.clone(),
                     messages,
-                    temperature,
+                    temperature: provider.resolve_effective_temperature(
+                        &model,
+                        provider.streaming_thinking_params(thinking_owned),
+                        temperature,
+                    ),
                     reasoning_effort: reasoning_effort.clone(),
                     tool_stream: if options_enabled {
                         provider.tool_stream_for_tools(false)
@@ -5239,6 +5276,335 @@ mod tests {
             Some(serde_json::json!("scalar")),
             "non-object extra_body must win outright over the injected thinking object"
         );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_in_native_tool_builder() {
+        // Anthropic rejects extended thinking combined with a modified
+        // temperature: whenever the builder injects the thinking object, the
+        // caller's temperature must be replaced with 1.0 (the native
+        // provider's rule). Flag off and params-None keep the caller's
+        // value, leaving those bodies byte-identical.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "injected thinking requires temperature 1.0; got: {value}"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "the forcing must ride on an actually injected thinking object"
+        );
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off request must keep the caller's temperature"
+        );
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off request must inject nothing; got: {legacy}"
+        );
+
+        let no_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["temperature"],
+            serde_json::json!(0.75),
+            "params-None request under passthrough must keep the caller's temperature"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_in_raw_tool_builder() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let req = p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "raw tool builder must force temperature 1.0 when thinking is injected"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off raw tool request must keep the caller's temperature"
+        );
+        assert!(legacy.get("thinking").is_none());
+
+        let no_params = serde_json::to_value(p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["temperature"],
+            serde_json::json!(0.75),
+            "params-None raw tool request must keep the caller's temperature"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_for_adaptive_style() {
+        // The forcing rule is style-independent, matching the native
+        // provider: an adaptive-only gateway model with thinking params also
+        // gets temperature 1.0.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            Some(0.75),
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "adaptive-style thinking must force temperature 1.0 too"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "the adaptive shape must still be the injected object"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_temperature_on_streaming_builder() {
+        // Passthrough never attaches thinking to the streamed wire
+        // (streaming_thinking_params): the temperature resolves from the
+        // same params the builder actually injects, so the streamed body
+        // behaves like thinking-off for the temperature as well: the
+        // caller's value is kept, nothing is forced. Flag off is the same
+        // byte-identical legacy body.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let streamed = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            streamed["temperature"],
+            serde_json::json!(0.75),
+            "streamed requests under passthrough carry no thinking object, so the caller's temperature is kept"
+        );
+        assert!(
+            streamed.get("thinking").is_none(),
+            "streamed request must inject nothing; got: {streamed}"
+        );
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off streamed request must keep the caller's temperature"
+        );
+        assert!(legacy.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_forces_temperature_on_history_fallback() {
+        // The prompt-guided fallback rebuilds the request through
+        // chat_with_history_inner with the runtime's thinking params: the
+        // rebuilt body must carry the same temperature forcing as the
+        // primary path.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        flag_off
+            .chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), None)
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "one captured body per request");
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(1.0),
+            "fallback request with injected thinking must carry temperature 1.0"
+        );
+        assert!(bodies[0].get("thinking").is_some());
+        assert_eq!(
+            bodies[1]["temperature"],
+            serde_json::json!(0.75),
+            "flag-off fallback request must keep the caller's temperature"
+        );
+        assert!(bodies[1].get("thinking").is_none());
+        assert_eq!(
+            bodies[2]["temperature"],
+            serde_json::json!(0.75),
+            "params-None fallback request must keep the caller's temperature"
+        );
+        drop(bodies);
+        server.abort();
     }
 
     #[test]
