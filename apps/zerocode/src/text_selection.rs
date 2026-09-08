@@ -2,10 +2,11 @@
 
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 
 use crate::mouse;
@@ -49,6 +50,8 @@ pub(crate) enum TextRowBreak {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextSnapshot {
     pub(crate) area: Rect,
+    /// First transcript-global rendered row projected into `area`.
+    pub(crate) scroll: u16,
     pub(crate) cells: Vec<TextCell>,
     pub(crate) row_breaks: Vec<TextRowBreak>,
 }
@@ -81,9 +84,70 @@ impl TextSnapshot {
         }
         Self {
             area,
+            scroll: 0,
             cells,
             row_breaks,
         }
+    }
+
+    /// Capture the complete wrapped transcript while retaining the visible
+    /// screen area used to project global rows back into the current viewport.
+    pub(crate) fn from_lines(
+        lines: Vec<Line<'_>>,
+        area: Rect,
+        total_rows: u16,
+        scroll: u16,
+        row_breaks: Vec<TextRowBreak>,
+    ) -> Self {
+        let height = total_rows.max(1);
+        let buffer_area = Rect::new(0, 0, area.width, height);
+        let mut buffer = Buffer::empty(buffer_area);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(buffer_area, &mut buffer);
+
+        let mut cells = Vec::with_capacity(usize::from(area.width) * usize::from(height));
+        for row in 0..height {
+            let mut column = 0;
+            while column < area.width {
+                let symbol = buffer[(column, row)].symbol().to_string();
+                let width = (unicode_width::UnicodeWidthStr::width(symbol.as_str()) as u16)
+                    .max(1)
+                    .min(area.width - column);
+                cells.push(TextCell {
+                    symbol,
+                    span_start: column,
+                });
+                for _ in 1..width {
+                    cells.push(TextCell {
+                        symbol: String::new(),
+                        span_start: column,
+                    });
+                }
+                column += width;
+            }
+        }
+
+        Self {
+            area,
+            scroll,
+            cells,
+            row_breaks,
+        }
+    }
+
+    pub(crate) fn set_viewport(&mut self, area: Rect, scroll: u16) {
+        self.area = area;
+        self.scroll = scroll;
+    }
+
+    pub(crate) fn content_height(&self) -> u16 {
+        if self.area.width == 0 {
+            return 0;
+        }
+        (self.cells.len() / usize::from(self.area.width))
+            .try_into()
+            .unwrap_or(u16::MAX)
     }
 
     pub(crate) fn point_at(&self, column: u16, row: u16) -> Option<CellPoint> {
@@ -92,12 +156,12 @@ impl TextSnapshot {
         }
         Some(CellPoint {
             column: column - self.area.x,
-            row: row - self.area.y,
+            row: self.scroll.saturating_add(row - self.area.y),
         })
     }
 
     fn cell(&self, point: CellPoint) -> Option<&TextCell> {
-        if point.column >= self.area.width || point.row >= self.area.height {
+        if point.column >= self.area.width || point.row >= self.content_height() {
             return None;
         }
         let index =
@@ -218,13 +282,87 @@ impl TextSnapshot {
         text.chars().any(|ch| !ch.is_whitespace()).then_some(text)
     }
 
+    pub(crate) fn word_selection_at(&self, point: CellPoint) -> Option<TextSelection> {
+        let cell = self.cell(point)?;
+        let origin = self.cell(CellPoint {
+            column: cell.span_start,
+            row: point.row,
+        })?;
+        if origin.symbol.chars().all(char::is_whitespace) {
+            return None;
+        }
+        let is_word = origin
+            .symbol
+            .chars()
+            .any(|ch| ch.is_alphanumeric() || ch == '_');
+        let matches_class = |column| {
+            let point = CellPoint {
+                column,
+                row: point.row,
+            };
+            let Some(cell) = self.cell(point) else {
+                return false;
+            };
+            let Some(origin) = self.cell(CellPoint {
+                column: cell.span_start,
+                row: point.row,
+            }) else {
+                return false;
+            };
+            !origin.symbol.chars().all(char::is_whitespace)
+                && origin
+                    .symbol
+                    .chars()
+                    .any(|ch| ch.is_alphanumeric() || ch == '_')
+                    == is_word
+        };
+
+        let mut start = cell.span_start;
+        while start > 0 && matches_class(start - 1) {
+            start = self
+                .cell(CellPoint {
+                    column: start - 1,
+                    row: point.row,
+                })?
+                .span_start;
+        }
+        let mut end = cell.span_start;
+        while end + 1 < self.area.width && matches_class(end + 1) {
+            end += 1;
+        }
+
+        Some(TextSelection {
+            anchor: CellPoint {
+                column: start,
+                row: point.row,
+            },
+            head: CellPoint {
+                column: end,
+                row: point.row,
+            },
+            dragged: true,
+        })
+    }
+
     pub(crate) fn selection_anchor_rect(&self, selection: TextSelection) -> Option<Rect> {
         if !selection.dragged {
             return None;
         }
         let (start, end) = selection.normalized();
-        let y = self.area.y.saturating_add(start.row);
-        let height = end.row.saturating_sub(start.row).saturating_add(1);
+        let visible_start = start.row.max(self.scroll);
+        let visible_end = end.row.min(
+            self.scroll
+                .saturating_add(self.area.height)
+                .saturating_sub(1),
+        );
+        if visible_end < visible_start {
+            return None;
+        }
+        let y = self
+            .area
+            .y
+            .saturating_add(visible_start.saturating_sub(self.scroll));
+        let height = visible_end.saturating_sub(visible_start).saturating_add(1);
         Some(Rect::new(self.area.x, y, self.area.width, height))
     }
 
@@ -238,10 +376,14 @@ impl TextSnapshot {
             return;
         };
         let buffer = frame.buffer_mut();
-        for row in 0..self.area.height {
+        for screen_row in 0..self.area.height {
             for column in 0..self.area.width {
-                if Self::bounds_contain(start, end, CellPoint { column, row }) {
-                    buffer[(self.area.x + column, self.area.y + row)].set_style(style);
+                let point = CellPoint {
+                    column,
+                    row: self.scroll.saturating_add(screen_row),
+                };
+                if Self::bounds_contain(start, end, point) {
+                    buffer[(self.area.x + column, self.area.y + screen_row)].set_style(style);
                 }
             }
         }

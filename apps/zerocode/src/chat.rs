@@ -145,6 +145,8 @@ pub(crate) struct Chat {
     /// Double-click tracker for the session picker: a second click on the same row
     /// resumes that saved session, matching the keyboard Enter.
     session_list_double_click: crate::mouse::DoubleClickTracker,
+    /// Double-click tracker for normal-mode transcript word selection.
+    transcript_double_click: crate::mouse::DoubleClickTracker,
     /// One-shot app-level Help request, set by the `/help` slash command and
     /// drained immediately by `app.rs` after this pane handles the key.
     help_requested: bool,
@@ -236,6 +238,7 @@ impl Chat {
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
+            transcript_double_click: crate::mouse::DoubleClickTracker::new(),
             help_requested: false,
             deferred_elicitations: Vec::new(),
         }
@@ -1162,6 +1165,10 @@ impl Chat {
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
         self.maybe_refresh_git_branch();
+
+        if let ChatPhase::Active(state) = &mut self.phase {
+            state.advance_transcript_edge_drag();
+        }
 
         match &mut self.phase {
             ChatPhase::PickAgent {
@@ -2610,7 +2617,6 @@ impl Chat {
                     if let Some(track) = state.scrollbar_track_rect
                         && mouse::in_rect(col, row, track)
                     {
-                        state.clear_transcript_selection();
                         state.scrollbar_drag = Some(ScrollbarDrag {
                             start_scroll: state.scroll_offset,
                             start_row: row,
@@ -2623,13 +2629,13 @@ impl Chat {
                             let new_off = (rel * max as u32 / track.height.max(1) as u32) as u16;
                             state.scroll_offset = new_off.min(max);
                             state.pinned_to_bottom = state.scroll_offset >= max;
+                            state.sync_transcript_selection_viewport();
                         }
                         return;
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let Some(drag) = state.scrollbar_drag {
-                        state.clear_transcript_selection();
                         let max = state
                             .last_total_rows
                             .saturating_sub(state.last_inner_height);
@@ -2644,6 +2650,7 @@ impl Chat {
                             (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
                         state.scroll_offset = new_off as u16;
                         state.pinned_to_bottom = state.scroll_offset >= max;
+                        state.sync_transcript_selection_viewport();
                         return;
                     }
                 }
@@ -2699,11 +2706,15 @@ impl Chat {
                             }
                         } else {
                             state.clear_mouse_highlight();
-                            state.begin_transcript_drag(col, row);
+                            if self.transcript_double_click.click(col, row) {
+                                state.select_transcript_word(col, row);
+                            } else {
+                                state.begin_transcript_drag(col, row);
+                            }
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        state.update_transcript_drag(col, row);
+                        state.update_transcript_drag_at_edge(col, row);
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         state.finish_transcript_drag();
@@ -4182,6 +4193,9 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     // ── Rebuild cached lines only when entries changed ────────
     if state.dirty != LinesDirty::Clean || state.cached_render_width != inner_width {
+        // Selection endpoints belong to one stable rendered-content geometry.
+        // Viewport movement preserves them, but a cache rebuild does not.
+        state.clear_transcript_selection();
         state.rebuild_lines(inner_width);
     }
 
@@ -4192,6 +4206,9 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let has_stream_thought = state.show_thoughts && !state.streaming_thought.is_empty();
     let has_approval = state.pending_approval().is_some();
     let transient = has_stream_text || has_stream_thought || has_approval;
+    if (has_stream_text || has_stream_thought) && state.transcript_selection.is_some() {
+        state.clear_transcript_selection();
+    }
 
     // Reserve a pinned top row inside the panel for the session's first user
     // message — a recovery reminder that stays put across scroll and reload.
@@ -4294,7 +4311,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
-    capture_transcript_snapshot(f, state, body_area, row_breaks);
+    capture_transcript_snapshot(f, state, body_area, total_rows, scroll, row_breaks);
     render_transcript_selection(f, state);
 
     state.last_total_rows = total_rows;
@@ -4363,8 +4380,18 @@ fn capture_transcript_snapshot(
     f: &mut Frame,
     state: &mut ChatState,
     body: Rect,
+    total_rows: u16,
+    scroll: u16,
     row_breaks: Vec<TranscriptRowBreak>,
 ) {
+    if state.transcript_selection.is_some()
+        && let Some(snapshot) = state.transcript_snapshot.as_mut()
+        && snapshot.area.width == body.width
+        && snapshot.content_height() == total_rows
+    {
+        snapshot.set_viewport(body, scroll);
+        return;
+    }
     state.set_transcript_snapshot(TranscriptSnapshot::capture(f, body, row_breaks));
 }
 
@@ -5413,6 +5440,12 @@ struct ScrollbarDrag {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptDragEdge {
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TitleHitTarget {
     Agent,
     ModelProvider,
@@ -5633,6 +5666,8 @@ pub struct ChatState {
     /// Whether the left-button transcript selection gesture is still active.
     /// Action buttons appear only after mouse-up so they cannot move under the pointer.
     transcript_drag_active: bool,
+    /// Held edge and pointer position for draw-tick auto-scroll.
+    transcript_drag_edge: Option<(TranscriptDragEdge, u16, u16)>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Clickable `[Copy]` labels from the last draw.
@@ -5765,6 +5800,7 @@ impl ChatState {
             transcript_snapshot: None,
             transcript_selection: None,
             transcript_drag_active: false,
+            transcript_drag_edge: None,
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
             context_copy_regions: Vec::new(),
@@ -5856,6 +5892,7 @@ impl ChatState {
     fn clear_transcript_selection(&mut self) {
         self.transcript_selection = None;
         self.transcript_drag_active = false;
+        self.transcript_drag_edge = None;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.context_menu = None;
@@ -5863,6 +5900,7 @@ impl ChatState {
     }
 
     fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
+        self.materialize_transcript_selection_snapshot();
         let Some(snapshot) = &self.transcript_snapshot else {
             return false;
         };
@@ -5883,6 +5921,24 @@ impl ChatState {
         });
         self.transcript_drag_active = true;
         true
+    }
+
+    fn materialize_transcript_selection_snapshot(&mut self) {
+        let Some(current) = &self.transcript_snapshot else {
+            return;
+        };
+        if self.cached_lines.is_empty() || current.content_height() > current.area.height {
+            return;
+        }
+        let area = current.area;
+        let lines = self.cached_lines.iter().map(borrow_line).collect();
+        self.transcript_snapshot = Some(TranscriptSnapshot::from_lines(
+            lines,
+            area,
+            self.cached_total_rows,
+            self.scroll_offset,
+            self.cached_row_breaks.clone(),
+        ));
     }
 
     fn update_transcript_drag(&mut self, column: u16, row: u16) -> bool {
@@ -5906,8 +5962,68 @@ impl ChatState {
         true
     }
 
+    fn update_transcript_drag_at_edge(&mut self, column: u16, row: u16) -> bool {
+        let Some(area) = self
+            .transcript_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.area)
+        else {
+            return false;
+        };
+        if area.width == 0 || area.height == 0 {
+            return false;
+        }
+
+        let edge = if row <= area.y {
+            Some(TranscriptDragEdge::Top)
+        } else if row >= area.y.saturating_add(area.height).saturating_sub(1) {
+            Some(TranscriptDragEdge::Bottom)
+        } else {
+            None
+        };
+
+        let column = column.clamp(area.x, area.x.saturating_add(area.width).saturating_sub(1));
+        let row = row.clamp(area.y, area.y.saturating_add(area.height).saturating_sub(1));
+        self.transcript_drag_edge = edge.map(|edge| (edge, column, row));
+        self.update_transcript_drag(column, row)
+    }
+
+    fn advance_transcript_edge_drag(&mut self) {
+        if !self.transcript_drag_active {
+            self.transcript_drag_edge = None;
+            return;
+        }
+        let Some((edge, column, row)) = self.transcript_drag_edge else {
+            return;
+        };
+        match edge {
+            TranscriptDragEdge::Top => self.scroll_up(1),
+            TranscriptDragEdge::Bottom => self.scroll_down(1),
+        }
+        self.update_transcript_drag(column, row);
+    }
+
+    fn select_transcript_word(&mut self, column: u16, row: u16) -> bool {
+        self.materialize_transcript_selection_snapshot();
+        let Some(snapshot) = &self.transcript_snapshot else {
+            return false;
+        };
+        let Some(point) = snapshot.point_at(column, row) else {
+            return false;
+        };
+        let Some(selection) = snapshot.word_selection_at(point) else {
+            self.clear_transcript_selection();
+            return false;
+        };
+        self.copy_feedback = None;
+        self.transcript_selection = Some(selection);
+        self.transcript_drag_active = false;
+        true
+    }
+
     fn finish_transcript_drag(&mut self) {
         self.transcript_drag_active = false;
+        self.transcript_drag_edge = None;
         if self
             .transcript_selection
             .is_some_and(|selection| !selection.dragged)
@@ -5931,6 +6047,19 @@ impl ChatState {
             self.clear_transcript_selection();
         }
         self.transcript_snapshot = Some(snapshot);
+    }
+
+    fn sync_transcript_selection_viewport(&mut self) {
+        if self.transcript_selection.is_none() {
+            return;
+        }
+        if let Some(snapshot) = self.transcript_snapshot.as_mut() {
+            snapshot.scroll = self.scroll_offset;
+        }
+        self.copy_hit_regions
+            .retain(|region| region.kind != CopyHitKind::Transcript);
+        self.context_menu = None;
+        self.copy_feedback = None;
     }
 
     fn clear_mouse_highlight(&mut self) {
@@ -6599,18 +6728,18 @@ impl ChatState {
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
-        self.clear_transcript_selection();
         self.pinned_to_bottom = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.sync_transcript_selection_viewport();
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
-        self.clear_transcript_selection();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
         if self.scroll_offset >= max {
             self.pinned_to_bottom = true;
         }
+        self.sync_transcript_selection_viewport();
     }
 
     pub fn page_up(&mut self) {
@@ -6622,16 +6751,16 @@ impl ChatState {
     }
 
     pub fn scroll_to_top(&mut self) {
-        self.clear_transcript_selection();
         self.pinned_to_bottom = false;
         self.scroll_offset = 0;
+        self.sync_transcript_selection_viewport();
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.clear_transcript_selection();
         let max = self.last_total_rows.saturating_sub(self.last_inner_height);
         self.scroll_offset = max;
         self.pinned_to_bottom = true;
+        self.sync_transcript_selection_viewport();
     }
 
     pub fn title(&self) -> String {
@@ -7751,8 +7880,9 @@ mod tests {
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
         use unicode_width::UnicodeWidthChar;
 
-        let mut cells = Vec::with_capacity(usize::from(area.width) * usize::from(area.height));
-        for row in 0..area.height {
+        let content_height = area.height.max(rows.len().try_into().unwrap_or(u16::MAX));
+        let mut cells = Vec::with_capacity(usize::from(area.width) * usize::from(content_height));
+        for row in 0..content_height {
             let mut column = 0;
             for ch in rows
                 .get(usize::from(row))
@@ -7788,8 +7918,9 @@ mod tests {
         }
         TranscriptSnapshot {
             area,
+            scroll: 0,
             cells,
-            row_breaks: vec![TranscriptRowBreak::Hard; usize::from(area.height)],
+            row_breaks: vec![TranscriptRowBreak::Hard; usize::from(content_height)],
         }
     }
 
@@ -8613,40 +8744,39 @@ mod tests {
     }
 
     #[test]
-    fn transcript_selection_clears_on_scroll_and_session_reset() {
+    fn transcript_selection_survives_scrolling_but_clears_on_mode_or_session_change() {
         let mut state = state();
-        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 5, 2),
+            &["one  ", "two  ", "three", "four "],
+        ));
+        state.last_total_rows = 4;
+        state.last_inner_height = 2;
         assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
+        assert!(state.update_transcript_drag(2, 1));
         state.finish_transcript_drag();
-        state.set_overlay_copy_feedback(Rect::new(0, 0, 5, 1));
+        let selection = state.transcript_selection;
+        state.set_overlay_copy_feedback(Rect::new(0, 0, 5, 2));
 
-        state.scroll_up(1);
-        assert_eq!(state.transcript_selection, None);
+        state.scroll_down(1);
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.transcript_snapshot.as_ref().unwrap().scroll, 1);
         assert_eq!(state.copy_feedback, None);
         assert!(state.copy_hit_regions.is_empty());
 
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
         state.scroll_to_top();
-        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.transcript_snapshot.as_ref().unwrap().scroll, 0);
 
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
-        state.last_total_rows = 10;
-        state.last_inner_height = 1;
         state.scroll_to_bottom();
-        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.transcript_snapshot.as_ref().unwrap().scroll, 2);
 
-        assert!(state.begin_transcript_drag(0, 0));
-        assert!(state.update_transcript_drag(1, 0));
-        state.finish_transcript_drag();
         state.enter_browse_mode();
         assert_eq!(state.transcript_selection, None);
 
         state.exit_browse_mode();
+        state.scroll_to_top();
         assert!(state.begin_transcript_drag(0, 0));
         assert!(state.update_transcript_drag(1, 0));
         state.finish_transcript_drag();
@@ -8657,6 +8787,126 @@ mod tests {
         );
         assert_eq!(state.transcript_selection, None);
         assert!(state.transcript_snapshot.is_none());
+    }
+
+    #[test]
+    fn transcript_selection_shift_extension_uses_global_rows_after_viewport_scroll() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 8, 2),
+            &["alpha   ", "beta    ", "gamma   ", "delta   "],
+        ));
+        state.last_total_rows = 4;
+        state.last_inner_height = 2;
+        assert!(state.begin_transcript_drag(10, 5));
+        assert!(state.update_transcript_drag(13, 5));
+        state.finish_transcript_drag();
+
+        state.scroll_down(2);
+        assert!(state.update_transcript_drag(14, 6));
+        state.finish_transcript_drag();
+
+        assert_eq!(
+            state.transcript_selection,
+            Some(TranscriptSelection {
+                anchor: CellPoint { column: 0, row: 0 },
+                head: CellPoint { column: 4, row: 3 },
+                dragged: true,
+            })
+        );
+        assert_eq!(
+            state.transcript_selected_text().as_deref(),
+            Some("alpha\nbeta\ngamma\ndelta")
+        );
+    }
+
+    #[test]
+    fn transcript_selection_edge_drag_scrolls_and_extends_global_rows() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 8, 2),
+            &["alpha   ", "beta    ", "gamma   ", "delta   "],
+        ));
+        state.last_total_rows = 4;
+        state.last_inner_height = 2;
+        assert!(state.begin_transcript_drag(10, 6));
+
+        assert!(state.update_transcript_drag_at_edge(14, 6));
+        state.advance_transcript_edge_drag();
+
+        assert_eq!(state.scroll_offset, 1);
+        assert_eq!(
+            state.transcript_selection,
+            Some(TranscriptSelection {
+                anchor: CellPoint { column: 0, row: 1 },
+                head: CellPoint { column: 4, row: 2 },
+                dragged: true,
+            })
+        );
+        assert_eq!(
+            state.transcript_selected_text().as_deref(),
+            Some("beta\ngamma")
+        );
+
+        state.advance_transcript_edge_drag();
+        assert_eq!(state.scroll_offset, 2);
+        assert_eq!(
+            state.transcript_selected_text().as_deref(),
+            Some("beta\ngamma\ndelta")
+        );
+        state.finish_transcript_drag();
+        assert_eq!(state.transcript_drag_edge, None);
+    }
+
+    #[test]
+    fn transcript_selection_double_click_excludes_adjacent_punctuation() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 16, 1),
+            &["alpha, beta!"],
+        ));
+
+        assert!(state.select_transcript_word(18, 5));
+
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("beta"));
+        assert!(!state.transcript_drag_active);
+    }
+
+    #[tokio::test]
+    async fn transcript_selection_mouse_double_click_routes_to_word_selection() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 16, 1),
+            &["alpha, beta!"],
+        ));
+        chat.phase = ChatPhase::Active(Box::new(state));
+        let area = Rect::new(0, 0, 80, 20);
+
+        for _ in 0..2 {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                chat.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column: 18,
+                        row: 5,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    area,
+                )
+                .await;
+            }
+        }
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("beta"));
     }
 
     #[test]
