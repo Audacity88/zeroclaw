@@ -4384,15 +4384,16 @@ fn capture_transcript_snapshot(
     scroll: u16,
     row_breaks: Vec<TranscriptRowBreak>,
 ) {
+    let captured = TranscriptSnapshot::capture_at(f, body, total_rows, scroll, row_breaks);
     if state.transcript_selection.is_some()
         && let Some(snapshot) = state.transcript_snapshot.as_mut()
         && snapshot.area.width == body.width
         && snapshot.content_height() == total_rows
     {
-        snapshot.set_viewport(body, scroll);
+        snapshot.merge(captured);
         return;
     }
-    state.set_transcript_snapshot(TranscriptSnapshot::capture(f, body, row_breaks));
+    state.set_transcript_snapshot(captured);
 }
 
 fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
@@ -5897,10 +5898,12 @@ impl ChatState {
         self.context_copy_regions.clear();
         self.context_menu = None;
         self.copy_feedback = None;
+        if let Some(snapshot) = self.transcript_snapshot.as_mut() {
+            snapshot.retain_viewport();
+        }
     }
 
     fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
-        self.materialize_transcript_selection_snapshot();
         let Some(snapshot) = &self.transcript_snapshot else {
             return false;
         };
@@ -5923,28 +5926,57 @@ impl ChatState {
         true
     }
 
-    fn materialize_transcript_selection_snapshot(&mut self) {
-        let Some(current) = &self.transcript_snapshot else {
-            return;
+    fn capture_transcript_selection_rows(&mut self, start: u16, end: u16) -> usize {
+        let Some(current) = self.transcript_snapshot.as_ref() else {
+            return 0;
         };
-        if self.cached_lines.is_empty() || current.content_height() > current.area.height {
-            return;
+        if self.cached_lines.is_empty() || start >= current.content_height() {
+            return 0;
         }
         let area = current.area;
-        let lines = self.cached_lines.iter().map(borrow_line).collect();
-        self.transcript_snapshot = Some(TranscriptSnapshot::from_lines(
-            lines,
-            area,
-            self.cached_total_rows,
-            self.scroll_offset,
-            self.cached_row_breaks.clone(),
-        ));
+        let total_rows = current.content_height();
+        let end = end.min(total_rows.saturating_sub(1));
+        let missing_ranges = current.missing_row_ranges(start, end);
+        let mut captured_rows = 0;
+        for (missing_start, missing_end) in missing_ranges {
+            let height = missing_end.saturating_sub(missing_start).saturating_add(1);
+            let (line_lo, line_hi, local_scroll) = self.visible_line_bounds(missing_start, height);
+            let lines = self.cached_lines[line_lo..line_hi]
+                .iter()
+                .map(borrow_line)
+                .collect();
+            let row_breaks = self
+                .cached_row_breaks
+                .iter()
+                .copied()
+                .skip(usize::from(missing_start))
+                .take(usize::from(height))
+                .collect();
+            let captured = TranscriptSnapshot::capture_lines(
+                lines,
+                area,
+                total_rows,
+                missing_start,
+                height,
+                local_scroll,
+                row_breaks,
+            );
+            if let Some(snapshot) = self.transcript_snapshot.as_mut() {
+                snapshot.merge(captured);
+            }
+            captured_rows += usize::from(height);
+        }
+        if let Some(snapshot) = self.transcript_snapshot.as_mut() {
+            snapshot.set_viewport(area, self.scroll_offset);
+        }
+        captured_rows
     }
 
     fn update_transcript_drag(&mut self, column: u16, row: u16) -> bool {
-        let Some(anchor) = self.transcript_selection.map(|selection| selection.anchor) else {
+        let Some(selection) = self.transcript_selection else {
             return false;
         };
+        let anchor = selection.anchor;
         let Some(head) = self
             .transcript_snapshot
             .as_ref()
@@ -5952,6 +5984,10 @@ impl ChatState {
         else {
             return false;
         };
+        self.capture_transcript_selection_rows(
+            selection.head.row.min(head.row),
+            selection.head.row.max(head.row),
+        );
 
         self.transcript_selection = Some(TranscriptSelection {
             anchor,
@@ -6004,7 +6040,6 @@ impl ChatState {
     }
 
     fn select_transcript_word(&mut self, column: u16, row: u16) -> bool {
-        self.materialize_transcript_selection_snapshot();
         let Some(snapshot) = &self.transcript_snapshot else {
             return false;
         };
@@ -6525,9 +6560,9 @@ impl ChatState {
         self.rebuild_screen_ranges(width);
     }
 
-    fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+    fn visible_line_bounds(&self, scroll: u16, height: u16) -> (usize, usize, u16) {
         if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
-            return (self.cached_lines.clone(), scroll);
+            return (0, self.cached_lines.len(), scroll);
         }
         let view_end = scroll.saturating_add(height);
         let mut first: Option<usize> = None;
@@ -6541,11 +6576,16 @@ impl ChatState {
             }
         }
         let Some(first) = first else {
-            return (self.cached_lines.clone(), scroll);
+            return (0, self.cached_lines.len(), scroll);
         };
         let line_lo = self.cached_line_ranges[first].1;
         let line_hi = self.cached_line_ranges[last].2;
         let local_scroll = scroll.saturating_sub(self.cached_screen_ranges[first].1);
+        (line_lo, line_hi, local_scroll)
+    }
+
+    fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+        let (line_lo, line_hi, local_scroll) = self.visible_line_bounds(scroll, height);
         (self.cached_lines[line_lo..line_hi].to_vec(), local_scroll)
     }
 
@@ -7878,11 +7918,13 @@ mod tests {
     }
 
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
+        use std::collections::BTreeMap;
         use unicode_width::UnicodeWidthChar;
 
         let content_height = area.height.max(rows.len().try_into().unwrap_or(u16::MAX));
-        let mut cells = Vec::with_capacity(usize::from(area.width) * usize::from(content_height));
+        let mut cells = BTreeMap::new();
         for row in 0..content_height {
+            let mut row_cells = Vec::with_capacity(usize::from(area.width));
             let mut column = 0;
             for ch in rows
                 .get(usize::from(row))
@@ -7896,12 +7938,12 @@ mod tests {
                 let width = (ch.width().unwrap_or(0) as u16)
                     .max(1)
                     .min(area.width - column);
-                cells.push(TranscriptCell {
+                row_cells.push(TranscriptCell {
                     symbol: ch.to_string(),
                     span_start: column,
                 });
                 for _ in 1..width {
-                    cells.push(TranscriptCell {
+                    row_cells.push(TranscriptCell {
                         symbol: String::new(),
                         span_start: column,
                     });
@@ -7909,18 +7951,22 @@ mod tests {
                 column += width;
             }
             while column < area.width {
-                cells.push(TranscriptCell {
+                row_cells.push(TranscriptCell {
                     symbol: " ".to_string(),
                     span_start: column,
                 });
                 column += 1;
             }
+            cells.insert(row, row_cells);
         }
         TranscriptSnapshot {
             area,
             scroll: 0,
+            total_rows: content_height,
             cells,
-            row_breaks: vec![TranscriptRowBreak::Hard; usize::from(content_height)],
+            row_breaks: (0..content_height)
+                .map(|row| (row, TranscriptRowBreak::Hard))
+                .collect(),
         }
     }
 
@@ -7930,7 +7976,12 @@ mod tests {
         row_breaks: &[TranscriptRowBreak],
     ) -> TranscriptSnapshot {
         let mut snapshot = transcript_snapshot(area, rows);
-        snapshot.row_breaks = row_breaks.to_vec();
+        snapshot.row_breaks = row_breaks
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(row, row_break)| (row as u16, row_break))
+            .collect();
         snapshot
     }
 
@@ -8077,18 +8128,21 @@ mod tests {
                 .expect("render captures transcript cells");
             let rows = snapshot
                 .cells
-                .chunks(usize::from(snapshot.area.width))
-                .map(|cells| {
-                    cells
-                        .iter()
-                        .map(|cell| cell.symbol.as_str())
-                        .collect::<String>()
+                .iter()
+                .map(|(&row, cells)| {
+                    (
+                        row,
+                        cells
+                            .iter()
+                            .map(|cell| cell.symbol.as_str())
+                            .collect::<String>(),
+                    )
                 })
                 .collect::<Vec<_>>();
             let start_row = rows
                 .iter()
-                .position(|row| row.starts_with("abcdefgh"))
-                .expect("first wrapped row") as u16;
+                .find_map(|(row, text)| text.starts_with("abcdefgh").then_some(*row))
+                .expect("first wrapped row");
             let end_row = start_row + 1;
             let end_column = snapshot
                 .row_text_bounds(end_row)
@@ -8680,6 +8734,186 @@ mod tests {
     }
 
     #[test]
+    fn transcript_selection_capture_paths_share_wide_character_cells() {
+        use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
+
+        let area = Rect::new(0, 0, 4, 1);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut visible = None;
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new("A界B"), area);
+                visible = Some(TranscriptSnapshot::capture_at(
+                    frame,
+                    area,
+                    1,
+                    0,
+                    vec![TranscriptRowBreak::Hard],
+                ));
+            })
+            .expect("draw wide transcript row");
+        let bounded = TranscriptSnapshot::capture_lines(
+            vec![Line::from("A界B")],
+            area,
+            1,
+            0,
+            1,
+            0,
+            vec![TranscriptRowBreak::Hard],
+        );
+
+        assert_eq!(visible.expect("visible capture").cells, bounded.cells);
+        assert_eq!(bounded.cells[&0][2].span_start, 1);
+        assert!(bounded.cells[&0][2].symbol.is_empty());
+    }
+
+    #[test]
+    fn transcript_selection_bounded_capture_scrolls_within_one_deep_wrapped_line() {
+        let area = Rect::new(0, 0, 4, 1);
+        let line = Line::from(format!("{}tail", "a".repeat(400)));
+        let mut state = state();
+        state.cached_lines = vec![line];
+        state.cached_line_ranges = vec![(0, 0, 1)];
+        state.cached_screen_ranges = vec![(0, 0, 101, 4)];
+        state.cached_row_breaks = vec![TranscriptRowBreak::SoftConcat; 101];
+        state.transcript_snapshot = Some(TranscriptSnapshot::capture_lines(
+            vec![Line::from("aaaa")],
+            area,
+            101,
+            0,
+            1,
+            0,
+            vec![TranscriptRowBreak::SoftConcat],
+        ));
+        state.scroll_offset = 100;
+
+        assert_eq!(state.capture_transcript_selection_rows(100, 100), 1);
+        let snapshot = state.transcript_snapshot.as_ref().expect("snapshot");
+
+        let rendered = snapshot.cells[&100]
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert_eq!(rendered, "tail");
+        assert_eq!(snapshot.cells.len(), 2, "original and newly captured rows");
+    }
+
+    #[test]
+    fn transcript_selection_first_click_keeps_snapshot_viewport_bounded() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        for i in 0..200 {
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        state.mark_dirty_full();
+        state.scroll_to_top();
+        let area = Rect::new(0, 0, 40, 10);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_conversation(frame, &mut state, area))
+            .expect("draw conversation");
+
+        let snapshot = state.transcript_snapshot.as_ref().expect("snapshot");
+        let captured_before = snapshot.cells.len();
+        assert!(usize::from(snapshot.total_rows) > captured_before);
+        let global_row = *snapshot
+            .cells
+            .keys()
+            .find(|&&row| snapshot.row_text_bounds(row).is_some())
+            .expect("visible text row");
+        let (column, _) = snapshot.row_text_bounds(global_row).expect("text bounds");
+        let screen_row = snapshot.area.y + global_row.saturating_sub(snapshot.scroll);
+        let screen_column = snapshot.area.x + column;
+
+        assert!(state.begin_transcript_drag(screen_column, screen_row));
+        assert_eq!(
+            state.transcript_snapshot.as_ref().unwrap().cells.len(),
+            captured_before,
+            "first click must not materialize cached history"
+        );
+    }
+
+    #[test]
+    fn transcript_selection_scroll_merges_visible_rows_and_gap_capture_stays_bounded() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        for i in 0..200 {
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        state.mark_dirty_full();
+        state.scroll_to_top();
+        let area = Rect::new(0, 0, 40, 10);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_conversation(frame, &mut state, area))
+            .expect("draw top viewport");
+
+        let snapshot = state.transcript_snapshot.as_ref().expect("snapshot");
+        let anchor_row = *snapshot
+            .cells
+            .keys()
+            .find(|&&row| snapshot.row_text_bounds(row).is_some())
+            .expect("top text row");
+        let (anchor_column, _) = snapshot.row_text_bounds(anchor_row).expect("anchor bounds");
+        let anchor_screen_row = snapshot.area.y + anchor_row.saturating_sub(snapshot.scroll);
+        let anchor_screen_column = snapshot.area.x + anchor_column;
+        let initial_rows = snapshot.cells.len();
+        assert!(state.begin_transcript_drag(anchor_screen_column, anchor_screen_row));
+
+        state.scroll_down(40);
+        terminal
+            .draw(|frame| render_conversation(frame, &mut state, area))
+            .expect("draw scrolled viewport");
+        let snapshot = state.transcript_snapshot.as_ref().expect("merged snapshot");
+        assert!(snapshot.cells.len() > initial_rows);
+        let target_row = *snapshot
+            .cells
+            .keys()
+            .rev()
+            .find(|&&row| snapshot.row_text_bounds(row).is_some())
+            .expect("scrolled text row");
+        let (_, target_column) = snapshot.row_text_bounds(target_row).expect("target bounds");
+        let target_screen_row = snapshot.area.y + target_row.saturating_sub(snapshot.scroll);
+        let target_screen_column = snapshot.area.x + target_column;
+
+        assert!(state.update_transcript_drag(target_screen_column, target_screen_row));
+        let snapshot = state.transcript_snapshot.as_ref().expect("gap snapshot");
+        assert!(
+            snapshot
+                .missing_row_ranges(anchor_row, target_row)
+                .is_empty()
+        );
+        assert!(
+            snapshot.cells.len() < usize::from(snapshot.total_rows),
+            "selected interval capture must not materialize all cached rows"
+        );
+        assert_eq!(state.transcript_selection.unwrap().anchor.row, anchor_row);
+        assert_eq!(state.transcript_selection.unwrap().head.row, target_row);
+
+        let later_row = target_row.saturating_add(20);
+        assert!(later_row.saturating_add(1) < snapshot.total_rows);
+        assert!(state.capture_transcript_selection_rows(anchor_row, later_row) > 0);
+        assert_eq!(
+            state.capture_transcript_selection_rows(anchor_row, later_row + 1),
+            1,
+            "extending a captured interval by one row must render only that row"
+        );
+    }
+
+    #[test]
     fn transcript_selection_drag_is_limited_to_conversation_body() {
         let mut state = state();
         state.transcript_snapshot = Some(transcript_snapshot(
@@ -8977,19 +9211,18 @@ mod tests {
         );
         let (text_row, text_col) = snapshot
             .cells
-            .chunks(usize::from(snapshot.area.width))
-            .enumerate()
-            .find_map(|(row, cells)| {
+            .iter()
+            .find_map(|(&row, cells)| {
                 cells
                     .iter()
                     .map(|cell| cell.symbol.as_str())
                     .collect::<String>()
                     .find("hello")
-                    .map(|column| (row as u16, column as u16))
+                    .map(|column| (row, column as u16))
             })
             .expect("rendered transcript contains message text");
         let start_col = snapshot.area.x + text_col;
-        let start_row = snapshot.area.y + text_row;
+        let start_row = snapshot.area.y + text_row.saturating_sub(snapshot.scroll);
         chat.phase = ChatPhase::Active(Box::new(state));
 
         for event in [
