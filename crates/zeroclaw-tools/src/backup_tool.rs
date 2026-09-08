@@ -702,11 +702,14 @@ impl Tool for BackupTool {
     }
 }
 
+#[cfg(test)]
+type AfterFileCopyHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
 #[derive(Clone, Default)]
 struct BlockingOperationCancellation {
     cancelled: Arc<AtomicBool>,
     #[cfg(test)]
-    after_file_copy: Option<Arc<dyn Fn(&Path) + Send + Sync>>,
+    after_file_copy: Option<AfterFileCopyHook>,
 }
 
 impl BlockingOperationCancellation {
