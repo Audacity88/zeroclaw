@@ -366,6 +366,13 @@ impl ZerocodePane {
         self.conn_edit.is_some()
     }
 
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        self.capture.is_some()
+            || self.conn_edit.is_some()
+            || self.tracker_edit.is_some()
+            || crate::keymap::ConfigTabAction::from_chord(key).is_some()
+    }
+
     // ── Draw ─────────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -1999,6 +2006,19 @@ mod tests {
     fn given_explicit_row(action_key: &str, chords: Vec<Chord>) {
         let (tag, variant) = action_key.split_once('.').expect("dotted action key");
         overrides::set_row(tag, variant, chords);
+    }
+
+    #[test]
+    fn session_shortcut_is_captured_by_the_binding_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let row = focus_binding(&mut pane, "input_bar.clear_input");
+        pane.capture = Some(Capture { row, error: None });
+
+        assert!(pane.claims_session_shortcut(&KeyEvent::new(
+            KeyCode::Char('1'),
+            Chord::primary('1').effective_modifiers(),
+        )));
     }
 
     /// The bot's round-2 finding, at both call sites. An operator already owning

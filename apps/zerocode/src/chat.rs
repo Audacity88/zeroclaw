@@ -5842,6 +5842,22 @@ impl Chat {
             _ => false,
         }
     }
+
+    /// Whether the active Chat surface owns a global session shortcut chord.
+    ///
+    /// Pickers and modal overlays get first refusal over every key. In the
+    /// normal composer, an explicitly rebound pane or input-bar action keeps
+    /// its chord instead of being shadowed by the global default.
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        match &self.phase {
+            ChatPhase::Active(state) => {
+                !state.composer_owns_text_input()
+                    || crate::keymap::ChatTabAction::from_chord(key).is_some()
+                    || crate::keymap::InputBarAction::from_chord(key).is_some()
+            }
+            _ => true,
+        }
+    }
 }
 
 impl crate::widgets::HelpContext for Chat {
@@ -19312,11 +19328,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_session_swaps_states_and_preserves_transcripts() {
+    async fn session_shortcut_focus_swaps_states_and_preserves_running_transcripts() {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = two_session_chat(&rpc);
         if let ChatPhase::Active(a) = &mut chat.phase {
+            a.turn_in_flight = true;
             a.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from("from-a")));
             a.rebuild_lines(40);
@@ -19357,6 +19374,11 @@ mod tests {
             .iter()
             .find(|s| s.session_id == "sess-a")
             .expect("previous session stays tracked");
+        assert!(
+            a.turn_in_flight,
+            "switching must not cancel the running session"
+        );
+        assert_eq!(a.sidebar_status(), SidebarStatus::Running);
         assert!(matches!(&a.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-a"));
         assert_eq!(a.transcript_layout.view().dirty, LinesDirty::Clean);
         assert_eq!(a.transcript_layout.view().cached_lines, cached_a);
@@ -29846,6 +29868,48 @@ mod tests {
             agents: Vec::new(),
         };
         assert!(!chat.claims_pane_navigation(&word_left));
+    }
+
+    #[tokio::test]
+    async fn session_shortcut_respects_modal_and_explicit_input_bar_owners() {
+        use crate::keymap::{Chord, overrides};
+        use crossterm::event::KeyCode;
+
+        let shortcut = KeyEvent::new(
+            KeyCode::Char('1'),
+            Chord::primary('1').effective_modifiers(),
+        );
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        assert!(
+            !chat.claims_session_shortcut(&shortcut),
+            "the unobstructed composer leaves the default global shortcut available"
+        );
+
+        active_state(&mut chat).pending_approval = Some(PendingApproval {
+            request_id: "session-shortcut-approval".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+        assert!(
+            chat.claims_session_shortcut(&shortcut),
+            "the approval modal must keep ownership of every key"
+        );
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        overrides::reset();
+        overrides::set_row("input_bar", "clear_input", vec![Chord::primary('1')]);
+        let chat = chat_with_active_input(PaneKind::Chat);
+        assert!(
+            chat.claims_session_shortcut(&KeyEvent::new(
+                KeyCode::Char('1'),
+                Chord::primary('1').effective_modifiers(),
+            )),
+            "an explicit input-bar override must outrank the global default"
+        );
+        overrides::reset();
     }
 
     #[tokio::test]

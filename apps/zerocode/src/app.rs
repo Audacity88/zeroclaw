@@ -2453,6 +2453,42 @@ pub async fn run(
                     continue;
                 }
 
+                if let Some(ordinal) = session_shortcut_ordinal(global) {
+                    let pane_claims_shortcut = match mode {
+                        Mode::Dashboard => {
+                            crate::keymap::DashboardTabAction::from_chord(&key).is_some()
+                                || SearchBoxAction::from_chord(&key).is_some()
+                                || crate::keymap::ConfigEditorAction::from_chord(&key).is_some()
+                        }
+                        Mode::Config => config_app.claims_session_shortcut(&key),
+                        Mode::Doctor => crate::keymap::DoctorTabAction::from_chord(&key).is_some(),
+                        Mode::Acp => acp_pane.claims_session_shortcut(&key),
+                        Mode::Chat => chat_pane.claims_session_shortcut(&key),
+                        Mode::Logs => {
+                            crate::keymap::LogsTabAction::from_chord(&key).is_some()
+                                || SearchBoxAction::from_chord(&key).is_some()
+                        }
+                        Mode::Quickstart => {
+                            crate::keymap::QuickstartTabAction::from_chord(&key).is_some()
+                                || crate::keymap::QuickstartModalAction::from_chord(&key).is_some()
+                        }
+                        Mode::Sop => {
+                            crate::keymap::SopTabAction::from_chord(&key).is_some()
+                                || crate::keymap::SopEditorAction::from_chord(&key).is_some()
+                        }
+                    };
+                    if session_shortcut_is_available(mode, in_text_input, pane_claims_shortcut) {
+                        let sessions = session_summaries_in_sidebar_order(
+                            acp_pane.session_summaries(),
+                            chat_pane.session_summaries(),
+                        );
+                        if let Some(event) = session_shortcut_event(ordinal, &sessions) {
+                            apply_sidebar_event!(event, dispatch_state);
+                        }
+                        continue;
+                    }
+                }
+
                 let editor_claims_pane_navigation = matches!(
                     global,
                     Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
@@ -2824,8 +2860,21 @@ fn global_help_entries() -> Vec<HelpEntry> {
     let cycle_keys = action_key_labels(GlobalAction::PaneNavLeft)
         .into_iter()
         .chain(action_key_labels(GlobalAction::PaneNavRight));
+    let session_keys = [
+        GlobalAction::FocusSession1,
+        GlobalAction::FocusSession2,
+        GlobalAction::FocusSession3,
+        GlobalAction::FocusSession4,
+        GlobalAction::FocusSession5,
+        GlobalAction::FocusSession6,
+        GlobalAction::FocusSession7,
+        GlobalAction::FocusSession8,
+    ]
+    .into_iter()
+    .flat_map(action_key_labels);
     vec![
         HelpEntry::new(cycle_keys, crate::i18n::t("zc-app-help-cycle-mode")),
+        HelpEntry::new(session_keys, crate::i18n::t("zc-chat-help-switch-session")),
         HelpEntry::new(
             action_key_labels(GlobalAction::Help),
             crate::i18n::t("zc-app-help-help"),
@@ -2859,6 +2908,48 @@ fn pane_switch_delta(
         Some(GlobalAction::PaneNavRight) => Some(1),
         _ => None,
     }
+}
+
+fn session_shortcut_ordinal(action: Option<GlobalAction>) -> Option<usize> {
+    match action? {
+        GlobalAction::FocusSession1 => Some(0),
+        GlobalAction::FocusSession2 => Some(1),
+        GlobalAction::FocusSession3 => Some(2),
+        GlobalAction::FocusSession4 => Some(3),
+        GlobalAction::FocusSession5 => Some(4),
+        GlobalAction::FocusSession6 => Some(5),
+        GlobalAction::FocusSession7 => Some(6),
+        GlobalAction::FocusSession8 => Some(7),
+        _ => None,
+    }
+}
+
+fn session_shortcut_event(
+    ordinal: usize,
+    sessions: &[chat::SidebarSessionSummary],
+) -> Option<crate::agent_sidebar::SidebarEvent> {
+    sessions
+        .get(ordinal)
+        .map(|session| crate::agent_sidebar::SidebarEvent::FocusSession {
+            pane: session.pane_kind,
+            session_id: session.session_id.clone(),
+        })
+}
+
+fn session_shortcut_is_available(
+    mode: Mode,
+    in_text_input: bool,
+    pane_claims_shortcut: bool,
+) -> bool {
+    !pane_claims_shortcut && (!in_text_input || matches!(mode, Mode::Acp | Mode::Chat))
+}
+
+fn session_summaries_in_sidebar_order(
+    mut acp_sessions: Vec<chat::SidebarSessionSummary>,
+    chat_sessions: Vec<chat::SidebarSessionSummary>,
+) -> Vec<chat::SidebarSessionSummary> {
+    acp_sessions.extend(chat_sessions);
+    acp_sessions
 }
 
 fn copy_disconnected_composer(
@@ -5354,6 +5445,94 @@ mod tests {
         let expected = action_key_labels(GlobalAction::Help);
 
         assert_eq!(help.keys, expected);
+    }
+
+    #[test]
+    fn session_shortcut_help_groups_all_live_ordinals() {
+        use crate::keymap::{GlobalAction, action_key_labels};
+
+        let entries = global_help_entries();
+        let switch = entries
+            .iter()
+            .find(|entry| entry.action == crate::i18n::t("zc-chat-help-switch-session"))
+            .expect("global Help should advertise direct session switching");
+        let expected = [
+            GlobalAction::FocusSession1,
+            GlobalAction::FocusSession2,
+            GlobalAction::FocusSession3,
+            GlobalAction::FocusSession4,
+            GlobalAction::FocusSession5,
+            GlobalAction::FocusSession6,
+            GlobalAction::FocusSession7,
+            GlobalAction::FocusSession8,
+        ]
+        .into_iter()
+        .flat_map(action_key_labels)
+        .collect::<Vec<_>>();
+
+        assert_eq!(switch.keys, expected);
+    }
+
+    #[test]
+    fn session_shortcut_targets_follow_visible_code_then_chat_order() {
+        let summary = |pane_kind, session_id: &str| chat::SidebarSessionSummary {
+            session_id: session_id.to_string(),
+            agent_alias: "test".to_string(),
+            message_count: 0,
+            status: chat::SidebarStatus::Ready,
+            pane_kind,
+            focused: false,
+        };
+        let acp = vec![
+            summary(chat::PaneKind::Acp, "code-1"),
+            summary(chat::PaneKind::Acp, "code-2"),
+        ];
+        let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
+        let sessions = session_summaries_in_sidebar_order(acp, chat);
+
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession2)).unwrap(),
+                &sessions,
+            ),
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Acp,
+                session_id: "code-2".to_string(),
+            })
+        );
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession3)).unwrap(),
+                &sessions,
+            ),
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Chat,
+                session_id: "chat-1".to_string(),
+            })
+        );
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession4)).unwrap(),
+                &sessions,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn session_shortcut_dispatch_respects_composer_and_other_input_owners() {
+        assert!(
+            session_shortcut_is_available(Mode::Chat, true, false),
+            "typed composer text must not disable the modified session shortcut"
+        );
+        assert!(
+            !session_shortcut_is_available(Mode::Chat, true, true),
+            "an explicit Chat or input-bar binding must retain the chord"
+        );
+        assert!(
+            !session_shortcut_is_available(Mode::Config, true, false),
+            "non-chat text editors retain their existing input ownership"
+        );
     }
 
     #[test]
