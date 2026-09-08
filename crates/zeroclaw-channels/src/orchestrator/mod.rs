@@ -30614,6 +30614,16 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    /// A voice note on a configured Discord channel must reach the STT server
+    /// named by the owning agent's `transcription_provider`.
+    ///
+    /// Two providers are registered so the assertion distinguishes *selection*
+    /// from *presence*: against a lone registered provider, a dispatch that
+    /// ignored the named alias and reached whatever happened to be configured
+    /// would look identical to a correct one. The decoy must receive nothing.
+    ///
+    /// The channel alias, the agent alias and the provider aliases share no
+    /// name, so nothing can route correctly by coincidence.
     #[cfg(feature = "channel-discord")]
     #[tokio::test]
     async fn configured_discord_transcription_dispatches_to_routed_agent_provider() {
@@ -30623,6 +30633,7 @@ This is an example JSON object for profile settings."#;
 
         let media_server = MockServer::start().await;
         let whisper_server = MockServer::start().await;
+        let decoy_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/voice.ogg"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
@@ -30637,6 +30648,15 @@ This is an example JSON object for profile settings."#;
             )
             .expect(1)
             .mount(&whisper_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "decoy transcript"})),
+            )
+            .expect(0)
+            .mount(&decoy_server)
             .await;
 
         let mut config = Config::default();
@@ -30662,6 +30682,13 @@ This is an example JSON object for profile settings."#;
             "routed".to_string(),
             LocalWhisperTranscriptionProviderConfig {
                 uri: format!("{}/v1/transcribe", whisper_server.uri()),
+                ..Default::default()
+            },
+        );
+        config.providers.transcription.local_whisper.insert(
+            "decoy".to_string(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", decoy_server.uri()),
                 ..Default::default()
             },
         );
@@ -30695,8 +30722,19 @@ This is an example JSON object for profile settings."#;
             media.is_empty(),
             "successful direct-channel transcription must not fall back to media"
         );
+        assert!(
+            decoy_server.received_requests().await.unwrap().is_empty(),
+            "the provider the agent did not name must never be called"
+        );
+        let routed = whisper_server.received_requests().await.unwrap();
+        assert_eq!(routed.len(), 1, "exactly one transcription request");
+        assert!(
+            routed[0].body.windows(10).any(|w| w == b"fake-audio"),
+            "the routed request must carry the downloaded audio bytes verbatim"
+        );
         media_server.verify().await;
         whisper_server.verify().await;
+        decoy_server.verify().await;
     }
 
     // Regression: Voice Wake bound its transcription manager to its own
