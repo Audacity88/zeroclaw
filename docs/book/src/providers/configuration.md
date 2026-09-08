@@ -23,6 +23,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
 - `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
+- `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default) or `"1h"`. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -186,7 +187,8 @@ Requirements and caveats:
 - **Size and TTL.** Anthropic caches only prefixes of at least 1024 tokens
   (2048 on some smaller models), and entries expire after roughly five
   minutes, refreshed on each read. Short or infrequent conversations see
-  no benefit.
+  no benefit. The lifetime is configurable per provider with `cache_ttl`;
+  see [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - **Writes bill at a premium.** Tokens written to the cache are billed at
   a premium (1.25x on the observed route) and reads come back at a large
   discount. A route that writes the cache on every request without ever
@@ -213,6 +215,53 @@ Requirements and caveats:
   rolling message breakpoint. The live gateway qualification showed that
   with a system prompt present, tool-schema tokens sit inside the cached
   prefix anyway.
+
+## Choosing a 1h cache lifetime
+
+`cache_ttl = "1h"` requests a one-hour lifetime for the cache entries this
+provider's markers create instead of the default five minutes. Use it when
+conversations regularly resume more than five minutes after the previous
+request: every resumed turn pays a full-price cache rewrite for a prefix a
+longer lifetime would have kept alive.
+
+The break-even arithmetic: with the 5m default, one expiry must be written
+again in full. At a 140k-token prefix and Anthropic's nominal 2x
+cache-write price, a single expiry costs about $1.40 in write premium at a
+$10/M input rate. Extending the lifetime instead costs a small premium on
+every appended tail: a few thousand tokens times 0.75 times the input
+rate, roughly one cent per turn at the same rate. Conversations that pause
+longer than five minutes between turns favor `"1h"`; conversations that
+stay active or end quickly favor the default.
+
+Plan against Anthropic's nominal 2x cache-write price. A gateway in front
+of the API may bill 1h writes at its own rate, and internal cost tracking
+records cache writes at the input rate either way, so the premium shows up
+on the vendor bill rather than in the ledger.
+
+Two caveats from live route qualification: survival past five minutes was
+demonstrated once, at six minutes; a full one-hour lifetime was not
+measured. And one TTL applies to every marker in a request by design: the
+native Anthropic provider marks its system prompt, the last tool
+definition, and the rolling last message with the same lifetime, and the
+passthrough breakpoints carry it likewise. Per-marker mixed lifetimes are
+not supported.
+
+```toml
+[providers.models.custom.claude-via-gateway]
+uri = "https://<gateway-host>/v1"
+model = "<anthropic-routed model>"
+api_key = "op://platform/gateway/api-key"
+cache_passthrough = true
+cache_ttl = "1h"
+```
+
+On a native Anthropic entry the same key works without `cache_passthrough`:
+
+```toml
+[providers.models.anthropic.direct]
+model = "claude-sonnet-4-5"
+cache_ttl = "1h"
+```
 
 ## Per-family knobs: worked examples
 
