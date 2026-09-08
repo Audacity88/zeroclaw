@@ -49,7 +49,9 @@ thinking_passthrough = true
   bodies gain an Anthropic-shaped object at the top level:
   `{"thinking": {"type": "enabled", "budget_tokens": N}}`. An explicit
   `provider_extra` key always wins over the injected object, so you can pin a
-  custom shape through the escape hatch.
+  custom shape through the escape hatch. When a thinking object is injected,
+  the request's temperature is set to 1.0, as Anthropic requires; explicit
+  temperatures apply only when thinking is off.
 - **Capture**: gateway thinking responses are normalized into the same
   newline-delimited signed-JSON format the native Anthropic provider stores in
   `reasoning_content` (one `{"thinking": ..., "signature": ...}` line per
