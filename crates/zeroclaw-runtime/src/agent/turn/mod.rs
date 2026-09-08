@@ -378,6 +378,38 @@ impl<'a> TurnState<'a> {
     }
 }
 
+/// Emit `TurnEvent::Usage` for each billable attempt in `attempts` as a
+/// rejected (`accepted: false`) event, so the gateway's `usage_by_provider`
+/// breakdown includes all billable attempts (accepted + rejected). Callers
+/// pass the attempts settled for an iteration that will not reach an
+/// accepted response: each iteration's `attempts` vec is fresh from its own
+/// `call_provider`, so projecting here cannot double-emit.
+async fn emit_rejected_attempt_usage(
+    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) {
+    if let Some(tx) = event_tx {
+        for billable in crate::agent::cost::billable_provider_attempts(attempts) {
+            let cost_usd = crate::agent::cost::compute_cost_usd(
+                billable.attempt.provider_ref(),
+                billable.attempt.model(),
+                billable.usage,
+            );
+            let _ = tx
+                .send(TurnEvent::Usage {
+                    input_tokens: billable.usage.input_tokens,
+                    cached_input_tokens: billable.usage.cached_input_tokens,
+                    output_tokens: billable.usage.output_tokens,
+                    cost_usd,
+                    provider_ref: billable.attempt.provider_ref().to_string(),
+                    model: billable.attempt.model().to_string(),
+                    accepted: false,
+                })
+                .await;
+        }
+    }
+}
+
 pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let model_switch_state = p
         .exec
@@ -991,6 +1023,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
             Err(e) => {
                 crate::agent::cost::settle_provider_attempts(&attempts, None);
+                // This iteration's attempts never reach an accepted response
+                // (recovery continues with a fresh attempt vec, otherwise the
+                // turn fails) — project them now so the gateway ledger stays
+                // complete.
+                emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -1046,6 +1083,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
             crate::agent::cost::settle_provider_attempts(&attempts, None);
+            // Same contract as the error branch: this iteration's attempts
+            // are settled but never accepted — project them before retrying
+            // with a fresh vec or returning the fallback.
+            emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1113,28 +1154,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // gateway's usage_by_provider breakdown includes all billable attempts
         // (accepted + rejected). This makes the breakdown the single source of
         // truth that the done-frame cost_usd can be derived from.
-        if let Some(tx) = ctx.event_tx {
-            for billable in crate::agent::cost::billable_provider_attempts(
-                &attempts[..attempts.len().saturating_sub(1)],
-            ) {
-                let cost_usd = crate::agent::cost::compute_cost_usd(
-                    billable.attempt.provider_ref(),
-                    billable.attempt.model(),
-                    billable.usage,
-                );
-                let _ = tx
-                    .send(TurnEvent::Usage {
-                        input_tokens: billable.usage.input_tokens,
-                        cached_input_tokens: billable.usage.cached_input_tokens,
-                        output_tokens: billable.usage.output_tokens,
-                        cost_usd,
-                        provider_ref: billable.attempt.provider_ref().to_string(),
-                        model: billable.attempt.model().to_string(),
-                        accepted: false,
-                    })
-                    .await;
-            }
-        }
+        emit_rejected_attempt_usage(ctx.event_tx, &attempts[..attempts.len().saturating_sub(1)])
+            .await;
         record_accepted_chat_response(
             &ctx,
             served_provider,

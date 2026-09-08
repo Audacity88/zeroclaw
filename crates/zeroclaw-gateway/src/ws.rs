@@ -1346,15 +1346,19 @@ async fn process_chat_message(
                                         if let Some(ot) = output_tokens {
                                             total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
                                         }
-                                        // Per-(provider, model) breakdown accumulation
-                                        let key = (provider_ref.clone(), served_model.clone());
+                                        // Per-(provider, model) breakdown accumulation.
+                                        // The event-owned strings move into the map key; entry
+                                        // fields clone from the key only on insert, so repeat
+                                        // events for a known pair cost no extra clones.
                                         let entry = usage_by_provider
-                                            .entry(key)
-                                            .or_insert_with(|| ProviderUsageEntry {
-                                                provider_ref: provider_ref.clone(),
-                                                model: served_model.clone(),
-                                                ..Default::default()
-                                            });
+                                            .entry((provider_ref, served_model))
+                                            .or_insert_with_key(
+                                                |(provider_ref, model)| ProviderUsageEntry {
+                                                    provider_ref: provider_ref.clone(),
+                                                    model: model.clone(),
+                                                    ..Default::default()
+                                                },
+                                            );
                                         if let Some(it) = input_tokens {
                                             entry.input_tokens = entry.input_tokens.saturating_add(it);
                                         }
@@ -1576,11 +1580,24 @@ async fn process_chat_message(
                 (None, Some(o)) => Some(o),
                 (None, None) => None,
             };
+            // Deterministic ordering: sort by (provider_ref, model) so the wire
+            // format is stable (avoids flaky assertions in tests). cost_usd is
+            // summed over this sorted vector — never over the HashMap directly —
+            // so float accumulation order (and the emitted total) is stable.
+            let usage_by_provider_vec: Vec<ProviderUsageEntry> = {
+                let mut entries: Vec<_> = usage_by_provider.into_values().collect();
+                entries.sort_by(|a, b| {
+                    a.provider_ref
+                        .cmp(&b.provider_ref)
+                        .then(a.model.cmp(&b.model))
+                });
+                entries
+            };
             // cost_usd is the sum of all billable attempts' cost_usd from
             // usage_by_provider (which now includes rejected attempts). This makes
             // the breakdown the single source of truth.
             let cost_usd = {
-                let sum: f64 = usage_by_provider.values().map(|e| e.cost_usd).sum();
+                let sum: f64 = usage_by_provider_vec.iter().map(|e| e.cost_usd).sum();
                 if sum > 0.0 { Some(sum) } else { None }
             };
 
@@ -1609,17 +1626,6 @@ async fn process_chat_message(
             // Full provider_ref for the done frame: last served ref when
             // available, otherwise fall back to the turn-start provider label.
             let provider_ref_full = last_provider_ref.as_deref().unwrap_or(&provider_label);
-            // Deterministic ordering: sort by (provider_ref, model) so the wire
-            // format is stable (avoids flaky assertions in tests).
-            let usage_by_provider_vec: Vec<ProviderUsageEntry> = {
-                let mut entries: Vec<_> = usage_by_provider.into_values().collect();
-                entries.sort_by(|a, b| {
-                    a.provider_ref
-                        .cmp(&b.provider_ref)
-                        .then(a.model.cmp(&b.model))
-                });
-                entries
-            };
             let meta = DoneFrameMeta {
                 full_response: &outcome.response,
                 input_tokens: total_input_tokens,

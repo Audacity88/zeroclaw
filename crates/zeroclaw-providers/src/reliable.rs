@@ -62,6 +62,17 @@ struct ReliableEntryId {
     entry_index: usize,
 }
 
+/// Explicit outcome of the retry policy for one entry. Returned by the pure
+/// [`ReliableModelProvider::stream_recovery_decision`]; callers must not infer
+/// precedence from branch order — read the `match` arms instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    /// Attempt the entry with the given retry budget.
+    Admit(u32),
+    /// Skip the entry entirely (avoids replaying a failed stream entry).
+    Skip,
+}
+
 /// Call-scoped outcome retained independently of the provider result.
 ///
 /// In particular, callers must extract it before propagating an error: a
@@ -1765,10 +1776,12 @@ impl ReliableModelProvider {
 
     /// Admit an entry with its configured retry budget, except for the exact
     /// stream-failed entry, which is skipped to avoid replaying it — with two
-    /// one-shot exceptions, both granting a single atomic non-stream attempt:
+    /// one-shot exceptions, each granting a single atomic non-stream attempt:
     /// the semantic-empty entry (when the budget permits it), and the
     /// single-candidate case (no other candidate exists, so a non-stream retry
-    /// of the same entry is recovery, not replay).
+    /// of the same entry is recovery, not replay). When both exceptions apply
+    /// to the same entry, semantic-empty wins and the grants merge into one
+    /// single attempt — never two.
     fn effective_retry_limit(
         &self,
         model_slot: usize,
@@ -1782,24 +1795,56 @@ impl ReliableModelProvider {
                 let exact_failed_entry = accounting.stream_resume_after.is_some_and(|failed| {
                     model_slot == failed.model_slot && entry_index == failed.entry_index
                 });
-                if !exact_failed_entry {
-                    return Some(max_retries);
+                let decision = Self::stream_recovery_decision(
+                    max_retries,
+                    exact_failed_entry,
+                    accounting.stream_recovery_semantic_empty_permission,
+                    has_other_candidate,
+                );
+                match decision {
+                    RetryDecision::Admit(limit) => {
+                        if exact_failed_entry {
+                            // Consume one-shot recovery grants so each fires at
+                            // most once. Clearing the resume marker merges the
+                            // single-candidate grant into the semantic-empty
+                            // attempt when both apply.
+                            accounting.stream_recovery_semantic_empty_permission = false;
+                            if !has_other_candidate {
+                                accounting.stream_resume_after = None;
+                            }
+                        }
+                        Some(limit)
+                    }
+                    RetryDecision::Skip => None,
                 }
-                if max_retries > 0 && accounting.stream_recovery_semantic_empty_permission {
-                    accounting.stream_recovery_semantic_empty_permission = false;
-                    return Some(0);
-                }
-                // Single-candidate stream failure: no alternative entry exists,
-                // so one non-stream attempt of the same entry is the only
-                // recovery path. Consume the resume marker so this grants
-                // exactly one attempt; subsequent calls proceed normally.
-                if !has_other_candidate {
-                    accounting.stream_resume_after = None;
-                    return Some(0);
-                }
-                None
             })
             .unwrap_or(Some(max_retries))
+    }
+
+    /// Pure retry policy for a single entry: precedence is encoded in this
+    /// `match` so each recovery mode is an explicit, independently testable
+    /// decision rather than a branch in an if-chain. Stateful one-shot
+    /// consumption lives in [`Self::effective_retry_limit`], not here.
+    fn stream_recovery_decision(
+        max_retries: u32,
+        exact_failed_entry: bool,
+        semantic_empty_permission: bool,
+        has_other_candidate: bool,
+    ) -> RetryDecision {
+        if !exact_failed_entry {
+            return RetryDecision::Admit(max_retries);
+        }
+        // Semantic-empty wins when both exceptions apply (see
+        // `effective_retry_limit` for the merged single-attempt consumption).
+        if max_retries > 0 && semantic_empty_permission {
+            return RetryDecision::Admit(0);
+        }
+        // Single-candidate stream failure: no alternative entry exists, so one
+        // non-stream attempt of the same entry is the only recovery path.
+        if !has_other_candidate {
+            return RetryDecision::Admit(0);
+        }
+        RetryDecision::Skip
     }
 
     fn record_cooldown_skip_failure(failures: &mut FailureEvents, max_attempts: u32) {
@@ -9776,9 +9821,23 @@ mod tests {
 
             // Single-candidate stream failure grants one non-stream recovery
             // attempt even with zero budget; the marker is consumed one-shot.
+            // Uses a budgeted provider so consumption is observable: granted
+            // once as Some(0), then normal budget Some(2) afterwards.
             activate_stream_recovery_after_first_poll(7, 8);
-            assert_eq!(zero_budget.effective_retry_limit(7, 8, false), Some(0));
-            assert_eq!(zero_budget.effective_retry_limit(7, 8, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(7, 8, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(7, 8, false), Some(2));
+
+            // Single-candidate + semantic-empty on the same entry merges into
+            // one single attempt (semantic-empty wins): granted once, then
+            // normal budget — never two recovery attempts.
+            activate_stream_recovery_after_first_poll(9, 10);
+            mark_stream_recovery_semantic_empty();
+            assert_eq!(provider.effective_retry_limit(9, 10, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(9, 10, false), Some(2));
+            // Both grants are consumed: re-arming the same marker without a
+            // fresh permission must skip when another candidate exists.
+            activate_stream_recovery_after_first_poll(9, 10);
+            assert_eq!(provider.effective_retry_limit(9, 10, true), None);
         })
         .await;
     }

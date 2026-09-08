@@ -12,6 +12,13 @@ pub type ModelProviderPricing = HashMap<String, HashMap<String, f64>>;
 
 /// Per-scope token/cost accumulator derived from the usage events emitted
 /// during a single task-local runtime invocation.
+///
+/// `input_tokens`/`output_tokens`/`cost_usd` accumulate every billable
+/// attempt (accepted + rejected) for budgets, persistence, and peer scopes.
+/// `last_input_tokens` is the accepted-only context-window fill: only the
+/// accepted attempt may set it (see `settle_provider_attempts` and the
+/// accepted-response record paths). It is a separate fact from the totals —
+/// do not derive one from the other.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TurnUsage {
     pub input_tokens: u64,
