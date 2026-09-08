@@ -241,6 +241,17 @@ impl Tool for FileWriteTool {
             });
         };
         let prospective_target = prospective_parent.join(file_name);
+        if !self.security.is_resolved_path_allowed(&prospective_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(tool_text_arg(
+                    "tool-file-write-error-path-blocked",
+                    "path",
+                    &prospective_target.display().to_string(),
+                )),
+            });
+        }
         if self.security.is_runtime_config_path(&full_path)
             || self.security.is_runtime_config_path(&prospective_target)
         {
@@ -561,6 +572,41 @@ mod tests {
             "expected 'Path blocked' error, got: {:?}",
             result.error
         );
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_exact_forbidden_target_through_production_wrappers() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let target = workspace.join("blocked.txt");
+        tokio::fs::write(&target, "original").await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            forbidden_paths: vec![target.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        });
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            security,
+        );
+
+        let result = tool
+            .execute(json!({"path": "blocked.txt", "content": "replaced"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(tokio::fs::read_to_string(&target).await.unwrap(), "original");
+
+        tokio::fs::remove_file(&target).await.unwrap();
+        let result = tool
+            .execute(json!({"path": "blocked.txt", "content": "created"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(!target.exists());
     }
 
     #[tokio::test]
