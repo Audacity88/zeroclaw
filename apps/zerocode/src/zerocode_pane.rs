@@ -2017,7 +2017,7 @@ mod tests {
 
         assert!(pane.claims_session_shortcut(&KeyEvent::new(
             KeyCode::Char('1'),
-            Chord::primary('1').effective_modifiers(),
+            Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL).effective_modifiers(),
         )));
     }
 

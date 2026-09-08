@@ -29877,7 +29877,8 @@ mod tests {
 
         let shortcut = KeyEvent::new(
             KeyCode::Char('1'),
-            Chord::primary('1').effective_modifiers(),
+            Chord::with_primary(KeyCode::Char('1'), crossterm::event::KeyModifiers::CONTROL)
+                .effective_modifiers(),
         );
         let mut chat = chat_with_active_input(PaneKind::Chat);
         assert!(
@@ -29900,12 +29901,20 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         overrides::reset();
-        overrides::set_row("input_bar", "clear_input", vec![Chord::primary('1')]);
+        overrides::set_row(
+            "input_bar",
+            "clear_input",
+            vec![Chord::with_primary(
+                KeyCode::Char('1'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )],
+        );
         let chat = chat_with_active_input(PaneKind::Chat);
         assert!(
             chat.claims_session_shortcut(&KeyEvent::new(
                 KeyCode::Char('1'),
-                Chord::primary('1').effective_modifiers(),
+                Chord::with_primary(KeyCode::Char('1'), crossterm::event::KeyModifiers::CONTROL,)
+                    .effective_modifiers(),
             )),
             "an explicit input-bar override must outrank the global default"
         );

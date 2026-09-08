@@ -165,14 +165,14 @@ keyactions! {
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::primary('r'), Chord::ctrl('r')]            => "reload daemon",
         ToggleSidebar [Chord::ctrl('b')]                                => "toggle sidebar",
-        FocusSession1 [Chord::primary('1')]                              => "focus session 1",
-        FocusSession2 [Chord::primary('2')]                              => "focus session 2",
-        FocusSession3 [Chord::primary('3')]                              => "focus session 3",
-        FocusSession4 [Chord::primary('4')]                              => "focus session 4",
-        FocusSession5 [Chord::primary('5')]                              => "focus session 5",
-        FocusSession6 [Chord::primary('6')]                              => "focus session 6",
-        FocusSession7 [Chord::primary('7')]                              => "focus session 7",
-        FocusSession8 [Chord::primary('8')]                              => "focus session 8",
+        FocusSession1 [Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL)] => "focus session 1",
+        FocusSession2 [Chord::with_primary(KeyCode::Char('2'), KeyModifiers::CONTROL)] => "focus session 2",
+        FocusSession3 [Chord::with_primary(KeyCode::Char('3'), KeyModifiers::CONTROL)] => "focus session 3",
+        FocusSession4 [Chord::with_primary(KeyCode::Char('4'), KeyModifiers::CONTROL)] => "focus session 4",
+        FocusSession5 [Chord::with_primary(KeyCode::Char('5'), KeyModifiers::CONTROL)] => "focus session 5",
+        FocusSession6 [Chord::with_primary(KeyCode::Char('6'), KeyModifiers::CONTROL)] => "focus session 6",
+        FocusSession7 [Chord::with_primary(KeyCode::Char('7'), KeyModifiers::CONTROL)] => "focus session 7",
+        FocusSession8 [Chord::with_primary(KeyCode::Char('8'), KeyModifiers::CONTROL)] => "focus session 8",
         ConfirmYes   []                                                 => "confirm",
         ConfirmNo    []                                                 => "cancel",
     }
@@ -602,13 +602,21 @@ mod tests {
         for (index, action) in actions.into_iter().enumerate() {
             let digit = char::from_digit((index + 1) as u32, 10).unwrap();
             let modifiers = if cfg!(target_os = "macos") {
-                KeyModifiers::SUPER
+                KeyModifiers::CONTROL.union(KeyModifiers::SUPER)
             } else {
                 KeyModifiers::CONTROL
             };
             assert_eq!(
                 GlobalAction::from_chord(&KeyEvent::new(KeyCode::Char(digit), modifiers)),
                 Some(action)
+            );
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                GlobalAction::from_chord(
+                    &KeyEvent::new(KeyCode::Char(digit), KeyModifiers::SUPER,)
+                ),
+                None,
+                "bare Command+{digit} remains available to the terminal host"
             );
         }
     }

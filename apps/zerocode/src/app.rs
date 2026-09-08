@@ -5535,6 +5535,26 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_shortcut_decoder_preserves_ctrl_command_modifiers() {
+        let original = Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        ));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(original.clone());
+
+        assert_eq!(decoder.next(), Some(original));
+        assert_eq!(
+            GlobalAction::from_chord(&KeyEvent::new(
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SUPER,
+            )),
+            Some(GlobalAction::FocusSession1)
+        );
+    }
+
     #[test]
     fn active_text_editor_can_claim_global_pane_navigation() {
         assert_eq!(
