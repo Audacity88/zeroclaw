@@ -382,7 +382,7 @@ impl AcpSessionStore {
 
         let row = conn
             .query_row(
-                "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity
+                "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity
                  FROM acp_sessions
                  WHERE session_uuid = ?1 AND agent_alias = ?2",
                 params![session_uuid, agent_alias],
@@ -391,9 +391,10 @@ impl AcpSessionStore {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
@@ -404,6 +405,7 @@ impl AcpSessionStore {
             session_id,
             owner_alias,
             workspace_dir,
+            interaction_surface,
             token_count,
             created_at_s,
             last_activity_s,
@@ -420,6 +422,7 @@ impl AcpSessionStore {
             session_uuid: session_uuid.to_string(),
             agent_alias: owner_alias,
             workspace_dir,
+            interaction_surface,
             token_count: token_count.max(0) as u64,
             created_at,
             last_activity,
@@ -1771,7 +1774,14 @@ mod tests {
     #[test]
     fn load_session_for_agent_authorizes_uuid_and_preserves_projection() {
         let (_tmp, store) = open_store();
-        store.create_session("owned", "alpha", "/ws/alpha").unwrap();
+        store
+            .create_session_with_interaction_surface(
+                "owned",
+                "alpha",
+                "/ws/alpha",
+                Some("zerocode_code"),
+            )
+            .unwrap();
         store
             .append_turn(
                 "owned",
@@ -1801,6 +1811,7 @@ mod tests {
             .unwrap()
             .expect("matching owner should load");
         assert_eq!(data.agent_alias, "alpha");
+        assert_eq!(data.interaction_surface.as_deref(), Some("zerocode_code"));
         assert_eq!(data.messages.len(), 3);
         assert!(matches!(
             &data.messages[0],
