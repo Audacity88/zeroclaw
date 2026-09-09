@@ -2561,3 +2561,73 @@ async fn safety_net_terminal_malformed_fallback_reaches_event_consumer_after_too
         "the valid tool round must have executed exactly once"
     );
 }
+
+#[tokio::test]
+async fn safety_net_text_parsed_tool_call_emits_no_narration_chunk() {
+    // A provider that conveys the tool call inside the text (no native tool
+    // calls): the parser strips the markup, so the display residue is not
+    // separable narration. Parity with the on_delta relay: neither consumer
+    // emits a Chunk for it before the ToolCall event.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![
+            text_response(
+                "Working on it.<tool_call>{\"name\": \"echo\", \"arguments\": {}}</tool_call>",
+            ),
+            text_response("all done"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("markup tool call", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { name, .. } if name == "echo"))
+        .expect("the text-parsed tool call must emit its ToolCall event");
+    assert!(
+        !events[..pos_tool_call]
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Chunk { .. })),
+        "no narration Chunk may precede the ToolCall event for a text-parsed call"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("Working on it."))),
+        "the markup-stripped residue must not surface as a narration Chunk"
+    );
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { name, .. } if name == "echo"))
+        .expect("the text-parsed tool call must emit its ToolResult event");
+    let pos_final = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("all done")))
+        .expect("final response text must be emitted as a Chunk");
+    assert!(
+        pos_tool_result < pos_final,
+        "final-round Chunk must follow the ToolResult"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the text-parsed tool call must have executed exactly once"
+    );
+}
