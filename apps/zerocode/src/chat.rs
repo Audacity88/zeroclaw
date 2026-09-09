@@ -8499,14 +8499,12 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
         let mut chat = active_chat();
-        let selection = TranscriptSelection {
-            anchor: CellPoint { column: 1, row: 2 },
-            head: CellPoint { column: 4, row: 2 },
-            dragged: true,
-        };
         let ChatPhase::Active(state) = &mut chat.phase else {
             unreachable!()
         };
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("select me")));
         state.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
             content: "keep this plan".to_string(),
             status: crate::wire::PlanStatus::Pending,
@@ -8514,10 +8512,31 @@ mod tests {
             active_form: None,
         }]);
         state.input_bar.insert_text("keep this input");
-        state.transcript_selection = Some(selection);
         assert!(state.composer_owns_text_input());
 
         let close = draw_todo_close(&mut chat);
+        let selection = {
+            let ChatPhase::Active(state) = &mut chat.phase else {
+                unreachable!()
+            };
+            let snapshot = state
+                .transcript_snapshot
+                .as_ref()
+                .expect("rendered transcript");
+            let row = *snapshot
+                .cells
+                .keys()
+                .find(|&&row| snapshot.row_text_bounds(row).is_some())
+                .expect("rendered transcript row");
+            let (first, last) = snapshot.row_text_bounds(row).expect("text bounds");
+            let selection = TranscriptSelection {
+                anchor: CellPoint { column: first, row },
+                head: CellPoint { column: last, row },
+                dragged: true,
+            };
+            state.transcript_selection = Some(selection);
+            selection
+        };
         chat.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
