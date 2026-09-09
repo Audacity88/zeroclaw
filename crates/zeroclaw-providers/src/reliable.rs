@@ -9308,6 +9308,7 @@ mod tests {
         fn image_rejection(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
+                observed_models: None,
                 supports: true,
                 mode: StreamingRecordMode::ImageRejection,
             }
@@ -9446,7 +9447,9 @@ mod tests {
                     Ok(StreamChunk::final_chunk()),
                 ])
                 .boxed(),
-                StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+                StreamingRecordMode::Error | StreamingRecordMode::ImageRejection => {
+                    stream::iter(vec![Err(Self::stream_error())]).boxed()
+                }
                 StreamingRecordMode::UsageThenError => {
                     stream::iter(vec![Err(Self::stream_error())]).boxed()
                 }
@@ -9468,7 +9471,9 @@ mod tests {
                     Ok(StreamChunk::final_chunk()),
                 ])
                 .boxed(),
-                StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+                StreamingRecordMode::Error | StreamingRecordMode::ImageRejection => {
+                    stream::iter(vec![Err(Self::stream_error())]).boxed()
+                }
                 StreamingRecordMode::UsageThenError => {
                     stream::iter(vec![Err(Self::stream_error())]).boxed()
                 }
