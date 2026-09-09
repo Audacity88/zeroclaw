@@ -222,20 +222,67 @@ fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates
     zeroclaw_providers::pricing::lookup(&snapshot, model_provider_name, model).copied()
 }
 
-/// Flatten config rates merged with the live-price fallback into the
-/// `(input, output, cached)` tuple used for cost math. Config wins per
-/// dimension ([`ModelRates::or`]); live only fills dimensions config left
-/// unset; any dimension still unset bills at `0.0`.
-fn merge_config_and_live_rates(
-    config_rates: ModelRates,
-    live: Option<ModelRates>,
-) -> (f64, f64, f64) {
-    let merged = config_rates.or(live.unwrap_or_default());
-    (
-        merged.input_per_mtok.unwrap_or(0.0),
-        merged.output_per_mtok.unwrap_or(0.0),
-        merged.cached_input_per_mtok.unwrap_or(0.0),
-    )
+/// Merge configured rates with the live-price fallback without discarding
+/// whether each dimension was present. Config wins per dimension
+/// ([`ModelRates::or`]); live only fills dimensions config left unset.
+fn merge_config_and_live_rates(config_rates: ModelRates, live: Option<ModelRates>) -> ModelRates {
+    config_rates.or(live.unwrap_or_default())
+}
+
+fn normalized_rates(rates: ModelRates) -> ModelRates {
+    let valid =
+        |rate: Option<f64>| rate.filter(|value| zeroclaw_config::cost::is_sane_usd_rate(*value));
+    ModelRates {
+        input_per_mtok: valid(rates.input_per_mtok),
+        output_per_mtok: valid(rates.output_per_mtok),
+        cached_input_per_mtok: valid(rates.cached_input_per_mtok),
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UnpricedUsage {
+    tokens: u64,
+    dimensions: Vec<&'static str>,
+}
+
+fn unpriced_usage(
+    rates: ModelRates,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+) -> UnpricedUsage {
+    let cached_input_tokens = cached_input_tokens.min(input_tokens);
+    let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+    let mut unpriced = UnpricedUsage::default();
+    if rates.input_per_mtok.is_none() {
+        unpriced.tokens = unpriced.tokens.saturating_add(uncached_input_tokens);
+        if uncached_input_tokens > 0 {
+            unpriced.dimensions.push("input");
+        }
+    }
+    if rates.cached_input_per_mtok.is_none() && rates.input_per_mtok.is_none() {
+        unpriced.tokens = unpriced.tokens.saturating_add(cached_input_tokens);
+        if cached_input_tokens > 0 {
+            unpriced.dimensions.push("cached_input");
+        }
+    }
+    if rates.output_per_mtok.is_none() {
+        unpriced.tokens = unpriced.tokens.saturating_add(output_tokens);
+        if output_tokens > 0 {
+            unpriced.dimensions.push("output");
+        }
+    }
+    unpriced
+}
+
+#[cfg(test)]
+fn unpriced_tokens_for_usage(
+    rates: ModelRates,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+) -> u64 {
+    unpriced_usage(rates, input_tokens, cached_input_tokens, output_tokens).tokens
 }
 
 /// Record usage from a rejected provider attempt without replacing the accepted
@@ -281,32 +328,34 @@ pub fn compute_cost_usd(
         .ok()
         .flatten()?;
     let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let config_rates = pricing
-        .map(|map| resolve_rates_opt(map, model))
-        .unwrap_or_default();
+    let config_rates = normalized_rates(
+        pricing
+            .map(|map| resolve_rates_opt(map, model))
+            .unwrap_or_default(),
+    );
 
     let live = (!config_rates.is_complete())
         .then(|| live_pricing_for(model_provider_name, model))
         .flatten();
-    let (mut input_rate, mut output_rate, mut cached_rate) =
-        merge_config_and_live_rates(config_rates, live);
+    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
 
-    let _priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
-        if let Some((cat_in, cat_out, cat_cached)) =
-            crate::agent::pricing_catalog::global_pricing_rates(model)
-        {
-            input_rate = cat_in;
-            output_rate = cat_out;
-            if cached_rate == 0.0 {
-                cached_rate = cat_cached;
-            }
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    // The catalog is the final per-dimension fallback, not an all-or-nothing
+    // replacement. Preserve every configured/live value (including an
+    // explicit free 0.0) and fill only the dimensions still absent.
+    if let Some((cat_in, cat_out, cat_cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
+    {
+        rates = rates.or(ModelRates {
+            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
+            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
+            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
+        });
+    }
+
+    rates = normalized_rates(rates);
+    let input_rate = rates.input_per_mtok.unwrap_or(0.0);
+    let output_rate = rates.output_per_mtok.unwrap_or(0.0);
+    let cached_rate = rates.cached_input_per_mtok.unwrap_or(0.0);
 
     let cost_usage = CostTokenUsage::new_with_cache(
         model,
@@ -390,9 +439,11 @@ fn record_tool_loop_cost_usage_inner(
         .ok()
         .flatten()?;
     let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let config_rates = pricing
-        .map(|map| resolve_rates_opt(map, model))
-        .unwrap_or_default();
+    let config_rates = normalized_rates(
+        pricing
+            .map(|map| resolve_rates_opt(map, model))
+            .unwrap_or_default(),
+    );
 
     // Live-price FALLBACK fills only the dimensions config left unset; never
     // fetches on this path (reads a cached snapshot, empty unless a provider
@@ -400,29 +451,28 @@ fn record_tool_loop_cost_usage_inner(
     let live = (!config_rates.is_complete())
         .then(|| live_pricing_for(model_provider_name, model))
         .flatten();
-    // `mut` so the global-catalog fallback below can still fill rates config and
-    // the live snapshot both left unset.
-    let (mut input_rate, mut output_rate, mut cached_rate) =
-        merge_config_and_live_rates(config_rates, live);
+    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
 
-    let priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
-        if let Some((cat_in, cat_out, cat_cached)) =
-            crate::agent::pricing_catalog::global_pricing_rates(model)
-        {
-            input_rate = cat_in;
-            output_rate = cat_out;
-            if cached_rate == 0.0 {
-                cached_rate = cat_cached;
-            }
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    // The catalog is the final per-dimension fallback, not an all-or-nothing
+    // replacement. Preserve every configured/live value (including an
+    // explicit free 0.0) and fill only the dimensions still absent.
+    if let Some((cat_in, cat_out, cat_cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
+    {
+        rates = rates.or(ModelRates {
+            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
+            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
+            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
+        });
+    }
 
-    let cost_usage = CostTokenUsage::new_with_cache(
+    rates = normalized_rates(rates);
+    let unpriced = unpriced_usage(rates, input_tokens, cached_input_tokens, output_tokens);
+    let input_rate = rates.input_per_mtok.unwrap_or(0.0);
+    let output_rate = rates.output_per_mtok.unwrap_or(0.0);
+    let cached_rate = rates.cached_input_per_mtok.unwrap_or(0.0);
+
+    let mut cost_usage = CostTokenUsage::new_with_cache(
         model,
         input_tokens,
         cached_input_tokens,
@@ -431,9 +481,11 @@ fn record_tool_loop_cost_usage_inner(
         cached_rate,
         output_rate,
     );
+    cost_usage.unpriced_tokens = unpriced.tokens;
+    cost_usage.pricing_available = unpriced.tokens == 0;
 
-    if ctx.tracker.is_some() && !priced_from_catalog && input_rate == 0.0 && output_rate == 0.0 {
-        warn_once_missing_pricing(model_provider_name, model);
+    if ctx.tracker.is_some() && unpriced.tokens > 0 {
+        warn_once_missing_pricing(model_provider_name, model, &unpriced.dimensions);
     }
 
     // Accumulate turn usage: prefer the caller-scoped TOOL_LOOP_TURN_USAGE
@@ -492,23 +544,26 @@ fn missing_pricing_first_sighting(
         .insert((model_provider.to_string(), model.to_string()))
 }
 
-fn warn_once_missing_pricing(model_provider: &str, model: &str) {
+fn warn_once_missing_pricing(model_provider: &str, model: &str, missing_dimensions: &[&str]) {
     static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let missing_dimensions = missing_dimensions.join(", ");
     if missing_pricing_first_sighting(seen, model_provider, model) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(
-                    ::serde_json::json!({"model_provider": model_provider, "model": model})
-                ),
-            "Cost tracking: no pricing entry found for {model_provider}/{model} — \
-             token usage will be recorded with zero cost and budget enforcement \
-             is inert for this model. Add a `pricing` table to the model provider \
-             entry in config.toml (under `[providers.models.\"{model_provider}\"]`) \
-             with `\"{model}.input\"` and `\"{model}.output\"` keys (USD per 1M tokens). \
+                .with_attrs(::serde_json::json!({
+                    "model_provider": model_provider,
+                    "model": model,
+                    "missing_dimensions": missing_dimensions,
+                })),
+            "Cost tracking: pricing is incomplete for {model_provider}/{model} \
+             (missing token rate dimensions: {missing_dimensions}). Usage for those \
+             dimensions will be recorded with zero cost, so budget enforcement cannot \
+             account for it. Add the missing USD rates to `[cost.rates]` or the \
+             provider's legacy `pricing` table. \
              This warning fires once per (model_provider, model) pair per process."
         );
     } else {
@@ -519,7 +574,7 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
                 .with_attrs(
                     ::serde_json::json!({"model_provider": model_provider, "model": model})
                 ),
-            "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
+            "Cost tracking recorded token usage with incomplete pricing"
         );
     }
 }
@@ -875,7 +930,14 @@ mod tests {
             output_per_mtok: Some(15.0),
             cached_input_per_mtok: Some(1.5),
         });
-        assert_eq!(merge_config_and_live_rates(config, live), (5.0, 15.0, 1.5));
+        assert_eq!(
+            merge_config_and_live_rates(config, live),
+            ModelRates {
+                input_per_mtok: Some(5.0),
+                output_per_mtok: Some(15.0),
+                cached_input_per_mtok: Some(1.5),
+            }
+        );
     }
 
     #[test]
@@ -884,7 +946,7 @@ mod tests {
         // exactly: all rates zero.
         assert_eq!(
             merge_config_and_live_rates(ModelRates::default(), None),
-            (0.0, 0.0, 0.0)
+            ModelRates::default()
         );
         // A configured zero (genuinely free) is preserved, not "filled".
         assert_eq!(
@@ -900,8 +962,61 @@ mod tests {
                     cached_input_per_mtok: Some(0.3),
                 })
             ),
-            (0.0, 0.0, 0.3)
+            ModelRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.3),
+            }
         );
+    }
+
+    #[test]
+    fn unpriced_count_tracks_each_token_bearing_dimension() {
+        let input_only = ModelRates {
+            input_per_mtok: Some(0.0),
+            output_per_mtok: None,
+            cached_input_per_mtok: None,
+        };
+        assert_eq!(unpriced_tokens_for_usage(input_only, 100, 0, 0), 0);
+        assert_eq!(unpriced_tokens_for_usage(input_only, 100, 0, 1), 1);
+        assert_eq!(
+            unpriced_usage(input_only, 100, 0, 1).dimensions,
+            vec!["output"]
+        );
+        assert_eq!(unpriced_tokens_for_usage(input_only, 100, 100, 0), 0);
+
+        let cached_only = ModelRates {
+            input_per_mtok: None,
+            output_per_mtok: None,
+            cached_input_per_mtok: Some(0.0),
+        };
+        assert_eq!(unpriced_tokens_for_usage(cached_only, 100, 100, 0), 0);
+        assert_eq!(unpriced_tokens_for_usage(cached_only, 100, 99, 0), 1);
+        assert_eq!(
+            unpriced_usage(cached_only, 100, 99, 0).dimensions,
+            vec!["input"]
+        );
+    }
+
+    #[test]
+    fn invalid_rates_are_removed_without_erasing_configured_zero() {
+        let normalized = normalized_rates(ModelRates {
+            input_per_mtok: Some(-1.0),
+            output_per_mtok: Some(f64::INFINITY),
+            cached_input_per_mtok: Some(f64::MAX),
+        });
+        assert_eq!(normalized.input_per_mtok, None);
+        assert_eq!(normalized.output_per_mtok, None);
+        assert_eq!(normalized.cached_input_per_mtok, None);
+        assert_eq!(unpriced_tokens_for_usage(normalized, 100, 80, 20), 120);
+
+        let configured_free = normalized_rates(ModelRates {
+            input_per_mtok: Some(0.0),
+            output_per_mtok: Some(0.0),
+            cached_input_per_mtok: Some(0.0),
+        });
+        assert!(configured_free.is_complete());
+        assert_eq!(unpriced_tokens_for_usage(configured_free, 100, 80, 20), 0);
     }
 
     #[test]
