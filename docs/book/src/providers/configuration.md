@@ -34,6 +34,13 @@ budget is forwarded to the gateway, gateway thinking responses are normalized
 into replayable signed blocks, and signed blocks are replayed on outbound
 history.
 
+Before reaching for this flag, check whether the gateway also exposes an
+Anthropic Messages endpoint. If it does, point a
+`[providers.models.anthropic.<alias>]` entry at it with `uri`; the native
+provider handles thinking, signed-block replay, and prompt caching without
+translation. `thinking_passthrough` is for gateways that offer only the Chat
+Completions surface.
+
 ```toml
 [providers.models.custom.my-gateway]
 uri = "https://your-gateway.example.com"
