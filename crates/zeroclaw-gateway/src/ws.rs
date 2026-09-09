@@ -3035,210 +3035,49 @@ data: {\"type\":\"message_stop\"}\n\n",
         }
     }
 
-    /// Regression: usage_by_provider correctly accumulates per-(provider_ref, model)
-    /// when the same provider serves multiple models in one turn. This exercises
-    /// the aggregation logic directly (without full WS flow) to ensure the tuple
-    /// key and sorting are correct.
+    /// Regression: two models served under one provider_ref produce two
+    /// distinct breakdown entries keyed by (provider_ref, model). Drives the
+    /// production fold so a regression in `UsageFold::apply` is caught
+    /// (a hand-rolled map would pass even if the fold broke).
     #[test]
     fn usage_by_provider_same_provider_two_models() {
-        use std::collections::HashMap;
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.vertex",
+            "model-a",
+            Some(1000),
+            None,
+            Some(500),
+            Some(0.01),
+            true,
+        ));
+        fold.apply(usage_event(
+            "openrouter.vertex",
+            "model-b",
+            Some(2000),
+            Some(100),
+            Some(1000),
+            Some(0.02),
+            true,
+        ));
 
-        let provider_ref = "openrouter.vertex";
-
-        // Case 1: explicit window on second model
-        let mut usage_by_provider: HashMap<(String, String), ProviderUsageEntry> = HashMap::new();
-        // First call: model-a with usage
-        let key_a = (provider_ref.to_string(), "model-a".to_string());
-        let entry_a = usage_by_provider.entry(key_a).or_default();
-        entry_a.provider_ref = provider_ref.to_string();
-        entry_a.model = "model-a".to_string();
-        entry_a.input_tokens = 1000;
-        entry_a.output_tokens = 500;
-        entry_a.cached_input_tokens = 0;
-        entry_a.cost_usd = 0.01;
-
-        // Second call: model-b with usage (same provider_ref, different model)
-        let key_b = (provider_ref.to_string(), "model-b".to_string());
-        let entry_b = usage_by_provider.entry(key_b).or_default();
-        entry_b.provider_ref = provider_ref.to_string();
-        entry_b.model = "model-b".to_string();
-        entry_b.input_tokens = 2000;
-        entry_b.output_tokens = 1000;
-        entry_b.cached_input_tokens = 100;
-        entry_b.cost_usd = 0.02;
-
-        // Convert to sorted vec (as done in process_chat_message)
-        let mut entries: Vec<ProviderUsageEntry> = usage_by_provider.into_values().collect();
-        entries.sort_by(|a, b| {
-            a.provider_ref
-                .cmp(&b.provider_ref)
-                .then(a.model.cmp(&b.model))
-        });
-
-        // Should have exactly 2 entries, sorted by model name
+        // Same provider_ref but different models: exactly 2 entries, sorted
+        // by model name, with per-model tokens/cost (including cached).
+        let entries = fold.take_sorted_entries();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].provider_ref, provider_ref);
+        assert_eq!(entries[0].provider_ref, "openrouter.vertex");
         assert_eq!(entries[0].model, "model-a");
         assert_eq!(entries[0].input_tokens, 1000);
         assert_eq!(entries[0].output_tokens, 500);
+        assert_eq!(entries[0].cached_input_tokens, 0);
         assert_eq!(entries[0].cost_usd, 0.01);
-        assert_eq!(entries[1].provider_ref, provider_ref);
+        assert_eq!(entries[1].provider_ref, "openrouter.vertex");
         assert_eq!(entries[1].model, "model-b");
         assert_eq!(entries[1].input_tokens, 2000);
         assert_eq!(entries[1].output_tokens, 1000);
         assert_eq!(entries[1].cached_input_tokens, 100);
         assert_eq!(entries[1].cost_usd, 0.02);
-
-        // Case 2: second model has NO usage (None), but we still track identity
-        // This simulates B succeeding without usage — the done frame should still
-        // reflect B as the last_serving_model
-        let mut usage_by_provider2: HashMap<(String, String), ProviderUsageEntry> = HashMap::new();
-        let key_a2 = (provider_ref.to_string(), "model-a".to_string());
-        let entry_a2 = usage_by_provider2.entry(key_a2).or_default();
-        entry_a2.provider_ref = provider_ref.to_string();
-        entry_a2.model = "model-a".to_string();
-        entry_a2.input_tokens = 1000;
-        entry_a2.output_tokens = 500;
-        entry_a2.cost_usd = 0.01;
-
-        // model-b has NO usage event — it won't be in usage_by_provider
-        // but done-frame metadata will still show model-b as last_serving_model
-        let mut entries2: Vec<ProviderUsageEntry> = usage_by_provider2.into_values().collect();
-        entries2.sort_by(|a, b| {
-            a.provider_ref
-                .cmp(&b.provider_ref)
-                .then(a.model.cmp(&b.model))
-        });
-        assert_eq!(
-            entries2.len(),
-            1,
-            "only model-a has usage; model-b without usage not in breakdown"
-        );
-        assert_eq!(entries2[0].model, "model-a");
-
-        // Verify done-frame metadata would show model-b as last_serving_model
-        // (this is tested via build_done_frame_json with last_serving_model)
-        let meta = DoneFrameMeta {
-            full_response: "ok",
-            input_tokens: Some(3000),
-            output_tokens: Some(1500),
-            tokens_used: Some(4500),
-            cost_usd: Some(0.03),
-            model: "model-b",
-            provider: provider_ref,
-            provider_ref,
-            max_context_tokens: 800_000,
-            model_context_window: Some(2_000_000), // B has explicit window
-            last_input_tokens: Some(2000),
-            last_serving_provider_ref: Some(provider_ref),
-            last_serving_model: Some("model-b"),
-        };
-        let done = build_done_frame_json(&meta, &entries2);
-        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
-        assert_eq!(v["model"], "model-b");
-        assert_eq!(v["last_serving_model"], "model-b");
-        assert_eq!(v["model_context_window"], 2_000_000);
-        // usage_by_provider only has model-a entry
-        let ubp = v["usage_by_provider"].as_array().unwrap();
-        assert_eq!(ubp.len(), 1);
-        assert_eq!(ubp[0]["model"], "model-a");
-        assert_eq!(ubp[0]["provider_ref"], provider_ref);
-
-        // Case 3: no explicit window on second model (fallback to max_context_tokens)
-        let meta2 = DoneFrameMeta {
-            full_response: "ok",
-            input_tokens: Some(3000),
-            output_tokens: Some(1500),
-            tokens_used: Some(4500),
-            cost_usd: Some(0.03),
-            model: "model-b",
-            provider: provider_ref,
-            provider_ref,
-            max_context_tokens: 800_000,
-            model_context_window: None, // B has NO explicit window
-            last_input_tokens: Some(2000),
-            last_serving_provider_ref: Some(provider_ref),
-            last_serving_model: Some("model-b"),
-        };
-        let done2 = build_done_frame_json(&meta2, &entries2);
-        let v2: serde_json::Value = serde_json::from_str(&done2.to_string()).unwrap();
-        assert_eq!(v2["model"], "model-b");
-        assert_eq!(v2["last_serving_model"], "model-b");
-        assert!(
-            v2.get("model_context_window").is_none(),
-            "model_context_window must be absent when provider has no context_window"
-        );
-    }
-
-    /// Regression: two-call route-switch where the final accepted call is usage-less.
-    /// First call reports usage, second (accepted) call has input_tokens=None.
-    /// The done frame must show:
-    /// - last_input_tokens = null (not stale value from first call)
-    /// - model, provider_ref, model_context_window from the second call
-    /// - usage_by_provider contains BOTH calls (rejected + accepted)
-    #[test]
-    fn two_call_route_switch_usage_less_final() {
-        use std::collections::HashMap;
-
-        let provider_ref = "test.provider";
-
-        // Simulate first call: has usage (5000 input tokens)
-        let mut usage_by_provider = HashMap::new();
-        let key_a = (provider_ref.to_string(), "model-a".to_string());
-        let entry_a = ProviderUsageEntry {
-            provider_ref: provider_ref.to_string(),
-            model: "model-a".to_string(),
-            input_tokens: 5000,
-            output_tokens: 100,
-            cost_usd: 0.02,
-            ..Default::default()
-        };
-        usage_by_provider.insert(key_a, entry_a);
-
-        // Simulate second call: ACCEPTED but usage-less (input_tokens = None)
-        // In the real flow, this would emit a Usage event with input_tokens = None,
-        // which the gateway processes and sets last_input_tokens = None
-        // The done-frame metadata shows model-b as the last serving model
-        let entries: Vec<ProviderUsageEntry> = usage_by_provider.into_values().collect();
-
-        let meta = DoneFrameMeta {
-            full_response: "accepted response from model-b",
-            input_tokens: None, // usage-less final call
-            output_tokens: Some(50),
-            tokens_used: Some(50),
-            cost_usd: Some(0.02), // only model-a has cost
-            model: "model-b",
-            provider: provider_ref,
-            provider_ref,
-            max_context_tokens: 128_000,
-            model_context_window: Some(200_000), // model-b has explicit window
-            last_input_tokens: None,             // cleared because final call is usage-less
-            last_serving_provider_ref: Some(provider_ref),
-            last_serving_model: Some("model-b"),
-        };
-        let done = build_done_frame_json(&meta, &entries);
-        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
-
-        // Identity and ceiling must be from the SECOND (accepted) call
-        assert_eq!(v["model"], "model-b");
-        assert_eq!(v["provider_ref"], provider_ref);
-        assert_eq!(v["last_serving_model"], "model-b");
-        assert_eq!(v["last_serving_provider_ref"], provider_ref);
-        assert_eq!(v["model_context_window"], 200_000);
-
-        // last_input_tokens must be null (not 5000 from first call)
-        assert!(
-            v["last_input_tokens"].is_null(),
-            "last_input_tokens must be null when final call is usage-less, got: {}",
-            v["last_input_tokens"]
-        );
-
-        // usage_by_provider should have only model-a (which had usage)
-        // model-b had no usage so it's not in the breakdown
-        let ubp = v["usage_by_provider"].as_array().unwrap();
-        assert_eq!(ubp.len(), 1);
-        assert_eq!(ubp[0]["model"], "model-a");
-        assert_eq!(ubp[0]["input_tokens"], 5000);
+        assert_eq!(UsageFold::total_cost_usd(&entries), Some(0.03));
     }
 
     /// Build a `TurnEvent::Usage` for fold tests.
@@ -3246,13 +3085,14 @@ data: {\"type\":\"message_stop\"}\n\n",
         provider_ref: &str,
         model: &str,
         input_tokens: Option<u64>,
+        cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
         accepted: bool,
     ) -> zeroclaw_api::agent::TurnEvent {
         zeroclaw_api::agent::TurnEvent::Usage {
             input_tokens,
-            cached_input_tokens: None,
+            cached_input_tokens,
             output_tokens,
             cost_usd,
             provider_ref: provider_ref.to_string(),
@@ -3274,6 +3114,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             "openrouter.a",
             "model-a",
             Some(1000),
+            None,
             Some(500),
             Some(0.01),
             true,
@@ -3282,6 +3123,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             "openrouter.b",
             "model-b",
             Some(2000),
+            None,
             Some(1000),
             Some(0.02),
             false,
@@ -3340,6 +3182,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             "openrouter.a",
             "model-a",
             Some(1000),
+            None,
             Some(500),
             Some(0.01),
             true,
@@ -3347,6 +3190,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         fold.apply(usage_event(
             "openrouter.b",
             "model-b",
+            None,
             None,
             None,
             Some(0.005),
@@ -3376,6 +3220,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             "openrouter.a",
             "model-a",
             Some(1000),
+            None,
             Some(100),
             Some(0.02),
             true,
@@ -3383,6 +3228,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         fold.apply(usage_event(
             "ollama.b",
             "model-b",
+            None,
             None,
             Some(50),
             None,

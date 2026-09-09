@@ -246,6 +246,71 @@ fn build_agent_with_runtime(
     }
 }
 
+/// Test tool that queues a pending model switch when executed, standing in
+/// for the real `model_switch` tool during a streamed turn.
+struct ModelSwitchTriggerTool {
+    target_provider: String,
+    target_model: String,
+}
+
+zeroclaw_api::tool_attribution!(
+    ModelSwitchTriggerTool,
+    ::zeroclaw_api::attribution::ToolKind::Plugin
+);
+
+#[async_trait]
+impl Tool for ModelSwitchTriggerTool {
+    fn name(&self) -> &str {
+        "model_switch_trigger"
+    }
+    fn description(&self) -> &str {
+        "test tool: queues a pending model switch"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        let state = crate::agent::turn::current_model_switch_state()?;
+        *state.lock().unwrap() = Some((self.target_provider.clone(), self.target_model.clone()));
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: "model switch queued".into(),
+            error: None,
+        })
+    }
+}
+
+/// Test agent with an explicit serving identity and alias on `/tmp` (no
+/// managed workspace). `switch_cfg` is `Some` for in-turn-switch tests,
+/// `None` otherwise. Tests needing post-build mutation (e.g.
+/// `multimodal_config`) keep an inline builder.
+fn build_aliased_agent(
+    provider: Box<dyn ModelProvider>,
+    tools_vec: Vec<Box<dyn Tool>>,
+    provider_name: &str,
+    model: &str,
+    alias: &str,
+    switch_cfg: Option<crate::agent::agent::ProviderSwitchConfig>,
+) -> Agent {
+    let builder = Agent::builder()
+        .model_provider(provider)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools_vec,
+        ))
+        .memory(mem_none(std::path::Path::new("/tmp")))
+        .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .model_provider_name(provider_name.into())
+        .model_name(model.into())
+        .agent_alias(alias.into());
+    let builder = match switch_cfg {
+        Some(cfg) => builder.provider_switch_config(cfg),
+        None => builder,
+    };
+    builder.build().expect("agent builder should succeed")
+}
+
 // ── seam 1: dedup is OFF on the streaming and Agent::turn engines ───────
 // E1 dedups identical calls per iteration; E2/E3 never did. RPC retry and
 // polling patterns depend on the second identical call executing.
@@ -2350,44 +2415,6 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // Test tool that queues a pending model switch when executed, standing
-    // in for the real `model_switch` tool during a streamed turn.
-    struct ModelSwitchTriggerTool {
-        target_provider: String,
-        target_model: String,
-    }
-
-    zeroclaw_api::tool_attribution!(
-        ModelSwitchTriggerTool,
-        ::zeroclaw_api::attribution::ToolKind::Plugin
-    );
-
-    #[async_trait]
-    impl Tool for ModelSwitchTriggerTool {
-        fn name(&self) -> &str {
-            "model_switch_trigger"
-        }
-        fn description(&self) -> &str {
-            "test tool: queues a pending model switch"
-        }
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
-            let state = crate::agent::turn::current_model_switch_state()?;
-            *state.lock().unwrap() =
-                Some((self.target_provider.clone(), self.target_model.clone()));
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: "model switch queued".into(),
-                error: None,
-            })
-        }
-    }
-
     // Two cells: switched-to provider with and without an explicit context_window.
     for switch_window in [Some(200_000_u64), None] {
         let (input_tokens, output_tokens) = (10_u64, 5_u64);
@@ -2456,24 +2483,17 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
             "model_switch_trigger",
         )])]);
 
-        let agent = Agent::builder()
-            .model_provider(Box::new(provider))
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![Box::new(ModelSwitchTriggerTool {
-                    target_provider: "anthropic.provider-b".into(),
-                    target_model: "claude-3-opus".into(),
-                })],
-            ))
-            .memory(mem_none(std::path::Path::new("/tmp")))
-            .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .model_provider_name("openai.primary".into())
-            .model_name("gpt-4o-mini".into())
-            .provider_switch_config(switch_cfg)
-            .agent_alias("matrix-test".into())
-            .build()
-            .expect("agent builder should succeed");
+        let agent = build_aliased_agent(
+            Box::new(provider),
+            vec![Box::new(ModelSwitchTriggerTool {
+                target_provider: "anthropic.provider-b".into(),
+                target_model: "claude-3-opus".into(),
+            })],
+            "openai.primary",
+            "gpt-4o-mini",
+            "matrix-test",
+            Some(switch_cfg),
+        );
 
         // Wire a real CostTracker + provider-keyed pricing map so cost_usd
         // is computed (mirrors ws.rs::process_chat_message). The pricing map
@@ -2583,41 +2603,6 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     let (input_rate_a, output_rate_a) = (1.0_f64, 2.0_f64);
     let (input_rate_b, output_rate_b) = (1.5_f64, 3.0_f64);
 
-    // Test tool that queues a pending model switch when executed.
-    struct ModelSwitchTriggerTool {
-        target_provider: String,
-        target_model: String,
-    }
-    zeroclaw_api::tool_attribution!(
-        ModelSwitchTriggerTool,
-        ::zeroclaw_api::attribution::ToolKind::Plugin
-    );
-    #[async_trait]
-    impl Tool for ModelSwitchTriggerTool {
-        fn name(&self) -> &str {
-            "model_switch_trigger"
-        }
-        fn description(&self) -> &str {
-            "test tool: queues a pending model switch"
-        }
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
-            let state = crate::agent::turn::current_model_switch_state()?;
-            *state.lock().unwrap() =
-                Some((self.target_provider.clone(), self.target_model.clone()));
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: "model switch queued".into(),
-                error: None,
-            })
-        }
-    }
-
     // wiremock for switched-to provider B
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2676,24 +2661,17 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
 
     let provider = ScriptedProvider::new(vec![resp_a]);
 
-    let agent = Agent::builder()
-        .model_provider(Box::new(provider))
-        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-            vec![Box::new(ModelSwitchTriggerTool {
-                target_provider: "anthropic.provider-b".into(),
-                target_model: "claude-3-opus".into(),
-            })],
-        ))
-        .memory(mem_none(std::path::Path::new("/tmp")))
-        .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
-        .model_provider_name("openai.primary".into())
-        .model_name("gpt-4o-mini".into())
-        .provider_switch_config(switch_cfg)
-        .agent_alias("req-b2-test".into())
-        .build()
-        .expect("agent builder should succeed");
+    let agent = build_aliased_agent(
+        Box::new(provider),
+        vec![Box::new(ModelSwitchTriggerTool {
+            target_provider: "anthropic.provider-b".into(),
+            target_model: "claude-3-opus".into(),
+        })],
+        "openai.primary",
+        "gpt-4o-mini",
+        "req-b2-test",
+        Some(switch_cfg),
+    );
 
     // cost context with pricing for BOTH providers
     let tmpdir = tempfile::TempDir::new().unwrap();
@@ -2889,20 +2867,14 @@ async fn usage_event_emitted_even_without_usage_data() {
 
     let provider = ScriptedProvider::new(vec![resp]);
 
-    let agent = Agent::builder()
-        .model_provider(Box::new(provider))
-        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-            vec![],
-        ))
-        .memory(mem_none(std::path::Path::new("/tmp")))
-        .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
-        .model_provider_name("openai.default".into())
-        .model_name("gpt-4o-mini".into())
-        .agent_alias("req-b1-test".into())
-        .build()
-        .expect("agent builder should succeed");
+    let agent = build_aliased_agent(
+        Box::new(provider),
+        vec![],
+        "openai.default",
+        "gpt-4o-mini",
+        "req-b1-test",
+        None,
+    );
 
     let (_tracker, cost_ctx) =
         build_cost_context("openai.default", "gpt-4o-mini", input_rate, output_rate);
@@ -2981,20 +2953,14 @@ async fn usage_identity_updates_on_subsequent_calls_without_usage() {
 
     let provider = ScriptedProvider::new(vec![resp_a, resp_b]);
 
-    let agent = Agent::builder()
-        .model_provider(Box::new(provider))
-        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-            vec![],
-        ))
-        .memory(mem_none(std::path::Path::new("/tmp")))
-        .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
-        .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::path::PathBuf::from("/tmp"))
-        .model_provider_name("openai.default".into())
-        .model_name("gpt-4o-mini".into())
-        .agent_alias("req-b1-test".into())
-        .build()
-        .expect("agent builder should succeed");
+    let agent = build_aliased_agent(
+        Box::new(provider),
+        vec![],
+        "openai.default",
+        "gpt-4o-mini",
+        "req-b1-test",
+        None,
+    );
 
     let (_tracker, cost_ctx) = build_cost_context("openai.default", "gpt-4o-mini", 1.5, 3.0);
 
@@ -3110,20 +3076,14 @@ async fn usage_identity_crosses_provider_boundary_without_usage() {
         1,
     );
 
-    let agent = Agent::builder()
-            .model_provider(Box::new(reliable))
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![],
-            ))
-            .memory(mem_none(std::path::Path::new("/tmp")))
-            .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .model_provider_name("test-reliable".into())
-            .model_name("model-a".into()) // initial model
-            .agent_alias("cross-provider-test".into())
-            .build()
-            .expect("agent builder should succeed");
+    let agent = build_aliased_agent(
+        Box::new(reliable),
+        vec![],
+        "test-reliable",
+        "model-a", // initial model
+        "cross-provider-test",
+        None,
+    );
 
     let (_tracker, cost_ctx) = build_cost_context("provider-a", "model-a", 1.5, 3.0);
 
