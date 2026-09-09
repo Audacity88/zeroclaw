@@ -147,6 +147,13 @@ Chat Completions into the Anthropic Messages API (LiteLLM, TrueFoundry,
 and similar); the native Anthropic family already caches by default and
 ignores this field.
 
+Before reaching for this flag, check whether the gateway also exposes an
+Anthropic Messages endpoint. If it does, point a
+`[providers.models.anthropic.<alias>]` entry at it with `uri` and skip the
+passthrough entirely; the native provider places its own breakpoints.
+`cache_passthrough` is for gateways that offer only the Chat Completions
+surface.
+
 With the flag on, requests gain at most two `cache_control` breakpoints,
 placed the same way the native Anthropic provider places them: one on the
 system prompt, and one rolling breakpoint on the last message once the
