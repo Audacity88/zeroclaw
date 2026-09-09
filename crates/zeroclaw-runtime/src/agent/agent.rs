@@ -1601,6 +1601,40 @@ impl Agent {
         .await
     }
 
+    /// Build a daemon-backed ACP TUI Agent with access to the shared durable
+    /// session store. The store is a read view for session tools; TUI turns do
+    /// not gain ACP file-delivery authority.
+    pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        let config = live_config.read().clone();
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            &config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            // TUI turns never transport an ACP file attachment.
+            false,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+            Some(acp_session_store),
+            Some(live_config),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn from_config_with_session_cwd_and_mcp_approval_mode(
         config: &Config,
