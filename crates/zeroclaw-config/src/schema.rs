@@ -970,6 +970,8 @@ pub struct ModelProviderConfig {
     /// `cache_passthrough` is enabled; without passthrough no markers
     /// are placed at all and this field is inert (no parse-time warning:
     /// an operator may stage the key before switching passthrough on).
+    /// Providers that emit their own cache markers by other means
+    /// (openrouter) ignore this setting.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
