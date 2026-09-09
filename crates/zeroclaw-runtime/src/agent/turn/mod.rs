@@ -306,6 +306,119 @@ pub struct ToolLoopImageState<'a> {
 #[cfg(test)]
 mod provider_image_quarantine_tests {
     use super::*;
+    use axum::{
+        Json, Router,
+        http::{StatusCode, header},
+        response::IntoResponse,
+        routing::post,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+    use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
+    use zeroclaw_providers::reliable::ReliableModelProvider;
+
+    fn reliable_compatible(base_url: &str) -> ReliableModelProvider {
+        let compatible = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test Compatible")
+            .base_url(base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .vision(true)
+            .build();
+        ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".to_string(),
+                Box::new(compatible) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        )
+    }
+
+    async fn run_image_turn(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        cache: &mut zeroclaw_providers::multimodal::LocalImageCache,
+        quarantine: &mut ProviderImageQuarantine,
+    ) -> anyhow::Result<String> {
+        let observer = crate::observability::NoopObserver;
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(64);
+
+        run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "test-provider",
+                    model: "test-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &multimodal_config,
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(delta_tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: Some(ToolLoopImageState { cache, quarantine }),
+            ingress: IngressContext::sub_turn(),
+            memory: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: "test-turn",
+            sop_reassembly: None,
+        })
+        .await
+    }
+
+    fn request_contains_image(payload: &serde_json::Value) -> bool {
+        payload
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("image_url")
+                            })
+                        })
+                })
+            })
+    }
 
     fn image_ids() -> Vec<zeroclaw_providers::multimodal::ProviderImageId> {
         zeroclaw_providers::multimodal::provider_image_ids(&[
@@ -358,56 +471,125 @@ mod provider_image_quarantine_tests {
     #[tokio::test]
     async fn terminal_rejection_quarantines_replay_until_explicit_retry_succeeds() {
         let uri = "data:image/png;base64,AAAA";
-        let mut history = vec![
-            ChatMessage::user(format!("Look [IMAGE:{uri}]")),
-            ChatMessage::assistant("The provider rejected the image."),
-            ChatMessage::user("Continue without it"),
-        ];
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_route = Arc::clone(&requests);
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_route = Arc::clone(&request_count);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<serde_json::Value>| {
+                let requests = Arc::clone(&requests_for_route);
+                let request_count = Arc::clone(&request_count_for_route);
+                async move {
+                    requests.lock().expect("capture request").push(payload);
+                    if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"error":{"code":"image_input_rejected","message":"image rejected"}}"#,
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind compatible test server");
+        let addr = listener.local_addr().expect("read compatible test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve compatible test responses");
+        });
+        let provider = reliable_compatible(&format!("http://{addr}"));
+        let mut history = vec![ChatMessage::user(format!("Look [IMAGE:{uri}]"))];
         let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
         let mut quarantine = ProviderImageQuarantine::default();
 
-        let first =
-            zeroclaw_providers::multimodal::prepare_messages_for_provider_cached_with_quarantine(
-                &history,
-                &config,
-                &mut cache,
-                quarantine.as_slice(),
-            )
+        let error = run_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
             .await
-            .expect("initial image request prepares");
-        assert_eq!(first.submitted_image_ids.len(), 1);
-        let error = anyhow::Error::new(
-            zeroclaw_api::model_provider::ProviderImageInputRejected::new(None, "request rejected"),
-        );
-        retain_provider_image_rejection(&mut quarantine, &error, &first.submitted_image_ids);
-
-        let replay =
-            zeroclaw_providers::multimodal::prepare_messages_for_provider_cached_with_quarantine(
-                &history,
-                &config,
-                &mut cache,
-                quarantine.as_slice(),
-            )
-            .await
-            .expect("text-only follow-up prepares");
-        assert!(replay.submitted_image_ids.is_empty());
+            .expect_err("the compatible provider must reject the image");
+        assert!(error.chain().any(|source| {
+            source.is::<zeroclaw_api::model_provider::ProviderImageInputRejected>()
+        }));
+        assert_eq!(quarantine.as_slice().len(), 1);
         assert!(history[0].content.contains("[IMAGE:"));
 
+        history.push(ChatMessage::user("Continue without it"));
+        assert_eq!(
+            run_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
+                .await
+                .expect("text-only follow-up succeeds"),
+            "ok"
+        );
+        assert_eq!(quarantine.as_slice().len(), 1);
+
         history.push(ChatMessage::user(format!("Try again [IMAGE:{uri}]")));
-        let retry =
-            zeroclaw_providers::multimodal::prepare_messages_for_provider_cached_with_quarantine(
-                &history,
-                &config,
-                &mut cache,
-                quarantine.as_slice(),
-            )
-            .await
-            .expect("explicit retry prepares");
-        assert_eq!(retry.submitted_image_ids, retry.retry_image_ids);
-        assert_eq!(retry.retry_image_ids.len(), 1);
-        quarantine.clear_retried(&retry.retry_image_ids);
+        assert_eq!(
+            run_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
+                .await
+                .expect("explicit retry succeeds"),
+            "ok"
+        );
         assert!(quarantine.as_slice().is_empty());
+
+        let captured = requests.lock().expect("read captured requests");
+        assert_eq!(captured.len(), 3, "each turn makes one physical request");
+        assert!(request_contains_image(&captured[0]));
+        assert!(!request_contains_image(&captured[1]));
+        assert!(request_contains_image(&captured[2]));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compatible_ordinary_error_through_reliable_does_not_quarantine_images() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_route = Arc::clone(&request_count);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let request_count = Arc::clone(&request_count_for_route);
+                async move {
+                    request_count.fetch_add(1, Ordering::Relaxed);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":{"code":"invalid_request_error","message":"invalid tool schema"}}"#,
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind compatible test server");
+        let addr = listener.local_addr().expect("read compatible test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve compatible test response");
+        });
+        let provider = reliable_compatible(&format!("http://{addr}"));
+        let mut history = vec![ChatMessage::user("Look [IMAGE:data:image/png;base64,AAAA]")];
+        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let mut quarantine = ProviderImageQuarantine::default();
+
+        let error = run_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
+            .await
+            .expect_err("ordinary compatible error remains terminal");
+        assert!(!error.chain().any(|source| {
+            source.is::<zeroclaw_api::model_provider::ProviderImageInputRejected>()
+        }));
+        assert!(quarantine.as_slice().is_empty());
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        server.abort();
     }
 }
 
