@@ -1592,19 +1592,23 @@ impl AcpServer {
         let mut latest_plan: Option<Vec<PlanEntry>> = None;
         while let Some(event) = event_rx.recv().await {
             if let TurnEvent::Usage {
-                input_tokens: Some(it),
-                accepted: true,
+                input_tokens,
+                accepted,
                 ..
             } = &event
             {
                 if let Some(store) = &self.store {
                     let store = store.clone();
                     let sid = session_id.clone();
-                    let it = *it;
+                    // Accepted usage-less calls clear the durable snapshot so
+                    // a resumed session does not replay a stale route's count.
+                    // Rejected billing telemetry never touches the store.
+                    let (tokens, is_accepted) = (*input_tokens, *accepted);
                     zeroclaw_spawn::spawn!(async move {
-                        let persisted =
-                            tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
-                                .await;
+                        let persisted = tokio::task::spawn_blocking(move || {
+                            store.persist_usage_snapshot(&sid, tokens, is_accepted)
+                        })
+                        .await;
                         let error = match persisted {
                             Ok(Ok(())) => return,
                             Ok(Err(e)) => e.to_string(),
@@ -1618,7 +1622,8 @@ impl AcpServer {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "input_tokens": it,
+                                "input_tokens": tokens,
+                                "accepted": is_accepted,
                                 "error": error,
                             })),
                             "Failed to persist ACP session token_count"

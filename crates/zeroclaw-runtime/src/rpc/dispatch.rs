@@ -2303,18 +2303,19 @@ impl RpcDispatcher {
                     if let (
                         Some(store),
                         TurnEvent::Usage {
-                            input_tokens: Some(it),
-                            accepted: true,
+                            input_tokens,
+                            accepted,
                             ..
                         },
                     ) = (acp_token_store.as_ref(), &event)
                     {
                         let store = store.clone();
                         let sid = sid.clone();
-                        let it = *it;
-                        let _ =
-                            tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
-                                .await;
+                        let (tokens, is_accepted) = (*input_tokens, *accepted);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            store.persist_usage_snapshot(&sid, tokens, is_accepted)
+                        })
+                        .await;
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;

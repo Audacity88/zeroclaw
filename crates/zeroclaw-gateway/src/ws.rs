@@ -3279,4 +3279,44 @@ data: {\"type\":\"message_stop\"}\n\n",
             "last_input_tokens must be null when the accepted final call is usage-less"
         );
     }
+
+    #[test]
+    fn done_frame_accepted_usageless_route_serializes_null_snapshot() {
+        // Standalone wire-boundary pin for the accepted usage-less route,
+        // independent of UsageFold: identity follows the serving route, the
+        // snapshot serializes as explicit null, and the window stays omitted
+        // when the provider configures none.
+        let entries = vec![ProviderUsageEntry {
+            provider_ref: "openrouter.a".to_string(),
+            model: "model-a".to_string(),
+            input_tokens: 1000,
+            output_tokens: 100,
+            cached_input_tokens: 0,
+            cost_usd: 0.02,
+        }];
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(1000),
+            output_tokens: Some(100),
+            tokens_used: Some(1100),
+            cost_usd: UsageFold::total_cost_usd(&entries),
+            model: "model-a",
+            provider: "openrouter.a",
+            provider_ref: "openrouter.a",
+            max_context_tokens: 800_000,
+            model_context_window: None,
+            last_input_tokens: None,
+            last_serving_provider_ref: Some("openrouter.a"),
+            last_serving_model: Some("model-a"),
+        };
+        let done = build_done_frame_json(&meta, &entries);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert!(v["last_input_tokens"].is_null());
+        assert_eq!(v["last_serving_provider_ref"], "openrouter.a");
+        assert_eq!(v["usage_by_provider"][0]["input_tokens"], 1000);
+        assert!(
+            v.get("model_context_window").is_none(),
+            "model_context_window is additive and omitted when unset"
+        );
+    }
 }
