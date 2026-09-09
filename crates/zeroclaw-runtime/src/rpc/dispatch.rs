@@ -1391,9 +1391,9 @@ impl RpcDispatcher {
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
-            && let Some(notification) = plan_replay_notification(&session_id, &plan)
         {
-            let _ = self.rpc.send_raw(notification).await;
+            let event = TurnEvent::Plan { entries: plan };
+            forward_turn_event(&self.rpc, &session_id, &event, None, None).await;
         }
         if let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_start(&session_id, "rpc").await;
