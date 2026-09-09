@@ -996,6 +996,113 @@ struct ProviderUsageEntry {
     cost_usd: f64,
 }
 
+/// Fold state for `TurnEvent::Usage` inside the WS chat loop.
+///
+/// `process_chat_message` owns one per turn and feeds it every Usage event
+/// verbatim; the done/cancel frame paths then read the accumulated state.
+/// Billing aggregation (turn-wide totals plus the per-(provider, model)
+/// breakdown) accumulates every billable attempt, including rejected ones.
+/// The accepted-serving snapshot (`last_provider_ref` / `last_model` /
+/// `last_input_tokens`) advances only on `accepted: true` events, so a later
+/// billed rejected attempt cannot re-point the terminal identity or the
+/// context-meter ceiling (see the `TurnEvent::Usage` contract).
+#[derive(Debug, Default)]
+struct UsageFold {
+    total_input_tokens: Option<u64>,
+    total_output_tokens: Option<u64>,
+    last_provider_ref: Option<String>,
+    last_model: Option<String>,
+    last_input_tokens: Option<u64>,
+    usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry>,
+}
+
+impl UsageFold {
+    fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) {
+        let zeroclaw_api::agent::TurnEvent::Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            cost_usd,
+            provider_ref,
+            model: served_model,
+            accepted,
+        } = event
+        else {
+            return;
+        };
+        // Turn-wide billing totals accumulate every billable attempt,
+        // including rejected ones (`accepted: false` is billing-only
+        // telemetry per the TurnEvent::Usage contract). Only the
+        // accepted-serving snapshot below is gated on `accepted`.
+        if let Some(it) = input_tokens {
+            self.total_input_tokens = Some(self.total_input_tokens.unwrap_or(0) + it);
+        }
+        if let Some(ot) = output_tokens {
+            self.total_output_tokens = Some(self.total_output_tokens.unwrap_or(0) + ot);
+        }
+        if accepted {
+            self.last_provider_ref = Some(provider_ref.clone());
+            self.last_model = Some(served_model.clone());
+            if let Some(it) = input_tokens {
+                self.last_input_tokens = Some(it);
+            } else {
+                // Accepted call returned no usage data; clear the previous
+                // route's input snapshot to prevent stale values from a
+                // different route being rendered against this route's
+                // context window.
+                self.last_input_tokens = None;
+            }
+        }
+        // Per-(provider, model) breakdown accumulation.
+        // The event-owned strings move into the map key; entry
+        // fields clone from the key only on insert, so repeat
+        // events for a known pair cost no extra clones.
+        let entry = self
+            .usage_by_provider
+            .entry((provider_ref, served_model))
+            .or_insert_with_key(|(provider_ref, model)| ProviderUsageEntry {
+                provider_ref: provider_ref.clone(),
+                model: model.clone(),
+                ..Default::default()
+            });
+        if let Some(it) = input_tokens {
+            entry.input_tokens = entry.input_tokens.saturating_add(it);
+        }
+        if let Some(ot) = output_tokens {
+            entry.output_tokens = entry.output_tokens.saturating_add(ot);
+        }
+        if let Some(ct) = cached_input_tokens {
+            entry.cached_input_tokens = entry.cached_input_tokens.saturating_add(ct);
+        }
+        if let Some(cu) = cost_usd {
+            entry.cost_usd += cu;
+        }
+    }
+
+    /// Sorted per-(provider, model) breakdown in wire order; drains the map.
+    /// `total_cost_usd` sums over this vector — never over the HashMap
+    /// directly — so float accumulation order (and the emitted total) is
+    /// deterministic.
+    fn take_sorted_entries(&mut self) -> Vec<ProviderUsageEntry> {
+        let mut entries: Vec<_> = std::mem::take(&mut self.usage_by_provider)
+            .into_values()
+            .collect();
+        entries.sort_by(|a, b| {
+            a.provider_ref
+                .cmp(&b.provider_ref)
+                .then(a.model.cmp(&b.model))
+        });
+        entries
+    }
+
+    /// Turn-wide cost total over the sorted breakdown; `None` when nothing
+    /// billable was recorded.
+    fn total_cost_usd(entries: &[ProviderUsageEntry]) -> Option<f64> {
+        let sum: f64 = entries.iter().map(|e| e.cost_usd).sum();
+        if sum > 0.0 { Some(sum) } else { None }
+    }
+}
+
 /// Scalar inputs to build a done-frame JSON.
 /// `usage_by_provider` is kept as a separate arg (different concern).
 /// `cost_usd` is derived as the sum of `usage_by_provider[*].cost_usd`,
@@ -1170,23 +1277,10 @@ async fn process_chat_message(
     // Aggregate token usage across all LLM calls in this turn.
     // The agent emits TurnEvent::Usage once per LLM call when the provider
     // surfaces usage; we sum to produce a single done-frame total.
-    let mut total_input_tokens: Option<u64> = None;
-    let mut total_output_tokens: Option<u64> = None;
-
-    // Most recent serving provider/model from usage events (for done-frame metadata).
-    let mut last_provider_ref: Option<String> = None;
-    let mut last_model: Option<String> = None;
-
-    // Track the most recent absolute provider-reported prompt size
-    // (replaces on each TurnEvent::Usage; not accumulated).
-    // Used for accurate context-bar rendering on the client.
-    let mut last_input_tokens: Option<u64> = None;
-    // Per-(provider, model) usage snapshot — preserves identity of every LLM
-    // call so the done frame can attribute tokens/cost across provider/model
-    // switches. Keyed by (provider_ref, model) to avoid collapsing distinct
-    // models served by the same provider reference.
-    let mut usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry> =
-        std::collections::HashMap::new();
+    // `UsageFold` holds both the billing aggregation (every billable attempt,
+    // including rejected ones) and the accepted-serving snapshot (accepted
+    // events only) that the done/cancel frames render.
+    let mut usage_fold = UsageFold::default();
 
     let forward_fut = async {
         let mut cancel_drained = false;
@@ -1322,56 +1416,13 @@ async fn process_chat_message(
                                 event_opt = event_rx.recv() => {
                                 let Some(event) = event_opt else { break };
                                 let ws_msg = match event {
-            TurnEvent::Usage {
-                                    input_tokens,
-                                    cached_input_tokens,
-                                    output_tokens,
-                                    cost_usd,
-                                    provider_ref,
-                                    model: served_model,
-                                    accepted: _,
-                                } => {
-                                        last_provider_ref = Some(provider_ref.clone());
-                                        last_model = Some(served_model.clone());
-                                        if let Some(it) = input_tokens {
-                                            total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
-                                            last_input_tokens = Some(it);
-                                        } else {
-                                            // Accepted call returned no usage data; clear the previous
-                                            // route's input snapshot to prevent stale values from a
-                                            // different route being rendered against this route's
-                                            // context window.
-                                            last_input_tokens = None;
-                                        }
-                                        if let Some(ot) = output_tokens {
-                                            total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
-                                        }
-                                        // Per-(provider, model) breakdown accumulation.
-                                        // The event-owned strings move into the map key; entry
-                                        // fields clone from the key only on insert, so repeat
-                                        // events for a known pair cost no extra clones.
-                                        let entry = usage_by_provider
-                                            .entry((provider_ref, served_model))
-                                            .or_insert_with_key(
-                                                |(provider_ref, model)| ProviderUsageEntry {
-                                                    provider_ref: provider_ref.clone(),
-                                                    model: model.clone(),
-                                                    ..Default::default()
-                                                },
-                                            );
-                                        if let Some(it) = input_tokens {
-                                            entry.input_tokens = entry.input_tokens.saturating_add(it);
-                                        }
-                                        if let Some(ot) = output_tokens {
-                                            entry.output_tokens = entry.output_tokens.saturating_add(ot);
-                                        }
-                                        if let Some(ct) = cached_input_tokens {
-                                            entry.cached_input_tokens =
-                                                entry.cached_input_tokens.saturating_add(ct);
-                                        }
-                                        if let Some(cu) = cost_usd {
-                                            entry.cost_usd += cu;
-                                        }
+            usage_event @ TurnEvent::Usage { .. } => {
+                                        // The fold below is the production event path under
+                                        // test (see UsageFold regression tests): billing
+                                        // aggregates every billable attempt while the
+                                        // accepted-serving snapshot advances on accepted
+                                        // events only.
+                                        usage_fold.apply(usage_event);
                                         continue;
                                     }
                                     TurnEvent::Chunk { ref delta } => {
@@ -1496,8 +1547,11 @@ async fn process_chat_message(
         }
 
         // Broadcast agent_end event
-        let cancel_model = last_model.as_deref().unwrap_or(&turn_model);
-        let cancel_provider_ref = last_provider_ref.as_deref().unwrap_or(&provider_label);
+        let cancel_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
+        let cancel_provider_ref = usage_fold
+            .last_provider_ref
+            .as_deref()
+            .unwrap_or(&provider_label);
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
             "model_provider": &provider_label,
@@ -1574,7 +1628,10 @@ async fn process_chat_message(
                 }
             }
 
-            let total_tokens = match (total_input_tokens, total_output_tokens) {
+            let total_tokens = match (
+                usage_fold.total_input_tokens,
+                usage_fold.total_output_tokens,
+            ) {
                 (Some(i), Some(o)) => Some(i.saturating_add(o)),
                 (Some(i), None) => Some(i),
                 (None, Some(o)) => Some(o),
@@ -1584,25 +1641,15 @@ async fn process_chat_message(
             // format is stable (avoids flaky assertions in tests). cost_usd is
             // summed over this sorted vector — never over the HashMap directly —
             // so float accumulation order (and the emitted total) is stable.
-            let usage_by_provider_vec: Vec<ProviderUsageEntry> = {
-                let mut entries: Vec<_> = usage_by_provider.into_values().collect();
-                entries.sort_by(|a, b| {
-                    a.provider_ref
-                        .cmp(&b.provider_ref)
-                        .then(a.model.cmp(&b.model))
-                });
-                entries
-            };
+            let usage_by_provider_vec = usage_fold.take_sorted_entries();
             // cost_usd is the sum of all billable attempts' cost_usd from
             // usage_by_provider (which now includes rejected attempts). This makes
             // the breakdown the single source of truth.
-            let cost_usd = {
-                let sum: f64 = usage_by_provider_vec.iter().map(|e| e.cost_usd).sum();
-                if sum > 0.0 { Some(sum) } else { None }
-            };
+            let cost_usd = UsageFold::total_cost_usd(&usage_by_provider_vec);
 
             // Resolve context_window from the last-served provider's config.
-            let model_context_window = if let Some(ref provider_ref) = last_provider_ref {
+            let model_context_window = if let Some(ref provider_ref) = usage_fold.last_provider_ref
+            {
                 state
                     .config
                     .read()
@@ -1622,14 +1669,17 @@ async fn process_chat_message(
             };
             // Use the last served model from usage events when available so
             // the terminal metadata is one coherent tuple with the provider.
-            let effective_model = last_model.as_deref().unwrap_or(&turn_model);
+            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
             // Full provider_ref for the done frame: last served ref when
             // available, otherwise fall back to the turn-start provider label.
-            let provider_ref_full = last_provider_ref.as_deref().unwrap_or(&provider_label);
+            let provider_ref_full = usage_fold
+                .last_provider_ref
+                .as_deref()
+                .unwrap_or(&provider_label);
             let meta = DoneFrameMeta {
                 full_response: &outcome.response,
-                input_tokens: total_input_tokens,
-                output_tokens: total_output_tokens,
+                input_tokens: usage_fold.total_input_tokens,
+                output_tokens: usage_fold.total_output_tokens,
                 tokens_used: total_tokens,
                 cost_usd,
                 model: effective_model,
@@ -1637,9 +1687,9 @@ async fn process_chat_message(
                 provider_ref: provider_ref_full,
                 max_context_tokens,
                 model_context_window,
-                last_input_tokens,
-                last_serving_provider_ref: last_provider_ref.as_deref(),
-                last_serving_model: last_model.as_deref(),
+                last_input_tokens: usage_fold.last_input_tokens,
+                last_serving_provider_ref: usage_fold.last_provider_ref.as_deref(),
+                last_serving_model: usage_fold.last_model.as_deref(),
             };
             let done = build_done_frame_json(&meta, &usage_by_provider_vec);
             let _ = sender.send(Message::Text(done.to_string().into())).await;
@@ -1669,11 +1719,11 @@ async fn process_chat_message(
                         "model": effective_model,
                         "provider_ref": provider_ref_full,
                         "session_key": session_key,
-                        "input_tokens": total_input_tokens,
-                        "output_tokens": total_output_tokens,
+                        "input_tokens": usage_fold.total_input_tokens,
+                        "output_tokens": usage_fold.total_output_tokens,
                         "tokens_used": total_tokens,
                         "cost_usd": cost_usd,
-                        "last_input_tokens": last_input_tokens,
+                        "last_input_tokens": usage_fold.last_input_tokens,
                         "trace_id": turn_id,
                     })),
                 "gateway_ws_turn"
@@ -3189,5 +3239,198 @@ data: {\"type\":\"message_stop\"}\n\n",
         assert_eq!(ubp.len(), 1);
         assert_eq!(ubp[0]["model"], "model-a");
         assert_eq!(ubp[0]["input_tokens"], 5000);
+    }
+
+    /// Build a `TurnEvent::Usage` for fold tests.
+    fn usage_event(
+        provider_ref: &str,
+        model: &str,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cost_usd: Option<f64>,
+        accepted: bool,
+    ) -> zeroclaw_api::agent::TurnEvent {
+        zeroclaw_api::agent::TurnEvent::Usage {
+            input_tokens,
+            cached_input_tokens: None,
+            output_tokens,
+            cost_usd,
+            provider_ref: provider_ref.to_string(),
+            model: model.to_string(),
+            accepted,
+        }
+    }
+
+    /// Blocking regression (note9 blocker 1): an accepted Usage event followed
+    /// by a rejected billed Usage event must keep the accepted-serving
+    /// snapshot while billing both attempts. Drives `UsageFold::apply` — the
+    /// exact function the WS handler invokes per event — then renders the
+    /// done frame from the fold state with the same field mapping the handler
+    /// uses, asserting the wire-observable contract.
+    #[test]
+    fn usage_fold_accepted_then_rejected_billed_keeps_accepted_snapshot() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(1000),
+            Some(500),
+            Some(0.01),
+            true,
+        ));
+        fold.apply(usage_event(
+            "openrouter.b",
+            "model-b",
+            Some(2000),
+            Some(1000),
+            Some(0.02),
+            false,
+        ));
+
+        // Snapshot stays accepted-sourced: the rejected attempt must not
+        // re-point identity or the meter ceiling.
+        assert_eq!(fold.last_provider_ref.as_deref(), Some("openrouter.a"));
+        assert_eq!(fold.last_model.as_deref(), Some("model-a"));
+        assert_eq!(fold.last_input_tokens, Some(1000));
+        // Billing aggregates both attempts.
+        assert_eq!(fold.total_input_tokens, Some(3000));
+        assert_eq!(fold.total_output_tokens, Some(1500));
+
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].model, "model-a");
+        assert_eq!(entries[0].cost_usd, 0.01);
+        assert_eq!(entries[1].model, "model-b");
+        assert_eq!(entries[1].cost_usd, 0.02);
+        let cost_usd = UsageFold::total_cost_usd(&entries);
+        assert_eq!(cost_usd, Some(0.03));
+
+        // Wire contract: done frame carries both attempts in the ledger and
+        // cost total, but the serving identity and meter snapshot come from
+        // the accepted event.
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(3000),
+            output_tokens: Some(1500),
+            tokens_used: Some(4500),
+            cost_usd,
+            model: "model-a",
+            provider: "openrouter.a",
+            provider_ref: "openrouter.a",
+            max_context_tokens: 800_000,
+            model_context_window: Some(1_000_000),
+            last_input_tokens: Some(1000),
+            last_serving_provider_ref: Some("openrouter.a"),
+            last_serving_model: Some("model-a"),
+        };
+        let done = build_done_frame_json(&meta, &entries);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert_eq!(v["cost_usd"], 0.03);
+        assert_eq!(v["last_serving_provider_ref"], "openrouter.a");
+        assert_eq!(v["last_serving_model"], "model-a");
+        assert_eq!(v["last_input_tokens"], 1000);
+        assert_eq!(v["model_context_window"], 1_000_000);
+        let ubp = v["usage_by_provider"].as_array().unwrap();
+        assert_eq!(ubp.len(), 2);
+
+        // Negative control: a rejected event with input_tokens: None must
+        // neither move the snapshot nor clear the accepted prompt size.
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(1000),
+            Some(500),
+            Some(0.01),
+            true,
+        ));
+        fold.apply(usage_event(
+            "openrouter.b",
+            "model-b",
+            None,
+            None,
+            Some(0.005),
+            false,
+        ));
+        assert_eq!(fold.last_provider_ref.as_deref(), Some("openrouter.a"));
+        assert_eq!(fold.last_model.as_deref(), Some("model-a"));
+        assert_eq!(
+            fold.last_input_tokens,
+            Some(1000),
+            "rejected usage-less event must not clear the accepted snapshot"
+        );
+        assert_eq!(fold.total_input_tokens, Some(1000));
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 2, "rejected attempt is still billed");
+        assert_eq!(UsageFold::total_cost_usd(&entries), Some(0.015));
+    }
+
+    /// Boundary regression (note9 warning 2, via the production fold):
+    /// provider A reports usage, then accepted provider B succeeds usage-less
+    /// (`input_tokens: None`). Identity and the null meter snapshot must
+    /// follow B while the billing ledger retains A's tokens.
+    #[test]
+    fn usage_fold_cross_provider_accepted_usageless_moves_snapshot_not_ledger() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openrouter.a",
+            "model-a",
+            Some(1000),
+            Some(100),
+            Some(0.02),
+            true,
+        ));
+        fold.apply(usage_event(
+            "ollama.b",
+            "model-b",
+            None,
+            Some(50),
+            None,
+            true,
+        ));
+
+        // Identity follows the accepted usage-less B; the prompt-size snapshot
+        // is cleared rather than going stale.
+        assert_eq!(fold.last_provider_ref.as_deref(), Some("ollama.b"));
+        assert_eq!(fold.last_model.as_deref(), Some("model-b"));
+        assert_eq!(fold.last_input_tokens, None);
+        // Billing keeps A's tokens plus B's output.
+        assert_eq!(fold.total_input_tokens, Some(1000));
+        assert_eq!(fold.total_output_tokens, Some(150));
+
+        let entries = fold.take_sorted_entries();
+        assert_eq!(entries.len(), 2);
+        let a = entries.iter().find(|e| e.model == "model-a").unwrap();
+        assert_eq!(
+            (a.input_tokens, a.output_tokens, a.cost_usd),
+            (1000, 100, 0.02)
+        );
+
+        // Wire contract with B's explicit window: meter ceiling resolves from
+        // B, usage snapshot is null, ledger carries A's entry.
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(1000),
+            output_tokens: Some(150),
+            tokens_used: Some(1150),
+            cost_usd: UsageFold::total_cost_usd(&entries),
+            model: "model-b",
+            provider: "ollama.b",
+            provider_ref: "ollama.b",
+            max_context_tokens: 800_000,
+            model_context_window: Some(1_000_000),
+            last_input_tokens: None,
+            last_serving_provider_ref: Some("ollama.b"),
+            last_serving_model: Some("model-b"),
+        };
+        let done = build_done_frame_json(&meta, &entries);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert_eq!(v["model"], "model-b");
+        assert_eq!(v["last_serving_model"], "model-b");
+        assert_eq!(v["model_context_window"], 1_000_000);
+        assert!(
+            v["last_input_tokens"].is_null(),
+            "last_input_tokens must be null when the accepted final call is usage-less"
+        );
     }
 }
