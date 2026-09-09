@@ -285,6 +285,31 @@ fn unpriced_tokens_for_usage(
     unpriced_usage(rates, input_tokens, cached_input_tokens, output_tokens).tokens
 }
 
+/// A model with token usage whose ledger records explicitly report that one
+/// or more token-bearing pricing dimensions were unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpricedModel {
+    pub model: String,
+    pub unpriced_tokens: u64,
+}
+
+/// Return per-model unpriced token subsets from the ledger-derived summary,
+/// sorted by model id for stable output.
+pub fn unpriced_models_in_summary(
+    by_model: &HashMap<String, zeroclaw_config::cost::ModelStats>,
+) -> Vec<UnpricedModel> {
+    let mut out: Vec<UnpricedModel> = by_model
+        .values()
+        .filter(|m| m.unpriced_tokens > 0)
+        .map(|m| UnpricedModel {
+            model: m.model.clone(),
+            unpriced_tokens: m.unpriced_tokens,
+        })
+        .collect();
+    out.sort_by(|a, b| a.model.cmp(&b.model));
+    out
+}
+
 /// Record usage from a rejected provider attempt without replacing the accepted
 /// response's context-window fill.
 pub fn record_rejected_tool_loop_cost_usage(
@@ -521,9 +546,19 @@ fn record_tool_loop_cost_usage_inner(
         }
     }
 
+    // The session key scoped around this turn is the chat conversation the
+    // spend belongs to; the tracker's own id is daemon-lifetime scoped.
+    let conversation_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
     if let Some(tracker) = &ctx.tracker
-        && let Err(error) =
-            tracker.record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
+        && let Err(error) = tracker.record_usage_attributed(
+            cost_usage.clone(),
+            ctx.agent_alias.as_deref(),
+            None,
+            conversation_id,
+        )
     {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
@@ -601,8 +636,157 @@ mod tests {
     use zeroclaw_providers::ProviderDispatch;
     use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
 
+    struct ResetGlobalPricingCatalog;
+
+    impl Drop for ResetGlobalPricingCatalog {
+        fn drop(&mut self) {
+            crate::agent::pricing_catalog::set_global_pricing_catalog(
+                crate::agent::pricing_catalog::GlobalPricingCatalog::default(),
+            );
+        }
+    }
+
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    fn model_stats(
+        model: &str,
+        total_tokens: u64,
+        cost_usd: f64,
+        unpriced_tokens: u64,
+    ) -> zeroclaw_config::cost::ModelStats {
+        zeroclaw_config::cost::ModelStats {
+            model: model.to_string(),
+            cost_usd,
+            input_tokens: total_tokens,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens,
+            unpriced_tokens,
+            request_count: 1,
+        }
+    }
+
+    #[test]
+    fn unpriced_models_use_recorded_provenance_not_aggregate_cost() {
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "claude-haiku-4-5-20251001".to_string(),
+            model_stats("claude-haiku-4-5-20251001", 9420, 0.0, 9420),
+        );
+        by_model.insert(
+            "configured-free".to_string(),
+            model_stats("configured-free", 1000, 0.0, 0),
+        );
+        by_model.insert("mixed".to_string(), model_stats("mixed", 3000, 0.05, 700));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        assert_eq!(unpriced.len(), 2);
+        assert_eq!(unpriced[0].model, "claude-haiku-4-5-20251001");
+        assert_eq!(unpriced[0].unpriced_tokens, 9420);
+        assert_eq!(unpriced[1].model, "mixed");
+        assert_eq!(unpriced[1].unpriced_tokens, 700);
+    }
+
+    /// Output is sorted by model id for stable, deterministic status output.
+    #[test]
+    fn unpriced_models_are_sorted_by_id() {
+        let mut by_model = HashMap::new();
+        by_model.insert("zeta".to_string(), model_stats("zeta", 10, 0.0, 10));
+        by_model.insert("alpha".to_string(), model_stats("alpha", 20, 0.0, 20));
+        by_model.insert("mike".to_string(), model_stats("mike", 30, 0.0, 30));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        let ids: Vec<&str> = unpriced.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mike", "zeta"]);
+    }
+
+    #[test]
+    fn genuinely_free_model_does_not_warn() {
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "configured-free".to_string(),
+            model_stats("configured-free", 1000, 0.0, 0),
+        );
+        assert!(unpriced_models_in_summary(&by_model).is_empty());
+    }
+
+    /// Routing Anthropic through the existing global catalog
+    /// (rather than a bespoke hand-maintained table) prices a direct-provider
+    /// Anthropic model by its bare model id. This is the drift-free path — the
+    /// same catalog that prices every other provider.
+    #[test]
+    fn global_catalog_prices_anthropic_model_by_id() {
+        use crate::agent::pricing_catalog::{
+            GLOBAL_PRICING_CATALOG_TEST_LOCK, GlobalPricingCatalog, set_global_pricing_catalog,
+        };
+        let _catalog_lock = GLOBAL_PRICING_CATALOG_TEST_LOCK.lock();
+        let _catalog_reset = ResetGlobalPricingCatalog;
+        let catalog: GlobalPricingCatalog = serde_json::from_str(
+            r#"{"models":{"claude-haiku-4-5-20251001":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":5.0,"cache_read_usd_per_mtok":0.1}}}"#,
+        )
+        .expect("catalog json parses");
+        set_global_pricing_catalog(catalog);
+
+        let rates =
+            crate::agent::pricing_catalog::global_pricing_rates("claude-haiku-4-5-20251001");
+        assert_eq!(
+            rates,
+            Some((1.0, 5.0, 0.1)),
+            "catalog must price the direct Anthropic model by its bare id"
+        );
+    }
+
+    #[test]
+    fn global_catalog_fills_only_missing_configured_dimensions() {
+        use crate::agent::pricing_catalog::{
+            GLOBAL_PRICING_CATALOG_TEST_LOCK, GlobalPricingCatalog, set_global_pricing_catalog,
+        };
+        let _catalog_lock = GLOBAL_PRICING_CATALOG_TEST_LOCK.lock();
+        let _catalog_reset = ResetGlobalPricingCatalog;
+        let catalog: GlobalPricingCatalog = serde_json::from_str(
+            r#"{"models":{"partial-catalog-model":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":5.0}}}"#,
+        )
+        .expect("catalog json parses");
+        set_global_pricing_catalog(catalog);
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "configured".to_string(),
+                HashMap::from([("partial-catalog-model.input".to_string(), 2.0)]),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cached_input_tokens: Some(0),
+        };
+
+        let (_, cost_usd) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                record_tool_loop_cost_usage("configured", "partial-catalog-model", &usage)
+            }))
+            .expect("partially configured usage");
+
+        let expected = (100.0 * 2.0 + 20.0 * 5.0) / 1_000_000.0;
+        assert!((cost_usd - expected).abs() < 1e-12);
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let record: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
+        assert!(record.usage.pricing_available);
+        assert_eq!(record.usage.unpriced_tokens, 0);
     }
 
     #[tokio::test]
@@ -1400,6 +1584,233 @@ mod tests {
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cached_input_tokens, 4_000);
         assert_eq!(record.usage.billable_input_tokens(), 1_000);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_attributes_records_to_the_chat_session() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "deepseek".to_string(),
+                pricing_with_cache("deepseek-chat", 0.27, 0.027, 1.10),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(4_000),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for session in ["chat-session-a", "chat-session-b"] {
+            let ctx = ctx.clone();
+            let usage = usage.clone();
+            let session = session.to_string();
+            runtime.block_on(zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                Some(session),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                    record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+                        .expect("cost usage")
+                }),
+            ));
+        }
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let mut conversation_ids = Vec::new();
+        for line in stored.lines() {
+            let record: zeroclaw_config::cost::types::CostRecord =
+                serde_json::from_str(line).unwrap();
+            assert_eq!(record.session_id, tracker.session_id());
+            conversation_ids.push(record.conversation_id.expect("conversation id"));
+        }
+        conversation_ids.sort();
+        assert_eq!(
+            conversation_ids,
+            vec!["chat-session-a".to_string(), "chat-session-b".to_string()],
+            "two chat sessions on one daemon must stay separable in the ledger"
+        );
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_persists_pricing_provenance() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "configured-free".to_string(),
+                pricing_with_cache("free-model", 0.0, 0.0, 0.0),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cached_input_tokens: Some(0),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx.clone()), async {
+                    record_tool_loop_cost_usage("configured-free", "free-model", &usage)
+                })
+                .await
+                .expect("configured-free usage");
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    record_tool_loop_cost_usage(
+                        "missing-provider",
+                        "missing-provenance-model",
+                        &usage,
+                    )
+                })
+                .await
+                .expect("unpriced usage");
+        });
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let records: Vec<zeroclaw_config::cost::types::CostRecord> = stored
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records[0].usage.pricing_available);
+        assert_eq!(records[0].usage.cost_usd, 0.0);
+        assert!(!records[1].usage.pricing_available);
+        assert_eq!(records[1].usage.total_tokens, 150);
+        assert_eq!(records[1].usage.unpriced_tokens, 150);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_persists_partial_and_invalid_exposure() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let mut config = Config::default();
+        config.providers.models.deepseek.insert(
+            "invalid".to_string(),
+            DeepseekModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("invalid-model".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.cost.rates.providers.models.deepseek.insert(
+            "invalid-model".to_string(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(-1.0),
+                output_per_mtok: Some(f64::INFINITY),
+                cached_input_per_mtok: None,
+            },
+        );
+        let mut pricing = build_model_provider_pricing(&config);
+        pricing.insert(
+            "partial".to_string(),
+            HashMap::from([("partial-model.input".to_string(), 2.0)]),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cached_input_tokens: Some(0),
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (provider, model) in [
+                ("partial", "partial-model"),
+                ("deepseek.invalid", "invalid-model"),
+            ] {
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(Some(ctx.clone()), async {
+                        record_tool_loop_cost_usage(provider, model, &usage)
+                    })
+                    .await
+                    .expect("usage should be recorded");
+            }
+        });
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let records: Vec<zeroclaw_config::cost::types::CostRecord> = stored
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[0].usage.unpriced_tokens, 20);
+        assert!(!records[0].usage.pricing_available);
+        assert_eq!(records[1].usage.unpriced_tokens, 120);
+        assert!(!records[1].usage.pricing_available);
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.by_model["partial-model"].unpriced_tokens, 20);
+        assert_eq!(summary.by_model["invalid-model"].unpriced_tokens, 120);
+    }
+
+    #[test]
+    fn extreme_finite_rate_is_recorded_as_unpriced_instead_of_overflowing() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "extreme".to_string(),
+                pricing_with_cache("overflow-model", f64::MAX, 0.0, 0.0),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(10_000_000),
+            output_tokens: Some(0),
+            cached_input_tokens: Some(0),
+        };
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                record_tool_loop_cost_usage("extreme", "overflow-model", &usage)
+            }))
+            .expect("extreme-rate usage must remain observable");
+        assert_eq!(result, (10_000_000, 0.0));
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("the safety record must not be dropped");
+        let record: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
+        assert!(record.usage.cost_usd.is_finite());
+        assert!(!record.usage.pricing_available);
+        assert_eq!(record.usage.unpriced_tokens, 10_000_000);
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(
+            summary.by_model["overflow-model"].unpriced_tokens,
+            10_000_000
+        );
     }
 
     #[test]
