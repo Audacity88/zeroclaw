@@ -1505,6 +1505,13 @@ fn reliable_terminal_error_with_cause(
     final_cause: Option<anyhow::Error>,
 ) -> anyhow::Error {
     let rejected_attempt_usage = rejected_attempt_usage.or_else(accounted_rejected_attempt_usage);
+    let stream_recovery_failure = stream_recovery_failure();
+    let final_cause = final_cause.filter(|cause| {
+        !is_provider_image_input_rejected(cause)
+            || stream_recovery_failure
+                .as_ref()
+                .is_none_or(|failure| failure.image_rejection.is_some())
+    });
     if !final_cause_is_semantic_empty && let Some(cause) = final_cause {
         let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::with_cause(
             provider,
@@ -1521,7 +1528,7 @@ fn reliable_terminal_error_with_cause(
         }
         return terminal_failure;
     }
-    if !final_cause_is_semantic_empty && let Some(recovery_failure) = stream_recovery_failure() {
+    if !final_cause_is_semantic_empty && let Some(recovery_failure) = stream_recovery_failure {
         let aggregate = failure_aggregate(&failures);
         let terminal_failure = match recovery_failure.image_rejection {
             Some(image_rejection) => {
@@ -7163,6 +7170,73 @@ mod tests {
         .await;
 
         let error = result.expect_err("ordinary fallback remains terminal");
+        assert!(
+            !error
+                .chain()
+                .any(|source| source.is::<crate::traits::ProviderImageInputRejected>())
+        );
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn earlier_stream_error_supersedes_recovery_image_rejection() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "ordinary-stream-error".into(),
+                    Box::new(StreamingRecordMock::error(Arc::clone(&stream_calls)))
+                        as Box<dyn ModelProvider>,
+                ),
+                (
+                    "recovery-image-rejection".into(),
+                    Box::new(ImageRejectingProvider {
+                        calls: Arc::clone(&fallback_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (result, _) = scope_reliable_call_accounting(async {
+            let mut stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let stream_error = anyhow::Error::new(
+                stream
+                    .next()
+                    .await
+                    .expect("stream error event")
+                    .expect_err("stream must fail"),
+            );
+            record_stream_recovery_failure(&stream_error);
+            provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        let error = result.expect_err("image-rejecting fallback remains terminal");
         assert!(
             !error
                 .chain()
