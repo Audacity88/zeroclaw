@@ -1511,13 +1511,18 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let mut agent = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
-            let store = self
-                .ctx
-                .acp_session_store
-                .clone()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
-            Box::pin(
+        let acp_session_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+            Some(
+                self.ctx
+                    .acp_session_store
+                    .clone()
+                    .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?,
+            )
+        } else {
+            None
+        };
+        let mut agent = Box::pin(async {
+            if let Some(store) = acp_session_store {
                 crate::agent::agent::Agent::from_live_config_with_tui_env_and_acp_sessions(
                     Arc::clone(&self.ctx.config),
                     &req.agent_alias,
@@ -1528,22 +1533,23 @@ impl RpcDispatcher {
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
                     store,
-                ),
-            )
-            .await
-        } else {
-            crate::agent::agent::Agent::from_live_config_with_tui_env(
-                Arc::clone(&self.ctx.config),
-                &req.agent_alias,
-                cwd_path,
-                initialize_mcp,
-                exclude_memory,
-                tui_env,
-                self.ctx.sop_engine.clone(),
-                self.ctx.sop_audit.clone(),
-            )
-            .await
-        }
+                )
+                .await
+            } else {
+                crate::agent::agent::Agent::from_live_config_with_tui_env(
+                    Arc::clone(&self.ctx.config),
+                    &req.agent_alias,
+                    cwd_path,
+                    initialize_mcp,
+                    exclude_memory,
+                    tui_env,
+                    self.ctx.sop_engine.clone(),
+                    self.ctx.sop_audit.clone(),
+                )
+                .await
+            }
+        })
+        .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
         agent.set_interaction_context(
             resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
