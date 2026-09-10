@@ -402,22 +402,19 @@ pub(crate) async fn persist_and_swap(
     );
     let config_path = new_config.config_path.clone();
 
-    // Snapshot pre-write disk state (used for revert on save failure). When
-    // the file doesn't exist yet, snapshot is None — we'll remove the file
-    // again on rollback so a failed first-write doesn't leak partial state.
-    let snapshot = if config_path.exists() {
-        // best-effort; if we can't read, we can't revert
-        tokio::fs::read(&config_path).await.ok()
-    } else {
-        None
-    };
+    // Snapshot pre-write disk state (used for revert on save failure). Only
+    // NotFound means the file was absent. Any other read failure must stop
+    // before the save because treating an unreadable file as absent would
+    // let the rollback path delete an existing canonical config.
+    let snapshot = read_config_snapshot(&config_path).await?;
 
     if let Err(e) = new_config.save_dirty().await {
         if let Some(prev) = snapshot {
             let _ = tokio::fs::write(&config_path, prev).await;
-        } else if config_path.exists() {
-            let _ = tokio::fs::remove_file(&config_path).await;
         }
+        // When the path was absent, the atomic writer either leaves it absent
+        // on failure or reports a visible rename as success. Do not remove a
+        // path here: an external writer may have created it after admission.
         return Err(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("save failed: {e}"),
@@ -429,6 +426,19 @@ pub(crate) async fn persist_and_swap(
         .pending_reload
         .store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+async fn read_config_snapshot(
+    config_path: &std::path::Path,
+) -> Result<Option<Vec<u8>>, ConfigApiError> {
+    match tokio::fs::read(config_path).await {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ConfigApiError::new(
+            ConfigApiCode::ReloadFailed,
+            format!("failed to snapshot existing config before save: {error}"),
+        )),
+    }
 }
 
 /// Reject masked or empty values from writes to secret-bearing properties.

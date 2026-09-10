@@ -2108,7 +2108,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn section_select_failed_save_retains_prior_live_and_disk_state() {
+    async fn section_select_snapshot_read_failure_stops_before_save() {
+        use http_body_util::BodyExt;
+
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
         std::fs::create_dir_all(&config_path).unwrap();
@@ -2133,14 +2135,30 @@ mod tests {
             response.status(),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("snapshot failure response body")
+            .to_bytes();
+        let error: ConfigApiError =
+            serde_json::from_slice(&body).expect("snapshot failure response");
+        assert_eq!(error.code, ConfigApiCode::ReloadFailed);
+        assert!(
+            error
+                .message
+                .contains("failed to snapshot existing config before save"),
+            "the handler must reject the unreadable snapshot before attempting a save: {}",
+            error.message
+        );
         assert!(
             config_path.is_dir(),
-            "failed save must retain the prior disk state"
+            "snapshot admission failure must retain the prior disk state"
         );
-        let live_after = state.config.read().clone();
         assert_eq!(
-            live_after.tunnel.tunnel_provider, live_before.tunnel.tunnel_provider,
-            "failed save must not publish the working snapshot"
+            toml::Value::try_from(&*state.config.read()).unwrap(),
+            toml::Value::try_from(&live_before).unwrap(),
+            "snapshot admission failure must not publish the working snapshot"
         );
         assert!(
             !state
