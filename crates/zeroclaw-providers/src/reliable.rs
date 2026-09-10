@@ -9800,6 +9800,97 @@ mod tests {
         assert_eq!(report.attempts()[1].provider_ref(), "physical");
     }
 
+    #[test]
+    fn single_candidate_recovery_decision_boundaries() {
+        // Non-failed entries always admit the configured budget.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, false, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, false, false, false),
+            RetryDecision::Admit(2)
+        );
+        // Semantic-empty wins with budget; without budget it stays skipped
+        // when another candidate exists.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, true, true),
+            RetryDecision::Skip
+        );
+        // Single-candidate stream failure: one non-stream recovery attempt
+        // even with zero retries (recovery, not replay). Merges with
+        // semantic-empty into the same single attempt.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, true, false),
+            RetryDecision::Admit(0)
+        );
+        // Multi-candidate without permission: skip the failed entry.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, true),
+            RetryDecision::Skip
+        );
+    }
+
+    #[tokio::test]
+    async fn single_entry_stream_recovery_failure_errors_after_one_attempt() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamThenChatErrorMock) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let err = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect_err("failed recovery must surface, not loop");
+                assert!(
+                    format!("{err:?}").contains("expected recovery failure"),
+                    "unexpected error: {err:?}"
+                );
+            })
+            .await;
+
+        // Stream + exactly one recovery attempt are both ledger-visible.
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 2);
+        assert_eq!(report.attempts()[0].provider_ref(), "physical");
+        assert_eq!(report.attempts()[1].provider_ref(), "physical");
+    }
+
     #[tokio::test]
     async fn unpolled_reliable_stream_creates_no_accounted_attempt() {
         let provider = ReliableModelProvider::new(

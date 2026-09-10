@@ -1598,37 +1598,9 @@ impl AcpServer {
             } = &event
             {
                 if let Some(store) = &self.store {
-                    let store = store.clone();
-                    let sid = session_id.clone();
-                    // Accepted usage-less calls clear the durable snapshot so
-                    // a resumed session does not replay a stale route's count.
-                    // Rejected billing telemetry never touches the store.
                     let (tokens, is_accepted) = (*input_tokens, *accepted);
-                    zeroclaw_spawn::spawn!(async move {
-                        let persisted = tokio::task::spawn_blocking(move || {
-                            store.persist_usage_snapshot(&sid, tokens, is_accepted)
-                        })
+                    persist_acp_usage_snapshot_ordered(store, &session_id, tokens, is_accepted)
                         .await;
-                        let error = match persisted {
-                            Ok(Ok(())) => return,
-                            Ok(Err(e)) => e.to_string(),
-                            Err(join) => join.to_string(),
-                        };
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Write,
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "input_tokens": tokens,
-                                "accepted": is_accepted,
-                                "error": error,
-                            })),
-                            "Failed to persist ACP session token_count"
-                        );
-                    });
                 }
                 continue;
             }
@@ -2359,6 +2331,44 @@ fn map_tool_kind(name: &str) -> &'static str {
     }
 }
 
+/// Ordered, awaited durable write for one `TurnEvent::Usage`.
+///
+/// The ACP drain loop is sequential, so awaiting here preserves event order
+/// (accepted `Some` followed by accepted `None` clears) and guarantees
+/// completion before the prompt result. Rejected billing telemetry never
+/// touches the store; failures are best-effort WARN logs.
+async fn persist_acp_usage_snapshot_ordered(
+    store: &Arc<AcpSessionStore>,
+    session_id: &str,
+    input_tokens: Option<u64>,
+    accepted: bool,
+) {
+    let store = Arc::clone(store);
+    let sid = session_id.to_string();
+    let persisted = tokio::task::spawn_blocking(move || {
+        store.persist_usage_snapshot(&sid, input_tokens, accepted)
+    })
+    .await;
+    let error = match persisted {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(join) => Some(join.to_string()),
+    };
+    if let Some(error) = error {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write,)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "input_tokens": input_tokens,
+                    "accepted": accepted,
+                    "error": error,
+                })),
+            "Failed to persist ACP session token_count"
+        );
+    }
+}
+
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<JsonRpcNotification> {
     Some(match event {
         TurnEvent::Chunk { delta } => JsonRpcNotification {
@@ -2669,6 +2679,38 @@ mod tests {
         };
 
         assert!(notification_for_turn_event("session", &event).is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_usage_snapshots_persist_in_event_order_before_result() {
+        // Accepted Some followed by accepted None must clear, not resurrect.
+        // The ordered drain awaits each write, so the clear is durable before
+        // the prompt result is returned and an immediate load/resume sees it.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-acp-usage-order";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
+        persist_acp_usage_snapshot_ordered(&store, session_id, None, true).await;
+
+        assert_eq!(
+            store.load_session(session_id).unwrap().unwrap().token_count,
+            0,
+            "accepted usage-less event must clear stale count immediately"
+        );
+
+        // Rejected billing telemetry must not touch the accepted snapshot.
+        persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
+        persist_acp_usage_snapshot_ordered(&store, session_id, Some(5000), false).await;
+        assert_eq!(
+            store.load_session(session_id).unwrap().unwrap().token_count,
+            1000,
+            "rejected usage is billing-only"
+        );
     }
 
     struct EmptyTerminalProvider;
