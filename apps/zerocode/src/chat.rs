@@ -1093,15 +1093,20 @@ impl Chat {
         if let ChatPhase::Active(state) = &mut self.phase {
             state.transcript_snapshot = Some(TranscriptSnapshot {
                 area: Rect::new(0, 0, 5, 1),
-                cells: "hello"
-                    .chars()
-                    .enumerate()
-                    .map(|(column, ch)| TranscriptCell {
-                        symbol: ch.to_string(),
-                        span_start: column as u16,
-                    })
-                    .collect(),
-                row_breaks: vec![TranscriptRowBreak::Hard],
+                scroll: 0,
+                total_rows: 1,
+                cells: std::collections::BTreeMap::from([(
+                    0,
+                    "hello"
+                        .chars()
+                        .enumerate()
+                        .map(|(column, ch)| TranscriptCell {
+                            symbol: ch.to_string(),
+                            span_start: column as u16,
+                        })
+                        .collect(),
+                )]),
+                row_breaks: std::collections::BTreeMap::from([(0, TranscriptRowBreak::Hard)]),
             });
             assert!(state.begin_transcript_drag(0, 0));
             if move_pointer {
