@@ -1517,16 +1517,18 @@ impl RpcDispatcher {
                 .acp_session_store
                 .clone()
                 .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
-            crate::agent::agent::Agent::from_live_config_with_tui_env_and_acp_sessions(
-                Arc::clone(&self.ctx.config),
-                &req.agent_alias,
-                cwd_path,
-                initialize_mcp,
-                exclude_memory,
-                tui_env,
-                self.ctx.sop_engine.clone(),
-                self.ctx.sop_audit.clone(),
-                store,
+            Box::pin(
+                crate::agent::agent::Agent::from_live_config_with_tui_env_and_acp_sessions(
+                    Arc::clone(&self.ctx.config),
+                    &req.agent_alias,
+                    cwd_path,
+                    initialize_mcp,
+                    exclude_memory,
+                    tui_env,
+                    self.ctx.sop_engine.clone(),
+                    self.ctx.sop_audit.clone(),
+                    store,
+                ),
             )
             .await
         } else {
