@@ -1648,28 +1648,31 @@ async fn process_chat_message(
             let cost_usd = UsageFold::total_cost_usd(&usage_by_provider_vec);
 
             // Resolve context_window from the last-served provider's config.
+            // The served model must match the entry's configured primary model;
+            // fallback/vision/override models omit the window so clients fall
+            // back to the trim budget instead of understating fullness.
+            // Use the last served model from usage events when available so
+            // the terminal metadata is one coherent tuple with the provider.
+            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
             let model_context_window = if let Some(ref provider_ref) = usage_fold.last_provider_ref
             {
                 state
                     .config
                     .read()
-                    .model_provider_context_window_opt(provider_ref)
+                    .model_provider_context_window_opt(provider_ref, effective_model)
                     .map(|v| v as u64)
             } else {
-                let (_, live_provider, _) = agent.attribution_fields();
+                let (_, live_provider, live_model) = agent.attribution_fields();
                 if live_provider.is_empty() {
                     None
                 } else {
                     state
                         .config
                         .read()
-                        .model_provider_context_window_opt(&live_provider)
+                        .model_provider_context_window_opt(&live_provider, &live_model)
                         .map(|v| v as u64)
                 }
             };
-            // Use the last served model from usage events when available so
-            // the terminal metadata is one coherent tuple with the provider.
-            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
             // Full provider_ref for the done frame: last served ref when
             // available, otherwise fall back to the turn-start provider label.
             let provider_ref_full = usage_fold
@@ -2870,6 +2873,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .models
                 .ensure(vendor, model_alias)
                 .expect("ensure creates entry");
+            entry.model = Some("glm-5.2".to_string());
             if let Some(w) = context_window {
                 entry.context_window = Some(w);
             }
@@ -2883,7 +2887,7 @@ data: {\"type\":\"message_stop\"}\n\n",
 
             let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
             let model_ctx_window = cfg
-                .model_provider_context_window_opt(provider_alias)
+                .model_provider_context_window_opt(provider_alias, "glm-5.2")
                 .map(|v| v as u64);
             assert_eq!(
                 model_ctx_window, expected_window,
@@ -2980,11 +2984,12 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .expect("ensure A");
             // Provider B (switched-to) — has context_window.
             let (b_vendor, b_alias) = live_provider_ref.split_once('.').unwrap();
-            providers
+            let entry_b = providers
                 .models
                 .ensure(b_vendor, b_alias)
-                .expect("ensure B")
-                .context_window = Some(1_000_000);
+                .expect("ensure B");
+            entry_b.context_window = Some(1_000_000);
+            entry_b.model = Some("glm-5.2".to_string());
 
             let cfg = Config {
                 agents,
@@ -2994,7 +2999,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             };
 
             let model_ctx_window = cfg
-                .model_provider_context_window_opt(live_provider_ref)
+                .model_provider_context_window_opt(live_provider_ref, "glm-5.2")
                 .map(|v| v as u64);
             assert_eq!(
                 model_ctx_window,
@@ -3033,6 +3038,114 @@ data: {\"type\":\"message_stop\"}\n\n",
             assert_eq!(v["last_serving_provider_ref"], live_provider_ref);
             assert_eq!(v["last_serving_model"], "glm-5.2");
         }
+    }
+
+    /// Blocking (note12): same-profile fallback to a different model must not
+    /// borrow the primary model's capacity. Configures `openai.default` for
+    /// model-a with a 200k window and fallback_models=[model-b]. Serving
+    /// model-b under the same provider_ref must omit `model_context_window`
+    /// so clients fall back to the trim budget.
+    #[test]
+    fn done_frame_model_window_omitted_on_same_profile_model_fallback() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(800_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openai.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        let entry = providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure entry");
+        entry.model = Some("model-a".to_string());
+        entry.fallback_models = vec!["model-b".to_string()];
+        entry.context_window = Some(200_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        // Shared resolution: primary matches, fallback does not.
+        assert_eq!(
+            cfg.model_provider_context_window_opt("openai.default", "model-a"),
+            Some(200_000)
+        );
+        assert_eq!(
+            cfg.model_provider_context_window_opt("openai.default", "model-b"),
+            None,
+            "fallback model must not borrow the primary's capacity"
+        );
+
+        // Gateway projection: drive the production fold with a model-b Usage
+        // event, then resolve exactly as the WS handler does.
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openai.default",
+            "model-b",
+            Some(1000),
+            None,
+            Some(500),
+            Some(0.01),
+            true,
+        ));
+        assert_eq!(fold.last_provider_ref.as_deref(), Some("openai.default"));
+        assert_eq!(fold.last_model.as_deref(), Some("model-b"));
+
+        let effective_model = fold.last_model.as_deref().unwrap_or("model-a");
+        let provider_ref = fold.last_provider_ref.as_deref().unwrap();
+        let model_ctx_window = cfg
+            .model_provider_context_window_opt(provider_ref, effective_model)
+            .map(|v| v as u64);
+        assert!(
+            model_ctx_window.is_none(),
+            "gateway must omit window when served model differs from configured primary"
+        );
+
+        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            tokens_used: Some(1500),
+            cost_usd: Some(0.01),
+            model: effective_model,
+            provider: "openai.default",
+            provider_ref,
+            max_context_tokens: max_ctx,
+            model_context_window: model_ctx_window,
+            last_input_tokens: Some(1000),
+            last_serving_provider_ref: Some(provider_ref),
+            last_serving_model: Some(effective_model),
+        };
+        let done = build_done_frame_json(&meta, &[]);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert!(
+            v.get("model_context_window").is_none(),
+            "done-frame must omit model_context_window on same-profile fallback"
+        );
+        assert_eq!(v["max_context_tokens"], 800_000);
+        assert_eq!(v["last_serving_model"], "model-b");
     }
 
     /// Regression: two models served under one provider_ref produce two

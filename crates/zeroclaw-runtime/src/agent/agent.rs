@@ -11617,12 +11617,14 @@ mod tests {
             .ensure("openai", "provider-a")
             .expect("ensure provider A");
         provider_a.context_window = Some(128_000);
+        provider_a.model = Some("gpt-4o-mini".into());
         let provider_b = cfg
             .providers
             .models
             .ensure("ollama", "provider-b")
             .expect("ensure provider B");
         provider_b.context_window = Some(1_000_000);
+        provider_b.model = Some("llama3".into());
 
         let cfg_arc = std::sync::Arc::new(cfg);
         let switch_cfg = ProviderSwitchConfig {
@@ -11632,10 +11634,10 @@ mod tests {
         let mut agent = build_test_agent("openai.provider-a", "gpt-4o-mini", Some(switch_cfg));
 
         // Before switch: resolve with provider A's ref
-        let (_, live_provider_before, _) = agent.attribution_fields();
+        let (_, live_provider_before, live_model_before) = agent.attribution_fields();
         assert_eq!(live_provider_before, "openai.provider-a");
         let window_before = cfg_arc
-            .model_provider_context_window_opt(&live_provider_before)
+            .model_provider_context_window_opt(&live_provider_before, &live_model_before)
             .map(|v| v as u64);
         assert_eq!(window_before, Some(128_000));
 
@@ -11652,10 +11654,10 @@ mod tests {
         );
 
         // After switch: B's ref and window
-        let (_, live_provider_after, _) = agent.attribution_fields();
+        let (_, live_provider_after, live_model_after) = agent.attribution_fields();
         assert_eq!(live_provider_after, "ollama.provider-b");
         let window_after = cfg_arc
-            .model_provider_context_window_opt(&live_provider_after)
+            .model_provider_context_window_opt(&live_provider_after, &live_model_after)
             .map(|v| v as u64);
         assert_eq!(window_after, Some(1_000_000));
     }

@@ -2436,10 +2436,17 @@ impl RpcDispatcher {
                         .await;
                     // Resolve model_context_window per event from the embedded provider_ref.
                     // No agent-mutex reacquisition — resolve the live provider's window
-                    // from the config RwLock (read-only, non-blocking).
-                    let model_ctx_window = if let TurnEvent::Usage { provider_ref, .. } = &event {
+                    // from the config RwLock (read-only, non-blocking). The served
+                    // model must match the entry's configured model; otherwise omit
+                    // so fallback/vision/override models fall back to trim budget.
+                    let model_ctx_window = if let TurnEvent::Usage {
+                        provider_ref,
+                        model,
+                        ..
+                    } = &event
+                    {
                         let cfg = config.read();
-                        cfg.model_provider_context_window_opt(provider_ref)
+                        cfg.model_provider_context_window_opt(provider_ref, model)
                             .map(|v| v as u64)
                     } else {
                         None
@@ -8433,7 +8440,7 @@ mod tests {
 
         let max_ctx = Some(context_usage_max_tokens(&cfg, "coder"));
         let model_ctx_window = cfg
-            .model_provider_context_window_opt("openrouter.default")
+            .model_provider_context_window_opt("openrouter.default", "test-model")
             .map(|v| v as u64);
         assert!(
             model_ctx_window.is_none(),
@@ -8575,13 +8582,13 @@ mod tests {
             .get_agent(&session_id)
             .await
             .expect("agent exists");
-        let (_, live_provider, _) = agent.lock().await.attribution_fields();
+        let (_, live_provider, live_model) = agent.lock().await.attribution_fields();
         assert_eq!(live_provider, "openai.provider-b");
 
         // Resolve model_context_window from the live provider
         let cfg = dispatcher.ctx.config.read();
         let model_ctx_window = cfg
-            .model_provider_context_window_opt(&live_provider)
+            .model_provider_context_window_opt(&live_provider, &live_model)
             .map(|v| v as u64);
         assert_eq!(model_ctx_window, Some(1_000_000));
 
@@ -8604,6 +8611,101 @@ mod tests {
         assert_eq!(
             v["params"]["model_context_window"], 1_000_000,
             "emitted context_usage must carry B's model_context_window (1M), not A's (128k)"
+        );
+    }
+
+    /// Blocking (note12): same-profile fallback to a different model must not
+    /// borrow the primary's capacity. Mirrors the gateway regression with the
+    /// same config: `openai.default` for model-a (200k) with
+    /// fallback_models=[model-b]. Serving model-b must omit
+    /// `model_context_window` on the RPC wire so clients use the trim budget.
+    #[test]
+    fn context_usage_omits_window_on_same_profile_model_fallback() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(800_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openai.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        let entry = providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure entry");
+        entry.model = Some("model-a".to_string());
+        entry.fallback_models = vec!["model-b".to_string()];
+        entry.context_window = Some(200_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        // Shared resolution: primary matches, fallback does not.
+        assert_eq!(
+            cfg.model_provider_context_window_opt("openai.default", "model-a"),
+            Some(200_000)
+        );
+        assert_eq!(
+            cfg.model_provider_context_window_opt("openai.default", "model-b"),
+            None,
+            "fallback model must not borrow the primary's capacity"
+        );
+
+        // RPC projection: resolve per event exactly as dispatch does.
+        let event = TurnEvent::Usage {
+            input_tokens: Some(1000),
+            cached_input_tokens: None,
+            output_tokens: Some(500),
+            cost_usd: Some(0.01),
+            provider_ref: "openai.default".to_string(),
+            model: "model-b".to_string(),
+            accepted: true,
+        };
+        let model_ctx_window = if let TurnEvent::Usage {
+            provider_ref,
+            model,
+            ..
+        } = &event
+        {
+            cfg.model_provider_context_window_opt(provider_ref, model)
+                .map(|v| v as u64)
+        } else {
+            None
+        };
+        assert!(
+            model_ctx_window.is_none(),
+            "RPC must omit window when served model differs from configured primary"
+        );
+
+        let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let json =
+            notification_for_turn_event("s1", &event, Some(max_ctx), model_ctx_window).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(v["params"]["max_context_tokens"], 800_000);
+        assert!(
+            v["params"].get("model_context_window").is_none(),
+            "RPC wire must omit model_context_window on same-profile fallback"
         );
     }
 

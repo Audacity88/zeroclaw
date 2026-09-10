@@ -837,12 +837,13 @@ mod tests {
 
         // Build a config with a provider that has context_window set.
         let mut config = Config::default();
-        config
+        let entry = config
             .providers
             .models
             .ensure("openai", "default")
-            .expect("ensure provider")
-            .context_window = Some(128_000);
+            .expect("ensure provider");
+        entry.context_window = Some(128_000);
+        entry.model = Some("test-model".to_string());
         let config: Arc<parking_lot::RwLock<Config>> = Arc::new(config.into());
 
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -898,14 +899,18 @@ mod tests {
                 let rw = Arc::clone(&rw);
                 async move {
                     match &event {
-                        TurnEvent::Usage { provider_ref, .. } => {
+                        TurnEvent::Usage {
+                            provider_ref,
+                            model,
+                            ..
+                        } => {
                             *uc.lock().unwrap() += 1;
                             // Resolve model_context_window from the embedded
                             // provider_ref via config.read() — NOT via the
                             // agent mutex. This is the drain fix path.
                             let cfg = cfg.read();
                             let window = cfg
-                                .model_provider_context_window_opt(provider_ref)
+                                .model_provider_context_window_opt(provider_ref, model)
                                 .map(|v| v as u64);
                             *rw.lock().unwrap() = window;
                         }
@@ -979,6 +984,7 @@ mod tests {
                     .models
                     .ensure(type_key, alias_key)
                     .expect("ensure provider for matrix cell");
+                entry.model = Some("matrix-model".to_string());
                 if let Some(window) = cell.context_window {
                     entry.context_window = Some(window as usize);
                 }
@@ -1063,7 +1069,11 @@ mod tests {
                     let dc = Arc::clone(&dc);
                     async move {
                         match &event {
-                            TurnEvent::Usage { provider_ref, .. } => {
+                            TurnEvent::Usage {
+                                provider_ref,
+                                model,
+                                ..
+                            } => {
                                 *dc.usage_count.lock().unwrap() += 1;
                                 let before_second = dc
                                     .saw_second_usage
@@ -1076,7 +1086,7 @@ mod tests {
                                     .push(provider_ref.clone());
                                 let cfg = cfg.read();
                                 let window = cfg
-                                    .model_provider_context_window_opt(provider_ref)
+                                    .model_provider_context_window_opt(provider_ref, model)
                                     .map(|v| v as u64);
                                 dc.resolved_windows.lock().unwrap().push(window);
                                 if before_second {
@@ -1220,6 +1230,7 @@ mod tests {
             .ensure("openai", "default")
             .expect("ensure provider entry");
         provider_entry.context_window = Some(128_000);
+        provider_entry.model = Some("w1-model".to_string());
 
         let memory_cfg = MemoryConfig {
             backend: "none".into(),
@@ -1321,9 +1332,14 @@ mod tests {
                 async move {
                     // Resolve model_context_window per event from the embedded
                     // provider_ref (only Usage events carry it).
-                    let model_ctx_window = if let TurnEvent::Usage { provider_ref, .. } = &event {
+                    let model_ctx_window = if let TurnEvent::Usage {
+                        provider_ref,
+                        model,
+                        ..
+                    } = &event
+                    {
                         let cfg = cfg.read();
-                        cfg.model_provider_context_window_opt(provider_ref)
+                        cfg.model_provider_context_window_opt(provider_ref, model)
                             .map(|v| v as u64)
                     } else {
                         None

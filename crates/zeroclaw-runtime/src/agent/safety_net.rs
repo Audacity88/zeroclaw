@@ -2253,6 +2253,7 @@ async fn usage_event_coherent_tuple_vision_route() {
             .ensure("openai", "default")
             .expect("ensure base");
         base.context_window = Some(128_000); // must remain on the BASE provider only
+        base.model = Some("gpt-4o-mini".into());
         let vision = cfg
             .providers
             .models
@@ -2368,7 +2369,7 @@ async fn usage_event_coherent_tuple_vision_route() {
         );
 
         let resolved = cfg
-            .model_provider_context_window_opt(&usage.0)
+            .model_provider_context_window_opt(&usage.0, &usage.1)
             .map(|v| v as u64);
         assert_eq!(
             resolved, vision_window,
@@ -2377,7 +2378,7 @@ async fn usage_event_coherent_tuple_vision_route() {
 
         // Negative control: the BASE provider's window must NOT have leaked.
         let base_resolved = cfg
-            .model_provider_context_window_opt("openai.default")
+            .model_provider_context_window_opt("openai.default", "gpt-4o-mini")
             .map(|v| v as u64);
         assert_eq!(
             base_resolved,
@@ -2561,7 +2562,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         // ASSERTION 3: resolve_live_model_context_window follows the
         // SERVING provider's config_window, never the trim budget.
         let resolved = cfg
-            .model_provider_context_window_opt(&usage.0)
+            .model_provider_context_window_opt(&usage.0, &usage.1)
             .map(|v| v as u64);
         assert_eq!(
             resolved, switch_window,
@@ -2847,7 +2848,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
 
     // context_window resolved from Provider B's config
     let resolved_b = cfg
-        .model_provider_context_window_opt("anthropic.provider-b")
+        .model_provider_context_window_opt("anthropic.provider-b", "claude-3-opus")
         .map(|v| v as u64);
     assert_eq!(resolved_b, Some(200_000));
 }
