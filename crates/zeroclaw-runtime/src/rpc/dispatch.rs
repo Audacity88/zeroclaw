@@ -9830,7 +9830,10 @@ mod tests {
         });
         assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
 
-        let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
+        let failed = Err(crate::rpc::turn::TurnError::AgentError {
+            message: "failed".into(),
+            messages: Vec::new(),
+        });
         assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
         assert!(
             store
