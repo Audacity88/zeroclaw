@@ -204,7 +204,7 @@ Confirm with the user before running any estop command — these are disruptive.
 
 ### Channels
 
-Channel availability depends on the installed build's feature set. Use `zeroclaw channels list` to inspect configured channels and `zeroclaw channels doctor` to check their health. Consult the current channel guide and generated config reference before configuring a channel; do not infer config keys from a fixed channel inventory.
+Channel availability depends on the installed build's feature set. Use `zeroclaw channels list` to inspect configured channels and `zeroclaw channel doctor` to check their health. Consult the current channel guide and generated config reference before configuring a channel; do not infer config keys from a fixed channel inventory.
 
 ### Pairing (Authentication Setup)
 
@@ -227,7 +227,7 @@ Here are multi-step sequences you're likely to need:
 1. Inspect the relevant channel's configuration fields without printing credentials.
 2. Configure the channel with `zeroclaw config set channels.<name>.<field> <value>`; omit secret values to use the masked input prompt.
 3. Restart: `zeroclaw service restart` (or restart daemon manually)
-4. Verify: `zeroclaw channels doctor`
+4. Verify: `zeroclaw channel doctor`
 
 **"Switch to a different model"**
 1. Check available: `zeroclaw models list`
@@ -270,6 +270,6 @@ Only load these when you need precise details beyond what's in this file — for
 
 **Memory not persisting** — Check `[memory]` config. If `backend = "none"`, nothing is stored. Switch to `"sqlite"` or `"markdown"`. Also verify `auto_save = true`.
 
-**Channel not responding** — Run `zeroclaw channels doctor` for the specific channel. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
+**Channel not responding**: Run `zeroclaw channel doctor` and inspect the affected channel's result. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
 
 Report errors to the user with context appropriate to their expertise level. For beginners, explain what went wrong and suggest the fix. For experts, just show the error and the fix.
