@@ -475,7 +475,10 @@ mod tests {
                     &messages[0],
                     ConversationMessage::Chat(m) if m.role == "user"
                 ));
-                assert!(matches!(&messages[3], ConversationMessage::AssistantToolCalls { .. }));
+                assert!(matches!(
+                    &messages[3],
+                    ConversationMessage::AssistantToolCalls { .. }
+                ));
             }
             _ => panic!("expected AgentError carrying the turn messages"),
         }
