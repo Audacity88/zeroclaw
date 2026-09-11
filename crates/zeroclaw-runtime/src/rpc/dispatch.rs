@@ -1251,7 +1251,8 @@ impl RpcDispatcher {
             Method::Initialize => self.handle_initialize(params).await,
             Method::Status => self.handle_status().await,
             Method::Health => self.handle_health(),
-            Method::DoctorRun => self.handle_doctor_run().await,
+            // Heap-pinned for the same reason as `ConfigSet` below.
+            Method::DoctorRun => Box::pin(self.handle_doctor_run()).await,
 
             // Sessions
             Method::SessionNew => self.handle_session_new(params).await,
@@ -1301,26 +1302,26 @@ impl RpcDispatcher {
             Method::CronPatch => self.handle_cron_patch(params).await,
             Method::CronDelete => self.handle_cron_delete(params).await,
             Method::CronRuns => self.handle_cron_runs(params).await,
-            Method::CronTrigger => self.handle_cron_trigger(params).await,
+            Method::CronTrigger => Box::pin(self.handle_cron_trigger(params)).await,
             Method::CronSettings => self.handle_cron_settings(params).await,
 
             // Config
             Method::ConfigGet => self.handle_config_get(params),
-            Method::ConfigSet => self.handle_config_set(params).await,
+            Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
             Method::ConfigValidate => self.handle_config_validate(),
             Method::ConfigReload => self.handle_config_reload(),
             Method::ConfigList => self.handle_config_list(params),
-            Method::ConfigDelete => self.handle_config_delete(params).await,
+            Method::ConfigDelete => Box::pin(self.handle_config_delete(params)).await,
             Method::ConfigMapKeys => self.handle_config_map_keys(params),
             Method::ConfigResolveAliasSource => self.handle_config_resolve_alias_source(params),
-            Method::ConfigMapKeyCreate => self.handle_config_map_key_create(params).await,
-            Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(params).await,
+            Method::ConfigMapKeyCreate => Box::pin(self.handle_config_map_key_create(params)).await,
+            Method::ConfigMapKeyDelete => Box::pin(self.handle_config_map_key_delete(params)).await,
             Method::ConfigMapKeyRename => self.handle_config_map_key_rename(params).await,
             Method::ConfigTemplates => self.handle_config_templates(),
 
             // Agents
             Method::AgentsList => self.handle_agents_list(),
-            Method::AgentsStatus => self.handle_agents_status().await,
+            Method::AgentsStatus => Box::pin(self.handle_agents_status()).await,
             Method::AgentDeletePreview => self.handle_agent_delete_preview(params).await,
             Method::AgentDelete => Box::pin(self.handle_agent_delete(params)).await,
 
@@ -1345,7 +1346,9 @@ impl RpcDispatcher {
             Method::ConfigSections => self.handle_config_sections(),
             Method::ConfigStatus => self.handle_config_status(),
             Method::ConfigCatalog => self.handle_config_catalog(),
-            Method::ConfigCatalogModels => self.handle_config_catalog_models(params).await,
+            Method::ConfigCatalogModels => {
+                Box::pin(self.handle_config_catalog_models(params)).await
+            }
 
             // Logs
             Method::LogsSubscribe => self.handle_logs_subscribe().await,
@@ -1369,7 +1372,7 @@ impl RpcDispatcher {
             Method::QuickstartState => self.handle_quickstart_state(),
             Method::QuickstartFields => self.handle_quickstart_fields(params),
             Method::QuickstartValidate => self.handle_quickstart_validate(params),
-            Method::QuickstartApply => self.handle_quickstart_apply(params).await,
+            Method::QuickstartApply => Box::pin(self.handle_quickstart_apply(params)).await,
             Method::QuickstartDismiss => self.handle_quickstart_dismiss(params),
             Method::CertRenew => self.handle_renew_cert(params).await,
 
@@ -14522,11 +14525,10 @@ mod tests {
     async fn queued_remote_prompt_rejects_a_local_same_id_successor() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
-        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
-            4, 10, 60,
-        ));
-        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let data_dir = config.data_dir.clone();
+        let (seed, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&seed.ctx);
         let (remote_tx, _remote_rx) = tokio::sync::mpsc::channel(64);
         let mut remote = RpcDispatcher::new_with_access_policy(
             Arc::clone(&ctx),
@@ -14544,6 +14546,7 @@ mod tests {
             .unwrap()
             .to_string();
         let workspace = sessions.get_workspace_dir(&session_id).await.unwrap();
+        let original = sessions.get_agent(&session_id).await.unwrap();
 
         let admission = sessions.session_queue.acquire(&session_id).await.unwrap();
         let (local_tx, _local_rx) = tokio::sync::mpsc::channel(64);
@@ -14554,6 +14557,7 @@ mod tests {
                 .handle_session_new_for_test(&json!({
                     "agent_alias": "test-agent",
                     "session_id": replacement_id,
+                    "chat_mode": "acp",
                     "cwd": workspace,
                 }))
                 .await
@@ -14576,6 +14580,8 @@ mod tests {
             .await
             .expect("replacement task must join")
             .expect("trusted local replacement must succeed");
+        let successor = sessions.get_agent(&session_id).await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &successor));
         let error = prompt
             .await
             .expect("prompt task must join")
@@ -14592,11 +14598,10 @@ mod tests {
     async fn queued_remote_close_preserves_a_local_same_id_successor() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
-        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
-            4, 10, 60,
-        ));
-        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let data_dir = config.data_dir.clone();
+        let (seed, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&seed.ctx);
         let (remote_tx, _remote_rx) = tokio::sync::mpsc::channel(64);
         let mut remote = RpcDispatcher::new_with_access_policy(
             Arc::clone(&ctx),
@@ -14614,6 +14619,7 @@ mod tests {
             .unwrap()
             .to_string();
         let workspace = sessions.get_workspace_dir(&session_id).await.unwrap();
+        let original = sessions.get_agent(&session_id).await.unwrap();
 
         let admission = sessions.session_queue.acquire(&session_id).await.unwrap();
         let (local_tx, _local_rx) = tokio::sync::mpsc::channel(64);
@@ -14624,6 +14630,7 @@ mod tests {
                 .handle_session_new_for_test(&json!({
                     "agent_alias": "test-agent",
                     "session_id": replacement_id,
+                    "chat_mode": "acp",
                     "cwd": workspace,
                 }))
                 .await
@@ -14643,6 +14650,8 @@ mod tests {
             .await
             .expect("replacement task must join")
             .expect("trusted local replacement must succeed");
+        let successor = sessions.get_agent(&session_id).await.unwrap();
+        assert!(!Arc::ptr_eq(&original, &successor));
         let error = close
             .await
             .expect("close task must join")
@@ -15076,6 +15085,34 @@ mod tests {
             .expect("stack regression thread should spawn")
             .join()
             .expect("session/new should not exhaust a two-megabyte stack");
+    }
+
+    /// `process_line`'s exhaustive `match` sizes its generated state machine
+    /// to the largest inline-awaited branch, regardless of which arm a given
+    /// call actually takes — so a large future added to any one method can
+    /// blow the constrained-stack regression above even though that method
+    /// has nothing to do with `session/new`. Catch a regrowth here on every
+    /// platform instead of only on the Windows-only advisory job where the
+    /// stack overflow actually reproduces. The threshold is a generous
+    /// multiple of the current heap-pinned baseline (a few KB), not a tight
+    /// bound: the intent is to catch a new multi-hundred-KB branch, not to
+    /// force every incidental size change through this test.
+    #[test]
+    fn process_line_future_stays_small_enough_for_a_two_megabyte_stack() {
+        let tmp = tempfile::TempDir::new().expect("temporary test directory");
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _sessions, _rx) = make_acp_test_dispatcher_with_receiver(config);
+        let fut = dispatcher.process_line("{}");
+        let size = std::mem::size_of_val(&fut);
+        assert!(
+            size < 32 * 1024,
+            "process_line's future grew to {size} bytes; a new or changed handler is now \
+             inlined into this match without Box::pin, which can overflow the 2MB Windows \
+             thread stack this exists to protect (see \
+             process_line_session_new_creates_session_on_two_megabyte_stack). Box::pin the \
+             large new branch the same way ConfigSet, QuickstartApply, and the other handlers \
+             above are"
+        );
     }
 
     #[tokio::test]
@@ -16915,8 +16952,9 @@ mod tests {
             .expect("openai.test-provider slot exists")
             .model = Some("old-model".into());
 
-        // Replace the session via ACP rehydration while the stale refresh
-        // is paused. This installs a same-ID successor via SessionStore::insert.
+        // Reap the old incarnation before rehydration; live sessions cannot
+        // be overwritten by the recovery path.
+        sessions.remove(&session_id).await;
         let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
         assert!(
             rehydrated.is_some(),

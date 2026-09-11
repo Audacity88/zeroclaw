@@ -5290,7 +5290,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let message = ta(
                         "cli-standalone-daemon-owned",
                         &[("command", command), ("path", &data_dir.display().to_string())],
-                        &format!(
+                        format!(
                             "Cannot run `zeroclaw {command}` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
                             data_dir.display()
                         ),
@@ -5337,7 +5337,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let message = ta(
                         "cli-standalone-daemon-owned",
                         &[("command", "daemon"), ("path", &data_dir.display().to_string())],
-                        &format!(
+                        format!(
                             "Cannot run `zeroclaw daemon` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
                             data_dir.display()
                         ),
