@@ -2101,4 +2101,65 @@ mod tests {
             "a disabled resident tracker must short-circuit enforcement"
         );
     }
+
+    #[test]
+    fn derived_tracker_shares_ledger_and_enforces_its_own_limit() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        let mut capped = base.config();
+        capped.daily_limit_usd = 0.5;
+        let derived = base.derived_with_config(capped);
+        assert!(
+            (derived.config().daily_limit_usd - 0.5).abs() < f64::EPSILON,
+            "the derived tracker must enforce the substituted limit"
+        );
+        assert!(
+            (derived.config().monthly_limit_usd - 500.0).abs() < f64::EPSILON,
+            "the derived tracker must keep the base tracker's other limits"
+        );
+        assert_eq!(derived.session_id(), base.session_id());
+
+        // Spend recorded through the base tracker is immediately visible to
+        // the derived tracker's budget check (shared storage, no stale fork).
+        base.record_usage(TokenUsage::new("test/model", 2_000_000, 0, 0, 3.0, 3.0, 0.0))
+            .unwrap();
+        assert!(
+            matches!(
+                derived.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded { .. }
+            ),
+            "the derived tracker must see shared-ledger spend against its cap"
+        );
+        assert!(
+            matches!(base.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "the base tracker must still enforce its own (looser) limit"
+        );
+
+        // Spend recorded through the derived tracker lands on the same
+        // durable ledger the base tracker reads.
+        derived
+            .record_usage(TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0))
+            .unwrap();
+        let day = Utc::now().date_naive();
+        let daily = base.get_daily_cost(day).unwrap();
+        assert!(
+            daily > 0.0,
+            "usage recorded through the derived tracker must reach the shared ledger"
+        );
+        assert!(
+            (derived.get_daily_cost(day).unwrap() - daily).abs() < f64::EPSILON,
+            "both trackers must read the same ledger file"
+        );
+    }
 }

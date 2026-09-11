@@ -89,12 +89,27 @@ where
     let Some(cost_ctx) = cost_ctx else {
         return inner.await;
     };
-    TOOL_LOOP_TURN_USAGE
-        .scope(
-            Some(Arc::new(Mutex::new(TurnUsage::default()))),
-            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_ctx), inner),
-        )
-        .await
+    // A detached spawned task has no inherited turn-usage task-local to
+    // shield, and every extra task-local frame counts on the child's poll
+    // chain, so the turn-usage scope is installed only when a parent turn
+    // accumulator is actually live (the in-task paths). In detached tasks
+    // usage accumulates into the context's own turn_usage field, which also
+    // keeps child spend out of the parent's per-turn totals.
+    let parent_turn_usage_live = TOOL_LOOP_TURN_USAGE
+        .try_with(|turn_usage| turn_usage.is_some())
+        .unwrap_or(false);
+    if parent_turn_usage_live {
+        TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::new(Mutex::new(TurnUsage::default()))),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_ctx), inner),
+            )
+            .await
+    } else {
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(cost_ctx), inner)
+            .await
+    }
 }
 
 /// Warn once per process when a delegate executes with neither a live nor a
@@ -272,6 +287,15 @@ pub struct DelegateTool {
     /// daemon-provided control plane wins; non-daemon surfaces share a
     /// process-local handle keyed by `root_config.data_dir`.
     task_control_plane: Arc<tokio::sync::OnceCell<crate::control_plane::ControlPlaneHandle>>,
+    /// Cost-tracking context a detached-task caller (background or parallel)
+    /// built BEFORE the spawn and carried into this child tool. Tagged with
+    /// the target alias it was built for: the execute-path scope install
+    /// consumes it only for that one delegation, so second-hop delegates
+    /// still resolve their own context. Detached tasks drop task-locals, and
+    /// wrapping the child's execution in a second scope would stack another
+    /// layer on its (stack-marginal) poll chain, so carrying the pre-built
+    /// context is how the spawn-site context reaches the spawned sub-loop.
+    prebuilt_cost_ctx: Option<(String, ToolLoopCostTrackingContext)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,6 +414,7 @@ impl DelegateTool {
             live_config: None,
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
+            prebuilt_cost_ctx: None,
         }
     }
 
@@ -439,6 +464,7 @@ impl DelegateTool {
             live_config: None,
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
+            prebuilt_cost_ctx: None,
         }
     }
 
@@ -1999,7 +2025,20 @@ impl DelegateTool {
         // resolved policy (`0` = inherit the global limit); prevalidated
         // callers carry it on `security` itself.
         let cost_ceiling_cents = resolved_target_policy.max_cost_per_day_cents;
-        let cost_ctx = self.delegate_cost_context(agent_name, cost_ceiling_cents);
+        // Prevalidated callers (the detached background/parallel workers)
+        // build the context BEFORE their spawn and carry it in; reusing it
+        // here keeps the spawned sub-loop under a single scope install on
+        // its poll chain. Anything else (direct sync calls, second-hop
+        // delegates) resolves its own context for THIS target.
+        let cost_ctx = if admission == DelegateAdmission::Prevalidated {
+            self.prebuilt_cost_ctx
+                .as_ref()
+                .filter(|(alias, _)| alias == agent_name)
+                .map(|(_, ctx)| ctx.clone())
+                .or_else(|| self.delegate_cost_context(agent_name, cost_ceiling_cents))
+        } else {
+            self.delegate_cost_context(agent_name, cost_ceiling_cents)
+        };
         run_delegate_with_cost_scope(
             cost_ctx,
             self.execute_sync_dispatched(
@@ -2359,12 +2398,15 @@ impl DelegateTool {
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
 
-        // Build the target's cost-tracking context BEFORE the detached spawn:
-        // a spawned task does not inherit the caller's task-locals, so the
-        // context has to travel into the spawned future. The ceiling is the
-        // target policy's effective per-hop daily limit (resolved above; `0`
-        // = inherit the global limit).
+        // Build the target's cost-tracking context BEFORE the detached spawn
+        // and carry it into the child tool: a spawned task does not inherit
+        // the caller's task-locals, and wrapping the child's execution in a
+        // second scope would stack another layer on its poll chain. The
+        // execute-path install consumes the carried context for THIS
+        // delegation. The ceiling is the target policy's effective per-hop
+        // daily limit (resolved above; `0` = inherit the global limit).
         let cost_ctx = self.delegate_cost_context(&agent_name_owned, target_policy_ceiling_cents);
+        let prebuilt_cost_ctx = cost_ctx.map(|ctx| (agent_name_owned.clone(), ctx));
 
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
@@ -2389,6 +2431,7 @@ impl DelegateTool {
                     live_config,
                     caller_alias,
                     task_control_plane: nested_task_control_plane,
+                    prebuilt_cost_ctx,
                 };
 
                 let args_inner = json!({
@@ -2401,15 +2444,12 @@ impl DelegateTool {
                     () = child_token.cancelled() => {
                         Err("Cancelled by parent session".to_string())
                     }
-                    result = Box::pin(run_delegate_with_cost_scope(
-                        cost_ctx,
-                        inner.execute_sync_with_admission(
+                    result = Box::pin(inner.execute_sync_with_admission(
                             &agent_name_owned,
                             &full_prompt,
                             &args_inner,
                             DelegateAdmission::Prevalidated,
-                        ),
-                    )) => {
+                        )) => {
                         match result {
                             Ok(tool_result) => {
                                 if tool_result.success {
@@ -2618,15 +2658,20 @@ impl DelegateTool {
             let __zc_delegate_alias = agent_name.clone();
 
             // Build this worker's cost-tracking context BEFORE the detached
-            // spawn from the TARGET's resolved policy, so each spawned worker
-            // carries its own target-attributed context into the task.
-            let cost_ctx = self.delegate_cost_context(
-                &agent_name,
-                target_policies
-                    .get(&agent_name)
-                    .map(|policy| policy.max_cost_per_day_cents)
-                    .unwrap_or(0),
-            );
+            // spawn from the TARGET's resolved policy, and carry it into the
+            // child tool: spawned tasks drop task-locals, and wrapping the
+            // worker's execution in a second scope would stack another layer
+            // on its poll chain. The execute-path install consumes the
+            // carried context for THIS delegation.
+            let prebuilt_cost_ctx = self
+                .delegate_cost_context(
+                    &agent_name,
+                    target_policies
+                        .get(&agent_name)
+                        .map(|policy| policy.max_cost_per_day_cents)
+                        .unwrap_or(0),
+                )
+                .map(|ctx| (agent_name.clone(), ctx));
 
             handles.push(zeroclaw_spawn::spawn!(
                 async move {
@@ -2651,16 +2696,14 @@ impl DelegateTool {
                         live_config,
                         caller_alias,
                         task_control_plane,
+                        prebuilt_cost_ctx,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = scope_delegate_session_key(session_key, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                             .scope(receipt_scope, async move {
-                                run_delegate_with_cost_scope(
-                                    cost_ctx,
-                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)),
-                                )
-                                .await
+                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                    .await
                             })
                             .await
                     })
@@ -12235,6 +12278,520 @@ command = "rm independent-delegate-marker"
             credential.as_deref(),
             Some("sk-ant-global-coordinator-key"),
             "non-OAuth target without api_key must fall back to global credential"
+        );
+    }
+    // ── Delegated sub-loop cost scoping ─────────────────────────────
+
+    struct DelegateCostFixture {
+        _tmp: TempDir,
+        data_dir: PathBuf,
+        config: Arc<Config>,
+        tool: DelegateTool,
+    }
+
+    fn usage_completion(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {"content": content}
+            }],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 200}
+        })
+    }
+
+    /// Raw-TCP chat server serving `total` identical text+usage completions,
+    /// counting every accepted connection. The count doubles as the
+    /// provider-was-never-reached probe for the ceiling tests.
+    async fn start_usage_chat_server(
+        total: usize,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            for _ in 0..total {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                write_json_response(&mut socket, usage_completion("delegate cost flow done")).await;
+            }
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    /// Caller + agentic targets sharing one delegatable risk profile, with a
+    /// priced ollama-compat provider standing in at the HTTP boundary (the
+    /// same shape the peer-message cost-scope boundary test uses, where the
+    /// served provider ref demonstrably resolves the configured pricing).
+    async fn delegate_cost_fixture(
+        mock_uri: String,
+        daily_limit_usd: f64,
+        cost_tracking_enabled: bool,
+        target_ceiling_cents: u32,
+    ) -> DelegateCostFixture {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            CostConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let workspace_dir = tmp.path().join("workspace");
+        let mut root_config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        root_config.cost = CostConfig {
+            enabled: cost_tracking_enabled,
+            track_per_agent: true,
+            daily_limit_usd,
+            monthly_limit_usd: 10_000.0,
+            ..CostConfig::default()
+        };
+        root_config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("delegate-cost-model".to_string()),
+                    uri: Some(mock_uri),
+                    timeout_secs: Some(10),
+                    pricing: HashMap::from([
+                        ("delegate-cost-model.input".to_string(), 3.0),
+                        ("delegate-cost-model.output".to_string(), 15.0),
+                    ]),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        root_config.risk_profiles.insert(
+            "delegate_cost_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        root_config.runtime_profiles.insert(
+            "delegate_cost_runtime".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                max_cost_per_day_cents: target_ceiling_cents,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let target_config = AliasedAgentConfig {
+            model_provider: "ollama.default".into(),
+            risk_profile: "delegate_cost_profile".into(),
+            runtime_profile: "delegate_cost_runtime".into(),
+            ..AliasedAgentConfig::default()
+        };
+        root_config
+            .agents
+            .insert("caller".to_string(), target_config.clone());
+        root_config
+            .agents
+            .insert("target".to_string(), target_config.clone());
+        root_config
+            .agents
+            .insert("target2".to_string(), target_config);
+
+        let root_config = Arc::new(root_config);
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&root_config))
+            .with_workspace_dir(workspace_dir)
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(root_config.risk_profiles.clone())
+            .with_runtime_profiles(root_config.runtime_profiles.clone())
+            .with_caller_alias("caller");
+
+        DelegateCostFixture {
+            _tmp: tmp,
+            data_dir,
+            config: root_config,
+            tool,
+        }
+    }
+
+    /// Read per-agent ledger aggregates through a tracker instance freshly
+    /// opened over the fixture's data dir, so assertions see exactly what the
+    /// shared JSONL ledger holds regardless of which process-global tracker
+    /// instance recorded the spend (its in-memory session totals are
+    /// instance-local).
+    fn read_agent_cost(data_dir: &Path, alias: &str) -> Option<crate::cost::AgentCostStats> {
+        use crate::cost::CostTracker;
+        use zeroclaw_config::schema::CostConfig;
+
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..CostConfig::default()
+            },
+            data_dir,
+        )
+        .expect("reader tracker over the fixture ledger");
+        tracker
+            .get_summary()
+            .expect("cost summary readable")
+            .by_agent
+            .get(alias)
+            .cloned()
+    }
+
+    /// Poll until the alias's first ledger row lands (detached tasks write
+    /// asynchronously); every iteration opens a fresh tracker so the read is
+    /// served from the ledger file, not a stale in-process cache.
+    async fn poll_agent_cost(data_dir: &Path, alias: &str) -> crate::cost::AgentCostStats {
+        for _ in 0..20_000 {
+            if let Some(stats) = read_agent_cost(data_dir, alias) {
+                return stats;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("cost record for {alias} never reached the shared ledger at {data_dir:?}");
+    }
+
+    /// Seed the fixture's shared daily ledger with `usd` of attributed-to-
+    /// nobody spend, simulating concurrent traffic that exhausted the budget
+    /// before the delegate starts.
+    fn record_seed_spend(fixture: &DelegateCostFixture, usd: f64) {
+        use crate::cost::CostTracker;
+
+        let tracker =
+            CostTracker::get_or_init_global(fixture.config.cost.clone(), &fixture.data_dir)
+                .expect("global cost tracker over the fixture ledger");
+        tracker
+            .record_usage(crate::cost::TokenUsage::new(
+                "seed-model",
+                (usd * 1_000_000.0 / 3.0) as u64,
+                0,
+                0,
+                3.0,
+                3.0,
+                0.0,
+            ))
+            .expect("seed spend recorded");
+    }
+
+    #[tokio::test]
+    async fn sync_delegate_records_usage_under_target_alias() {
+        let (server, _requests) = start_usage_chat_server(1).await;
+        let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 0).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({"agent": "target", "prompt": "produce a status line"}))
+            .await
+            .expect("delegate execute runs");
+        assert!(result.success, "sync delegate failed: {result:?}");
+
+        let stats = poll_agent_cost(&fixture.data_dir, "target").await;
+        assert_eq!(
+            stats.request_count, 1,
+            "the delegated sub-loop's provider call must land on the ledger"
+        );
+        let expected = (1000.0 * 3.0 + 200.0 * 15.0) / 1_000_000.0;
+        assert!(
+            (stats.cost_usd - expected).abs() < 1e-9,
+            "delegated usage must be priced from the configured rates: {} vs {expected}",
+            stats.cost_usd
+        );
+        assert!(
+            read_agent_cost(&fixture.data_dir, "caller").is_none(),
+            "spend must be attributed to the target alias, not the caller's"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_records_usage_under_target_alias() {
+        let (server, _requests) = start_usage_chat_server(1).await;
+        let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 0).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "produce a status line",
+                "background": true
+            }))
+            .await
+            .expect("delegate execute runs");
+        assert!(result.success, "background task should start: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+        let background = wait_for_terminal_background_result(&fixture.tool, &task_id).await;
+        assert_eq!(
+            background.status,
+            BackgroundTaskStatus::Completed,
+            "{background:?}"
+        );
+
+        let stats = poll_agent_cost(&fixture.data_dir, "target").await;
+        assert_eq!(
+            stats.request_count, 1,
+            "the detached sub-loop's usage must be recorded, not dropped as unscoped"
+        );
+        assert!(
+            read_agent_cost(&fixture.data_dir, "caller").is_none(),
+            "spend must be attributed to the target alias, not the caller's"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_delegates_record_usage_per_target_alias() {
+        let (server, requests) = start_usage_chat_server(2).await;
+        let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 0).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "parallel": ["target", "target2"],
+                "prompt": "produce a status line"
+            }))
+            .await
+            .expect("parallel delegate execute runs");
+        assert!(result.success, "parallel delegate failed: {result:?}");
+
+        let target = poll_agent_cost(&fixture.data_dir, "target").await;
+        let target2 = poll_agent_cost(&fixture.data_dir, "target2").await;
+        assert_eq!(target.request_count, 1, "one record per spawned worker");
+        assert_eq!(target2.request_count, 1, "one record per spawned worker");
+        assert!(
+            read_agent_cost(&fixture.data_dir, "caller").is_none(),
+            "parallel spend must be attributed per target alias, not the caller's"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each parallel worker must make exactly one provider call"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_delegate_cost_scope_replaces_then_restores_parent() {
+        use crate::agent::cost::record_tool_loop_cost_usage;
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+        use zeroclaw_providers::traits::TokenUsage;
+
+        let workspace = TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let usage = TokenUsage {
+            input_tokens: Some(1_000),
+            cached_input_tokens: None,
+            output_tokens: Some(200),
+        };
+
+        let parent_ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::clone(&pricing))
+                .with_agent_alias("parent");
+        let child_ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::clone(&pricing))
+                .with_agent_alias("child");
+
+        let parent_alias_after_child = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(parent_ctx), async {
+                let alias_during_child = run_delegate_with_cost_scope(Some(child_ctx), async {
+                    record_tool_loop_cost_usage("mock-provider", "test-model", &usage);
+                    TOOL_LOOP_COST_TRACKING_CONTEXT
+                        .try_with(|ctx| ctx.as_ref().and_then(|c| c.agent_alias.clone()))
+                        .ok()
+                        .flatten()
+                })
+                .await;
+                assert_eq!(
+                    alias_during_child,
+                    Some("child".to_string()),
+                    "the nested sub-loop must run under the child's context"
+                );
+                // Back outside the child helper, the parent's context is
+                // restored by construction (D4).
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .try_with(|ctx| ctx.as_ref().and_then(|c| c.agent_alias.clone()))
+                    .expect("parent scope still installed")
+            })
+            .await;
+
+        assert_eq!(
+            parent_alias_after_child,
+            Some("parent".to_string()),
+            "the child's scope must replace, not merge, and restore the parent's"
+        );
+        let summary = tracker.get_summary().expect("cost summary");
+        let child_stats = summary
+            .by_agent
+            .get("child")
+            .expect("child usage must be recorded under the child alias");
+        assert_eq!(child_stats.request_count, 1);
+        let expected = (1000.0 * 3.0 + 200.0 * 15.0) / 1_000_000.0;
+        assert!((child_stats.cost_usd - expected).abs() < 1e-9);
+        assert!(
+            !summary.by_agent.contains_key("parent"),
+            "child spend must not merge into the parent alias; the ledger is \
+             the aggregation point"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_inherited_ceiling_stops_provider() {
+        let (server, requests) = start_usage_chat_server(1).await;
+        // 1-cent effective hop ceiling on the target's runtime profile.
+        let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 1).await;
+        record_seed_spend(&fixture, 6.0);
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "produce a status line",
+                "background": true
+            }))
+            .await
+            .expect("delegate execute runs");
+        assert!(result.success, "background task should start: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+        let background = wait_for_terminal_background_result(&fixture.tool, &task_id).await;
+        assert_eq!(
+            background.status,
+            BackgroundTaskStatus::Failed,
+            "the detached sub-loop must fail on the exhausted carried ceiling: {background:?}"
+        );
+        let error = background.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded"),
+            "the inherited ceiling must surface as a task error: {background:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the delegated provider must never be reached once the carried \
+             ceiling is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_delegate_exceeded_budget_refuses_before_provider() {
+        let (server, requests) = start_usage_chat_server(1).await;
+        let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 1).await;
+        record_seed_spend(&fixture, 6.0);
+
+        let result = fixture
+            .tool
+            .execute(json!({"agent": "target", "prompt": "produce a status line"}))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "delegation must fail on the exceeded ceiling: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded"),
+            "budget refusal must surface as a tool error, not a panic: {error}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provider must not be reached once the ceiling is exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_with_cost_tracking_disabled_runs_unscoped() {
+        let (server, _requests) = start_usage_chat_server(1).await;
+        let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, false, 0).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({"agent": "target", "prompt": "produce a status line"}))
+            .await
+            .expect("delegate execute runs");
+        assert!(
+            result.success,
+            "delegate must run with cost tracking off: {result:?}"
+        );
+
+        assert!(
+            read_agent_cost(&fixture.data_dir, "target").is_none(),
+            "no cost context may be scoped when tracking is disabled"
+        );
+    }
+
+    #[test]
+    fn delegate_cost_scope_missing_config_warns_once() {
+        let seen = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            delegate_cost_scope_missing_config_should_warn(&seen),
+            "the first configless delegate must warn"
+        );
+        assert!(
+            !delegate_cost_scope_missing_config_should_warn(&seen),
+            "later configless delegates must not repeat the warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_without_any_config_returns_clean_tool_error() {
+        // Configless DelegateTool: no root_config, no live_config, no
+        // providers_models. The unscoped fallback must keep the tool boundary
+        // well-formed - the delegate reports a normal error result instead of
+        // panicking when no provider can be built.
+        let mut agents = HashMap::new();
+        agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                ..Default::default()
+            },
+        );
+        let tool = DelegateTool::new(agents, None, test_security());
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "produce a status line"}))
+            .await
+            .expect("execute must not panic without any config");
+        assert!(
+            !result.success,
+            "configless delegate cannot build a provider: {result:?}"
+        );
+        assert!(
+            result.error.is_some(),
+            "configless delegate must surface a clean tool error: {result:?}"
         );
     }
 }
