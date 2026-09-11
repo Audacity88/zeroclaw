@@ -442,7 +442,12 @@ impl ModelProvider for RouterModelProvider {
                     .await
                 {
                     Ok(response) => synthesize_stream_events(response),
-                    Err(error) => vec![Err(StreamError::ModelProvider(error.to_string()))],
+                    // The non-streaming call is complete by the time this arm
+                    // runs: its failure already survived the provider's own
+                    // retry/fallback budget. Mark the stream error terminal so
+                    // the runtime recovers it as a plain failed chat instead of
+                    // re-running the whole non-streaming call.
+                    Err(error) => vec![Err(StreamError::Terminal(error.to_string()))],
                 }
             })
             .flat_map(stream::iter)
@@ -1655,6 +1660,113 @@ mod tests {
             0,
             "the unrelated streaming route must stay idle"
         );
+    }
+
+    /// R4 pin: the synthesized arm is the ONLY legitimate producer of
+    /// `StreamError::Terminal` (enforced workspace-wide by the
+    /// stream_error_terminal architecture gate). A resolved non-streaming
+    /// route that fails has already exhausted its own retry budget inside
+    /// the completed `chat()` call, so the synthesized failure event must
+    /// carry the terminal identity verbatim.
+    struct FailingNonStreamingLeaf;
+
+    #[async_trait]
+    impl ModelProvider for FailingNonStreamingLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("401 Unauthorized: invalid api key")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            stream::once(async {
+                Err(StreamError::ModelProvider(
+                    "non-streaming leaf must never be streamed".to_string(),
+                ))
+            })
+            .boxed()
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FailingNonStreamingLeaf {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "FailingNonStreamingLeaf"
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_failure_emits_terminal_error() {
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "leaf".into(),
+                Box::new(FailingNonStreamingLeaf) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "test",
+            vec![("reliable".into(), Box::new(reliable))],
+            vec![],
+            "default-model".to_string(),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let events: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(true))
+            .collect()
+            .await;
+
+        assert_eq!(
+            events.len(),
+            1,
+            "a failed synthesized call surfaces as a single error event"
+        );
+        match &events[0] {
+            Err(StreamError::Terminal(message)) => {
+                assert!(
+                    message.contains("All model providers/models failed"),
+                    "the reliability domain's terminal cause must survive synthesis verbatim: {message}"
+                );
+            }
+            other => panic!("the synthesized arm must emit Terminal, got {other:?}"),
+        }
     }
 
     #[tokio::test]
