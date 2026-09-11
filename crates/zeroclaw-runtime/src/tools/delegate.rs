@@ -2318,6 +2318,10 @@ impl DelegateTool {
         }
 
         let agents = Arc::clone(&self.agents);
+        // Carried ceiling: the resolved target policy's effective per-hop
+        // daily limit (`0` = inherit the global limit), read before the
+        // policy moves into the child tool's `security` field.
+        let target_policy_ceiling_cents = target_policy.max_cost_per_day_cents;
         let security = target_policy;
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
@@ -2355,6 +2359,13 @@ impl DelegateTool {
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
 
+        // Build the target's cost-tracking context BEFORE the detached spawn:
+        // a spawned task does not inherit the caller's task-locals, so the
+        // context has to travel into the spawned future. The ceiling is the
+        // target policy's effective per-hop daily limit (resolved above; `0`
+        // = inherit the global limit).
+        let cost_ctx = self.delegate_cost_context(&agent_name_owned, target_policy_ceiling_cents);
+
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
                 let inner = DelegateTool {
@@ -2390,11 +2401,14 @@ impl DelegateTool {
                     () = child_token.cancelled() => {
                         Err("Cancelled by parent session".to_string())
                     }
-                    result = Box::pin(inner.execute_sync_with_admission(
-                        &agent_name_owned,
-                        &full_prompt,
-                        &args_inner,
-                        DelegateAdmission::Prevalidated,
+                    result = Box::pin(run_delegate_with_cost_scope(
+                        cost_ctx,
+                        inner.execute_sync_with_admission(
+                            &agent_name_owned,
+                            &full_prompt,
+                            &args_inner,
+                            DelegateAdmission::Prevalidated,
+                        ),
                     )) => {
                         match result {
                             Ok(tool_result) => {
@@ -2535,17 +2549,27 @@ impl DelegateTool {
             }
         }
 
+        // Resolve every target's policy up front: the whole fan-out fails if
+        // any target is blocked, and each spawned worker reuses the resolved
+        // policy's effective per-hop cost ceiling (`0` = inherit the global
+        // limit) so the cost context is built BEFORE the detached spawn.
+        let mut target_policies: HashMap<String, Arc<SecurityPolicy>> = HashMap::new();
         for name in &agent_names {
             // Validate the whole fan-out before any spawn. A single blocked
             // target should fail the entire parallel request rather than
             // launching a partial set of child agents and then reporting mixed
             // results.
-            if let Err(e) = self.policy_for_target(name) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("{e:#}")),
-                });
+            match self.policy_for_target(name) {
+                Ok(policy) => {
+                    target_policies.insert(name.clone(), policy);
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("{e:#}")),
+                    });
+                }
             }
             if let Some(refusal) = self.independent_always_ask_refusal(name) {
                 return Ok(refusal);
@@ -2593,6 +2617,17 @@ impl DelegateTool {
             let task_control_plane = Arc::clone(&self.task_control_plane);
             let __zc_delegate_alias = agent_name.clone();
 
+            // Build this worker's cost-tracking context BEFORE the detached
+            // spawn from the TARGET's resolved policy, so each spawned worker
+            // carries its own target-attributed context into the task.
+            let cost_ctx = self.delegate_cost_context(
+                &agent_name,
+                target_policies
+                    .get(&agent_name)
+                    .map(|policy| policy.max_cost_per_day_cents)
+                    .unwrap_or(0),
+            );
+
             handles.push(zeroclaw_spawn::spawn!(
                 async move {
                     let inner = DelegateTool {
@@ -2621,8 +2656,11 @@ impl DelegateTool {
                     let result = scope_delegate_session_key(session_key, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                             .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
-                                    .await
+                                run_delegate_with_cost_scope(
+                                    cost_ctx,
+                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)),
+                                )
+                                .await
                             })
                             .await
                     })
