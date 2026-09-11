@@ -450,6 +450,7 @@ zc-chat-resume-dropped = { $count } prior session(s) could not be re-attached an
 zc-chat-reconnect-interrupted = The connection was rebuilt and queued messages were preserved. Waiting for the prior turn to stop before reloading the durable transcript.
 zc-chat-resyncing = Some live updates were missed. Reloading this session before sending queued messages…
 zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
+zc-chat-resynced-turn-running = Live updates were missed, so the durable transcript was reloaded. The in-progress turn is still running; the transcript will be reloaded once more when it finishes.
 zc-chat-resync-failed = Live updates were missed and the session could not be reloaded: { $error }
 zc-chat-session-restart-error = Failed to start a new session: { $error }
 zc-chat-code-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local Code session must start in that project, so it was not created.

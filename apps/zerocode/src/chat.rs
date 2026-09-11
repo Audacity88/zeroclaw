@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -272,7 +272,7 @@ pub(crate) struct Chat {
     /// session but cannot leave while its live view is desynchronized.
     session_resync_tx: mpsc::Sender<SessionResyncResult>,
     session_resync_rx: mpsc::Receiver<SessionResyncResult>,
-    session_resync_in_flight: HashSet<String>,
+    session_resync_in_flight: HashMap<String, SessionResyncMode>,
     /// Request-form `session/prompt` completions. Terminal notifications remain
     /// transcript authority; this channel only prevents a lost terminal frame
     /// from leaving the matching local turn stuck in flight.
@@ -362,6 +362,24 @@ struct SessionResyncResult {
     result: Result<SessionResyncSnapshot, String>,
 }
 
+/// How a resync reconciles with the daemon before reloading the transcript.
+///
+/// Single source of truth for the two recovery behaviours:
+/// - [`SessionResyncMode::Reattach`] never cancels. It reads the daemon's
+///   authoritative `session/state`, snapshots the durable transcript, and
+///   reports whether the turn is still live so the pane can re-attach to the
+///   running stream. Used by notification-lag recovery: a client-side buffer
+///   overflow must not abort turns the daemon is running for this client.
+/// - [`SessionResyncMode::Cancel`] forces a terminal state first (best-effort
+///   `session/cancel`, then poll `session/state` to terminal) and only then
+///   reloads. Kept for reconnect/resume recovery, where the caller needs a
+///   known-idle session before proceeding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionResyncMode {
+    Reattach,
+    Cancel,
+}
+
 /// Canonical daemon state recovered after notification loss. Transcript and
 /// plan travel together so the UI cannot display a plan from the abandoned
 /// turn beside a newly reloaded transcript.
@@ -369,6 +387,11 @@ struct SessionResyncSnapshot {
     messages: Vec<crate::client::MessageEntry>,
     message_count: usize,
     plan: Option<Vec<crate::wire::PlanEntry>>,
+    /// `Reattach` only: the daemon still reported a live turn after the
+    /// transcript snapshot, so the pane must return to the in-flight state
+    /// and re-attach to the live stream. The cancel mode always ends
+    /// terminal, so it reports `false`.
+    turn_running: bool,
 }
 
 struct ChatEntryRetryResult {
@@ -538,7 +561,7 @@ impl Chat {
             session_reattach_in_flight: HashSet::new(),
             session_resync_tx,
             session_resync_rx,
-            session_resync_in_flight: HashSet::new(),
+            session_resync_in_flight: HashMap::new(),
             prompt_completion_tx,
             prompt_completion_rx,
             phase: ChatPhase::PickAgent {
@@ -622,7 +645,9 @@ impl Chat {
                     || state.pending_approval.is_some()
                     || state.pending_elicitation.is_some(),
                 recovery_required: state.last_error == Some(SessionError::ResyncFailed)
-                    || self.session_resync_in_flight.contains(&state.session_id),
+                    || self
+                        .session_resync_in_flight
+                        .contains_key(&state.session_id),
             });
         }
 
@@ -879,7 +904,10 @@ impl Chat {
                     }
                 }
                 if needs_terminal_recovery {
-                    self.begin_session_resync(resumed_id);
+                    // Reconnect resume needs a known-idle session: the
+                    // interrupted turn predates this pane incarnation, so its
+                    // terminal frames can no longer be matched by generation.
+                    self.begin_session_resync(resumed_id, SessionResyncMode::Cancel);
                 }
                 self.pump_all_queues();
                 true
@@ -1040,7 +1068,12 @@ impl Chat {
             .state_for_session(session_id)
             .is_some_and(|state| state.last_error == Some(SessionError::ResyncFailed))
         {
-            self.begin_session_resync(session_id.to_string());
+            // Retry of a failed reconciliation: still Cancel. The caller
+            // needs a known-terminal session before the session-lost
+            // re-attach or queue dispatch can proceed, and a turn that
+            // outlived a Cancel attempt belongs to a pre-resync pane
+            // incarnation whose terminal frames can no longer be matched.
+            self.begin_session_resync(session_id.to_string(), SessionResyncMode::Cancel);
             return;
         }
 
@@ -1559,8 +1592,11 @@ impl Chat {
                 *self = replacement;
                 self.entry_retry_preparing = false;
                 let pending_resync = std::mem::take(&mut self.session_resync_in_flight);
-                for session_id in pending_resync {
-                    self.begin_session_resync(session_id);
+                // Adoption re-begins exactly the resyncs that were gated when
+                // the pane was rebuilt; each keeps the mode it was started
+                // with instead of being re-classified here.
+                for (session_id, mode) in pending_resync {
+                    self.begin_session_resync(session_id, mode);
                 }
                 self.pump_all_queues();
             }
@@ -1773,7 +1809,7 @@ impl Chat {
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
                 if needs_terminal_recovery {
-                    self.begin_session_resync(recovery_session_id);
+                    self.begin_session_resync(recovery_session_id, SessionResyncMode::Cancel);
                 }
             }
             Err(e) => {
@@ -1818,7 +1854,7 @@ impl Chat {
                         self.phase = ChatPhase::Active(Box::new(state));
                         retained.extend(entries);
                         if needs_terminal_recovery {
-                            self.begin_session_resync(session_id);
+                            self.begin_session_resync(session_id, SessionResyncMode::Cancel);
                         }
                         break;
                     }
@@ -1859,7 +1895,7 @@ impl Chat {
                         }
                         self.background.push(state);
                         if needs_terminal_recovery {
-                            self.begin_session_resync(session_id);
+                            self.begin_session_resync(session_id, SessionResyncMode::Cancel);
                         }
                     }
                     Err(_) => retained.push(entry),
@@ -2092,6 +2128,7 @@ impl Chat {
 
     fn drain_notifications(&mut self) {
         let mut applied = false;
+        let mut reconciles: Vec<String> = Vec::new();
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == "session/update" => {
@@ -2100,12 +2137,32 @@ impl Chat {
                         // their stream too, so transcripts and status dots
                         // stay current while unfocused.
                         let sid = update.session_id().to_string();
-                        if !self.session_resync_in_flight.contains(&sid)
+                        let mut terminal_reconcile = false;
+                        if !self.session_resync_in_flight.contains_key(&sid)
                             && let Some(state) = self.state_for_session_mut(&sid)
                             && state.last_error != Some(SessionError::ResyncFailed)
                         {
-                            state.apply_update(update);
-                            applied = true;
+                            // A turn that survived a lag resync streamed entries
+                            // into the durable store while the resync gate was
+                            // closed; its terminal frame is the signal to reload
+                            // the transcript once more instead of trusting the
+                            // frame alone (`resync_terminal_reload_pending`).
+                            // Stale generations keep the regular ignore path.
+                            if state.resync_terminal_reload_pending
+                                && Self::turn_complete_matches_generation(
+                                    &update,
+                                    state.turn_generation,
+                                )
+                            {
+                                state.resync_terminal_reload_pending = false;
+                                terminal_reconcile = true;
+                            } else {
+                                state.apply_update(update);
+                                applied = true;
+                            }
+                        }
+                        if terminal_reconcile {
+                            reconciles.push(sid);
                         }
                     }
                 }
@@ -2116,8 +2173,23 @@ impl Chat {
                 _ => break,
             }
         }
+        for sid in reconciles {
+            self.begin_session_resync(sid, SessionResyncMode::Reattach);
+        }
         if applied {
             self.pump_all_queues();
+        }
+    }
+
+    /// Whether a `session/update` is this session's live terminal frame (the
+    /// daemon either echoes the client turn generation or omits it).
+    fn turn_complete_matches_generation(update: &SessionUpdate, generation: u64) -> bool {
+        match update {
+            SessionUpdate::TurnComplete {
+                client_turn_generation,
+                ..
+            } => client_turn_generation.is_none_or(|turn| turn == generation),
+            _ => false,
         }
     }
 
@@ -2125,6 +2197,12 @@ impl Chat {
     /// the missing frame may have been a terminal update. Gate queue dispatch,
     /// invalidate transport-bound interactions, and reload every tracked
     /// session from the daemon's durable transcript.
+    ///
+    /// Reloads use `Reattach`: the overflow is a client-side event and must
+    /// not cancel turns the daemon is running for this client, including
+    /// background sessions. Sessions the daemon reports idle reload exactly
+    /// as before; live turns keep running and the pane re-attaches to their
+    /// stream.
     fn begin_notification_resync(&mut self) {
         let session_ids = self
             .session_summaries()
@@ -2132,7 +2210,7 @@ impl Chat {
             .map(|summary| summary.session_id)
             .collect::<Vec<_>>();
         for session_id in session_ids {
-            self.begin_session_resync(session_id);
+            self.begin_session_resync(session_id, SessionResyncMode::Reattach);
         }
     }
 
@@ -2171,8 +2249,12 @@ impl Chat {
         }
     }
 
-    fn begin_session_resync(&mut self, session_id: String) {
-        if !self.session_resync_in_flight.insert(session_id.clone()) {
+    fn begin_session_resync(&mut self, session_id: String, mode: SessionResyncMode) {
+        if self
+            .session_resync_in_flight
+            .insert(session_id.clone(), mode)
+            .is_some()
+        {
             return;
         }
         if self.entry_retry_preparing {
@@ -2194,18 +2276,19 @@ impl Chat {
         }
 
         tokio::spawn(async move {
-            let result = Self::cancel_confirm_and_reload_with_retry(&rpc, &session_id).await;
+            let result = Self::confirm_and_reload_with_retry(&rpc, &session_id, mode).await;
             let _ = tx.send(SessionResyncResult { session_id, result }).await;
         });
     }
 
-    async fn cancel_confirm_and_reload_with_retry(
+    async fn confirm_and_reload_with_retry(
         rpc: &Arc<RpcClient>,
         session_id: &str,
+        mode: SessionResyncMode,
     ) -> Result<SessionResyncSnapshot, String> {
         let mut last_error = String::new();
         for attempt in 0..SESSION_RECOVERY_MAX_ATTEMPTS {
-            match Self::cancel_confirm_and_reload(rpc, session_id).await {
+            match Self::confirm_and_reload(rpc, session_id, mode).await {
                 Ok(messages) => return Ok(messages),
                 Err(error) => last_error = error,
             }
@@ -2215,6 +2298,17 @@ impl Chat {
             }
         }
         Err(last_error)
+    }
+
+    async fn confirm_and_reload(
+        rpc: &Arc<RpcClient>,
+        session_id: &str,
+        mode: SessionResyncMode,
+    ) -> Result<SessionResyncSnapshot, String> {
+        match mode {
+            SessionResyncMode::Cancel => Self::cancel_confirm_and_reload(rpc, session_id).await,
+            SessionResyncMode::Reattach => Self::reattach_confirm_and_reload(rpc, session_id).await,
+        }
     }
 
     async fn cancel_confirm_and_reload(
@@ -2250,9 +2344,66 @@ impl Chat {
                 message_count: messages.total,
                 messages: messages.messages,
                 plan,
+                turn_running: false,
             })
             .map_err(|error| format!("transcript reload failed: {error}"))?;
         Ok(messages)
+    }
+
+    /// Reattach-mode reconciliation: read the daemon's authoritative state,
+    /// snapshot the durable transcript, and report whether the turn survived.
+    /// No cancellation — a notification overflow is a client-side event, and
+    /// the turns the daemon is running for this client are unrelated to it.
+    ///
+    /// The daemon's `session/state` answers what the cancel cascade only
+    /// guessed at: whether a turn is actually live (`running` with a turn id)
+    /// or merely queued (`running` without one — daemon-side queued work,
+    /// which reloads and settles like idle here; the pane's own queue stays
+    /// client-owned either way).
+    ///
+    /// The two state reads bracket the transcript snapshot: a turn still live
+    /// across both reports `turn_running`, and one that ends inside the
+    /// bracket triggers a post-terminal re-fetch so the pane never settles
+    /// short of the turn's final durable entries.
+    async fn reattach_confirm_and_reload(
+        rpc: &Arc<RpcClient>,
+        session_id: &str,
+    ) -> Result<SessionResyncSnapshot, String> {
+        let state_before = rpc
+            .session_state(session_id)
+            .await
+            .map_err(|error| format!("session-state check failed: {error}"))?;
+        let turn_was_live = state_before.state == "running" && state_before.turn_id.is_some();
+        let messages = rpc
+            .session_messages(session_id)
+            .await
+            .map_err(|error| format!("transcript reload failed: {error}"))?;
+        // Bracket the snapshot with a second state read: a turn still live
+        // across both reports re-attaches (entries the snapshot raced are
+        // reconciled at its terminal frame), a turn that ended inside the
+        // bracket may have left the snapshot short of its final entries, so
+        // the reload runs once more after the terminal confirmation.
+        let state_after = rpc
+            .session_state(session_id)
+            .await
+            .map_err(|error| format!("session-state check failed: {error}"))?;
+        let turn_running =
+            turn_was_live && state_after.state == "running" && state_after.turn_id.is_some();
+        let (messages, message_count) = if turn_was_live && !turn_running {
+            let refreshed = rpc
+                .session_messages(session_id)
+                .await
+                .map_err(|error| format!("transcript reload failed: {error}"))?;
+            (refreshed.messages, refreshed.total)
+        } else {
+            (messages.messages, messages.total)
+        };
+        Ok(SessionResyncSnapshot {
+            message_count,
+            messages,
+            plan: state_after.plan,
+            turn_running,
+        })
     }
 
     fn apply_session_resync_result(&mut self, update: SessionResyncResult) {
@@ -2266,11 +2417,15 @@ impl Chat {
                 state.replace_history_after_notification_resync(
                     snapshot.messages,
                     strip_runtime_enrichment,
+                    snapshot.turn_running,
                 );
                 state.message_count = snapshot.message_count;
                 if let Some(plan) = snapshot.plan {
                     state.todo_tracker.set_plan(plan);
                 }
+                // Dropping the gate re-enables live `session/update` frames for
+                // this session; a kept-running turn streams onto the reloaded
+                // transcript from here.
                 self.session_resync_in_flight.remove(&update.session_id);
                 self.pump_all_queues();
             }
@@ -2541,7 +2696,10 @@ impl Chat {
             })
             .collect::<Vec<_>>();
         for session_id in retry_resyncs {
-            self.begin_session_resync(session_id);
+            // Queue-driven retry of a failed reconciliation: still Cancel,
+            // matching `ensure_session_alive` — the caller needs a
+            // known-terminal session before the queued input can dispatch.
+            self.begin_session_resync(session_id, SessionResyncMode::Cancel);
         }
     }
 
@@ -2591,12 +2749,12 @@ impl Chat {
         rpc: &Arc<RpcClient>,
         session_reattach_tx: &mpsc::Sender<SessionReattachResult>,
         session_reattach_in_flight: &mut HashSet<String>,
-        session_resync_in_flight: &HashSet<String>,
+        session_resync_in_flight: &HashMap<String, SessionResyncMode>,
         pane_kind: PaneKind,
         transport: crate::client::Transport,
         state: &mut ChatState,
     ) {
-        if session_resync_in_flight.contains(&state.session_id) {
+        if session_resync_in_flight.contains_key(&state.session_id) {
             return;
         }
         if state.last_error == Some(SessionError::ResyncFailed) {
@@ -7398,6 +7556,12 @@ pub struct ChatState {
     /// Anchor for the dots animation — reset each time a turn begins so
     /// the pulse starts from phase 0.
     turn_started_at: Instant,
+    /// Set when a lag resync re-attached to a still-running turn. The
+    /// transcript snapshot raced the live stream, so entries emitted while
+    /// the resync gate was closed exist only in the durable store: the
+    /// turn's terminal frame must trigger one more transcript reload
+    /// instead of being trusted alone.
+    resync_terminal_reload_pending: bool,
     show_thoughts: bool,
     /// Browse mode cursor (most-recently moved position).
     browse_cursor: Option<usize>,
@@ -7552,6 +7716,7 @@ impl ChatState {
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
+            resync_terminal_reload_pending: false,
             show_thoughts: true,
             browse_cursor: None,
             browse_anchor: None,
@@ -9489,6 +9654,9 @@ impl ChatState {
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.resume_override = false;
+        // A fresh resync supersedes any owed terminal reload; the new
+        // snapshot decides the outcome instead.
+        self.resync_terminal_reload_pending = false;
         let cleanup_report = self.cleanup_active_turn_attachments();
         self.surface_cleanup_report(cleanup_report);
         self.set_info_notice(crate::i18n::t("zc-chat-resyncing"));
@@ -9498,6 +9666,7 @@ impl ChatState {
         &mut self,
         messages: Vec<crate::client::MessageEntry>,
         strip_runtime_enrichment: bool,
+        turn_kept_running: bool,
     ) {
         self.entries.clear();
         self.first_message = None;
@@ -9511,12 +9680,28 @@ impl ChatState {
         self.cached_total_rows = 0;
         self.clear_transcript_selection();
         self.load_history(messages, strip_runtime_enrichment);
+        let notice = if turn_kept_running {
+            crate::i18n::t("zc-chat-resynced-turn-running")
+        } else {
+            crate::i18n::t("zc-chat-resynced")
+        };
         self.entries
-            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                "zc-chat-resynced",
-            ))));
+            .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
         self.info_message = None;
         self.last_error = None;
+        if turn_kept_running {
+            // The daemon still reports this turn live: re-attach instead of
+            // settling. Live updates resume once the resync gate drops (see
+            // `apply_session_resync_result`); `Working` is the neutral anchor
+            // until the first live chunk re-labels the status. The turn's
+            // client generation is untouched so the pending prompt response
+            // still settles it. Entries the snapshot raced are reconciled by
+            // one more reload at the turn's terminal frame.
+            self.turn_in_flight = true;
+            self.turn_status = TurnStatus::Working;
+            self.turn_started_at = Instant::now();
+            self.resync_terminal_reload_pending = true;
+        }
         self.mark_dirty_full();
     }
 
@@ -12952,7 +13137,8 @@ mod tests {
         let mut chat = Chat::new(client, PaneKind::Chat);
         chat.phase = ChatPhase::Active(Box::new(state()));
         chat.session_order.push("sess-1".to_string());
-        chat.session_resync_in_flight.insert("sess-1".to_string());
+        chat.session_resync_in_flight
+            .insert("sess-1".to_string(), SessionResyncMode::Cancel);
 
         let entries = chat.resume_entries();
         assert_eq!(entries.len(), 1);
@@ -13074,8 +13260,10 @@ mod tests {
         chat.session_order = vec!["sess-1".to_string()];
 
         // The test client's notification channel holds 64 frames. Put the
-        // terminal frame first, then overflow it so `try_recv` reports Lagged
-        // and the old implementation would have stranded `turn_in_flight`.
+        // terminal frame first, then overflow it with unparsable
+        // `session/update` frames so `try_recv` reports Lagged while the
+        // drain still consumes the backlog (a foreign method would stop the
+        // drain loop and strand later frames behind it).
         chat.rpc.push_notification_for_test(
             "session/update",
             serde_json::json!({
@@ -13087,33 +13275,25 @@ mod tests {
         );
         for _ in 0..64 {
             chat.rpc
-                .push_notification_for_test("test/noop", serde_json::Value::Null);
+                .push_notification_for_test("session/update", serde_json::Value::Null);
         }
         chat.drain_notifications();
 
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("session remains active during recovery");
         };
-        assert!(!state.turn_in_flight, "lag resets terminal turn state");
-        assert_eq!(state.queue_len(), 1, "queued input remains client-owned");
+        assert!(chat.session_resync_in_flight.contains_key("sess-1"));
         assert!(state.pending_approval.is_none());
         assert!(state.pending_elicitation.is_none());
-        assert!(chat.session_resync_in_flight.contains("sess-1"));
 
-        let mut saw_cancel = false;
         let mut saw_approval = false;
         let mut saw_elicitation = false;
-        while !(saw_cancel && saw_approval && saw_elicitation) {
+        while !(saw_approval && saw_elicitation) {
             let frame =
-                next_rpc_request(&mut writer_rx, "resync should cancel and invalidate").await;
+                next_rpc_request(&mut writer_rx, "resync should invalidate stale input").await;
             match frame.get("method").and_then(serde_json::Value::as_str) {
                 Some(method::SESSION_CANCEL) => {
-                    saw_cancel = true;
-                    respond_ok(
-                        &outbound,
-                        &frame,
-                        serde_json::json!({ "session_id": "sess-1", "cancelled": true }),
-                    );
+                    panic!("lag recovery must not cancel the running turn");
                 }
                 Some(method::SESSION_APPROVE) => {
                     saw_approval = true;
@@ -13128,36 +13308,14 @@ mod tests {
             }
         }
 
-        let running = next_rpc_request(&mut writer_rx, "resync must confirm terminal state").await;
+        let running = next_rpc_request(&mut writer_rx, "resync checks daemon state").await;
         assert_eq!(running["method"], method::SESSION_STATE);
         respond_ok(
             &outbound,
             &running,
-            serde_json::json!({ "session_id": "sess-1", "state": "running" }),
+            serde_json::json!({ "session_id": "sess-1", "state": "running", "turn_id": "7" }),
         );
-        assert!(
-            writer_rx.try_recv().is_err(),
-            "overflow recovery must not reload or dispatch while the old turn is running"
-        );
-
-        let idle = next_rpc_request(&mut writer_rx, "resync should poll until terminal").await;
-        assert_eq!(idle["method"], method::SESSION_STATE);
-        respond_ok(
-            &outbound,
-            &idle,
-            serde_json::json!({
-                "session_id": "sess-1",
-                "state": "idle",
-                "plan": [{
-                    "content": "Authoritative recovery task",
-                    "status": "in_progress",
-                    "priority": "high",
-                    "activeForm": "Recovering task"
-                }]
-            }),
-        );
-
-        let messages = next_rpc_request(&mut writer_rx, "terminal resync reloads transcript").await;
+        let messages = next_rpc_request(&mut writer_rx, "resync reloads the transcript").await;
         assert_eq!(messages["method"], method::SESSION_MESSAGES);
         respond_ok(
             &outbound,
@@ -13169,9 +13327,23 @@ mod tests {
                 ]
             }),
         );
-        assert!(
-            writer_rx.try_recv().is_err(),
-            "queue dispatch stays gated until transcript reload completes"
+        let still_running =
+            next_rpc_request(&mut writer_rx, "resync confirms the turn survived").await;
+        assert_eq!(still_running["method"], method::SESSION_STATE);
+        respond_ok(
+            &outbound,
+            &still_running,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "state": "running",
+                "turn_id": "7",
+                "plan": [{
+                    "content": "Authoritative recovery task",
+                    "status": "in_progress",
+                    "priority": "high",
+                    "activeForm": "Recovering task"
+                }]
+            }),
         );
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -13181,21 +13353,103 @@ mod tests {
         })
         .await
         .expect("session/messages should finish resync");
-        // The daemon's authoritative idle response is ordered after this old
-        // terminal notification on the same RPC stream. Exercise the real
-        // frame-tick order: the resync gate must discard the old completion
-        // before its result releases the queued follow-up.
+        chat.tick_transport_events();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("session remains active after recovery");
+        };
+        assert!(
+            state.turn_in_flight,
+            "the daemon kept the turn running, so the pane re-attaches"
+        );
+        assert_eq!(state.turn_status, TurnStatus::Working);
+        assert_eq!(state.queue_len(), 1, "queued input waits for the live turn");
+        assert!(state.entries.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::SystemMessage(message)
+                if message.as_ref() == crate::i18n::t("zc-chat-resynced-turn-running")
+        )));
+        assert_eq!(state.todo_tracker.entries().len(), 1);
+        assert_eq!(
+            state.todo_tracker.entries()[0].content,
+            "Authoritative recovery task"
+        );
+
+        // Live updates resume once the gate drops: a fresh delta streams onto
+        // the reloaded transcript without a new resync.
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk",
+                "session_id": "sess-1",
+                "text": "live delta"
+            }),
+        );
+        chat.tick_transport_events();
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("session remains active after recovery");
+        };
+        assert_eq!(state.turn_status, TurnStatus::Responding);
+
+        // The surviving turn's terminal frame carries durable entries the
+        // snapshot raced; it must trigger one authoritative reload instead of
+        // being trusted alone.
         chat.rpc.push_notification_for_test(
             "session/update",
             serde_json::json!({
                 "type": "turn_complete",
                 "session_id": "sess-1",
                 "outcome": "completed",
-                "content": "stale late completion",
+                "content": "final answer",
+                "client_turn_generation": 1,
             }),
         );
         chat.tick_transport_events();
-        let prompt = next_rpc_request(&mut writer_rx, "recovery should release queued input").await;
+
+        let idle =
+            next_rpc_request(&mut writer_rx, "terminal frame triggers one more reload").await;
+        assert_eq!(idle["method"], method::SESSION_STATE);
+        respond_ok(
+            &outbound,
+            &idle,
+            serde_json::json!({ "session_id": "sess-1", "state": "idle" }),
+        );
+        let reconciled = next_rpc_request(
+            &mut writer_rx,
+            "terminal reload fetches the full transcript",
+        )
+        .await;
+        assert_eq!(reconciled["method"], method::SESSION_MESSAGES);
+        respond_ok(
+            &outbound,
+            &reconciled,
+            serde_json::json!({
+                "messages": [
+                    { "role": "user", "content": "in flight" },
+                    { "role": "assistant", "content": "durable answer" },
+                    { "role": "assistant", "content": "reconciled tail" }
+                ]
+            }),
+        );
+        let confirm_idle =
+            next_rpc_request(&mut writer_rx, "terminal reload brackets the snapshot").await;
+        assert_eq!(confirm_idle["method"], method::SESSION_STATE);
+        respond_ok(
+            &outbound,
+            &confirm_idle,
+            serde_json::json!({ "session_id": "sess-1", "state": "idle" }),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal reload should finish resync");
+        chat.tick_transport_events();
+
+        let prompt = next_rpc_request(&mut writer_rx, "settled pane releases queued input").await;
         assert_eq!(prompt["method"], method::SESSION_PROMPT);
         assert_eq!(prompt["params"]["prompt"], "send after recovery");
         let ChatPhase::Active(state) = &chat.phase else {
@@ -13203,24 +13457,154 @@ mod tests {
         };
         assert_eq!(state.queue_len(), 0);
         assert!(state.turn_in_flight, "queued follow-up is now in flight");
-        assert!(state.entries.iter().all(|entry| !matches!(
+        assert!(state.entries.iter().any(|entry| matches!(
             entry,
-            ChatEntry::AgentMessage(message) if message.as_ref() == "stale late completion"
+            ChatEntry::AgentMessage(message) if message.as_ref() == "reconciled tail"
         )));
-        assert!(matches!(
-            state.entries.get(1),
-            Some(ChatEntry::AgentMessage(message)) if message.as_ref() == "durable answer"
-        ));
-        assert_eq!(state.todo_tracker.entries().len(), 1);
-        assert_eq!(
-            state.todo_tracker.entries()[0].content,
-            "Authoritative recovery task"
-        );
         assert!(state.entries.iter().any(|entry| matches!(
             entry,
             ChatEntry::SystemMessage(message)
                 if message.as_ref() == crate::i18n::t("zc-chat-resynced")
         )));
+        // The terminal reload replaced the transcript wholesale, so only the
+        // settled outcome's notice remains (the kept-running one was asserted
+        // between the two applies above).
+    }
+
+    #[tokio::test]
+    async fn notification_lag_resync_reloads_running_and_idle_sessions_without_cancel() {
+        let (tx, mut writer_rx) = mpsc::channel::<String>(32);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut running = state_for("sess-running", "myagent");
+        running.push_user_message(Some("busy turn".to_string()), Vec::new());
+        let idle = state_for("sess-idle", "myagent");
+        chat.phase = ChatPhase::Active(Box::new(running));
+        chat.background.push(idle);
+        chat.session_order = vec!["sess-running".to_string(), "sess-idle".to_string()];
+
+        // Overflow the test client's 64-frame notification channel with
+        // unparsable `session/update` frames so the drain reports Lagged and
+        // re-syncs every tracked session while still consuming the backlog.
+        for _ in 0..65 {
+            chat.rpc
+                .push_notification_for_test("session/update", serde_json::Value::Null);
+        }
+        chat.drain_notifications();
+        assert!(chat.session_resync_in_flight.contains_key("sess-running"));
+        assert!(chat.session_resync_in_flight.contains_key("sess-idle"));
+
+        // Each resync task exchanges state/messages/state with the fake
+        // daemon; the running session stays live across the bracket, the
+        // idle one never leaves it. Interleaving between the two tasks is
+        // arbitrary, so route every frame by method and session.
+        for _ in 0..6 {
+            let frame = next_rpc_request(&mut writer_rx, "recovery reloads each session").await;
+            let method_name = frame
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let sid = frame["params"]["session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            match (method_name.as_str(), sid.as_str()) {
+                (method::SESSION_CANCEL, _) => {
+                    panic!("lag recovery must not cancel any session");
+                }
+                (method::SESSION_STATE, "sess-running") => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({ "session_id": "sess-running", "state": "running", "turn_id": "3" }),
+                ),
+                (method::SESSION_STATE, "sess-idle") => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({ "session_id": "sess-idle", "state": "idle" }),
+                ),
+                (method::SESSION_MESSAGES, "sess-running") => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({
+                        "messages": [{ "role": "user", "content": "busy turn" }],
+                        "total": 1
+                    }),
+                ),
+                (method::SESSION_MESSAGES, "sess-idle") => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({
+                        "messages": [
+                            { "role": "user", "content": "old ask" },
+                            { "role": "assistant", "content": "old answer" }
+                        ],
+                        "total": 2
+                    }),
+                ),
+                other => panic!("unexpected recovery frame: {other:?}"),
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both sessions should finish resync");
+        chat.tick_transport_events();
+
+        let ChatPhase::Active(running) = &chat.phase else {
+            panic!("focused session remains active after recovery");
+        };
+        assert!(
+            running.turn_in_flight,
+            "the daemon kept the focused turn running, so the pane re-attaches"
+        );
+        assert_eq!(running.turn_status, TurnStatus::Working);
+        assert!(running.entries.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::UserMessage { text: Some(text), .. } if text.as_ref() == "busy turn"
+        )));
+        assert!(running.entries.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::SystemMessage(message)
+                if message.as_ref() == crate::i18n::t("zc-chat-resynced-turn-running")
+        )));
+
+        let idle = chat
+            .background
+            .iter()
+            .find(|state| state.session_id == "sess-idle")
+            .expect("idle background session survives resync");
+        assert!(!idle.turn_in_flight, "an idle session reloads and settles");
+        assert!(idle.entries.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::AgentMessage(message) if message.as_ref() == "old answer"
+        )));
+        assert!(idle.entries.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::SystemMessage(message)
+                if message.as_ref() == crate::i18n::t("zc-chat-resynced")
+        )));
+
+        // The re-attached session applies subsequent live deltas normally.
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk",
+                "session_id": "sess-running",
+                "text": "post-resync delta"
+            }),
+        );
+        chat.tick_transport_events();
+        let ChatPhase::Active(running) = &chat.phase else {
+            panic!("focused session remains active");
+        };
+        assert_eq!(running.turn_status, TurnStatus::Responding);
+        assert!(running.streaming_text.contains("post-resync delta"));
     }
 
     #[tokio::test]
@@ -13237,7 +13621,7 @@ mod tests {
         chat.phase = ChatPhase::Active(Box::new(active));
         chat.session_order = vec!["sess-1".to_string()];
 
-        chat.begin_session_resync("sess-1".to_string());
+        chat.begin_session_resync("sess-1".to_string(), SessionResyncMode::Cancel);
         let cancel = next_rpc_request(&mut writer_rx, "first resync cancels the turn").await;
         assert_eq!(cancel["method"], method::SESSION_CANCEL);
         respond_ok(
@@ -13255,7 +13639,7 @@ mod tests {
             "transient state lookup failure",
         );
 
-        assert!(chat.session_resync_in_flight.contains("sess-1"));
+        assert!(chat.session_resync_in_flight.contains_key("sess-1"));
         let retry_cancel =
             next_rpc_request(&mut writer_rx, "resync must retry after a transient error").await;
         assert_eq!(retry_cancel["method"], method::SESSION_CANCEL);
@@ -13297,7 +13681,7 @@ mod tests {
         let prompt = next_rpc_request(&mut writer_rx, "retry releases queued input").await;
         assert_eq!(prompt["method"], method::SESSION_PROMPT);
         assert_eq!(prompt["params"]["prompt"], "send after retry");
-        assert!(!chat.session_resync_in_flight.contains("sess-1"));
+        assert!(!chat.session_resync_in_flight.contains_key("sess-1"));
     }
 
     #[tokio::test]
@@ -13319,7 +13703,7 @@ mod tests {
         chat.phase = ChatPhase::Active(Box::new(active));
         chat.session_order = vec!["sess-1".to_string()];
 
-        chat.begin_session_resync("sess-1".to_string());
+        chat.begin_session_resync("sess-1".to_string(), SessionResyncMode::Cancel);
         for _ in 0..SESSION_RECOVERY_MAX_ATTEMPTS {
             let cancel = next_rpc_request(&mut writer_rx, "each recovery attempt cancels").await;
             assert_eq!(cancel["method"], method::SESSION_CANCEL);
@@ -13358,7 +13742,7 @@ mod tests {
             "client-owned prompt must remain queued"
         );
         assert_eq!(state.todo_tracker.entries()[0].content, "stale plan");
-        assert!(!chat.session_resync_in_flight.contains("sess-1"));
+        assert!(!chat.session_resync_in_flight.contains_key("sess-1"));
         assert_eq!(chat.session_summaries()[0].status, SidebarStatus::Errored);
         chat.rpc.push_notification_for_test(
             "session/update",
@@ -13420,7 +13804,7 @@ mod tests {
         .await;
         assert_eq!(cancel["method"], method::SESSION_CANCEL);
         let mut chat = reconnect.await.unwrap();
-        assert!(chat.session_resync_in_flight.contains("sess-1"));
+        assert!(chat.session_resync_in_flight.contains_key("sess-1"));
         assert_eq!(
             chat.state_for_session("sess-1")
                 .expect("reattached session")
@@ -16584,7 +16968,7 @@ mod tests {
             .enqueue_message("after recovery".into(), Vec::new())
             .unwrap();
         worker.phase = ChatPhase::Active(Box::new(queued));
-        worker.begin_session_resync("sess-1".into());
+        worker.begin_session_resync("sess-1".into(), SessionResyncMode::Cancel);
         worker.pump_all_queues();
         assert!(
             tokio::time::timeout(Duration::from_millis(50), rx.recv())
@@ -16612,7 +16996,7 @@ mod tests {
         });
         pane.drain_entry_retry_results();
         assert!(!pane.entry_retry_preparing);
-        assert!(pane.session_resync_in_flight.contains("sess-1"));
+        assert!(pane.session_resync_in_flight.contains_key("sess-1"));
         assert_eq!(pane.state_for_session("sess-1").unwrap().queue_len(), 1);
         let request = next_rpc_request(&mut rx, "adoption starts deferred recovery").await;
         assert_eq!(request["method"], method::SESSION_CANCEL);
