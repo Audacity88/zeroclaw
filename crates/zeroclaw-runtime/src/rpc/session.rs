@@ -123,12 +123,13 @@ type GatedOpPause = (
 #[cfg(test)]
 type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
+type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
     model_provider_update_waiting: Arc<tokio::sync::Notify>,
-    cancel_tokens:
-        std::sync::Mutex<HashMap<String, (u64, Option<u64>, tokio_util::sync::CancellationToken)>>,
+    cancel_tokens: std::sync::Mutex<HashMap<String, CancelTokenEntry>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
@@ -791,7 +792,7 @@ impl SessionStore {
 
     fn register_cancel_token_locked(
         &self,
-        tokens: &mut HashMap<String, (u64, Option<u64>, tokio_util::sync::CancellationToken)>,
+        tokens: &mut HashMap<String, CancelTokenEntry>,
         id: &str,
         session_generation: Option<u64>,
         token: tokio_util::sync::CancellationToken,

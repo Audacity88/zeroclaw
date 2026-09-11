@@ -12023,7 +12023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inflight_acp_resume_leaves_pending_checkpoint_for_later_recovery() {
+    async fn inflight_acp_reattach_leaves_pending_checkpoint_for_later_recovery() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -12064,17 +12064,17 @@ mod tests {
             )
             .unwrap();
 
-        let error = dispatcher
+        let resumed = dispatcher
             .handle_session_new_for_test(&params)
             .await
-            .expect_err("an inflight ACP owner must reject duplicate session/new");
-        assert_eq!(error.code, SESSION_BUSY);
+            .expect("an inflight ACP owner should permit same-mode reattachment");
+        assert_eq!(resumed["session_id"], sid);
         assert!(sessions.has_inflight_turn(sid));
         assert!(!token.is_cancelled());
         let still_live = sessions
             .get_agent(sid)
             .await
-            .expect("duplicate rejection must preserve the live owner");
+            .expect("reattachment must preserve the live owner");
         assert!(Arc::ptr_eq(&live_agent, &still_live));
         assert!(
             acp_store
@@ -12109,7 +12109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_new_rejects_inflight_acp_resume_without_cancelling_owner() {
+    async fn session_new_reattaches_inflight_acp_without_cancelling_owner() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -12127,16 +12127,25 @@ mod tests {
             .handle_session_new_for_test(&params)
             .await
             .expect("initial session/new should succeed");
+        let live_agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("initial session owner must be live");
         let token = tokio_util::sync::CancellationToken::new();
         let generation = sessions.register_cancel_token(sid, token.clone());
 
-        let error = dispatcher
+        let resumed = dispatcher
             .handle_session_new_for_test(&params)
             .await
-            .expect_err("an inflight owner must make duplicate session/new busy");
-        assert_eq!(error.code, SESSION_BUSY);
+            .expect("an inflight ACP owner should permit same-mode reattachment");
+        assert_eq!(resumed["session_id"], sid);
         assert!(sessions.has_inflight_turn(sid));
         assert!(!token.is_cancelled());
+        let still_live = sessions
+            .get_agent(sid)
+            .await
+            .expect("reattachment must preserve the live owner");
+        assert!(Arc::ptr_eq(&live_agent, &still_live));
         sessions.remove_cancel_token(sid, generation);
     }
 
