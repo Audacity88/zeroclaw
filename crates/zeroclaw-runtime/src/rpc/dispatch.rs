@@ -16,6 +16,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
@@ -498,6 +500,21 @@ pub struct RpcDispatcher {
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
+    /// Generation token for the transport connection that accepted work.
+    /// Every detached prompt is linked to it and drained before teardown.
+    connection_cancel: CancellationToken,
+    /// Whether this dispatcher owns the transport connection. Only the owner
+    /// may end the generation: prompt handles from [`Self::spawn_handle`] read
+    /// the same token to observe teardown, and a completing prompt dropping
+    /// its handle must not close the connection that is still serving requests.
+    owns_connection: bool,
+    /// Liveness token for the accepted connection, shared with every task this
+    /// connection starts. Cloned into each spawned prompt and into the nested
+    /// turn task, so the listener's client count falls to zero only once that
+    /// work has actually finished unwinding. `None` when no listener supplied
+    /// one (direct dispatcher construction outside an accepted connection).
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    prompt_tasks: Vec<JoinHandle<()>>,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
     /// handshake (remote WSS plane only; `None` on the local socket). This is the
     /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
@@ -508,6 +525,15 @@ pub struct RpcDispatcher {
 
 impl RpcDispatcher {
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
+        Self::new_with_connection_cancel(ctx, writer_tx, peer_label, CancellationToken::new())
+    }
+
+    pub(crate) fn new_with_connection_cancel(
+        ctx: Arc<RpcContext>,
+        writer_tx: mpsc::Sender<String>,
+        peer_label: String,
+        connection_cancel: CancellationToken,
+    ) -> Self {
         Self {
             ctx,
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
@@ -516,8 +542,24 @@ impl RpcDispatcher {
             tui_epoch: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
+            connection_cancel,
+            owns_connection: true,
+            connection_activity: None,
+            prompt_tasks: Vec::new(),
             peer_cert_fingerprint: None,
         }
+    }
+
+    /// Attach the accepted connection's liveness token. Additive builder so the
+    /// listeners can share their client-count token with the tasks this
+    /// dispatcher spawns while other construction sites need no change.
+    #[must_use]
+    pub(crate) fn with_connection_activity(
+        mut self,
+        activity: crate::rpc::ConnectionActivity,
+    ) -> Self {
+        self.connection_activity = Some(activity);
+        self
     }
 
     /// Bind the client certificate fingerprint from the mTLS handshake (WSS).
@@ -559,6 +601,10 @@ impl RpcDispatcher {
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
+    ///
+    /// The handle observes the connection generation token but does not own it:
+    /// a prompt finishing normally drops its handle, and that drop must leave
+    /// the connection open for the requests that follow.
     fn spawn_handle(&self) -> Self {
         Self {
             ctx: Arc::clone(&self.ctx),
@@ -571,7 +617,33 @@ impl RpcDispatcher {
             tui_epoch: self.tui_epoch,
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
+            connection_cancel: self.connection_cancel.clone(),
+            owns_connection: false,
+            // Shared, not re-created: this handle is moved into the spawned
+            // prompt task, so the clone it carries keeps the connection counted
+            // until that task's future is dropped.
+            connection_activity: self.connection_activity.clone(),
+            prompt_tasks: Vec::new(),
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
+        }
+    }
+
+    /// Cancel and join every prompt accepted by this connection generation.
+    /// The queue guard held by an in-flight turn is released only after its
+    /// provider/tool future has observed cancellation and returned, so a
+    /// replacement connection cannot race invisible old-generation work.
+    pub(crate) async fn shutdown(&mut self) {
+        self.connection_cancel.cancel();
+        // Join each handle where it is stored, and remove it only once its
+        // join has returned. Moving handles out first would detach whichever
+        // prompt is being awaited if this future is itself dropped: the
+        // listener force-aborts a connection that outlives its drain deadline,
+        // and `Drop` below can only abort the handles it still holds.
+        while !self.prompt_tasks.is_empty() {
+            if let Some(task) = self.prompt_tasks.last_mut() {
+                let _ = task.await;
+            }
+            self.prompt_tasks.pop();
         }
     }
 
@@ -695,6 +767,17 @@ impl RpcDispatcher {
         }
     }
 
+    /// Own a transport until EOF or generation cancellation, then drain all
+    /// work accepted by that exact connection before returning.
+    pub(crate) async fn run_connection(&mut self, transport: &mut (dyn RpcTransport + Send)) {
+        let connection_cancel = self.connection_cancel.clone();
+        tokio::select! {
+            _ = self.run(transport) => {}
+            _ = connection_cancel.cancelled() => {}
+        }
+        self.shutdown().await;
+    }
+
     async fn process_line(&mut self, line: &str) {
         let value: Value = match serde_json::from_str(line) {
             Ok(value) => value,
@@ -812,7 +895,8 @@ impl RpcDispatcher {
                 let id_clone = req_id.clone();
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
-                zeroclaw_spawn::spawn!(async move {
+                self.prompt_tasks.retain(|task| !task.is_finished());
+                let task = zeroclaw_spawn::spawn!(async move {
                     let result = handle.handle_session_prompt(&params_clone).await;
                     if !is_notif {
                         match result {
@@ -821,6 +905,7 @@ impl RpcDispatcher {
                         }
                     }
                 });
+                self.prompt_tasks.push(task);
                 return;
             }
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
@@ -2237,16 +2322,22 @@ impl RpcDispatcher {
             ));
         }
 
-        // Admission fences the complete session incarnation: agent, mode,
-        // attachments, durable writes, and terminal state are all resolved
-        // while same-ID replacement is excluded.
-        let _guard = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(sid)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        let _guard = tokio::select! {
+            biased;
+            _ = self.connection_cancel.cancelled() => {
+                return Err(rpc_err(SESSION_BUSY, "RPC connection closed before prompt admission"));
+            }
+            guard = self.ctx.sessions.session_queue.acquire(sid) => {
+                guard.map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+            }
+        };
+
+        if self.connection_cancel.is_cancelled() {
+            return Err(rpc_err(
+                SESSION_BUSY,
+                "RPC connection closed before prompt execution",
+            ));
+        }
 
         // Registration is the first operation after admission and the RAII
         // handle removes this exact generation on every exit path. Removal
@@ -2312,9 +2403,22 @@ impl RpcDispatcher {
                 prompt.push('\n');
             }
             for (idx, entry) in req.attachments.iter().enumerate() {
-                let result =
-                    process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions)
-                        .await?;
+                let result = tokio::select! {
+                    biased;
+                    _ = self.connection_cancel.cancelled() => {
+                        return Err(rpc_err(
+                            SESSION_BUSY,
+                            "RPC connection closed while preparing prompt attachments",
+                        ));
+                    }
+                    result = process_file_entry(
+                        entry,
+                        sid,
+                        &upload_root,
+                        is_wss,
+                        &self.ctx.sessions,
+                    ) => result?,
+                };
                 if idx > 0 {
                     prompt.push('\n');
                 }
@@ -2412,10 +2516,10 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
-        let outcome = execute_turn(
+        let turn = execute_turn(
             agent,
             prompt.clone(),
-            cancel,
+            cancel.clone(),
             TurnAttribution {
                 session_key: Some(sid.to_string()),
                 agent_alias,
@@ -2424,6 +2528,7 @@ impl RpcDispatcher {
                 channel: "rpc",
             },
             cost_context,
+            self.connection_activity.clone(),
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -2452,8 +2557,20 @@ impl RpcDispatcher {
                     }
                 }
             },
-        )
-        .await;
+        );
+        tokio::pin!(turn);
+        let outcome = tokio::select! {
+            biased;
+            _ = self.connection_cancel.cancelled() => {
+                self.ctx.sessions.record_cancel_cause_if_absent(
+                    sid,
+                    crate::rpc::session::CancelCause::ConnectionClosed,
+                );
+                cancel.cancel();
+                turn.await
+            }
+            outcome = &mut turn => outcome,
+        };
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
@@ -5451,6 +5568,21 @@ fn response_id_key(id: &Value) -> Option<String> {
     }
 }
 
+impl Drop for RpcDispatcher {
+    fn drop(&mut self) {
+        // Only the connection owner ends the generation. A prompt handle shares
+        // the token so it can observe teardown; cancelling here would let a
+        // prompt that simply finished close its own connection.
+        if !self.owns_connection {
+            return;
+        }
+        self.connection_cancel.cancel();
+        for task in &self.prompt_tasks {
+            task.abort();
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
@@ -5658,6 +5790,196 @@ fn notification_for_turn_event(
     let params = serde_json::to_value(update).ok()?;
     let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
     serde_json::to_string(&n).ok()
+}
+
+#[cfg(test)]
+pub(crate) mod connection_test_support {
+    use super::RpcContext;
+    use async_trait::async_trait;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::ModelProvider;
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+
+    pub(crate) const RUNNING_SID: &str = "connection-running";
+    pub(crate) const QUEUED_SID: &str = "connection-queued";
+    pub(crate) const IMMEDIATE_SID: &str = "connection-immediate";
+
+    pub(crate) struct ConnectionPromptFixture {
+        pub(crate) ctx: Arc<RpcContext>,
+        pub(crate) provider_started: Arc<Notify>,
+        pub(crate) provider_dropped: Arc<AtomicBool>,
+        pub(crate) queued_provider_calls: Arc<AtomicUsize>,
+    }
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    struct PendingProvider {
+        started: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for PendingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let _drop_signal = DropSignal(Arc::clone(&self.dropped));
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("pending provider should be cancelled with its connection")
+        }
+    }
+
+    impl Attributable for PendingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "connection-pending"
+        }
+    }
+
+    struct CountingProvider(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ModelProvider for CountingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok("unexpected queued provider call".to_string())
+        }
+    }
+
+    impl Attributable for CountingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "connection-counting"
+        }
+    }
+
+    struct ImmediateProvider;
+
+    #[async_trait]
+    impl ModelProvider for ImmediateProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("done".to_string())
+        }
+    }
+
+    impl Attributable for ImmediateProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "connection-immediate"
+        }
+    }
+
+    /// Install a session whose provider answers straight away, so a prompt on
+    /// it runs to normal completion instead of parking.
+    pub(crate) async fn insert_immediate_session(ctx: &Arc<RpcContext>, path: &Path) {
+        insert_session(ctx, path, IMMEDIATE_SID, Box::new(ImmediateProvider)).await;
+    }
+
+    pub(crate) async fn insert_session(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        provider: Box<dyn ModelProvider>,
+    ) {
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(path.to_path_buf())
+            .build()
+            .expect("connection lifecycle test agent should build");
+        ctx.sessions
+            .insert(
+                session_id.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    path.to_str().expect("test path should be UTF-8"),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .expect("connection lifecycle test session should insert");
+    }
+
+    pub(crate) async fn fixture(path: &Path) -> ConnectionPromptFixture {
+        let config = zeroclaw_config::schema::Config {
+            data_dir: path.to_path_buf(),
+            config_path: path.join("config.toml"),
+            ..Default::default()
+        };
+        let queue = Arc::new(SessionActorQueue::new(4, 30, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(64, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let provider_started = Arc::new(Notify::new());
+        let provider_dropped = Arc::new(AtomicBool::new(false));
+        let queued_provider_calls = Arc::new(AtomicUsize::new(0));
+
+        insert_session(
+            &ctx,
+            path,
+            RUNNING_SID,
+            Box::new(PendingProvider {
+                started: Arc::clone(&provider_started),
+                dropped: Arc::clone(&provider_dropped),
+            }),
+        )
+        .await;
+        insert_session(
+            &ctx,
+            path,
+            QUEUED_SID,
+            Box::new(CountingProvider(Arc::clone(&queued_provider_calls))),
+        )
+        .await;
+
+        ConnectionPromptFixture {
+            ctx,
+            provider_started,
+            provider_dropped,
+            queued_provider_calls,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -14732,5 +15054,55 @@ mod tests {
                 .and_then(|overrides| overrides.model_provider),
             Some("openai.test-provider".to_string())
         );
+    }
+    /// A listener force-aborts a connection task that outlives its drain
+    /// deadline, so the dispatcher can be dropped while `shutdown` is joining a
+    /// prompt. The prompt has to end with the connection: had `shutdown` moved
+    /// the handles out of `prompt_tasks` first, `Drop` would hold nothing to
+    /// abort and the prompt would run on after the listener reported the
+    /// connection gone.
+    #[tokio::test]
+    async fn shutdown_aborted_mid_join_still_ends_its_prompt() {
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = connection_test_support::fixture(tmp.path()).await;
+        let (writer_tx, _writer_rx) = mpsc::channel::<String>(8);
+        let connection_cancel = CancellationToken::new();
+        let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+            Arc::clone(&fixture.ctx),
+            writer_tx,
+            "test:forced-drain".to_string(),
+            connection_cancel.clone(),
+        );
+
+        // A prompt that ignores cancellation, as a stuck provider or tool call
+        // does. The sender is dropped with the task, so a resolved receiver
+        // proves the task ended instead of being detached.
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+        dispatcher
+            .prompt_tasks
+            .push(zeroclaw_spawn::spawn!(async move {
+                let _ends_with_the_task = ended_tx;
+                std::future::pending::<()>().await;
+            }));
+
+        let shutdown = zeroclaw_spawn::spawn!(async move {
+            dispatcher.shutdown().await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), connection_cancel.cancelled())
+            .await
+            .expect("shutdown should cancel the generation before joining its prompts");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The forced listener path: the connection task is aborted while it is
+        // still inside that join.
+        shutdown.abort();
+        let _ = shutdown.await;
+
+        tokio::time::timeout(Duration::from_secs(5), ended_rx)
+            .await
+            .expect("an aborted shutdown must still end the prompt it was joining")
+            .expect_err("the prompt must be aborted rather than run to completion");
     }
 }
