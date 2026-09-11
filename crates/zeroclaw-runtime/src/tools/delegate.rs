@@ -1,3 +1,7 @@
+use crate::agent::cost::{
+    TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext, TurnUsage,
+    tool_loop_cost_tracking_context_for_agent,
+};
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
@@ -9,13 +13,14 @@ use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +65,59 @@ where
     F: std::future::Future,
 {
     TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
+}
+
+/// Run `inner` under the delegate target's cost-tracking task-locals so the
+/// child loop's usage is recorded with target attribution and every provider
+/// call participates in the process-wide budget with the target's effective
+/// daily ceiling. Mirrors the scope the peer-message delivery path installs
+/// around detached recipient turns (`deliver_peer_turn_with_cost_scope`).
+/// Split out from the execute paths so the scope install itself can be
+/// exercised directly in tests, independent of the spawn plumbing around it.
+///
+/// When no context can be built (cost tracking disabled for the resolved
+/// config, or no config available at all) the inner future runs exactly as
+/// before: no task-locals are installed and the loop behaves as an unscoped
+/// delegate run.
+async fn run_delegate_with_cost_scope<F, T>(
+    cost_ctx: Option<ToolLoopCostTrackingContext>,
+    inner: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let Some(cost_ctx) = cost_ctx else {
+        return inner.await;
+    };
+    TOOL_LOOP_TURN_USAGE
+        .scope(
+            Some(Arc::new(Mutex::new(TurnUsage::default()))),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_ctx), inner),
+        )
+        .await
+}
+
+/// Warn once per process when a delegate executes with neither a live nor a
+/// root config available, so its sub-loop cannot run under cost tracking and
+/// its spend goes unrecorded. Mirrors the once-per-key shape of the
+/// missing-pricing warning in `agent/cost.rs`; split out so the once-only
+/// transition is unit-testable with a caller-owned flag.
+fn delegate_cost_scope_missing_config_should_warn(seen: &AtomicBool) -> bool {
+    !seen.swap(true, Ordering::SeqCst)
+}
+
+fn delegate_cost_scope_missing_config_warn_once() {
+    static MISSING_CONFIG_WARNED: AtomicBool = AtomicBool::new(false);
+    if delegate_cost_scope_missing_config_should_warn(&MISSING_CONFIG_WARNED) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "delegate sub-loop ran without cost tracking: no live or root config \
+             is available, so its spend is neither recorded in the cost ledger \
+             nor checked against a daily ceiling"
+        );
+    }
 }
 
 /// Serializable result of a background delegate task.
@@ -670,6 +728,66 @@ impl DelegateTool {
              delegate_same_risk_profile enabled",
             self.caller_alias, self.caller_alias
         )
+    }
+
+    /// Build the cost-tracking context a delegated sub-loop runs under: the
+    /// process-global tracker scoped to the TARGET agent alias, with the
+    /// target's effective per-hop daily ceiling
+    /// (`SecurityPolicy.max_cost_per_day_cents`, `0` = inherit the global
+    /// limit) enforced through a derived tracker that shares the global
+    /// ledger. Recorded spend and budget enforcement therefore agree on the
+    /// same context, and concurrent traffic counts against the delegate's
+    /// ceiling.
+    ///
+    /// Returns `None` (leave the sub-loop unscoped, matching the previous
+    /// behavior) when cost tracking is disabled for the resolved config or
+    /// when neither `live_config` nor `root_config` is available - the
+    /// configless fallback warns once per process.
+    fn delegate_cost_context(
+        &self,
+        target_alias: &str,
+        ceiling_cents: u32,
+    ) -> Option<ToolLoopCostTrackingContext> {
+        let config = self.cost_scope_config_snapshot()?;
+
+        if !config.cost.enabled {
+            // Cost tracking is off for this config: leave the sub-loop
+            // unscoped (no ledger, no budget checks) instead of resolving the
+            // global tracker, whose reuse path would hot-swap a disabled
+            // config over the shared singleton.
+            return None;
+        }
+
+        let mut ctx = tool_loop_cost_tracking_context_for_agent(&config, target_alias)?;
+
+        if ceiling_cents > 0
+            && let Some(tracker) = ctx.tracker.as_ref()
+        {
+            // Share the global ledger but cap the daily limit at the
+            // effective per-hop ceiling: never looser than the global daily
+            // limit, never looser than the tightened hop ceiling.
+            let mut capped_config = tracker.config();
+            let ceiling_usd = f64::from(ceiling_cents) / 100.0;
+            capped_config.daily_limit_usd = capped_config.daily_limit_usd.min(ceiling_usd);
+            ctx.tracker = Some(Arc::new(tracker.derived_with_config(capped_config)));
+        }
+
+        Some(ctx)
+    }
+
+    /// Snapshot the config a delegate's cost context resolves from: the live
+    /// config handle when one was carried in (so reloads are visible),
+    /// otherwise the root snapshot. `None` (with a once-per-process warning)
+    /// when the tool was built without either.
+    fn cost_scope_config_snapshot(&self) -> Option<Config> {
+        if let Some(live) = self.live_config.as_ref() {
+            return Some(live.read().clone());
+        }
+        if let Some(root) = self.root_config.as_ref() {
+            return Some((**root).clone());
+        }
+        delegate_cost_scope_missing_config_warn_once();
+        None
     }
 
     fn mode_for_target(&self, target_alias: &str) -> DelegateExecutionMode {
@@ -1845,7 +1963,7 @@ impl DelegateTool {
             });
         }
 
-        if admission == DelegateAdmission::Required {
+        let resolved_target_policy = if admission == DelegateAdmission::Required {
             if let Err(error) = self
                 .security
                 .enforce_tool_operation(ToolOperation::Act, "delegate")
@@ -1857,23 +1975,70 @@ impl DelegateTool {
                 });
             }
 
-            if let Err(e) = self.policy_for_target(agent_name) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("{e:#}")),
-                });
-            }
+            let policy = match self.policy_for_target(agent_name) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("{e:#}")),
+                    });
+                }
+            };
             if let Some(refusal) = self.independent_always_ask_refusal(agent_name) {
                 return Ok(refusal);
             }
-        }
+            policy
+        } else {
+            // Prevalidated callers (background and parallel workers) carry
+            // the target's already-assembled policy as `security`.
+            Arc::clone(&self.security)
+        };
 
+        // The effective per-hop daily cost ceiling rides on the target's
+        // resolved policy (`0` = inherit the global limit); prevalidated
+        // callers carry it on `security` itself.
+        let cost_ceiling_cents = resolved_target_policy.max_cost_per_day_cents;
+        let cost_ctx = self.delegate_cost_context(agent_name, cost_ceiling_cents);
+        run_delegate_with_cost_scope(
+            cost_ctx,
+            self.execute_sync_dispatched(
+                agent_name,
+                agent_config,
+                prompt,
+                context,
+                &legacy_provider_type,
+                credential.as_deref(),
+                temperature,
+                agentic,
+                admission,
+            ),
+        )
+        .await
+    }
+
+    /// Provider resolution plus the agentic/non-agentic dispatch for a sync
+    /// delegate, split out of `execute_sync_with_admission_inner` so the
+    /// cost-tracking scope wraps the whole delegated execution. Admission
+    /// has already run by the time this is entered.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_sync_dispatched(
+        &self,
+        agent_name: &str,
+        agent_config: &AliasedAgentConfig,
+        prompt: &str,
+        context: &str,
+        legacy_provider_type: &str,
+        credential: Option<&str>,
+        temperature: Option<f64>,
+        agentic: bool,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
         // Create model_provider for this agent
         let (model_provider, provider_type, model) = match self.build_target_provider(
             &agent_config.model_provider,
-            &legacy_provider_type,
-            credential.as_deref(),
+            legacy_provider_type,
+            credential,
         ) {
             Ok(provider) => provider,
             Err(e) => {

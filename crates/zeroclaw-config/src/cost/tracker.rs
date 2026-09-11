@@ -74,6 +74,26 @@ impl CostTracker {
         *self.config.write() = config;
     }
 
+    /// Derive an ephemeral tracker that shares this tracker's ledger storage,
+    /// session id, and per-session totals but enforces `config` instead of
+    /// this tracker's live config. Delegated sub-loops use this to enforce a
+    /// per-hop daily ceiling while their recorded spend lands on the same
+    /// durable ledger as every other path: budget checks through the derived
+    /// tracker read the same live aggregates, so concurrent traffic counts
+    /// against the delegate's ceiling, and usage recorded through it is
+    /// immediately visible to every other tracker over that ledger. The
+    /// derived tracker is never registered as the process-global one; it
+    /// lives only as long as the delegation that created it and never
+    /// receives config reloads.
+    pub fn derived_with_config(&self, config: CostConfig) -> Self {
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            storage: Arc::clone(&self.storage),
+            session_id: self.session_id.clone(),
+            session_totals: Arc::clone(&self.session_totals),
+        }
+    }
+
     /// Get the session ID.
     pub fn session_id(&self) -> &str {
         &self.session_id
