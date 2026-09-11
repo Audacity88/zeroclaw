@@ -1216,6 +1216,7 @@ pub async fn run_with_authority(
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),
     // or an unrecoverable initial socket ownership conflict.
+    let rpc_connection_count = socket_client_count.clone();
     let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
     tokio::pin!(exit);
 
@@ -1275,6 +1276,22 @@ pub async fn run_with_authority(
     live_config_authority.close_agent_lifecycle();
     channels_cancel.cancel();
 
+    // Retire the accepted RPC connections before the component handles are
+    // touched. Each connection cancels and joins its prompts, and its listener
+    // force-aborts it after `rpc::CONNECTION_DRAIN_GRACE`; the liveness token
+    // every task started by the connection holds keeps the count above zero
+    // until those tasks have actually ended, so waiting for zero is what stops
+    // the replacement generation from admitting work for a session the
+    // retiring generation is still unwinding. A reload that cannot establish
+    // that is refused below instead of handing over. Only this wait carries
+    // the listeners' budget: the per-component grace below stays as it was, so
+    // an unrelated pending component adds no reload latency.
+    let drain = await_rpc_connection_drain(&rpc_connection_count).await;
+    let exit_result = settle_exit_against_drain(exit_result, drain);
+
+    // Grace window for cooperative shutdown of each component supervisor. The
+    // RPC listeners are already past their own drain by this point, so this
+    // only covers the supervisor loop returning after its component did.
     const GRACE_WINDOW: Duration = Duration::from_millis(500);
     let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
     let mut remaining: Vec<JoinHandle<()>> = Vec::new();
@@ -1476,6 +1493,80 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
             let _ = tokio::fs::write(&path, data).await;
         }
     })
+}
+
+/// Whether the RPC connections accepted by the retiring generation finished
+/// draining within the shutdown budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpcDrain {
+    /// Every accepted connection, and every task it started, has ended.
+    Complete,
+    /// The budget expired with this many connections still unwinding.
+    Outstanding(usize),
+}
+
+/// Wait for the connections the RPC listeners accepted to finish draining.
+///
+/// `count` is decremented when the last task started by a connection has
+/// ended: the connection task, each prompt it spawned, and the nested turn task
+/// each hold a clone of the connection's liveness token. A count of zero is
+/// therefore the daemon-visible proof that no old-generation work is still
+/// running, not merely that the connection task was aborted. The wait is
+/// bounded just past the listeners' own forced-abort deadline
+/// (`rpc::CONNECTION_DRAIN_GRACE`), the point at which a connection that
+/// ignored cancellation is aborted. Returns immediately when no connection was
+/// accepted, which is also the case when no RPC listener is running at all.
+pub(crate) async fn await_rpc_connection_drain(count: &std::sync::atomic::AtomicUsize) -> RpcDrain {
+    use std::sync::atomic::Ordering;
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    let deadline = tokio::time::Instant::now()
+        + crate::rpc::CONNECTION_DRAIN_GRACE.saturating_add(Duration::from_millis(500));
+
+    loop {
+        let outstanding = count.load(Ordering::Relaxed);
+        if outstanding == 0 {
+            return RpcDrain::Complete;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({ "connections": outstanding })),
+                "RPC connections still draining when the shutdown budget expired"
+            );
+            return RpcDrain::Outstanding(outstanding);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Decide what a reload may do once the drain has been attempted.
+///
+/// A reload keeps the process alive and starts a replacement generation over
+/// the same durable sessions, so it is admissible only when the retiring
+/// generation is proven finished. When the drain budget expires with work
+/// still unwinding, the reload is refused and downgraded to a shutdown: the
+/// supervisor restarts a fresh process, which cannot overlap with work this
+/// one never managed to retire. Shutdown exits and failures are returned
+/// unchanged.
+fn settle_exit_against_drain(exit: Result<DaemonExit>, drain: RpcDrain) -> Result<DaemonExit> {
+    let RpcDrain::Outstanding(outstanding) = drain else {
+        return exit;
+    };
+    if !matches!(exit, Ok(DaemonExit::Reload)) {
+        return exit;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "connections": outstanding })),
+        "Reload refused: RPC work from the retiring generation is still unwinding; shutting down \
+         instead so a replacement generation cannot overlap it"
+    );
+    Ok(DaemonExit::Shutdown)
 }
 
 fn spawn_component_supervisor<F, Fut>(
@@ -6491,5 +6582,131 @@ mod tests {
 
         // `_hook_guard` drops here, releasing the serialising lock
         // and clearing the global hook for the next test.
+    }
+
+    /// The reload drain must report the connections that were still unwinding
+    /// when its budget expired, not silently declare the generation retired.
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_reports_connections_left_unwinding_when_the_budget_expires() {
+        let count = std::sync::atomic::AtomicUsize::new(2);
+        assert_eq!(
+            await_rpc_connection_drain(&count).await,
+            RpcDrain::Outstanding(2)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_drain_completes_once_the_last_connection_task_ends() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let releaser = std::sync::Arc::clone(&count);
+        let release = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            releaser.store(0, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(await_rpc_connection_drain(&count).await, RpcDrain::Complete);
+        release.await.unwrap();
+    }
+
+    /// A reload hands the same durable sessions to a replacement generation, so
+    /// it is admissible only on proof that the retiring generation is finished.
+    #[test]
+    fn reload_is_refused_when_rpc_work_is_still_unwinding() {
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Reload), RpcDrain::Outstanding(1)).unwrap(),
+            DaemonExit::Shutdown,
+            "an undrained reload must shut the process down instead of handing over"
+        );
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Reload), RpcDrain::Complete).unwrap(),
+            DaemonExit::Reload,
+            "a drained reload must still reload"
+        );
+        assert_eq!(
+            settle_exit_against_drain(Ok(DaemonExit::Shutdown), RpcDrain::Outstanding(1)).unwrap(),
+            DaemonExit::Shutdown,
+            "a shutdown is unaffected by the drain verdict"
+        );
+        assert!(
+            settle_exit_against_drain(Err(anyhow::Error::msg("boom")), RpcDrain::Outstanding(1))
+                .is_err(),
+            "a failed daemon run must keep reporting its failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::{Duration, Instant, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let accepted = Arc::new(AtomicBool::new(false));
+        let drained = Arc::new(AtomicBool::new(false));
+        let accepted_for_socket = accepted.clone();
+        let drained_for_socket = drained.clone();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, cancel, client_count, readiness| {
+            let accepted = accepted_for_socket.clone();
+            let drained = drained_for_socket.clone();
+            Box::pin(async move {
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                // One accepted connection, counted the way a listener counts a
+                // live client.
+                client_count.store(1, Ordering::SeqCst);
+                accepted.store(true, Ordering::SeqCst);
+                cancel.cancelled().await;
+                // A connection whose prompt takes longer than the per-component
+                // grace to unwind before its client-count guard drops.
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                client_count.store(0, Ordering::SeqCst);
+                drained.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }));
+        // The gateway asks for the reload once the connection exists, then
+        // parks: an unrelated pending component must not extend shutdown.
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+                let accepted = accepted.clone();
+                Box::pin(async move {
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    while !accepted.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    reload_tx.send(true).expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let started = Instant::now();
+        let exit = timeout(
+            Duration::from_secs(8),
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon should finish the reload inside the RPC connection drain budget")
+        .expect("daemon run should succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(exit, DaemonExit::Reload);
+        assert!(
+            drained.load(Ordering::SeqCst),
+            "reload must wait for the accepted RPC connection to drain before retiring \
+             the listener; aborting the listener at the component grace leaves the \
+             connection's prompt work running into the replacement generation"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "a pending unrelated component must not inherit the RPC drain budget; \
+             reload took {elapsed:?}"
+        );
     }
 }
