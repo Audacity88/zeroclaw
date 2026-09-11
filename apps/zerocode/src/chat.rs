@@ -13469,6 +13469,31 @@ mod tests {
         // The terminal reload replaced the transcript wholesale, so only the
         // settled outcome's notice remains (the kept-running one was asserted
         // between the two applies above).
+
+        // The correlation fence still holds: a late frame from the original
+        // turn must not settle the post-recovery prompt (generation 2 now).
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "turn_complete",
+                "session_id": "sess-1",
+                "outcome": "completed",
+                "content": "stale late completion",
+                "client_turn_generation": 1,
+            }),
+        );
+        chat.tick_transport_events();
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("session remains active after recovery");
+        };
+        assert!(state.entries.iter().all(|entry| !matches!(
+            entry,
+            ChatEntry::AgentMessage(message) if message.as_ref() == "stale late completion"
+        )));
+        assert!(
+            state.turn_in_flight,
+            "stale frame must not settle the new turn"
+        );
     }
 
     #[tokio::test]
