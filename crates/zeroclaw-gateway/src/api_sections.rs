@@ -16,7 +16,7 @@ use zeroclaw_runtime::rpc::types::{
 
 use super::AppState;
 use super::api::require_auth;
-use super::api_config::{compute_drift, persist_and_swap};
+use super::api_config::{persist_and_swap, try_compute_drift};
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
@@ -1082,7 +1082,10 @@ pub async fn handle_section_select(
 
     if working.dirty_paths.is_empty() {
         let drifted = match section_enum {
-            Section::Memory | Section::Tunnel => compute_drift(&working).await,
+            Section::Memory | Section::Tunnel => match try_compute_drift(&working).await {
+                Ok(drifted) => drifted,
+                Err(error) => return error_response(error),
+            },
             _ => Vec::new(),
         };
         let tunnel_prefix =
@@ -2105,6 +2108,88 @@ mod tests {
                 .pending_reload
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    #[tokio::test]
+    async fn unchanged_memory_and_tunnel_selections_reject_uninspectable_config() {
+        use http_body_util::BodyExt;
+
+        for (section, key) in [("memory", "sqlite"), ("tunnel", "cloudflare")] {
+            for malformed in [false, true] {
+                let tmp = tempfile::tempdir().expect("section tempdir");
+                let config_path = tmp.path().join("config.toml");
+                let mut live_cfg = zeroclaw_config::schema::Config {
+                    config_path: config_path.clone(),
+                    ..Default::default()
+                };
+                if section == "memory" {
+                    live_cfg.memory.backend = key.to_string();
+                    live_cfg
+                        .onboard_state
+                        .completed_sections
+                        .push(section.to_string());
+                } else {
+                    live_cfg.tunnel.tunnel_provider = key.to_string();
+                    live_cfg.tunnel.cloudflare = Some(Default::default());
+                }
+
+                let malformed_contents = b"[memory\nbackend = \"sqlite\"";
+                if malformed {
+                    tokio::fs::write(&config_path, malformed_contents)
+                        .await
+                        .expect("write malformed config");
+                } else {
+                    std::fs::create_dir(&config_path).expect("create unreadable config path");
+                }
+
+                let state = section_test_state(live_cfg);
+                let live_before = state.config.read().clone();
+                let response = handle_section_select(
+                    State(state.clone()),
+                    axum::http::HeaderMap::new(),
+                    axum::extract::Path(SectionItemPath {
+                        section: section.to_string(),
+                        key: key.to_string(),
+                    }),
+                    None,
+                )
+                .await;
+
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::CONFLICT,
+                    "{section} must reject an {} canonical config",
+                    if malformed { "malformed" } else { "unreadable" }
+                );
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("section response body")
+                    .to_bytes();
+                let error: ConfigApiError =
+                    serde_json::from_slice(&body).expect("section error response");
+                assert_eq!(error.code, ConfigApiCode::ConfigChangedExternally);
+                if malformed {
+                    assert_eq!(
+                        tokio::fs::read(&config_path).await.unwrap(),
+                        malformed_contents
+                    );
+                } else {
+                    assert!(config_path.is_dir());
+                }
+                assert_eq!(
+                    toml::Value::try_from(&*state.config.read()).unwrap(),
+                    toml::Value::try_from(&live_before).unwrap(),
+                    "a rejected {section} selection must preserve the live snapshot"
+                );
+                assert!(
+                    !state
+                        .pending_reload
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -584,25 +584,32 @@ fn is_gateway_managed_field(name: &str) -> bool {
 }
 
 pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<DriftEntry> {
-    let path = &in_memory.config_path;
-    if !path.exists() {
-        return Vec::new();
-    }
+    try_compute_drift(in_memory).await.unwrap_or_default()
+}
 
+pub(crate) async fn try_compute_drift(
+    in_memory: &zeroclaw_config::schema::Config,
+) -> Result<Vec<DriftEntry>, ConfigApiError> {
+    let path = &in_memory.config_path;
     let raw = match tokio::fs::read_to_string(path).await {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ConfigApiError::new(
+                ConfigApiCode::ConfigChangedExternally,
+                format!("cannot inspect the canonical config before comparing changes: {error}"),
+            ));
+        }
     };
 
     // Re-parse the on-disk form into a fresh Config for value-by-value comparison.
-    let on_disk: zeroclaw_config::schema::Config =
-        match toml::from_str::<zeroclaw_config::schema::Config>(&raw) {
-            Ok(mut cfg) => {
-                cfg.config_path = path.clone();
-                cfg
-            }
-            Err(_) => return Vec::new(),
-        };
+    let mut on_disk = toml::from_str::<zeroclaw_config::schema::Config>(&raw).map_err(|_| {
+        ConfigApiError::new(
+            ConfigApiCode::ConfigChangedExternally,
+            "cannot compare changes because the canonical config is malformed",
+        )
+    })?;
+    on_disk.config_path = path.clone();
 
     let in_memory_props: std::collections::HashMap<String, zeroclaw_config::traits::PropFieldInfo> =
         in_memory
@@ -672,7 +679,7 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
 
     // Stable order so callers can diff snapshots.
     drift.sort_by(|a, b| a.path.cmp(&b.path));
-    drift
+    Ok(drift)
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
