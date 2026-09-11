@@ -2132,8 +2132,16 @@ mod tests {
 
         // Spend recorded through the base tracker is immediately visible to
         // the derived tracker's budget check (shared storage, no stale fork).
-        base.record_usage(TokenUsage::new("test/model", 2_000_000, 0, 0, 3.0, 3.0, 0.0))
-            .unwrap();
+        base.record_usage(TokenUsage::new(
+            "test/model",
+            2_000_000,
+            0,
+            0,
+            3.0,
+            3.0,
+            0.0,
+        ))
+        .unwrap();
         assert!(
             matches!(
                 derived.check_budget(0.0).unwrap(),
