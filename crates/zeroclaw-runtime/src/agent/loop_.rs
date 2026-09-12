@@ -15468,6 +15468,7 @@ Let me check the result."#;
                 input_tokens: Some(60),
                 output_tokens: Some(4),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15478,6 +15479,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(7),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };

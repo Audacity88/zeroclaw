@@ -392,6 +392,7 @@ mod tests {
             input_tokens: Some(input),
             cached_input_tokens: None,
             output_tokens: Some(output),
+            cache_creation_input_tokens: None,
         }
     }
 
@@ -876,6 +877,7 @@ mod tests {
                         input_tokens: Some(500),
                         cached_input_tokens: None,
                         output_tokens: Some(100),
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 })
