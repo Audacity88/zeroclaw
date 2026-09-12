@@ -10800,7 +10800,7 @@ mod tests {
             rect: Rect::new(0, 0, 20, 4),
             target: ChatContextMenuTarget::Transcript(CopyHitRegion {
                 rect: Rect::new(0, 0, 5, 1),
-                text: "first\n\n世界".to_string(),
+                text: Arc::<str>::from("first\n\n世界"),
                 kind: CopyHitKind::Transcript,
                 group: 0,
                 action: CopyHitAction::Copy,
@@ -10849,7 +10849,7 @@ mod tests {
             rect: Rect::new(4, 4, 20, 4),
             target: ChatContextMenuTarget::Transcript(CopyHitRegion {
                 rect: Rect::new(0, 0, 5, 1),
-                text: "selected".to_string(),
+                text: Arc::<str>::from("selected"),
                 kind: CopyHitKind::Transcript,
                 group: 0,
                 action: CopyHitAction::Copy,
@@ -10893,7 +10893,7 @@ mod tests {
             rect: Rect::new(0, 0, 20, 4),
             target: ChatContextMenuTarget::Transcript(CopyHitRegion {
                 rect: Rect::new(0, 0, 5, 1),
-                text: "selected".to_string(),
+                text: Arc::<str>::from("selected"),
                 kind: CopyHitKind::Transcript,
                 group: 0,
                 action: CopyHitAction::Copy,
@@ -11044,7 +11044,7 @@ mod tests {
             rect: Rect::new(0, 0, 16, 4),
             target: ChatContextMenuTarget::Transcript(CopyHitRegion {
                 rect: Rect::new(0, 0, 5, 1),
-                text: "hello".to_string(),
+                text: Arc::<str>::from("hello"),
                 kind: CopyHitKind::Transcript,
                 group: 0,
                 action: CopyHitAction::Copy,
@@ -11062,7 +11062,7 @@ mod tests {
         assert!(state.context_menu.is_none());
         assert!(matches!(
             request,
-            ChatContextMenuRequest::AddToChat(CopyHitRegion { text, .. }) if text == "hello"
+            ChatContextMenuRequest::AddToChat(CopyHitRegion { text, .. }) if text.as_ref() == "hello"
         ));
     }
 
@@ -11284,7 +11284,9 @@ mod tests {
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| render_conversation(frame, &mut state, area))
+            .draw(|frame| {
+                render_conversation(frame, &mut state, area);
+            })
             .expect("draw conversation");
 
         let snapshot = state.transcript_snapshot.as_ref().expect("snapshot");
@@ -11325,7 +11327,9 @@ mod tests {
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| render_conversation(frame, &mut state, area))
+            .draw(|frame| {
+                render_conversation(frame, &mut state, area);
+            })
             .expect("draw top viewport");
 
         let snapshot = state.transcript_snapshot.as_ref().expect("snapshot");
@@ -11342,7 +11346,9 @@ mod tests {
 
         state.scroll_down(40);
         terminal
-            .draw(|frame| render_conversation(frame, &mut state, area))
+            .draw(|frame| {
+                render_conversation(frame, &mut state, area);
+            })
             .expect("draw scrolled viewport");
         let snapshot = state.transcript_snapshot.as_ref().expect("merged snapshot");
         assert!(snapshot.cells.len() > initial_rows);
@@ -12012,7 +12018,7 @@ mod tests {
         state.finish_transcript_drag();
         state.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(20, 6, 2, 1),
-            text: "button".to_string(),
+            text: Arc::<str>::from("button"),
             kind: CopyHitKind::Transcript,
             group: 0,
             action: CopyHitAction::Copy,
