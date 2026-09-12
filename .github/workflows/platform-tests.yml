@@ -1,4 +1,4 @@
-name: Windows issue 10793 phase trace
+name: Windows issue 10793 command discovery trace
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   windows-diagnostics:
-    name: PowerShell phase trace
+    name: PowerShell command discovery trace
     if: github.repository == 'Audacity88/zeroclaw'
     runs-on: windows-latest
     timeout-minutes: 12
@@ -56,13 +56,32 @@ jobs:
           print(json.dumps({'head': os.environ['GITHUB_SHA'], 'source_contract': 'matched', 'baseline_names': len(names)}), flush=True)
 
           plain = 'Write-Output "quoted safe value" | Select-Object -First 1'
-          # .NET markers avoid cmdlet discovery before the original pipeline.
-          traced = '''$zcWatch = [System.Diagnostics.Stopwatch]::StartNew();
+          # Resolve through the engine intrinsic, avoiding Get-Command's own lookup.
+          lookup = r'''$zcWatch = [System.Diagnostics.Stopwatch]::StartNew();
           [Console]::Error.WriteLine(('ZC10793|entry|{0}' -f $zcWatch.ElapsedMilliseconds));
+          $zcWrite = $ExecutionContext.InvokeCommand.GetCommand('Write-Output', [System.Management.Automation.CommandTypes]::Cmdlet);
+          [Console]::Error.WriteLine(('ZC10793|after_resolve_write|{0}' -f $zcWatch.ElapsedMilliseconds));
+          $zcSelect = $ExecutionContext.InvokeCommand.GetCommand('Select-Object', [System.Management.Automation.CommandTypes]::Cmdlet);
+          [Console]::Error.WriteLine(('ZC10793|after_resolve_select|{0}' -f $zcWatch.ElapsedMilliseconds));
+          if ($null -eq $zcWrite -or $null -eq $zcSelect -or $zcWrite.Name -ne 'Write-Output' -or $zcSelect.Name -ne 'Select-Object' -or $zcWrite.ModuleName -ne 'Microsoft.PowerShell.Utility' -or $zcSelect.ModuleName -ne 'Microsoft.PowerShell.Utility') { throw 'Unexpected diagnostic command identity' };
+          & $zcWrite "quoted safe value" | & $zcSelect -First 1;
+          [Console]::Error.WriteLine(('ZC10793|after_first|{0}' -f $zcWatch.ElapsedMilliseconds));
+          & $zcWrite "quoted safe value" | & $zcSelect -First 1;
+          [Console]::Error.WriteLine(('ZC10793|after_second|{0}' -f $zcWatch.ElapsedMilliseconds));'''
+          # A known built-in manifest avoids searching arbitrary module names.
+          imported = r'''$zcWatch = [System.Diagnostics.Stopwatch]::StartNew();
+          [Console]::Error.WriteLine(('ZC10793|entry|{0}' -f $zcWatch.ElapsedMilliseconds));
+          $zcModule = [System.IO.Path]::Combine($PSHOME, 'Modules', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1');
+          if (-not [System.IO.File]::Exists($zcModule)) { throw 'Missing built-in diagnostic module' };
+          Microsoft.PowerShell.Core\Import-Module -Name $zcModule -ErrorAction Stop;
+          [Console]::Error.WriteLine(('ZC10793|after_import|{0}' -f $zcWatch.ElapsedMilliseconds));
           Write-Output "quoted safe value" | Select-Object -First 1;
           [Console]::Error.WriteLine(('ZC10793|after_first|{0}' -f $zcWatch.ElapsedMilliseconds));
           Write-Output "quoted safe value" | Select-Object -First 1;
           [Console]::Error.WriteLine(('ZC10793|after_second|{0}' -f $zcWatch.ElapsedMilliseconds));'''
+          scripts = {'plain': plain, 'lookup': lookup, 'import': imported}
+          phases = {'plain': [], 'lookup': ['entry', 'after_resolve_write', 'after_resolve_select', 'after_first', 'after_second'],
+                    'import': ['entry', 'after_import', 'after_first', 'after_second']}
 
           def drain(pipe, started, parse_markers):
               result = {'data': bytearray(), 'first_ms': None, 'eof_ms': None, 'markers': [], 'overflow': False, 'error': False}
@@ -85,7 +104,7 @@ jobs:
                               pending += chunk
                               while b'\n' in pending:
                                   line, pending = pending.split(b'\n', 1)
-                                  match = re.fullmatch(rb'ZC10793\|(entry|after_first|after_second)\|(\d+)\r?', line)
+                                  match = re.fullmatch(rb'ZC10793\|(entry|after_resolve_write|after_resolve_select|after_import|after_first|after_second)\|(\d+)\r?', line)
                                   if match:
                                       result['markers'].append({'phase': match[1].decode('ascii'), 'script_ms': int(match[2]), 'received_ms': now})
                                   else:
@@ -100,14 +119,15 @@ jobs:
               thread.start()
               return result, thread
 
-          modes = [('plain-inherited', False, False), ('plain-sanitized', True, False),
-                   ('traced-inherited', False, True), ('traced-sanitized', True, True)]
+          modes = [('plain-inherited', False, 'plain'), ('plain-sanitized', True, 'plain'),
+                   ('lookup-sanitized', True, 'lookup'), ('import-sanitized', True, 'import')]
           with tempfile.TemporaryDirectory(prefix='zc10793-phase-') as cwd:
-              for number, (mode, clean, instrumented) in enumerate(modes + list(reversed(modes))):
+              for number, (mode, clean, kind) in enumerate(modes + list(reversed(modes))):
+                  instrumented = kind != 'plain'
                   print(f'PHASE_ATTEMPT round={number} mode={mode}', flush=True)
                   started = time.monotonic()
                   try:
-                      child = subprocess.Popen(['powershell', '-NoProfile', '-NonInteractive', '-Command', traced if instrumented else plain],
+                      child = subprocess.Popen(['powershell', '-NoProfile', '-NonInteractive', '-Command', scripts[kind]],
                                                cwd=cwd, env=sanitized if clean else None,
                                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                                creationflags=subprocess.CREATE_NO_WINDOW)
@@ -137,7 +157,7 @@ jobs:
                   except UnicodeError:
                       output_matches = False
                   marker_names = [m['phase'] for m in err['markers']]
-                  markers_ok = marker_names == (['entry', 'after_first', 'after_second'] if instrumented else [])
+                  markers_ok = marker_names == phases[kind]
                   stderr_ok = not err['data'] if not instrumented else markers_ok
                   ok = code == 0 and not timed_out and output_matches and markers_ok and stderr_ok and not any(r['error'] or r['overflow'] for r in (out, err))
                   print(json.dumps({'round': number, 'mode': mode, 'exit': code, 'timed_out': timed_out, 'success': ok,
