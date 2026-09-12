@@ -2681,14 +2681,18 @@ impl RpcDispatcher {
 
         // Keep the terminal count aligned with session/new and session/messages:
         // it is the durable projected conversation length, not the number of
-        // visible TUI bubbles or local user turns.
+        // visible TUI bubbles or local user turns. The store maintains this
+        // counter as turns are appended, so reading it here avoids hydrating
+        // the whole history on every turn end.
         let message_count = match chat_mode {
-            crate::rpc::types::ChatMode::Acp => self
-                .ctx
-                .acp_session_store
-                .as_ref()
-                .and_then(|store| store.load_session(&req.session_id).ok().flatten())
-                .map(|data| conversation_message_entries(&data.messages).len()),
+            crate::rpc::types::ChatMode::Acp => {
+                self.ctx.acp_session_store.as_ref().and_then(|store| {
+                    store
+                        .projected_message_count(&req.session_id)
+                        .ok()
+                        .flatten()
+                })
+            }
             crate::rpc::types::ChatMode::Chat => self
                 .ctx
                 .session_backend
@@ -10522,7 +10526,10 @@ mod tests {
             ]),
         ];
 
-        assert_eq!(projected_entry_count(&msgs), conversation_message_entries(&msgs).len());
+        assert_eq!(
+            projected_entry_count(&msgs),
+            conversation_message_entries(&msgs).len()
+        );
         // 1 chat + (text + 2 calls) + folded result + empty-text-batch call
         // + 2 folded results + 1 orphan result.
         assert_eq!(projected_entry_count(&msgs), 6);
