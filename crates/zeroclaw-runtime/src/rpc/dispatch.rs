@@ -9915,7 +9915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_persistence_skips_empty_and_failed_turns() {
+    async fn acp_persistence_skips_empty_and_messageless_failed_turns() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
@@ -10084,6 +10084,56 @@ mod tests {
                 if m.role == "system"
                     && m.content == zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER
         ));
+    }
+
+    #[tokio::test]
+    async fn persist_acp_turn_keeps_partial_assistant_text_from_failed_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "failed-turn-partial-text";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        // A stream that died after visible output: the agent loop already
+        // committed the partial as an assistant row with its interruption
+        // marker appended. Persistence treats that text as opaque and must
+        // store it byte-identically, with the failure marker after it.
+        let partial = "The first half of the answer was\n\n[stream interrupted]";
+        let failed = Err(crate::rpc::turn::TurnError::AgentError {
+            message: "provider stream failed".into(),
+            messages: vec![
+                ConversationMessage::Chat(ChatMessage::user("finish the thought")),
+                ConversationMessage::Chat(ChatMessage::assistant(partial)),
+            ],
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+
+        let data = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            3,
+            "prompt + partial assistant text + marker"
+        );
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(m) if m.role == "user" && m.content == "finish the thought"
+        ));
+        assert!(
+            matches!(
+                &data.messages[1],
+                ConversationMessage::Chat(m) if m.role == "assistant" && m.content == partial
+            ),
+            "partial assistant text survives unchanged"
+        );
+        assert!(
+            matches!(
+                &data.messages[2],
+                ConversationMessage::Chat(m)
+                    if m.role == "system"
+                        && m.content == zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER
+            ),
+            "the failure marker is the last row"
+        );
     }
 
     #[tokio::test]
