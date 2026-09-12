@@ -541,14 +541,26 @@ fn has_typed_non_retryable_marker(err: &anyhow::Error) -> bool {
         .any(|source| source.is::<crate::traits::NonRetryableProviderError>())
 }
 
-/// First status-shaped HTTP client error code embedded in an error message:
-/// a run of exactly three ASCII digits, not adjacent (either side) to an
-/// ASCII alphanumeric character, whose value is in 400..500. Numbers glued to
-/// units or words ("480s"), longer digit runs ("0409", "4800"), and values
-/// outside the client range are not status codes. This keeps timing and
-/// sizing numbers in provider messages (for example a stream-idle bound of
-/// 480 s) from being misread as a 4xx client error.
-fn embedded_client_status(message: &str) -> Option<u16> {
+/// The status shape rule shared by `embedded_status_code` and the
+/// error-text marker parser (`http_status_from_error_text`): a status
+/// code is a run of exactly three ASCII digits with no alphanumeric byte
+/// on either side.
+fn is_status_shaped_run(bytes: &[u8], start: usize) -> bool {
+    start + 3 <= bytes.len()
+        && bytes[start..start + 3].iter().all(u8::is_ascii_digit)
+        && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+        && (start + 3 == bytes.len() || !bytes[start + 3].is_ascii_alphanumeric())
+}
+
+/// First status-shaped HTTP status code embedded in an error message and
+/// admitted by `accept`: a run of exactly three ASCII digits, not adjacent
+/// (either side) to an ASCII alphanumeric character
+/// (`is_status_shaped_run`). Numbers glued to units or words ("480s"),
+/// longer digit runs ("0409", "4800"), and values `accept` rejects are
+/// not status codes. This keeps timing and sizing numbers in provider
+/// messages (for example a stream-idle bound of 480 s) from being misread
+/// as an HTTP status.
+fn embedded_status_code(message: &str, accept: impl Fn(u16) -> bool) -> Option<u16> {
     let bytes = message.as_bytes();
     let mut start = 0;
     while start < bytes.len() {
@@ -560,18 +572,20 @@ fn embedded_client_status(message: &str) -> Option<u16> {
         while end < bytes.len() && bytes[end].is_ascii_digit() {
             end += 1;
         }
-        let status_shaped = end - start == 3
-            && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
-            && (end == bytes.len() || !bytes[end].is_ascii_alphanumeric());
-        if status_shaped
-            && let Ok(code) = message[start..end].parse::<u16>()
-            && (400..500).contains(&code)
+        if is_status_shaped_run(bytes, start)
+            && let Ok(code) = message[start..start + 3].parse::<u16>()
+            && accept(code)
         {
             return Some(code);
         }
         start = end;
     }
     None
+}
+
+/// First status-shaped HTTP client error (4xx) code embedded in a message.
+fn embedded_client_status(message: &str) -> Option<u16> {
+    embedded_status_code(message, |code| (400..500).contains(&code))
 }
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
@@ -748,20 +762,50 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
 }
 
 /// Check if an error is an overload (transient server-side shed): the
-/// upstream accepted the request and dropped it under load. Matches a
-/// reqwest 529 status, a literal 529, or the word "overloaded"
-/// (case-insensitive, covering `overloaded_error`). Consulted on error
-/// values only — successful response text never reaches it. A plain 503
-/// (even one whose body mentions "overload") is not an overload signal; it
-/// keeps the ordinary server-error policy without the overload backoff floor.
+/// upstream accepted the request and dropped it under load. The decision is
+/// layered, each layer decisive when it applies:
+///
+/// 1. A typed reqwest status: overload iff it is 529.
+/// 2. The outermost status the crate's recognised markers yield
+///    (`modelprovider error:`, `api error (`, `http `): 529 is an
+///    overload; any 4xx is definitive and not one; another 5xx falls
+///    through to the wording, so a gateway's 502 or 503 whose body says
+///    "overloaded" still gets the overload floor. A status quoted from
+///    an upstream body never outranks the adapter's own status.
+/// 3. A status-shaped embedded client status (4xx): definitive, not an
+///    overload; a parsed client status outranks wording, so
+///    "429 ...: servers overloaded" is a rate limit, not a shed.
+/// 4. Otherwise the wording: "overloaded" (case-insensitive, covering
+///    `overloaded_error`) or a status-shaped 529.
+///
+/// Residual: a status-shaped `529` (space or punctuation on both sides) in
+/// a message with no recognised status marker and no typed classification
+/// is treated as overload — the price of the text fallback.
+/// `is_terminal_provider_failure` keeps that residual from overriding
+/// typed or quota decisions. Consulted on error values only — successful
+/// response text never reaches it. A plain 503 (even one whose body
+/// mentions "overload") is not an overload signal; it keeps the ordinary
+/// server-error policy without the overload backoff floor.
 fn is_overloaded(err: &anyhow::Error) -> bool {
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
         && let Some(status) = reqwest_err.status()
     {
         return status.as_u16() == 529;
     }
-    let lower = err.to_string().to_lowercase();
-    lower.contains("529") || lower.contains("overloaded")
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+    if let Some(status) = http_status_from_error_text(&lower) {
+        if status == 529 {
+            return true;
+        }
+        if (400..500).contains(&status) {
+            return false;
+        }
+    }
+    if embedded_client_status(&msg).is_some() {
+        return false;
+    }
+    lower.contains("overloaded") || embedded_status_code(&lower, |code| code == 529).is_some()
 }
 
 fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
@@ -1036,6 +1080,16 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
     Some(sanitized_url_endpoint(url))
 }
 
+/// HTTP status code carried by one of the crate's recognised error-text
+/// markers: a `modelprovider error:` prefix at the start of the text, or
+/// an `api error (` / `http ` marker anywhere in it. The outermost marker
+/// wins: adapters format their own response status first and append the
+/// upstream body after it (the Gemini CLI OAuth refresh bail in
+/// `gemini.rs` is the shape in hand), and `anyhow::Error::to_string`
+/// renders the outermost message, so the first marker in the text carries
+/// the wrapper's status; anything later is quoted payload and never
+/// outranks it. The shape rule is the one `embedded_status_code` applies:
+/// exactly three digits, no alphanumeric neighbour.
 fn http_status_from_error_text(text: &str) -> Option<u16> {
     for prefix in [
         "model_provider stream error: modelprovider error:",
@@ -1057,21 +1111,29 @@ fn http_status_from_error_text(text: &str) -> Option<u16> {
         }
     }
 
+    // Earliest accepted marker occurrence wins, across both markers: a
+    // status quoted from an upstream body sits after the adapter's own
+    // status and must not override it.
+    let bytes = text.as_bytes();
+    let mut outermost: Option<(usize, u16)> = None;
     for marker in ["api error (", "http "] {
+        let mut scanned_to = 0;
         let mut remainder = text;
         while let Some(start) = remainder.find(marker) {
-            let after_marker = &remainder[start + marker.len()..];
-            if let Some(code) = after_marker
-                .get(..3)
-                .and_then(|value| value.parse::<u16>().ok())
-                .filter(|code| (400..600).contains(code))
+            let marker_at = scanned_to + start;
+            let status_at = marker_at + marker.len();
+            if is_status_shaped_run(bytes, status_at)
+                && let Ok(code) = text[status_at..status_at + 3].parse::<u16>()
+                && (400..600).contains(&code)
+                && outermost.is_none_or(|(at, _)| marker_at < at)
             {
-                return Some(code);
+                outermost = Some((marker_at, code));
             }
-            remainder = after_marker;
+            scanned_to = status_at;
+            remainder = &remainder[start + marker.len()..];
         }
     }
-    None
+    outermost.map(|(_, code)| code)
 }
 
 fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorDiagnostic {
@@ -7169,6 +7231,16 @@ mod tests {
         assert!(is_terminal_provider_failure(&anyhow::Error::msg(
             "401 Unauthorized: request req_a529b"
         )));
+        // An outer auth status stays terminal when the upstream body
+        // quotes an overload status: the marker layer reads the
+        // outermost status, and only status-shaped tokens count, so a
+        // nested "529" (or a queue-depth "52931") never clears it.
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}"
+        )));
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (52931 queued requests)\"}"
+        )));
         // A typed refusal is terminal (constructed offline, no live
         // response needed).
         let refusal = anyhow::Error::new(AnthropicRefusalError {
@@ -7275,6 +7347,42 @@ mod tests {
             .chat_with_system(None, "hello", "test", None)
             .await
             .expect_err("auth failure with incidental 529 digits must stay terminal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("non_retryable"),
+            "failure events must record non_retryable: {err}"
+        );
+    }
+
+    /// An outer auth status with an overload status quoted from the
+    /// upstream body is terminal: the marker layer reads the outermost
+    /// status, so the `chat_with_tools` arm fails fast instead of
+    /// retrying the authentication failure against the same candidate.
+    #[tokio::test(start_paused = true)]
+    async fn chat_with_tools_does_not_retry_outer_auth_status_with_nested_529() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "",
+                    error: "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}",
+                }),
+            )],
+            2,
+            1,
+        );
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "noop", "parameters": {}}
+        })];
+        let err = provider
+            .chat_with_tools(&[], &tools, "test", None)
+            .await
+            .expect_err("outer auth status with nested 529 must stay terminal");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(
             err.to_string().contains("non_retryable"),
@@ -7528,6 +7636,15 @@ mod tests {
             ),
             (
                 "401 Unauthorized: invalid api key",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                // The outer adapter status classifies the diagnostic; a
+                // 529 quoted from the upstream body is payload, not the
+                // response status.
+                "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}",
                 "auth",
                 "http_response",
                 "credentials",
@@ -8259,14 +8376,47 @@ mod tests {
         assert!(is_overloaded(&anyhow::Error::msg(
             "ModelProvider error: overloaded_error: Overloaded"
         )));
-        // Status code in the text (gateway style).
+        // Recognised `ModelProvider error:` prefix yields the status
+        // (gateway style).
         assert!(is_overloaded(&anyhow::Error::msg(
             "ModelProvider error: 529 <unknown status code>: Overloaded"
+        )));
+        // Marker layer: the crate's `api error (` marker yields the status
+        // even when the payload wording alone would carry it.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (529 <unknown status code>): {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"
         )));
         // Case-insensitive: a 503 body that says "OVERLOADED" is an overload
         // signal too (same provider_server classification, plus the floor).
         assert!(is_overloaded(&anyhow::Error::msg(
             "503 Service Unavailable: OVERLOADED"
+        )));
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (503 Service Unavailable): overloaded_error"
+        )));
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "ModelProvider error: 502 Bad Gateway: upstream overloaded"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (400 Bad Request): prompt has 529 tokens"
+        )));
+        // The marker layer reads the outermost status and only
+        // status-shaped tokens: an adapter's own HTTP status wins over a
+        // status quoted from the upstream body, and "52931 queued
+        // requests" is a queue depth, not a 529.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (52931 queued requests)\"}"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (52931 queued requests)"
+        )));
+        // The outer status is the real one: an outer 529 with a quoted
+        // 401 in the body is an overload, not an auth failure.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 529 overloaded): {\"error\":\"upstream API error (401 Unauthorized)\"}"
         )));
 
         // The predicate classifies the shared provider_server kind, matching
@@ -8279,8 +8429,12 @@ mod tests {
         // Negatives: other failure classes never match, and the singular
         // word "overload" is prose, not the provider's overload signal — a
         // plain 503 keeps the ordinary server-error policy (base backoff, no
-        // floor). The predicate only ever sees error values, so response
-        // text containing "Overloaded" cannot reach it.
+        // floor). The status half matches status-shaped runs only, so "529"
+        // inside a larger number (token counts below) is not an overload
+        // signal: this predicate overrides non-retryable classification in
+        // the retry loop, and a 400 whose body merely mentions a token count
+        // must not be retried. The predicate only ever sees error values, so
+        // response text containing "Overloaded" cannot reach it.
         assert!(!is_overloaded(&anyhow::Error::msg("429 Too Many Requests")));
         assert!(!is_overloaded(&anyhow::Error::msg(
             "401 Unauthorized: bad key"
@@ -8291,6 +8445,117 @@ mod tests {
         assert!(!is_overloaded(&anyhow::Error::msg(
             "maximum context length exceeded"
         )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: prompt is 15290 tokens, limit 8192"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: input has 52931 tokens"
+        )));
+        // Shape rule, shared with `embedded_client_status`: a status is a
+        // run of exactly three digits with non-alphanumeric neighbours, so
+        // digits glued to letters ("req_a529b", "model529b",
+        // "chatcmpl-529abc") or to more digits ("0529") are never a status,
+        // and a leading-zero run is four digits, not a three-digit status.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "401 Unauthorized: request req_a529b"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "unknown model model529b for this key"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "no such completion chatcmpl-529abc"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "gateway reported 0529 queued requests"
+        )));
+        // A parsed client status outranks overload wording: a bad request
+        // and a rate limit are client decisions, not a server shed.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: prompt has 529 tokens"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "429 Too Many Requests: insufficient_quota, servers overloaded"
+        )));
+    }
+
+    #[test]
+    fn embedded_status_code_admits_by_acceptor() {
+        // A non-client acceptor: the overload probe looking for a bare 529.
+        // A status-shaped 529 between spaces is found.
+        assert_eq!(
+            embedded_status_code("shed 529 retry later", |code| code == 529),
+            Some(529)
+        );
+        // Digits glued to letters on either side are not a status.
+        assert_eq!(
+            embedded_status_code("request req_a529b failed", |code| code == 529),
+            None
+        );
+        // A leading-zero run is four digits, not a three-digit status.
+        assert_eq!(
+            embedded_status_code("queue depth 0529", |code| code == 529),
+            None
+        );
+        // The first accepted code wins when two are present.
+        assert_eq!(
+            embedded_status_code("saw 530 then 529", |code| matches!(code, 529 | 530)),
+            Some(530)
+        );
+    }
+
+    #[test]
+    fn http_status_from_error_text_prefers_outer_status_and_status_shaped_tokens() {
+        // Inputs are lowercase: both callers pass a lowercased message.
+        // The outer adapter status wins over a status quoted from the
+        // upstream body (the Gemini CLI OAuth refresh adapter wraps its
+        // own response status around the body it received).
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 401 unauthorized): {\"error_description\":\"upstream api error (529 <unknown status code>)\"}"
+            ),
+            Some(401)
+        );
+        // A marker-adjacent run of more than three digits is not a
+        // status: "52931 queued requests" is a queue depth, not a 529.
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 401 unauthorized): {\"error_description\":\"upstream api error (52931 queued requests)\"}"
+            ),
+            Some(401)
+        );
+        assert_eq!(
+            http_status_from_error_text("anthropic api error (52931 queued requests)"),
+            None
+        );
+        assert_eq!(http_status_from_error_text("http 52931"), None);
+        // The outer status is the real one: an outer 529 with a quoted
+        // 401 in the body is an overload, not an auth failure.
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 529 overloaded): {\"error\":\"upstream api error (401 unauthorized)\"}"
+            ),
+            Some(529)
+        );
+        // Unchanged positives: a lone marker status, and the
+        // `modelprovider error:` prefix path.
+        assert_eq!(
+            http_status_from_error_text(
+                "anthropic api error (529 <unknown status code>): overloaded"
+            ),
+            Some(529)
+        );
+        assert_eq!(
+            http_status_from_error_text(
+                "modelprovider error: 529 <unknown status code>: overloaded"
+            ),
+            Some(529)
+        );
+        // A marker whose token is not status-shaped is skipped; the next
+        // valid marker counts.
+        assert_eq!(
+            http_status_from_error_text("anthropic api error (unknown): http 401"),
+            Some(401)
+        );
     }
 
     #[test]
