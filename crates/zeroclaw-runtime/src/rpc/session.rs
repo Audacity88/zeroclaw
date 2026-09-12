@@ -128,6 +128,13 @@ type GatedOpPause = (
 #[cfg(test)]
 type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
+#[cfg(test)]
+type RemovalSignalPause = (
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+);
+
 type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 
 pub struct SessionStore {
@@ -154,6 +161,10 @@ pub struct SessionStore {
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause after a removal handler captures the target generation
+    /// but before it signals an in-flight turn.
+    #[cfg(test)]
+    test_removal_signal_pause: std::sync::Mutex<Option<RemovalSignalPause>>,
     #[cfg(test)]
     test_prompt_admission_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -211,6 +222,8 @@ impl SessionStore {
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_removal_signal_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_admission_hook: std::sync::Mutex::new(None),
         }
@@ -889,6 +902,47 @@ impl SessionStore {
         (entered, release)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn wait_test_removal_signal_pause(&self) {
+        let (entered, release) = {
+            let guard = self.test_removal_signal_pause.lock().unwrap();
+            match &*guard {
+                Some((entered, release, _)) => (Arc::clone(entered), Arc::clone(release)),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_removal_signal_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_removal_signal_pause(&self) -> RemovalSignalPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let attempted = Arc::new(tokio::sync::Notify::new());
+        *self.test_removal_signal_pause.lock().unwrap() = Some((
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&attempted),
+        ));
+        (entered, release, attempted)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_test_removal_signal_attempted(&self) {
+        if let Some((_, _, attempted)) = self.test_removal_signal_pause.lock().unwrap().as_ref() {
+            attempted.notify_one();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn notify_test_removal_signal_attempted(&self) {}
+
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {
         {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -924,12 +978,31 @@ impl SessionStore {
         id: &str,
         session_generation: Option<u64>,
     ) -> bool {
+        self.signal_cancellation_for_generation(id, session_generation, CancelCause::SessionRemoved)
+    }
+
+    /// Signal an administrative kill only when the in-flight turn belongs to
+    /// the captured live session incarnation.
+    pub fn signal_session_kill_for_generation(
+        &self,
+        id: &str,
+        session_generation: Option<u64>,
+    ) -> bool {
+        self.signal_cancellation_for_generation(id, session_generation, CancelCause::AdminKill)
+    }
+
+    fn signal_cancellation_for_generation(
+        &self,
+        id: &str,
+        session_generation: Option<u64>,
+        cause: CancelCause,
+    ) -> bool {
         let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         tokens
             .get(id)
             .filter(|(_, registered_generation, _)| *registered_generation == session_generation)
             .map(|(_, _, token)| {
-                self.record_cancel_cause(id, CancelCause::SessionRemoved);
+                self.record_cancel_cause(id, cause);
                 token.cancel();
                 true
             })
@@ -1092,6 +1165,9 @@ mod tests {
                     CancelCause::ClientRpc => signal_store.cancel_session("s"),
                     CancelCause::SessionRemoved => signal_store.signal_session_removal("s"),
                     CancelCause::AdminKill => signal_store.signal_session_kill("s"),
+                    CancelCause::ConnectionClosed => {
+                        unreachable!("connection closure is not a session-scoped RPC signal")
+                    }
                 }
             });
             tokio::time::timeout(DEADLOCK_BOUND, signal_started.notified())
@@ -1145,7 +1221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_session_removal_does_not_cancel_successor_prompt() {
+    async fn stale_generation_scoped_removal_does_not_cancel_successor_prompt() {
         let store = make_store(4);
         store
             .insert(
@@ -1188,6 +1264,33 @@ mod tests {
         assert!(store.signal_session_removal_for_generation("s", Some(successor_generation)));
         assert!(token.is_cancelled());
         assert_eq!(registration.finish(), Some(CancelCause::SessionRemoved));
+    }
+
+    #[tokio::test]
+    async fn generation_scoped_kill_preserves_admin_cancellation_cause() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".to_string(),
+                RpcSession::new(
+                    make_agent(),
+                    "agent",
+                    "/tmp",
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        let generation = store.get_generation("s").await.unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let (_guard, registration) = store
+            .acquire_prompt("s", Some(generation), token.clone())
+            .await
+            .unwrap();
+
+        assert!(store.signal_session_kill_for_generation("s", Some(generation)));
+        assert!(token.is_cancelled());
+        assert_eq!(registration.finish(), Some(CancelCause::AdminKill));
     }
 
     #[tokio::test]

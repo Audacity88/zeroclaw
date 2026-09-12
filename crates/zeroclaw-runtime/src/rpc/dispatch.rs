@@ -2162,21 +2162,19 @@ impl RpcDispatcher {
         // A hard-cancelled ACP prompt can remove its live owner before this
         // handler acquires admission. Preserve the mode that the caller
         // targeted instead of guessing from whichever durable rows remain.
-        let requested_generation = self.ctx.sessions.get_generation(sid).await;
-        let requested_mode = self.ctx.sessions.chat_mode(sid).await;
-        if self.ctx.sessions.get_generation(sid).await != requested_generation
-            || requested_mode.is_some() != requested_generation.is_some()
-        {
-            return Err(rpc_err(
-                SESSION_BUSY,
-                "Session changed while preparing to kill it",
-            ));
-        }
+        let requested_identity = self.ctx.sessions.generation_and_mode(sid).await;
+        let (requested_generation, requested_mode) = requested_identity
+            .map(|(generation, mode)| (Some(generation), Some(mode)))
+            .unwrap_or((None, None));
+        self.ctx.sessions.wait_test_removal_signal_pause().await;
 
         // Preserve kill semantics by signalling the admitted prompt first,
         // then wait for its finalization before reading mode or tombstoning
         // and removing this exact session incarnation.
-        self.ctx.sessions.signal_session_kill(sid);
+        self.ctx
+            .sessions
+            .signal_session_kill_for_generation(sid, requested_generation);
+        self.ctx.sessions.notify_test_removal_signal_attempted();
         let _guard = self
             .ctx
             .sessions
@@ -3672,17 +3670,15 @@ impl RpcDispatcher {
         // Preserve the targeted live domain across hard-cancel finalization.
         // If no live owner exists, resolve a single durable domain below and
         // reject collisions instead of deleting from both stores.
-        let requested_generation = self.ctx.sessions.get_generation(&req.session_id).await;
-        let requested_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
-        if self.ctx.sessions.get_generation(&req.session_id).await != requested_generation
-            || requested_mode.is_some() != requested_generation.is_some()
-        {
-            return Err(rpc_err(
-                SESSION_BUSY,
-                "Session changed while preparing to delete it",
-            ));
-        }
-        self.ctx.sessions.signal_session_removal(&req.session_id);
+        let requested_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        let (requested_generation, requested_mode) = requested_identity
+            .map(|(generation, mode)| (Some(generation), Some(mode)))
+            .unwrap_or((None, None));
+        self.ctx.sessions.wait_test_removal_signal_pause().await;
+        self.ctx
+            .sessions
+            .signal_session_removal_for_generation(&req.session_id, requested_generation);
+        self.ctx.sessions.notify_test_removal_signal_attempted();
         let _guard = self
             .ctx
             .sessions
@@ -13045,6 +13041,98 @@ mod tests {
                 sessions.get_generation(&sid).await,
                 Some(original_generation),
                 "replacement must install a distinct generation"
+            );
+            assert_eq!(sessions.chat_mode(&sid).await, Some(ChatMode::Chat));
+            assert!(
+                acp_store.load_session(&sid).unwrap().is_some(),
+                "stale {method} must preserve the original ACP durable row"
+            );
+            assert!(
+                !acp_store.is_session_killed(&sid).unwrap(),
+                "stale {method} must not tombstone the original ACP durable row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_scoped_admin_removal_does_not_cancel_successor_prompt() {
+        for method in ["kill", "delete"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, _chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = format!("acp-replaced-before-{method}-signal");
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "acp",
+                    "session_id": sid,
+                }))
+                .await
+                .expect("initial ACP session/new should succeed");
+            let original_generation = sessions.get_generation(&sid).await.unwrap();
+            let (captured, release_signal, signal_attempted) =
+                sessions.set_test_removal_signal_pause();
+
+            let removal_handle = dispatcher.spawn_handle();
+            let removal_sid = sid.clone();
+            let removal = zeroclaw_spawn::spawn!(async move {
+                match method {
+                    "kill" => {
+                        removal_handle
+                            .handle_session_kill(&json!({ "session_id": removal_sid }))
+                            .await
+                    }
+                    _ => {
+                        removal_handle
+                            .handle_session_delete(&json!({ "session_id": removal_sid }))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), captured.notified())
+                .await
+                .expect("removal must pause after capturing the target generation");
+
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "chat",
+                    "session_id": sid,
+                }))
+                .await
+                .expect("same-ID Chat replacement should succeed");
+            let successor_generation = sessions.get_generation(&sid).await.unwrap();
+            assert_ne!(successor_generation, original_generation);
+            let successor_token = tokio_util::sync::CancellationToken::new();
+            let (successor_guard, successor_registration) = sessions
+                .acquire_prompt(&sid, Some(successor_generation), successor_token.clone())
+                .await
+                .unwrap();
+
+            release_signal.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                signal_attempted.notified(),
+            )
+            .await
+            .expect("removal must attempt cancellation while the successor prompt is live");
+            assert!(
+                !successor_token.is_cancelled(),
+                "stale {method} must not cancel the same-ID successor prompt"
+            );
+            assert_eq!(successor_registration.finish(), None);
+            drop(successor_guard);
+
+            let error = removal
+                .await
+                .expect("removal task must not panic")
+                .expect_err("stale removal must reject a replacement generation");
+            assert_eq!(error.code, SESSION_NOT_FOUND);
+            assert_eq!(
+                sessions.get_generation(&sid).await,
+                Some(successor_generation)
             );
             assert_eq!(sessions.chat_mode(&sid).await, Some(ChatMode::Chat));
             assert!(
