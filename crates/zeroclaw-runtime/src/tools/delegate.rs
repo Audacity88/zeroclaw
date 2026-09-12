@@ -2068,9 +2068,15 @@ impl DelegateTool {
         } else {
             self.delegate_cost_context(agent_name, cost_ceiling_cents)
         };
+        // The dispatched future holds the whole agentic tool loop. Inlining
+        // it into the scope wrappers' state machine overflowed the 2 MB
+        // test-thread stack on Linux debug builds (a pre-existing routed
+        // agentic delegate test aborted with SIGABRT in CI), so it lives on
+        // the heap, as the background and parallel spawn sites already do
+        // for the same reason.
         run_delegate_with_cost_scope(
             cost_ctx,
-            self.execute_sync_dispatched(
+            Box::pin(self.execute_sync_dispatched(
                 agent_name,
                 agent_config,
                 prompt,
@@ -2080,7 +2086,7 @@ impl DelegateTool {
                 temperature,
                 agentic,
                 admission,
-            ),
+            )),
         )
         .await
     }
