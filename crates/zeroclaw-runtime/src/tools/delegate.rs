@@ -2303,10 +2303,8 @@ impl DelegateTool {
 
         // Resolve profile references
         let authoritative_config = admitted_config.as_deref();
-        let max_depth = self.effective_max_depth_from_config(
-            authoritative_config,
-            &agent_config.runtime_profile,
-        );
+        let max_depth = self
+            .effective_max_depth_from_config(authoritative_config, &agent_config.runtime_profile);
         let (legacy_provider_type, credential, _, temperature) =
             self.resolve_brain_from_config(authoritative_config, &agent_config.model_provider);
         let agentic =
@@ -2327,8 +2325,7 @@ impl DelegateTool {
         }
 
         if admission == DelegateAdmission::Required {
-            if let Some(refusal) =
-                self.operator_approval_refusal_from_config(authoritative_config)
+            if let Some(refusal) = self.operator_approval_refusal_from_config(authoritative_config)
             {
                 return Ok(ToolResult {
                     success: false,
