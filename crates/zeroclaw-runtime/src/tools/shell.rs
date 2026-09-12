@@ -1161,18 +1161,44 @@ mod tests {
         let script = "Write-Output \"quoted safe value\" | Select-Object -First 1";
         let mut all_succeeded = true;
 
-        // Counterbalance order to expose obvious first-launch/cache effects.
-        // This is a comparison, not proof of a particular cache mechanism.
-        for (round, sanitized) in [false, true, true, false].into_iter().enumerate() {
-            let label = if sanitized { "sanitized" } else { "inherited" };
+        let allowed_vars = collect_allowed_shell_env_vars(&security);
+        let candidates = ["APPDATA", "LOCALAPPDATA"].map(|name| {
+            assert!(
+                !allowed_vars
+                    .iter()
+                    .any(|var| var.eq_ignore_ascii_case(name)),
+                "diagnostic candidate is already in the sanitized baseline: {name}"
+            );
+            let value = std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .expect("diagnostic requires nonempty inherited APPDATA and LOCALAPPDATA");
+            (name, value)
+        });
+        // Counterbalance all modes. These inherited inputs can influence code
+        // loading; add them only to this fixed-command diagnostic, never policy.
+        let modes = [
+            ("inherited", false, [false, false]),
+            ("sanitized", true, [false, false]),
+            ("sanitized-appdata", true, [true, false]),
+            ("sanitized-localappdata", true, [false, true]),
+            ("sanitized-both", true, [true, true]),
+        ];
+        for (round, &(label, sanitized, add_back)) in
+            modes.iter().chain(modes.iter().rev()).enumerate()
+        {
             let mut cmd = runtime
                 .build_shell_command(script, workspace.path())
                 .unwrap();
             if sanitized {
                 cmd.env_clear();
-                for var in collect_allowed_shell_env_vars(&security) {
-                    if let Ok(value) = std::env::var(&var) {
-                        cmd.env(&var, value);
+                for var in &allowed_vars {
+                    if let Ok(value) = std::env::var(var) {
+                        cmd.env(var, value);
+                    }
+                }
+                for ((name, value), include) in candidates.iter().zip(add_back) {
+                    if include {
+                        cmd.env(name, value);
                     }
                 }
             }

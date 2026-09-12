@@ -48,8 +48,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p zeroclaw-runtime --lib --no-run --message-format=json > "$RUNNER_TEMP/windows-10793-build.jsonl"
-      - name: Execute five exact tests separately
-        timeout-minutes: 12
+      - name: Execute only the exact environment add-back diagnostic
+        timeout-minutes: 15
         shell: python
         run: |
           import json
@@ -70,10 +70,6 @@ jobs:
               sys.exit('Expected exactly one runtime library test harness')
           harness = harnesses.pop()
           tests = [
-              ('control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit', False),
-              ('control_plane::authority::tests::windows_process_exit_is_detected', False),
-              ('tools::shell::tests::powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias', False),
-              ('tools::skill_tool::tests::skill_shell_tool_executes_powershell_safe_pipeline_with_sanitized_env', False),
               ('tools::shell::tests::windows_powershell_pipeline_environment_diagnostic', True),
           ]
           failed = False
@@ -85,7 +81,7 @@ jobs:
               started = time.monotonic()
               try:
                   result = subprocess.run(command, capture_output=True, text=True,
-                                          encoding='utf-8', errors='replace', timeout=330)
+                                          encoding='utf-8', errors='replace', timeout=690)
               except subprocess.TimeoutExpired as error:
                   # subprocess.run kills and waits for the harness on timeout.
                   # Stop this job rather than continue with uncertain descendants.
