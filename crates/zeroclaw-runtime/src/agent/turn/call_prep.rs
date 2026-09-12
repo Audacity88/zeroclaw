@@ -6,6 +6,7 @@ use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
+use super::outcome::ToolLoopCancelled;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
@@ -281,23 +282,40 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         // ── Approval hook ────────────────────────────────
-        let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
-            ApprovalGateOutcome::Proceed { approved } => approved,
-            ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
-                // The before phase ran but this call will never execute: its
-                // only terminal lifecycle operation is abandonment.
-                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                // Streaming consumers see the denied/replaced call and its
-                // synthesized result (e.g. a DenyWithEdit replacement) as a
-                // ToolCall/ToolResult pair, as the direct path always did.
-                if let Some(tx) = ctx.event_tx {
-                    emit_tool_call_pair(tx, call, &outcome).await;
-                }
-                ordered_results[idx] =
-                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
-                continue;
-            }
+        // The batch position comes from this enumeration, so the card can say
+        // which of the model's calls it is describing. It counts every call in
+        // the batch, not just the ones that need approval.
+        let position = zeroclaw_api::channel::ApprovalPosition {
+            index: u32::try_from(idx + 1).unwrap_or(u32::MAX),
+            total: u32::try_from(tool_calls.len()).unwrap_or(u32::MAX),
         };
+        let approved =
+            match gate_tool_approval(ctx, &tool_name, &tool_args, iteration, position).await {
+                ApprovalGateOutcome::Proceed { approved } => approved,
+                ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
+                    // The before phase ran but this call will never execute:
+                    // its only terminal lifecycle operation is abandonment.
+                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                    // Streaming consumers see the denied/replaced call and its
+                    // synthesized result (e.g. a DenyWithEdit replacement) as a
+                    // ToolCall/ToolResult pair, as the direct path always did.
+                    if let Some(tx) = ctx.event_tx {
+                        emit_tool_call_pair(tx, call, &outcome).await;
+                    }
+                    ordered_results[idx] =
+                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                    continue;
+                }
+                ApprovalGateOutcome::Cancelled => {
+                    // Preparation aborts before execution takes ownership of
+                    // the retained contexts or the call awaiting approval.
+                    for (retained_context, retained_tool) in &retained_hook_contexts {
+                        abandon_prepared_context(ctx, retained_context, retained_tool).await;
+                    }
+                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                    return Err(ToolLoopCancelled.into());
+                }
+            };
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 
         let signature = tool_call_signature(&tool_name, &tool_args);
@@ -781,6 +799,91 @@ mod tests {
                 "after:dup_tool:test-turn:0:0".to_string(),
             ],
             "the duplicate is abandoned once; the surviving call correlates to its after hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_cancellation_abandons_retained_and_waiting_calls_once() {
+        use crate::rpc::approval_channel::RpcApprovalChannel;
+        use crate::rpc::context::ApprovalPendingMap;
+        use tokio_util::sync::CancellationToken;
+        use zeroclaw_api::jsonrpc::RpcOutbound;
+
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["normal_tool".to_string()],
+            always_ask: vec!["guarded_tool".to_string()],
+            ..Default::default()
+        };
+        let approval = crate::approval::ApprovalManager::for_non_interactive_backchannel(&profile);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(4);
+        let channel = RpcApprovalChannel::new(
+            "rpc",
+            "session-approval",
+            Arc::new(RpcOutbound::new(writer_tx)),
+            Arc::new(ApprovalPendingMap::default()),
+            Default::default(),
+        );
+        let cancel = CancellationToken::new();
+        let ctx = TurnCtx {
+            channel: Some(&channel),
+            channel_reply_target: Some("operator"),
+            cancellation_token: Some(&cancel),
+            on_delta: None,
+            ..lifecycle_ctx(&observer, &pacing, &tx, Some(&approval), Some(&runner))
+        };
+        let calls = [
+            parsed_call("normal_tool", serde_json::json!({"n": 1}), "call-1"),
+            parsed_call("guarded_tool", serde_json::json!({"n": 2}), "call-2"),
+            parsed_call("unvisited_tool", serde_json::json!({"n": 3}), "call-3"),
+        ];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let preparation = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        );
+        tokio::pin!(preparation);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut preparation => panic!("preparation must wait for approval"),
+                request = writer_rx.recv() => {
+                    request.expect("approval request must reach the RPC channel");
+                }
+            }
+            cancel.cancel();
+            let Err(error) = preparation.await else {
+                panic!("cancelled approval must abort preparation");
+            };
+            assert!(error.is::<super::ToolLoopCancelled>());
+        })
+        .await
+        .expect("approval cancellation must finish promptly");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:normal_tool:test-turn:0:0".to_string(),
+                "before:guarded_tool:test-turn:0:1".to_string(),
+                "abandoned:normal_tool:test-turn:0:0".to_string(),
+                "abandoned:guarded_tool:test-turn:0:1".to_string(),
+            ],
+            "both prepared contexts must be abandoned once, with no after hooks or unvisited call"
         );
     }
 
