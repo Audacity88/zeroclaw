@@ -1468,4 +1468,204 @@ mod tests {
             "echo tool must run exactly once between the two Usage events"
         );
     }
+
+    /// A forced listener teardown drops the prompt future while it is joining
+    /// the turn task. The turn task must stay owned across that drop, and the
+    /// connection it belongs to must stay counted until the task's cleanup has
+    /// actually returned.
+    ///
+    /// Without the owning guard the handle is moved out before the join, so the
+    /// drop detaches the task: cleanup never starts and the count never falls.
+    /// Requesting an abort is not enough either, which is why the assertion is
+    /// on cleanup having ended rather than on the abort having been issued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_prompt_keeps_the_turn_task_owned_until_its_cleanup_ends() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::observability::{NoopObserver, Observer};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_memory::Memory;
+
+        /// Finite cleanup that outlives the forced deadline: it starts when the
+        /// provider future is dropped and returns only when the test releases
+        /// it, the same shape as the listeners' `HoldOnDrop` fixture.
+        struct HoldOnDrop {
+            unwind_started: Arc<AtomicBool>,
+            unwind_ended: Arc<AtomicBool>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl Drop for HoldOnDrop {
+            fn drop(&mut self) {
+                self.unwind_started.store(true, Ordering::SeqCst);
+                // Bounded so a failing assertion elsewhere cannot park this
+                // worker thread for the life of the test binary.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let (lock, cvar) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    released = cvar.wait_timeout(released, remaining).unwrap().0;
+                }
+                self.unwind_ended.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct HeldProvider {
+            started: Arc<AtomicBool>,
+            unwind_started: Arc<AtomicBool>,
+            unwind_ended: Arc<AtomicBool>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for HeldProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                let _cleanup = HoldOnDrop {
+                    unwind_started: Arc::clone(&self.unwind_started),
+                    unwind_ended: Arc::clone(&self.unwind_ended),
+                    release: Arc::clone(&self.release),
+                };
+                self.started.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok("unreachable".to_string())
+            }
+        }
+
+        impl Attributable for HeldProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "held-provider"
+            }
+        }
+
+        async fn wait_for(label: &str, condition: impl Fn() -> bool) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !condition() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label}"));
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let unwind_started = Arc::new(AtomicBool::new(false));
+        let unwind_ended = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let agent = Agent::builder()
+            .model_provider(Box::new(HeldProvider {
+                started: Arc::clone(&started),
+                unwind_started: Arc::clone(&unwind_started),
+                unwind_ended: Arc::clone(&unwind_ended),
+                release: Arc::clone(&release),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("held-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let activity = crate::rpc::ConnectionActivity::new(Arc::clone(&connections));
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            1,
+            "the accepted connection must be counted before any prompt runs"
+        );
+
+        let cancel = CancellationToken::new();
+        let turn_cancel = cancel.clone();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            let _ = execute_turn(
+                Arc::new(Mutex::new(agent)),
+                "hold".to_string(),
+                turn_cancel,
+                TurnAttribution {
+                    session_key: Some("forced-drop".into()),
+                    agent_alias: "rpc-agent".into(),
+                    model_provider: "held-provider".into(),
+                    model: "test-model".into(),
+                    channel: "rpc",
+                },
+                None,
+                Some(activity),
+                noop,
+            )
+            .await;
+        });
+
+        wait_for("the prompt must reach the provider", || {
+            started.load(Ordering::SeqCst)
+        })
+        .await;
+
+        // The connection generation ends, then the listener's forced deadline
+        // drops the prompt while it is still joining the turn task.
+        cancel.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        prompt_task.abort();
+        let _ = prompt_task.await;
+
+        wait_for(
+            "a dropped prompt must abort the turn task it owns, not detach it",
+            || unwind_started.load(Ordering::SeqCst),
+        )
+        .await;
+        assert!(
+            !unwind_ended.load(Ordering::SeqCst),
+            "the fixture must still be holding cleanup at this point"
+        );
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            1,
+            "the connection must stay counted while its turn task unwinds"
+        );
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        wait_for(
+            "the connection must be released once cleanup returns",
+            || connections.load(Ordering::Relaxed) == 0,
+        )
+        .await;
+        assert!(
+            unwind_ended.load(Ordering::SeqCst),
+            "the count may only reach zero after the turn task's cleanup ended"
+        );
+    }
 }
