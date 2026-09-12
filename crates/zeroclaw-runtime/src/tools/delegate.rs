@@ -2209,20 +2209,25 @@ impl DelegateTool {
                     .is_some_and(|config| self.resolve_agentic(&config.runtime_profile))
             });
         // Keep target recovery metadata local: the parent channel scope belongs to its own model call.
-        let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
-            let result = self
-                .execute_sync_with_admission_inner(
-                    agent_name,
-                    prompt,
-                    args,
-                    admission,
-                    execution_admission,
-                )
-                .await;
-            let fallback = zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
-            (result, fallback)
-        })
-        .await;
+        // The inner future owns the complete delegated agentic loop. Keep it
+        // off the caller's bounded worker stack while the fallback scope and
+        // lifecycle admission remain installed around it.
+        let (result, fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
+                let result = self
+                    .execute_sync_with_admission_inner(
+                        agent_name,
+                        prompt,
+                        args,
+                        admission,
+                        execution_admission,
+                    )
+                    .await;
+                let fallback =
+                    zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
+                (result, fallback)
+            }))
+            .await;
 
         let mut result = result?;
         if result.success
