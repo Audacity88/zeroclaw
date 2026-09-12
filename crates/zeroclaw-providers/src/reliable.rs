@@ -607,13 +607,25 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
+/// Match `code` as a whole numeric token in `msg`: digit runs split on
+/// non-digit characters, so a code inside a larger number ("15290") does
+/// not match.
+fn message_has_status_token(msg: &str, code: u16) -> bool {
+    msg.split(|c: char| !c.is_ascii_digit())
+        .any(|token| token.parse::<u16>().is_ok_and(|parsed| parsed == code))
+}
+
 /// Check if an error is an overload (transient server-side shed): the
 /// upstream accepted the request and dropped it under load. Matches a
-/// reqwest 529 status, a literal 529, or the word "overloaded"
-/// (case-insensitive, covering `overloaded_error`). Consulted on error
-/// values only — successful response text never reaches it. A plain 503
-/// (even one whose body mentions "overload") is not an overload signal; it
-/// keeps the ordinary server-error policy without the overload backoff floor.
+/// reqwest 529 status, a 529 status token in the message, or the word
+/// "overloaded" (case-insensitive, covering `overloaded_error`). The status
+/// half matches whole numeric tokens only — a larger number that merely
+/// contains "529" (a token count, an id) must not classify as overload,
+/// because this predicate overrides non-retryable classification in the
+/// retry loop. Consulted on error values only — successful response text
+/// never reaches it. A plain 503 (even one whose body mentions "overload")
+/// is not an overload signal; it keeps the ordinary server-error policy
+/// without the overload backoff floor.
 fn is_overloaded(err: &anyhow::Error) -> bool {
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
         && let Some(status) = reqwest_err.status()
@@ -621,7 +633,7 @@ fn is_overloaded(err: &anyhow::Error) -> bool {
         return status.as_u16() == 529;
     }
     let lower = err.to_string().to_lowercase();
-    lower.contains("529") || lower.contains("overloaded")
+    lower.contains("overloaded") || message_has_status_token(&lower, 529)
 }
 
 fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
@@ -7273,8 +7285,12 @@ mod tests {
         // Negatives: other failure classes never match, and the singular
         // word "overload" is prose, not the provider's overload signal — a
         // plain 503 keeps the ordinary server-error policy (base backoff, no
-        // floor). The predicate only ever sees error values, so response
-        // text containing "Overloaded" cannot reach it.
+        // floor). The status half matches whole numeric tokens only, so "529"
+        // inside a larger number (token counts below) is not an overload
+        // signal: this predicate overrides non-retryable classification in
+        // the retry loop, and a 400 whose body merely mentions a token count
+        // must not be retried. The predicate only ever sees error values, so
+        // response text containing "Overloaded" cannot reach it.
         assert!(!is_overloaded(&anyhow::Error::msg("429 Too Many Requests")));
         assert!(!is_overloaded(&anyhow::Error::msg(
             "401 Unauthorized: bad key"
@@ -7284,6 +7300,20 @@ mod tests {
         )));
         assert!(!is_overloaded(&anyhow::Error::msg(
             "maximum context length exceeded"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: prompt is 15290 tokens, limit 8192"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: input has 52931 tokens"
+        )));
+        // Id-shaped adjacency: the token split runs on non-digit characters,
+        // so the digits inside "req_a529b" form their own "529" token and DO
+        // match. The whole-token rule closes the larger-number false
+        // positives above; tightening to non-alphanumeric boundaries would
+        // be a further narrowing, out of scope here.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "401 Unauthorized: request req_a529b"
         )));
     }
 
