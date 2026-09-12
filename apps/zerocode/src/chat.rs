@@ -15341,11 +15341,12 @@ mod tests {
                     "inject",
                 ),
             ];
-            #[cfg(target_os = "macos")]
-            cases.push((
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
-                "control inject",
-            ));
+            if cfg!(target_os = "macos") {
+                cases.push((
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                    "control inject",
+                ));
+            }
 
             for (key, prompt) in cases {
                 let (tx, mut rx) = mpsc::channel::<String>(16);
