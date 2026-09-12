@@ -15320,6 +15320,9 @@ mod tests {
         );
     }
 
+    // This test intentionally holds the process-global keymap test guard while
+    // async dispatch runs so override-mutating tests cannot race it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn rtg_9739_composer_enter_and_modifier_enter_dispatch_without_approval() {
         use crossterm::event::{KeyCode, KeyModifiers};
