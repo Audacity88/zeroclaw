@@ -1,4 +1,4 @@
-name: Windows issue 10793 diagnostics
+name: Windows issue 10793 phase trace
 
 on:
   workflow_dispatch:
@@ -10,87 +10,140 @@ concurrency:
   group: windows-10793-diagnostics-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  CARGO_TERM_COLOR: never
-  CARGO_INCREMENTAL: 0
-
 jobs:
   windows-diagnostics:
-    name: Exact Windows diagnostics
+    name: PowerShell phase trace
     if: github.repository == 'Audacity88/zeroclaw'
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: platform-test
-          save-if: false
-      - name: Record basis and prepare placeholder
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          git rev-parse HEAD
-          rustc -Vv
-          mkdir -p web/dist
-          touch web/dist/.gitkeep
-      - name: Record Windows PowerShell version
-        shell: powershell
-        run: $PSVersionTable.PSVersion.ToString()
-      - name: Build only the runtime library test harness
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p zeroclaw-runtime --lib --no-run --message-format=json > "$RUNNER_TEMP/windows-10793-build.jsonl"
-      - name: Execute only the exact environment add-back diagnostic
-        timeout-minutes: 15
+      - name: Trace fixed PowerShell pipeline without a Rust rebuild
         shell: python
+        timeout-minutes: 10
         run: |
+          import hashlib
           import json
           import os
           from pathlib import Path
           import re
           import subprocess
           import sys
+          import tempfile
+          import threading
           import time
 
-          messages = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'windows-10793-build.jsonl').read_text().splitlines()]
-          harnesses = {message['executable'] for message in messages
-                       if message.get('reason') == 'compiler-artifact'
-                       and message.get('target', {}).get('name') == 'zeroclaw_runtime'
-                       and message.get('profile', {}).get('test')
-                       and message.get('executable')}
-          if len(harnesses) != 1:
-              sys.exit('Expected exactly one runtime library test harness')
-          harness = harnesses.pop()
-          tests = [
-              ('tools::shell::tests::windows_powershell_pipeline_environment_diagnostic', True),
-          ]
-          failed = False
-          for name, ignored in tests:
-              command = [harness, name, '--exact', '--nocapture']
-              if ignored:
-                  command.append('--ignored')
-              print(f'EXACT_TEST {name}', flush=True)
-              started = time.monotonic()
-              try:
-                  result = subprocess.run(command, capture_output=True, text=True,
-                                          encoding='utf-8', errors='replace', timeout=690)
-              except subprocess.TimeoutExpired as error:
-                  # subprocess.run kills and waits for the harness on timeout.
-                  # Stop this job rather than continue with uncertain descendants.
-                  print(error.stdout or b'', flush=True)
-                  print(error.stderr or b'', flush=True)
-                  sys.exit('Harness timeout: stop; runner teardown owns remaining descendants')
-              print(result.stdout, flush=True)
-              print(result.stderr, flush=True)
-              exactly_one = re.search(r'^running 1 test\r?$', result.stdout, re.MULTILINE) is not None
-              print(f'EXACT_RESULT name={name} exit={result.returncode} exactly_one={exactly_one} elapsed_s={time.monotonic() - started:.3f}', flush=True)
-              failed |= result.returncode != 0 or not exactly_one
-          sys.exit(1 if failed else 0)
+          # Freeze the source contract instead of inventing a second allowlist.
+          expected = {
+              'crates/zeroclaw-config/src/platform/native.rs': '7420ad6db1dddd3174ec412ae1a5edab7a975fdce0bbd19afe8b1f9415b34cd0',
+              'crates/zeroclaw-runtime/src/tools/shell_env.rs': '2dbf7c674dfde322b36d0743d83b378aa4eabb7609981e65b1d973b154e66e1e',
+          }
+          for path, digest in expected.items():
+              # Checkout may use CRLF; these source files are text contracts.
+              content = Path(path).read_bytes().replace(b'\r\n', b'\n')
+              if hashlib.sha256(content).hexdigest() != digest:
+                  sys.exit('STOP: source contract drift')
+          source = Path('crates/zeroclaw-runtime/src/tools/shell_env.rs').read_text()
+          blocks = re.findall(r'#\[cfg\(target_os = "windows"\)\]\s*pub\(crate\) const SAFE_SHELL_ENV_VARS: &\[&str\] = &\[(.*?)\];', source, re.S)
+          if len(blocks) != 1:
+              sys.exit('STOP: cannot resolve Windows baseline')
+          names = re.findall(r'"([A-Za-z_][A-Za-z_0-9]*)"', blocks[0])
+          if re.sub(r'"[A-Za-z_][A-Za-z_0-9]*"|[\s,]', '', blocks[0]) or not names:
+              sys.exit('STOP: unexpected baseline syntax')
+          sanitized = {name: os.environ[name] for name in names if name in os.environ}
+          print(json.dumps({'head': os.environ['GITHUB_SHA'], 'source_contract': 'matched', 'baseline_names': len(names)}), flush=True)
+
+          plain = 'Write-Output "quoted safe value" | Select-Object -First 1'
+          # .NET markers avoid cmdlet discovery before the original pipeline.
+          traced = '''$zcWatch = [System.Diagnostics.Stopwatch]::StartNew();
+          [Console]::Error.WriteLine(('ZC10793|entry|{0}' -f $zcWatch.ElapsedMilliseconds));
+          Write-Output "quoted safe value" | Select-Object -First 1;
+          [Console]::Error.WriteLine(('ZC10793|after_first|{0}' -f $zcWatch.ElapsedMilliseconds));
+          Write-Output "quoted safe value" | Select-Object -First 1;
+          [Console]::Error.WriteLine(('ZC10793|after_second|{0}' -f $zcWatch.ElapsedMilliseconds));'''
+
+          def drain(pipe, started, parse_markers):
+              result = {'data': bytearray(), 'first_ms': None, 'eof_ms': None, 'markers': [], 'overflow': False, 'error': False}
+              def run():
+                  pending = b''
+                  try:
+                      while True:
+                          chunk = pipe.read1(4096)
+                          now = round((time.monotonic() - started) * 1000, 3)
+                          if not chunk:
+                              result['eof_ms'] = now
+                              break
+                          if result['first_ms'] is None:
+                              result['first_ms'] = now
+                          if len(result['data']) + len(chunk) > 8192:
+                              result['overflow'] = True
+                              continue
+                          result['data'].extend(chunk)
+                          if parse_markers:
+                              pending += chunk
+                              while b'\n' in pending:
+                                  line, pending = pending.split(b'\n', 1)
+                                  match = re.fullmatch(rb'ZC10793\|(entry|after_first|after_second)\|(\d+)\r?', line)
+                                  if match:
+                                      result['markers'].append({'phase': match[1].decode('ascii'), 'script_ms': int(match[2]), 'received_ms': now})
+                                  else:
+                                      result['error'] = True
+                      if pending:
+                          result['error'] = True
+                  except Exception:
+                      result['error'] = True
+                  finally:
+                      pipe.close()
+              thread = threading.Thread(target=run, daemon=True)
+              thread.start()
+              return result, thread
+
+          modes = [('plain-inherited', False, False), ('plain-sanitized', True, False),
+                   ('traced-inherited', False, True), ('traced-sanitized', True, True)]
+          with tempfile.TemporaryDirectory(prefix='zc10793-phase-') as cwd:
+              for number, (mode, clean, instrumented) in enumerate(modes + list(reversed(modes))):
+                  print(f'PHASE_ATTEMPT round={number} mode={mode}', flush=True)
+                  started = time.monotonic()
+                  try:
+                      child = subprocess.Popen(['powershell', '-NoProfile', '-NonInteractive', '-Command', traced if instrumented else plain],
+                                               cwd=cwd, env=sanitized if clean else None,
+                                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                               creationflags=subprocess.CREATE_NO_WINDOW)
+                  except Exception:
+                      sys.exit('STOP: could not spawn fixed diagnostic')
+                  out, out_thread = drain(child.stdout, started, False)
+                  err, err_thread = drain(child.stderr, started, instrumented)
+                  timed_out = False
+                  try:
+                      code = child.wait(timeout=60)
+                  except subprocess.TimeoutExpired:
+                      timed_out = True
+                      child.kill()
+                      try:
+                          code = child.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          sys.exit('STOP: child cleanup failed; runner teardown owns descendants')
+                  exited_ms = round((time.monotonic() - started) * 1000, 3)
+                  deadline = time.monotonic() + 5
+                  for thread in (out_thread, err_thread):
+                      thread.join(max(0, deadline - time.monotonic()))
+                  if out_thread.is_alive() or err_thread.is_alive():
+                      sys.exit('STOP: pipe cleanup failed; runner teardown owns descendants')
+                  expected_output = ['quoted safe value'] * (2 if instrumented else 1)
+                  try:
+                      output_matches = bytes(out['data']).decode('ascii').splitlines() == expected_output
+                  except UnicodeError:
+                      output_matches = False
+                  marker_names = [m['phase'] for m in err['markers']]
+                  markers_ok = marker_names == (['entry', 'after_first', 'after_second'] if instrumented else [])
+                  stderr_ok = not err['data'] if not instrumented else markers_ok
+                  ok = code == 0 and not timed_out and output_matches and markers_ok and stderr_ok and not any(r['error'] or r['overflow'] for r in (out, err))
+                  print(json.dumps({'round': number, 'mode': mode, 'exit': code, 'timed_out': timed_out, 'success': ok,
+                                    'child_exit_ms': exited_ms, 'stdout_first_ms': out['first_ms'], 'stdout_eof_ms': out['eof_ms'],
+                                    'stderr_eof_ms': err['eof_ms'], 'markers': err['markers'],
+                                    'stdout_bytes': len(out['data']), 'stderr_bytes': len(err['data']), 'output_matches': output_matches}), flush=True)
+                  if not ok:
+                      sys.exit('STOP: invalid phase observation; no retries')
+          print('PHASE_RESULT attempts=8 success=True', flush=True)
