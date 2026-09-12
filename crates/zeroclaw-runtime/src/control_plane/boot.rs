@@ -361,14 +361,20 @@ mod tests {
 
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        assert!(
-            recovery
-                .handle()
-                .store
-                .reconcile_lost("foreign-process-owner", "daemon-boot")
-                .await
-                .unwrap()
+        #[cfg(windows)]
+        let after_wait = std::time::Instant::now();
+        let reclaimed = recovery
+            .handle()
+            .store
+            .reconcile_lost("foreign-process-owner", "daemon-boot")
+            .await
+            .unwrap();
+        #[cfg(windows)]
+        eprintln!(
+            "windows-recovery-probe phase=after-kill-and-wait reclaimed={reclaimed} reconcile_ms={}",
+            after_wait.elapsed().as_millis()
         );
+        assert!(reclaimed, "reclamation after successful child kill/wait");
         assert_eq!(
             recovery
                 .handle()

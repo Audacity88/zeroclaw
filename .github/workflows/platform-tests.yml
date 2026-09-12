@@ -1,74 +1,100 @@
-name: Scheduled Platform Tests
+name: Windows issue 10793 diagnostics
 
 on:
-  pull_request:
-    branches: [master]
-    paths:
-      - ".github/workflows/platform-tests.yml"
-      - "crates/zeroclaw-tools/src/coding_cli.rs"
   workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * *"
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: windows-10793-diagnostics-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: 0
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  windows-diagnostics:
+    name: Exact Windows diagnostics
+    if: github.repository == 'Audacity88/zeroclaw'
+    runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
-          components: rustfmt
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-  platform-tests:
-    name: Platform Test (${{ matrix.name }})
-    needs: [fmt]
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS
-            os: macos-14
-            nextest-platform: mac
-            timeout-minutes: 45
-          - name: Windows
-            os: windows-latest
-            nextest-platform: windows-tar
-            timeout-minutes: 60
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout-minutes }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: 1.98.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: platform-test
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Ensure web/dist placeholder exists
+          save-if: false
+      - name: Record basis and prepare placeholder
         shell: bash
-        run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Install cargo-nextest
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git rev-parse HEAD
+          rustc -Vv
+          mkdir -p web/dist
+          touch web/dist/.gitkeep
+      - name: Record Windows PowerShell version
+        shell: powershell
+        run: $PSVersionTable.PSVersion.ToString()
+      - name: Build only the runtime library test harness
         shell: bash
-        run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
-      - name: Run tests
-        shell: bash
-        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
+        run: |
+          set -euo pipefail
+          cargo test --locked -p zeroclaw-runtime --lib --no-run --message-format=json > "$RUNNER_TEMP/windows-10793-build.jsonl"
+      - name: Execute five exact tests separately
+        timeout-minutes: 12
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import time
+
+          messages = [json.loads(line) for line in (Path(os.environ['RUNNER_TEMP']) / 'windows-10793-build.jsonl').read_text().splitlines()]
+          harnesses = {message['executable'] for message in messages
+                       if message.get('reason') == 'compiler-artifact'
+                       and message.get('target', {}).get('name') == 'zeroclaw_runtime'
+                       and message.get('profile', {}).get('test')
+                       and message.get('executable')}
+          if len(harnesses) != 1:
+              sys.exit('Expected exactly one runtime library test harness')
+          harness = harnesses.pop()
+          tests = [
+              ('control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit', False),
+              ('control_plane::authority::tests::windows_process_exit_is_detected', False),
+              ('tools::shell::tests::powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias', False),
+              ('tools::skill_tool::tests::skill_shell_tool_executes_powershell_safe_pipeline_with_sanitized_env', False),
+              ('tools::shell::tests::windows_powershell_pipeline_environment_diagnostic', True),
+          ]
+          failed = False
+          for name, ignored in tests:
+              command = [harness, name, '--exact', '--nocapture']
+              if ignored:
+                  command.append('--ignored')
+              print(f'EXACT_TEST {name}', flush=True)
+              started = time.monotonic()
+              try:
+                  result = subprocess.run(command, capture_output=True, text=True,
+                                          encoding='utf-8', errors='replace', timeout=330)
+              except subprocess.TimeoutExpired as error:
+                  # subprocess.run kills and waits for the harness on timeout.
+                  # Stop this job rather than continue with uncertain descendants.
+                  print(error.stdout or b'', flush=True)
+                  print(error.stderr or b'', flush=True)
+                  sys.exit('Harness timeout: stop; runner teardown owns remaining descendants')
+              print(result.stdout, flush=True)
+              print(result.stderr, flush=True)
+              exactly_one = re.search(r'^running 1 test\r?$', result.stdout, re.MULTILINE) is not None
+              print(f'EXACT_RESULT name={name} exit={result.returncode} exactly_one={exactly_one} elapsed_s={time.monotonic() - started:.3f}', flush=True)
+              failed |= result.returncode != 0 or not exactly_one
+          sys.exit(1 if failed else 0)

@@ -97,11 +97,25 @@ fn process_state(pid: u32, expected_started_at: Option<u64>) -> ProcessState {
         sysinfo::ProcessRefreshKind::nothing(),
     );
     let Some(process) = system.process(pid) else {
-        return match pid_is_definitely_absent(pid.as_u32()) {
+        let native_absent = pid_is_definitely_absent(pid.as_u32());
+        #[cfg(all(test, windows))]
+        eprintln!("windows-recovery-probe sysinfo=absent native_absent={native_absent:?}");
+        return match native_absent {
             Some(true) => ProcessState::AbsentOrReused,
             Some(false) | None => ProcessState::Unknown,
         };
     };
+    // Temporary test-build evidence: this sample does not select the result.
+    // Use this invocation's snapshot, not a later re-sampling of sysinfo.
+    #[cfg(all(test, windows))]
+    {
+        let start_known = process.start_time() != 0;
+        let start_matches = expected_started_at.map(|value| value == process.start_time());
+        let native_absent = pid_is_definitely_absent(pid.as_u32());
+        eprintln!(
+            "windows-recovery-probe sysinfo=present start_known={start_known} start_matches={start_matches:?} native_absent_observation={native_absent:?}"
+        );
+    }
     if process.start_time() == 0 {
         return ProcessState::Unknown;
     }

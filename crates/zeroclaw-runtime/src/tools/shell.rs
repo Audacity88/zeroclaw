@@ -1119,6 +1119,124 @@ mod tests {
         assert!(!workspace.path().join("blocked.txt").exists());
     }
 
+    /// Temporary diagnostic, not a latency assertion or a production timeout change.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "explicit Windows environment/pipe timing diagnostic for #10793"]
+    async fn windows_powershell_pipeline_environment_diagnostic() {
+        use std::process::Stdio;
+        use std::time::Instant;
+        use tokio::io::{AsyncRead, AsyncReadExt};
+
+        async fn observe_pipe(
+            reader: impl AsyncRead + Unpin,
+            label: &str,
+            stream: &str,
+            started: Instant,
+        ) -> std::io::Result<Vec<u8>> {
+            // Fixed tiny command: reaching this cap is an invalid observation,
+            // not EOF. Never print captured data or inherited environment values.
+            let mut bytes = Vec::new();
+            let result = reader.take(4097).read_to_end(&mut bytes).await;
+            eprintln!(
+                "windows-powershell-probe mode={label} stream={stream} elapsed_ms={} read_ok={} eof={} bytes={}",
+                started.elapsed().as_millis(),
+                result.is_ok(),
+                result.is_ok() && bytes.len() < 4097,
+                bytes.len()
+            );
+            result?;
+            if bytes.len() == 4097 {
+                return Err(std::io::Error::other("diagnostic output limit reached"));
+            }
+            Ok(bytes)
+        }
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        };
+        let runtime = NativeRuntime::with_shell("powershell".into());
+        let script = "Write-Output \"quoted safe value\" | Select-Object -First 1";
+        let mut all_succeeded = true;
+
+        // Counterbalance order to expose obvious first-launch/cache effects.
+        // This is a comparison, not proof of a particular cache mechanism.
+        for (round, sanitized) in [false, true, true, false].into_iter().enumerate() {
+            let label = if sanitized { "sanitized" } else { "inherited" };
+            let mut cmd = runtime
+                .build_shell_command(script, workspace.path())
+                .unwrap();
+            if sanitized {
+                cmd.env_clear();
+                for var in collect_allowed_shell_env_vars(&security) {
+                    if let Ok(value) = std::env::var(&var) {
+                        cmd.env(&var, value);
+                    }
+                }
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let started = Instant::now();
+            eprintln!("windows-powershell-probe round={round} mode={label} phase=spawn");
+            let mut child = cmd.spawn().expect("spawn fixed PowerShell diagnostic");
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let observation = tokio::time::timeout(Duration::from_secs(60), async {
+                tokio::join!(
+                    async {
+                        let status = child.wait().await;
+                        eprintln!(
+                            "windows-powershell-probe mode={label} phase=child-exit elapsed_ms={} wait_ok={} exit_code={:?}",
+                            started.elapsed().as_millis(),
+                            status.is_ok(),
+                            status.as_ref().ok().and_then(|status| status.code())
+                        );
+                        status
+                    },
+                    observe_pipe(stdout, label, "stdout", started),
+                    observe_pipe(stderr, label, "stderr", started)
+                )
+            })
+            .await;
+            let success = match observation {
+                Ok((status, stdout, stderr)) => {
+                    let output_matches = stdout
+                        .as_ref()
+                        .is_ok_and(|bytes| decode_output(bytes).trim() == "quoted safe value");
+                    let success = status.is_ok_and(|status| status.success())
+                        && output_matches
+                        && stderr.is_ok_and(|bytes| bytes.is_empty());
+                    eprintln!(
+                        "windows-powershell-probe mode={label} phase=complete elapsed_ms={} success={success} output_matches={output_matches}",
+                        started.elapsed().as_millis()
+                    );
+                    success
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                    let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                        .await
+                        .is_ok_and(|result| result.is_ok());
+                    eprintln!(
+                        "windows-powershell-probe mode={label} phase=timeout elapsed_ms={} reaped={reaped}",
+                        started.elapsed().as_millis()
+                    );
+                    assert!(reaped, "stop diagnostic after unsuccessful child cleanup");
+                    false
+                }
+            };
+            all_succeeded &= success;
+        }
+        assert!(
+            all_succeeded,
+            "inspect per-phase Windows diagnostic outcomes"
+        );
+    }
+
     #[tokio::test]
     async fn shell_uses_runtime_dialect_to_reject_powershell_expression_bypass() {
         let security = Arc::new(SecurityPolicy {
