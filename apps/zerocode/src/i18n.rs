@@ -459,8 +459,7 @@ mod tests {
             assert!(controls.contains("Esc"));
 
             let picker_error = format_ftl_message(
-                source,
-                locale,
+                &bundle,
                 "zc-sidebar-picker-error",
                 &[("error", "socket closed")],
             )
