@@ -2668,6 +2668,7 @@ mod parser_bound_tests {
 mod connection_tests {
     use super::*;
     use crate::rpc::session::SessionStore;
+    use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     use zeroclaw_infra::session_queue::SessionActorQueue;
 
