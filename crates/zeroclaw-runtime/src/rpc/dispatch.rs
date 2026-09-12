@@ -1615,6 +1615,7 @@ impl RpcDispatcher {
                     &session_id,
                     &req.agent_alias,
                     &chat_mode,
+                    resolved_interaction_surface,
                     self.tui_id.clone(),
                 )
                 .await
@@ -1650,6 +1651,7 @@ impl RpcDispatcher {
                     &session_id,
                     &req.agent_alias,
                     &chat_mode,
+                    resolved_interaction_surface,
                     self.tui_id.clone(),
                 )
                 .await
@@ -1850,6 +1852,7 @@ impl RpcDispatcher {
             .insert_if_absent(
                 session_id.clone(),
                 super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                    .with_interaction_surface(resolved_interaction_surface)
                     .with_owner(self.tui_id.clone()),
             )
             .await
@@ -2431,11 +2434,11 @@ impl RpcDispatcher {
             zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
                 &data.messages,
             );
-        let interaction_context = match data.interaction_surface.as_deref() {
-            Some(value) => crate::agent::prompt::InteractionSurface::from_persisted(value)
-                .map(|surface| surface.resolve()),
-            None => None,
-        };
+        let interaction_surface = data
+            .interaction_surface
+            .as_deref()
+            .and_then(crate::agent::prompt::InteractionSurface::from_persisted);
+        let interaction_context = interaction_surface.map(|surface| surface.resolve());
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
@@ -2477,6 +2480,7 @@ impl RpcDispatcher {
             &data.workspace_dir,
             crate::rpc::types::ChatMode::Acp,
         )
+        .with_interaction_surface(interaction_surface)
         .with_owner(self.tui_id.clone());
         match cancel_generation {
             Some(cancel_generation) => {
@@ -2606,6 +2610,7 @@ impl RpcDispatcher {
                 }
             },
         };
+        self.ctx.sessions.wait_test_prompt_rehydration_pause().await;
         let live_agent = Arc::clone(&agent);
 
         // Process inline attachments: upload each, append markers to prompt.
@@ -10478,6 +10483,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rtg_10197_live_acp_reattach_validates_interaction_surface() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, tmp.path());
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "live-surfaced-acp",
+            }))
+            .await
+            .expect("initial surfaced ACP session must succeed");
+        let surfaced_generation = sessions.get_generation("live-surfaced-acp").await.unwrap();
+        for surface in [Some("zerocode_code"), None] {
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "acp",
+                    "interaction_surface": surface,
+                    "session_id": "live-surfaced-acp",
+                }))
+                .await
+                .expect("matching or omitted surface must reattach");
+            assert_eq!(
+                sessions.get_generation("live-surfaced-acp").await,
+                Some(surfaced_generation)
+            );
+        }
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": "live-generic-acp",
+            }))
+            .await
+            .expect("initial generic ACP session must succeed");
+        let generic_generation = sessions.get_generation("live-generic-acp").await.unwrap();
+        let mismatch = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "live-generic-acp",
+            }))
+            .await
+            .expect_err("a live generic ACP session must reject a surfaced reattach");
+        assert_eq!(mismatch.code, INVALID_PARAMS);
+        assert!(mismatch.message.contains("different interaction surface"));
+        assert_eq!(
+            sessions.get_generation("live-generic-acp").await,
+            Some(generic_generation),
+            "rejection must preserve the live incarnation"
+        );
+
+        let unsupported = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "unsupported_surface",
+                "session_id": "live-surfaced-acp",
+            }))
+            .await
+            .expect_err("unsupported surface identifiers must be rejected before reattach");
+        assert_eq!(unsupported.code, INVALID_PARAMS);
+        assert_eq!(
+            sessions.get_generation("live-surfaced-acp").await,
+            Some(surfaced_generation)
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_same_target_replacements_keep_first_admitted_incarnation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -13142,6 +13222,113 @@ mod tests {
             assert!(
                 !acp_store.is_session_killed(&sid).unwrap(),
                 "stale {method} must not tombstone the original ACP durable row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rtg_10197_reaped_prompt_publishes_before_close_kill_or_delete_can_remove_it() {
+        for method in ["close", "kill", "delete"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, _chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = format!("reaped-prompt-before-{method}");
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "acp",
+                    "session_id": sid,
+                }))
+                .await
+                .expect("initial ACP session must succeed");
+            assert!(sessions.remove(&sid).await);
+            assert!(acp_store.load_session(&sid).unwrap().is_some());
+
+            let (prompt_registered, release_registration) =
+                sessions.set_test_prompt_registration_pause();
+            let (rehydrated, release_rehydrated) = sessions.set_test_prompt_rehydration_pause();
+            let prompt_handle = dispatcher.spawn_handle();
+            let prompt_sid = sid.clone();
+            let prompt = zeroclaw_spawn::spawn!(async move {
+                prompt_handle
+                    .handle_session_prompt(&json!({
+                        "session_id": prompt_sid,
+                        "prompt": "rehydrate before removal",
+                    }))
+                    .await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                prompt_registered.notified(),
+            )
+            .await
+            .expect("reaped prompt must register its unbound cancellation token");
+
+            let removal_handle = dispatcher.spawn_handle();
+            let removal_sid = sid.clone();
+            let removal = zeroclaw_spawn::spawn!(async move {
+                match method {
+                    "close" => {
+                        removal_handle
+                            .handle_session_close(&json!({ "session_id": removal_sid }))
+                            .await
+                    }
+                    "kill" => {
+                        removal_handle
+                            .handle_session_kill(&json!({ "session_id": removal_sid }))
+                            .await
+                    }
+                    _ => {
+                        removal_handle
+                            .handle_session_delete(&json!({ "session_id": removal_sid }))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while sessions.session_queue.queue_depth(&sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removal must attempt its signal and wait behind prompt admission");
+            assert_eq!(
+                sessions.take_cancel_cause(&sid),
+                None,
+                "generation-scoped {method} must not cancel an unbound rehydration token"
+            );
+
+            release_registration.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(1), rehydrated.notified())
+                .await
+                .expect("prompt must publish the rehydrated incarnation");
+            let published_generation = sessions
+                .get_generation(&sid)
+                .await
+                .expect("rehydration must bind a live generation before prompt execution");
+            assert!(sessions.cancel_session(&sid));
+            release_rehydrated.notify_one();
+            prompt
+                .await
+                .expect("prompt task must not panic")
+                .expect("the test cancellation must settle the rehydrated prompt");
+
+            let error = removal
+                .await
+                .expect("removal task must not panic")
+                .expect_err("an unbound removal must reject the published incarnation");
+            assert_eq!(error.code, SESSION_NOT_FOUND);
+            assert!(sessions.get_agent(&sid).await.is_some());
+            assert_eq!(
+                sessions.get_generation(&sid).await,
+                Some(published_generation),
+                "rejected {method} must preserve the published incarnation"
+            );
+            assert!(
+                acp_store.load_session(&sid).unwrap().is_some(),
+                "rejected {method} must preserve durable ACP state"
             );
         }
     }

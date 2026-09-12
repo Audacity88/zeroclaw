@@ -71,6 +71,7 @@ pub struct RpcSession {
     pub uploads: HashMap<String, UploadEntry>,
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
+    pub interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
     pub owner_tui_id: Option<String>,
     /// Monotonic generation counter stamped by `SessionStore::insert`.
     /// Provider-refresh callers capture this before building a provider box
@@ -106,6 +107,7 @@ impl RpcSession {
             uploads: HashMap::new(),
             plan: Vec::new(),
             chat_mode,
+            interaction_surface: None,
             owner_tui_id: None,
             generation: 0,
         }
@@ -114,6 +116,14 @@ impl RpcSession {
     /// Bind this session to a TUI owner.
     pub fn with_owner(mut self, tui_id: Option<String>) -> Self {
         self.owner_tui_id = tui_id;
+        self
+    }
+
+    pub fn with_interaction_surface(
+        mut self,
+        interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
+    ) -> Self {
+        self.interaction_surface = interaction_surface;
         self
     }
 }
@@ -127,6 +137,9 @@ type GatedOpPause = (
 
 #[cfg(test)]
 type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
+#[cfg(test)]
+type PromptRehydrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 #[cfg(test)]
 type RemovalSignalPause = (
@@ -161,6 +174,8 @@ pub struct SessionStore {
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    #[cfg(test)]
+    test_prompt_rehydration_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
     /// Test-only pause after a removal handler captures the target generation
     /// but before it signals an in-flight turn.
     #[cfg(test)]
@@ -222,6 +237,8 @@ impl SessionStore {
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_removal_signal_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -306,6 +323,7 @@ impl SessionStore {
         id: &str,
         agent_alias: &str,
         chat_mode: &crate::rpc::types::ChatMode,
+        interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
         owner_tui_id: Option<String>,
     ) -> Result<Option<ResumedRpcSession>, &'static str> {
         let mut sessions = self.sessions.lock().await;
@@ -317,6 +335,9 @@ impl SessionStore {
         }
         if &session.chat_mode != chat_mode {
             return Err("session uses a different chat mode");
+        }
+        if interaction_surface.is_some() && session.interaction_surface != interaction_surface {
+            return Err("ACP session belongs to a different interaction surface");
         }
 
         if owner_tui_id.is_some() {
@@ -903,6 +924,32 @@ impl SessionStore {
     }
 
     #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_rehydration_pause(&self) {
+        let (entered, release) = {
+            let guard = self.test_prompt_rehydration_pause.lock().unwrap();
+            match &*guard {
+                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_prompt_rehydration_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_rehydration_pause(&self) -> PromptRehydrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_rehydration_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_test_removal_signal_pause(&self) {
         let (entered, release) = {
             let guard = self.test_removal_signal_pause.lock().unwrap();
@@ -997,10 +1044,15 @@ impl SessionStore {
         session_generation: Option<u64>,
         cause: CancelCause,
     ) -> bool {
+        let Some(session_generation) = session_generation else {
+            return false;
+        };
         let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         tokens
             .get(id)
-            .filter(|(_, registered_generation, _)| *registered_generation == session_generation)
+            .filter(|(_, registered_generation, _)| {
+                *registered_generation == Some(session_generation)
+            })
             .map(|(_, _, token)| {
                 self.record_cancel_cause(id, cause);
                 token.cancel();
@@ -1291,6 +1343,36 @@ mod tests {
         assert!(store.signal_session_kill_for_generation("s", Some(generation)));
         assert!(token.is_cancelled());
         assert_eq!(registration.finish(), Some(CancelCause::AdminKill));
+    }
+
+    #[tokio::test]
+    async fn rtg_10197_generation_scoped_signals_ignore_unbound_rehydration_prompt() {
+        for signal in [CancelCause::SessionRemoved, CancelCause::AdminKill] {
+            let store = make_store(4);
+            let token = tokio_util::sync::CancellationToken::new();
+            let (_guard, registration) = store
+                .acquire_prompt("reaped", None, token.clone())
+                .await
+                .unwrap();
+
+            let signalled = match signal {
+                CancelCause::AdminKill => store.signal_session_kill_for_generation("reaped", None),
+                CancelCause::SessionRemoved => {
+                    store.signal_session_removal_for_generation("reaped", None)
+                }
+                _ => unreachable!(),
+            };
+
+            assert!(
+                !signalled,
+                "a generation-scoped {signal:?} must not match an unbound prompt"
+            );
+            assert!(
+                !token.is_cancelled(),
+                "close, kill, or delete must wait for the rehydrating prompt to publish its generation"
+            );
+            assert_eq!(registration.finish(), None);
+        }
     }
 
     #[tokio::test]
