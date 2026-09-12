@@ -11242,6 +11242,7 @@ mod tests {
         let mut state = state();
         state.cached_lines = vec![line];
         state.cached_line_ranges = vec![(0, 0, 1)];
+        state.cached_line_screen_ranges = vec![(0, 101)];
         state.cached_screen_ranges = vec![(0, 0, 101, 4)];
         state.cached_row_breaks = vec![TranscriptRowBreak::SoftConcat; 101];
         state.transcript_snapshot = Some(TranscriptSnapshot::capture_lines(
