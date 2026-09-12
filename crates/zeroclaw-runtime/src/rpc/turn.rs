@@ -71,6 +71,7 @@ pub async fn execute_turn<F, Fut>(
     cancel: CancellationToken,
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -81,7 +82,12 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
 
-    let mut turn_handle = zeroclaw_spawn::spawn!(async move {
+    let turn_handle = zeroclaw_spawn::spawn!(async move {
+        // Held inside the task body so the connection stays counted until this
+        // task's future is actually dropped. An abort requested by the caller
+        // only schedules that drop; provider and tool cleanup still runs after
+        // it, and the reload drain must not read zero while it does.
+        let _connection_activity = connection_activity;
         let mut guard = agent.lock().await;
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
@@ -112,6 +118,8 @@ where
         .await
     });
 
+    let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));
+
     let mut accumulated_text = String::new();
 
     let drain =
@@ -121,25 +129,71 @@ where
 
     match drain {
         DrainOutcome::Completed => {
-            let joined = turn_handle
-                .await
-                .map_err(|e| TurnError::Panicked(format!("{e}")))?;
+            let joined = {
+                let handle = turn_handle_guard.handle()?;
+                handle
+                    .await
+                    .map_err(|e| TurnError::Panicked(format!("{e}")))?
+            };
             outcome_from_task_result(joined, accumulated_text)
         }
         DrainOutcome::ExplicitCancel => {
-            match tokio::time::timeout(CANCEL_GRACE, &mut turn_handle).await {
+            let graced = {
+                let handle = turn_handle_guard.handle()?;
+                tokio::time::timeout(CANCEL_GRACE, &mut *handle).await
+            };
+            match graced {
                 Ok(joined) => outcome_from_task_result(
                     joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
                     accumulated_text,
                 ),
                 Err(_) => {
-                    turn_handle.abort();
+                    let handle = turn_handle_guard.handle()?;
+                    handle.abort();
+                    // Joined through the guard rather than a moved-out handle:
+                    // if this future is dropped while the abort is still being
+                    // processed, the guard aborts what it still owns instead of
+                    // leaving a detached task behind.
+                    let _ = handle.await;
                     Ok(TurnOutcome::Cancelled {
                         partial_text: accumulated_text,
                         messages: Vec::new(),
                     })
                 }
             }
+        }
+    }
+}
+
+type TurnJoinHandle = tokio::task::JoinHandle<
+    std::result::Result<
+        crate::agent::agent::StreamedTurnSuccess,
+        crate::agent::agent::StreamedTurnError,
+    >,
+>;
+
+/// Owner of the spawned turn task for the whole lifetime of
+/// [`execute_turn`].
+///
+/// The handle is never moved out. Awaiting a moved-out handle detaches the
+/// turn task when the awaiting future is dropped, and a dropped prompt is
+/// exactly what a forced listener teardown produces, so the task would keep
+/// running with nobody holding it. Borrowing the handle out of the guard keeps
+/// [`Drop`] able to abort it on every exit path.
+struct TurnHandleGuard(Option<TurnJoinHandle>);
+
+impl TurnHandleGuard {
+    fn handle(&mut self) -> Result<&mut TurnJoinHandle, TurnError> {
+        self.0.as_mut().ok_or_else(|| {
+            TurnError::Panicked("turn task handle missing from its owner".to_string())
+        })
+    }
+}
+
+impl Drop for TurnHandleGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
         }
     }
 }
@@ -740,6 +794,7 @@ mod tests {
                 channel: "rpc",
             },
             Some(cost_context),
+            None,
             noop,
         )
         .await
@@ -891,6 +946,7 @@ mod tests {
                 model: "test-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             move |event| {
                 let cfg = Arc::clone(&cfg_for_cb);
@@ -1063,6 +1119,7 @@ mod tests {
                     model: "matrix-model".into(),
                     channel: "rpc",
                 },
+                None,
                 None,
                 move |event| {
                     let cfg = Arc::clone(&cfg_arc);
@@ -1325,6 +1382,7 @@ mod tests {
                 model: "w1-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             move |event| {
                 let rpc = Arc::clone(&rpc);
