@@ -2016,6 +2016,7 @@ mod accept_error_tests {
         use crate::rpc::context::RpcContext;
         use crate::rpc::dispatch::connection_test_support::insert_session;
         use crate::rpc::session::SessionStore;
+        use crate::rpc::types::ChatMode;
         use async_trait::async_trait;
         use tokio::sync::Notify;
         use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
@@ -2023,6 +2024,7 @@ mod accept_error_tests {
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
         const DURABLE_SID: &str = "durable-reload-session-wss";
+        const OWNER: &str = "reload-test-owner";
 
         struct HoldOnDrop {
             allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -2155,12 +2157,16 @@ mod accept_error_tests {
         };
         let queue1 = Arc::new(SessionActorQueue::new(4, 30, 60));
         let sessions1 = Arc::new(SessionStore::new(64, queue1));
-        let ctx1 = RpcContext::for_persistence_tests(
+        let mut ctx1 = RpcContext::for_persistence_tests(
             config1,
             sessions1,
             Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
             None,
         );
+
+        std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).unwrap();
+        Arc::get_mut(&mut ctx1).unwrap().tui_registry =
+            Arc::new(crate::rpc::tui_identity::TuiRegistry::new(tmp.path()));
 
         insert_session(
             &ctx1,
@@ -2174,6 +2180,17 @@ mod accept_error_tests {
             }),
         )
         .await;
+
+        ctx1.sessions
+            .resume_existing(
+                DURABLE_SID,
+                "test-agent",
+                &ChatMode::Chat,
+                Some(OWNER.into()),
+            )
+            .await
+            .unwrap()
+            .expect("Gen 1 fixture session must exist");
 
         let cancel1 = CancellationToken::new();
         let count1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2221,8 +2238,8 @@ mod accept_error_tests {
         let (mut client_sink1, mut client_stream1) = ws1.split();
         let init = InitializeParams {
             protocol_version: 1,
-            tui_id: None,
-            tui_sig: None,
+            tui_id: Some(OWNER.into()),
+            tui_sig: Some(ctx1.tui_registry.sign(OWNER).expect("fixture signing key")),
             env: Default::default(),
             client_capabilities: None,
         };
@@ -2232,7 +2249,11 @@ mod accept_error_tests {
             ))
             .await
             .unwrap();
-        let _ = client_stream1.next().await.unwrap().unwrap();
+        let initialized = client_stream1.next().await.unwrap().unwrap();
+        let initialized: serde_json::Value =
+            serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+        assert!(initialized["error"].is_null(), "{initialized}");
+        assert_eq!(initialized["result"]["tui_id"], OWNER);
 
         // Send prompt to Generation 1
         client_sink1
@@ -2316,12 +2337,16 @@ mod accept_error_tests {
             };
             let queue2 = Arc::new(SessionActorQueue::new(4, 30, 60));
             let sessions2 = Arc::new(SessionStore::new(64, queue2));
-            let ctx2 = RpcContext::for_persistence_tests(
+            let mut ctx2 = RpcContext::for_persistence_tests(
                 config2,
                 sessions2,
                 Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
                 None,
             );
+
+            Arc::get_mut(&mut ctx2).unwrap().tui_registry =
+                Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&tmp_path));
+            let owner_sig = ctx2.tui_registry.sign(OWNER).expect("fixture signing key");
 
             insert_session(
                 &ctx2,
@@ -2335,6 +2360,17 @@ mod accept_error_tests {
                 }),
             )
             .await;
+
+            ctx2.sessions
+                .resume_existing(
+                    DURABLE_SID,
+                    "test-agent",
+                    &ChatMode::Chat,
+                    Some(OWNER.into()),
+                )
+                .await
+                .unwrap()
+                .expect("Gen 2 fixture session must exist");
 
             let cancel2 = CancellationToken::new();
             let count2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2379,8 +2415,8 @@ mod accept_error_tests {
             let (mut client_sink2, mut client_stream2) = ws2.split();
             let init = InitializeParams {
                 protocol_version: 1,
-                tui_id: None,
-                tui_sig: None,
+                tui_id: Some(OWNER.into()),
+                tui_sig: Some(owner_sig),
                 env: Default::default(),
                 client_capabilities: None,
             };
@@ -2390,7 +2426,11 @@ mod accept_error_tests {
                 ))
                 .await
                 .unwrap();
-            let _ = client_stream2.next().await.unwrap().unwrap();
+            let initialized = client_stream2.next().await.unwrap().unwrap();
+            let initialized: serde_json::Value =
+                serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+            assert!(initialized["error"].is_null(), "{initialized}");
+            assert_eq!(initialized["result"]["tui_id"], OWNER);
 
             client_sink2
                 .send(Message::Text(
