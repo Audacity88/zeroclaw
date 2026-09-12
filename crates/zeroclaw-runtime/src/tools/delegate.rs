@@ -135,6 +135,22 @@ fn delegate_cost_scope_missing_config_warn_once() {
     }
 }
 
+/// Warn once per process when a delegate carries a per-hop cost ceiling but
+/// cost tracking has `track_per_agent = false`: per-alias daily totals cannot
+/// exist, so the ceiling is enforced against the shared daily total instead.
+fn delegate_cost_scope_per_agent_disabled_warn_once() {
+    static PER_AGENT_DISABLED_WARNED: AtomicBool = AtomicBool::new(false);
+    if delegate_cost_scope_missing_config_should_warn(&PER_AGENT_DISABLED_WARNED) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "per-agent delegate ceilings need [cost] track_per_agent = true; \
+             enforcing the ceiling against the shared daily total instead"
+        );
+    }
+}
+
 /// Serializable result of a background delegate task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundDelegateResult {
@@ -789,13 +805,26 @@ impl DelegateTool {
         if ceiling_cents > 0
             && let Some(tracker) = ctx.tracker.as_ref()
         {
-            // Share the global ledger but cap the daily limit at the
-            // effective per-hop ceiling: never looser than the global daily
-            // limit, never looser than the tightened hop ceiling.
-            let mut capped_config = tracker.config();
             let ceiling_usd = f64::from(ceiling_cents) / 100.0;
-            capped_config.daily_limit_usd = capped_config.daily_limit_usd.min(ceiling_usd);
-            ctx.tracker = Some(Arc::new(tracker.derived_with_config(capped_config)));
+            if !config.cost.track_per_agent {
+                // Without per-agent attribution the alias is dropped before
+                // persistence, so no per-alias daily total exists to check
+                // against. Degrade to the shared check (previous behavior)
+                // and tell the operator once why the per-profile ceiling is
+                // looser than the field name suggests.
+                delegate_cost_scope_per_agent_disabled_warn_once();
+                let mut capped_config = tracker.config();
+                capped_config.daily_limit_usd = capped_config.daily_limit_usd.min(ceiling_usd);
+                ctx.tracker = Some(Arc::new(tracker.derived_with_config(capped_config)));
+            } else {
+                // Per-agent scope: the ceiling applies to the TARGET's own
+                // daily spend on the shared ledger; the global daily/monthly
+                // limits still apply to the shared totals on top, so the
+                // derived tracker is never looser than the global tracker.
+                ctx.tracker = Some(Arc::new(
+                    tracker.derived_for_agent(target_alias, ceiling_usd),
+                ));
+            }
         }
 
         Some(ctx)
@@ -12330,6 +12359,23 @@ command = "rm independent-delegate-marker"
         cost_tracking_enabled: bool,
         target_ceiling_cents: u32,
     ) -> DelegateCostFixture {
+        delegate_cost_fixture_opts(
+            mock_uri,
+            daily_limit_usd,
+            cost_tracking_enabled,
+            target_ceiling_cents,
+            true,
+        )
+        .await
+    }
+
+    async fn delegate_cost_fixture_opts(
+        mock_uri: String,
+        daily_limit_usd: f64,
+        cost_tracking_enabled: bool,
+        target_ceiling_cents: u32,
+        track_per_agent: bool,
+    ) -> DelegateCostFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             CostConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
@@ -12345,7 +12391,7 @@ command = "rm independent-delegate-marker"
         };
         root_config.cost = CostConfig {
             enabled: cost_tracking_enabled,
-            track_per_agent: true,
+            track_per_agent,
             daily_limit_usd,
             monthly_limit_usd: 10_000.0,
             ..CostConfig::default()
@@ -12476,6 +12522,31 @@ command = "rm independent-delegate-marker"
                 3.0,
                 0.0,
             ))
+            .expect("seed spend recorded");
+    }
+
+    /// Seed the fixture's shared daily ledger with `usd` attributed to
+    /// `alias`'s own spend, so per-agent ceiling checks see that alias's
+    /// own total while unrelated agents' totals stay clear.
+    fn record_agent_seed_spend(fixture: &DelegateCostFixture, alias: &str, usd: f64) {
+        use crate::cost::CostTracker;
+
+        let tracker =
+            CostTracker::get_or_init_global(fixture.config.cost.clone(), &fixture.data_dir)
+                .expect("global cost tracker over the fixture ledger");
+        tracker
+            .record_usage_with_agent(
+                crate::cost::TokenUsage::new(
+                    "seed-model",
+                    (usd * 1_000_000.0 / 3.0) as u64,
+                    0,
+                    0,
+                    3.0,
+                    3.0,
+                    0.0,
+                ),
+                Some(alias),
+            )
             .expect("seed spend recorded");
     }
 
@@ -12662,11 +12733,58 @@ command = "rm independent-delegate-marker"
     }
 
     #[tokio::test]
-    async fn background_delegate_inherited_ceiling_stops_provider() {
+    async fn background_delegate_ceiling_ignores_unrelated_shared_spend() {
         let (server, requests) = start_usage_chat_server(1).await;
-        // 1-cent effective hop ceiling on the target's runtime profile.
+        // 1-cent per-hop ceiling on the target's runtime profile; shared
+        // total seeded far above it, but NONE of it belongs to `target`.
         let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 1).await;
         record_seed_spend(&fixture, 6.0);
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "produce a status line",
+                "background": true
+            }))
+            .await
+            .expect("delegate execute runs");
+        assert!(result.success, "background task should start: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+        let background = wait_for_terminal_background_result(&fixture.tool, &task_id).await;
+        assert_eq!(
+            background.status,
+            BackgroundTaskStatus::Completed,
+            "shared spend by other agents must not exhaust the target's own \
+             per-hop ceiling: {background:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the delegate must be ADMITTED when only the shared total is over"
+        );
+        let stats = poll_agent_cost(&fixture.data_dir, "target").await;
+        assert_eq!(
+            stats.request_count, 1,
+            "the admitted delegate's usage must land on the ledger under the alias"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_own_ceiling_stops_provider() {
+        let (server, requests) = start_usage_chat_server(1).await;
+        // 1-cent per-hop ceiling on the target's runtime profile.
+        let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 1).await;
+        // Seed the TARGET's OWN alias with spend above its ceiling; the
+        // shared total stays far below the global daily limit.
+        record_agent_seed_spend(&fixture, "target", 6.0);
 
         let result = fixture
             .tool
@@ -12694,8 +12812,8 @@ command = "rm independent-delegate-marker"
         );
         let error = background.error.clone().unwrap_or_default();
         assert!(
-            error.contains("Budget exceeded"),
-            "the inherited ceiling must surface as a task error: {background:?}"
+            error.contains("Budget exceeded for agent `target`"),
+            "the per-agent ceiling must surface with the agent-scoped wording: {background:?}"
         );
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst),
@@ -12706,9 +12824,41 @@ command = "rm independent-delegate-marker"
     }
 
     #[tokio::test]
-    async fn sync_delegate_exceeded_budget_refuses_before_provider() {
+    async fn sync_delegate_own_ceiling_refuses_before_provider() {
         let (server, requests) = start_usage_chat_server(1).await;
         let fixture = delegate_cost_fixture(server.uri.clone(), 1000.0, true, 1).await;
+        // The TARGET's own spend exceeds its 1-cent ceiling; the shared total
+        // stays below the global daily limit.
+        record_agent_seed_spend(&fixture, "target", 6.0);
+
+        let result = fixture
+            .tool
+            .execute(json!({"agent": "target", "prompt": "produce a status line"}))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "delegation must fail on the target's own exhausted ceiling: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`"),
+            "the agent-scoped refusal must name the alias, not the shared limit: {error}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provider must not be reached once the ceiling is exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_delegate_shared_daily_limit_still_binds() {
+        let (server, requests) = start_usage_chat_server(1).await;
+        // High per-hop ceiling, low global daily limit: unattributed shared
+        // spend over the global limit must refuse the delegate regardless of
+        // the target alias's own (zero) total.
+        let fixture = delegate_cost_fixture(server.uri.clone(), 5.0, true, 0).await;
         record_seed_spend(&fixture, 6.0);
 
         let result = fixture
@@ -12718,17 +12868,47 @@ command = "rm independent-delegate-marker"
             .expect("delegate execute returns a result");
         assert!(
             !result.success,
-            "delegation must fail on the exceeded ceiling: {result:?}"
+            "the shared global daily limit must still bind: {result:?}"
         );
         let error = result.error.clone().unwrap_or_default();
         assert!(
-            error.contains("Budget exceeded"),
-            "budget refusal must surface as a tool error, not a panic: {error}"
+            error.contains("Budget exceeded") && !error.contains("for agent"),
+            "the shared-limit refusal must keep the shared wording: {error}"
         );
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "provider must not be reached once the ceiling is exceeded"
+            "provider must not be reached once the shared daily limit is exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_per_agent_false_degrades_to_shared_ceiling() {
+        let (server, requests) = start_usage_chat_server(1).await;
+        // track_per_agent = false: the alias is dropped before persistence,
+        // so the 1-cent per-hop ceiling can only be enforced against the
+        // shared daily total.
+        let fixture = delegate_cost_fixture_opts(server.uri.clone(), 1000.0, true, 1, false).await;
+        record_seed_spend(&fixture, 6.0);
+
+        let result = fixture
+            .tool
+            .execute(json!({"agent": "target", "prompt": "produce a status line"}))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "the shared-check fallback must refuse when the shared total is over: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded") && !error.contains("for agent"),
+            "the degraded fallback must use the shared wording: {error}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provider must not be reached under the shared fallback either"
         );
     }
 
