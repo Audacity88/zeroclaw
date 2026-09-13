@@ -2,8 +2,6 @@
 
 This is the procedure followed when reviewing a pull request in `zeroclaw-labs/zeroclaw`. It's loaded by the `github-pr-review-session` skill and read by human reviewers, it's authoritative for both.
 
-Apply the review-policy changes accepted in [RFC #10366](https://github.com/zeroclaw-labs/zeroclaw/issues/10366) to future reviews and active PRs at their next review. Do not retroactively request changes solely because an older PR lacks evidence that was not required when it was filed. A concrete unresolved behavior, presentation, security, privacy, or validation concern can still block on its own merits.
-
 The `gh` CLI is assumed available and authenticated.
 
 ## Untrusted GitHub input
