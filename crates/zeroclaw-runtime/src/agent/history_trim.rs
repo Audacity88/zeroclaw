@@ -775,6 +775,108 @@ mod tests {
     }
 
     #[test]
+    fn trim_conversation_to_recent_turns_repeated_additions_after_trim_stay_under_cap() {
+        let cap = 10;
+        let target = history_trim_target(cap, 0.7);
+        assert_eq!(target, 7);
+
+        // Five complete turns fill the cap exactly and must not trim.
+        let at_cap = trim_conversation_to_recent_turns(
+            vec![
+                conversation_user("first request"),
+                conversation_assistant("first answer"),
+                conversation_user("second request"),
+                conversation_assistant("second answer"),
+                conversation_user("third request"),
+                conversation_assistant("third answer"),
+                conversation_user("fourth request"),
+                conversation_assistant("fourth answer"),
+                conversation_user("fifth request"),
+                conversation_assistant("fifth answer"),
+            ],
+            cap,
+            target,
+            false,
+        );
+        assert!(!at_cap.trimmed);
+        assert_eq!(at_cap.dropped_messages, 0);
+        assert_eq!(at_cap.history.len(), cap);
+
+        // One more in-flight request crosses the cap. The trim drops whole
+        // turns until the body is at or below the target: dropping one turn
+        // would leave 9 (still above 7), so two turns go and the body lands
+        // on exactly the target of 7.
+        let mut history = at_cap.history;
+        history.push(conversation_user("sixth request"));
+        let first = trim_conversation_to_recent_turns(history, cap, target, false);
+        assert!(first.trimmed);
+        assert_eq!(first.dropped_messages, 4);
+        assert_eq!(first.dropped_turns, 2);
+        assert_eq!(first.kept_turns, 4);
+        assert_eq!(first.history.len(), target);
+        assert!(first.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "third request"
+        )));
+        assert!(first.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "sixth request"
+        )));
+
+        // Small turns appended after the trim call the trimmer again: the
+        // first fits inside the headroom, the second crosses the cap and
+        // trims back down to the target rather than refilling to the cap.
+        let mut history = first.history;
+        let mut additions = 0;
+        loop {
+            additions += 1;
+            history.push(conversation_user(&format!("follow-up request {additions}")));
+            history.push(conversation_assistant(&format!(
+                "follow-up answer {additions}"
+            )));
+            let result = trim_conversation_to_recent_turns(history, cap, target, false);
+            history = result.history;
+            if !result.trimmed {
+                assert_eq!(
+                    result.dropped_messages, 0,
+                    "a below-cap addition must not drop anything"
+                );
+                assert_eq!(
+                    history.len(),
+                    9,
+                    "the first post-trim addition stays inside the headroom"
+                );
+                assert!(history.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat) if chat.content == "third request"
+                )));
+                continue;
+            }
+            assert_eq!(result.dropped_messages, 4, "second trim depth");
+            assert_eq!(result.dropped_turns, 2, "second trim drops whole turns");
+            assert_eq!(
+                history.len(),
+                target,
+                "the second trim lands on the target, not the cap of {cap}"
+            );
+            assert!(!history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content == "third request"
+            )));
+            assert!(matches!(
+                history.last(),
+                Some(ConversationMessage::Chat(chat))
+                    if chat.role == "assistant" && chat.content == "follow-up answer 2"
+            ));
+            break;
+        }
+        assert_eq!(
+            additions, 2,
+            "one addition fits under the cap, the next one crosses it"
+        );
+    }
+
+    #[test]
     fn trim_conversation_to_recent_turns_crossing_by_one_drops_to_target() {
         let history = vec![
             conversation_user("first request"),
