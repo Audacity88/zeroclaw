@@ -8190,8 +8190,8 @@ impl ChatState {
 
     fn context_menu_select_step(&mut self, delta: isize) {
         if let Some(menu) = self.context_menu.as_mut() {
+            // The overlay redraws independently; rebuilding transcript lines clears its selection.
             menu.select_step(delta);
-            self.mark_dirty_full();
         }
     }
 
@@ -11704,6 +11704,84 @@ mod tests {
             assert_eq!(state.transcript_selection, None, "{case} selection");
             assert!(state.copy_hit_regions.is_empty(), "{case} copy regions");
             assert_eq!(state.copy_feedback, None, "{case} copy feedback");
+        }
+    }
+
+    #[test]
+    fn transcript_selection_context_menu_keyboard_navigation_survives_redraw() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for keys in [&[KeyCode::Down][..], &[KeyCode::Down, KeyCode::Up][..]] {
+            let mut state = state();
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from("hello world")));
+            state.mark_dirty_full();
+
+            let area = Rect::new(0, 0, 80, 20);
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+                .expect("draw chat");
+
+            let snapshot = state.transcript_snapshot.as_ref().expect("transcript");
+            let (text_row, text_col) = snapshot
+                .cells
+                .iter()
+                .find_map(|(&row, cells)| {
+                    cells
+                        .iter()
+                        .map(|cell| cell.symbol.as_str())
+                        .collect::<String>()
+                        .find("hello")
+                        .map(|column| (row, column as u16))
+                })
+                .expect("rendered message text");
+            let column = snapshot.area.x + text_col;
+            let row = snapshot.area.y + text_row.saturating_sub(snapshot.scroll);
+            assert!(state.begin_transcript_drag(column, row));
+            assert!(state.update_transcript_drag(column + 4, row));
+            state.finish_transcript_drag();
+            assert_eq!(state.transcript_selected_text().as_deref(), Some("hello"));
+            assert!(state.open_transcript_context_menu(column, row));
+
+            for &key in keys {
+                assert!(
+                    state
+                        .handle_context_menu_key(&KeyEvent::new(key, KeyModifiers::NONE))
+                        .is_none()
+                );
+                let expected_action = match key {
+                    KeyCode::Down => ChatContextMenuAction::Copy,
+                    KeyCode::Up => ChatContextMenuAction::AddToChat,
+                    _ => unreachable!("only menu navigation keys"),
+                };
+                terminal
+                    .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+                    .expect("redraw after menu navigation");
+                assert_eq!(state.transcript_selected_text().as_deref(), Some("hello"));
+                assert_eq!(
+                    state
+                        .context_menu
+                        .as_ref()
+                        .and_then(|menu| menu.selected_action()),
+                    Some(expected_action)
+                );
+            }
+
+            let request = state
+                .handle_context_menu_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .expect("confirm navigated menu action");
+            let target = match request {
+                ChatContextMenuRequest::CopyTranscript(target) if keys.len() == 1 => target,
+                ChatContextMenuRequest::AddToChat(target) if keys.len() == 2 => target,
+                other => panic!("unexpected menu request: {other:?}"),
+            };
+            assert_eq!(target.kind, CopyHitKind::Transcript);
+            assert_eq!(target.text.as_ref(), "hello");
+            assert!(state.context_menu.is_none());
         }
     }
 
