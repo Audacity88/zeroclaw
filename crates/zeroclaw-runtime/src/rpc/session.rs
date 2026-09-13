@@ -183,6 +183,10 @@ pub struct SessionStore {
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    #[cfg(test)]
+    pub(crate) rehydration_publication_waiting: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(crate) test_rehydration_published_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -234,6 +238,10 @@ impl SessionStore {
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            rehydration_publication_waiting: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            test_rehydration_published_pause: std::sync::Mutex::new(None),
         }
     }
 

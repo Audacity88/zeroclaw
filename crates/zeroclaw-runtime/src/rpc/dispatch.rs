@@ -2810,6 +2810,14 @@ impl RpcDispatcher {
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let message_count = data.messages.len();
+        // A published incarnation must already own its durable conversation:
+        // cancellation may drop recovery at any await after insertion.
+        let seed_event = agent.seed_conversation_history_with_event(data.messages);
+        #[cfg(test)]
+        self.ctx
+            .sessions
+            .rehydration_publication_waiting
+            .notify_one();
         let publish = self.insert_lifecycle_session(
             sid.to_string(),
             agent,
@@ -2827,11 +2835,20 @@ impl RpcDispatcher {
             None => publish.await,
         };
         published.ok()?;
-        let seed_event = self
-            .ctx
-            .sessions
-            .seed_conversation_history_with_event(sid, data.messages)
-            .await;
+        #[cfg(test)]
+        {
+            let pause = self
+                .ctx
+                .sessions
+                .test_rehydration_published_pause
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         self.forward_seed_event(sid, seed_event).await;
         self.ctx.sessions.touch(sid).await;
 
@@ -11986,6 +12003,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_reaped_acp_restore_retains_history_for_next_prompt() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"remembered\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                )))
+            .mount(&server).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .unwrap()
+            .uri = Some(server.uri());
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-cancel-after-publication";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("remember the blue door")),
+                    ConversationMessage::Chat(ChatMessage::assistant("the door is blue")),
+                ],
+            )
+            .unwrap();
+        let published = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sessions.test_rehydration_published_pause.lock().unwrap() =
+            Some((published.clone(), release));
+        let prompt_handle = dispatcher.spawn_handle();
+        let prompt = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({"session_id": sid, "prompt": "interrupted"}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), published.notified())
+            .await
+            .expect("restoration reaches its first post-publication await");
+        dispatcher.connection_cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["stop_reason"], "cancelled");
+        let original = sessions
+            .get_agent(sid)
+            .await
+            .expect("local disconnect retains session");
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let reconnected =
+            RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "reconnected-local".into());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reconnected.handle_session_prompt(&json!({"session_id": sid, "prompt": "what color?"})),
+        )
+        .await
+        .expect("next prompt completes")
+        .expect("next prompt succeeds");
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent(sid).await.unwrap()
+        ));
+        let requests = server.received_requests().await.unwrap();
+        let body: Value =
+            serde_json::from_slice(&requests.last().expect("provider request").body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let conversation: Vec<_> = messages
+            .iter()
+            .filter(|message| message["role"] != "system")
+            .map(|message| {
+                (
+                    message["role"].as_str().unwrap(),
+                    message["content"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            conversation,
+            vec![
+                ("user", "remember the blue door"),
+                ("assistant", "the door is blue"),
+                ("user", "what color?"),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn acp_resume_recovers_persisted_cwd() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -12584,6 +12705,8 @@ mod tests {
             .insert("delete-agent".to_string(), delete_agent);
         config.save().await.unwrap();
 
+        let save_gate =
+            zeroclaw_config::schema::test_post_replace_pause_gate::arm(config.config_path.clone());
         let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
         let ctx = Arc::clone(&dispatcher.ctx);
         let sessions = Arc::clone(&ctx.sessions);
@@ -12595,7 +12718,16 @@ mod tests {
         acp_store
             .create_session(session_id, "test-agent", tmp.path().to_str().unwrap())
             .expect("seed restorable ACP session");
-        let (prompt_registered, release_prompt) = sessions.set_test_prompt_registration_pause();
+
+        let delete_handle = dispatcher.spawn_handle();
+        let deletion = zeroclaw_spawn::spawn!(async move {
+            delete_handle
+                .handle_agent_delete(&json!({"alias": "delete-agent"}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), save_gate.wait_paused())
+            .await
+            .expect("deletion holds the config lock across persistence");
 
         let prompt_handle = dispatcher.spawn_handle();
         let prompt = zeroclaw_spawn::spawn!(async move {
@@ -12607,28 +12739,19 @@ mod tests {
                 .await
         });
         tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            prompt_registered.notified(),
+            std::time::Duration::from_secs(5),
+            sessions.rehydration_publication_waiting.notified(),
         )
         .await
-        .expect("prompt registers cancellation before restoration");
+        .expect("restoration reaches publication while deletion holds the config lock");
         assert!(sessions.has_inflight_turn(session_id));
+        assert!(ctx.config_write_lock.try_lock().is_err());
+        assert!(matches!(
+            ctx.agent_lifecycle.delete_blocker("test-agent"),
+            Some(crate::live_config_authority::AgentDeleteBlocker::Reservations { count: 1, .. })
+        ));
 
-        let delete_handle = dispatcher.spawn_handle();
-        let deletion = zeroclaw_spawn::spawn!(async move {
-            delete_handle
-                .handle_agent_delete(&json!({"alias": "delete-agent"}))
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while ctx.config.read().agents.contains_key("delete-agent") {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("agent deletion commits before waiting for prompt cancellation");
-
-        release_prompt.notify_one();
+        save_gate.release();
         let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
             .await
             .expect("cancelled restoration must not deadlock on config publication")
@@ -12647,11 +12770,10 @@ mod tests {
             sessions.get_agent(session_id).await.is_none(),
             "cancelled restoration must not publish a stale live session"
         );
-        let admission = ctx
-            .agent_lifecycle
-            .reserve_admission("test-agent")
-            .expect("cancelled restoration releases its admission reservation");
-        drop(admission);
+        assert!(
+            ctx.agent_lifecycle.delete_blocker("test-agent").is_none(),
+            "cancelled restoration releases every reservation and live lease"
+        );
         assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -15114,7 +15236,7 @@ mod tests {
                 }))
                 .await
         });
-        wait_for_queue_depth(&sessions, &session_id, 1).await;
+        wait_for_queue_depth(&sessions, &session_id, 2).await;
 
         let prompt_id = session_id.clone();
         let prompt = zeroclaw_spawn::spawn!(async move {
@@ -15125,7 +15247,7 @@ mod tests {
                 }))
                 .await
         });
-        wait_for_queue_depth(&sessions, &session_id, 2).await;
+        wait_for_queue_depth(&sessions, &session_id, 3).await;
         drop(admission);
 
         replacement
@@ -15249,7 +15371,7 @@ mod tests {
                 }))
                 .await
         });
-        wait_for_queue_depth(&sessions, &session_id, 1).await;
+        wait_for_queue_depth(&sessions, &session_id, 2).await;
 
         let resume_id = session_id.clone();
         let resume = zeroclaw_spawn::spawn!(async move {
@@ -15261,7 +15383,7 @@ mod tests {
                 }))
                 .await
         });
-        wait_for_queue_depth(&sessions, &session_id, 2).await;
+        wait_for_queue_depth(&sessions, &session_id, 3).await;
         drop(admission);
 
         replacement
@@ -15316,7 +15438,7 @@ mod tests {
                 }))
                 .await
         });
-        wait_for_queue_depth(&sessions, &session_id, 1).await;
+        wait_for_queue_depth(&sessions, &session_id, 2).await;
 
         assert!(sessions.remove(&session_id).await);
         local
@@ -15384,7 +15506,7 @@ mod tests {
                 }))
                 .await
         });
-        wait_for_queue_depth(&sessions, &session_id, 1).await;
+        wait_for_queue_depth(&sessions, &session_id, 2).await;
 
         let close_id = session_id.clone();
         let close = zeroclaw_spawn::spawn!(async move {
@@ -15392,7 +15514,7 @@ mod tests {
                 .handle_session_close(&json!({"session_id": close_id}))
                 .await
         });
-        wait_for_queue_depth(&sessions, &session_id, 2).await;
+        wait_for_queue_depth(&sessions, &session_id, 3).await;
         drop(admission);
 
         replacement
