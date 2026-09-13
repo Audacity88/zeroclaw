@@ -1378,7 +1378,7 @@ impl OpenAiCompatibleModelProvider {
             tool_stream: None,
             tools: None,
             tool_choice: None,
-            max_tokens: self.max_tokens,
+            max_tokens: self.resolve_effective_max_tokens(model, thinking, self.max_tokens),
             extra_body: self.request_extra_body(model, thinking),
         };
         // No cache breakpoints here, deliberately: this text-only path
@@ -1522,6 +1522,46 @@ impl OpenAiCompatibleModelProvider {
         } else {
             temperature
         }
+    }
+
+    /// Effective `max_tokens` for a request body. Anthropic rejects a
+    /// fixed-budget thinking request whose output limit does not strictly
+    /// exceed the budget, so whenever this request injects a budget-style
+    /// thinking object (same predicate [`Self::request_extra_body`] uses:
+    /// passthrough on, params present) the configured limit is raised to
+    /// `budget_tokens + 1` when it is not already above the budget,
+    /// matching the native provider; an unset limit resolves to that
+    /// minimum. Adaptive-style thinking carries no budget and leaves the
+    /// limit unchanged, and with the flag off or no params supplied the
+    /// incoming value passes through unchanged, keeping flag-off requests
+    /// byte-identical.
+    fn resolve_effective_max_tokens(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        max_tokens: Option<u32>,
+    ) -> Option<u32> {
+        let Some(params) = thinking.filter(|_| self.thinking_passthrough) else {
+            return max_tokens;
+        };
+        if !matches!(
+            crate::anthropic::anthropic_thinking_style(model),
+            crate::anthropic::AnthropicThinkingStyle::Budget
+        ) {
+            return max_tokens;
+        }
+        // The API requires max_tokens > budget_tokens (strictly greater).
+        let min_required = params.budget_tokens + 1;
+        let raised = max_tokens.max(Some(min_required));
+        if raised != max_tokens {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"model": model})),
+                "Passthrough thinking budget meets or exceeds configured max_tokens; raising output limit"
+            );
+        }
+        raised
     }
 }
 
@@ -2889,7 +2929,7 @@ impl OpenAiCompatibleModelProvider {
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice,
-            max_tokens: self.max_tokens,
+            max_tokens: self.resolve_effective_max_tokens(model, thinking, self.max_tokens),
             extra_body: self.request_extra_body(model, thinking),
         }
     }
@@ -2919,7 +2959,7 @@ impl OpenAiCompatibleModelProvider {
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice: has_tool_entries.then(|| "auto".to_string()),
-            max_tokens: self.max_tokens,
+            max_tokens: self.resolve_effective_max_tokens(model, thinking, self.max_tokens),
             extra_body: self.request_extra_body(model, thinking),
         }
     }
@@ -3002,7 +3042,11 @@ impl OpenAiCompatibleModelProvider {
             }),
             tools,
             tool_choice,
-            max_tokens: self.max_tokens,
+            max_tokens: self.resolve_effective_max_tokens(
+                model,
+                self.streaming_thinking_params(thinking),
+                self.max_tokens,
+            ),
             extra_body: self.request_extra_body(model, self.streaming_thinking_params(thinking)),
         }
     }
@@ -4311,7 +4355,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     }),
                     tools: None,
                     tool_choice: None,
-                    max_tokens: provider.max_tokens,
+                    max_tokens: provider.resolve_effective_max_tokens(
+                        &model,
+                        provider.streaming_thinking_params(thinking_owned),
+                        provider.max_tokens,
+                    ),
                     extra_body: provider.request_extra_body(
                         &model,
                         provider.streaming_thinking_params(thinking_owned),
@@ -6664,6 +6712,429 @@ mod tests {
             bodies[2]["temperature"],
             serde_json::json!(0.75),
             "params-None fallback request must keep the caller's temperature"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[test]
+    fn thinking_passthrough_raises_max_tokens_in_native_tool_builder() {
+        // Anthropic rejects a fixed-budget thinking request whose output
+        // limit does not strictly exceed the budget: whenever the builder
+        // injects the thinking object, the configured limit is raised to
+        // budget_tokens + 1 (the native provider's rule). Flag off and
+        // params-None keep the configured limit, leaving those bodies
+        // byte-identical.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "injected thinking requires max_tokens above the budget; got: {value}"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "the raising must ride on an actually injected thinking object"
+        );
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off request must keep the configured max_tokens"
+        );
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off request must inject nothing; got: {legacy}"
+        );
+
+        let no_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None request under passthrough must keep the configured max_tokens"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_raises_max_tokens_in_raw_tool_builder() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let req = p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "raw tool builder must raise max_tokens when thinking is injected"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off raw tool request must keep the configured max_tokens"
+        );
+        assert!(legacy.get("thinking").is_none());
+
+        let no_params = serde_json::to_value(p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None raw tool request must keep the configured max_tokens"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_when_configured_above_budget() {
+        // The native rule raises only when needed: a configured limit
+        // already above the budget is sent unchanged, and an unset limit
+        // resolves to the minimum the budget requires.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(16_384))
+            .build();
+        let value = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(16_384),
+            "configured limit above the budget must be kept"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let unset = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let value = serde_json::to_value(unset.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "unset limit must resolve to the budget minimum"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_for_adaptive_style() {
+        // The raising rule is budget-only, matching the native provider:
+        // adaptive-style thinking carries no budget, so the configured
+        // limit is unconstrained.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(4_096),
+            "adaptive-style thinking must keep the configured max_tokens"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "the adaptive shape must still be the injected object"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_on_streaming_builder() {
+        // Passthrough never attaches thinking to the streamed wire
+        // (streaming_thinking_params): the limit resolves from the same
+        // params the builder actually injects, so the streamed body
+        // behaves like thinking-off for the limit as well: the configured
+        // value is kept, nothing is raised. Flag off is the same
+        // byte-identical legacy body.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let streamed = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            streamed["max_tokens"],
+            serde_json::json!(4_096),
+            "streamed requests under passthrough carry no thinking object, so the configured max_tokens is kept"
+        );
+        assert!(
+            streamed.get("thinking").is_none(),
+            "streamed request must inject nothing; got: {streamed}"
+        );
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off streamed request must keep the configured max_tokens"
+        );
+        assert!(legacy.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_raises_max_tokens_on_history_fallback() {
+        // The prompt-guided fallback rebuilds the request through
+        // chat_with_history_inner with the runtime's thinking params: the
+        // rebuilt body must carry the same budget-safe limit as the
+        // primary path.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        flag_off
+            .chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), None)
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "one captured body per request");
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(8_193),
+            "fallback request with injected thinking must carry a budget-safe limit"
+        );
+        assert!(bodies[0].get("thinking").is_some());
+        assert_eq!(
+            bodies[1]["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off fallback request must keep the configured max_tokens"
+        );
+        assert!(bodies[1].get("thinking").is_none());
+        assert_eq!(
+            bodies[2]["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None fallback request must keep the configured max_tokens"
         );
         drop(bodies);
         server.abort();
