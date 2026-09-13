@@ -106,9 +106,13 @@ apply to existing sessions. Because the trigger stays on the cap, the usual
 pattern is one deeper trim at the cap followed by room for new turns,
 instead of a trim on every turn near the limit. A value of `1.0` disables
 hysteresis and refills straight to the cap, which matches the pre-hysteresis
-behavior. Validation reports out-of-range fractions, but loading is
-boot-resilient, so a config that starts anyway falls back to trimming
-straight to the cap until the fraction is repaired.
+behavior. Range checking depends on the write path. `Config::validate()`
+rejects out-of-range fractions and runs for the CLI `validate` command and
+gateway config PATCH writes. Boot-time loading is resilient and starts
+anyway, and RPC `config/set` persists a fraction without validating it. In
+either fall-through case the trimmer uses the cap, with no hysteresis, until
+the fraction is repaired, and the `trim_target` field on the history-trim
+debug event shows which target was used.
 
 ## Visible trimming
 

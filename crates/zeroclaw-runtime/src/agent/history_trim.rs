@@ -746,8 +746,9 @@ mod tests {
         // The target never aims below a single message.
         assert_eq!(history_trim_target(1, 0.7), 1);
         assert_eq!(history_trim_target(0, 0.7), 1);
-        // Out-of-range fractions (rejected at config load) degrade to the
-        // legacy no-hysteresis target rather than something nonsensical.
+        // Out-of-range fractions (rejected by Config::validate, but
+        // persistable via boot-resilient load or RPC config/set) degrade to
+        // the legacy no-hysteresis target rather than something nonsensical.
         assert_eq!(history_trim_target(10, 1.5), 10);
         assert_eq!(history_trim_target(10, f32::NAN), 10);
         assert_eq!(history_trim_target(10, 0.0), 10);
