@@ -92,6 +92,23 @@ pub struct ResumedRpcSession {
     pub message_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeExistingError {
+    DifferentAgent,
+    DifferentChatMode,
+    StaleIncarnation,
+}
+
+impl ResumeExistingError {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::DifferentAgent => "session belongs to a different agent",
+            Self::DifferentChatMode => "session uses a different chat mode",
+            Self::StaleIncarnation => "session changed while resuming",
+        }
+    }
+}
+
 impl RpcSession {
     pub fn new(
         agent: Agent,
@@ -262,22 +279,33 @@ impl SessionStore {
     /// `Agent`. A supplied session ID is a resume selector: when the live
     /// incarnation already exists, rebuilding it would fork provider history
     /// from an in-flight predecessor turn.
-    pub async fn resume_existing(
+    pub(crate) async fn resume_existing(
         &self,
         id: &str,
         agent_alias: &str,
         chat_mode: &crate::rpc::types::ChatMode,
         owner_tui_id: Option<String>,
-    ) -> Result<Option<ResumedRpcSession>, &'static str> {
+        expected_access: Option<(u64, Option<&str>)>,
+    ) -> Result<Option<ResumedRpcSession>, ResumeExistingError> {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(id) else {
-            return Ok(None);
+            return if expected_access.is_some() {
+                Err(ResumeExistingError::StaleIncarnation)
+            } else {
+                Ok(None)
+            };
         };
+        if let Some((expected_generation, expected_owner)) = expected_access
+            && (session.generation != expected_generation
+                || session.owner_tui_id.as_deref() != expected_owner)
+        {
+            return Err(ResumeExistingError::StaleIncarnation);
+        }
         if session.agent_alias != agent_alias {
-            return Err("session belongs to a different agent");
+            return Err(ResumeExistingError::DifferentAgent);
         }
         if &session.chat_mode != chat_mode {
-            return Err("session uses a different chat mode");
+            return Err(ResumeExistingError::DifferentChatMode);
         }
 
         if owner_tui_id.is_some() {
@@ -295,6 +323,28 @@ impl SessionStore {
             workspace_dir: session.workspace_dir.clone(),
             message_count,
         }))
+    }
+
+    /// Remove the exact live incarnation authorized for a mode replacement.
+    /// Remote callers supply a generation/owner fence; trusted-local callers
+    /// deliberately omit it and retain administrative replacement authority.
+    pub(crate) async fn remove_for_replacement(
+        &self,
+        id: &str,
+        expected_access: Option<(u64, Option<&str>)>,
+    ) -> Result<bool, ResumeExistingError> {
+        let mut sessions = self.sessions.lock().await;
+        match (sessions.get(id), expected_access) {
+            (None, Some(_)) => return Err(ResumeExistingError::StaleIncarnation),
+            (Some(session), Some((expected_generation, expected_owner)))
+                if session.generation != expected_generation
+                    || session.owner_tui_id.as_deref() != expected_owner =>
+            {
+                return Err(ResumeExistingError::StaleIncarnation);
+            }
+            _ => {}
+        }
+        Ok(sessions.remove(id).is_some())
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {

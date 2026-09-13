@@ -2187,6 +2187,7 @@ mod accept_error_tests {
                 "test-agent",
                 &ChatMode::Chat,
                 Some(OWNER.into()),
+                None,
             )
             .await
             .unwrap()
@@ -2367,6 +2368,7 @@ mod accept_error_tests {
                     "test-agent",
                     &ChatMode::Chat,
                     Some(OWNER.into()),
+                    None,
                 )
                 .await
                 .unwrap()
