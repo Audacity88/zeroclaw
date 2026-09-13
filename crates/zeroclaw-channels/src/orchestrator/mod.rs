@@ -12634,7 +12634,6 @@ fn compose_channel_mcp_prompt_sections(
 }
 
 /// Start all configured channels and route messages to the agent
-#[allow(clippy::too_many_lines)]
 pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
@@ -12656,6 +12655,54 @@ pub async fn start_channels_with_authority(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
+    Box::pin(start_channels_with_authority_and_plugin_webhooks(
+        authority,
+        canvas_store,
+        cancel,
+        sop_engine,
+        sop_audit,
+        None,
+    ))
+    .await
+}
+
+/// Start supervised channels with an owned config snapshot and the daemon
+/// generation's plugin-webhook route registry.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_plugin_webhooks(
+    config: Config,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+) -> Result<()> {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config)?;
+    start_channels_with_authority_and_plugin_webhooks(
+        authority,
+        canvas_store,
+        cancel,
+        sop_engine,
+        sop_audit,
+        plugin_webhooks,
+    )
+    .await
+}
+
+/// Start supervised channels with the shared live-config authority and the
+/// daemon generation's plugin-webhook route registry.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_authority_and_plugin_webhooks(
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+) -> Result<()> {
+    let plugin_webhook_registry_lease = plugin_webhooks
+        .as_ref()
+        .map(|registry| registry.start_generation());
     let config_arc = authority.config();
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
@@ -13117,11 +13164,13 @@ pub async fn start_channels_with_authority(
                      `channel-filesystem`; skipping Filesystem."
                 );
             }
-            let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
-                Arc::new(config.clone()),
-                Some(Arc::clone(&config_arc)),
-            )
-            .await;
+            let plugin_channels =
+                zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
+                    Arc::new(config.clone()),
+                    Some(Arc::clone(&config_arc)),
+                    plugin_webhook_registry_lease.as_ref(),
+                )
+                .await;
             append_configured_plugin_channels(&mut configured_channels, plugin_channels);
             let (channels_by_name, registry_lease) =
                 publish_cron_channel_registry(&configured_channels);
@@ -30263,7 +30312,7 @@ This is an example JSON object for profile settings."#;
                 }
                 "plugin" => source_segment_between(
                     async_assembly,
-                    "let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(",
+                    "zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(",
                     "publish_cron_channel_registry(&configured_channels)",
                 )
                 .is_some_and(|block| {
