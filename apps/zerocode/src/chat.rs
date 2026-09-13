@@ -13797,7 +13797,6 @@ mod tests {
             running.turn_in_flight,
             "the daemon kept the focused turn running, so the pane re-attaches"
         );
-        assert_eq!(running.turn_status, TurnStatus::Working);
         // The kept-running turn keeps what the user was reading, in order:
         // the prompt, the streamed partial committed as its own bubble, then
         // the notice marking the gap. The empty snapshot replaced nothing.
@@ -13820,6 +13819,11 @@ mod tests {
             "the pre-lag partial was committed, not left to splice onto new chunks"
         );
         assert!(running.resync_terminal_reload_pending);
+        assert_eq!(
+            running.turn_status,
+            TurnStatus::Responding,
+            "the turn was never reset, so the pre-lag status label survives too"
+        );
 
         let idle = chat
             .background
