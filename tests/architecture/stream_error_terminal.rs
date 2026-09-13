@@ -77,7 +77,9 @@ fn scan_dir(dir: &Path, violations: &mut Vec<String>) {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let display = path.display().to_string();
+        // Normalize separators so the allow-list matches on Windows, where
+        // `read_dir` yields backslash paths.
+        let display = path.to_string_lossy().replace('\\', "/");
         let allowed = ALLOWED_PRODUCER_FILES
             .iter()
             .any(|allowed| display.contains(allowed));
