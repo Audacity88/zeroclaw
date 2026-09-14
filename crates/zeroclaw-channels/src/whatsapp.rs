@@ -1039,6 +1039,7 @@ impl Channel for WhatsAppChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
         let attributed = run_approval_lifecycle(
             token,
