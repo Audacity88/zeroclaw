@@ -12096,14 +12096,21 @@ mod tests {
                 )
             })
             .collect();
+        assert_eq!(conversation.len(), 3);
         assert_eq!(
-            conversation,
-            vec![
+            &conversation[..2],
+            &[
                 ("user", "remember the blue door"),
                 ("assistant", "the door is blue"),
-                ("user", "what color?"),
             ]
         );
+        assert_eq!(conversation[2].0, "user");
+        let (_, prompt) = conversation[2]
+            .1
+            .strip_prefix("[CURRENT DATE & TIME: ")
+            .and_then(|content| content.split_once("]\n\n"))
+            .expect("new prompt has the runtime timestamp envelope");
+        assert_eq!(prompt, "what color?");
     }
 
     #[tokio::test]
