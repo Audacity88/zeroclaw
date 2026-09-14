@@ -12004,28 +12004,28 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_reaped_acp_restore_retains_history_for_next_prompt() {
-        use wiremock::matchers::method;
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        use zeroclaw_config::schema::WireApi;
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(concat!(
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"remembered\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                    "data: [DONE]\n\n"
-                )))
-            .mount(&server).await;
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "remembered"}}]
+            })))
+            .mount(&server)
+            .await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
-        config
+        let provider = config
             .providers
             .models
             .ensure("openai", "test-provider")
-            .unwrap()
-            .uri = Some(server.uri());
+            .unwrap();
+        provider.wire_api = Some(WireApi::ChatCompletions);
+        provider.uri = Some(server.uri());
         let data_dir = config.data_dir.clone();
         let (dispatcher, sessions, _, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
