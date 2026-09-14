@@ -430,6 +430,25 @@ def line_in_ranges(line_number: int, ranges: Iterable[tuple[int, int]]) -> bool:
     return any(start <= line_number <= end for start, end in ranges)
 
 
+def structural_brace_changed(
+    old_changed: Iterable[tuple[int, str]],
+    new_changed: Iterable[tuple[int, str]],
+    base_structural_lines: list[str],
+    head_structural_lines: list[str],
+) -> bool:
+    for line_number, _ in old_changed:
+        if 1 <= line_number <= len(base_structural_lines):
+            line = base_structural_lines[line_number - 1]
+            if "{" in line or "}" in line:
+                return True
+    for line_number, _ in new_changed:
+        if 1 <= line_number <= len(head_structural_lines):
+            line = head_structural_lines[line_number - 1]
+            if "{" in line or "}" in line:
+                return True
+    return False
+
+
 def strict_test_only_proof(
     files: list[dict[str, Any]],
     high_globs: tuple[str, ...],
@@ -486,6 +505,8 @@ def strict_test_only_proof(
             head_source = source_text(api.get_source(path, head_sha))
             base_lines = base_source.splitlines()
             head_lines = head_source.splitlines()
+            base_structural_lines = rust_structural_text(base_source).splitlines()
+            head_structural_lines = rust_structural_text(head_source).splitlines()
             for line_number, content in old_changed:
                 require(
                     1 <= line_number <= len(base_lines) and base_lines[line_number - 1] == content,
@@ -496,6 +517,13 @@ def strict_test_only_proof(
                     1 <= line_number <= len(head_lines) and head_lines[line_number - 1] == content,
                     "Rust patch does not match head source",
                 )
+            if structural_brace_changed(
+                old_changed,
+                new_changed,
+                base_structural_lines,
+                head_structural_lines,
+            ):
+                return False, "Rust structural brace changed"
             base_ranges = cfg_test_ranges(base_source)
             head_ranges = cfg_test_ranges(head_source)
         except Exception as exc:

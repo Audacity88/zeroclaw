@@ -291,6 +291,39 @@ class RiskClassifierTest(unittest.TestCase):
                 TEST_SOURCE,
                 TEST_SOURCE.replace("fn production()", "fn changed()"),
             ),
+            (
+                "brace move changes cfg membership",
+                changed_file(
+                    path,
+                    1,
+                    1,
+                    "@@ -6,7 +6,7 @@\n mod tests {\n     #[test]\n     fn existing() {\n         assert_eq!(1, 1);\n     }\n-}\n \n fn production() {\n     println!(\"production\");\n }\n+}\n",
+                ),
+                """#[cfg(test)]
+mod tests {
+    #[test]
+    fn existing() {
+        assert_eq!(1, 1);
+    }
+}
+
+fn production() {
+    println!("production");
+}
+""",
+                """#[cfg(test)]
+mod tests {
+    #[test]
+    fn existing() {
+        assert_eq!(1, 1);
+    }
+
+fn production() {
+    println!("production");
+}
+}
+""",
+            ),
         ]
         for name, file, base_source, head_source in cases:
             with self.subTest(name=name):
