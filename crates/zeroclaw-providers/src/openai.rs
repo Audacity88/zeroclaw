@@ -2,6 +2,7 @@ use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
+use crate::opencode_session::OPENCODE_SESSION_HEADER;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -29,6 +30,7 @@ pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
+    canonical_base_url: &'static str,
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
@@ -238,6 +240,7 @@ pub struct OpenAiBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
+    canonical_base_url: Option<&'static str>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
 }
@@ -256,6 +259,11 @@ impl OpenAiBuilder {
     /// Override the API endpoint. Trailing slashes are stripped.
     pub fn base_url(mut self, base_url: &str) -> Self {
         self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub(crate) fn canonical_base_url(mut self, base_url: &'static str) -> Self {
+        self.canonical_base_url = Some(base_url);
         self
     }
 
@@ -279,6 +287,7 @@ impl OpenAiBuilder {
         OpenAiModelProvider {
             alias: self.alias,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            canonical_base_url: self.canonical_base_url.unwrap_or(BASE_URL),
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
@@ -294,6 +303,7 @@ impl OpenAiModelProvider {
             alias: alias.to_string(),
             credential: None,
             base_url: None,
+            canonical_base_url: None,
             max_tokens: None,
             timeout_secs: None,
         }
@@ -459,7 +469,7 @@ impl OpenAiModelProvider {
 impl ModelProvider for OpenAiModelProvider {
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
-        Some(BASE_URL)
+        Some(self.canonical_base_url)
     }
 
     async fn chat_with_system(
@@ -601,6 +611,7 @@ impl ModelProvider for OpenAiModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -687,6 +698,7 @@ impl ModelProvider for OpenAiModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -1147,6 +1159,37 @@ impl OpenAiResponsesModelProvider {
         headers
     }
 
+    /// OpenCode affinity header value for the calling conversation, or `None`
+    /// when this provider does not target OpenCode.
+    ///
+    /// `responses_url` is the full endpoint rather than a base URL; the target
+    /// test parses its host, so it matches either shape. Returns `None` when
+    /// the operator already pinned the header through `extra_headers`, which
+    /// `build_default_headers` puts on every request — a second value here
+    /// would send the header twice.
+    fn opencode_session_value(&self) -> Option<String> {
+        if self
+            .extra_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
+        {
+            return None;
+        }
+        crate::opencode_session::session_token(&self.responses_url)
+    }
+
+    /// Attach the OpenCode affinity header, for request paths that build in the
+    /// caller's task. The streaming path resolves the value before its spawn.
+    fn apply_opencode_session_header(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match self.opencode_session_value() {
+            Some(session) => req.header(OPENCODE_SESSION_HEADER, session),
+            None => req,
+        }
+    }
+
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1155,6 +1198,10 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
@@ -1166,6 +1213,10 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
         builder.build().unwrap_or_else(|_| Client::new())
     }
 }
@@ -1227,9 +1278,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         };
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1277,9 +1330,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             );
         }
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1318,6 +1373,9 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let tools_owned = request.tools.map(<[ToolSpec]>::to_vec);
         let model = model.to_string();
         let responses_url = self.responses_url.clone();
+        // Resolved before the spawn: `spawn!` propagates the tracing span but
+        // not task-locals, so the conversation scope is unreadable inside.
+        let opencode_session = self.opencode_session_value();
         let count_tokens = options.count_tokens;
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
@@ -1370,11 +1428,14 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 );
             }
 
-            let request_builder = client
+            let mut request_builder = client
                 .post(&responses_url)
                 .header("Authorization", format!("Bearer {credential}"))
-                .header("Accept", "text/event-stream")
-                .json(&req);
+                .header("Accept", "text/event-stream");
+            if let Some(session) = opencode_session.as_deref() {
+                request_builder = request_builder.header(OPENCODE_SESSION_HEADER, session);
+            }
+            let request_builder = request_builder.json(&req);
 
             run_responses_sse(request_builder, &tx, count_tokens).await;
         });
@@ -1461,6 +1522,7 @@ mod tests {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
 
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let app = Router::new().route(
             "/responses",
             post(|| async {
@@ -1508,6 +1570,118 @@ mod tests {
         server_handle.abort();
     }
 
+    #[tokio::test]
+    async fn responses_provider_honors_runtime_proxy_config() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        async fn proxy_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "proxied",
+                "output": []
+            }))
+        }
+
+        async fn direct_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "direct",
+                "output": []
+            }))
+        }
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_app = Router::new()
+            .fallback(proxy_response)
+            .with_state(Arc::clone(&proxy_hits));
+        let proxy_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(proxy_listener, proxy_app).await.unwrap();
+        });
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let direct_app = Router::new()
+            .route("/responses", post(direct_response))
+            .with_state(Arc::clone(&direct_hits));
+        let direct_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(direct_listener, direct_app).await.unwrap();
+        });
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(format!("http://{proxy_addr}")),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.openai".to_string()],
+            ..Default::default()
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{direct_addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let client = provider.http_client();
+        let streaming_client = provider.streaming_client();
+        set_runtime_proxy_config(ProxyConfig::default());
+
+        let response = client
+            .post(&provider.responses_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("responses request should succeed through runtime proxy");
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+        let streaming_response = streaming_client
+            .post(&provider.responses_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("streaming responses request should succeed through runtime proxy");
+        let streaming_body: serde_json::Value = streaming_response
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+
+        proxy_server.abort();
+        direct_server.abort();
+
+        assert_eq!(
+            body.get("output_text").and_then(serde_json::Value::as_str),
+            Some("proxied"),
+            "Responses requests must use the runtime proxy client path for model_provider.openai"
+        );
+        assert_eq!(
+            streaming_body
+                .get("output_text")
+                .and_then(serde_json::Value::as_str),
+            Some("proxied"),
+            "streaming Responses requests must use the runtime proxy client path for model_provider.openai"
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            2,
+            "runtime proxy server should receive the Responses request"
+        );
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            0,
+            "direct Responses endpoint must not be contacted when the runtime proxy applies"
+        );
+    }
+
     #[test]
     fn creates_with_key() {
         let p = OpenAiModelProvider::builder("test")
@@ -1539,6 +1713,37 @@ mod tests {
             .credential(None)
             .build();
         assert_eq!(p.responses_url, RESPONSES_URL);
+    }
+
+    #[test]
+    fn opencode_session_header_follows_the_built_request_destination() {
+        // Header selection must agree with the parser that addresses the
+        // request, not with a textual reading of the configured URI.
+        for (api_url, expected_host) in [
+            // `\` ends the authority; `@opencode.ai/zen/v1` is only path.
+            (
+                "https://relay.example\\@opencode.ai/zen/v1",
+                "relay.example",
+            ),
+            // A percent-encoded host decodes to the relay.
+            ("https://%6fpencode.ai/zen/v1", "opencode.ai"),
+        ] {
+            let provider = OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .build();
+            let request = provider
+                .apply_opencode_session_header(reqwest::Client::new().post(&provider.responses_url))
+                .build()
+                .expect("request must build");
+            let host = request.url().host_str().expect("request must have a host");
+            assert_eq!(host, expected_host, "{api_url}");
+            assert_eq!(
+                request.headers().contains_key(OPENCODE_SESSION_HEADER),
+                host == "opencode.ai",
+                "{api_url}: header selection must match the request host {host}"
+            );
+        }
     }
 
     #[test]

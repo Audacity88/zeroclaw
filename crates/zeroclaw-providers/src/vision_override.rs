@@ -1,5 +1,7 @@
 use super::ModelProvider;
-use super::dispatch::ProviderDispatch;
+use super::dispatch::{
+    ProviderDispatch, mark_current_dispatch_composite, stream_as_dispatch_composite,
+};
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -66,6 +68,23 @@ impl ModelProvider for VisionOverrideProvider {
         capabilities
     }
 
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        // When this decorator patches `vision` itself, that patch - not
+        // whatever the wrapped provider reports - is authoritative for the
+        // capability seen above, so the inner offender (if any) no longer
+        // applies. There is no dotted entry name for the override itself,
+        // so the honest answer is `None` rather than a stale one. Only a
+        // pass-through (`None` override) forwards to the inner lookup.
+        match self.supports_vision {
+            Some(_) => None,
+            None => self.inner.vision_limited_by(model),
+        }
+    }
+
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        self.inner.has_mixed_native_tool_support_for_model(model)
+    }
+
     fn default_temperature(&self) -> f64 {
         self.inner.default_temperature()
     }
@@ -130,6 +149,7 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .simple_chat(message, model, temperature)
             .await
@@ -142,6 +162,7 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_system(system_prompt, message, model, temperature)
             .await
@@ -153,6 +174,7 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_history(messages, model, temperature)
             .await
@@ -164,6 +186,7 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat(request, model, temperature)
             .await
@@ -176,6 +199,7 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_tools(messages, tools, model, temperature)
             .await
@@ -189,8 +213,15 @@ impl ModelProvider for VisionOverrideProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        self.inner
-            .stream_chat_with_system(system_prompt, message, model, temperature, options)
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_system(
+                system_prompt,
+                message,
+                model,
+                temperature,
+                options,
+            ),
+        )
     }
 
     fn stream_chat_with_history(
@@ -200,8 +231,14 @@ impl ModelProvider for VisionOverrideProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        self.inner
-            .stream_chat_with_history(messages, model, temperature, options)
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_history(
+                messages,
+                model,
+                temperature,
+                options,
+            ),
+        )
     }
 
     fn stream_chat(
@@ -211,7 +248,12 @@ impl ModelProvider for VisionOverrideProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        ProviderDispatch::from_ref(&*self.inner).stream_chat(request, model, temperature, options)
+        stream_as_dispatch_composite(ProviderDispatch::from_ref(&*self.inner).stream_chat(
+            request,
+            model,
+            temperature,
+            options,
+        ))
     }
 }
 
@@ -227,6 +269,7 @@ impl zeroclaw_api::attribution::Attributable for VisionOverrideProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::AccountedChatScope;
     use crate::traits::ProviderCapabilities;
     use std::sync::Arc;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
@@ -272,6 +315,10 @@ mod tests {
                 context_window: None,
             }])
         }
+
+        fn vision_limited_by(&self, _model: &str) -> Option<String> {
+            Some("inner-fallback".to_string())
+        }
     }
 
     #[tokio::test]
@@ -290,6 +337,62 @@ mod tests {
         assert!(
             models[0].pricing.is_some(),
             "vision override must delegate list_models_with_pricing and keep pricing"
+        );
+    }
+
+    struct ModelAwareCapabilityFake;
+
+    impl Attributable for ModelAwareCapabilityFake {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "model_aware_capability_fake"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ModelAwareCapabilityFake {
+        fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: model == "routed-model",
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+            model == "routed-model"
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn vision_override_preserves_model_aware_tool_capabilities() {
+        let wrapped = VisionOverrideProvider::new(Box::new(ModelAwareCapabilityFake), false);
+
+        let capabilities = wrapped.capabilities_for_model("routed-model");
+        assert!(
+            capabilities.native_tool_calling,
+            "the vision decorator must preserve model-aware native-tool support"
+        );
+        assert!(
+            !capabilities.vision,
+            "the configured vision override remains authoritative"
+        );
+        assert!(
+            wrapped.has_mixed_native_tool_support_for_model("routed-model"),
+            "the vision decorator must transparently forward mixed-chain detection"
         );
     }
 
@@ -313,5 +416,110 @@ mod tests {
         let stable_inner = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
         let stable = VisionOverrideProvider::new(Box::new(stable_inner), false);
         assert!(stable.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn vision_limited_by_hides_inner_offender_when_overridden_but_forwards_on_pass_through() {
+        // An active override (force-on or force-off) is itself authoritative
+        // for the capability it patches, so the inner offender must not leak
+        // through and mislead a caller about what actually limits vision here.
+        let overridden = VisionOverrideProvider::new(Box::new(PricedVisionFake), false);
+        assert_eq!(overridden.vision_limited_by("model"), None);
+
+        // With no override set, the wrapper is a transparent pass-through and
+        // must forward the inner provider's answer unchanged.
+        let pass_through = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
+        assert_eq!(
+            pass_through.vision_limited_by("model"),
+            Some("inner-fallback".to_string())
+        );
+    }
+
+    struct AccountedVisionLeaf;
+
+    impl Attributable for AccountedVisionLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "configured.inner"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for AccountedVisionLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn accounting_through_vision_override_keeps_inner_identity() {
+        let wrapped = VisionOverrideProvider::new(Box::new(AccountedVisionLeaf), false);
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&wrapped)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "served-model",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("configured.inner", "served-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_accounting_through_vision_override_keeps_only_inner_leaf() {
+        let wrapped = VisionOverrideProvider::new(Box::new(AccountedVisionLeaf), false);
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+
+        let result = scope
+            .scope(ProviderDispatch::from_ref(&wrapped).chat_with_history(
+                &messages,
+                "served-model",
+                None,
+            ))
+            .await;
+
+        assert!(result.is_ok());
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 1);
+        let leaf = &report.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("configured.inner", "served-model")
+        );
     }
 }
