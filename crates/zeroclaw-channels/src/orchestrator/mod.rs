@@ -6433,7 +6433,9 @@ async fn process_channel_message_body(
                 ],
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                let _ = channel
+                    .send(&SendMessage::reply_to(&msg, message).suppress_voice())
+                    .await;
             }
             reconcile_early_ack(
                 ctx.as_ref(),
@@ -7038,7 +7040,8 @@ async fn process_channel_message_body(
                         let _ = ch
                             .send(
                                 &SendMessage::new(&text, &notify_reply_target)
-                                    .in_thread(thread_ts.clone()),
+                                    .in_thread(thread_ts.clone())
+                                    .suppress_voice(),
                             )
                             .await;
                     }
@@ -7797,7 +7800,8 @@ async fn process_channel_message_body(
                     && let Err(e) = channel
                         .send(
                             &SendMessage::new(block, &delivery_recipient)
-                                .in_thread(msg.thread_ts.clone()),
+                                .in_thread(msg.thread_ts.clone())
+                                .suppress_voice(),
                         )
                         .await
                 {
@@ -12379,7 +12383,6 @@ fn compose_channel_mcp_prompt_sections(
 }
 
 /// Start all configured channels and route messages to the agent
-#[allow(clippy::too_many_lines)]
 pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
@@ -12387,6 +12390,32 @@ pub async fn start_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
+    Box::pin(start_channels_with_plugin_webhooks(
+        config,
+        canvas_store,
+        cancel,
+        sop_engine,
+        sop_audit,
+        None,
+    ))
+    .await
+}
+
+/// Start supervised channels with the daemon generation's plugin-webhook route
+/// registry. Standalone channel runs use [`start_channels`] because no gateway
+/// shares their lifecycle.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_plugin_webhooks(
+    config: Config,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+) -> Result<()> {
+    let plugin_webhook_registry_lease = plugin_webhooks
+        .as_ref()
+        .map(|registry| registry.start_generation());
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
@@ -12845,11 +12874,13 @@ pub async fn start_channels(
                      `channel-filesystem`; skipping Filesystem."
                 );
             }
-            let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
-                Arc::new(config.clone()),
-                Some(Arc::clone(&config_arc)),
-            )
-            .await;
+            let plugin_channels =
+                zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
+                    Arc::new(config.clone()),
+                    Some(Arc::clone(&config_arc)),
+                    plugin_webhook_registry_lease.as_ref(),
+                )
+                .await;
             append_configured_plugin_channels(&mut configured_channels, plugin_channels);
             let (channels_by_name, registry_lease) =
                 publish_cron_channel_registry(&configured_channels);
@@ -13335,6 +13366,40 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-wechat"))]
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
+        }
+        #[cfg(feature = "channel-qq")]
+        "qq" => {
+            let qq = config.channels.qq.get(alias).ok_or_else(not_configured)?;
+            // The listener collector skips a disabled alias, but cron and
+            // one-off delivery reach this arm without a live instance, so the
+            // off switch has to be honored here before the transport is built.
+            if !qq.enabled {
+                let message =
+                    format!("[channels.qq.{alias}] is disabled; set enabled = true to deliver");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"channel": format!("qq.{alias}")})),
+                    &message
+                );
+                anyhow::bail!("{message}");
+            }
+            let peers = config.channel_external_peers("qq", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                alias,
+                peer_resolver,
+            )
+            .with_proxy_url(qq.proxy_url.clone());
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-qq"))]
+        "qq" => {
+            anyhow::bail!("QQ channel requires the `channel-qq` feature");
         }
         #[cfg(feature = "channel-lark")]
         "lark" | "feishu" => {
@@ -17288,6 +17353,44 @@ api_key = "anthropic-key"
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
     }
 
+    /// Records every outbound `SendMessage` whole, so a test can assert on
+    /// delivery flags (`suppress_voice`, `force_voice`) and not only on
+    /// recipient and text.
+    #[derive(Default)]
+    struct SendMessageRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<SendMessage>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SendMessageRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SendMessageRecordingChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages.lock().await.push(message.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[cfg(feature = "channel-email")]
     #[derive(Default)]
     struct ThreadingRecordingChannel {
@@ -20973,6 +21076,147 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_keeps_tool_progress_and_receipts_out_of_voice() {
+        // Tool-progress notices and the receipts block are system content:
+        // both must carry `suppress_voice` so a TTS channel never reads them
+        // aloud, while the conversational reply keeps its default routing.
+        let channel_impl = Arc::new(SendMessageRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let base_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(MockPriceTool)],
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            receipt_generator: Some(
+                zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
+            ),
+            show_receipts_in_response: true,
+            ..(*base_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let is_progress = |m: &SendMessage| m.content.starts_with('\u{1F527}');
+        let is_receipts = |m: &SendMessage| m.content.contains("Tool receipts:");
+
+        let progress: Vec<&SendMessage> = sent_messages.iter().filter(|m| is_progress(m)).collect();
+        assert!(
+            !progress.is_empty(),
+            "expected at least one tool-progress notice; got {sent_messages:?}"
+        );
+        for notice in progress {
+            assert!(
+                notice.suppress_voice,
+                "tool-progress notice must suppress voice synthesis, got {notice:?}"
+            );
+            assert!(!notice.force_voice);
+        }
+
+        let receipts = sent_messages
+            .iter()
+            .find(|m| is_receipts(m))
+            .unwrap_or_else(|| panic!("no `Tool receipts:` send found; got {sent_messages:?}"));
+        assert!(
+            receipts.suppress_voice,
+            "receipts block must suppress voice synthesis, got {receipts:?}"
+        );
+        assert!(!receipts.force_voice);
+
+        let reply = sent_messages
+            .iter()
+            .find(|m| !is_progress(m) && !is_receipts(m))
+            .unwrap_or_else(|| panic!("no conversational reply found; got {sent_messages:?}"));
+        assert!(
+            !reply.suppress_voice,
+            "the conversational reply must keep its default voice routing, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_keeps_provider_init_failure_notice_out_of_voice() {
+        // The notice sent when the routed provider cannot be built is system
+        // content, like the other error notices, and must never be voiced.
+        let channel_impl = Arc::new(SendMessageRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-42".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+        runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                runtime_conversation_history_key(runtime_ctx.as_ref(), &msg),
+                ChannelRouteSelection {
+                    model_provider: "no-such-provider".into(),
+                    model: "route-model".to_string(),
+                    api_key: None,
+                },
+            );
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let notice = sent_messages
+            .iter()
+            .find(|m| m.content.contains("no-such-provider"))
+            .unwrap_or_else(|| {
+                panic!("no provider-init failure notice found; got {sent_messages:?}")
+            });
+        assert!(
+            notice.suppress_voice,
+            "provider-init failure notice must suppress voice synthesis, got {notice:?}"
+        );
+        assert!(!notice.force_voice);
+    }
+
+    #[tokio::test]
     async fn process_channel_message_omits_receipts_block_when_disabled() {
         // Backward-compat: with show_receipts_in_response=false (default), no
         // trailing receipts message is sent — even when a generator is active
@@ -24266,6 +24510,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             tool_name: "shell".to_string(),
                             arguments_summary: "command".to_string(),
                             raw_arguments: None,
+                            position: None,
                         },
                     )
                     .await
@@ -29927,7 +30172,7 @@ This is an example JSON object for profile settings."#;
                 }
                 "plugin" => source_segment_between(
                     async_assembly,
-                    "let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(",
+                    "zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(",
                     "publish_cron_channel_registry(&configured_channels)",
                 )
                 .is_some_and(|block| {
@@ -36014,6 +36259,29 @@ Done."#;
     }
 
     #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn one_off_send_resolves_dotted_qq_alias() {
+        // The QQ instance alias is the channel type in practice
+        // (`[channels.qq.qq]`), and a bare id only ever resolves a
+        // `default` alias, so the dotted form is the one operators use.
+        // It must reach the QQ arm rather than the dispatcher's reject path.
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "qq.qq", "user:OPENID", "test message")
+            .await
+            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[channels.qq.qq] not configured"),
+            "dotted qq id should reach named channel resolution; got: {message}"
+        );
+        assert!(
+            !message.contains("unsupported delivery channel"),
+            "dotted qq id must not be reported as an unsupported delivery channel; got: {message}"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(feature = "channel-linq")]
     async fn one_off_send_keeps_dotted_linq_alias_on_builder() {
         // `linq.<alias>` predates the announcement delegation and is resolved by
@@ -36065,7 +36333,6 @@ Done."#;
             "wecom",
             "wecom_ws",
             "wecom-ws",
-            "qq",
             "nostr",
             "clawdtalk",
             "reddit",
@@ -36189,6 +36456,59 @@ Done."#;
         assert!(
             msg.contains("[channels.email.default] not configured"),
             "email.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn deliver_announcement_routes_qq_to_qq_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "qq.qq", "user:OPENID", None, "hi")
+            .await
+            .expect_err("expected qq.qq to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "qq.qq must route to the QQ arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.qq.qq] not configured"),
+            "qq.qq must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn deliver_announcement_rejects_disabled_qq_alias() {
+        // Disabling an alias keeps its credentials, and the cron scheduler
+        // reaches this arm without consulting the listener collector, so the
+        // refusal has to come from the dispatcher itself.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.qq.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::QQConfig {
+                enabled: false,
+                app_id: "test-app-id".to_string(),
+                app_secret: "test-app-secret".to_string(),
+                // If the guard regresses, the send attempt lands on a refused
+                // loopback port instead of Tencent's API.
+                proxy_url: Some("http://127.0.0.1:1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "qq.work", "user:OPENID", None, "hi")
+            .await
+            .expect_err("a disabled qq alias must not be delivered to");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("[channels.qq.work] is disabled"),
+            "disabled alias must report the off switch; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "disabled alias must reach the QQ arm; got: {msg}"
         );
     }
 
