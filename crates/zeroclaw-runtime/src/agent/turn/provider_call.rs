@@ -1821,6 +1821,7 @@ mod streaming_fallback_tests {
                     input_tokens: Some(3),
                     output_tokens: Some(2),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -1906,6 +1907,7 @@ mod streaming_fallback_tests {
                     input_tokens: Some(1),
                     output_tokens: Some(1),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 })),
                 Err(zeroclaw_providers::traits::StreamError::ModelProvider(
                     "503 Service Unavailable".to_string(),
