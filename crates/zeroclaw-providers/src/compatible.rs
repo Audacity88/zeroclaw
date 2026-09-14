@@ -998,19 +998,23 @@ impl OpenAiCompatibleModelProvider {
 
     /// Inject Anthropic prompt-cache breakpoints behind `cache_passthrough`.
     ///
-    /// The native Anthropic provider is the source of truth for placement:
-    /// `AnthropicModelProvider::should_cache_conversation` and
+    /// The native Anthropic provider is the reference for the breakpoint
+    /// gate: `AnthropicModelProvider::should_cache_conversation` and
     /// `apply_cache_to_last_message` in `anthropic.rs`. (a) The system prompt
     /// always carries a breakpoint when one exists on the wire. With
     /// `merge_system_into_user`, the system role disappears from the wire,
     /// so the carrier index of the merged system content (the first user
     /// message, or the synthetic user carrying it) takes over that role and
-    /// is marked unconditionally. (b) The last message's trailing text part
-    /// carries a rolling breakpoint once the conversation has more than one
-    /// non-system message, the same gate the native provider applies before
-    /// `apply_cache_to_last_message`. At most two breakpoints per request;
-    /// only breakpoint-carrying messages convert from string content to
-    /// block form, every other message serializes exactly as before.
+    /// is marked unconditionally. (b) Once the conversation has more than
+    /// one non-system message, a rolling breakpoint lands on the last
+    /// non-system message with a non-empty text part: the last message when
+    /// it carries text, otherwise the nearest earlier non-system message
+    /// that does, so an image-only turn rolls the breakpoint back instead
+    /// of silently dropping it. System messages are never marked twice, and
+    /// when nothing qualifies there is no rolling breakpoint. At most two
+    /// breakpoints per request; only breakpoint-carrying messages convert
+    /// from string content to block form, every other message serializes
+    /// exactly as before.
     fn apply_cache_breakpoints<T: CacheBreakpointMessage>(
         &self,
         messages: &mut [T],
@@ -1040,12 +1044,17 @@ impl OpenAiCompatibleModelProvider {
             .iter()
             .filter(|m| m.cache_role() != "system")
             .count();
-        if non_system_count > 1
-            && let Some(last) = messages.last_mut()
-            && last.cache_role() != "system"
-            && let Some(content) = last.cache_content()
-        {
-            content.apply_cache_control();
+        if non_system_count > 1 {
+            for message in messages.iter_mut().rev() {
+                if message.cache_role() == "system" {
+                    continue;
+                }
+                if let Some(content) = message.cache_content()
+                    && content.apply_cache_control()
+                {
+                    break;
+                }
+            }
         }
     }
 
@@ -1249,24 +1258,40 @@ enum MessageContent {
 }
 
 impl MessageContent {
-    /// Mark this content as an Anthropic prompt-cache breakpoint: plain
-    /// string content converts to the single-text-block wire form (block
-    /// conversion touches only breakpoint-carrying messages); block-form
-    /// content gains the marker on its trailing text part. Trailing
-    /// non-text parts (images) are left unmarked, mirroring the native
-    /// Anthropic provider's placement, which never marks image blocks.
-    fn apply_cache_control(&mut self) {
+    /// Mark this content as an Anthropic prompt-cache breakpoint and return
+    /// whether a markable text part was found: plain string content
+    /// converts to the single-text-block wire form (block conversion
+    /// touches only breakpoint-carrying messages); block-form content gains
+    /// the marker on its last non-empty text part. A message ending in an
+    /// image part therefore carries the breakpoint on its text, and the
+    /// image part stays unmarked: the image is covered by the following
+    /// turn's rolling breakpoint. Empty text is never marked, because the
+    /// wire format rejects empty text blocks that carry `cache_control`.
+    fn apply_cache_control(&mut self) -> bool {
         match self {
             MessageContent::Text(text) => {
+                if text.is_empty() {
+                    return false;
+                }
                 *self = MessageContent::Parts(vec![MessagePart::Text {
                     text: std::mem::take(text),
                     cache_control: Some(crate::anthropic::CacheControl::ephemeral()),
                 }]);
+                true
             }
             MessageContent::Parts(parts) => {
-                if let Some(MessagePart::Text { cache_control, .. }) = parts.last_mut() {
-                    *cache_control = Some(crate::anthropic::CacheControl::ephemeral());
+                for part in parts.iter_mut().rev() {
+                    if let MessagePart::Text {
+                        text,
+                        cache_control,
+                    } = part
+                        && !text.is_empty()
+                    {
+                        *cache_control = Some(crate::anthropic::CacheControl::ephemeral());
+                        return true;
+                    }
                 }
+                false
             }
         }
     }
@@ -4622,6 +4647,322 @@ mod tests {
             requests[0].to_string().matches("cache_control").count(),
             2,
             "rolling breakpoint must never exceed two per request"
+        );
+    }
+
+    /// Writes a minimal real PNG (a 1x1 transparent pixel) into a fresh
+    /// tempdir and returns the dir plus the file path. The dir must outlive
+    /// the request so the multimodal prepare pass can inline the file, and
+    /// tests build the image marker at runtime from the path so this
+    /// source never carries a literal marker.
+    fn write_minimal_png() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let image_path = temp.path().join("pixel.png");
+        std::fs::write(&image_path, png).unwrap();
+        (temp, image_path)
+    }
+
+    /// Wire form of [`write_minimal_png`]'s file once the multimodal
+    /// prepare pass inlines it: MIME detected from the PNG signature,
+    /// standard padded base64.
+    const MINIMAL_PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
+
+    /// Rolling breakpoint on an image-ending turn: the last user message
+    /// serializes as [text, image] parts, and the breakpoint must land on
+    /// that text part instead of vanishing because the final part is an
+    /// image. The image part stays unmarked; the following turn's rolling
+    /// breakpoint covers it.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_lands_on_text_before_trailing_image() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on image-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "system and the text part ahead of the trailing image carry the breakpoints; middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "an image-ending turn must still carry exactly two breakpoints"
+        );
+    }
+
+    /// Streaming twin of the image-turn pin: the streaming path must place
+    /// the rolling breakpoint on the same text part when the final user
+    /// message ends with an image.
+    #[tokio::test]
+    async fn cache_passthrough_streaming_rolling_breakpoint_lands_on_text_before_trailing_image() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "streaming image-turn request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "streaming path must inject the image-turn breakpoints identically"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "streaming image-ending turn must carry exactly two breakpoints"
+        );
+    }
+
+    /// Image-only turn: a message whose content is just the image carries
+    /// no text part at all, so it cannot host the rolling breakpoint. The
+    /// breakpoint rolls back onto the nearest earlier non-system message
+    /// with text, the image part stays unmarked, and the two-breakpoint
+    /// ceiling holds.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_falls_back_when_last_message_is_image_only() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!("[{}:{}]", "IMAGE", image_path.display())),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on image-only request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "image-only turn rolls the breakpoint onto the nearest earlier non-system message; the image part stays unmarked"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "image-only fallback must still carry exactly two breakpoints"
+        );
+    }
+
+    /// Unit pin for the fallback walk on hand-built messages, so the
+    /// invariant holds regardless of how a history was constructed: an
+    /// image-only last message rolls the rolling breakpoint back onto the
+    /// nearest earlier non-system message with text, a trailing system
+    /// message never absorbs the slot or gains a second mark, and the
+    /// two-breakpoint ceiling holds.
+    #[test]
+    fn cache_passthrough_breakpoint_walk_handles_hand_built_image_only_messages() {
+        let provider = make_cache_passthrough_model_provider("custom", "http://127.0.0.1:1");
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: MessageContent::Text("you are brief".to_string()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![MessagePart::ImageUrl {
+                    image_url: ImageUrlPart {
+                        url: "data:image/png;base64,abcd".to_string(),
+                    },
+                }]),
+            },
+            Message {
+                role: "system".to_string(),
+                content: MessageContent::Text("extra".to_string()),
+            },
+        ];
+        provider.apply_cache_breakpoints(&mut messages, None);
+        let value = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abcd"}},
+                ]},
+                {"role": "system", "content": "extra"},
+            ]),
+            "image-only turn rolls the breakpoint onto the nearest earlier non-system message; system messages never take the rolling slot"
+        );
+        assert_eq!(
+            value.to_string().matches("cache_control").count(),
+            2,
+            "hand-built fallback must keep the two-breakpoint ceiling"
+        );
+    }
+
+    /// Flag-off twin for the multimodal shape: with the flag off, the
+    /// image-ending history serializes byte-identically to the pre-feature
+    /// wire, with plain string content where the flag-on path would mark,
+    /// the same unmarked image parts, and no cache markers anywhere in the
+    /// body.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_image_turn_body_unmarked() {
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-off image-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "you are brief"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "flag-off multimodal body must stay byte-identical: plain strings and unmarked image parts"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off image-ending turn must carry no cache markers"
         );
     }
 

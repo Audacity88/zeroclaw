@@ -154,10 +154,12 @@ passthrough entirely; the native provider places its own breakpoints.
 `cache_passthrough` is for gateways that offer only the Chat Completions
 surface.
 
-With the flag on, requests gain at most two `cache_control` breakpoints,
-placed the same way the native Anthropic provider places them: one on the
-system prompt, and one rolling breakpoint on the last message once the
-conversation has more than one non-system message. With
+With the flag on, requests gain at most two `cache_control` breakpoints:
+one on the system prompt, and one rolling breakpoint on the last message
+once the conversation has more than one non-system message, the same gate
+the native Anthropic provider applies. On a message that ends with an
+image, the rolling breakpoint sits on the message's last text block; the
+image is covered by the following turn. With
 `merge_system_into_user` the system role never reaches the wire, so the
 merged first user message (or the synthetic user carrying the system text)
 carries the system-equivalent breakpoint instead. Only breakpoint-carrying
