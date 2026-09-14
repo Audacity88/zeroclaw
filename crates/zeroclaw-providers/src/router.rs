@@ -426,6 +426,7 @@ impl ModelProvider for RouterModelProvider {
             // route that cannot preserve its own contract (or skipping it for
             // a later fallback) would invert the operator's route ranking.
             let provider = Arc::clone(model_provider);
+            let provider_name = provider_name.clone();
             let resolved_model = resolved_model.clone();
             let messages: Vec<ChatMessage> = request.messages.to_vec();
             let tools: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
@@ -437,9 +438,19 @@ impl ModelProvider for RouterModelProvider {
                     tools: tools.as_deref(),
                     thinking,
                 };
-                match ProviderDispatch::from_ref(&*provider)
-                    .chat(request, &resolved_model, temperature)
-                    .await
+                // The synthesized call is still a routed dispatch: the
+                // configured route identity must reach the accounting node
+                // exactly as it does on the streaming arm below.
+                match with_exact_dispatch_route(
+                    provider_name,
+                    resolved_model.clone(),
+                    ProviderDispatch::from_ref(&*provider).chat(
+                        request,
+                        &resolved_model,
+                        temperature,
+                    ),
+                )
+                .await
                 {
                     Ok(response) => synthesize_stream_events(response),
                     // The non-streaming call is complete by the time this arm
@@ -548,6 +559,7 @@ impl ::zeroclaw_api::attribution::Attributable for RouterModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::AccountedChatScope;
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1568,6 +1580,71 @@ mod tests {
         fn alias(&self) -> &str {
             "NonStreamingToolCallMock"
         }
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_attributes_the_configured_route_not_the_leaf_alias() {
+        // The synthesized non-streaming arm is a routed dispatch like any
+        // other: the accounting leaf must carry the configured route name
+        // and resolved model, not the wrapped provider's own alias.
+        let leaf = Arc::new(NonStreamingToolCallMock::new());
+        let router = RouterModelProvider::new(
+            "test",
+            vec![(
+                "gateway-primary".into(),
+                Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "route".to_string(),
+                crate::router::Route {
+                    provider_name: "gateway-primary".to_string(),
+                    model: "inner-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+        let events: Vec<_> = scope
+            .scope(async {
+                ProviderDispatch::from_ref(&router)
+                    .stream_chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "hint:route",
+                        None,
+                        StreamOptions::new(true),
+                    )
+                    .collect()
+                    .await
+            })
+            .await;
+        scope.mark_logical_success();
+        let report = scope.take();
+
+        assert!(events.iter().all(Result::is_ok));
+        assert_eq!(leaf.chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report.attempts().len(),
+            1,
+            "one physical leaf; the router itself is a composite"
+        );
+        let attempt = &report.attempts()[0];
+        assert_eq!(
+            attempt.provider_ref(),
+            "gateway-primary",
+            "the synthesized arm must record the configured route, not the leaf alias"
+        );
+        assert_eq!(attempt.model(), "inner-model");
+        let accepted = report
+            .accepted_route()
+            .expect("a successful synthesized call has an accepted route");
+        assert_eq!(accepted.provider_ref(), "gateway-primary");
+        assert_eq!(accepted.model(), "inner-model");
     }
 
     #[tokio::test]
