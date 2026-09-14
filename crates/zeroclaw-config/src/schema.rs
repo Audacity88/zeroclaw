@@ -8341,7 +8341,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), or "bocha" (Bocha AI, requires API key — Chinese-friendly, <https://open.bochaai.com>)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), or "anysearch" (optional API key; anonymous requests use a lower quota)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -8368,6 +8368,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bocha_api_key: Option<String>,
+    /// AnySearch API key (optional if search_provider is `"anysearch"`). Without a key, requests use AnySearch's rate-limited anonymous quota. Obtain at <https://www.anysearch.com/console/api-keys>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub anysearch_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -8400,6 +8406,7 @@ impl Default for WebSearchConfig {
             tavily_api_key: None,
             jina_api_key: None,
             bocha_api_key: None,
+            anysearch_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -8755,7 +8762,8 @@ pub struct KnowledgeConfig {
     /// Enable the knowledge graph tool. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the knowledge graph SQLite database.
+    /// Path to the knowledge graph SQLite database. A leading `~` is expanded
+    /// at use time via [`KnowledgeConfig::resolved_db_path`].
     #[serde(default = "default_knowledge_db_path")]
     pub db_path: String,
     /// Maximum number of knowledge nodes. Default: 100000.
@@ -8786,6 +8794,20 @@ impl Default for KnowledgeConfig {
             auto_capture: false,
             suggest_on_query: true,
         }
+    }
+}
+
+impl KnowledgeConfig {
+    /// Resolve `db_path` to a filesystem path, expanding only a leading `~`
+    /// or `~/` as the home directory.
+    ///
+    /// A `~` anywhere else in the path is left intact, so Windows 8.3 short
+    /// names such as `ADMINI~1` survive resolution. This is the single source
+    /// of truth for the knowledge database location. Pure — performs no
+    /// filesystem I/O.
+    #[must_use]
+    pub fn resolved_db_path(&self) -> PathBuf {
+        expand_tilde_path(&self.db_path)
     }
 }
 
@@ -26753,6 +26775,46 @@ zeroclaw-operators = "operator"
         }
     }
 
+    // ── Knowledge db path resolution ──────────────────────────
+
+    #[test]
+    async fn resolved_db_path_passes_absolute_path_through() {
+        let cfg = KnowledgeConfig {
+            db_path: "/srv/zeroclaw/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_db_path(),
+            PathBuf::from("/srv/zeroclaw/knowledge.db")
+        );
+    }
+
+    #[test]
+    async fn resolved_db_path_preserves_non_prefix_tilde() {
+        // Windows 8.3 short names contain a `~` that is not a home shortcut.
+        let cfg = KnowledgeConfig {
+            db_path: "/tmp/ADMINI~1/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_db_path(),
+            PathBuf::from("/tmp/ADMINI~1/knowledge.db")
+        );
+    }
+
+    #[test]
+    async fn resolved_db_path_expands_leading_tilde() {
+        let cfg = KnowledgeConfig {
+            db_path: "~/.zeroclaw/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        let resolved = cfg.resolved_db_path();
+        if std::env::var("HOME").is_ok() {
+            assert!(!resolved.to_string_lossy().starts_with('~'));
+            assert!(resolved.ends_with(".zeroclaw/knowledge.db"));
+        }
+    }
+
     /// Build a `Config` whose data dir, install root, and configured plugins dir
     /// live under `root`, and create a plugin at `<parent>/<name>/manifest.toml`.
     fn config_with_dirs(root: &Path) -> Config {
@@ -30318,6 +30380,7 @@ default_temperature = 0.7
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.web_search.tavily_api_key = Some("tavily-credential".into());
+        config.web_search.anysearch_api_key = Some("anysearch-credential".into());
         config.storage.postgres.insert(
             "default".to_string(),
             PostgresStorageConfig {
@@ -30431,6 +30494,7 @@ default_temperature = 0.7
             "browser-credential",
             "brave-credential",
             "tavily-credential",
+            "anysearch-credential",
             "postgres://user:pw@host/db",
             "qdrant-credential",
             "rotation-credential-a",
@@ -30504,6 +30568,15 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(tavily_encrypted).unwrap(),
             "tavily-credential"
+        );
+
+        let anysearch_encrypted = stored.web_search.anysearch_api_key.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(
+            anysearch_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(anysearch_encrypted).unwrap(),
+            "anysearch-credential"
         );
 
         let worker_provider = stored
