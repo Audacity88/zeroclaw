@@ -3240,7 +3240,7 @@ mod sop_step_reassembly_tests {
     async fn run_budgeted_test_loop(
         provider: &dyn ModelProvider,
         history: &mut Vec<ChatMessage>,
-        tools: &[Box<dyn crate::tools::Tool>],
+        tools: &crate::tools::scoped::ScopedToolRegistry,
         budget: ExecutionTreeBudget,
         cancellation_token: CancellationToken,
         max_tool_iterations: usize,
@@ -3315,9 +3315,11 @@ mod sop_step_reassembly_tests {
     async fn root_local_iteration_cap_consumes_tree_budget_for_summary() {
         let root_budget = ExecutionTreeBudget::root(2);
         let tool_calls = Arc::new(AtomicUsize::new(0));
-        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&tool_calls),
-        })];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
         let mut history = vec![ChatMessage::user("run one tool")];
 
         let response = run_budgeted_test_loop(
@@ -3342,9 +3344,11 @@ mod sop_step_reassembly_tests {
 
         let root_budget = ExecutionTreeBudget::root(2);
         let tool_calls = Arc::new(AtomicUsize::new(0));
-        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&tool_calls),
-        })];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
         let mut history = vec![ChatMessage::user("run one child tool")];
 
         let error = run_budgeted_test_loop(
@@ -3375,9 +3379,11 @@ mod sop_step_reassembly_tests {
         let root_budget = ExecutionTreeBudget::root(3);
         let cancellation_token = CancellationToken::new();
         let tool_calls = Arc::new(AtomicUsize::new(0));
-        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&tool_calls),
-        })];
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
         let mut child_history = vec![ChatMessage::user("run tools")];
 
         let child_error = run_budgeted_test_loop(

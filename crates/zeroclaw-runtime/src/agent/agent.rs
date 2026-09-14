@@ -10064,7 +10064,9 @@ mod tests {
                 started: started_tx,
                 release: Arc::clone(&release),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
