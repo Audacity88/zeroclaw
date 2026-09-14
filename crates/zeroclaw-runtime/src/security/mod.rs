@@ -4,6 +4,7 @@ pub mod audit;
 pub mod auth_provider;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod cert_ledger;
 pub mod detect;
 pub mod docker;
 
@@ -23,6 +24,7 @@ pub mod otp;
 pub mod pairing;
 pub mod playbook;
 pub mod policy;
+pub mod principal_resolver;
 pub mod prompt_guard;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
