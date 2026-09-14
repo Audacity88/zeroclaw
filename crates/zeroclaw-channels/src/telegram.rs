@@ -15866,6 +15866,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let attributed = ch
             .request_approval_attributed_with_timeout("12345", &request, Duration::from_millis(100))
@@ -16061,6 +16062,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let mut waiter = Box::pin(ch.request_approval_attributed("12345", &request));
         tokio::time::timeout(Duration::from_secs(5), async {
