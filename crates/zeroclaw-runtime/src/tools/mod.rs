@@ -3889,6 +3889,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"knowledge"));
