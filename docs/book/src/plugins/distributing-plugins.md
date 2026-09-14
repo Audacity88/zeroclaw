@@ -28,6 +28,11 @@ Two consequences worth knowing:
   similarly prefixed root fields such as `signature_algorithm`, remain signed.
   Reformatting or reordering retained content invalidates the signature. Sign
   last, after the manifest is final.
+- Config exposure markers such as
+  `config_schema.properties.api_token.x-secret` are therefore
+  signature-covered policy. Changing a tool or channel property between public
+  config exposure and scoped `secrets.get` access requires rebuilding and
+  re-signing.
 - Packages signed by the former prefix-based canonicalizer need re-signing only
   if they relied on one of those edge cases or on TOML decoration attached to a
   removed field. Ordinary manifests keep the same signed content.
@@ -92,7 +97,11 @@ The install path is the local plugin directory; a registry is only a JSON
 index consulted at command time (`zeroclaw plugin search` / `install`).
 Both commands exist only in binaries with the plugin host compiled in (see
 [build features](../developing/plugin-protocol.md#build-features)); the
-prebuilt release binaries ship without it. The
+prebuilt release binaries ship without it. Fetching an index through either
+command caches it locally. `zeroclaw plugin list` then combines installed
+packages with the cache without making a network request; it keeps installed
+and registry versions separate rather than guessing whether an arbitrary
+version string is newer. The
 default index is the `zeroclaw-labs/zeroclaw-plugins` repository's
 `registry.json`; private registries are a URL away
 (`--registry <url>` per command, or the `ZEROCLAW_PLUGIN_REGISTRY_URL`

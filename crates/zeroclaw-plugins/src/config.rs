@@ -17,10 +17,12 @@ use serde_json::Value;
 use crate::error::PluginError;
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use crate::instance::PluginInstanceScope;
-use crate::{PluginManifest, PluginPermission};
+use crate::{PluginCapability, PluginManifest, PluginPermission};
 
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 32;
+/// Keep admission-time validator compilation bounded for wide object schemas.
+const MAX_SCHEMA_PROPERTIES: usize = 256;
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// Ceiling on one compiled `pattern` program, in bytes.
@@ -72,22 +74,34 @@ const DYNAMIC_KEY_KEYWORDS: [&str; 3] = [
 #[cfg(any(feature = "plugins-wasmtime", test))]
 pub struct ResolvedPluginConfig {
     scope: PluginInstanceScope,
-    value: Value,
+    public_json: Value,
+    secrets: HashMap<String, String>,
 }
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
 impl ResolvedPluginConfig {
-    fn new(scope: &PluginInstanceScope, value: Value) -> Self {
+    fn new(
+        scope: &PluginInstanceScope,
+        public_json: Value,
+        secrets: HashMap<String, String>,
+    ) -> Self {
         Self {
             scope: scope.clone(),
-            value,
+            public_json,
+            secrets,
         }
     }
 
-    /// Borrow the validated JSON object for immediate guest injection.
+    /// Borrow the validated non-secret JSON object for immediate guest injection.
     #[must_use]
-    pub(crate) fn as_json(&self) -> &Value {
-        &self.value
+    pub(crate) fn public_json(&self) -> &Value {
+        &self.public_json
+    }
+
+    /// Borrow one schema-designated secret for an immediate host-mediated use.
+    #[must_use]
+    pub(crate) fn secret(&self, name: &str) -> Option<&str> {
+        self.secrets.get(name).map(String::as_str)
     }
 
     /// Reject pairing this materialized view with another admission decision.
@@ -102,7 +116,8 @@ impl ResolvedPluginConfig {
 }
 
 /// Host-injected config service. The closure resolves from canonical state on
-/// every call; the service itself carries no config values or schema snapshot.
+/// every call; the service carries only that source handle, not a materialized
+/// resolved view.
 #[derive(Clone)]
 #[cfg(any(feature = "plugins-wasmtime", test))]
 pub struct PluginConfigResolver {
@@ -117,6 +132,7 @@ type ResolveConfig = dyn Fn(&PluginInstanceScope) -> Result<ResolvedPluginConfig
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
 impl PluginConfigResolver {
+    /// Build a resolver whose canonical source may change between service frames.
     #[must_use]
     pub fn new(
         resolve: impl Fn(&PluginInstanceScope) -> Result<ResolvedPluginConfig, PluginError>
@@ -223,6 +239,12 @@ fn compile_manifest_config(
             manifest.name
         ))
     })?;
+    validate_secret_annotations(schema).map_err(|message| {
+        invalid_manifest(format!(
+            "plugin '{}' config_schema {message}",
+            manifest.name
+        ))
+    })?;
 
     if schema.get("type").and_then(Value::as_str) != Some("object") {
         return Err(invalid_manifest(format!(
@@ -258,14 +280,6 @@ fn compile_manifest_config(
         )));
     }
 
-    let validator = manifest_schema_options().build(schema).map_err(|error| {
-        invalid_manifest(format!(
-            "plugin '{}' config_schema cannot be compiled: {}",
-            manifest.name,
-            error.masked()
-        ))
-    })?;
-
     let properties = schema
         .get("properties")
         .and_then(Value::as_object)
@@ -275,13 +289,47 @@ fn compile_manifest_config(
                 manifest.name
             ))
         })?;
+    if properties.len() > MAX_SCHEMA_PROPERTIES {
+        return Err(invalid_manifest(format!(
+            "plugin '{}' config_schema declares {} root properties, exceeding the maximum of {MAX_SCHEMA_PROPERTIES}",
+            manifest.name,
+            properties.len()
+        )));
+    }
+
+    let validator = manifest_schema_options().build(schema).map_err(|error| {
+        invalid_manifest(format!(
+            "plugin '{}' config_schema cannot be compiled: {}",
+            manifest.name,
+            error.masked()
+        ))
+    })?;
+
     for (name, property) in properties {
-        property_type(schema, property).map_err(|message| {
+        let kind = property_type(schema, property).map_err(|message| {
             invalid_manifest(format!(
                 "plugin '{}' config_schema property '{name}' {message}",
                 manifest.name
             ))
         })?;
+        if is_secret_property(property) && !matches!(kind, PropertyKind::String) {
+            return Err(invalid_manifest(format!(
+                "plugin '{}' config_schema property '{name}' marks x-secret but does not resolve to type string",
+                manifest.name
+            )));
+        }
+    }
+    let has_secret_consumer = manifest.capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            PluginCapability::Tool | PluginCapability::Channel
+        )
+    });
+    if properties.values().any(is_secret_property) && !has_secret_consumer {
+        return Err(invalid_manifest(format!(
+            "plugin '{}' config_schema uses x-secret without a tool or channel config consumer",
+            manifest.name
+        )));
     }
     Ok(Some(validator))
 }
@@ -324,7 +372,11 @@ pub fn resolve_plugin_config_from(
                 manifest.name
             )));
         }
-        return Ok(ResolvedPluginConfig::new(scope, Value::Object(Map::new())));
+        return Ok(ResolvedPluginConfig::new(
+            scope,
+            Value::Object(Map::new()),
+            HashMap::new(),
+        ));
     };
     let validator = validator.ok_or_else(|| {
         PluginError::InvalidConfig(format!(
@@ -335,7 +387,7 @@ pub fn resolve_plugin_config_from(
     if !scope.grants().allows(PluginPermission::ConfigRead) {
         let withheld = Value::Object(Map::new());
         validate_config_instance(manifest, &validator, &withheld)?;
-        return Ok(ResolvedPluginConfig::new(scope, withheld));
+        return Ok(ResolvedPluginConfig::new(scope, withheld, HashMap::new()));
     }
     let configured = configured()?.unwrap_or_default();
     let properties = schema
@@ -365,7 +417,39 @@ pub fn resolve_plugin_config_from(
     }
     let resolved = Value::Object(resolved);
     validate_config_instance(manifest, &validator, &resolved)?;
-    Ok(ResolvedPluginConfig::new(scope, resolved))
+
+    let Value::Object(resolved) = resolved else {
+        return Err(PluginError::InvalidConfig(format!(
+            "plugin '{}' resolved config is not an object",
+            manifest.name
+        )));
+    };
+    let mut public = Map::with_capacity(resolved.len());
+    let mut secrets = HashMap::new();
+    for (name, value) in resolved {
+        let property = properties.get(&name).ok_or_else(|| {
+            PluginError::InvalidConfig(format!(
+                "plugin '{}' resolved config contains a property absent from config_schema",
+                manifest.name
+            ))
+        })?;
+        if is_secret_property(property) {
+            let Value::String(secret) = value else {
+                return Err(PluginError::InvalidConfig(format!(
+                    "plugin '{}' resolved secret config is not a string",
+                    manifest.name
+                )));
+            };
+            secrets.insert(name, secret);
+        } else {
+            public.insert(name, value);
+        }
+    }
+    Ok(ResolvedPluginConfig::new(
+        scope,
+        Value::Object(public),
+        secrets,
+    ))
 }
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -423,6 +507,80 @@ fn validate_schema_node(node: &Value, depth: usize) -> Result<(), String> {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
     Ok(())
+}
+
+fn validate_secret_annotations(schema: &Value) -> Result<(), String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Location {
+        Root,
+        TopLevelProperty,
+        OtherSchema,
+    }
+
+    fn visit_schema(node: &Value, location: Location) -> Result<(), String> {
+        let Some(object) = node.as_object() else {
+            return Ok(());
+        };
+
+        if let Some(marker) = object.get("x-secret") {
+            if location != Location::TopLevelProperty {
+                return Err("declares x-secret outside a top-level property".to_string());
+            }
+            if marker != &Value::Bool(true) {
+                return Err("x-secret marker must be the boolean value true".to_string());
+            }
+        }
+
+        for keyword in [
+            "additionalProperties",
+            "contains",
+            "contentSchema",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        ] {
+            if let Some(child) = object.get(keyword) {
+                visit_schema(child, Location::OtherSchema)?;
+            }
+        }
+        for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+            if let Some(children) = object.get(keyword).and_then(Value::as_array) {
+                for child in children {
+                    visit_schema(child, Location::OtherSchema)?;
+                }
+            }
+        }
+        for keyword in [
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "patternProperties",
+            "properties",
+        ] {
+            if let Some(children) = object.get(keyword).and_then(Value::as_object) {
+                for child in children.values() {
+                    let child_location = if keyword == "properties" && location == Location::Root {
+                        Location::TopLevelProperty
+                    } else {
+                        Location::OtherSchema
+                    };
+                    visit_schema(child, child_location)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    visit_schema(schema, Location::Root)
+}
+
+fn is_secret_property(property: &Value) -> bool {
+    property.get("x-secret") == Some(&Value::Bool(true))
 }
 
 #[derive(Clone, Copy)]
@@ -558,6 +716,7 @@ mod tests {
             config_schema: schema,
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         }
     }
 
@@ -831,6 +990,10 @@ additionalProperties = false
 [config_schema.properties.retries]
 type = "integer"
 minimum = 1
+
+[config_schema.properties.api_key]
+type = "string"
+x-secret = true
 "#,
         )
         .expect("typed manifest schema must deserialize");
@@ -840,6 +1003,107 @@ minimum = 1
             manifest.config_schema.as_ref().unwrap()["properties"]["retries"]["minimum"],
             1
         );
+        assert_eq!(
+            manifest.config_schema.as_ref().unwrap()["properties"]["api_key"]["x-secret"],
+            true
+        );
+    }
+
+    #[test]
+    fn secret_annotations_are_allowed_only_on_top_level_string_properties() {
+        let valid = object_schema(json!({
+            "api_key": {"type": "string", "x-secret": true}
+        }));
+        validate_manifest_config(&manifest(Some(valid), true))
+            .expect("a top-level string property may be secret");
+
+        let property_named_like_annotation = object_schema(json!({
+            "x-secret": {"type": "string"}
+        }));
+        validate_manifest_config(&manifest(Some(property_named_like_annotation), true))
+            .expect("a property name is not itself an annotation");
+
+        let data_keys_named_like_annotation = object_schema(json!({
+            "metadata": {
+                "type": "object",
+                "properties": {"x-secret": {"type": "string"}},
+                "additionalProperties": false,
+                "default": {"x-secret": "ordinary data"}
+            }
+        }));
+        validate_manifest_config(&manifest(Some(data_keys_named_like_annotation), true))
+            .expect("property names and annotation payload data are not schema markers");
+
+        let invalid_schemas = [
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+                "x-secret": true
+            }),
+            object_schema(json!({
+                "api_key": {"type": "string", "x-secret": false}
+            })),
+            object_schema(json!({
+                "api_key": {"type": "string", "x-secret": "true"}
+            })),
+            object_schema(json!({
+                "retries": {"type": "integer", "x-secret": true}
+            })),
+            object_schema(json!({
+                "credentials": {
+                    "type": "object",
+                    "properties": {
+                        "api_key": {"type": "string", "x-secret": true}
+                    },
+                    "additionalProperties": false
+                }
+            })),
+            json!({
+                "type": "object",
+                "properties": {
+                    "api_key": {"$ref": "#/$defs/api_key", "x-secret": true}
+                },
+                "additionalProperties": false,
+                "$defs": {
+                    "api_key": {"type": "string", "x-secret": true}
+                }
+            }),
+        ];
+        for schema in invalid_schemas {
+            assert!(matches!(
+                validate_manifest_config(&manifest(Some(schema), true)),
+                Err(PluginError::InvalidManifest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn secret_annotations_require_a_tool_or_channel_consumer() {
+        let schema = object_schema(json!({
+            "api_key": {"type": "string", "x-secret": true}
+        }));
+
+        let mut channel = manifest(Some(schema.clone()), true);
+        channel.capabilities = vec![PluginCapability::Channel];
+        validate_manifest_config(&channel).expect("channel may consume scoped secrets");
+
+        let mut mixed = manifest(Some(schema.clone()), true);
+        mixed.capabilities = vec![PluginCapability::Tool, PluginCapability::Channel];
+        validate_manifest_config(&mixed).expect("mixed tool/channel manifest is supported");
+
+        for capability in [
+            PluginCapability::Memory,
+            PluginCapability::Observer,
+            PluginCapability::Skill,
+        ] {
+            let mut unsupported = manifest(Some(schema.clone()), true);
+            unsupported.capabilities = vec![capability];
+            assert!(matches!(
+                validate_manifest_config(&unsupported),
+                Err(PluginError::InvalidManifest(_))
+            ));
+        }
     }
 
     #[test]
@@ -871,7 +1135,7 @@ minimum = 1
         let resolved = resolve_plugin_config(&manifest, &scope, Some(&configured))
             .expect("well-typed config must resolve");
         assert_eq!(
-            resolved.as_json(),
+            resolved.public_json(),
             &json!({
                 "label": "007",
                 "enabled": true,
@@ -881,6 +1145,72 @@ minimum = 1
                 "options": {"nested": false}
             })
         );
+    }
+
+    #[test]
+    fn resolution_partitions_secret_properties_out_of_public_json() {
+        let mut schema = object_schema(json!({
+            "endpoint": {"type": "string"},
+            "api_key": {"type": "string", "x-secret": true, "minLength": 8}
+        }));
+        schema["required"] = json!(["endpoint", "api_key"]);
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+        let values = configured(&[
+            ("endpoint", "https://example.test"),
+            ("api_key", "secret-value"),
+        ]);
+
+        let resolved = resolve_plugin_config(&manifest, &scope, Some(&values))
+            .expect("the complete config must validate before partitioning");
+        assert_eq!(
+            resolved.public_json(),
+            &json!({"endpoint": "https://example.test"})
+        );
+        assert_eq!(resolved.secret("api_key"), Some("secret-value"));
+        assert_eq!(resolved.secret("endpoint"), None);
+        assert_eq!(resolved.secret("missing"), None);
+        assert!(!resolved.public_json().to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn required_secret_properties_are_validated_before_partitioning() {
+        let mut schema = object_schema(json!({
+            "api_key": {"type": "string", "x-secret": true}
+        }));
+        schema["required"] = json!(["api_key"]);
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+
+        assert!(resolve_plugin_config(&manifest, &scope, None).is_err());
+        let values = configured(&[("api_key", "present")]);
+        let resolved = resolve_plugin_config(&manifest, &scope, Some(&values))
+            .expect("a required secret must satisfy the complete schema");
+        assert_eq!(resolved.public_json(), &json!({}));
+        assert_eq!(resolved.secret("api_key"), Some("present"));
+    }
+
+    #[test]
+    fn secret_properties_may_resolve_string_types_through_local_refs() {
+        let schema = json!({
+            "$schema": DRAFT_2020_12,
+            "type": "object",
+            "properties": {
+                "api_key": {"$ref": "#/$defs/secret_value", "x-secret": true}
+            },
+            "additionalProperties": false,
+            "$defs": {
+                "secret_value": {"type": "string", "minLength": 4}
+            }
+        });
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+        let values = configured(&[("api_key", "secret")]);
+
+        let resolved = resolve_plugin_config(&manifest, &scope, Some(&values))
+            .expect("a secret string type may be supplied through a local ref");
+        assert_eq!(resolved.public_json(), &json!({}));
+        assert_eq!(resolved.secret("api_key"), Some("secret"));
     }
 
     #[test]
@@ -906,18 +1236,22 @@ minimum = 1
     #[test]
     fn withheld_grant_validates_and_returns_only_an_empty_object() {
         let optional_manifest = manifest(
-            Some(object_schema(json!({"enabled": {"type": "boolean"}}))),
+            Some(object_schema(json!({
+                "enabled": {"type": "boolean"},
+                "api_key": {"type": "string", "x-secret": true}
+            }))),
             true,
         );
         let optional_scope = scope(&optional_manifest, false);
         for inaccessible in [
             configured(&[("enabled", "not-a-boolean")]),
+            configured(&[("api_key", "host-only-secret")]),
             configured(&[("unknown-secret-key", "host-only-secret")]),
         ] {
             let resolved =
                 resolve_plugin_config(&optional_manifest, &optional_scope, Some(&inaccessible))
                     .expect("withheld values must not be parsed or validated");
-            assert_eq!(resolved.as_json(), &json!({}));
+            assert_eq!(resolved.public_json(), &json!({}));
         }
 
         let source_called = std::cell::Cell::new(false);
@@ -954,14 +1288,17 @@ minimum = 1
         });
 
         assert_eq!(
-            resolver.resolve(&scope).unwrap().as_json()["enabled"],
+            resolver.resolve(&scope).unwrap().public_json()["enabled"],
             false
         );
         values
             .write()
             .unwrap()
             .insert("enabled".to_string(), "true".to_string());
-        assert_eq!(resolver.resolve(&scope).unwrap().as_json()["enabled"], true);
+        assert_eq!(
+            resolver.resolve(&scope).unwrap().public_json()["enabled"],
+            true
+        );
     }
 
     #[test]
@@ -1043,11 +1380,42 @@ minimum = 1
     }
 
     #[test]
+    fn root_property_count_limit_is_enforced_at_admission() {
+        let at_limit = (0..MAX_SCHEMA_PROPERTIES)
+            .map(|index| (format!("key_{index}"), json!({"type": "string"})))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(
+            validate_manifest_config(&manifest(
+                Some(object_schema(Value::Object(at_limit))),
+                true
+            ))
+            .is_ok()
+        );
+
+        let over_limit = (0..=MAX_SCHEMA_PROPERTIES)
+            .map(|index| {
+                (
+                    format!("key_{index}"),
+                    json!({"type": "string", "pattern": "(?=x)"}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let error = validate_manifest_config(&manifest(
+            Some(object_schema(Value::Object(over_limit))),
+            true,
+        ))
+        .expect_err("schema over the root property cap must fail closed");
+        assert!(matches!(error, PluginError::InvalidManifest(_)));
+        assert!(error.to_string().contains("root properties"));
+        assert!(error.to_string().contains("maximum of 256"));
+    }
+
+    #[test]
     fn config_errors_do_not_expose_secret_values_or_nested_secret_keys() {
         let scalar_secret = "sk-live-value-must-not-leak";
         let scalar_manifest = manifest(
             Some(object_schema(json!({
-                "api_key": {"type": "string", "minLength": 100}
+                "api_key": {"type": "string", "x-secret": true, "minLength": 100}
             }))),
             true,
         );

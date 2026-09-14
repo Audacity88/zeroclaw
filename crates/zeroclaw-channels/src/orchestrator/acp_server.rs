@@ -52,8 +52,6 @@ impl Default for AcpServerConfig {
 
 struct Session {
     agent: Agent,
-    #[allow(dead_code)] // WIP: intended for session expiry logic
-    created_at: Instant,
     last_active: Instant,
     /// Agent alias (e.g. `"clamps"`) for attributable span logs.
     agent_alias: String,
@@ -229,6 +227,21 @@ impl AcpServer {
             ConfigSource::Standalone(config) => config.as_ref().clone(),
             ConfigSource::Live(config) => config.read().clone(),
         }
+    }
+
+    fn client_elicitation_capabilities(&self) -> ElicitationCapabilities {
+        match self.client_elicitation_caps.read() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn set_client_elicitation_capabilities(&self, capabilities: ElicitationCapabilities) {
+        let mut current = match self.client_elicitation_caps.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *current = capabilities;
     }
 
     async fn build_agent(
@@ -557,8 +570,7 @@ impl AcpServer {
         let elicitation = params
             .get("clientCapabilities")
             .and_then(|c| c.get("elicitation"));
-        *self.client_elicitation_caps.write().unwrap() =
-            ElicitationCapabilities::from_value(elicitation);
+        self.set_client_elicitation_capabilities(ElicitationCapabilities::from_value(elicitation));
 
         let config = self.config_snapshot();
         let default_model = config
@@ -856,7 +868,7 @@ impl AcpServer {
             session_id.clone(),
             Arc::clone(&self.rpc),
             Duration::from_secs(self.acp_config.session_timeout_secs),
-            *self.client_elicitation_caps.read().unwrap(),
+            self.client_elicitation_capabilities(),
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
@@ -897,7 +909,6 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
-                    created_at: now,
                     last_active: now,
                     agent_alias: agent_alias.clone(),
                     model_provider: config
@@ -1087,7 +1098,7 @@ impl AcpServer {
             session_id.clone(),
             Arc::clone(&self.rpc),
             Duration::from_secs(self.acp_config.session_timeout_secs),
-            *self.client_elicitation_caps.read().unwrap(),
+            self.client_elicitation_capabilities(),
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
@@ -1102,7 +1113,6 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
-                    created_at: now,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
                     model_provider: config
@@ -1287,7 +1297,7 @@ impl AcpServer {
             session_id.clone(),
             Arc::clone(&self.rpc),
             Duration::from_secs(self.acp_config.session_timeout_secs),
-            *self.client_elicitation_caps.read().unwrap(),
+            self.client_elicitation_capabilities(),
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
@@ -1302,7 +1312,6 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
-                    created_at: now,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
                     model_provider: config
@@ -2484,13 +2493,10 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
-        // Usage events are filtered out at every call site (ACP has no
-        // `session/update` shape for them; the cost tracker records them
-        // out-of-band). Reaching this arm means a caller forgot the filter.
-        TurnEvent::Usage { .. } => unreachable!(
-            "TurnEvent::Usage must be filtered before notification_for_turn_event; \
-             ACP has no session/update notification for token usage"
-        ),
+        // ACP has no `session/update` shape for usage; the cost tracker records
+        // it out-of-band. Keep this helper total even if a caller omits its
+        // fast-path filter.
+        TurnEvent::Usage { .. } => return None,
     })
 }
 
@@ -2640,6 +2646,18 @@ mod tests {
     use async_trait::async_trait;
     use zeroclaw_api::model_provider::ModelProvider;
 
+    #[test]
+    fn usage_event_has_no_acp_notification() {
+        let event = TurnEvent::Usage {
+            input_tokens: Some(10),
+            cached_input_tokens: Some(2),
+            output_tokens: Some(3),
+            cost_usd: Some(0.01),
+        };
+
+        assert!(notification_for_turn_event("session", &event).is_none());
+    }
+
     struct EmptyTerminalProvider;
 
     #[async_trait]
@@ -2672,7 +2690,9 @@ mod tests {
     fn acp_test_agent(workspace_dir: std::path::PathBuf) -> Agent {
         Agent::builder()
             .model_provider(Box::new(EmptyTerminalProvider))
-            .tools(Vec::new())
+            .tools(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new()),
+            )
             .observer(Arc::from(zeroclaw_runtime::observability::NoopObserver {}))
             .tool_dispatcher(Box::new(
                 zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
