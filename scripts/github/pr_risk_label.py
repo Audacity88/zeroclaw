@@ -7,15 +7,14 @@ import argparse
 import base64
 from functools import lru_cache
 from html import escape as html_escape
+import http.client
 import json
 import os
 from pathlib import Path
 import re
 import sys
 from typing import Any, Iterable
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 
 DEFAULT_REPOSITORY = "zeroclaw-labs/zeroclaw"
@@ -28,6 +27,7 @@ MAX_PAGES = 1000
 MAX_PR_FILES = 3000
 MAX_TEST_ONLY_SOURCE_FILES = 25
 RUST_SUFFIX = ".rs"
+USER_AGENT = "zeroclaw-pr-risk-labeler/1.0"
 LOW_PATH_GLOBS = (
     "docs/**",
     "**/*.md",
@@ -609,26 +609,63 @@ class GitHubAPI:
         require(repository and token, "GitHub API credentials are missing")
         self.repository = parse_repository(repository)
         self.base_url = (api_url or os.environ.get("GITHUB_API_URL", "https://api.github.com")).rstrip("/")
+        self.api_origin = urlparse(self.base_url)
+        require(
+            self.api_origin.scheme == "https"
+            and bool(self.api_origin.netloc)
+            and self.api_origin.username is None
+            and self.api_origin.password is None
+            and not self.api_origin.params
+            and not self.api_origin.query
+            and not self.api_origin.fragment,
+            "GitHub API URL must be an HTTPS origin",
+        )
+        self.base_path = self.api_origin.path.rstrip("/")
         self.token = token
+
+    def request_target(self, path: str) -> str:
+        require(isinstance(path, str) and path.startswith("/"), "GitHub API path is malformed")
+        parsed = urlparse(path)
+        require(
+            not parsed.scheme
+            and not parsed.netloc
+            and parsed.path.startswith("/")
+            and not parsed.params
+            and not parsed.fragment,
+            "GitHub API path must stay on the configured API origin",
+        )
+        require(
+            all(character >= " " and character != "\x7f" for character in path),
+            "GitHub API path is malformed",
+        )
+        target = f"{self.base_path}{parsed.path}" if self.base_path else parsed.path
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        return target
 
     def request(self, method: str, path: str) -> Any:
         require(method == "GET", "risk report API is read-only")
-        url = urljoin(self.base_url + "/", path.lstrip("/"))
-        request = Request(
-            url,
-            method="GET",
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self.token}",
-                "User-Agent": "zeroclaw-pr-risk-labeler/1.0",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
+        target = self.request_target(path)
+        connection = http.client.HTTPSConnection(self.api_origin.netloc, timeout=30)
         try:
-            with urlopen(request, timeout=30) as response:
-                raw = response.read()
-        except (HTTPError, URLError, TimeoutError) as exc:
+            connection.request(
+                "GET",
+                target,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {self.token}",
+                    "User-Agent": USER_AGENT,
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            response = connection.getresponse()
+            raw = response.read()
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
             raise RiskReportError("GitHub API request failed") from exc
+        finally:
+            connection.close()
+        if response.status >= 400:
+            raise RiskReportError(f"GitHub API request failed with HTTP {response.status}")
         try:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

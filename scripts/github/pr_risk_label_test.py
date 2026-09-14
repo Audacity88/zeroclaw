@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 try:
     from scripts.github import pr_risk_label as classifier
@@ -183,6 +184,74 @@ class RiskClassifierTest(unittest.TestCase):
         api = FakeAPI(pull(), [changed_file("docs/book/src/guide.md")])
         evaluate(api)
         self.assertEqual(api.paginated_paths, ["/repos/zeroclaw-labs/zeroclaw/pulls/1/files"])
+
+    def test_github_api_refuses_non_https_or_ambiguous_origins(self) -> None:
+        invalid_origins = (
+            "file:///tmp/github-api",
+            "http://api.github.com",
+            "https://api.github.com?debug=1",
+            "https://api.github.com#fragment",
+            "https://token@api.github.com",
+        )
+        for origin in invalid_origins:
+            with self.subTest(origin=origin), self.assertRaises(classifier.RiskReportError):
+                classifier.GitHubAPI("owner/repo", "token", origin)
+
+    def test_github_api_request_targets_stay_on_configured_origin(self) -> None:
+        api = classifier.GitHubAPI("owner/repo", "token", "https://github.example/api/v3")
+        self.assertEqual(
+            api.request_target("/repos/owner/repo/pulls/1/files?per_page=100&page=2"),
+            "/api/v3/repos/owner/repo/pulls/1/files?per_page=100&page=2",
+        )
+
+        invalid_paths = (
+            "repos/owner/repo",
+            "file:///etc/passwd",
+            "https://api.github.com/repos/owner/repo",
+            "//evil.example/repos/owner/repo",
+            "/repos/owner/repo#fragment",
+            "/repos/owner/repo;params",
+        )
+        for path in invalid_paths:
+            with self.subTest(path=path), self.assertRaises(classifier.RiskReportError):
+                api.request_target(path)
+
+    def test_github_api_request_uses_validated_https_target(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        class FakeResponse:
+            status = 200
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        class FakeConnection:
+            def __init__(self, netloc: str, timeout: int) -> None:
+                calls.append(("connect", (netloc, timeout)))
+
+            def request(self, method: str, target: str, headers: dict[str, str]) -> None:
+                calls.append(("request", (method, target, headers["User-Agent"])))
+
+            def getresponse(self) -> FakeResponse:
+                calls.append(("response", None))
+                return FakeResponse()
+
+            def close(self) -> None:
+                calls.append(("close", None))
+
+        with mock.patch.object(classifier.http.client, "HTTPSConnection", FakeConnection):
+            api = classifier.GitHubAPI("owner/repo", "token", "https://github.example/api/v3")
+            self.assertEqual(api.request("GET", "/repos/owner/repo"), {"ok": True})
+
+        self.assertEqual(
+            calls,
+            [
+                ("connect", ("github.example", 30)),
+                ("request", ("GET", "/api/v3/repos/owner/repo", classifier.USER_AGENT)),
+                ("response", None),
+                ("close", None),
+            ],
+        )
 
     def test_high_glob_proposes_high_with_matching_evidence(self) -> None:
         report = evaluate(FakeAPI(pull(), [changed_file("wit/plugin.wit")]))
