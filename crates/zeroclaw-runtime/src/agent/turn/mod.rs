@@ -247,6 +247,26 @@ fn suppress_quarantined_provider_images(
     filtered
 }
 
+fn prepare_provider_image_recovery_view(
+    messages: &[ChatMessage],
+    submitted: &[ProviderImageId],
+    accepted: &[ProviderImageId],
+) -> Option<(Vec<ChatMessage>, Vec<ProviderImageId>)> {
+    let replaced: Vec<_> = submitted
+        .iter()
+        .copied()
+        .filter(|image| !accepted.contains(image))
+        .collect();
+    if submitted.is_empty() || replaced.is_empty() {
+        return None;
+    }
+
+    Some((
+        zeroclaw_providers::multimodal::omit_provider_image_ids(messages, &replaced),
+        replaced,
+    ))
+}
+
 #[cfg(test)]
 mod provider_image_state_tests {
     use super::*;
@@ -334,7 +354,7 @@ mod provider_image_state_tests {
     }
 
     #[test]
-    fn quarantine_notice_pluralizes_replaced_history_images() {
+    fn quarantine_notice_describes_images_from_the_rejected_request() {
         let singular = crate::i18n::get_english_cli_string_with_args(
             "turn-provider-images-quarantined",
             &[("count", "1"), ("count_plural", "one")],
@@ -344,8 +364,23 @@ mod provider_image_state_tests {
             &[("count", "2"), ("count_plural", "other")],
         );
 
-        assert!(singular.contains("1 novel image from earlier conversation history was replaced"));
-        assert!(plural.contains("2 novel images from earlier conversation history were replaced"));
+        assert!(singular.contains("1 image that had not previously succeeded"));
+        assert!(plural.contains("2 images that had not previously succeeded"));
+        assert!(singular.contains("Send an omitted image again in a new message"));
+    }
+
+    #[test]
+    fn provider_image_recovery_view_includes_newest_unaccepted_image() {
+        let image = "data:image/png;base64,AAAA";
+        let messages = vec![ChatMessage::user(format!("new [IMAGE:{image}]"))];
+        let submitted = zeroclaw_providers::multimodal::provider_image_ids(&messages);
+
+        let (recovery_messages, replaced) =
+            prepare_provider_image_recovery_view(&messages, &submitted, &[])
+                .expect("newest unaccepted image is recoverable");
+
+        assert_eq!(replaced, submitted);
+        assert!(!recovery_messages[0].content.contains("[IMAGE:"));
     }
 
     #[test]
@@ -1107,19 +1142,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .as_mut()
             .map(|state| state.provider_state.accepted(&image_route))
             .unwrap_or_default();
-        let recovery_replaced_image_ids: Vec<_> = submitted_image_ids
-            .iter()
-            .copied()
-            .filter(|image| !accepted_image_ids.contains(image))
-            .collect();
-        let image_recovery_messages = (!submitted_image_ids.is_empty()
-            && !recovery_replaced_image_ids.is_empty())
-        .then(|| {
-            zeroclaw_providers::multimodal::omit_provider_image_ids(
+        let (image_recovery_messages, recovery_replaced_image_ids) =
+            match prepare_provider_image_recovery_view(
                 &provider_request_messages,
-                &recovery_replaced_image_ids,
-            )
-        });
+                &submitted_image_ids,
+                &accepted_image_ids,
+            ) {
+                Some((messages, replaced)) => (Some(messages), replaced),
+                None => (None, Vec::new()),
+            };
         let recovery_submitted_image_ids = image_recovery_messages
             .as_deref()
             .map(zeroclaw_providers::multimodal::provider_image_ids)

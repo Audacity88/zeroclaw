@@ -959,9 +959,9 @@ turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
 turn-provider-images-quarantined =
     { $count_plural ->
-        [one] 1 novel image from earlier conversation history was replaced after the provider rejected the request.
-       *[other] { $count } novel images from earlier conversation history were replaced after the provider rejected the request.
-    } Resubmit an image in your newest message to try it again.
+        [one] 1 image that had not previously succeeded with this provider was omitted after the provider rejected the request.
+       *[other] { $count } images that had not previously succeeded with this provider were omitted after the provider rejected the request.
+    } Send an omitted image again in a new message to try it again.
 turn-failed = [turn failed]
 turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
