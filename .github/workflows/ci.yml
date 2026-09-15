@@ -169,6 +169,8 @@ jobs:
 
       - name: Test CLI and hardware path-label ownership
         run: bash scripts/ci/path_labeler_matrix.test.sh
+      - name: Test hardware feature test-lane contract
+        run: bash scripts/ci/hardware_feature_test_lane.test.sh
 
       - name: Test release announcement composer
         run: bash scripts/ci/release_post_text.test.sh
@@ -729,6 +731,14 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # The crate's default feature set excludes the host-side hardware
+      # modules. Compile-only `ci-all` coverage cannot exercise their process,
+      # timeout, cleanup, and validation regressions.
+      - name: Run hardware feature lib unit tests
+        run: cargo nextest run --locked --no-fail-fast -p zeroclaw-hardware --features hardware --lib
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
