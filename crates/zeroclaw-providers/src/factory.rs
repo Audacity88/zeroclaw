@@ -250,6 +250,8 @@ pub fn apply_compat_options(
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
         b = b.tls_ca_cert_path(cert_path);
     }
+    b = b.tool_result_image_policy(opts.tool_result_image_policy);
+    b = b.multimodal(opts.multimodal.clone());
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
@@ -1090,6 +1092,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
             .credential(key)
+            .server_fallback_models(self.server_fallback_models.clone())
             .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
@@ -2065,7 +2068,10 @@ mod tests {
         );
         assert_eq!(
             ZerorouterEndpoint::default().uri(),
-            "http://localhost:8080/v1"
+            "https://zerorouter.ai/v1",
+            "the default must be the hosted deployment — a localhost default \
+             gives a zero-config user a connection refusal or a stray dev \
+             instance's partial catalog"
         );
         assert!(
             !ZerorouterModelProviderConfig::default()

@@ -2634,7 +2634,11 @@ mod tests {
                 ),
             ),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
@@ -4217,7 +4221,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = config_with_telegram_alias(&tmp, "alerts");
         let mut state = test_state(config);
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let (status, _json) = response_json(
             handle_api_channel_bind(
@@ -4279,7 +4287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_context_window_forwards_api_key() {
+    async fn refresh_context_window_allows_slow_response_and_forwards_api_key() {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
         use wiremock::matchers::{header, method, path};
@@ -4290,12 +4298,16 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/models"))
             .and(header("authorization", "Bearer test-api-key-123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{
-                    "id": "llama-3.1-70b",
-                    "context_length": 4096
-                }]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(3_100))
+                    .set_body_json(serde_json::json!({
+                        "data": [{
+                            "id": "llama-3.1-70b",
+                            "context_length": 4096
+                        }]
+                    })),
+            )
             .expect(1)
             .mount(&mock)
             .await;
