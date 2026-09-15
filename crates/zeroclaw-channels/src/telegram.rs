@@ -729,7 +729,6 @@ pub struct TelegramChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     persist: Option<Arc<RwLock<Config>>>,
     pairing: Option<PairingGuard>,
-    client: reqwest::Client,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
@@ -1046,7 +1045,15 @@ impl TelegramChannel {
         let pairing = if has_peers {
             None
         } else {
-            let guard = PairingGuard::new(true, &[]);
+            // Chat-channel bind codes are retyped by hand into a Telegram/
+            // LINE/WeChat message, so they deliberately keep the six-digit
+            // numeric shape. The shared-policy change re-scoped the *gateway* pairing code, not
+            // this one; changing it here would be an unreviewed UX change.
+            let guard = PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::numeric_compat(),
+            );
             if let Some(code) = guard.pairing_code() {
                 // Surface the one-time bind code through the structured log,
                 // not just stdout. A backgrounded daemon (launchd/systemd/
@@ -1078,7 +1085,6 @@ impl TelegramChannel {
             peer_resolver,
             persist: None,
             pairing,
-            client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
@@ -1182,86 +1188,30 @@ impl TelegramChannel {
         self
     }
 
-    /// Configure voice transcription.
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                let names = m.available_providers();
-                let m = if names.len() == 1 {
-                    let only = names[0].to_string();
-                    m.with_agent_transcription_provider(only)
-                } else {
-                    m
-                };
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
-        }
-        self
-    }
-
-    pub fn with_typed_transcription_providers(
-        mut self,
-        typed: &zeroclaw_config::providers::TranscriptionProviders,
-        agent_alias: &str,
-    ) -> Self {
-        if agent_alias.is_empty() || typed.is_empty() {
-            return self;
-        }
-        let base = match self.transcription_manager.take() {
-            Some(arc) => match std::sync::Arc::try_unwrap(arc) {
-                Ok(m) => m,
-                Err(arc) => {
-                    self.transcription_manager = Some(arc);
-                    return self;
-                }
-            },
-            None => super::transcription::TranscriptionManager::empty(),
-        };
-        let updated = base
-            .with_typed_providers(typed)
-            .with_agent_transcription_provider(agent_alias.to_string());
-        self.transcription_manager = Some(std::sync::Arc::new(updated));
-        self
-    }
-
-    /// Set the agent transcription provider alias on the internal TranscriptionManager.
-    /// Must be called after `with_transcription`. No-op if transcription was not configured.
-    /// The alias should be the provider type key ("groq", "openai", etc.) registered in
-    /// the TranscriptionManager, or the full "type.alias" form (the type prefix is extracted).
-    pub fn with_agent_transcription_provider(mut self, alias: impl Into<String>) -> Self {
-        let alias = alias.into();
-        if alias.is_empty() {
-            return self;
-        }
-        // Resolve "groq.default" → "groq" (TranscriptionManager keys by type, not full alias)
-        let key = alias.split('.').next().unwrap_or(&alias).to_string();
-        if let Some(manager) = self.transcription_manager.take() {
-            match std::sync::Arc::try_unwrap(manager) {
-                Ok(m) => {
-                    self.transcription_manager = Some(std::sync::Arc::new(
-                        m.with_agent_transcription_provider(key),
-                    ));
-                }
-                Err(arc) => {
-                    self.transcription_manager = Some(arc);
-                }
-            }
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
         self
     }
@@ -1935,16 +1885,20 @@ impl TelegramChannel {
 
         // Only queue substantive natural-language replies for voice.
         // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-        let is_substantive = content.len() > 40
-            && !content.starts_with("http")
-            && !content.starts_with('{')
-            && !content.starts_with('[')
-            && !content.starts_with("Error")
-            && !content.contains("```")
-            && !content.contains("tool_call")
-            && !content.contains("wttr.in");
-
-        if !is_substantive {
+        if let Some(reason) = crate::util::voice_reply_skip_reason(content) {
+            // Stable literal per the logging contract: the classification and
+            // per-event measurements ride solely in `attributes` above.
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_attrs(::serde_json::json!({
+                        "recipient": recipient,
+                        "reason": reason,
+                        "content_len": content.len(),
+                        "immediate": immediate,
+                    })),
+                "voice reply skipped"
+            );
             return;
         }
 
@@ -1961,6 +1915,7 @@ impl TelegramChannel {
             // Finalize path: text is already the final answer — no debounce.
             let text = content.to_string();
             let recipient = recipient.to_string();
+            let proxy_url = self.proxy_url.clone();
             zeroclaw_spawn::spawn!(async move {
                 let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
                 if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
@@ -1969,6 +1924,7 @@ impl TelegramChannel {
                 match Self::synthesize_and_send_voice(
                     &api_base,
                     &bot_token,
+                    proxy_url.as_deref(),
                     &chat_id,
                     thread_id.as_deref(),
                     &text,
@@ -2013,6 +1969,7 @@ impl TelegramChannel {
 
         let pending = self.pending_voice.clone();
         let recipient = recipient.to_string();
+        let proxy_url = self.proxy_url.clone();
         zeroclaw_spawn::spawn!(async move {
             // Wait 10 seconds — long enough for the agent to finish its
             // full tool chain and send the final answer.
@@ -2036,6 +1993,7 @@ impl TelegramChannel {
                 match Self::synthesize_and_send_voice(
                     &api_base,
                     &bot_token,
+                    proxy_url.as_deref(),
                     &chat_id,
                     thread_id.as_deref(),
                     &text,
@@ -2074,6 +2032,7 @@ impl TelegramChannel {
     async fn synthesize_and_send_voice(
         api_base: &str,
         bot_token: &str,
+        proxy_url: Option<&str>,
         chat_id: &str,
         thread_id: Option<&str>,
         text: &str,
@@ -2096,7 +2055,10 @@ impl TelegramChannel {
         let (method, field, filename, mime) = telegram_audio_send_spec("opus")?;
 
         let url = format!("{api_base}/bot{bot_token}/{method}");
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("channel.telegram");
+        // The same per-channel proxy every other Telegram request uses; the
+        // global proxy alone dropped a configured `proxy_url` for voice uploads.
+        let client =
+            zeroclaw_config::schema::build_channel_proxy_client("channel.telegram", proxy_url);
 
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
@@ -5290,7 +5252,7 @@ impl Channel for TelegramChannel {
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendMessage"))
             .json(&body)
             .send()
@@ -5372,7 +5334,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
@@ -5428,7 +5390,7 @@ impl Channel for TelegramChannel {
         if !suppress_voice && self.is_voice_peer(recipient) {
             if let Ok(id) = message_id.parse::<i64>() {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5466,7 +5428,7 @@ impl Channel for TelegramChannel {
             // Delete the draft message
             if let Some(id) = msg_id {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5495,7 +5457,7 @@ impl Channel for TelegramChannel {
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
             if let Some(id) = msg_id {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5526,7 +5488,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
@@ -5552,7 +5514,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&plain_body)
             .send()
@@ -5572,7 +5534,7 @@ impl Channel for TelegramChannel {
         }
 
         let delete_resp = self
-            .client
+            .http_client()
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,
@@ -5629,7 +5591,7 @@ impl Channel for TelegramChannel {
         };
 
         let response = self
-            .client
+            .http_client()
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,
@@ -6090,8 +6052,14 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
+        // Back-to-back cards from one message are otherwise indistinguishable
+        // before the operator taps, so say which call this is.
+        let position = Self::escape_html(&crate::util::approval_position_line(
+            request.position_counter(),
+        ));
         let text = format!(
             "\u{1f527} <b>{heading}</b>\n\n\
+             {position}\
              {tool_label}: <code>{tool}</code>\n\
              {args}\n\n\
              {tap_instruction}",
@@ -6149,9 +6117,13 @@ Ensure only one `zeroclaw` process is using this bot token."
                     "Telegram sendMessage (approval) with HTML failed; retrying without parse_mode"
                 );
 
-                // Fallback: plain text, no parse_mode, keep the buttons
+                // Fallback: plain text, no parse_mode, keep the buttons.
+                // Unescaped position line: this send has no parse_mode, so the
+                // HTML-escaped one above would show its entities literally.
+                let plain_position =
+                    crate::util::approval_position_line(request.position_counter());
                 let plain_text = format!(
-                    "🔧 {heading}\n\n{tool_label}: {}\n{}\n\n{tap_instruction}",
+                    "🔧 {heading}\n\n{plain_position}{tool_label}: {}\n{}\n\n{tap_instruction}",
                     request.tool_name, request.arguments_summary
                 );
                 let mut plain_body = serde_json::json!({
@@ -15718,6 +15690,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let attributed = ch
             .request_approval_attributed("12345", &request)
@@ -15810,6 +15783,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let waiter = {
             let ch = Arc::clone(&ch);
@@ -15950,6 +15924,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
@@ -15991,6 +15966,153 @@ mod tests {
         }
         assert_eq!(ids.len(), 1, "all three buttons share one approval id");
         assert_eq!(actions, vec!["approve", "deny", "always"]);
+    }
+
+    #[tokio::test]
+    async fn approval_card_shows_the_batch_position_in_html_and_in_the_plain_fallback() {
+        use wiremock::matchers::{body_string_contains, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // When the HTML send is rejected, the card is rebuilt from scratch
+        // without `parse_mode` and resent with the same buttons. That rebuild
+        // is a second renderer, and it has to carry the position too — the
+        // operator sees the fallback card, not the one that failed.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_string_contains("parse_mode"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
+        };
+
+        // Nothing resolves the pending oneshot; the short timeout returns a
+        // Deny instead of hanging the test.
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "HTML send then plain-text retry");
+
+        let raw = crate::util::approval_position_line(Some((2, 3)));
+        let raw = raw.trim_end();
+        assert!(!raw.is_empty(), "helper should render a 2-of-3 line");
+        // The two sends escape differently, so the expectations differ. Several
+        // locales put an apostrophe in this line (fr: `Appel d'outil 2 sur 3`),
+        // which the HTML send escapes and the fallback must not; comparing both
+        // against the raw string passes only in locales with nothing to escape.
+        let escaped = TelegramChannel::escape_html(raw);
+
+        let html: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            html["parse_mode"], "HTML",
+            "the first send is the HTML card"
+        );
+        let html_text = html["text"].as_str().unwrap();
+        assert!(
+            html_text.contains(escaped.as_str()),
+            "HTML card should carry the escaped position; want {escaped:?}, got {html_text}"
+        );
+        if escaped != raw {
+            assert!(
+                !html_text.contains(raw),
+                "the HTML position line must be escaped, not raw; got {html_text}"
+            );
+        }
+
+        let plain: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            plain.get("parse_mode").is_none(),
+            "the retry is the plain-text fallback"
+        );
+        let plain_text = plain["text"].as_str().unwrap();
+        assert!(
+            plain_text.contains(raw),
+            "plain fallback should carry the raw position; want {raw:?}, got {plain_text}"
+        );
+        // With no parse_mode, an escaped line would show its entities literally.
+        // Only meaningful in a locale where the two forms actually differ.
+        if escaped != raw {
+            assert!(
+                !plain_text.contains(escaped.as_str()),
+                "the fallback position line must not be HTML-escaped; got {plain_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_card_omits_the_position_for_a_single_call() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: Some(zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 }),
+        };
+
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let heading = i18n::get_required_cli_string("channel-approval-heading");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
+        assert_eq!(
+            body["text"],
+            format!(
+                "\u{1f527} <b>{heading}</b>\n\n{tool_label}: <code>shell</code>\nls -la\n\n{tap_instruction}",
+            ),
+            "a one-call batch renders exactly as an unpositioned card"
+        );
     }
 
     #[test]

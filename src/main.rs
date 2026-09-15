@@ -915,6 +915,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
+#[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
@@ -3312,7 +3314,7 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
+    /// List installed and cached-registry plugins
     List,
     /// Search an installable plugin registry
     Search {
@@ -4588,6 +4590,20 @@ fn main() -> Result<()> {
     async_main(command)
 }
 
+/// Explicit runtime construction instead of `#[tokio::main]` so worker
+/// threads get an 8 MiB stack. Debug builds of the deepest inline RPC
+/// handlers (quickstart apply walks the whole config tree with several
+/// `Config`-sized temporaries) overflow tokio's 2 MiB worker default and
+/// abort the daemon. The size matches the 8 MiB main-thread stacks the
+/// workspace already requests via linker args on other targets.
+fn async_main(command: clap::Command) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main_inner(command))
+}
+
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
 /// exactly "ZeroClaw" or "ZeroClaw" followed by a separator (e.g. "ZeroClaw
 /// Companion"), case-insensitively. Matching the visible application name — not
@@ -5082,9 +5098,8 @@ fn find_linux_desktop_app() -> Option<PathBuf> {
     None
 }
 
-#[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn async_main(command: clap::Command) -> Result<()> {
+async fn async_main_inner(command: clap::Command) -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -5940,6 +5955,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "gateway")]
+                let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
+                #[cfg(feature = "gateway")]
+                let channel_plugin_webhooks = Some(Arc::clone(&plugin_webhooks));
+                #[cfg(not(feature = "gateway"))]
+                let channel_plugin_webhooks: Option<
+                    Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+                > = None;
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
@@ -5973,12 +5996,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let plugin_webhooks = Arc::clone(&plugin_webhooks);
                     move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = Arc::clone(&plugin_webhooks);
                         Box::pin(async move {
-                            Box::pin(zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
                                 config,
@@ -5988,7 +6013,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
-                                ready_tx,
+                                zeroclaw_gateway::GatewaySupervision::new(
+                                    ready_tx,
+                                    plugin_webhooks,
+                                ),
                             ))
                             .await
                         })
@@ -5998,19 +6026,22 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let plugin_webhooks = channel_plugin_webhooks.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            let channels = zeroclaw_channels::orchestrator::start_channels_with_plugin_webhooks(
                                 config,
                                 Some(canvas_store),
                                 cancel,
                                 sop_engine,
                                 sop_audit,
-                            ))
-                            .await
+                                plugin_webhooks,
+                            );
+                            Box::pin(channels).await
                         })
                     }
                 }));
@@ -6301,13 +6332,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
                     Box::pin(async move {
-                        let (enroll_cfg, wss_cfg, relay_cfg, data_dir) = {
+                        let (
+                            enroll_cfg,
+                            wss_cfg,
+                            relay_cfg,
+                            data_dir,
+                            startup_pairing_code_policy,
+                        ) = {
                             let cfg = ctx.config.read();
                             (
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
                                 cfg.data_dir.clone(),
+                                cfg.gateway.pairing_code,
                             )
                         };
                         if !enroll_cfg.enabled {
@@ -6407,6 +6445,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
                             true,
                             &[],
+                            startup_pairing_code_policy,
                         ));
                         if let Some(code) = pairing.pairing_code() {
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
@@ -6493,6 +6532,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ca_key_pem,
                             ledger,
                             pairing,
+                            pairing_code_policy: {
+                                let config = ctx.config.clone();
+                                std::sync::Arc::new(move || config.read().gateway.pairing_code)
+                            },
                             static_client_pins_configured: wss_cfg
                                 .client_auth
                                 .as_ref()
@@ -8532,20 +8575,7 @@ Add pricing to the active provider profile or supply a catalog entry."
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
-                }
+                plugin_catalog::print(&config, &host);
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
