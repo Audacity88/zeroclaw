@@ -4237,12 +4237,15 @@ mod tests {
     fn streaming_api_error_sanitizes_and_bounds_upstream_body() {
         let secret = "sk-test-streaming-secret";
         let body = format!(r#"{{"error":"{secret} {}"}}"#, "x".repeat(4_000));
-        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body).to_string();
+        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body);
 
-        assert!(error.starts_with("ModelProvider error: 401 Unauthorized:"));
-        assert!(error.contains("[REDACTED]"));
-        assert!(!error.contains(secret));
-        assert!(error.chars().count() <= 550);
+        let StreamError::HttpStatus { status, message } = error else {
+            panic!("expected HTTP status error, got {error}");
+        };
+        assert_eq!(status, 401);
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains(secret));
+        assert!(message.chars().count() <= 512);
     }
 
     #[test]
@@ -4263,13 +4266,17 @@ mod tests {
         })
         .to_string();
 
-        let error =
-            streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body).to_string();
+        let error = streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body);
 
-        assert_eq!(
-            error,
-            format!("ModelProvider error: 500 Internal Server Error: {message}")
-        );
+        let StreamError::HttpStatus {
+            status,
+            message: actual_message,
+        } = error
+        else {
+            panic!("expected HTTP status error, got {error}");
+        };
+        assert_eq!(status, 500);
+        assert_eq!(actual_message, message);
     }
 
     fn make_model_provider(
@@ -6440,13 +6447,13 @@ mod tests {
     }
 
     fn assert_sanitized_streaming_error(error: StreamError, secret: &str) {
-        let StreamError::ModelProvider(message) = error else {
-            panic!("expected model-provider error, got {error}");
+        let StreamError::HttpStatus { status, message } = error else {
+            panic!("expected HTTP status error, got {error}");
         };
-        assert!(message.contains("401 Unauthorized"));
+        assert_eq!(status, 401);
         assert!(message.contains("[REDACTED]"));
         assert!(!message.contains(secret));
-        assert!(message.chars().count() <= 525);
+        assert!(message.chars().count() <= 512);
     }
 
     #[test]
