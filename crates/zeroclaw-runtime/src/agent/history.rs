@@ -8,6 +8,7 @@ use zeroclaw_providers::ChatMessage;
 use zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX;
 use zeroclaw_providers::multimodal::ImageMarkerDisposition;
 use zeroclaw_providers::multimodal::image_marker_dispositions;
+use zeroclaw_providers::multimodal::image_marker_summary;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
@@ -337,15 +338,15 @@ fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDispos
     {
         return text_estimate;
     }
-    let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
-    if refs.is_empty() {
+    let summary = image_marker_summary(&message.content);
+    if summary.image_refs == 0 {
         return text_estimate; // placeholders stay text, byte-identical to the plain formula
     }
     match disposition {
         ImageMarkerDisposition::Normalized => {
-            text.len().div_ceil(4) + refs.len() * IMAGE_TOKEN_ESTIMATE + 4
+            summary.text_bytes.div_ceil(4) + summary.image_refs * IMAGE_TOKEN_ESTIMATE + 4
         }
-        ImageMarkerDisposition::Stripped => text.len().div_ceil(4) + 4,
+        ImageMarkerDisposition::Stripped => summary.text_bytes.div_ceil(4) + 4,
         // Unreachable after the guard; keeps the arm total.
         ImageMarkerDisposition::Literal => text_estimate,
     }
