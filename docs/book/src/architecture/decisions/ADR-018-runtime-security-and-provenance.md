@@ -1,5 +1,5 @@
 ---
-id: ADR-017
+id: ADR-018
 title: Runtime security and provenance use runtime-owned decision boundaries
 date: 2026-08-17
 status: proposed
@@ -32,7 +32,7 @@ relates-to:
   - crates/zeroclaw-runtime/src/tools/spawn_subagent.rs
 ---
 
-# ADR-017: Runtime Security and Provenance Use Runtime-Owned Decision Boundaries
+# ADR-018: Runtime Security and Provenance Use Runtime-Owned Decision Boundaries
 
 ## Context
 
