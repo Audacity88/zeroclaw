@@ -30367,12 +30367,12 @@ This is an example JSON object for profile settings."#;
                     })
                         && source_segment_between(
                             cli_owner,
-                            "Commands::Acp {\n            max_sessions,\n            session_timeout,\n        } => {",
+                            "Commands::Acp {\n",
                             "Commands::Gateway {",
                         )
                         .is_some_and(|block| {
                             block.contains("channels::acp_server::AcpServer::new")
-                                && block.contains("server.run().await")
+                                && block.contains(".run().await")
                         })
                 }
                 _ => false,
