@@ -3109,21 +3109,19 @@ mod tests {
 
         // The reachable Enabled toggle saves false on disk...
         pane.activate_tracker();
-        assert_eq!(
-            config::load_persisted(dir.path())
+        assert!(
+            !config::load_persisted(dir.path())
                 .unwrap()
                 .todotracker
-                .enabled,
-            false
+                .enabled
         );
         // ...but the next session still resolves true via the override, so the
         // feedback must report the override instead of plain success.
-        assert_eq!(
+        assert!(
             config::ensure_and_load(dir.path())
                 .unwrap()
                 .resolve_todo_tracker()
-                .enabled,
-            true
+                .enabled
         );
         assert_eq!(
             pane.status.as_deref(),
@@ -3146,12 +3144,11 @@ mod tests {
 
         pane.activate_tracker();
 
-        assert_eq!(
-            config::ensure_and_load(dir.path())
+        assert!(
+            !config::ensure_and_load(dir.path())
                 .unwrap()
                 .resolve_todo_tracker()
-                .enabled,
-            false
+                .enabled
         );
         assert_eq!(
             pane.status.as_deref(),
@@ -3180,12 +3177,11 @@ mod tests {
         pane.activate_tracker();
 
         // The edit still lands on disk...
-        assert_eq!(
-            config::load_persisted(dir.path())
+        assert!(
+            !config::load_persisted(dir.path())
                 .unwrap()
                 .todotracker
-                .enabled,
-            false
+                .enabled
         );
         // ...but the status reflects the resolution failure, not plain success.
         assert_eq!(

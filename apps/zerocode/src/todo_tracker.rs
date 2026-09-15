@@ -15,7 +15,9 @@ use crate::wire::{PlanEntry, PlanStatus};
 // Re-export the config-owned runtime types so existing `crate::todo_tracker::*`
 // call sites keep resolving after these moved to `crate::config` (their single
 // owner). The widget below is built from them.
-pub(crate) use crate::config::{TodoLocation, TodoTrackerSettings};
+#[cfg(test)]
+pub(crate) use crate::config::TodoLocation;
+pub(crate) use crate::config::TodoTrackerSettings;
 
 #[derive(Debug)]
 pub(crate) struct TodoTracker {
@@ -99,6 +101,7 @@ impl TodoTracker {
     }
 
     /// Explicitly hide the tracker while retaining the current plan.
+    #[cfg(test)]
     pub(crate) fn hide(&mut self) {
         if self.settings.enabled {
             self.visible = false;
