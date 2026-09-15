@@ -216,42 +216,55 @@ class RiskClassifierTest(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(classifier.RiskReportError):
                 api.request_target(path)
 
-    def test_github_api_request_uses_validated_https_target(self) -> None:
-        calls: list[tuple[str, object]] = []
+    def test_github_api_request_uses_validated_gh_api_target(self) -> None:
+        calls: list[dict[str, object]] = []
 
-        class FakeResponse:
-            status = 200
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            calls.append({"args": args, "kwargs": kwargs})
+            return subprocess.CompletedProcess(args=args[0], returncode=0, stdout=b'{"ok": true}', stderr=b"")
 
-            def read(self) -> bytes:
-                return b'{"ok": true}'
-
-        class FakeConnection:
-            def __init__(self, netloc: str, timeout: int) -> None:
-                calls.append(("connect", (netloc, timeout)))
-
-            def request(self, method: str, target: str, headers: dict[str, str]) -> None:
-                calls.append(("request", (method, target, headers["User-Agent"])))
-
-            def getresponse(self) -> FakeResponse:
-                calls.append(("response", None))
-                return FakeResponse()
-
-            def close(self) -> None:
-                calls.append(("close", None))
-
-        with mock.patch.object(classifier.http.client, "HTTPSConnection", FakeConnection):
+        with mock.patch.object(classifier.subprocess, "run", fake_run):
             api = classifier.GitHubAPI("owner/repo", "token", "https://github.example/api/v3")
             self.assertEqual(api.request("GET", "/repos/owner/repo"), {"ok": True})
 
+        self.assertEqual(len(calls), 1)
+        kwargs = calls[0]["kwargs"]
         self.assertEqual(
-            calls,
-            [
-                ("connect", ("github.example", 30)),
-                ("request", ("GET", "/api/v3/repos/owner/repo", classifier.USER_AGENT)),
-                ("response", None),
-                ("close", None),
-            ],
+            calls[0]["args"],
+            (
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "GET",
+                    "--hostname",
+                    "github.example",
+                    "--header",
+                    "Accept: application/vnd.github+json",
+                    "--header",
+                    "X-GitHub-Api-Version: 2022-11-28",
+                    "/api/v3/repos/owner/repo",
+                ],
+            ),
         )
+        self.assertEqual(kwargs["check"], False)
+        self.assertEqual(kwargs["capture_output"], True)
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertEqual(kwargs["env"]["GH_TOKEN"], "token")
+        self.assertEqual(kwargs["env"]["GH_ENTERPRISE_TOKEN"], "token")
+
+    def test_github_api_request_fails_closed_on_gh_api_errors(self) -> None:
+        failures = (
+            subprocess.CompletedProcess(args=["gh"], returncode=1, stdout=b"", stderr=b"error"),
+            subprocess.CompletedProcess(args=["gh"], returncode=0, stdout=b"not json", stderr=b""),
+        )
+        for result in failures:
+            with (
+                self.subTest(returncode=result.returncode, stdout=result.stdout),
+                mock.patch.object(classifier.subprocess, "run", return_value=result),
+                self.assertRaises(classifier.RiskReportError),
+            ):
+                classifier.GitHubAPI("owner/repo", "token").request("GET", "/repos/owner/repo")
 
     def test_high_glob_proposes_high_with_matching_evidence(self) -> None:
         report = evaluate(FakeAPI(pull(), [changed_file("wit/plugin.wit")]))

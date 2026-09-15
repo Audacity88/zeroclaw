@@ -7,11 +7,11 @@ import argparse
 import base64
 from functools import lru_cache
 from html import escape as html_escape
-import http.client
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 from typing import Any, Iterable
 from urllib.parse import parse_qs, quote, urlencode, urlparse
@@ -27,7 +27,6 @@ MAX_PAGES = 1000
 MAX_PR_FILES = 3000
 MAX_TEST_ONLY_SOURCE_FILES = 25
 RUST_SUFFIX = ".rs"
-USER_AGENT = "zeroclaw-pr-risk-labeler/1.0"
 LOW_PATH_GLOBS = (
     "docs/**",
     "**/*.md",
@@ -646,28 +645,39 @@ class GitHubAPI:
     def request(self, method: str, path: str) -> Any:
         require(method == "GET", "risk report API is read-only")
         target = self.request_target(path)
-        connection = http.client.HTTPSConnection(self.api_origin.netloc, timeout=30)
+        hostname = "github.com" if self.api_origin.netloc == "api.github.com" else self.api_origin.netloc
+        environment = {
+            **os.environ,
+            "GH_TOKEN": self.token,
+        }
+        if self.api_origin.netloc != "api.github.com":
+            environment["GH_ENTERPRISE_TOKEN"] = self.token
         try:
-            connection.request(
-                "GET",
-                target,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "Authorization": f"Bearer {self.token}",
-                    "User-Agent": USER_AGENT,
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "GET",
+                    "--hostname",
+                    hostname,
+                    "--header",
+                    "Accept: application/vnd.github+json",
+                    "--header",
+                    "X-GitHub-Api-Version: 2022-11-28",
+                    target,
+                ],
+                check=False,
+                capture_output=True,
+                env=environment,
+                timeout=30,
             )
-            response = connection.getresponse()
-            raw = response.read()
-        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        except (OSError, TimeoutError, subprocess.SubprocessError) as exc:
             raise RiskReportError("GitHub API request failed") from exc
-        finally:
-            connection.close()
-        if response.status >= 400:
-            raise RiskReportError(f"GitHub API request failed with HTTP {response.status}")
+        if result.returncode != 0:
+            raise RiskReportError("GitHub API request failed")
         try:
-            return json.loads(raw.decode("utf-8"))
+            return json.loads(result.stdout.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RiskReportError("GitHub API returned invalid JSON") from exc
 
