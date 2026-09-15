@@ -2683,10 +2683,10 @@ impl AnthropicModelProvider {
 impl ModelProvider for AnthropicModelProvider {
     fn supports_exact_request_replay(
         &self,
-        _request: crate::traits::ChatRequest<'_>,
-        _model: &str,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
     ) -> bool {
-        true
+        request.thinking.is_some() || self.server_fallbacks_for(model, None).is_none()
     }
 
     fn default_temperature(&self) -> f64 {
@@ -8105,6 +8105,31 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .map(|s| s.contains("server-side-fallback"))
                 .unwrap_or(false)
         })
+    }
+
+    #[test]
+    fn exact_request_replay_rejects_effective_server_fallback() {
+        let messages = [crate::traits::ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        assert!(!provider.supports_exact_request_replay(request, "claude-fable-5"));
+
+        let thinking_request = ProviderChatRequest {
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 1_024,
+                display: None,
+            }),
+            ..request
+        };
+        assert!(provider.supports_exact_request_replay(thinking_request, "claude-fable-5"));
     }
 
     #[tokio::test]
