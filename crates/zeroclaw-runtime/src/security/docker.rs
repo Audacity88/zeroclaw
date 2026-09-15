@@ -109,12 +109,15 @@ impl DockerSandbox {
             workspace_dir: None,
         }
     }
-}
-
-impl Sandbox for DockerSandbox {
-    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+    fn wrap_command_with_program(
+        &self,
+        cmd: &mut Command,
+        shell_program: Option<&OsStr>,
+    ) -> std::io::Result<()> {
         let launcher = self.resolve_launcher()?;
-        let program = cmd.get_program().to_string_lossy().to_string();
+        let program = shell_program
+            .unwrap_or_else(|| cmd.get_program())
+            .to_os_string();
         let args: Vec<String> = cmd
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
@@ -147,6 +150,20 @@ impl Sandbox for DockerSandbox {
         *cmd = docker_cmd;
         Ok(())
     }
+}
+
+impl Sandbox for DockerSandbox {
+    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+        self.wrap_command_with_program(cmd, None)
+    }
+
+    fn wrap_shell_command(
+        &self,
+        cmd: &mut Command,
+        shell_program: Option<&OsStr>,
+    ) -> std::io::Result<()> {
+        self.wrap_command_with_program(cmd, shell_program)
+    }
 
     fn is_available(&self) -> bool {
         let launcher = match self.resolve_launcher() {
@@ -178,6 +195,88 @@ impl Sandbox for DockerSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn docker_shell_tool_preserves_container_shell_identity() {
+        use crate::platform::{NativeRuntime, RuntimeAdapter};
+        use crate::security::{AutonomyLevel, NoopSandbox, SecurityPolicy};
+        use crate::tools::shell::ShellTool;
+        use std::collections::HashMap;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::sync::Arc;
+        use zeroclaw_api::tool::Tool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let host_shell = root.join("host-only-shell");
+        let docker = root.join("docker-recorder");
+        for (path, script) in [
+            (&host_shell, "#!/bin/sh\nexit 99\n"),
+            (
+                &docker,
+                "#!/bin/sh\nprintf '%s\\n' DOCKER_RECORDER \"$@\"\n",
+            ),
+        ] {
+            std::fs::write(path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        symlink(&host_shell, root.join("sh")).unwrap();
+        symlink(&host_shell, root.join("MixedCaseShell")).unwrap();
+        let path = std::env::join_paths([root.clone()]).unwrap();
+
+        for program in [
+            "sh".to_string(),
+            "MixedCaseShell".to_string(),
+            root.join("MixedCaseShell").to_str().unwrap().to_string(),
+        ] {
+            let runtime = Arc::new(NativeRuntime::with_shell(program.clone()));
+            let mut host_command = runtime
+                .build_shell_command_with_effective_path(
+                    "echo sandbox_identity",
+                    &root,
+                    Some(&path),
+                )
+                .unwrap();
+            NoopSandbox
+                .wrap_shell_command(host_command.as_std_mut(), runtime.shell_program())
+                .unwrap();
+            assert_eq!(host_command.as_std().get_program(), host_shell.as_os_str());
+
+            let sandbox = DockerSandbox {
+                launcher: Some(docker.clone()),
+                image: "alpine:latest".into(),
+                workspace_dir: None,
+            };
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: root.clone(),
+                allowed_commands: vec!["echo".into()],
+                ..SecurityPolicy::default()
+            });
+            let tool = ShellTool::new_with_sandbox(security, runtime, Arc::new(sandbox))
+                .with_tui_env(Some(HashMap::from([(
+                    "PATH".into(),
+                    path.to_str().unwrap().to_string(),
+                )])));
+            let result = tool
+                .execute(serde_json::json!({"command": "echo sandbox_identity"}))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+            let lines: Vec<_> = result.output.lines().collect();
+            assert_eq!(lines.first(), Some(&"DOCKER_RECORDER"));
+            let image_index = lines
+                .iter()
+                .position(|line| *line == "alpine:latest")
+                .unwrap();
+            assert_eq!(
+                &lines[image_index + 1..],
+                &[program.as_str(), "-c", "echo sandbox_identity"],
+                "container argv must retain the configured shell, not its host symlink target"
+            );
+        }
+    }
 
     #[test]
     fn docker_sandbox_name() {

@@ -234,6 +234,20 @@ impl RuntimeAdapter for NativeRuntime {
         }
     }
 
+    fn shell_program(&self) -> Option<&OsStr> {
+        #[cfg(not(target_os = "windows"))]
+        if is_android() {
+            return Some(OsStr::new("/system/bin/sh"));
+        }
+
+        #[cfg(target_os = "windows")]
+        if self.shell_dialect() == ShellDialect::WindowsCmd {
+            return Some(OsStr::new(WINDOWS_COMMAND_INTERPRETER));
+        }
+
+        Some(OsStr::new(&self.shell))
+    }
+
     fn build_shell_command(
         &self,
         command: &str,

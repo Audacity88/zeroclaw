@@ -251,6 +251,18 @@ pub trait RuntimeAdapter: Send + Sync {
         ShellProfile::from_dialect(self.shell_dialect())
     }
 
+    /// Return the direct shell program before host executable resolution.
+    ///
+    /// Container sandbox wrappers use this exact identifier inside the image,
+    /// where a canonical host path may name a different or nonexistent file.
+    /// This must match the program and invocation convention used by the shell
+    /// builder, including platform overrides. Adapters that prepend another
+    /// runtime boundary must leave this as `None`: their outer program is not
+    /// the shell. Host execution must still use the resolved command program.
+    fn shell_program(&self) -> Option<&OsStr> {
+        None
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`
