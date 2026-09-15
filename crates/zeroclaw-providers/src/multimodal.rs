@@ -650,6 +650,40 @@ fn should_normalize_message_images(
     message.role == "user"
 }
 
+/// How multimodal preparation will treat the `[IMAGE:...]` markers in a
+/// message at its position in the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageMarkerDisposition {
+    /// Loadable markers become provider image blocks: user messages and the
+    /// latest run of tool-result carriers.
+    Normalized,
+    /// Markers are stripped before dispatch: tool-result carriers outside the
+    /// latest run.
+    Stripped,
+    /// Content is dispatched verbatim as text: system and assistant messages.
+    Literal,
+}
+
+/// One disposition per message, computed with the same predicates preparation
+/// uses (`is_tool_result_carrier`, `latest_tool_result_indices`,
+/// `should_normalize_message_images`).
+pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDisposition> {
+    let latest_indices = latest_tool_result_indices(messages);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if should_normalize_message_images(index, message, &latest_indices) {
+                ImageMarkerDisposition::Normalized
+            } else if is_tool_result_carrier(message) {
+                ImageMarkerDisposition::Stripped
+            } else {
+                ImageMarkerDisposition::Literal
+            }
+        })
+        .collect()
+}
+
 fn stripped_image_marker_text(content: &str) -> String {
     let (cleaned, refs) = parse_image_markers(content);
     if refs.is_empty() {
@@ -1544,6 +1578,45 @@ fn normalize_content_type(content_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_marker_dispositions_match_preparation() {
+        let native = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("yo"),
+            ChatMessage::tool("early result"),
+            ChatMessage::user("turn two"),
+            ChatMessage::assistant("calling"),
+            ChatMessage::tool("latest result"),
+        ];
+        assert_eq!(
+            image_marker_dispositions(&native),
+            vec![
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Stripped,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Normalized,
+            ]
+        );
+
+        let prompt_mode = vec![
+            ChatMessage::user("[Tool results]\nearly carrier"),
+            ChatMessage::user("turn"),
+            ChatMessage::user("[Tool results]\nlatest carrier"),
+        ];
+        assert_eq!(
+            image_marker_dispositions(&prompt_mode),
+            vec![
+                ImageMarkerDisposition::Stripped,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Normalized,
+            ]
+        );
+    }
 
     #[test]
     fn image_failure_reporting_tracks_reference_and_kind_until_success() {

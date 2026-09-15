@@ -1070,4 +1070,29 @@ mod tests {
             "nothing should be dropped when the estimate fits the budget"
         );
     }
+
+    #[test]
+    fn stale_tool_images_do_not_force_a_trim() {
+        let markers: Vec<String> = (0..30)
+            .map(|index| format!("[IMAGE:/tmp/stale-{index}.png]"))
+            .collect();
+        // The latest message is a genuine user turn, so the whole tool run is
+        // stale and preparation strips every marker before dispatch.
+        let history = vec![
+            sys("s"),
+            user("u"),
+            asst("a"),
+            tool(&markers.join("\n")),
+            user("v"),
+        ];
+
+        let result = trim_to_recent_turns(history, 32_000);
+
+        assert!(
+            !result.trimmed,
+            "stale tool images are stripped before dispatch and must not force a trim"
+        );
+        assert_eq!(result.dropped_turns, 0);
+        assert_eq!(result.history.len(), 5);
+    }
 }

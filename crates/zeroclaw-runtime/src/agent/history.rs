@@ -6,6 +6,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX;
+use zeroclaw_providers::multimodal::ImageMarkerDisposition;
+use zeroclaw_providers::multimodal::image_marker_dispositions;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
@@ -313,37 +315,66 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
 }
 
 /// Fixed per-image charge for `[IMAGE:...]` markers in the history estimate.
-/// Anthropic bills at most ~1,600 tokens for an image after its 1568px
-/// downscale (w*h/750); OpenAI high-detail and Gemini land below that for the
-/// same input. Qwen-VL can bill more (~4k for an A4 page at 300dpi); that
-/// remains an under-estimate here, bounded and corrected by the
-/// provider-reported usage path after the first response.
+/// Approximates the standard-tier Anthropic maximum (1,568 tokens for an image
+/// at the 1568px downscale). High-resolution tiers and some models bill more
+/// (Anthropic high-res up to 4,784; GPT-4o-mini base 2,833; Qwen-VL ~4k per
+/// A4 page): this is a heuristic for trimming, not a ceiling, and
+/// provider-reported usage corrects it after the first successful response.
 pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
 
 /// Estimate the token cost of a single message: the ~4 chars/token heuristic
-/// plus ~4 framing tokens (role, delimiters), with `[IMAGE:...]` markers
-/// charged at [`IMAGE_TOKEN_ESTIMATE`] per image instead of their text
-/// length. Single-sourced so the history and system-floor estimates stay in
-/// lock-step.
-fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    if !message.content.contains(IMAGE_MARKER_PREFIX) {
-        return message.content.len().div_ceil(4) + 4;
+/// plus ~4 framing tokens (role, delimiters). Loadable `[IMAGE:...]` markers
+/// are charged at [`IMAGE_TOKEN_ESTIMATE`] per image only when preparation
+/// dispatches them as images ([`ImageMarkerDisposition::Normalized`]); stale
+/// tool-result markers are priced as their non-marker text, and system or
+/// assistant content stays literal text. A message whose markers are all
+/// placeholders keeps the plain-text formula. Single-sourced so the history
+/// and system-floor estimates stay in lock-step.
+fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDisposition) -> usize {
+    let text_estimate = message.content.len().div_ceil(4) + 4;
+    if disposition == ImageMarkerDisposition::Literal
+        || !message.content.contains(IMAGE_MARKER_PREFIX)
+    {
+        return text_estimate;
     }
     let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
-    text.len().div_ceil(4) + refs.len() * IMAGE_TOKEN_ESTIMATE + 4
+    if refs.is_empty() {
+        return text_estimate; // placeholders stay text, byte-identical to the plain formula
+    }
+    match disposition {
+        ImageMarkerDisposition::Normalized => {
+            text.len().div_ceil(4) + refs.len() * IMAGE_TOKEN_ESTIMATE + 4
+        }
+        ImageMarkerDisposition::Stripped => text.len().div_ceil(4) + 4,
+        // Unreachable after the guard; keeps the arm total.
+        ImageMarkerDisposition::Literal => text_estimate,
+    }
 }
 
-/// Estimate token count for a message history using ~4 chars/token heuristic.
-/// Includes a small overhead per message for role/framing tokens.
+/// Estimate token count for a message history using the ~4 chars/token
+/// heuristic plus ~4 framing tokens per message. Loadable image markers are
+/// charged per image only where preparation dispatches them: user turns and
+/// the latest run of tool results. Stale tool-result markers are priced as
+/// their remaining text, and system or assistant content is priced as text.
+/// Trim probes estimate history suffixes that always retain the newest turn,
+/// so the latest tool-result run carries the same disposition in every probe
+/// as in the full history.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
-    history.iter().map(estimate_message_tokens).sum()
+    let dispositions = image_marker_dispositions(history);
+    history
+        .iter()
+        .zip(dispositions)
+        .map(|(message, disposition)| estimate_message_tokens(message, disposition))
+        .sum()
 }
 
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
+    // System content is always dispatched verbatim, so the floor always uses
+    // the literal-text formula.
     history
         .iter()
         .filter(|m| m.role == "system")
-        .map(estimate_message_tokens)
+        .map(|m| estimate_message_tokens(m, ImageMarkerDisposition::Literal))
         .sum()
 }
 
@@ -622,6 +653,94 @@ mod tests {
 
         let expected = text.len().div_ceil(4) + 2 * IMAGE_TOKEN_ESTIMATE + 4;
         assert_eq!(estimate_history_tokens(&[message]), expected);
+    }
+
+    #[test]
+    fn system_and_assistant_markers_stay_text() {
+        // System and assistant content is dispatched verbatim, so a 16 KB data
+        // URI marker must estimate as its full text, not as one image.
+        let payload = format!("data:image/png;base64,{}", "A".repeat(16_000));
+        let system_marker = ChatMessage::system(format!("[IMAGE:{payload}]"));
+        let system_len = system_marker.content.len();
+        assert_eq!(
+            estimate_history_tokens(&[system_marker]),
+            system_len.div_ceil(4) + 4
+        );
+
+        let assistant_marker = ChatMessage::assistant("[IMAGE:/tmp/a.png]");
+        let assistant_len = assistant_marker.content.len();
+        assert_eq!(
+            estimate_history_tokens(&[assistant_marker]),
+            assistant_len.div_ceil(4) + 4
+        );
+
+        // Twenty short markers in one system message must stay far under the
+        // default 32,000-token floor warning they used to trip.
+        let twenty = (0..20)
+            .map(|index| format!("[IMAGE:/tmp/s-{index}.png]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let system_history = vec![ChatMessage::system(twenty)];
+        let floor = estimate_system_floor_tokens(&system_history);
+        assert_eq!(floor, system_history[0].content.len().div_ceil(4) + 4);
+        assert!(floor < 32_000);
+    }
+
+    #[test]
+    fn placeholder_with_padding_is_byte_identical_to_master() {
+        // Parsing trims the padding around a placeholder, but a message with
+        // no loadable references keeps the plain-text formula.
+        let padded = "    [IMAGE:...]    ";
+        let message = ChatMessage::user(padded);
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            padded.len().div_ceil(4) + 4
+        );
+    }
+
+    #[test]
+    fn stale_tool_result_markers_are_not_charged_as_images() {
+        let markers: Vec<String> = (0..30)
+            .map(|index| format!("[IMAGE:/tmp/slide-{index}.png]"))
+            .collect();
+        // Bookend prose keeps the non-marker text identical whether the
+        // marker scanner trims the cleaned string or counts raw segment bytes.
+        let tool_content = format!("a\n{}\nb", markers.join("\n"));
+        let tool_text_bytes = "a\n".len() + "\n".len() * (markers.len() - 1) + "\nb".len();
+        let tool = ChatMessage::tool(&tool_content);
+
+        let prefix = || {
+            vec![
+                ChatMessage::system("s"),
+                ChatMessage::user("u"),
+                ChatMessage::assistant("called tools"),
+            ]
+        };
+
+        // A trailing user turn makes the tool run stale: preparation strips
+        // the markers, so the estimate must price the message as text only.
+        let stale_history = [prefix(), vec![tool.clone(), ChatMessage::user("next")]].concat();
+        let stale_control = [prefix(), vec![ChatMessage::user("next")]].concat();
+        let stale_tool_tokens =
+            estimate_history_tokens(&stale_history) - estimate_history_tokens(&stale_control);
+        assert_eq!(
+            stale_tool_tokens,
+            tool_text_bytes.div_ceil(4) + 4,
+            "stale tool markers must be priced as their remaining text"
+        );
+        assert!(stale_tool_tokens < IMAGE_TOKEN_ESTIMATE);
+
+        // Without the trailing user message the tool run is the latest one
+        // and its images are dispatched: thirty per-image charges appear.
+        let latest_history = [prefix(), vec![tool]].concat();
+        let latest_control = prefix();
+        let latest_tool_tokens =
+            estimate_history_tokens(&latest_history) - estimate_history_tokens(&latest_control);
+        assert_eq!(
+            latest_tool_tokens - stale_tool_tokens,
+            30 * IMAGE_TOKEN_ESTIMATE
+        );
     }
 
     #[test]
