@@ -18,7 +18,9 @@ impl Default for DockerSandbox {
     fn default() -> Self {
         Self {
             launcher: None,
-            image: "alpine:latest".to_string(),
+            // Read from the config crate so the sandbox default and the
+            // `[security.sandbox].image` serde default cannot drift apart.
+            image: zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE.to_string(),
             workspace_dir: None,
         }
     }
@@ -29,7 +31,7 @@ impl DockerSandbox {
     /// Exposed so callers constructing via with_workspace() without a custom
     /// image don't duplicate the default-image string.
     pub fn default_image() -> String {
-        "alpine:latest".to_string()
+        Self::default().image
     }
 
     /// Construct a Docker sandbox with a workspace bind-mount (read-only).
@@ -184,9 +186,16 @@ mod tests {
     }
 
     #[test]
-    fn docker_sandbox_default_image() {
+    fn docker_sandbox_default_image_tracks_the_config_default() {
+        // Asserting against the constant rather than a literal is the point:
+        // the sandbox default and `[security.sandbox].image` now have one
+        // source, and this fails if someone reintroduces a second one.
         let sandbox = DockerSandbox::default();
         assert!(sandbox.launcher.is_none());
+        assert_eq!(
+            sandbox.image,
+            zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE
+        );
         assert_eq!(sandbox.image, "alpine:latest");
     }
 
