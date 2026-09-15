@@ -188,6 +188,7 @@ cli-acp-long-about =
 
     示例：
     zeroclaw acp                        # 启动 ACP 服务器
+    zeroclaw acp --agent fable         # 将新会话的默认智能体设为 fable
     zeroclaw acp --max-sessions 5       # 限制并发会话数
 cli-daemon-long-about =
     启动长期运行的自主守护进程。
@@ -1069,6 +1070,7 @@ channel-approval-btn-approve = 批准
 channel-approval-btn-deny = 拒绝
 channel-approval-btn-always = 始终
 channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-position = 第 { $index } 个工具调用，共 { $total } 个
 channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
 channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
 channel-approval-group-visibility-warning = 这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。

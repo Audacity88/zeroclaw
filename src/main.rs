@@ -915,6 +915,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
+#[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
@@ -1204,8 +1206,13 @@ Methods: initialize, session/new, session/prompt, session/stop.
 
 Examples:
   zeroclaw acp                        # start ACP server
+  zeroclaw acp --agent fable         # default new sessions to agent fable
   zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
     Acp {
+        /// Process-scoped default agent for alias-less session/new requests
+        #[arg(long)]
+        agent: Option<String>,
+
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
         max_sessions: Option<usize>,
@@ -3312,7 +3319,7 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
+    /// List installed and cached-registry plugins
     List,
     /// Search an installable plugin registry
     Search {
@@ -5566,6 +5573,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         }
 
         Commands::Acp {
+            agent,
             max_sessions,
             session_timeout,
         } => {
@@ -5598,17 +5606,16 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         })
                         .ok();
                 let server = if let Some(store) = store {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                        config, acp_config, store,
-                    ))
+                    channels::acp_server::AcpServer::new_with_store(config, acp_config, store)
                 } else {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
-                };
-                server.run().await
+                    channels::acp_server::AcpServer::new(config, acp_config)
+                }
+                .with_connection_default_agent(agent);
+                std::sync::Arc::new(server).run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
             {
-                let _ = (max_sessions, session_timeout);
+                let _ = (agent, max_sessions, session_timeout);
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
@@ -5953,6 +5960,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "gateway")]
+                let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
+                #[cfg(feature = "gateway")]
+                let channel_plugin_webhooks = Some(Arc::clone(&plugin_webhooks));
+                #[cfg(not(feature = "gateway"))]
+                let channel_plugin_webhooks: Option<
+                    Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+                > = None;
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
@@ -5986,12 +6001,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let plugin_webhooks = Arc::clone(&plugin_webhooks);
                     move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = Arc::clone(&plugin_webhooks);
                         Box::pin(async move {
-                            Box::pin(zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
                                 config,
@@ -6001,7 +6018,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
-                                ready_tx,
+                                zeroclaw_gateway::GatewaySupervision::new(
+                                    ready_tx,
+                                    plugin_webhooks,
+                                ),
                             ))
                             .await
                         })
@@ -6011,19 +6031,22 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let plugin_webhooks = channel_plugin_webhooks.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            let channels = zeroclaw_channels::orchestrator::start_channels_with_plugin_webhooks(
                                 config,
                                 Some(canvas_store),
                                 cancel,
                                 sop_engine,
                                 sop_audit,
-                            ))
-                            .await
+                                plugin_webhooks,
+                            );
+                            Box::pin(channels).await
                         })
                     }
                 }));
@@ -6314,13 +6337,20 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
                     Box::pin(async move {
-                        let (enroll_cfg, wss_cfg, relay_cfg, data_dir) = {
+                        let (
+                            enroll_cfg,
+                            wss_cfg,
+                            relay_cfg,
+                            data_dir,
+                            startup_pairing_code_policy,
+                        ) = {
                             let cfg = ctx.config.read();
                             (
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
                                 cfg.data_dir.clone(),
+                                cfg.gateway.pairing_code,
                             )
                         };
                         if !enroll_cfg.enabled {
@@ -6420,6 +6450,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
                             true,
                             &[],
+                            startup_pairing_code_policy,
                         ));
                         if let Some(code) = pairing.pairing_code() {
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
@@ -6506,6 +6537,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             ca_key_pem,
                             ledger,
                             pairing,
+                            pairing_code_policy: {
+                                let config = ctx.config.clone();
+                                std::sync::Arc::new(move || config.read().gateway.pairing_code)
+                            },
                             static_client_pins_configured: wss_cfg
                                 .client_auth
                                 .as_ref()
@@ -8545,20 +8580,7 @@ Add pricing to the active provider profile or supply a catalog entry."
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
-                }
+                plugin_catalog::print(&config, &host);
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
@@ -12192,6 +12214,19 @@ mod tests {
     }
 
     #[test]
+    fn acp_cli_accepts_process_default_agent() {
+        let cli = Cli::try_parse_from(["zeroclaw", "acp", "--agent", "fable"])
+            .expect("standalone ACP should accept a process default agent");
+
+        match cli.command {
+            Commands::Acp { agent, .. } => {
+                assert_eq!(agent.as_deref(), Some("fable"));
+            }
+            other => panic!("expected ACP command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cli_quickstart_uses_advertised_local_provider_runtime_default() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "lmstudio".into(),
@@ -14114,6 +14149,7 @@ mod tests {
                     model: Some("claude-opus-4-7".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
