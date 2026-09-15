@@ -48,6 +48,8 @@ zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = ca
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
 zc-error-daemon-initialize-timeout = zerocode connected to the daemon, but initialization did not finish within { $seconds }s. Restart the daemon and try again.
 zc-error-spawned-daemon-startup = zerocode started an ephemeral daemon, but it failed to become ready: { $details }
+zc-daemon-wait-notice = zerocode: waiting for daemon at { $path } (up to { $seconds }s)…
+zc-error-daemon-not-ready-timeout = daemon did not become ready within { $seconds }s (socket: { $path }); if the socket path is long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
@@ -452,6 +454,8 @@ zc-chat-resyncing = Some live updates were missed. Reloading this session before
 zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
 zc-chat-resync-failed = Live updates were missed and the session could not be reloaded: { $error }
 zc-chat-session-restart-error = Failed to start a new session: { $error }
+zc-chat-code-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local Code session must start in that project, so it was not created.
+zc-chat-code-cwd-not-utf8 = The directory zerocode was launched from is not valid UTF-8 ({ $path }), so a local Code session cannot start there. Relaunch zerocode from a UTF-8 path.
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
@@ -497,7 +501,10 @@ zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
 zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
+zc-chat-session-list-resume-note = Session history saved & resumable · Persistent memory isolated
+zc-chat-agent-picker-acp-memory-note = Session history saved & resumable · Persistent memory isolated
 zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice
