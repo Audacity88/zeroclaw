@@ -1058,7 +1058,8 @@ impl AcpSessionStore {
 
     /// Produce provider-safe ACP history while preserving client-visible text.
     /// Only an immediately adjacent tool-call/result pair is retained, and one
-    /// result is kept for each call id. Recovery markers stay transcript-only.
+    /// result is kept for each unambiguous call id. Duplicate call IDs within
+    /// a batch are rejected; recovery markers stay transcript-only.
     pub fn provider_safe_history(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
         let mut repaired = Vec::new();
         let mut index = 0;
@@ -1084,7 +1085,16 @@ impl AcpSessionStore {
                     let mut paired_calls = Vec::new();
                     let mut paired_results = Vec::new();
                     if let Some(results) = adjacent_results {
+                        let mut call_id_counts = std::collections::HashMap::new();
                         for call in tool_calls {
+                            *call_id_counts.entry(call.id.as_str()).or_insert(0usize) += 1;
+                        }
+                        for call in tool_calls {
+                            // Reserving a result is insufficient: even with two
+                            // results, duplicated call IDs cannot identify a pair.
+                            if call_id_counts.get(call.id.as_str()) != Some(&1) {
+                                continue;
+                            }
                             if let Some(result) =
                                 results.iter().find(|result| result.tool_call_id == call.id)
                             {
@@ -1988,6 +1998,71 @@ mod tests {
                     && results[0].tool_call_id == "paired"
                     && results[0].content == "first"
         ));
+    }
+
+    #[test]
+    fn provider_safe_history_rejects_duplicate_call_ids_per_batch() {
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        };
+        let result = |id: &str| ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: "shell".into(),
+            content: format!("output for {id}"),
+        };
+        for result_count in [1, 2] {
+            for keep_unique_peer in [false, true] {
+                let mut calls = vec![call("duplicate"), call("duplicate")];
+                let mut results = vec![result("duplicate"); result_count];
+                if keep_unique_peer {
+                    calls.push(call("unique"));
+                    results.push(result("unique"));
+                }
+                let messages = vec![
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("partial text".into()),
+                        tool_calls: calls,
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(results),
+                ];
+                let mut expected = if keep_unique_peer {
+                    vec![
+                        ConversationMessage::AssistantToolCalls {
+                            text: Some("partial text".into()),
+                            tool_calls: vec![call("unique")],
+                            reasoning_content: None,
+                        },
+                        ConversationMessage::ToolResults(vec![result("unique")]),
+                    ]
+                } else {
+                    vec![ConversationMessage::Chat(ChatMessage::assistant(
+                        "partial text",
+                    ))]
+                };
+                // Reusing the ID in a later, unambiguous batch remains valid.
+                let later = vec![
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![call("duplicate")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![result("duplicate")]),
+                ];
+                let mut messages = messages;
+                messages.extend(later.clone());
+                expected.extend(later);
+                assert_eq!(
+                    serde_json::to_value(AcpSessionStore::provider_safe_history(&messages))
+                        .unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "duplicate result count={result_count}, unique peer={keep_unique_peer}"
+                );
+            }
+        }
     }
 
     #[test]
