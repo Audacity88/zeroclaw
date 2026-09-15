@@ -118,13 +118,13 @@ fn image_failure_reference_key(reference: &str) -> [u8; 32] {
 pub struct PreparedMessages {
     pub messages: Vec<ChatMessage>,
     pub contains_images: bool,
-    /// Image identities in the final provider-visible request, in wire order.
+    /// Normalized image identities in the final provider-visible request.
     pub submitted_image_ids: Vec<ProviderImageId>,
-    /// Submitted identities explicitly reintroduced by the newest user turn.
-    pub retry_image_ids: Vec<ProviderImageId>,
+    /// Submitted identities explicitly present in the newest user turn.
+    pub newest_user_image_ids: Vec<ProviderImageId>,
 }
 
-/// Stable identity for a normalized provider-visible image reference.
+/// Stable identity for one normalized provider-visible image reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProviderImageId([u8; 32]);
 
@@ -715,7 +715,6 @@ async fn normalize_native_tool_result_json(
     remote_client: &Client,
     ctx: &ImageNormalizeCtx<'_>,
     cache: Option<&mut LocalImageCache>,
-    quarantined_image_ids: &[ProviderImageId],
 ) -> Option<(String, bool)> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
     else {
@@ -733,11 +732,9 @@ async fn normalize_native_tool_result_json(
 
     let normalized =
         normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache).await;
-    let (cleaned_text, data_uris) =
-        omit_quarantined_images(cleaned_text, normalized.data_uris, quarantined_image_ids);
     let new_inner = compose_multimodal_content(
         &cleaned_text,
-        &data_uris,
+        &normalized.data_uris,
         normalized.skipped_count,
         refs.len(),
     );
@@ -745,7 +742,7 @@ async fn normalize_native_tool_result_json(
 
     Some((
         serde_json::Value::Object(obj).to_string(),
-        !data_uris.is_empty(),
+        !normalized.data_uris.is_empty(),
     ))
 }
 
@@ -753,7 +750,7 @@ pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
 ) -> anyhow::Result<PreparedMessages> {
-    prepare_messages_inner(messages, config, None, &[]).await
+    prepare_messages_inner(messages, config, None).await
 }
 
 /// Like [`prepare_messages_for_provider`] but reuses a [`LocalImageCache`]
@@ -764,26 +761,13 @@ pub async fn prepare_messages_for_provider_cached(
     config: &MultimodalConfig,
     cache: &mut LocalImageCache,
 ) -> anyhow::Result<PreparedMessages> {
-    prepare_messages_inner(messages, config, Some(cache), &[]).await
-}
-
-/// Prepares provider messages while omitting quarantined images from replayed
-/// history. Images explicitly attached to the newest user turn bypass the
-/// quarantine so users can retry them.
-pub async fn prepare_messages_for_provider_cached_with_quarantine(
-    messages: &[ChatMessage],
-    config: &MultimodalConfig,
-    cache: &mut LocalImageCache,
-    quarantined_image_ids: &[ProviderImageId],
-) -> anyhow::Result<PreparedMessages> {
-    prepare_messages_inner(messages, config, Some(cache), quarantined_image_ids).await
+    prepare_messages_inner(messages, config, Some(cache)).await
 }
 
 async fn prepare_messages_inner(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
     mut cache: Option<&mut LocalImageCache>,
-    quarantined_image_ids: &[ProviderImageId],
 ) -> anyhow::Result<PreparedMessages> {
     // Strip loadable audio markers before any provider sees the history. Left
     // in place, an audio path reaches the model as literal text and fails
@@ -812,7 +796,7 @@ async fn prepare_messages_inner(
                 .collect(),
             contains_images: false,
             submitted_image_ids: Vec::new(),
-            retry_image_ids: Vec::new(),
+            newest_user_image_ids: Vec::new(),
         });
     }
 
@@ -826,12 +810,6 @@ async fn prepare_messages_inner(
     // the threshold, so no pre-normalization trim is needed here.
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
     let latest_tool_indices = latest_tool_result_indices(messages);
-    let latest_user_index = messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, message)| message.role == "user" && !is_prompt_tool_result_message(message))
-        .map(|(index, _)| index);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
@@ -856,7 +834,6 @@ async fn prepare_messages_inner(
                     role: &message.role,
                 },
                 cache.as_deref_mut(),
-                quarantined_image_ids,
             )
             .await
         {
@@ -886,18 +863,13 @@ async fn prepare_messages_inner(
             cache.as_deref_mut(),
         )
         .await;
-        let (cleaned_text, data_uris) = if Some(index) == latest_user_index {
-            (cleaned_text, normalized.data_uris)
-        } else {
-            omit_quarantined_images(cleaned_text, normalized.data_uris, quarantined_image_ids)
-        };
         let content = compose_multimodal_content(
             &cleaned_text,
-            &data_uris,
+            &normalized.data_uris,
             normalized.skipped_count,
             refs.len(),
         );
-        has_successful_images |= !data_uris.is_empty();
+        has_successful_images |= !normalized.data_uris.is_empty();
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
@@ -949,8 +921,10 @@ async fn prepare_messages_inner(
     };
 
     let submitted_image_ids = provider_image_ids(&capped_messages);
-    let retry_image_ids = latest_user_index
-        .and_then(|index| capped_messages.get(index))
+    let newest_user_image_ids = capped_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
         .map(provider_image_ids_in_message)
         .unwrap_or_default();
 
@@ -958,30 +932,8 @@ async fn prepare_messages_inner(
         contains_images: !submitted_image_ids.is_empty(),
         messages: capped_messages,
         submitted_image_ids,
-        retry_image_ids,
+        newest_user_image_ids,
     })
-}
-
-fn omit_quarantined_images(
-    mut text: String,
-    data_uris: Vec<String>,
-    quarantined_image_ids: &[ProviderImageId],
-) -> (String, Vec<String>) {
-    if quarantined_image_ids.is_empty() {
-        return (text, data_uris);
-    }
-
-    let original_len = data_uris.len();
-    let retained: Vec<String> = data_uris
-        .into_iter()
-        .filter(|reference| {
-            !quarantined_image_ids.contains(&ProviderImageId::from_reference(reference))
-        })
-        .collect();
-    if retained.is_empty() && retained.len() != original_len && text.trim().is_empty() {
-        text = "[image removed from history]".to_string();
-    }
-    (text, retained)
 }
 
 fn provider_image_ids_in_message(message: &ChatMessage) -> Vec<ProviderImageId> {
@@ -992,7 +944,7 @@ fn provider_image_ids_in_message(message: &ChatMessage) -> Vec<ProviderImageId> 
         .collect()
 }
 
-/// Returns normalized image identities in provider wire order.
+/// Return normalized image identities in provider wire order.
 pub fn provider_image_ids(messages: &[ChatMessage]) -> Vec<ProviderImageId> {
     let latest_tool_indices = latest_tool_result_indices(messages);
     messages
@@ -1002,6 +954,64 @@ pub fn provider_image_ids(messages: &[ChatMessage]) -> Vec<ProviderImageId> {
             should_normalize_message_images(*index, message, &latest_tool_indices)
         })
         .flat_map(|(_, message)| provider_image_ids_in_message(message))
+        .collect()
+}
+
+fn omit_provider_image_ids_from_content(content: &str, omitted: &[ProviderImageId]) -> String {
+    let (mut text, references) = parse_image_markers(content);
+    if references.is_empty() {
+        return content.to_string();
+    }
+
+    let retained: Vec<String> = references
+        .iter()
+        .filter(|reference| !omitted.contains(&ProviderImageId::from_reference(reference)))
+        .cloned()
+        .collect();
+    if retained.len() == references.len() {
+        return content.to_string();
+    }
+    if retained.is_empty() && text.trim().is_empty() {
+        text = "[image removed from history]".to_string();
+    }
+    compose_multimodal_message(&text, &retained)
+}
+
+/// Build a provider-only replay view with selected normalized images removed.
+/// The caller retains canonical history unchanged.
+pub fn omit_provider_image_ids(
+    messages: &[ChatMessage],
+    omitted: &[ProviderImageId],
+) -> Vec<ChatMessage> {
+    if omitted.is_empty() {
+        return messages.to_vec();
+    }
+
+    messages
+        .iter()
+        .map(|message| {
+            if message.role == "tool"
+                && let Ok(serde_json::Value::Object(mut object)) =
+                    serde_json::from_str::<serde_json::Value>(&message.content)
+                && let Some(serde_json::Value::String(content)) = object.get("content").cloned()
+            {
+                object.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(omit_provider_image_ids_from_content(
+                        &content, omitted,
+                    )),
+                );
+                return ChatMessage {
+                    role: message.role.clone(),
+                    content: serde_json::Value::Object(object).to_string(),
+                };
+            }
+
+            ChatMessage {
+                role: message.role.clone(),
+                content: omit_provider_image_ids_from_content(&message.content, omitted),
+            }
+        })
         .collect()
 }
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
@@ -3136,36 +3146,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn quarantine_omits_history_but_newest_user_can_retry_same_image() {
-        let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
-        let original = vec![
-            ChatMessage::user(format!("Original [IMAGE:{uri}]")),
-            ChatMessage::assistant("The provider rejected that image."),
-            ChatMessage::user("Continue without it"),
-        ];
-        let config = MultimodalConfig::default();
-        let identity = ProviderImageId::from_reference(&uri);
-
-        let quarantined = prepare_messages_inner(&original, &config, None, &[identity])
-            .await
-            .expect("quarantined history prepares");
-        assert!(quarantined.submitted_image_ids.is_empty());
-        assert!(quarantined.retry_image_ids.is_empty());
-        assert!(!quarantined.messages[0].content.contains("[IMAGE:"));
-        assert!(original[0].content.contains("[IMAGE:"));
-
-        let mut retry_history = original.clone();
-        retry_history.push(ChatMessage::user(format!("Try again [IMAGE:{uri}]")));
-        let retried = prepare_messages_inner(&retry_history, &config, None, &[identity])
-            .await
-            .expect("explicit newest-user retry prepares");
-        assert_eq!(retried.submitted_image_ids, vec![identity]);
-        assert_eq!(retried.retry_image_ids, vec![identity]);
-        assert!(!retried.messages[0].content.contains("[IMAGE:"));
-        assert!(retried.messages[3].content.contains("[IMAGE:"));
-    }
-
     #[test]
     fn extract_ollama_image_payload_supports_data_uris() {
         let payload = extract_ollama_image_payload("data:image/png;base64,abcd==")
@@ -3191,5 +3171,22 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn provider_image_filter_removes_only_selected_identity() {
+        let first = "data:image/png;base64,AAAA";
+        let second = "data:image/png;base64,BBBB";
+        let messages = vec![ChatMessage::user(format!(
+            "compare [IMAGE:{first}] with [IMAGE:{second}]"
+        ))];
+        let ids = provider_image_ids(&messages);
+
+        let filtered = omit_provider_image_ids(&messages, &ids[1..]);
+
+        assert_eq!(provider_image_ids(&filtered), vec![ids[0]]);
+        assert!(filtered[0].content.contains(first));
+        assert!(!filtered[0].content.contains(second));
+        assert!(filtered[0].content.contains("compare"));
     }
 }

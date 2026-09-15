@@ -2,9 +2,8 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -15,6 +14,25 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
+
+#[derive(Debug, thiserror::Error)]
+#[error("model_provider stream error: {source}")]
+pub(crate) struct StreamProviderFailure {
+    #[source]
+    source: zeroclaw_api::model_provider::StreamError,
+    usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    replay_safe: bool,
+}
+
+impl StreamProviderFailure {
+    pub(crate) fn usage(&self) -> Option<zeroclaw_providers::traits::TokenUsage> {
+        self.usage.clone()
+    }
+
+    pub(crate) fn replay_safe(&self) -> bool {
+        self.replay_safe
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
@@ -72,6 +90,7 @@ pub(crate) async fn consume_provider_streaming_response(
     // surfaces, so a non-streaming retry after a stream error overwrites
     // rather than duplicates.
     let mut visible_event_output = false;
+    let mut replay_blocking_activity = false;
     let mut forwarded_text = String::new();
 
     macro_rules! forward_visible {
@@ -150,15 +169,8 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
-                if !visible_event_output
-                    && let zeroclaw_api::model_provider::StreamError::ProviderImageInputRejected(
-                        rejection,
-                    ) = &err
-                {
-                    return Err(anyhow::Error::new(rejection.clone()).context(message));
-                }
-                let provider_error = anyhow::Error::msg(message.clone());
                 if visible_event_output {
+                    let provider_error = anyhow::Error::msg(message.clone());
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
                     // that includes guard-withheld protocol fragments and
@@ -173,9 +185,10 @@ pub(crate) async fn consume_provider_streaming_response(
                     }
                     .into());
                 }
-                return Err(StreamErrorWithUsage {
-                    message,
+                return Err(StreamProviderFailure {
+                    source: err,
                     usage: outcome.usage,
+                    replay_safe: !replay_blocking_activity && !outcome.forwarded_live_deltas,
                 }
                 .into());
             }
@@ -186,6 +199,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 outcome.usage = Some(usage);
             }
             StreamEvent::ToolCall(tool_call) => {
+                replay_blocking_activity = true;
                 outcome.tool_calls.push(tool_call);
             }
             // Transient, human-readable thinking progress. Surfaced via
@@ -197,6 +211,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 if delta.is_empty() {
                     continue;
                 }
+                replay_blocking_activity = true;
                 if draft_reasoning == StreamReasoningMode::Full
                     && let Some(tx) = on_delta
                 {
@@ -211,12 +226,14 @@ pub(crate) async fn consume_provider_streaming_response(
             // reasoning_content for history reconstruction and never
             // surfaced as user-visible progress.
             StreamEvent::ReasoningFinalized(payload) => {
+                replay_blocking_activity = true;
                 outcome.reasoning_content.push_str(&payload);
             }
             // Pre-executed tool events are for observability only: they are
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
             StreamEvent::PreExecutedToolCall { name, args } => {
+                replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = Uuid::new_v4().to_string();
                 pre_executed_ids
@@ -235,6 +252,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
+                replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = pre_executed_ids
                     .get_mut(&name)
@@ -1185,55 +1203,6 @@ mod tests {
     /// fallback eligibility: a marker-only delta yields empty stripped text,
     /// which must NOT count as visible output.
     struct MarkerOnlyThenErrorProvider;
-    struct ImageRejectedStreamProvider;
-
-    impl ::zeroclaw_api::attribution::Attributable for ImageRejectedStreamProvider {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Model(
-                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-
-        fn alias(&self) -> &str {
-            "ImageRejectedStreamProvider"
-        }
-    }
-
-    #[async_trait]
-    impl ModelProvider for ImageRejectedStreamProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> Result<String> {
-            anyhow::bail!("unused")
-        }
-
-        fn supports_streaming(&self) -> bool {
-            true
-        }
-
-        fn stream_chat(
-            &self,
-            _request: ChatRequest<'_>,
-            _model: &str,
-            _temperature: Option<f64>,
-            _options: StreamOptions,
-        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![Err(
-                ::zeroclaw_api::model_provider::StreamError::ProviderImageInputRejected(
-                    ::zeroclaw_api::model_provider::ProviderImageInputRejected::new(
-                        None,
-                        "image input rejected",
-                    ),
-                ),
-            )]))
-        }
-    }
 
     impl ::zeroclaw_api::attribution::Attributable for MarkerOnlyThenErrorProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -1357,28 +1326,6 @@ mod tests {
             err.to_string().contains("provider exploded"),
             "the underlying provider error must be surfaced: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn image_rejection_before_visible_output_preserves_typed_cause() {
-        let error = consume_provider_streaming_response(
-            &ImageRejectedStreamProvider,
-            &[ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")],
-            None,
-            "mock-model",
-            Some(0.0),
-            None,
-            None,
-            None,
-            false,
-            StreamReasoningMode::Status,
-        )
-        .await
-        .expect_err("typed image rejection must surface");
-
-        assert!(error.chain().any(|source| {
-            source.is::<::zeroclaw_api::model_provider::ProviderImageInputRejected>()
-        }));
     }
 
     #[tokio::test]

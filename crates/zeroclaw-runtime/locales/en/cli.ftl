@@ -937,6 +937,11 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-provider-images-quarantined =
+    { $count_plural ->
+        [one] 1 novel image from earlier conversation history was replaced after the provider rejected the request.
+       *[other] { $count } novel images from earlier conversation history were replaced after the provider rejected the request.
+    } Resubmit an image in your newest message to try it again.
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn

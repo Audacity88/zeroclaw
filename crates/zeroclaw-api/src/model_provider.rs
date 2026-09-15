@@ -413,27 +413,6 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
-/// Structured error returned when a provider rejects image input in an
-/// otherwise valid request.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("provider rejected image input: {detail}")]
-pub struct ProviderImageInputRejected {
-    /// Optional zero-based image positions in the provider request.
-    /// `None` means the provider did not identify a particular image.
-    pub image_indices: Option<Vec<usize>>,
-    /// Sanitized provider detail suitable for display and source context.
-    pub detail: String,
-}
-
-impl ProviderImageInputRejected {
-    pub fn new(image_indices: Option<Vec<usize>>, detail: impl Into<String>) -> Self {
-        Self {
-            image_indices,
-            detail: detail.into(),
-        }
-    }
-}
-
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -449,8 +428,9 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
-    #[error(transparent)]
-    ProviderImageInputRejected(#[from] ProviderImageInputRejected),
+    /// A provider returned a non-success HTTP response before streaming began.
+    #[error("ModelProvider HTTP {status}: {message}")]
+    HttpStatus { status: u16, message: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -561,6 +541,14 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// identity. Callers use this fact to fail closed for identity-sensitive
     /// behavior such as persistent full-response caching.
     fn has_stable_request_identity(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Whether this exact request shape can be replayed for `model` on the same
+    /// provider/model route without internal retries, fallback, or key
+    /// mutation. Runtime fails closed when this capability is absent.
+    #[doc(hidden)]
+    fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
         false
     }
 
@@ -867,6 +855,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn has_stable_request_identity(&self, model: &str) -> bool {
         self.as_ref().has_stable_request_identity(model)
+    }
+
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        self.as_ref().supports_exact_request_replay(request, model)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -1217,26 +1209,6 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod provider_image_rejection_tests {
-    use super::{ProviderImageInputRejected, StreamError};
-
-    #[test]
-    fn streaming_rejection_preserves_typed_cause_through_anyhow() {
-        let rejection = ProviderImageInputRejected::new(Some(vec![0, 2]), "sanitized detail");
-        let error = anyhow::Error::new(StreamError::from(rejection.clone()));
-
-        assert!(matches!(
-            error.downcast_ref::<StreamError>(),
-            Some(StreamError::ProviderImageInputRejected(actual)) if actual == &rejection
-        ));
-        assert_eq!(
-            error.to_string(),
-            "provider rejected image input: sanitized detail"
-        );
     }
 }
 

@@ -79,7 +79,7 @@ use crate::agent::tool_execution::{
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
@@ -95,6 +95,279 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+
+const PROVIDER_IMAGE_ROUTE_MAX_ENTRIES: usize = 8;
+const PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES: usize = 32;
+const PROVIDER_IMAGE_QUARANTINED_MAX_ENTRIES: usize = 32;
+
+type ProviderImageId = zeroclaw_providers::multimodal::ProviderImageId;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderImageRoute {
+    provider: String,
+    model: String,
+}
+
+#[derive(Debug, Default)]
+struct ProviderImageRouteState {
+    accepted: VecDeque<ProviderImageId>,
+    quarantined: VecDeque<ProviderImageId>,
+}
+
+/// Provider-facing replay state. Canonical conversation history remains the
+/// only durable message source; this state only materializes a route-local view.
+#[derive(Debug, Default)]
+pub(crate) struct ProviderImageState {
+    routes: VecDeque<(ProviderImageRoute, ProviderImageRouteState)>,
+}
+
+impl ProviderImageState {
+    fn route(provider: &str, model: &str) -> ProviderImageRoute {
+        ProviderImageRoute {
+            provider: provider.to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    fn touch_route(&mut self, route: &ProviderImageRoute) -> Option<&ProviderImageRouteState> {
+        let index = self
+            .routes
+            .iter()
+            .position(|(candidate, _)| candidate == route)?;
+        let entry = self.routes.remove(index)?;
+        self.routes.push_back(entry);
+        self.routes.back().map(|(_, state)| state)
+    }
+
+    fn route_mut(&mut self, route: ProviderImageRoute) -> &mut ProviderImageRouteState {
+        if let Some(index) = self
+            .routes
+            .iter()
+            .position(|(candidate, _)| candidate == &route)
+            && let Some(entry) = self.routes.remove(index)
+        {
+            self.routes.push_back(entry);
+        } else {
+            if self.routes.len() >= PROVIDER_IMAGE_ROUTE_MAX_ENTRIES {
+                self.routes.pop_front();
+            }
+            self.routes
+                .push_back((route, ProviderImageRouteState::default()));
+        }
+        &mut self.routes.back_mut().expect("route was just inserted").1
+    }
+
+    fn retain_recent(
+        ids: &mut VecDeque<ProviderImageId>,
+        incoming: &[ProviderImageId],
+        max_entries: usize,
+    ) {
+        for image in incoming {
+            if let Some(index) = ids.iter().position(|candidate| candidate == image) {
+                ids.remove(index);
+            }
+            ids.push_back(*image);
+        }
+        while ids.len() > max_entries {
+            ids.pop_front();
+        }
+    }
+
+    fn accepted(&mut self, route: &ProviderImageRoute) -> Vec<ProviderImageId> {
+        self.touch_route(route)
+            .map(|state| state.accepted.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn quarantined(&mut self, route: &ProviderImageRoute) -> Vec<ProviderImageId> {
+        self.touch_route(route)
+            .map(|state| state.quarantined.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_success(
+        &mut self,
+        route: ProviderImageRoute,
+        accepted: &[ProviderImageId],
+        retried: &[ProviderImageId],
+    ) {
+        let state = self.route_mut(route);
+        Self::retain_recent(
+            &mut state.accepted,
+            accepted,
+            PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES,
+        );
+        for image in retried {
+            if accepted.contains(image) {
+                state.quarantined.retain(|candidate| candidate != image);
+            }
+        }
+    }
+
+    fn record_recovery(
+        &mut self,
+        route: ProviderImageRoute,
+        retained: &[ProviderImageId],
+        replaced: &[ProviderImageId],
+    ) {
+        let state = self.route_mut(route);
+        Self::retain_recent(
+            &mut state.accepted,
+            retained,
+            PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES,
+        );
+        Self::retain_recent(
+            &mut state.quarantined,
+            replaced,
+            PROVIDER_IMAGE_QUARANTINED_MAX_ENTRIES,
+        );
+    }
+}
+
+fn suppress_quarantined_provider_images(
+    messages: &[ChatMessage],
+    quarantined: &[zeroclaw_providers::multimodal::ProviderImageId],
+) -> Vec<ChatMessage> {
+    let newest_user_message = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| {
+            message.role == "user" && !message.content.trim_start().starts_with("[Tool results]")
+        })
+        .map(|(index, message)| (index, message.clone()));
+    let mut filtered =
+        zeroclaw_providers::multimodal::omit_provider_image_ids(messages, quarantined);
+    if let Some((index, message)) = newest_user_message
+        && let Some(slot) = filtered.get_mut(index)
+    {
+        *slot = message;
+    }
+    filtered
+}
+
+#[cfg(test)]
+mod provider_image_state_tests {
+    use super::*;
+
+    fn image_id(payload: &str) -> zeroclaw_providers::multimodal::ProviderImageId {
+        zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user(format!(
+            "[IMAGE:data:image/png;base64,{payload}]"
+        ))])[0]
+    }
+
+    fn image_ids(prefix: &str, count: usize) -> Vec<ProviderImageId> {
+        (0..count)
+            .map(|index| image_id(&format!("{prefix}{index}")))
+            .collect()
+    }
+
+    #[test]
+    fn acceptance_and_quarantine_are_route_local_and_retry_clears_on_success() {
+        let accepted = image_id("AAAA");
+        let rejected = image_id("BBBB");
+        let route_a = ProviderImageState::route("compatible.primary", "model-a");
+        let route_b = ProviderImageState::route("compatible.primary", "model-b");
+        let mut state = ProviderImageState::default();
+
+        state.record_recovery(route_a.clone(), &[accepted], &[rejected]);
+        assert!(state.accepted(&route_a).contains(&accepted));
+        assert_eq!(state.quarantined(&route_a), vec![rejected]);
+        assert!(state.accepted(&route_b).is_empty());
+        assert!(state.quarantined(&route_b).is_empty());
+
+        state.record_success(route_a.clone(), &[rejected], &[rejected]);
+        assert!(state.accepted(&route_a).contains(&rejected));
+        assert!(state.quarantined(&route_a).is_empty());
+    }
+
+    #[test]
+    fn route_state_evicts_the_oldest_route_and_reads_refresh_recency() {
+        let mut state = ProviderImageState::default();
+        let routes: Vec<_> = (0..PROVIDER_IMAGE_ROUTE_MAX_ENTRIES)
+            .map(|index| ProviderImageState::route("compatible.primary", &format!("model-{index}")))
+            .collect();
+        for route in &routes {
+            state.record_success(route.clone(), &[], &[]);
+        }
+
+        state.accepted(&routes[0]);
+        let newest = ProviderImageState::route("compatible.primary", "model-new");
+        state.record_success(newest.clone(), &[], &[]);
+
+        assert_eq!(state.routes.len(), PROVIDER_IMAGE_ROUTE_MAX_ENTRIES);
+        assert!(state.routes.iter().any(|(route, _)| route == &routes[0]));
+        assert!(!state.routes.iter().any(|(route, _)| route == &routes[1]));
+        assert_eq!(state.routes.back().map(|(route, _)| route), Some(&newest));
+    }
+
+    #[test]
+    fn identity_state_evicts_oldest_entries_and_duplicates_refresh_recency() {
+        let route = ProviderImageState::route("compatible.primary", "model-a");
+        let accepted = image_ids("accepted-", PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES);
+        let quarantined = image_ids("quarantined-", PROVIDER_IMAGE_QUARANTINED_MAX_ENTRIES);
+        let accepted_new = image_id("accepted-new");
+        let quarantined_new = image_id("quarantined-new");
+        let mut state = ProviderImageState::default();
+
+        state.record_recovery(route.clone(), &accepted, &quarantined);
+        state.record_recovery(
+            route.clone(),
+            &[accepted[0], accepted_new],
+            &[quarantined[0], quarantined_new],
+        );
+
+        let accepted_after = state.accepted(&route);
+        assert_eq!(accepted_after.len(), PROVIDER_IMAGE_ACCEPTED_MAX_ENTRIES);
+        assert!(accepted_after.contains(&accepted[0]));
+        assert!(!accepted_after.contains(&accepted[1]));
+        assert_eq!(accepted_after.last(), Some(&accepted_new));
+        let quarantined_after = state.quarantined(&route);
+        assert_eq!(
+            quarantined_after.len(),
+            PROVIDER_IMAGE_QUARANTINED_MAX_ENTRIES
+        );
+        assert!(quarantined_after.contains(&quarantined[0]));
+        assert!(!quarantined_after.contains(&quarantined[1]));
+        assert_eq!(quarantined_after.last(), Some(&quarantined_new));
+    }
+
+    #[test]
+    fn quarantine_notice_pluralizes_replaced_history_images() {
+        let singular = crate::i18n::get_english_cli_string_with_args(
+            "turn-provider-images-quarantined",
+            &[("count", "1"), ("count_plural", "one")],
+        );
+        let plural = crate::i18n::get_english_cli_string_with_args(
+            "turn-provider-images-quarantined",
+            &[("count", "2"), ("count_plural", "other")],
+        );
+
+        assert!(singular.contains("1 novel image from earlier conversation history was replaced"));
+        assert!(plural.contains("2 novel images from earlier conversation history were replaced"));
+    }
+
+    #[test]
+    fn newest_user_resubmission_bypasses_only_its_own_suppression() {
+        let image = "data:image/png;base64,AAAA";
+        let messages = vec![
+            ChatMessage::user(format!("old [IMAGE:{image}]")),
+            ChatMessage::assistant("retry it"),
+            ChatMessage::user(format!("new [IMAGE:{image}]")),
+        ];
+        let id = image_id("AAAA");
+
+        let filtered = suppress_quarantined_provider_images(&messages, &[id]);
+
+        assert!(!filtered[0].content.contains("[IMAGE:"));
+        assert!(filtered[2].content.contains("[IMAGE:"));
+    }
+}
+
+pub struct ToolLoopImageState<'a> {
+    pub cache: &'a mut zeroclaw_providers::multimodal::LocalImageCache,
+    pub(crate) provider_state: &'a mut ProviderImageState,
+}
 
 /// Complete system-prompt variants for the two tool transports supported by a
 /// turn. The caller owns construction; the loop only selects the variant after
@@ -234,363 +507,6 @@ pub struct ToolLoop<'a> {
     /// FAILS CLOSED (the step errors rather than running with the parent
     /// agent's broader context).
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
-}
-
-const PROVIDER_IMAGE_QUARANTINE_MAX_ENTRIES: usize = 32;
-
-#[derive(Debug, Default)]
-pub(crate) struct ProviderImageQuarantine {
-    ids: Vec<zeroclaw_providers::multimodal::ProviderImageId>,
-}
-
-impl ProviderImageQuarantine {
-    fn as_slice(&self) -> &[zeroclaw_providers::multimodal::ProviderImageId] {
-        &self.ids
-    }
-
-    fn retain_rejected(
-        &mut self,
-        rejected: impl IntoIterator<Item = zeroclaw_providers::multimodal::ProviderImageId>,
-    ) {
-        for id in rejected {
-            if let Some(index) = self.ids.iter().position(|existing| *existing == id) {
-                self.ids.remove(index);
-            }
-            self.ids.push(id);
-        }
-        let excess = self
-            .ids
-            .len()
-            .saturating_sub(PROVIDER_IMAGE_QUARANTINE_MAX_ENTRIES);
-        if excess > 0 {
-            self.ids.drain(..excess);
-        }
-    }
-
-    fn clear_retried(&mut self, retried: &[zeroclaw_providers::multimodal::ProviderImageId]) {
-        self.ids.retain(|id| !retried.contains(id));
-    }
-}
-
-fn rejected_provider_image_ids(
-    error: &anyhow::Error,
-    submitted: &[zeroclaw_providers::multimodal::ProviderImageId],
-) -> Option<Vec<zeroclaw_providers::multimodal::ProviderImageId>> {
-    let rejection = error.chain().find_map(|source| {
-        source.downcast_ref::<zeroclaw_api::model_provider::ProviderImageInputRejected>()
-    })?;
-    Some(match &rejection.image_indices {
-        Some(indices) => indices
-            .iter()
-            .filter_map(|index| submitted.get(*index).copied())
-            .collect(),
-        None => submitted.to_vec(),
-    })
-}
-
-fn retain_provider_image_rejection(
-    quarantine: &mut ProviderImageQuarantine,
-    error: &anyhow::Error,
-    submitted: &[zeroclaw_providers::multimodal::ProviderImageId],
-) {
-    if let Some(rejected) = rejected_provider_image_ids(error, submitted) {
-        quarantine.retain_rejected(rejected);
-    }
-}
-
-pub struct ToolLoopImageState<'a> {
-    pub cache: &'a mut zeroclaw_providers::multimodal::LocalImageCache,
-    pub(crate) quarantine: &'a mut ProviderImageQuarantine,
-}
-
-#[cfg(test)]
-mod provider_image_quarantine_tests {
-    use super::*;
-    use axum::{
-        Json, Router,
-        http::{StatusCode, header},
-        response::IntoResponse,
-        routing::post,
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-    use tokio::net::TcpListener;
-    use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
-    use zeroclaw_providers::reliable::ReliableModelProvider;
-
-    fn reliable_compatible(base_url: &str) -> ReliableModelProvider {
-        let compatible = OpenAiCompatibleModelProvider::builder("test")
-            .display_name("Test Compatible")
-            .base_url(base_url)
-            .credential(None)
-            .auth_style(AuthStyle::Bearer)
-            .vision(true)
-            .build();
-        ReliableModelProvider::new(
-            "test",
-            vec![(
-                "primary".to_string(),
-                Box::new(compatible) as Box<dyn ModelProvider>,
-            )],
-            0,
-            1,
-        )
-    }
-
-    async fn run_image_turn(
-        provider: &dyn ModelProvider,
-        history: &mut Vec<ChatMessage>,
-        cache: &mut zeroclaw_providers::multimodal::LocalImageCache,
-        quarantine: &mut ProviderImageQuarantine,
-    ) -> anyhow::Result<String> {
-        let observer = crate::observability::NoopObserver;
-        let tools_registry =
-            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
-        let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let knobs = LoopKnobs::default();
-        let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(64);
-
-        run_tool_call_loop(ToolLoop {
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: provider,
-                    provider_name: "test-provider",
-                    model: "test-model",
-                    temperature: Some(0.0),
-                },
-                tools_registry: &tools_registry,
-                observer: &observer,
-                silent: true,
-                approval: None,
-                multimodal_config: &multimodal_config,
-                config: None,
-                max_tool_iterations: 3,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &pacing,
-                strict_tool_parsing: false,
-                parallel_tools: false,
-                max_tool_result_chars: 0,
-                context_token_budget: 0,
-                receipt_generator: None,
-                knobs: &knobs,
-            },
-            history,
-            channel_name: "test",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: Some(delta_tx),
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx: None,
-            steering: None,
-            new_messages_out: None,
-            image_cache: Some(ToolLoopImageState { cache, quarantine }),
-            ingress: IngressContext::sub_turn(),
-            memory: None,
-            agent_alias: None,
-            parent_agent_alias: None,
-            turn_id: "test-turn",
-            sop_reassembly: None,
-        })
-        .await
-    }
-
-    fn request_contains_image(payload: &serde_json::Value) -> bool {
-        payload
-            .get("messages")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message
-                        .get("content")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|parts| {
-                            parts.iter().any(|part| {
-                                part.get("type").and_then(serde_json::Value::as_str)
-                                    == Some("image_url")
-                            })
-                        })
-                })
-            })
-    }
-
-    fn image_ids() -> Vec<zeroclaw_providers::multimodal::ProviderImageId> {
-        zeroclaw_providers::multimodal::provider_image_ids(&[
-            ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]"),
-            ChatMessage::user("[IMAGE:data:image/png;base64,BBBB]"),
-        ])
-    }
-
-    #[test]
-    fn request_level_rejection_selects_all_submitted_images() {
-        let submitted = image_ids();
-        let error = anyhow::Error::new(
-            zeroclaw_api::model_provider::ProviderImageInputRejected::new(None, "request rejected"),
-        )
-        .context("terminal provider failure");
-
-        assert_eq!(
-            rejected_provider_image_ids(&error, &submitted),
-            Some(submitted)
-        );
-    }
-
-    #[test]
-    fn indexed_rejection_selects_only_valid_positions() {
-        let submitted = image_ids();
-        let error = anyhow::Error::new(
-            zeroclaw_api::model_provider::ProviderImageInputRejected::new(
-                Some(vec![1, 99]),
-                "one image rejected",
-            ),
-        );
-
-        assert_eq!(
-            rejected_provider_image_ids(&error, &submitted),
-            Some(vec![submitted[1]])
-        );
-    }
-
-    #[test]
-    fn ordinary_provider_error_does_not_quarantine_submitted_images() {
-        let submitted = image_ids();
-        let error = anyhow::Error::msg("400 Bad Request: invalid tool schema");
-        let mut quarantine = ProviderImageQuarantine::default();
-
-        retain_provider_image_rejection(&mut quarantine, &error, &submitted);
-
-        assert!(quarantine.as_slice().is_empty());
-    }
-
-    #[tokio::test]
-    async fn terminal_rejection_quarantines_replay_until_explicit_retry_succeeds() {
-        let uri = "data:image/png;base64,AAAA";
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let requests_for_route = Arc::clone(&requests);
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_for_route = Arc::clone(&request_count);
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move |Json(payload): Json<serde_json::Value>| {
-                let requests = Arc::clone(&requests_for_route);
-                let request_count = Arc::clone(&request_count_for_route);
-                async move {
-                    requests.lock().expect("capture request").push(payload);
-                    if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            [(header::CONTENT_TYPE, "application/json")],
-                            r#"{"error":{"code":"image_input_rejected","message":"image rejected"}}"#,
-                        )
-                            .into_response()
-                    } else {
-                        (
-                            StatusCode::OK,
-                            [(header::CONTENT_TYPE, "text/event-stream")],
-                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
-                        )
-                            .into_response()
-                    }
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind compatible test server");
-        let addr = listener.local_addr().expect("read compatible test address");
-        let server = ::zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve compatible test responses");
-        });
-        let provider = reliable_compatible(&format!("http://{addr}"));
-        let mut history = vec![ChatMessage::user(format!("Look [IMAGE:{uri}]"))];
-        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
-        let mut quarantine = ProviderImageQuarantine::default();
-
-        let error = run_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
-            .await
-            .expect_err("the compatible provider must reject the image");
-        assert!(error.chain().any(|source| {
-            source.is::<zeroclaw_api::model_provider::ProviderImageInputRejected>()
-        }));
-        assert_eq!(quarantine.as_slice().len(), 1);
-        assert!(history[0].content.contains("[IMAGE:"));
-
-        history.push(ChatMessage::user("Continue without it"));
-        assert_eq!(
-            run_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
-                .await
-                .expect("text-only follow-up succeeds"),
-            "ok"
-        );
-        assert_eq!(quarantine.as_slice().len(), 1);
-
-        history.push(ChatMessage::user(format!("Try again [IMAGE:{uri}]")));
-        assert_eq!(
-            run_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
-                .await
-                .expect("explicit retry succeeds"),
-            "ok"
-        );
-        assert!(quarantine.as_slice().is_empty());
-
-        let captured = requests.lock().expect("read captured requests");
-        assert_eq!(captured.len(), 3, "each turn makes one physical request");
-        assert!(request_contains_image(&captured[0]));
-        assert!(!request_contains_image(&captured[1]));
-        assert!(request_contains_image(&captured[2]));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn compatible_ordinary_error_through_reliable_does_not_quarantine_images() {
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_for_route = Arc::clone(&request_count);
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move || {
-                let request_count = Arc::clone(&request_count_for_route);
-                async move {
-                    request_count.fetch_add(1, Ordering::Relaxed);
-                    (
-                        StatusCode::BAD_REQUEST,
-                        [(header::CONTENT_TYPE, "application/json")],
-                        r#"{"error":{"code":"invalid_request_error","message":"invalid tool schema"}}"#,
-                    )
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind compatible test server");
-        let addr = listener.local_addr().expect("read compatible test address");
-        let server = ::zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve compatible test response");
-        });
-        let provider = reliable_compatible(&format!("http://{addr}"));
-        let mut history = vec![ChatMessage::user("Look [IMAGE:data:image/png;base64,AAAA]")];
-        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
-        let mut quarantine = ProviderImageQuarantine::default();
-
-        let error = run_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
-            .await
-            .expect_err("ordinary compatible error remains terminal");
-        assert!(!error.chain().any(|source| {
-            source.is::<zeroclaw_api::model_provider::ProviderImageInputRejected>()
-        }));
-        assert!(quarantine.as_slice().is_empty());
-        assert_eq!(request_count.load(Ordering::Relaxed), 1);
-        server.abort();
-    }
 }
 
 async fn enforce_reported_budget(
@@ -764,13 +680,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         sop_reassembly,
     } = p;
     let mut loop_local_image_cache = None;
-    let mut loop_local_image_quarantine = ProviderImageQuarantine::default();
+    let mut loop_local_provider_image_state = ProviderImageState::default();
     let mut image_cache = Some(match image_cache {
-        Some(cache) => cache,
+        Some(state) => state,
         None => ToolLoopImageState {
             cache: loop_local_image_cache
                 .insert(zeroclaw_providers::multimodal::LocalImageCache::new()),
-            quarantine: &mut loop_local_image_quarantine,
+            provider_state: &mut loop_local_provider_image_state,
         },
     });
     let ResolvedAgentExecution {
@@ -1123,12 +1039,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_state.history,
             multimodal_config,
             degrade_strip_images,
-            image_cache.as_mut(),
+            image_cache.as_mut().map(|state| &mut *state.cache),
         )
         .await?;
-        let mut retry_image_ids = prepared_messages.retry_image_ids;
-        let mut submitted_image_ids = prepared_messages.submitted_image_ids;
         let mut provider_request_messages = prepared_messages.messages;
+        let newest_user_image_ids = prepared_messages.newest_user_image_ids;
         let mut hook_selected_model = None;
 
         if let Some(hooks) = ctx.hooks.filter(|hooks| !hooks.is_empty()) {
@@ -1145,12 +1060,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 }
             }
         }
-        if ctx.hooks.is_some() {
-            submitted_image_ids =
-                zeroclaw_providers::multimodal::provider_image_ids(&provider_request_messages);
-            retry_image_ids.retain(|id| submitted_image_ids.contains(id));
-        }
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        let image_route =
+            ProviderImageState::route(active_model_provider_name, provider_request_model);
+        let quarantined_image_ids = image_cache
+            .as_mut()
+            .map(|state| state.provider_state.quarantined(&image_route))
+            .unwrap_or_default();
+        provider_request_messages = suppress_quarantined_provider_images(
+            &provider_request_messages,
+            &quarantined_image_ids,
+        );
         // Only direct Agent turns scope the complete prompt variants. Preserve
         // the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt
@@ -1179,6 +1099,29 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &mut provider_request_messages,
             use_native_tools,
         );
+        let submitted_image_ids =
+            zeroclaw_providers::multimodal::provider_image_ids(&provider_request_messages);
+        let accepted_image_ids = image_cache
+            .as_mut()
+            .map(|state| state.provider_state.accepted(&image_route))
+            .unwrap_or_default();
+        let recovery_replaced_image_ids: Vec<_> = submitted_image_ids
+            .iter()
+            .copied()
+            .filter(|image| !accepted_image_ids.contains(image))
+            .collect();
+        let image_recovery_messages = (!submitted_image_ids.is_empty()
+            && !recovery_replaced_image_ids.is_empty())
+        .then(|| {
+            zeroclaw_providers::multimodal::omit_provider_image_ids(
+                &provider_request_messages,
+                &recovery_replaced_image_ids,
+            )
+        });
+        let recovery_submitted_image_ids = image_recovery_messages
+            .as_deref()
+            .map(zeroclaw_providers::multimodal::provider_image_ids)
+            .unwrap_or_default();
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
@@ -1259,16 +1202,25 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
+            image_recovery_succeeded,
         } = call_provider(
             &ctx,
             active_model_provider,
             provider_request_model,
             &provider_request_messages,
+            image_recovery_messages.as_deref(),
             request_tools,
             should_consume_provider_stream,
             iteration,
         )
         .await?;
+        let accepted_request_messages = if image_recovery_succeeded {
+            image_recovery_messages
+                .as_deref()
+                .unwrap_or(&provider_request_messages)
+        } else {
+            &provider_request_messages
+        };
 
         // Reliable reports its actually served candidate; direct providers
         // intentionally retain the requested route as the accounting fallback.
@@ -1303,15 +1255,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             response_usage,
         ) = match chat_result {
             Ok(resp) => {
-                if let Some(image_state) = image_cache.as_mut() {
-                    image_state.quarantine.clear_retried(&retry_image_ids);
-                }
                 let interpreted = interpret_chat_response(
                     &ctx,
                     served_provider,
                     served_model,
                     resp,
-                    &provider_request_messages,
+                    accepted_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
                     iteration,
@@ -1332,13 +1281,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                if let Some(image_state) = image_cache.as_mut() {
-                    retain_provider_image_rejection(
-                        image_state.quarantine,
-                        &e,
-                        &submitted_image_ids,
-                    );
-                }
                 crate::agent::cost::settle_provider_attempts(&attempts, None);
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
@@ -1466,7 +1408,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &native_tool_calls,
             tool_calls.len(),
             response_usage.as_ref(),
-            &provider_request_messages,
+            accepted_request_messages,
             llm_started_at,
             iteration,
         )
@@ -1476,6 +1418,44 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // presentation state after parsing has accepted the response, so a
         // malformed fallback completion cannot leak a stale recovery notice.
         zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
+
+        if let Some(image_state) = image_cache.as_mut() {
+            if image_recovery_succeeded {
+                image_state.provider_state.record_recovery(
+                    image_route,
+                    &recovery_submitted_image_ids,
+                    &recovery_replaced_image_ids,
+                );
+            } else {
+                image_state.provider_state.record_success(
+                    image_route,
+                    &submitted_image_ids,
+                    &newest_user_image_ids,
+                );
+            }
+        }
+
+        if image_recovery_succeeded {
+            let replaced_count = recovery_replaced_image_ids.len().to_string();
+            let replaced_count_plural = if recovery_replaced_image_ids.len() == 1 {
+                "one"
+            } else {
+                "other"
+            };
+            let notice = crate::i18n::get_required_cli_string_with_args(
+                "turn-provider-images-quarantined",
+                &[
+                    ("count", replaced_count.as_str()),
+                    ("count_plural", replaced_count_plural),
+                ],
+            );
+            accumulated_display_text.push_str(&notice);
+            accumulated_display_text.push_str("\n\n");
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &format!("{notice}\n\n")).await;
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(StreamDelta::Text(format!("{notice}\n\n"))).await;
+            }
+        }
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -2510,18 +2490,14 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            // Cross-agent steps have an isolated transcript and provider, so a
-                            // rejection there must not suppress the image for the parent agent.
-                            // Keep the decoded image cache shared, but scope rejection state to
-                            // the child loop. Same-agent steps continue sharing both.
-                            let mut child_image_quarantine = ProviderImageQuarantine::default();
+                            let mut child_provider_image_state = ProviderImageState::default();
                             let nested_image_state =
                                 image_cache.as_deref_mut().map(|state| ToolLoopImageState {
                                     cache: &mut *state.cache,
-                                    quarantine: if owned.is_some() {
-                                        &mut child_image_quarantine
+                                    provider_state: if owned.is_some() {
+                                        &mut child_provider_image_state
                                     } else {
-                                        &mut *state.quarantine
+                                        &mut *state.provider_state
                                     },
                                 });
                             let step_result = crate::sop::executor::scope_step_call_sink(
@@ -3405,58 +3381,6 @@ mod sop_step_reassembly_tests {
         }
     }
 
-    struct ImageRejectingProvider;
-
-    impl ::zeroclaw_api::attribution::Attributable for ImageRejectingProvider {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Model(
-                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-
-        fn alias(&self) -> &str {
-            "ImageRejectingProvider"
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ModelProvider for ImageRejectingProvider {
-        fn supports_vision(&self) -> bool {
-            true
-        }
-
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> Result<String> {
-            Err(anyhow::Error::new(
-                zeroclaw_api::model_provider::ProviderImageInputRejected::new(
-                    None,
-                    "image rejected",
-                ),
-            ))
-        }
-
-        async fn chat(
-            &self,
-            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> Result<ChatResponse> {
-            Err(anyhow::Error::new(
-                zeroclaw_api::model_provider::ProviderImageInputRejected::new(
-                    None,
-                    "image rejected",
-                ),
-            ))
-        }
-    }
-
     /// One captured child-provider request: transcript, offered tool-spec
     /// names, and the temperature the loop passed.
     type CapturedRequest = (Vec<ChatMessage>, Vec<String>, Option<f64>);
@@ -3695,38 +3619,6 @@ mod sop_step_reassembly_tests {
         model_switch_callback: Option<ModelSwitchCallback>,
         exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
     ) {
-        drive_step_with_image_state(
-            engine,
-            action,
-            parent_provider,
-            parent_tools,
-            observer,
-            history,
-            new_messages_out,
-            agent_alias,
-            sop_reassembly,
-            model_switch_callback,
-            None,
-            exec_cache,
-        )
-        .await;
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn drive_step_with_image_state(
-        engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
-        action: crate::sop::types::SopRunAction,
-        parent_provider: &dyn ModelProvider,
-        parent_tools: &crate::tools::scoped::ScopedToolRegistry,
-        observer: &dyn crate::observability::Observer,
-        history: &mut Vec<ChatMessage>,
-        new_messages_out: Option<&mut Vec<ChatMessage>>,
-        agent_alias: Option<&str>,
-        sop_reassembly: Option<SopStepReassembly<'_>>,
-        model_switch_callback: Option<ModelSwitchCallback>,
-        image_state: Option<&mut ToolLoopImageState<'_>>,
-        exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
-    ) {
         use crate::sop::executor::QueuedSopAction;
 
         let queued = QueuedSopAction {
@@ -3769,7 +3661,7 @@ mod sop_step_reassembly_tests {
             None,
             None,
             new_messages_out,
-            image_state,
+            None,
             agent_alias,
             None,
             sop_reassembly,
@@ -3797,7 +3689,6 @@ mod sop_step_reassembly_tests {
     // ── Blocker regressions: the REAL nested loop with distinct providers ────
 
     const PARENT_MARKER: &str = "PARENT-ONLY-SECRET-7f3a";
-    const SOP_IMAGE_MARKER: &str = "[IMAGE:data:image/png;base64,AAAA]";
 
     /// Cross-agent steps run on an isolated child transcript: the parent
     /// history (distinct provider, marker message) never reaches the child
@@ -3894,140 +3785,6 @@ mod sop_step_reassembly_tests {
         assert_eq!(result.status, crate::sop::types::SopStepStatus::Completed);
         assert_eq!(result.output, "child-done");
         assert_eq!(result.effective_agent.as_deref(), Some("stepper"));
-    }
-
-    #[tokio::test]
-    async fn cross_agent_image_rejection_does_not_quarantine_parent_replay() {
-        let (engine, _run_id, mut action) = start_single_cross_agent_step("stepper");
-        let crate::sop::types::SopRunAction::ExecuteStep { context, .. } = &mut action else {
-            unreachable!("helper always returns ExecuteStep")
-        };
-        *context = SOP_IMAGE_MARKER.to_string();
-
-        let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
-        let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut child = seeded_owned(
-            requests,
-            Vec::new(),
-            std::collections::HashSet::new(),
-            Vec::new(),
-            None,
-        );
-        child.model_provider = Box::new(ImageRejectingProvider);
-        let mut exec_cache = std::collections::HashMap::from([("stepper".to_string(), child)]);
-
-        let parent_provider = TextProvider;
-        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
-        let mut history = vec![ChatMessage::system("parent system prompt")];
-        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
-        let mut quarantine = ProviderImageQuarantine::default();
-
-        drive_step_with_image_state(
-            engine,
-            action,
-            &parent_provider,
-            &parent_tools,
-            &crate::observability::NoopObserver {},
-            &mut history,
-            None,
-            Some("outer"),
-            Some(handle),
-            None,
-            Some(&mut ToolLoopImageState {
-                cache: &mut cache,
-                quarantine: &mut quarantine,
-            }),
-            &mut exec_cache,
-        )
-        .await;
-
-        assert!(
-            quarantine.as_slice().is_empty(),
-            "a child-provider rejection must not mutate the parent quarantine"
-        );
-        history.push(ChatMessage::user("continue"));
-        let prepared = prepare_messages_for_iteration(
-            &history,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            Some(&mut ToolLoopImageState {
-                cache: &mut cache,
-                quarantine: &mut quarantine,
-            }),
-        )
-        .await
-        .expect("parent replay prepares");
-        assert_eq!(
-            prepared.submitted_image_ids,
-            zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user(
-                SOP_IMAGE_MARKER
-            )]),
-            "the parent provider must still receive the image rejected by the child"
-        );
-    }
-
-    #[tokio::test]
-    async fn same_agent_image_rejection_quarantines_parent_replay() {
-        let (engine, _run_id, mut action) = start_single_cross_agent_step("outer");
-        let crate::sop::types::SopRunAction::ExecuteStep { context, .. } = &mut action else {
-            unreachable!("helper always returns ExecuteStep")
-        };
-        *context = SOP_IMAGE_MARKER.to_string();
-
-        let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
-        let parent_provider = ImageRejectingProvider;
-        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
-        let mut history = vec![ChatMessage::system("parent system prompt")];
-        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
-        let mut quarantine = ProviderImageQuarantine::default();
-        let mut exec_cache = std::collections::HashMap::new();
-
-        drive_step_with_image_state(
-            engine,
-            action,
-            &parent_provider,
-            &parent_tools,
-            &crate::observability::NoopObserver {},
-            &mut history,
-            None,
-            Some("outer"),
-            Some(handle),
-            None,
-            Some(&mut ToolLoopImageState {
-                cache: &mut cache,
-                quarantine: &mut quarantine,
-            }),
-            &mut exec_cache,
-        )
-        .await;
-
-        let expected = zeroclaw_providers::multimodal::provider_image_ids(&[ChatMessage::user(
-            SOP_IMAGE_MARKER,
-        )]);
-        assert_eq!(
-            quarantine.as_slice(),
-            expected,
-            "a same-agent rejection must remain in the parent quarantine"
-        );
-        history.push(ChatMessage::user("continue"));
-        let prepared = prepare_messages_for_iteration(
-            &history,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            Some(&mut ToolLoopImageState {
-                cache: &mut cache,
-                quarantine: &mut quarantine,
-            }),
-        )
-        .await
-        .expect("same-agent replay prepares");
-        assert!(
-            prepared.submitted_image_ids.is_empty(),
-            "the same provider must not receive the rejected historical image again"
-        );
     }
 
     /// The child registry and the child's own `tool_filter_groups` govern the

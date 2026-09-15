@@ -8,8 +8,8 @@ use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    ModelProvider, ProviderImageInputRejected, StreamChunk, StreamError, StreamEvent,
-    StreamOptions, StreamResult, ToolCall as ProviderToolCall,
+    ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult,
+    ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -23,6 +23,21 @@ use zeroclaw_config::schema::ToolResultImagePolicy;
 /// Maximum silence between body reads for OpenAI-compatible SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
+
+tokio::task_local! {
+    static EXACT_REQUEST_REPLAY: ();
+}
+
+/// Run one compatible-provider dispatch without provider-internal retries or
+/// request-shape fallbacks. Runtime uses this only for exact image recovery.
+#[doc(hidden)]
+pub async fn scope_exact_request_replay<F: std::future::Future>(future: F) -> F::Output {
+    EXACT_REQUEST_REPLAY.scope((), future).await
+}
+
+fn exact_request_replay_active() -> bool {
+    EXACT_REQUEST_REPLAY.try_with(|_| ()).is_ok()
+}
 
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -278,98 +293,23 @@ fn structured_api_error_message(value: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn request_contains_image_blocks(payload: &serde_json::Value) -> bool {
-    payload
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message
-                    .get("content")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|parts| {
-                        parts.iter().any(|part| {
-                            part.get("type").and_then(serde_json::Value::as_str)
-                                == Some("image_url")
-                        })
-                    })
-            })
-        })
-}
-
-fn api_chat_request_contains_image_blocks(request: &ApiChatRequest) -> bool {
-    request.messages.iter().any(|message| {
-        matches!(
-            &message.content,
-            MessageContent::Parts(parts)
-                if parts
-                    .iter()
-                    .any(|part| matches!(part, MessagePart::ImageUrl { .. }))
-        )
-    })
-}
-
-fn compatible_image_rejection_detail(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let error = value
-        .get("error")
-        .and_then(serde_json::Value::as_object)
-        .or_else(|| value.as_object())?;
-    let discriminator = error
-        .get("code")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| error.get("type").and_then(serde_json::Value::as_str))?;
-    let is_image_rejection = [
-        "image_input_rejected",
-        "image_processing_error",
-        "invalid_image",
-        "unsupported_image",
-    ]
-    .iter()
-    .any(|known| discriminator.trim().eq_ignore_ascii_case(known));
-    if !is_image_rejection {
-        return None;
-    }
-
-    let detail = structured_api_error_message(&value).unwrap_or_else(|| body.to_string());
-    Some(super::sanitize_api_error(&detail))
-}
-
-fn api_error_for_request(
-    model_provider: &str,
-    status: reqwest::StatusCode,
-    body: &str,
-    request_contains_images: bool,
-) -> anyhow::Error {
-    if status == reqwest::StatusCode::BAD_REQUEST
-        && request_contains_images
-        && let Some(detail) = compatible_image_rejection_detail(body)
-    {
-        return anyhow::Error::new(ProviderImageInputRejected::new(None, detail));
-    }
-    super::api_error_from_parts(model_provider, status, body)
-}
-
 fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
     let message = serde_json::from_str(body)
         .ok()
         .and_then(|value| structured_api_error_message(&value));
     let sanitized = super::sanitize_api_error(message.as_deref().unwrap_or(body));
-    StreamError::ModelProvider(format!("{status}: {sanitized}"))
+    StreamError::HttpStatus {
+        status: status.as_u16(),
+        message: sanitized,
+    }
 }
 
-fn streaming_api_error_for_request(
-    status: reqwest::StatusCode,
-    body: &str,
-    request_contains_images: bool,
-) -> StreamError {
-    if status == reqwest::StatusCode::BAD_REQUEST
-        && request_contains_images
-        && let Some(detail) = compatible_image_rejection_detail(body)
-    {
-        return StreamError::from(ProviderImageInputRejected::new(None, detail));
-    }
-    streaming_api_error(status, body)
+fn provider_http_error(name: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let error = super::api_error_from_parts(name, status, body);
+    anyhow::Error::new(crate::reliable::ProviderHttpError::new(
+        status,
+        error.to_string(),
+    ))
 }
 
 /// Upper bound on a `/models` catalog response buffered before parsing. Real
@@ -2905,6 +2845,27 @@ impl OpenAiCompatibleModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleModelProvider {
+    fn supports_exact_request_replay(
+        &self,
+        request: ProviderChatRequest<'_>,
+        _model: &str,
+    ) -> bool {
+        // Tools can activate reasoning/schema fallback, and provider-backed
+        // auth can refresh or replace the credential between physical calls.
+        let uses_static_credential = self
+            .credential
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|credential| !credential.is_empty())
+            || self.auth_service.is_none();
+        request.tools.is_none()
+            && self
+                .extra_body
+                .as_ref()
+                .is_none_or(|extra| extra.get("tools").is_none())
+            && uses_static_credential
+    }
+
     fn default_base_url(&self) -> Option<&str> {
         self.canonical_base_url
     }
@@ -3163,7 +3124,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
-        let request_contains_images = api_chat_request_contains_image_blocks(&request);
 
         let url = self.chat_completions_url();
 
@@ -3184,12 +3144,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
-            return Err(api_error_for_request(
-                &self.name,
-                status,
-                &error,
-                request_contains_images,
-            ));
+            return Err(provider_http_error(&self.name, status, &error));
         }
 
         let body = response.text().await?;
@@ -3258,7 +3213,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
-        let request_contains_images = api_chat_request_contains_image_blocks(&request);
 
         let url = self.chat_completions_url();
         let response = match self
@@ -3275,13 +3229,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error = response.text().await?;
-            return Err(api_error_for_request(
-                &self.name,
-                status,
-                &error,
-                request_contains_images,
-            ));
+            let body = response.text().await?;
+            return Err(provider_http_error(&self.name, status, &body));
         }
 
         let body = response.text().await?;
@@ -3323,6 +3272,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let exact_request_replay = exact_request_replay_active();
         let credential = self.resolve_credential().await?;
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
@@ -3345,7 +3295,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .get("tools")
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len);
-        let request_contains_images = request_contains_image_blocks(&payload);
 
         let url = self.chat_completions_url();
         let response = loop {
@@ -3358,6 +3307,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .await
             {
                 Ok(response) => response,
+                Err(error) if exact_request_replay => return Err(error.into()),
                 Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -3383,7 +3333,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let status = response.status();
             let error = response.text().await?;
-            if tools_count > 0
+            if !exact_request_replay
+                && tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
                 && ensure_reasoning_effort_none(&mut payload)
             {
@@ -3408,16 +3359,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 continue;
             }
 
-            if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
-                return Err(api_error_for_request(
-                    &self.name,
-                    status,
-                    &error,
-                    request_contains_images,
-                ));
-            }
-
-            return Err(super::api_error_from_parts(&self.name, status, &error));
+            return Err(provider_http_error(&self.name, status, &error));
         };
 
         let body = response.text().await?;
@@ -3445,6 +3387,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let exact_request_replay = exact_request_replay_active();
         let credential = self.resolve_credential().await?;
 
         let normalized = self
@@ -3475,7 +3418,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             self.reasoning_effort.is_some() && payload.get("reasoning_effort").is_none();
         let reasoning_effort_omission_reason =
             reasoning_effort_omitted.then_some("model_ineligible");
-        let request_contains_images = request_contains_image_blocks(&payload);
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -3517,7 +3459,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
-            if tools_count > 0
+            if !exact_request_replay
+                && tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
                 && ensure_reasoning_effort_none(&mut payload)
             {
@@ -3542,7 +3485,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 continue;
             }
 
-            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+            if !exact_request_replay
+                && tools_count > 0
+                && Self::is_native_tool_schema_unsupported(status, &sanitized)
+            {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
@@ -3556,16 +3502,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 });
             }
 
-            if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
-                return Err(api_error_for_request(
-                    &self.name,
-                    status,
-                    &error,
-                    request_contains_images,
-                ));
-            }
-
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            return Err(provider_http_error(&self.name, status, &error));
         };
 
         let body = response.text().await?;
@@ -3623,6 +3560,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let options_enabled = options.enabled;
+        let exact_request_replay = exact_request_replay_active();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -3703,7 +3641,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     return;
                 }
             };
-            let request_contains_images = request_contains_image_blocks(&payload);
             if ::zeroclaw_log::debug_enabled() {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -3762,7 +3699,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(text) => text,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                if tools_count > 0
+                if !exact_request_replay
+                    && tools_count > 0
                     && super::rejects_tools_with_reasoning_effort(status, &error)
                     && ensure_reasoning_effort_none(&mut payload)
                 {
@@ -3785,17 +3723,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         "compatible streaming provider retrying with reasoning effort disabled after endpoint capability rejection"
                     );
                     continue;
-                }
-
-                if status == reqwest::StatusCode::BAD_REQUEST && request_contains_images {
-                    let _ = tx
-                        .send(Err(streaming_api_error_for_request(
-                            status,
-                            &error,
-                            request_contains_images,
-                        )))
-                        .await;
-                    return;
                 }
 
                 let _ = tx.send(Err(streaming_api_error(status, &error))).await;
@@ -3900,7 +3827,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
-            let request_contains_images = api_chat_request_contains_image_blocks(&request);
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
@@ -3942,13 +3868,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(e) => e,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                let _ = tx
-                    .send(Err(streaming_api_error_for_request(
-                        status,
-                        &error,
-                        request_contains_images,
-                    )))
-                    .await;
+                let _ = tx.send(Err(streaming_api_error(status, &error))).await;
                 return;
             }
 
@@ -4024,7 +3944,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
-            let request_contains_images = api_chat_request_contains_image_blocks(&request);
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
@@ -4059,13 +3978,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(e) => e,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                let _ = tx
-                    .send(Err(streaming_api_error_for_request(
-                        status,
-                        &error,
-                        request_contains_images,
-                    )))
-                    .await;
+                let _ = tx.send(Err(streaming_api_error(status, &error))).await;
                 return;
             }
 
@@ -4272,83 +4185,6 @@ mod tests {
             error,
             format!("ModelProvider error: 500 Internal Server Error: {message}")
         );
-    }
-
-    #[test]
-    fn structured_image_bad_request_is_typed_for_both_transports() {
-        let payload = serde_json::json!({
-            "messages": [{
-                "role": "user",
-                "content": [{
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,AAAA"}
-                }]
-            }]
-        });
-        let body = r#"{"error":{"code":"image_input_rejected","message":"image rejected: sk-test-secret"}}"#;
-
-        let non_streaming = api_error_for_request(
-            "test",
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            request_contains_image_blocks(&payload),
-        );
-        let rejection = non_streaming
-            .downcast_ref::<ProviderImageInputRejected>()
-            .expect("structured image rejection must remain typed");
-        assert_eq!(rejection.image_indices, None);
-        assert!(rejection.detail.contains("image rejected"));
-        assert!(!rejection.detail.contains("sk-test-secret"));
-
-        let streaming = streaming_api_error_for_request(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            request_contains_image_blocks(&payload),
-        );
-        assert!(matches!(
-            streaming,
-            StreamError::ProviderImageInputRejected(ProviderImageInputRejected {
-                image_indices: None,
-                detail,
-            }) if detail.contains("image rejected") && !detail.contains("sk-test-secret")
-        ));
-    }
-
-    #[test]
-    fn unrelated_image_bad_request_is_ordinary_for_both_transports() {
-        let payload = serde_json::json!({
-            "messages": [{
-                "role": "user",
-                "content": [{
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,AAAA"}
-                }]
-            }]
-        });
-        let body = r#"{"error":{"code":"invalid_request_error","message":"invalid tool schema"}}"#;
-        let non_streaming = api_error_for_request(
-            "test",
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            request_contains_image_blocks(&payload),
-        );
-
-        assert!(
-            non_streaming
-                .downcast_ref::<ProviderImageInputRejected>()
-                .is_none()
-        );
-        assert!(non_streaming.to_string().contains("invalid tool schema"));
-
-        let streaming = streaming_api_error_for_request(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            request_contains_image_blocks(&payload),
-        );
-        assert!(matches!(
-            streaming,
-            StreamError::ModelProvider(message) if message.contains("invalid tool schema")
-        ));
     }
 
     fn make_model_provider(
@@ -4906,7 +4742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejecting_endpoint_retries_once_with_reasoning_disabled() {
+    async fn tool_bearing_request_is_ineligible_and_retains_reasoning_fallback() {
         let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
@@ -4924,18 +4760,14 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
 
-        let response = provider
-            .chat(
-                crate::traits::ChatRequest {
-                    messages: &messages,
-                    tools: Some(&tools),
-                    thinking: None,
-                },
-                "gpt-5",
-                None,
-            )
-            .await
-            .unwrap();
+        let request = crate::traits::ChatRequest {
+            messages: &messages,
+            tools: Some(&tools),
+            thinking: None,
+        };
+        assert!(!provider.supports_exact_request_replay(request, "gpt-5"));
+
+        let response = provider.chat(request, "gpt-5", None).await.unwrap();
         assert_eq!(response.text.as_deref(), Some("ok"));
 
         let bodies = bodies.lock().unwrap();
@@ -4959,7 +4791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_image_request_preserves_reasoning_fallback() {
+    async fn streaming_rejection_retries_once_with_reasoning_disabled() {
         use futures_util::StreamExt as _;
 
         let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(true).await;
@@ -4971,9 +4803,7 @@ mod tests {
             .auth_style(AuthStyle::Bearer)
             .reasoning_effort(Some("high".to_string()))
             .build();
-        let messages = vec![ChatMessage::user(
-            "hello [IMAGE:data:image/png;base64,AAAA]",
-        )];
+        let messages = vec![ChatMessage::user("hello")];
         let tools = vec![zeroclaw_api::tool::ToolSpec::new(
             "get_weather",
             "Get weather",
@@ -5006,7 +4836,6 @@ mod tests {
 
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2, "stream fallback must retry exactly once");
-        assert!(bodies.iter().all(request_contains_image_blocks));
         assert_eq!(
             bodies[0]
                 .get("reasoning_effort")
@@ -5024,7 +4853,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_request_preserves_reasoning_fallback() {
+    async fn exact_replay_scope_suppresses_stream_reasoning_retry() {
+        use futures_util::StreamExt as _;
+
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(true).await;
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let events = scope_exact_request_replay(async {
+            provider
+                .stream_chat(
+                    crate::traits::ChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "gpt-5",
+                    None,
+                    StreamOptions {
+                        enabled: true,
+                        count_tokens: false,
+                    },
+                )
+                .collect::<Vec<_>>()
+                .await
+        })
+        .await;
+
+        assert!(events.iter().any(Result::is_err));
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            1,
+            "exact replay must suppress the spawned stream worker's reasoning retry"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_retries_once_with_reasoning_disabled() {
         let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
@@ -5034,9 +4911,7 @@ mod tests {
             .auth_style(AuthStyle::Bearer)
             .reasoning_effort(Some("high".to_string()))
             .build();
-        let messages = vec![ChatMessage::user(
-            "hello [IMAGE:data:image/png;base64,AAAA]",
-        )];
+        let messages = vec![ChatMessage::user("hello")];
         let tools = vec![serde_json::json!({
             "type": "function",
             "function": {
@@ -5054,7 +4929,6 @@ mod tests {
 
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2, "fallback must be bounded to one retry");
-        assert!(bodies.iter().all(request_contains_image_blocks));
         assert_eq!(
             bodies[0]
                 .get("reasoning_effort")
@@ -7198,6 +7072,80 @@ mod tests {
         assert_eq!(output[0].role, "system");
         assert!(output[0].content.contains("Available Tools"));
         assert!(output[0].content.contains("shell_exec"));
+    }
+
+    #[tokio::test]
+    async fn normal_chat_retains_native_tool_schema_fallback() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let has_tools = body.get("tools").is_some();
+                    bodies.lock().unwrap().push(body);
+                    if has_tools {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {"message": "unknown parameter: tools"}
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "prompt fallback"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "inspect",
+            "Inspect input",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .expect("normal call uses prompt-guided fallback");
+
+        assert_eq!(response.text.as_deref(), Some("prompt fallback"));
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].get("tools").is_some());
+        assert!(bodies[1].get("tools").is_none());
+        server.abort();
     }
 
     #[test]
@@ -9977,5 +9925,21 @@ mod tests {
         assert_eq!(native.len(), 2);
         assert_eq!(native[1].role, "tool");
         assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
+    }
+
+    #[test]
+    fn message_only_bad_request_preserves_http_status_without_prose_classification() {
+        let error = provider_http_error(
+            "test",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"request could not be processed"}}"#,
+        );
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::reliable::ProviderHttpError>()
+                .map(crate::reliable::ProviderHttpError::status),
+            Some(400)
+        );
     }
 }
