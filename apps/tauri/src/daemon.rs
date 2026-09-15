@@ -10,6 +10,8 @@ use std::time::Duration;
 #[cfg(any(unix, windows))]
 use std::time::Instant;
 
+// Keep this wire-protocol limit aligned with DESKTOP_READINESS_FRAME_MAX_BYTES
+// in zeroclaw-runtime's service module.
 const READINESS_FRAME_MAX_BYTES: usize = 4096;
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -376,9 +378,7 @@ fn read_readiness_frame<R: Read>(mut reader: R) -> std::io::Result<Option<String
     if bytes_read == 0 {
         return Ok(None);
     }
-    if frame.len() > READINESS_FRAME_MAX_BYTES && frame.last().copied() != Some(b'\n')
-        || frame.len() > READINESS_FRAME_MAX_BYTES + 1
-    {
+    if frame.len() > READINESS_FRAME_MAX_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("desktop supervisor readiness exceeded {READINESS_FRAME_MAX_BYTES} bytes"),
@@ -722,7 +722,15 @@ mod tests {
 
     #[test]
     fn readiness_frame_rejects_oversized_and_unterminated_input() {
-        let oversized = vec![b'x'; READINESS_FRAME_MAX_BYTES + 1];
+        let mut maximum = vec![b'x'; READINESS_FRAME_MAX_BYTES - 1];
+        maximum.push(b'\n');
+        assert_eq!(
+            read_readiness_frame(maximum.as_slice()).expect("maximum frame"),
+            Some("x".repeat(READINESS_FRAME_MAX_BYTES - 1))
+        );
+
+        let mut oversized = vec![b'x'; READINESS_FRAME_MAX_BYTES];
+        oversized.push(b'\n');
         let error = read_readiness_frame(oversized.as_slice()).expect_err("oversized frame");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeded"));

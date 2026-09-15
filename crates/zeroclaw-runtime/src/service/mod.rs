@@ -19,8 +19,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::io::{AsyncRead, AsyncReadExt};
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, not(unix))))]
+use tokio::process::Child;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
-use tokio::process::{Child, Command as TokioCommand};
+use tokio::process::Command as TokioCommand;
 use zeroclaw_config::schema::{Config, resolve_runtime_dirs};
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
@@ -39,6 +41,8 @@ const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
 const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
 #[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
@@ -68,6 +72,7 @@ struct BoundedServiceLog {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 impl BoundedServiceLog {
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -298,9 +303,13 @@ fn open_or_create_private_desktop_subdir(
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = DirBuilder::new();
+            let builder = DirBuilder::new();
             #[cfg(unix)]
-            builder.mode(0o700);
+            let builder = {
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
             parent.create_dir_with(name, &builder).with_context(|| {
                 format!(
                     "Failed to create private desktop directory {}",
@@ -710,6 +719,15 @@ fn desktop_handshake_frame(prefix: &str, message: Option<&str>) -> String {
     if let Some(message) = message {
         line.push(' ');
         line.push_str(&message.replace("\r\n", " ").replace(['\r', '\n'], " "));
+    }
+    let max_content_bytes = DESKTOP_READINESS_FRAME_MAX_BYTES - 1;
+    if line.len() > max_content_bytes {
+        let mut truncate_at = max_content_bytes - 3;
+        while !line.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        line.truncate(truncate_at);
+        line.push_str("...");
     }
     line.push('\n');
     line
@@ -3563,6 +3581,17 @@ mod bounded_service_log_tests {
             assert_eq!(frame.matches('\n').count(), 1);
             assert!(!frame[..frame.len() - 1].contains('\r'));
         }
+    }
+
+    #[test]
+    fn desktop_error_frame_is_bounded_and_valid_utf8() {
+        let message = "failure ".to_string() + &"界".repeat(DESKTOP_READINESS_FRAME_MAX_BYTES);
+        let frame = desktop_handshake_frame("ERROR", Some(&message));
+
+        assert!(frame.len() <= DESKTOP_READINESS_FRAME_MAX_BYTES);
+        assert!(frame.starts_with("ERROR "));
+        assert!(frame.ends_with("...\n"));
+        assert_eq!(frame.matches('\n').count(), 1);
     }
 
     #[tokio::test]
