@@ -5923,7 +5923,7 @@ mod tests {
             "carried-over image marker must be stripped, got: {sent_blob}"
         );
         assert!(
-            sent_blob.contains("[media attachment]"),
+            sent_blob.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
             "stripped marker should become the text placeholder, got: {sent_blob}"
         );
     }
@@ -15172,6 +15172,7 @@ Let me check the result."#;
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15275,6 +15276,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(5),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15285,6 +15287,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(7),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15636,6 +15639,7 @@ Let me check the result."#;
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15863,6 +15867,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15934,6 +15939,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -16055,6 +16061,7 @@ Let me check the result."#;
                         input_tokens: Some(1_000_000),
                         output_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 },
@@ -16124,6 +16131,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
