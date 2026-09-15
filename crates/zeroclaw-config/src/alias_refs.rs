@@ -741,7 +741,7 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
         // workspace.read_memory_from[] (raw match).
         for m in agent.workspace.read_memory_from.iter_mut() {
             if m.as_str() == old {
-                *m = AgentAlias::new(new);
+                *m.agent_mut() = AgentAlias::new(new);
                 touched = true;
             }
         }
@@ -1460,7 +1460,9 @@ mod tests {
         referrer
             .workspace
             .read_memory_from
-            .push(AgentAlias::new("bot"));
+            .push(crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(
+                "bot",
+            )));
         cfg.agents.insert("lead".to_string(), referrer);
         let mut group = PeerGroupConfig::default();
         group.agents.push(AgentAlias::new("bot"));
@@ -1576,7 +1578,9 @@ mod tests {
             .unwrap()
             .workspace
             .read_memory_from
-            .push(AgentAlias::new(" bot "));
+            .push(crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(
+                " bot ",
+            )));
 
         let sites = find_all_references(&cfg, &AliasKind::Agent, "bot");
         let paths: Vec<_> = sites.iter().map(|s| s.path.as_str()).collect();
@@ -2080,7 +2084,12 @@ mod tests {
         lead.workspace
             .access
             .insert(AgentAlias::new("bot"), AccessMode::Read);
-        lead.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        lead.workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: AgentAlias::new("bot"),
+                categories: Some(vec!["family".to_string(), "events".to_string()]),
+            });
         cfg.agents.insert("lead".to_string(), lead);
         cfg.peer_groups.insert(
             "crew".to_string(),
@@ -2123,9 +2132,9 @@ mod tests {
             delegates: vec![DelegateTargetConfig::bounded(" bot ")],
             ..Default::default()
         };
-        lead.workspace
-            .read_memory_from
-            .push(AgentAlias::new(" bot ")); // raw, must remain
+        lead.workspace.read_memory_from.push(
+            crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(" bot ")), // raw, must remain
+        );
         cfg.agents.insert("lead".to_string(), lead);
 
         let report = delete_with_cascade(
@@ -2185,7 +2194,11 @@ mod tests {
             delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
         };
-        bot.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        bot.workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(
+                "bot",
+            )));
         cfg.agents.insert("bot".to_string(), bot);
 
         let report = delete_with_cascade(
@@ -2428,7 +2441,12 @@ mod tests {
         lead.workspace
             .access
             .insert(AgentAlias::new("bot"), AccessMode::Read);
-        lead.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        lead.workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: AgentAlias::new("bot"),
+                categories: Some(vec!["family".to_string(), "events".to_string()]),
+            });
         cfg.agents.insert("lead".to_string(), lead);
         let mut group = PeerGroupConfig::default();
         group.agents.push(AgentAlias::new("bot"));
@@ -2465,7 +2483,10 @@ mod tests {
         );
         assert_eq!(
             cfg.agents["lead"].workspace.read_memory_from,
-            vec![AgentAlias::new("bot2")]
+            vec![crate::multi_agent::MemoryGrant::Scoped {
+                agent: AgentAlias::new("bot2"),
+                categories: Some(vec!["family".to_string(), "events".to_string()]),
+            }]
         );
         assert_eq!(
             cfg.peer_groups["crew"].agents,
