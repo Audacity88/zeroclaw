@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -1180,7 +1180,10 @@ impl Chat {
     }
 
     /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
-    /// show the CWD picker first on WSS ACP connections).
+    /// show the CWD picker first on WSS ACP connections) — except on the Code
+    /// (ACP) pane with no resumable history, where the single-item agent
+    /// picker is shown first so the memory-isolation disclosure is visible
+    /// before the session starts.
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
         self.init_with_cancel(None, None).await.map(|_| ())
     }
@@ -1248,6 +1251,17 @@ impl Chat {
                 return Ok(ChatInitOutcome::Other);
             }
             if self.try_show_recent_acp_session_picker(&agents).await {
+                return Ok(ChatInitOutcome::Other);
+            }
+            if self.pane_kind == PaneKind::Acp {
+                // No resumable ACP history: route through the same
+                // disclosure-bearing agent picker as the multi-agent
+                // no-history path (below) instead of starting straight into
+                // a session, so a first-time Code user still sees the
+                // history-vs-persistent-memory note before any fresh
+                // `session/new` request goes out. Chat has no such note and
+                // keeps auto-starting.
+                self.show_agent_picker(agents);
                 return Ok(ChatInitOutcome::Other);
             }
             self.pick_or_start_session_inner(&agents[0], cancellation, phase)
@@ -2828,6 +2842,8 @@ impl Chat {
                     list_state,
                     *loading,
                     &self.pane_kind.name(),
+                    (self.pane_kind == PaneKind::Acp)
+                        .then(|| crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
                 );
                 self.pick_agent_list_area = list_area;
             }
@@ -2842,6 +2858,7 @@ impl Chat {
                     sessions,
                     list_state,
                     crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
                 );
             }
             ChatPhase::PickCwd { explorer, .. } => {
@@ -4052,13 +4069,18 @@ impl Chat {
             } = &mut self.phase
             {
                 let overlay_area = session_list_overlay_area(area);
+                // The resume picker renders the memory-isolation note in its
+                // footer; clicks there must not resolve to (possibly hidden)
+                // session rows, so hit-test against the note-free list rect.
+                let note = crate::i18n::t("zc-chat-session-list-resume-note");
+                let click_area = session_list_click_area(overlay_area, Some(&note));
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left)
                         if mouse::in_rect(mouse.column, mouse.row, overlay_area) =>
                     {
                         if let Some(idx) = mouse::list_click_index(
                             mouse.row,
-                            overlay_area,
+                            click_area,
                             list_state.offset(),
                             sessions.len(),
                         ) {
@@ -4364,6 +4386,13 @@ impl Chat {
                 return;
             }
 
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && mouse.modifiers.is_empty()
+                && (state.toggle_tool_footer_at(col, row) || state.toggle_tool_header_at(col, row))
+            {
+                return;
+            }
+
             if !state.in_browse_mode() {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_up(3),
@@ -4659,7 +4688,7 @@ impl crate::widgets::HelpContext for Chat {
                         .chain(action_key_labels(C::BrowseDown))
                         .chain(action_key_labels(C::BrowseUpVim))
                         .chain(action_key_labels(C::BrowseDownVim));
-                    HelpNode::entries(vec![
+                    let mut entries = vec![
                         E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
                         E::new(
                             action_key_labels(ModalAction::Confirm),
@@ -4669,7 +4698,15 @@ impl crate::widgets::HelpContext for Chat {
                             action_key_labels(GlobalAction::Quit),
                             crate::i18n::t("zc-chat-help-quit"),
                         ),
-                    ])
+                    ];
+                    // On the ACP (Code) pane the agent picker is the
+                    // no-saved-session entry point, so include the
+                    // history-vs-persistent-memory disclosure here too. Kept out
+                    // of the Chat pane's picker.
+                    if self.pane_kind == PaneKind::Acp {
+                        entries.push(E::desc(crate::i18n::t("zc-chat-help-acp-memory")));
+                    }
+                    HelpNode::entries(entries)
                 }
             }
             ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
@@ -4690,6 +4727,7 @@ impl crate::widgets::HelpContext for Chat {
                             .chain(action_key_labels(C::NewSession)),
                         crate::i18n::t("zc-chat-help-new-session"),
                     ),
+                    E::desc(crate::i18n::t("zc-chat-help-acp-memory")),
                 ])
             }
             ChatPhase::Error(_) => {
@@ -4901,6 +4939,7 @@ fn draw_agent_picker(
     list_state: &mut ListState,
     loading: bool,
     tab_title: &str,
+    acp_memory_note: Option<String>,
 ) -> Rect {
     let block = Block::default()
         .title(Span::styled(format!(" {tab_title} "), theme::title_style()))
@@ -4926,12 +4965,16 @@ fn draw_agent_picker(
         return Rect::default();
     }
 
+    let note_rows = acp_memory_note
+        .as_deref()
+        .map(|note| note_reserved_rows(note, inner.width))
+        .unwrap_or(1);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(note_rows),
         ])
         .split(inner);
 
@@ -4956,6 +4999,18 @@ fn draw_agent_picker(
         .collect();
     let list = List::new(items).highlight_style(theme::list_highlight_style());
     frame.render_stateful_widget(list, chunks[1], list_state);
+
+    // On the ACP no-saved-session path (a fresh Code start with nothing to
+    // resume) the resume picker never appears, so surface the same
+    // history-vs-persistent-memory disclosure in the agent picker's footer
+    // slot. Only rendered for the Code (ACP) pane — Chat passes `None` — so the
+    // Code-specific copy stays out of the Chat picker.
+    if let Some(note) = acp_memory_note {
+        let note_line =
+            Paragraph::new(Span::styled(note, theme::dim_style())).wrap(Wrap { trim: true });
+        frame.render_widget(note_line, chunks[2]);
+    }
+
     // The list rect is unbordered, but `mouse::list_click_index` assumes a
     // 1-cell top border. Hand back a rect shifted up one row (and one taller) so
     // the helper's border compensation lands on the true first item.
@@ -5147,6 +5202,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
                 sessions,
                 list_state,
                 crate::i18n::t("zc-chat-session-list-switch-title"),
+                None,
             );
         }
         SessionOverlay::None => {}
@@ -5404,6 +5460,104 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn terminal_safe_tool_text_limited(
+    text: &str,
+    max_bytes: usize,
+    max_lines: usize,
+) -> (String, bool) {
+    let mut safe = String::with_capacity(text.len().min(max_bytes));
+    let mut lines = 1usize;
+    for ch in text.chars() {
+        let piece = match ch {
+            '\n' if lines >= max_lines => return (safe, true),
+            '\n' => {
+                lines += 1;
+                "\n".to_string()
+            }
+            ch if ch.is_control() => ch.escape_default().to_string(),
+            ch => ch.to_string(),
+        };
+        if safe.len().saturating_add(piece.len()) > max_bytes {
+            return (safe, true);
+        }
+        safe.push_str(&piece);
+    }
+    (safe, false)
+}
+
+const FILE_TOOL_PREVIEW_LINES: usize = 6;
+const TOOL_EXPANDED_MAX_BYTES: usize = 8 * 1024;
+const TOOL_EXPANDED_MAX_LINES: usize = 100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolDisclosure {
+    Collapsed,
+    Preview,
+    Full,
+}
+
+impl ToolDisclosure {
+    fn is_open(self) -> bool {
+        !matches!(self, Self::Collapsed)
+    }
+}
+
+fn valid_specialized_file_input(name: &str, input: &serde_json::Value) -> bool {
+    if input.get("path").and_then(|value| value.as_str()).is_none() {
+        return false;
+    }
+    match name {
+        "file_edit" => {
+            input
+                .get("old_string")
+                .and_then(|value| value.as_str())
+                .is_some()
+                && input
+                    .get("new_string")
+                    .and_then(|value| value.as_str())
+                    .is_some()
+        }
+        "file_write" => {
+            let has_content = input
+                .get("content")
+                .and_then(|value| value.as_str())
+                .is_some();
+            let valid_encoding = match input.get("encoding") {
+                None => true,
+                Some(serde_json::Value::String(encoding)) => {
+                    encoding == "utf8" || encoding == "base64"
+                }
+                Some(_) => false,
+            };
+            has_content && valid_encoding
+        }
+        _ => false,
+    }
+}
+
+fn default_tool_disclosure(name: &str, input_json: &str) -> ToolDisclosure {
+    let specialized = matches!(name, "file_edit" | "file_write")
+        && serde_json::from_str::<serde_json::Value>(input_json)
+            .is_ok_and(|input| valid_specialized_file_input(name, &input));
+    if specialized {
+        ToolDisclosure::Preview
+    } else {
+        ToolDisclosure::Collapsed
+    }
+}
+
+fn semantic_tool_metadata(input: &serde_json::Value, bulk_fields: &[&str]) -> String {
+    let Some(object) = input.as_object() else {
+        return input.to_string();
+    };
+    let metadata = object
+        .iter()
+        .filter(|(key, _)| !bulk_fields.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::Value::Object(metadata).to_string()
+}
+
 fn bounded_tool_output(raw_output: String) -> String {
     const MAX_OUTPUT: usize = 16 * 1024;
     const TRUNCATION_MARKER: &str = "…[truncated]";
@@ -5425,76 +5579,185 @@ fn render_tool_entry(
     input_json: &str,
     result: Option<&str>,
     is_selected: bool,
-) {
+    disclosure: ToolDisclosure,
+) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
         Modifier::empty()
     };
+    let marker = if disclosure.is_open() { "▼" } else { "▶" };
     lines.push(Line::from(vec![Span::styled(
-        format!("[tool: {name}] "),
+        format!("{marker} [tool: {name}] "),
         theme::tool_label_style().add_modifier(sel_mod),
     )]));
 
-    let parsed: Option<serde_json::Value> = match name {
-        "file_edit" | "file_write" => serde_json::from_str(input_json).ok(),
-        _ => None,
+    let preview = |text: &str, max_bytes: usize| {
+        let (compact, limited) = terminal_safe_tool_text_limited(text, max_bytes, 1);
+        if limited {
+            format!("{compact}…")
+        } else {
+            compact
+        }
     };
-
-    let body_start = lines.len();
-    match name {
-        "file_edit" => {
-            let input = parsed.as_ref();
-            let old = input
-                .and_then(|v| v.get("old_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let new = input
-                .and_then(|v| v.get("new_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
-            let ext = input.and_then(|v| file_ext(v));
-            let start_line = path
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|content| {
-                    content
-                        .find(old)
-                        .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
-                })
-                .unwrap_or(1);
-            lines.extend(diff::diff_lines(old, new, ext, start_line));
-        }
-        "file_write" => {
-            let input = parsed.as_ref();
-            let content = input
-                .and_then(|v| v.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let ext = input.and_then(|v| file_ext(v));
-            lines.extend(diff::write_lines(content, ext));
-        }
-        _ => {
-            let truncated = if input_json.len() > 120 {
-                format!("{}…", truncate_utf8(input_json, 120))
+    let push_text = |lines: &mut Vec<Line<'static>>, label: &str, text: &str| {
+        for (line_idx, text_line) in text.split('\n').enumerate() {
+            let prefix = if line_idx == 0 {
+                format!("  {label}: ")
             } else {
-                input_json.to_string()
+                "    ".to_string()
             };
             lines.push(Line::from(Span::styled(
-                format!("  {truncated}"),
+                format!("{prefix}{text_line}"),
                 theme::dim_style().add_modifier(sel_mod),
             )));
         }
+    };
+
+    let body_start = lines.len();
+    let mut footer = None;
+    let mut display_limited = false;
+    let render_generic_input = |lines: &mut Vec<Line<'static>>| {
+        let (input, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(
+                input_json,
+                TOOL_EXPANDED_MAX_BYTES,
+                TOOL_EXPANDED_MAX_LINES,
+            )
+        } else {
+            (preview(input_json, 120), false)
+        };
+        push_text(lines, "input", &input);
+        limited
+    };
+    match name {
+        "file_edit" => {
+            if disclosure.is_open() {
+                let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+                let valid = parsed
+                    .as_ref()
+                    .filter(|input| valid_specialized_file_input(name, input))
+                    .and_then(|input| {
+                        Some((
+                            input.get("old_string")?.as_str()?,
+                            input.get("new_string")?.as_str()?,
+                        ))
+                    });
+                if let (Some(input), Some((old, new))) = (parsed.as_ref(), valid) {
+                    let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
+                        &semantic_tool_metadata(input, &["old_string", "new_string"]),
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= metadata_limited;
+                    push_text(lines, "input", &metadata);
+                    let (old, old_limited) = terminal_safe_tool_text_limited(
+                        old,
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    let (new, new_limited) = terminal_safe_tool_text_limited(
+                        new,
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= old_limited || new_limited;
+                    let rendered = diff::diff_lines_limited(
+                        &old,
+                        &new,
+                        file_ext(input),
+                        None,
+                        matches!(disclosure, ToolDisclosure::Preview)
+                            .then_some(FILE_TOOL_PREVIEW_LINES),
+                    );
+                    footer = (rendered.total > FILE_TOOL_PREVIEW_LINES).then_some(rendered.omitted);
+                    lines.extend(rendered.lines);
+                } else {
+                    display_limited |= render_generic_input(lines);
+                }
+            }
+        }
+        "file_write" => {
+            if disclosure.is_open() {
+                let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+                let content = parsed
+                    .as_ref()
+                    .filter(|input| valid_specialized_file_input(name, input))
+                    .and_then(|input| input.get("content"))
+                    .and_then(|value| value.as_str());
+                if let (Some(input), Some(content)) = (parsed.as_ref(), content) {
+                    let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
+                        &semantic_tool_metadata(input, &["content"]),
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= metadata_limited;
+                    push_text(lines, "input", &metadata);
+                    let encoding = input
+                        .get("encoding")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("utf8");
+                    if encoding == "base64" {
+                        push_text(
+                            lines,
+                            "content",
+                            &crate::i18n::t_args(
+                                "zc-chat-tool-encoded-size",
+                                &[("count", &content.len().to_string())],
+                            ),
+                        );
+                    } else {
+                        let (content, limited) = terminal_safe_tool_text_limited(
+                            content,
+                            TOOL_EXPANDED_MAX_BYTES,
+                            TOOL_EXPANDED_MAX_LINES,
+                        );
+                        display_limited |= limited;
+                        let rendered = diff::write_lines_limited(
+                            &content,
+                            file_ext(input),
+                            matches!(disclosure, ToolDisclosure::Preview)
+                                .then_some(FILE_TOOL_PREVIEW_LINES),
+                        );
+                        footer =
+                            (rendered.total > FILE_TOOL_PREVIEW_LINES).then_some(rendered.omitted);
+                        lines.extend(rendered.lines);
+                    }
+                } else {
+                    display_limited |= render_generic_input(lines);
+                }
+            }
+        }
+        _ => display_limited |= render_generic_input(lines),
+    }
+
+    let mut footer_line = None;
+    if let Some(omitted) = footer {
+        let text = if matches!(disclosure, ToolDisclosure::Full) {
+            crate::i18n::t("zc-chat-tool-show-less")
+        } else {
+            crate::i18n::t_args("zc-chat-tool-show-all", &[("count", &omitted.to_string())])
+        };
+        footer_line = Some(lines.len());
+        lines.push(Line::from(Span::styled(
+            format!("  {text}"),
+            theme::tool_label_style().add_modifier(sel_mod),
+        )));
     }
 
     if let Some(res) = result {
-        let truncated = if res.len() > 200 {
-            format!("{}…", truncate_utf8(res, 200))
+        let (result, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
         } else {
-            res.to_string()
+            (preview(res, 200), false)
         };
+        push_text(lines, "result", &result);
+        display_limited |= limited;
+    }
+
+    if display_limited {
         lines.push(Line::from(Span::styled(
-            format!("  → {truncated}"),
+            format!("  {}", crate::i18n::t("zc-chat-tool-display-limited")),
             theme::dim_style().add_modifier(sel_mod),
         )));
     }
@@ -5509,6 +5772,7 @@ fn render_tool_entry(
                 .collect();
         }
     }
+    footer_line
 }
 
 /// Render a single committed entry into `lines`.
@@ -5518,9 +5782,10 @@ fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
     show_thoughts: bool,
+    tool_disclosure: ToolDisclosure,
     width: u16,
     lines: &mut Vec<Line<'static>>,
-) {
+) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
@@ -5602,15 +5867,17 @@ fn render_entry_into(
             result,
             ..
         } => {
-            render_tool_entry(
+            return render_tool_entry(
                 lines,
                 name.as_ref(),
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
                 is_selected,
+                tool_disclosure,
             );
         }
     }
+    None
 }
 
 /// Locate the `[Copy]` label within a code-fence bar line. Returns the label's
@@ -5729,6 +5996,37 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
+fn append_wrapped_hit_rects(
+    regions: &mut Vec<(usize, Rect)>,
+    entry_idx: usize,
+    line: &Line<'static>,
+    screen_start: u16,
+    scroll: u16,
+    body: Rect,
+) {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    for (row_offset, visual_line) in crate::input_bar::wrap_visual_lines(&text, body.width)
+        .iter()
+        .enumerate()
+    {
+        let screen_row = screen_start.saturating_add(row_offset as u16);
+        if screen_row < scroll || screen_row >= scroll.saturating_add(body.height) {
+            continue;
+        }
+        let width = crate::display_width::display_width(&text[visual_line.start..visual_line.end])
+            .min(usize::from(body.width));
+        if width > 0 {
+            regions.push((
+                entry_idx,
+                Rect::new(body.x, body.y + (screen_row - scroll), width as u16, 1),
+            ));
+        }
+    }
+}
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
 fn copy_region(
     global_row: u16,
@@ -5959,9 +6257,11 @@ fn render_conversation(
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    for &(entry_idx, screen_lo, screen_hi, content_width) in
-        &state.cached_screen_ranges[visible_cached_window.entries.clone()]
-    {
+    state.tool_header_rects.clear();
+    state.tool_footer_rects.clear();
+    for range_idx in visible_cached_window.entries.clone() {
+        let (entry_idx, screen_lo, screen_hi, content_width) =
+            state.cached_screen_ranges[range_idx];
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll.saturating_add(body_h));
         debug_assert!(visible_hi > visible_lo);
@@ -5975,6 +6275,33 @@ fn render_conversation(
             visible_hi - visible_lo,
         );
         state.entry_rects.push((entry_idx, rect));
+
+        if matches!(state.entries.get(entry_idx), Some(ChatEntry::Tool { .. })) {
+            let (_, line_lo, line_hi) = state.cached_line_ranges[range_idx];
+            let header_line = &state.cached_lines[line_lo];
+            append_wrapped_hit_rects(
+                &mut state.tool_header_rects,
+                entry_idx,
+                header_line,
+                screen_lo,
+                scroll,
+                body_area,
+            );
+
+            if let Some(&footer_line) = state.cached_tool_footer_lines.get(&entry_idx)
+                && (line_lo..line_hi).contains(&footer_line)
+            {
+                let footer_screen_lo = state.cached_line_screen_ranges[footer_line].0;
+                append_wrapped_hit_rects(
+                    &mut state.tool_footer_rects,
+                    entry_idx,
+                    &state.cached_lines[footer_line],
+                    footer_screen_lo,
+                    scroll,
+                    body_area,
+                );
+            }
+        }
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
@@ -6370,12 +6697,63 @@ fn session_list_overlay_area(area: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
+/// Shrink the session-list overlay rect to the rows that actually render
+/// list items when a footer `note` is present, mirroring the carve-out in
+/// [`render_session_list_overlay`]. `mouse::list_click_index` treats every
+/// row inside the border as list content, so hit-testing against the full
+/// overlay rect would map clicks on the note rows to (possibly scrolled
+/// off-screen) session indices. Keeping this next to
+/// [`session_list_overlay_area`] preserves the "same geometry, no stored
+/// state" contract for mouse handling.
+fn session_list_click_area(overlay_area: Rect, note: Option<&str>) -> Rect {
+    let Some(note) = note else {
+        return overlay_area;
+    };
+    let inner_width = overlay_area.width.saturating_sub(2);
+    let inner_height = overlay_area.height.saturating_sub(2);
+    let reserved = note_reserved_rows(note, inner_width);
+    if inner_height > reserved {
+        Rect::new(
+            overlay_area.x,
+            overlay_area.y,
+            overlay_area.width,
+            overlay_area.height - reserved,
+        )
+    } else {
+        // The render path keeps the full inner rect for the list when the
+        // note cannot fit; mirror that here.
+        overlay_area
+    }
+}
+
+/// Rows to reserve for the dim footer `note` so it renders in full when
+/// wrapped at `inner_width`. ratatui's `Wrap { trim: true }` breaks on word
+/// boundaries, so the row count is *not* `ceil(display_width / inner_width)` —
+/// a word that would overflow the current line is pushed whole to the next one,
+/// which can cost an extra row. We mirror that word-boundary packing here so a
+/// narrow inner width (e.g. the 80x24 default) reserves enough rows for every
+/// wrapped line. The disclosure is short, fixed catalogue copy, so its full
+/// wrapped height is authoritative: clipping it would hide the persistent-
+/// memory isolation half of the contract on narrow Code panes.
+fn note_reserved_rows(note: &str, inner_width: u16) -> u16 {
+    if inner_width == 0 {
+        return 1;
+    }
+    Paragraph::new(note)
+        .wrap(Wrap { trim: true })
+        .line_count(inner_width)
+        .try_into()
+        .unwrap_or(u16::MAX)
+        .max(1)
+}
+
 fn render_session_list_overlay(
     f: &mut Frame,
     area: Rect,
     sessions: &[SessionEntry],
     list_state: &mut ListState,
     title: String,
+    note: Option<String>,
 ) {
     let overlay_area = session_list_overlay_area(area);
 
@@ -6389,6 +6767,26 @@ fn render_session_list_overlay(
 
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
+
+    // Reserve enough dim footer rows for the note (if any) to render in full at
+    // the current inner width, so narrow terminals (e.g. the 80x24 default)
+    // don't silently drop the second wrapped line of the memory-isolation
+    // disclosure. It is only carved out when at least one list row survives.
+    let (list_area, note_area) = match &note {
+        Some(text) => {
+            let reserved = note_reserved_rows(text, inner.width);
+            if inner.height > reserved {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(reserved)])
+                    .split(inner);
+                (chunks[0], Some(chunks[1]))
+            } else {
+                (inner, None)
+            }
+        }
+        None => (inner, None),
+    };
 
     let items: Vec<ListItem> = sessions
         .iter()
@@ -6404,8 +6802,16 @@ fn render_session_list_overlay(
     // Render through the caller's state so the scroll offset ratatui computes
     // to keep the selection visible is retained. Mouse hit-testing later reads
     // `list_state.offset()`, so a discarded offset would make clicks after a
-    // scroll resolve to the wrong row.
-    f.render_stateful_widget(list, inner, list_state);
+    // scroll resolve to the wrong row. `list_area` is `inner` minus any
+    // reserved note rows, so the offset stays consistent with the rows the
+    // user can actually see.
+    f.render_stateful_widget(list, list_area, list_state);
+
+    if let (Some(text), Some(note_area)) = (note, note_area) {
+        let note_line =
+            Paragraph::new(Span::styled(text, theme::dim_style())).wrap(Wrap { trim: true });
+        f.render_widget(note_line, note_area);
+    }
 }
 
 fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
@@ -7289,6 +7695,12 @@ pub struct ChatState {
     transcript_selection: Option<TranscriptSelection>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Visible tool-header hit rects from the last draw.
+    tool_header_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Visible file-tool footer hit rects from the last draw.
+    tool_footer_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Per-tool disclosure overrides; file tools otherwise default to preview.
+    tool_disclosures: BTreeMap<Arc<str>, ToolDisclosure>,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
     /// Full code-block targets used by right-click context-menu resolution.
@@ -7315,6 +7727,8 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
+    /// Per-entry disclosure footer line indices in `cached_lines`.
+    cached_tool_footer_lines: BTreeMap<usize, usize>,
     /// Per-line wrapped screen-row spans derived from `cached_lines` at
     /// `cached_render_width`. This is the line-level index for viewport
     /// slicing; it is rebuilt atomically with the rendered-line cache.
@@ -7432,6 +7846,9 @@ impl ChatState {
             transcript_snapshot: None,
             transcript_selection: None,
             entry_rects: Vec::new(),
+            tool_header_rects: Vec::new(),
+            tool_footer_rects: Vec::new(),
+            tool_disclosures: BTreeMap::new(),
             copy_hit_regions: Vec::new(),
             context_copy_regions: Vec::new(),
             context_menu: None,
@@ -7447,6 +7864,7 @@ impl ChatState {
             cached_lines: Vec::new(),
             cached_row_breaks: Vec::new(),
             cached_line_ranges: Vec::new(),
+            cached_tool_footer_lines: BTreeMap::new(),
             cached_line_screen_ranges: Vec::new(),
             cached_screen_ranges: Vec::new(),
             cached_code_blocks: Vec::new(),
@@ -7796,6 +8214,88 @@ impl ChatState {
         }
     }
 
+    fn toggle_tool_header_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(entry_idx) = self
+            .tool_header_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(idx, _)| *idx)
+        else {
+            return false;
+        };
+        let Some(ChatEntry::Tool {
+            tool_call_id,
+            name,
+            input_json,
+            ..
+        }) = self.entries.get(entry_idx)
+        else {
+            return false;
+        };
+        let tool_call_id = Arc::clone(tool_call_id);
+        let current = self
+            .tool_disclosures
+            .get(&tool_call_id)
+            .copied()
+            .unwrap_or_else(|| default_tool_disclosure(name, input_json));
+        let next = match current {
+            ToolDisclosure::Collapsed => match default_tool_disclosure(name, input_json) {
+                ToolDisclosure::Preview => ToolDisclosure::Preview,
+                ToolDisclosure::Collapsed | ToolDisclosure::Full => ToolDisclosure::Full,
+            },
+            ToolDisclosure::Preview | ToolDisclosure::Full => ToolDisclosure::Collapsed,
+        };
+        self.tool_disclosures.insert(tool_call_id, next);
+        self.clear_transcript_selection();
+        self.mark_dirty_full();
+        true
+    }
+
+    fn disclosure_for_entry(&self, entry: &ChatEntry) -> ToolDisclosure {
+        let ChatEntry::Tool {
+            tool_call_id,
+            name,
+            input_json,
+            ..
+        } = entry
+        else {
+            return ToolDisclosure::Collapsed;
+        };
+        self.tool_disclosures
+            .get(tool_call_id)
+            .copied()
+            .unwrap_or_else(|| default_tool_disclosure(name, input_json))
+    }
+
+    fn toggle_tool_footer_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(entry_idx) = self
+            .tool_footer_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(idx, _)| *idx)
+        else {
+            return false;
+        };
+        let Some(ChatEntry::Tool { tool_call_id, .. }) = self.entries.get(entry_idx) else {
+            return false;
+        };
+        let tool_call_id = Arc::clone(tool_call_id);
+        let current = self
+            .tool_disclosures
+            .get(&tool_call_id)
+            .copied()
+            .unwrap_or(ToolDisclosure::Preview);
+        let next = if matches!(current, ToolDisclosure::Full) {
+            ToolDisclosure::Preview
+        } else {
+            ToolDisclosure::Full
+        };
+        self.tool_disclosures.insert(tool_call_id, next);
+        self.clear_transcript_selection();
+        self.mark_dirty_full();
+        true
+    }
+
     /// Yank a single entry's body text for explicit copy actions.
     fn yank_single_entry(&self, idx: usize) -> String {
         self.entries
@@ -7986,10 +8486,12 @@ impl ChatState {
             for (rel_idx, entry) in self.entries[render_from..end].iter().enumerate() {
                 let abs_idx = render_from + rel_idx;
                 let before = new_lines.len();
-                render_entry_into(
+                let disclosure = self.disclosure_for_entry(entry);
+                let footer_line = render_entry_into(
                     entry,
                     self.is_entry_highlighted(abs_idx),
                     show_thoughts,
+                    disclosure,
                     width,
                     &mut new_lines,
                 );
@@ -7997,6 +8499,10 @@ impl ChatState {
                 if after > before {
                     let base = self.cached_lines.len();
                     new_ranges.push((abs_idx, base + before, base + after));
+                }
+                if let Some(footer_line) = footer_line {
+                    self.cached_tool_footer_lines
+                        .insert(abs_idx, self.cached_lines.len() + footer_line);
                 }
             }
             self.cached_row_breaks
@@ -8012,14 +8518,17 @@ impl ChatState {
         // Full rebuild path.
         let mut lines = Vec::new();
         let mut ranges = Vec::new();
+        let mut footer_lines = BTreeMap::new();
         let show_thoughts = self.show_thoughts;
         for (rel_idx, entry) in self.entries[start..end].iter().enumerate() {
             let abs_idx = start + rel_idx;
             let before = lines.len();
-            render_entry_into(
+            let disclosure = self.disclosure_for_entry(entry);
+            let footer_line = render_entry_into(
                 entry,
                 self.is_entry_highlighted(abs_idx),
                 show_thoughts,
+                disclosure,
                 width,
                 &mut lines,
             );
@@ -8027,10 +8536,14 @@ impl ChatState {
             if after > before {
                 ranges.push((abs_idx, before, after));
             }
+            if let Some(footer_line) = footer_line {
+                footer_lines.insert(abs_idx, footer_line);
+            }
         }
         self.cached_row_breaks = row_breaks_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
+        self.cached_tool_footer_lines = footer_lines;
         self.cached_entry_count = end - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
@@ -9498,6 +10011,10 @@ impl ChatState {
         self.cached_screen_ranges.clear();
         self.cached_code_blocks.clear();
         self.entry_rects.clear();
+        self.tool_header_rects.clear();
+        self.tool_footer_rects.clear();
+        self.tool_disclosures.clear();
+        self.cached_tool_footer_lines.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.context_menu = None;
@@ -14367,6 +14884,17 @@ mod tests {
         assert_eq!(request["method"], method::SESSION_LIST_ACP);
         respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
 
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickAgent { .. }));
+
+        let start = tokio::spawn(async move {
+            chat.pick_or_start_session("alpha").await;
+            chat
+        });
+
         let request = next_rpc_request(&mut rx, "fresh ACP should start a session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
@@ -14377,7 +14905,7 @@ mod tests {
         // and shell tools operate on that project, not the agent workspace.
         assert_eq!(params["cwd"], expected_cwd);
 
-        init.abort();
+        start.abort();
     }
 
     #[tokio::test]
@@ -14666,7 +15194,7 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Acp);
-        let area = Rect::new(0, 0, 100, 30);
+        let area = Rect::new(0, 0, 35, 30);
         let overlay_area = session_list_overlay_area(area);
         let mut state = ChatState::new(
             "sess-old".to_string(),
@@ -16818,6 +17346,397 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_retention_truncates_utf8_safely_and_keeps_marker() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-long".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "long-output"}),
+        });
+        let raw_output = format!("{}éé", "a".repeat(16 * 1024 - 1));
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-long".to_string(),
+            raw_output,
+        });
+
+        let ChatEntry::Tool {
+            result: Some(result),
+            ..
+        } = &s.entries()[0]
+        else {
+            panic!("expected retained tool result");
+        };
+        assert!(result.ends_with("…[truncated]"));
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    fn rendered_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tool_entry_disclosure_shows_full_retained_content_only_when_expanded() {
+        let input = format!(r#"{{"command":"{}"}}"#, "x".repeat(180));
+        let result = format!(
+            "first line\n{}\n\u{1b}]52;c;payload\u{7}\n…[truncated]",
+            "y".repeat(240)
+        );
+
+        let mut collapsed = Vec::new();
+        render_tool_entry(
+            &mut collapsed,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed_text = rendered_text(&collapsed);
+        assert!(collapsed_text.starts_with("▶ [tool: shell]"));
+        assert!(collapsed_text.contains("input:"));
+        assert!(collapsed_text.contains("result:"));
+        assert!(!collapsed_text.contains(&input));
+        assert!(!collapsed_text.contains("→"));
+
+        let mut expanded = Vec::new();
+        render_tool_entry(
+            &mut expanded,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let expanded_text = rendered_text(&expanded);
+        assert!(expanded_text.starts_with("▼ [tool: shell]"));
+        assert!(expanded_text.contains(&input));
+        assert!(expanded_text.contains(&"y".repeat(240)));
+        assert!(!expanded_text.contains('\u{1b}'));
+        assert!(!expanded_text.contains('\u{7}'));
+        assert!(expanded_text.contains("\\u{1b}]52;c;payload\\u{7}"));
+        assert!(expanded_text.contains("…[truncated]"));
+    }
+
+    #[test]
+    fn expanded_tool_display_is_bounded_while_copy_retains_full_content() {
+        let input_tail = "input-tail-must-remain-copyable";
+        let result_tail = "result-tail-must-remain-copyable";
+        let input = format!("{}\n{input_tail}", "input line\n".repeat(500));
+        let result = format!("{}\n{result_tail}", "result line\n".repeat(500));
+        let mut lines = Vec::new();
+
+        render_tool_entry(
+            &mut lines,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+
+        let text = rendered_text(&lines);
+        assert!(lines.len() <= 2 * TOOL_EXPANDED_MAX_LINES + 2);
+        assert!(text.contains("Display limited; copy for full content"));
+        assert!(!text.contains(input_tail));
+        assert!(!text.contains(result_tail));
+
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::from("tc-oversized"),
+            name: Arc::from("shell"),
+            input_json: Arc::from(input),
+            result: Some(Arc::from(result)),
+        };
+        let copied = clipboard_text(&entry);
+        assert!(copied.contains(input_tail));
+        assert!(copied.contains(result_tail));
+    }
+
+    #[test]
+    fn file_tool_preview_is_six_lines_and_full_view_avoids_raw_content_duplication() {
+        let edit_input = serde_json::json!({
+            "path": "/tmp/example.rs",
+            "old_string": "fn old() {}",
+            "new_string": "fn new() {}",
+        })
+        .to_string();
+        let mut collapsed_edit_lines = Vec::new();
+        render_tool_entry(
+            &mut collapsed_edit_lines,
+            "file_edit",
+            &edit_input,
+            Some("done"),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed_edit_text = rendered_text(&collapsed_edit_lines);
+        assert!(collapsed_edit_text.starts_with("▶ [tool: file_edit]"));
+        assert!(!collapsed_edit_text.contains("fn old() {}"));
+        assert!(!collapsed_edit_text.contains("fn new() {}"));
+        assert!(!collapsed_edit_text.contains(&edit_input));
+        assert!(collapsed_edit_text.contains("result: done"));
+
+        let content = (0..10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let write_input = serde_json::json!({
+            "path": "/tmp/example.txt",
+            "content": content,
+        })
+        .to_string();
+        let result = format!("first\n{}", "result".repeat(60));
+        let mut preview_lines = Vec::new();
+        let footer_line = render_tool_entry(
+            &mut preview_lines,
+            "file_write",
+            &write_input,
+            Some(&result),
+            false,
+            ToolDisclosure::Preview,
+        );
+        let preview_text = rendered_text(&preview_lines);
+        let footer_line = footer_line.expect("long preview has a disclosure footer");
+        assert!(preview_text.starts_with("▼ [tool: file_write]"));
+        assert!(preview_text.contains(r#"input: {"path":"/tmp/example.txt"}"#));
+        assert!(preview_text.contains("line 0"));
+        assert!(preview_text.contains("line 5"));
+        assert!(!preview_text.contains("line 6"));
+        assert!(preview_text.contains("4 more lines"));
+        assert!(!preview_text.contains(&write_input));
+        assert!(!preview_text.contains(&result));
+        assert!(
+            preview_lines[footer_line]
+                .to_string()
+                .contains("4 more lines")
+        );
+        assert!(preview_text.find("line 5").unwrap() < preview_text.find("4 more lines").unwrap());
+        assert!(
+            preview_text.find("4 more lines").unwrap()
+                < preview_text.find("result: first").unwrap()
+        );
+
+        let mut full_lines = Vec::new();
+        render_tool_entry(
+            &mut full_lines,
+            "file_write",
+            &write_input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let full_text = rendered_text(&full_lines);
+        assert!(full_text.contains("line 9"));
+        assert!(full_text.contains("first"));
+        assert!(full_text.contains(&"result".repeat(60)));
+        assert!(full_text.contains("[Show less]"));
+        assert!(!full_text.contains(&write_input));
+        assert!(full_text.find("line 9").unwrap() < full_text.find("[Show less]").unwrap());
+        assert!(full_text.find("[Show less]").unwrap() < full_text.find("result: first").unwrap());
+    }
+
+    #[test]
+    fn file_write_base64_and_malformed_inputs_have_safe_fallbacks() {
+        let base64_input = serde_json::json!({
+            "path": "/tmp/example.bin",
+            "content": "A".repeat(4_000),
+            "encoding": "base64",
+        })
+        .to_string();
+        let mut base64_lines = Vec::new();
+        let footer_line = render_tool_entry(
+            &mut base64_lines,
+            "file_write",
+            &base64_input,
+            None,
+            false,
+            ToolDisclosure::Preview,
+        );
+        let base64_text = rendered_text(&base64_lines);
+        assert!(footer_line.is_none());
+        assert!(base64_text.contains(r#""encoding":"base64""#));
+        assert!(base64_text.contains("content: 4000 encoded characters"));
+        assert!(!base64_text.contains(&"A".repeat(200)));
+
+        let malformed = r#"{"path":"/tmp/example.txt""#;
+        let mut malformed_lines = Vec::new();
+        render_tool_entry(
+            &mut malformed_lines,
+            "file_write",
+            malformed,
+            None,
+            false,
+            ToolDisclosure::Preview,
+        );
+        assert!(rendered_text(&malformed_lines).contains(malformed));
+
+        for invalid in [
+            serde_json::json!({"content": "text"}),
+            serde_json::json!({"path": "/tmp/a.txt", "content": "text", "encoding": 3}),
+            serde_json::json!({"path": "/tmp/a.txt", "content": "text", "encoding": "hex"}),
+        ] {
+            let invalid = invalid.to_string();
+            assert_eq!(
+                default_tool_disclosure("file_write", &invalid),
+                ToolDisclosure::Collapsed
+            );
+        }
+        assert_eq!(
+            default_tool_disclosure("file_edit", r#"{"old_string":"a","new_string":"b"}"#),
+            ToolDisclosure::Collapsed
+        );
+    }
+
+    #[test]
+    fn wrapped_tool_hit_regions_exclude_blank_cells_and_respect_scroll() {
+        let label = crate::i18n::t_args("zc-chat-tool-show-all", &[("count", "123")]);
+        let line = Line::from(format!("  {label}"));
+        let body = Rect::new(5, 7, 10, 2);
+        let mut regions = Vec::new();
+        append_wrapped_hit_rects(&mut regions, 4, &line, 4, 5, body);
+
+        assert_eq!(regions.len(), 2, "first wrapped row is scrolled out");
+        assert!(
+            regions
+                .iter()
+                .all(|(entry, rect)| *entry == 4 && rect.height == 1)
+        );
+        assert_eq!(regions[0].1.y, body.y);
+        assert!(regions[0].1.width <= body.width);
+        assert!(regions[1].1.width < body.width);
+        assert!(!mouse::in_rect(
+            body.x + body.width - 1,
+            regions[1].1.y,
+            regions[1].1
+        ));
+    }
+
+    #[test]
+    fn tool_clipboard_keeps_raw_input_and_result() {
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::<str>::from("tc-copy"),
+            name: Arc::<str>::from("file_write"),
+            input_json: Arc::<str>::from(r#"{"path":"a.txt","content":"raw"}"#),
+            result: Some(Arc::<str>::from("written")),
+        };
+        let copied = clipboard_text(&entry);
+        assert!(copied.contains(r#""content":"raw""#));
+        assert!(copied.contains("written"));
+    }
+
+    #[tokio::test]
+    async fn file_tool_header_and_footer_clicks_keep_cards_independent() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        let content = (0..10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (id, path) in [
+            ("tc-offscreen", "older.txt"),
+            ("tc-1", "first.txt"),
+            ("tc-2", "second.txt"),
+        ] {
+            state.entries.push(ChatEntry::Tool {
+                tool_call_id: Arc::<str>::from(id),
+                name: Arc::<str>::from("file_write"),
+                input_json: Arc::<str>::from(
+                    serde_json::json!({"path": path, "content": content.clone()}).to_string(),
+                ),
+                result: Some(Arc::<str>::from("written")),
+            });
+        }
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 24);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+        state.pinned_to_bottom = false;
+        state.scroll_offset = state.cached_screen_ranges[1].1;
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw scrolled chat");
+        assert_eq!(
+            state
+                .visible_cached_entry_range(state.scroll_offset, state.last_inner_height)
+                .start,
+            1,
+            "the click must use an absolute cached-entry index after scrolling"
+        );
+        assert!(state.entry_rects.iter().all(|(idx, _)| *idx != 0));
+        assert!(state.tool_header_rects.iter().all(|(idx, _)| *idx != 0));
+        assert!(state.tool_footer_rects.iter().all(|(idx, _)| *idx != 0));
+        assert_eq!(state.tool_footer_rects[0].0, 1);
+        let first_footer = state.tool_footer_rects[0].1;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first_footer.x + 1,
+                row: first_footer.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.tool_disclosures.get("tc-1"),
+            Some(&ToolDisclosure::Full)
+        );
+        assert!(!state.tool_disclosures.contains_key("tc-2"));
+        assert!(!state.tool_disclosures.contains_key("tc-offscreen"));
+        assert_eq!(state.dirty, LinesDirty::Full);
+
+        terminal
+            .draw(|frame| render(frame, state, area, PaneKind::Chat))
+            .expect("redraw expanded chat");
+        let first_header = state.tool_header_rects[0].1;
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first_header.x + 1,
+                row: first_header.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.tool_disclosures.get("tc-1"),
+            Some(&ToolDisclosure::Collapsed)
+        );
+        assert!(!state.tool_disclosures.contains_key("tc-2"));
+        assert!(!state.tool_disclosures.contains_key("tc-offscreen"));
+
+        state.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        assert!(state.tool_disclosures.is_empty());
+        assert!(state.tool_header_rects.is_empty());
+        assert!(state.tool_footer_rects.is_empty());
+    }
+
+    #[test]
     fn approval_request_sets_pending_approval() {
         let mut s = state();
         s.apply_update(SessionUpdate::ApprovalRequest {
@@ -16955,6 +17874,7 @@ mod tests {
                     &sessions,
                     &mut list_state,
                     crate::i18n::t("zc-chat-session-list-switch-title"),
+                    None,
                 );
             })
             .expect("draw session list overlay");
@@ -16978,6 +17898,512 @@ mod tests {
             Some(expected_bg),
             "selected session row must keep the themed fill background"
         );
+    }
+
+    /// Collects every row of `area` in `terminal`'s buffer into a single
+    /// newline-joined string, for substring assertions on rendered text.
+    fn overlay_text(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        area: Rect,
+    ) -> String {
+        let buf = terminal.backend().buffer();
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn session_list_overlay_renders_memory_isolation_note() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                // Mirrors the Code (ACP) pre-session picker call site: the
+                // resume title plus the memory-isolation note.
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
+                );
+            })
+            .expect("draw session list overlay with note");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            text.contains("resumable"),
+            "Code session picker must state history is saved & resumable: {text:?}"
+        );
+        assert!(
+            text.contains("isolated"),
+            "Code session picker must state persistent memory is isolated: {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_list_overlay_renders_full_memory_note_on_narrow_terminal() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Regression guard: at the ubiquitous 80-column default the centered
+        // overlay is narrow enough that the note wraps to a second line. A
+        // single reserved row would drop the "isolated" half; the reservation
+        // must grow to keep the full disclosure visible.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 80, 24);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
+                );
+            })
+            .expect("draw session list overlay with note at 80 cols");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            text.contains("resumable"),
+            "80-col Code session picker must state history is saved & resumable: {text:?}"
+        );
+        assert!(
+            text.contains("isolated"),
+            "80-col Code session picker must show the full note incl. persistent \
+             memory isolation (second wrapped line must not be dropped): {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_switch_overlay_omits_memory_isolation_note() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                // Mirrors the in-session switch overlay call site (shared by
+                // both panes): no `note`, so the Code-only copy must not
+                // leak into this Chat-reachable path.
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                    None,
+                );
+            })
+            .expect("draw session switch overlay without note");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            !text.contains("resumable") && !text.contains("isolated"),
+            "in-session switch overlay must not render the Code memory-isolation note: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_session_help_context_states_memory_isolation() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickSession {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+            agents: Vec::new(),
+        };
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help
+            .entries
+            .iter()
+            .any(|e| e.action.contains("resumable") && e.action.contains("isolated"));
+        assert!(
+            has_memory_note,
+            "Code session picker help must explain history is saved & resumable while \
+             persistent memory is isolated: {help:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_agent_help_context_omits_memory_isolation_note() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        // Default phase is PickAgent — not the Code session picker — for
+        // both Chat and Acp panes, so the memory-isolation entry must not
+        // appear here. Force a non-loading PickAgent so this exercises the
+        // real (non-loading) help branch and genuinely proves the pane gate.
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["agent-a".to_string()],
+            list_state: ListState::default(),
+            loading: false,
+        };
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help.entries.iter().any(|e| e.action.contains("isolated"));
+        assert!(
+            !has_memory_note,
+            "non-PickSession help (e.g. Chat pane) must not surface the Code-only \
+             memory-isolation note: {help:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_agent_help_context_states_memory_isolation_on_acp_pane() {
+        // No-saved-session boundary from the linked issue: a first-time Code
+        // user (or any user with no resumable ACP history) lands in the *agent*
+        // picker, not the resume picker, so the disclosure must be reachable
+        // there too — but only on the Code (ACP) pane.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["agent-a".to_string()],
+            list_state: ListState::default(),
+            loading: false,
+        };
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help.entries.iter().any(|e| e.action.contains("isolated"));
+        assert!(
+            has_memory_note,
+            "ACP agent picker (no-saved-session path) help must surface the \
+             history-vs-persistent-memory disclosure: {help:?}"
+        );
+    }
+
+    #[test]
+    fn agent_picker_renders_memory_isolation_note_on_acp_pane() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The multi-agent no-saved-session path renders the agent picker; on the
+        // Code (ACP) pane it must carry the memory-isolation disclosure in its
+        // footer so the distinction is visible before starting Code work.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Acp.name(),
+                    Some(crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
+                );
+            })
+            .expect("draw agent picker with acp note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "ACP agent picker must render the full memory-isolation note: {text:?}"
+        );
+    }
+
+    #[test]
+    fn agent_picker_keeps_full_memory_note_and_footer_non_clickable_when_narrow() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Regression guard for a 22-cell pane (20-cell bordered inner width):
+        // the catalogue copy needs more than three wrapped rows, so a fixed
+        // three-row footer clips the word "isolated" and makes the disclosure
+        // materially false at this width.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 22, 16);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut list_area = Rect::default();
+        terminal
+            .draw(|frame| {
+                list_area = draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Acp.name(),
+                    Some(crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
+                );
+            })
+            .expect("draw narrow agent picker with acp note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "narrow ACP picker must render the complete disclosure: {text:?}"
+        );
+
+        let footer_row = area.y + area.height - 2;
+        assert!(
+            crate::mouse::list_click_index(footer_row, list_area, 0, agents.len()).is_none(),
+            "the disclosure footer must remain outside agent-list hit testing"
+        );
+    }
+
+    #[test]
+    fn agent_picker_omits_memory_isolation_note_on_chat_pane() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The Chat pane reaches the same PickAgent phase but must NOT surface the
+        // Code-only disclosure — the render call site passes `None`.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Chat.name(),
+                    None,
+                );
+            })
+            .expect("draw agent picker without note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            !text.contains("isolated"),
+            "Chat pane agent picker must not render the Code memory-isolation note: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_init_single_agent_no_history_shows_disclosure_before_session_start() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The single-agent counterpart of the no-saved-session boundary above:
+        // with exactly one enabled agent, `init` skips `show_agent_picker` and
+        // `try_show_recent_acp_session_picker` finds nothing to resume, so the
+        // old fall-through called `pick_or_start_session()` directly and never
+        // showed the disclosure. It must now land on the same
+        // disclosure-bearing agent picker as the multi-agent path, and it must
+        // do so *before* any `session/new` request goes out.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "single-agent init should check for saved sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
+
+        // `init` must finish here without a `config/list` or `session/new`
+        // request ever going out: neither response was supplied above, so if
+        // `init` tried to start a session first this join would time out.
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect(
+                "single-agent no-history ACP init must land on the disclosure surface \
+                 without starting a session first",
+            )
+            .unwrap();
+        let ChatPhase::PickAgent {
+            agents, loading, ..
+        } = &chat.phase
+        else {
+            panic!("single-agent no-history ACP start must land in the agent picker");
+        };
+        assert_eq!(agents, &vec!["alpha".to_string()]);
+        assert!(!loading);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| chat.draw(frame, area))
+            .expect("draw single-agent no-history agent picker");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "single-agent Code start with no saved session must render the \
+             history-vs-persistent-memory disclosure before any session starts: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_init_single_agent_no_history_skips_disclosure_and_autostarts() {
+        // Companion to the ACP case above: the Chat pane must keep the
+        // original no-saved-session behavior unchanged — straight into the
+        // session, no agent-picker detour, and no Code-only disclosure ever
+        // in the picture, since Chat has no session history to disclose.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        // Chat never checks for ACP session history, so the very next request
+        // must mint the session directly — never a `session/list_acp` request
+        // and never a detour through the agent picker. TodoTracker settings are
+        // resolved from the local ZeroCode config before this RPC boundary.
+        let request = next_rpc_request(
+            &mut rx,
+            "Chat single-agent start should mint a fresh session",
+        )
+        .await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "alpha");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-chat",
+                "workspace_dir": "/tmp/chat"
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "fresh Chat session should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("Chat single-agent no-history start must go straight to an active session");
+        };
+        assert_eq!(state.session_id, "sess-chat");
+        assert_eq!(state.agent_alias, "alpha");
+    }
+
+    #[test]
+    fn note_reserved_rows_accounts_for_word_boundary_wrapping() {
+        let note = crate::i18n::t("zc-chat-agent-picker-acp-memory-note");
+        assert!(
+            unicode_width::UnicodeWidthStr::width(note.as_str()) > 31,
+            "test copy must exceed the narrow inner width to exercise wrapping"
+        );
+        assert!(
+            note_reserved_rows(&note, 31) >= 3,
+            "31-cell inner width must reserve 3 rows for the word-wrapped note, \
+             not the 2 a naive ceil would give"
+        );
+        // Wide terminal: fits on one line.
+        assert_eq!(note_reserved_rows(&note, 200), 1);
+        // The full disclosure remains reserved even at very narrow widths.
+        assert!(note_reserved_rows(&note, 20) > 3);
+    }
+
+    #[test]
+    fn note_reserved_rows_uses_paragraph_hard_wrapping_for_long_words() {
+        assert_eq!(note_reserved_rows("abcdefghijkl", 5), 3);
+        assert_eq!(note_reserved_rows("", 10), 1);
+        assert_eq!(note_reserved_rows("word", 10), 1);
     }
 
     #[test]
@@ -17015,6 +18441,7 @@ mod tests {
                     &sessions,
                     &mut list_state,
                     crate::i18n::t("zc-chat-session-list-switch-title"),
+                    None,
                 );
             })
             .expect("draw session list overlay");
@@ -17037,6 +18464,86 @@ mod tests {
             idx,
             offset + 2,
             "clicked row must map to offset + visible row, not the unscrolled index"
+        );
+    }
+
+    #[test]
+    fn resume_picker_footer_clicks_do_not_select_hidden_sessions() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+
+        // Enough saved sessions to overflow the visible list, so the rows
+        // hidden behind the footer note correspond to real (off-screen)
+        // session indices — the exact shape where a footer click used to
+        // move the selection to a hidden session.
+        let sessions: Vec<SessionEntry> = (0..40)
+            .map(|i| SessionEntry {
+                session_id: format!("sess-{i}"),
+                session_key: format!("sess-{i}"),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                agent_alias: Some("agent".to_string()),
+                channel_id: None,
+                name: Some(format!("prompt {i}")),
+                message_count: 1,
+            })
+            .collect();
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+
+        // 80x24 default terminal: narrow enough that the resume note wraps.
+        let area = Rect::new(0, 0, 80, 24);
+        let overlay_area = session_list_overlay_area(area);
+        let note = crate::i18n::t("zc-chat-session-list-resume-note");
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(note.clone()),
+                );
+            })
+            .expect("draw resume overlay");
+
+        let click_area = session_list_click_area(overlay_area, Some(&note));
+        let reserved = note_reserved_rows(&note, overlay_area.width.saturating_sub(2));
+        assert_eq!(
+            click_area.height,
+            overlay_area.height - reserved,
+            "click area must exclude exactly the reserved note rows"
+        );
+
+        // Every reserved footer row (the note area sits directly above the
+        // bottom border) must be dead for list hit-testing, while the same
+        // rows against the full overlay rect would have resolved to a session.
+        let offset = list_state.offset();
+        for row_from_bottom in 0..reserved {
+            let note_row = overlay_area.y + overlay_area.height - 2 - row_from_bottom;
+            assert!(
+                crate::mouse::list_click_index(note_row, click_area, offset, sessions.len())
+                    .is_none(),
+                "footer note row {note_row} must not resolve to a session index"
+            );
+            assert!(
+                crate::mouse::list_click_index(note_row, overlay_area, offset, sessions.len())
+                    .is_some(),
+                "regression precondition: the full overlay rect maps row {note_row} to a session"
+            );
+        }
+
+        // The last true list row must still be clickable through the shrunken rect.
+        let last_list_row = overlay_area.y + click_area.height - 2;
+        assert!(
+            crate::mouse::list_click_index(last_list_row, click_area, offset, sessions.len())
+                .is_some(),
+            "the final visible list row must remain clickable"
         );
     }
 
