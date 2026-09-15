@@ -1,5 +1,5 @@
 ---
-id: ADR-016
+id: ADR-017
 title: Inbound authentication resolves canonical principals before authorization
 date: 2026-08-14
 status: proposed
@@ -22,7 +22,7 @@ relates-to:
   - crates/zeroclaw-memory/src/sqlite_permissions.rs
 ---
 
-# ADR-016: Inbound Authentication Resolves Canonical Principals Before Authorization
+# ADR-017: Inbound Authentication Resolves Canonical Principals Before Authorization
 
 ## Context
 
