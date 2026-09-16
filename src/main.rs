@@ -5269,6 +5269,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunDesktopDaemon { port },
+        ..
+    } = &cli.command
+    {
+        return service::run_desktop_daemon(*port).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunOpenrcLogWriter { stream },
         ..
     } = &cli.command
@@ -6855,6 +6864,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             }
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
+            }
+            if zeroclaw_runtime::restart::desktop_restart_requested() {
+                std::process::exit(zeroclaw_runtime::restart::DESKTOP_RESTART_EXIT_CODE);
             }
             // Bare-process auto-restart: the daemon has now torn down (the
             // gateway listener is released), so launch the upgraded binary as a
@@ -12495,6 +12507,29 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn desktop_daemon_cli_parses_hidden_command() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "service",
+            "run-desktop-daemon",
+            "--port",
+            "42617",
+        ])
+        .expect("internal desktop daemon should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunDesktopDaemon { port },
+                ..
+            } if port == 42617
+        ));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("run-desktop-daemon"));
     }
 
     #[test]
