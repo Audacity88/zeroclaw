@@ -37,6 +37,60 @@ impl ToolEventKind {
     }
 }
 
+/// Kind of a settled terminal append range recorded in the
+/// `acp_terminal_ranges` table.
+///
+/// Every range row certifies that its message rows were written by one
+/// completed transaction — the write settled. The kind keeps what the turn
+/// actually was distinguishable: a normally finished turn, a turn that
+/// terminated in failure (its batch carries the fixed failed-turn marker), or
+/// a turn rescued from an interruption by checkpoint recovery. Only
+/// `Completed` ranges may ever be certified as compactable coverage; `Failed`
+/// and `Interrupted` ranges stay raw tail history instead of being silently
+/// summarized as successful work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRangeKind {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl TerminalRangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    fn from_persisted(value: &str) -> Result<Self> {
+        match value {
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(anyhow::Error::msg(format!(
+                "unknown terminal_kind '{other}' in acp_terminal_ranges"
+            ))),
+        }
+    }
+
+    /// Classify a terminal append batch from its own content. A batch whose
+    /// final row is the store-owned failed-turn marker is a terminal failed
+    /// attempt; anything else written by `append_turn` or turn finalization
+    /// is a normally completed turn.
+    fn for_terminal_batch(messages: &[ConversationMessage]) -> Self {
+        match messages.last() {
+            Some(ConversationMessage::Chat(chat))
+                if chat.role == "system" && chat.content == FAILED_TURN_MARKER =>
+            {
+                Self::Failed
+            }
+            _ => Self::Completed,
+        }
+    }
+}
+
 pub struct AcpSessionStore {
     conn: Mutex<Connection>,
 }
@@ -76,6 +130,303 @@ pub struct AcpSessionSummary {
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
 }
+
+/// One settled terminal append range, as recorded by the transaction that
+/// wrote its message rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcpTerminalRangeRow {
+    pub first_message_id: i64,
+    pub last_message_id: i64,
+    pub kind: TerminalRangeKind,
+}
+
+/// The single active derived compaction checkpoint for a session.
+///
+/// This is derived data: the original messages it covers are retained
+/// untouched, and the checkpoint only describes a provider-facing projection.
+/// Estimates are display data; the row ids and counts are the integrity
+/// identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpActiveCheckpointRecord {
+    pub format_version: i64,
+    pub operation_id: String,
+    pub source_first_message_id: i64,
+    pub covered_through_message_id: i64,
+    pub source_message_rows: i64,
+    pub summary: String,
+    pub summary_model_provider: String,
+    pub summary_model: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub created_at: String,
+}
+
+/// State of the most recent checkpoint row written for one operation id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpCheckpointOperationState {
+    Active,
+    Inactive,
+}
+
+/// Consistent single-snapshot view of everything a manual compaction
+/// operation needs: the durable session incarnation, its original rows with
+/// stable ids, the settled terminal ranges, the active checkpoint (if any),
+/// the caller's own operation's checkpoint row (if any), and any durable
+/// in-flight turn checkpoint.
+pub struct AcpCompactionSnapshot {
+    /// Autoincrement row id of the session: the durable incarnation identity.
+    /// A delete/recreate of the same public UUID produces a new id, so a
+    /// stale checkpoint or retry can never attach to the successor.
+    pub session_row_id: i64,
+    pub session_uuid: String,
+    pub agent_alias: String,
+    pub workspace_dir: String,
+    pub interaction_surface: Option<String>,
+    pub killed: bool,
+    pub message_rows: Vec<(i64, ConversationMessage)>,
+    pub terminal_ranges: Vec<AcpTerminalRangeRow>,
+    pub active_checkpoint: Option<AcpActiveCheckpointRecord>,
+    pub operation_checkpoint: Option<AcpCheckpointOperationState>,
+    pub inflight_turn_id: Option<String>,
+}
+
+/// Restore-mode read that pairs the full durable originals with the active
+/// checkpoint (if any) so callers assemble one committed projection.
+pub struct AcpProjectedRestore {
+    pub data: AcpSessionData,
+    pub message_rows: Vec<(i64, ConversationMessage)>,
+    pub checkpoint: Option<AcpActiveCheckpointRecord>,
+}
+
+pub enum AcpSessionRestoreProjection {
+    Missing,
+    Killed,
+    Projected(AcpProjectedRestore),
+}
+
+/// Selected contiguous known-completed prefix coverage for a compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionSourceSelection {
+    pub first_message_id: i64,
+    pub covered_through_message_id: i64,
+    /// Number of durable message ROWS in the covered span (not decomposed
+    /// message entries).
+    pub covered_message_rows: usize,
+    pub covered_ranges: usize,
+}
+
+/// Why a session's history cannot be compacted in v1. Each variant is a
+/// typed, user-explainable refusal — compaction never silently certifies
+/// unknown, interrupted, failed, or ambiguous history as recoverable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionSourceError {
+    /// No terminal ranges certify the session's head rows: the history is
+    /// empty or predates terminal-range recording (legacy).
+    NoTerminalCoverage { first_message_id: i64 },
+    /// The head range settled, but not as a completed turn (failed or
+    /// interrupted); coverage cannot start there.
+    LeadingRangeNotCompleted {
+        kind: TerminalRangeKind,
+        first_message_id: i64,
+    },
+    /// The only certified coverage is the newest completed turn, which is
+    /// always retained.
+    NewestTurnMustBeRetained,
+    /// The candidate coverage contains a tool exchange whose call/result
+    /// pairing is ambiguous or unpaired.
+    AmbiguousToolPairing { message_id: i64 },
+}
+
+/// Durably-validated request to activate (or idempotently recognize) one
+/// compaction checkpoint.
+pub struct CompactionActivationRequest<'a> {
+    pub session_uuid: &'a str,
+    pub expected_session_row_id: i64,
+    pub format_version: i64,
+    pub operation_id: &'a str,
+    /// The active checkpoint operation this request snapshotted before
+    /// summarizing (`None` when none was active). Activation supersedes a
+    /// prior checkpoint only when the durable active operation still
+    /// matches this expectation, so a stale request can never overwrite a
+    /// later operation's committed projection.
+    pub expected_prior_active_operation: Option<&'a str>,
+    pub source_first_message_id: i64,
+    pub covered_through_message_id: i64,
+    pub source_message_rows: i64,
+    pub summary: &'a str,
+    pub summary_model_provider: &'a str,
+    pub summary_model: &'a str,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionActivationOutcome {
+    /// The checkpoint row was committed and is now the active projection.
+    Activated,
+    /// The same operation id is already the active checkpoint: a committed
+    /// retry is recognized without a second write. The caller rebuilds its
+    /// acknowledgement from the active checkpoint it already read.
+    AlreadyActive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionActivationError {
+    SessionMissing,
+    IncarnationMismatch {
+        found_session_row_id: i64,
+    },
+    SessionKilled,
+    /// A durable in-flight turn checkpoint exists; its turn has not settled.
+    InflightTurn,
+    /// The covered source no longer matches the snapshot the caller
+    /// summarized. Nothing was written.
+    SourceMismatch {
+        detail: String,
+    },
+    /// The active checkpoint changed since the caller's snapshot; a stale
+    /// request must not supersede a later operation. Nothing was written.
+    StaleActiveCheckpoint {
+        active_operation: Option<String>,
+        expected_operation: Option<String>,
+    },
+    /// The activation transaction itself failed. Nothing was written.
+    Storage(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionDeactivationOutcome {
+    /// The active checkpoint was deactivated by this operation.
+    Deactivated {
+        covered_through_message_id: i64,
+        covered_message_rows: i64,
+    },
+    /// This operation id already deactivated the checkpoint (committed
+    /// retry); nothing changed.
+    AlreadyDeactivated,
+    /// No active checkpoint exists for this session.
+    NoActiveCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionDeactivationError {
+    SessionMissing,
+    IncarnationMismatch {
+        found_session_row_id: i64,
+    },
+    SessionKilled,
+    InflightTurn,
+    /// The active checkpoint changed since the caller's snapshot; a stale
+    /// restore must not deactivate a later operation's checkpoint. Nothing
+    /// was written.
+    StaleActiveCheckpoint {
+        active_operation: Option<String>,
+        expected_operation: Option<String>,
+    },
+    /// The deactivation transaction itself failed. Nothing was written.
+    Storage(String),
+}
+
+impl std::fmt::Display for CompactionSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoTerminalCoverage { first_message_id } => write!(
+                f,
+                "no terminal-range coverage certifies the session head (first row {first_message_id}); \
+                 legacy or empty history cannot be compacted"
+            ),
+            Self::LeadingRangeNotCompleted {
+                kind,
+                first_message_id,
+            } => write!(
+                f,
+                "the oldest settled range (row {first_message_id}) is a {kind} turn, \
+                 so no completed prefix exists to summarize",
+                kind = kind.as_str()
+            ),
+            Self::NewestTurnMustBeRetained => write!(
+                f,
+                "the newest completed turn is always retained, leaving no older \
+                 completed prefix to summarize"
+            ),
+            Self::AmbiguousToolPairing { message_id } => write!(
+                f,
+                "message row {message_id} has an ambiguous or unpaired tool exchange; \
+                 refusing to certify it as completed coverage"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompactionSourceError {}
+
+impl std::fmt::Display for CompactionActivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionMissing => write!(f, "session no longer exists"),
+            Self::IncarnationMismatch {
+                found_session_row_id,
+            } => write!(
+                f,
+                "session was recreated (durable row {found_session_row_id}); the stale \
+                 source snapshot cannot be committed"
+            ),
+            Self::SessionKilled => write!(f, "session is killed"),
+            Self::InflightTurn => write!(
+                f,
+                "a durable in-flight turn checkpoint exists; the turn must settle first"
+            ),
+            Self::SourceMismatch { detail } => {
+                write!(f, "compaction source identity mismatch: {detail}")
+            }
+            Self::StaleActiveCheckpoint {
+                active_operation,
+                expected_operation,
+            } => write!(
+                f,
+                "the active checkpoint changed since the snapshot (active {active:?}, \
+                 expected {expected:?}); retry with a fresh operation",
+                active = active_operation.as_deref().unwrap_or("<none>"),
+                expected = expected_operation.as_deref().unwrap_or("<none>"),
+            ),
+            Self::Storage(detail) => write!(f, "compaction storage failure: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for CompactionActivationError {}
+
+impl std::fmt::Display for CompactionDeactivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionMissing => write!(f, "session no longer exists"),
+            Self::IncarnationMismatch {
+                found_session_row_id,
+            } => write!(
+                f,
+                "session was recreated (durable row {found_session_row_id})"
+            ),
+            Self::SessionKilled => write!(f, "session is killed"),
+            Self::InflightTurn => write!(
+                f,
+                "a durable in-flight turn checkpoint exists; the turn must settle first"
+            ),
+            Self::StaleActiveCheckpoint {
+                active_operation,
+                expected_operation,
+            } => write!(
+                f,
+                "the active checkpoint changed since the snapshot (active {active:?}, \\
+                 expected {expected:?}); retry with a fresh operation",
+                active = active_operation.as_deref().unwrap_or("<none>"),
+                expected = expected_operation.as_deref().unwrap_or("<none>"),
+            ),
+            Self::Storage(detail) => write!(f, "compaction storage failure: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for CompactionDeactivationError {}
 
 impl AcpSessionStore {
     pub fn new(workspace_dir: &Path) -> Result<Self> {
@@ -156,7 +507,41 @@ impl AcpSessionStore {
                  payload    TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_acp_turn_checkpoint_events_session
-                 ON acp_turn_checkpoint_events(session_id, id);",
+                 ON acp_turn_checkpoint_events(session_id, id);
+
+             CREATE TABLE IF NOT EXISTS acp_terminal_ranges (
+                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id       INTEGER NOT NULL REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 first_message_id INTEGER NOT NULL,
+                 last_message_id  INTEGER NOT NULL,
+                 terminal_kind    TEXT NOT NULL,
+                 created_at       TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_acp_terminal_ranges_session
+                 ON acp_terminal_ranges(session_id, first_message_id);
+
+             CREATE TABLE IF NOT EXISTS acp_compaction_checkpoints (
+                 id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id                 INTEGER NOT NULL REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 format_version             INTEGER NOT NULL,
+                 operation_id               TEXT NOT NULL,
+                 source_first_message_id    INTEGER NOT NULL,
+                 covered_through_message_id INTEGER NOT NULL,
+                 source_message_rows        INTEGER NOT NULL,
+                 summary                    TEXT NOT NULL,
+                 summary_model_provider     TEXT NOT NULL,
+                 summary_model              TEXT NOT NULL,
+                 input_tokens               INTEGER,
+                 output_tokens              INTEGER,
+                 created_at                 TEXT NOT NULL,
+                 active                     INTEGER NOT NULL DEFAULT 1,
+                 deactivated_at             TEXT,
+                 deactivated_by_operation   TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_acp_compaction_checkpoints_session
+                 ON acp_compaction_checkpoints(session_id, id);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_acp_compaction_one_active
+                 ON acp_compaction_checkpoints(session_id) WHERE active = 1;",
         )
         .context("Failed to create ACP session schema")?;
 
@@ -340,30 +725,81 @@ impl AcpSessionStore {
         .with_context(|| format!("unknown session_uuid: {session_uuid}"))
     }
 
-    /// Load session metadata and full message history for restore.
-    /// Returns `None` if the session_uuid is not found.
+    /// Load session metadata and full message history.
+    ///
+    /// This is the legacy reader used by external ACP `session/load` and
+    /// `session/resume` consumers that have not been adapted to context
+    /// compaction. It fails closed for a session with an ACTIVE compaction
+    /// checkpoint: returning unprojected originals to an unsupported
+    /// execution consumer would silently undo the committed projection. Use
+    /// [`Self::load_session_transcript`] for intentional transcript reads and
+    /// [`Self::load_session_for_restore_with_projection`] for projected
+    /// native restore paths.
     pub fn load_session(&self, session_uuid: &str) -> Result<Option<AcpSessionData>> {
         let conn = self.conn.lock();
 
-        let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity
-             FROM acp_sessions WHERE session_uuid = ?1",
+        let session_id = match conn.query_row(
+            "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(session_id) => session_id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e).context("Failed to query ACP session"),
+        };
+
+        if let Some(checkpoint) = Self::active_checkpoint_row(&conn, session_id)? {
+            return Err(anyhow::Error::msg(format!(
+                "ACP session {session_uuid} has an active context-compaction checkpoint \
+                 (operation {}). This legacy load path is not adapted to compacted \
+                 sessions; resume it through the native ZeroCode Code surface.",
+                checkpoint.operation_id
+            )));
+        }
+
+        Self::load_session_data(&conn, session_uuid, session_id).map(Some)
+    }
+
+    /// Raw transcript reader: durable originals for intentional transcript
+    /// reads (history browsing, export), regardless of any compaction
+    /// checkpoint. Compaction never rewrites these rows, so the full
+    /// original transcript stays loadable at all times.
+    pub fn load_session_transcript(&self, session_uuid: &str) -> Result<Option<AcpSessionData>> {
+        let conn = self.conn.lock();
+        let session_id = match conn.query_row(
+            "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(session_id) => session_id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e).context("Failed to query ACP session"),
+        };
+        Self::load_session_data(&conn, session_uuid, session_id).map(Some)
+    }
+
+    fn load_session_data(
+        conn: &Connection,
+        session_uuid: &str,
+        session_id: i64,
+    ) -> Result<AcpSessionData> {
+        let row = conn.query_row(
+            "SELECT agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity
+             FROM acp_sessions WHERE id = ?1",
+            params![session_id],
             |row| {
                 Ok((
-                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
                 ))
             },
         );
 
         let (
-            session_id,
             agent_alias,
             workspace_dir,
             interaction_surface,
@@ -372,16 +808,15 @@ impl AcpSessionStore {
             last_activity_s,
         ) = match row {
             Ok(r) => r,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e).context("Failed to query ACP session"),
         };
 
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
 
-        let messages = Self::load_messages(&conn, session_id)?;
+        let messages = Self::load_messages(conn, session_id)?;
 
-        Ok(Some(AcpSessionData {
+        Ok(AcpSessionData {
             session_uuid: session_uuid.to_string(),
             agent_alias,
             workspace_dir,
@@ -390,7 +825,7 @@ impl AcpSessionStore {
             created_at,
             last_activity,
             messages,
-        }))
+        })
     }
 
     /// Load only durable ACP rows that are allowed to become live sessions.
@@ -512,6 +947,21 @@ impl AcpSessionStore {
     }
 
     fn load_messages(conn: &Connection, session_id: i64) -> Result<Vec<ConversationMessage>> {
+        Ok(Self::load_message_rows(conn, session_id)?
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect())
+    }
+
+    /// Load the durable transcript as `(acp_messages.id, message)` pairs in
+    /// row order. A message row carrying both tool-call and tool-result rows
+    /// decomposes into its `AssistantToolCalls` and `ToolResults` entries,
+    /// both stamped with that row's id, so range boundaries and per-row
+    /// identity stay exact for compaction coverage.
+    fn load_message_rows(
+        conn: &Connection,
+        session_id: i64,
+    ) -> Result<Vec<(i64, ConversationMessage)>> {
         // Pull all message rows.
         let mut msg_stmt = conn
             .prepare(
@@ -598,22 +1048,28 @@ impl AcpSessionStore {
 
             if ins.is_empty() && outs.is_empty() {
                 // Pure chat message.
-                out.push(ConversationMessage::Chat(ChatMessage { role, content }));
+                out.push((
+                    msg_id,
+                    ConversationMessage::Chat(ChatMessage { role, content }),
+                ));
             } else {
                 if !ins.is_empty() {
                     // Assistant turn that issued tool calls. The text may be empty.
-                    out.push(ConversationMessage::AssistantToolCalls {
-                        text: if content.is_empty() {
-                            None
-                        } else {
-                            Some(content)
+                    out.push((
+                        msg_id,
+                        ConversationMessage::AssistantToolCalls {
+                            text: if content.is_empty() {
+                                None
+                            } else {
+                                Some(content)
+                            },
+                            tool_calls: ins,
+                            reasoning_content,
                         },
-                        tool_calls: ins,
-                        reasoning_content,
-                    });
+                    ));
                 }
                 if !outs.is_empty() {
-                    out.push(ConversationMessage::ToolResults(outs));
+                    out.push((msg_id, ConversationMessage::ToolResults(outs)));
                 }
             }
         }
@@ -621,16 +1077,23 @@ impl AcpSessionStore {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_messages(
         tx: &Transaction<'_>,
         session_uuid: &str,
         session_id: i64,
         messages: &[ConversationMessage],
         now: &str,
+        range_kind: TerminalRangeKind,
     ) -> Result<()> {
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
         let mut last_assistant_msg_id: Option<i64> = None;
+        // Row-id bounds of this batch for the terminal-range record. Both are
+        // acp_messages row ids; tool-call rows live in their own table and
+        // never stretch the range.
+        let mut first_message_id: Option<i64> = None;
+        let mut last_message_id: Option<i64> = None;
 
         for msg in messages {
             match msg {
@@ -642,8 +1105,11 @@ impl AcpSessionStore {
                         params![session_id, chat.role, chat.content, now],
                     )
                     .context("Failed to insert chat message")?;
+                    let row_id = tx.last_insert_rowid();
+                    first_message_id.get_or_insert(row_id);
+                    last_message_id = Some(row_id);
                     if chat.role == "assistant" {
-                        last_assistant_msg_id = Some(tx.last_insert_rowid());
+                        last_assistant_msg_id = Some(row_id);
                     }
                 }
                 ConversationMessage::AssistantToolCalls {
@@ -664,6 +1130,8 @@ impl AcpSessionStore {
                     )
                     .context("Failed to insert assistant tool-call message")?;
                     let msg_id = tx.last_insert_rowid();
+                    first_message_id.get_or_insert(msg_id);
+                    last_message_id = Some(msg_id);
                     last_assistant_msg_id = Some(msg_id);
 
                     for tc in tool_calls {
@@ -735,6 +1203,20 @@ impl AcpSessionStore {
             }
         }
 
+        // Record the settled terminal range in the SAME transaction as the
+        // rows it certifies: this batch's rows are known-complete coverage
+        // exactly when this transaction commits. An empty batch certifies no
+        // rows and records nothing.
+        if let (Some(first), Some(last)) = (first_message_id, last_message_id) {
+            tx.execute(
+                "INSERT INTO acp_terminal_ranges
+                   (session_id, first_message_id, last_message_id, terminal_kind, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![session_id, first, last, range_kind.as_str(), now],
+            )
+            .context("Failed to insert terminal range row")?;
+        }
+
         tx.execute(
             "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
             params![now, session_id],
@@ -775,7 +1257,8 @@ impl AcpSessionStore {
             .transaction()
             .context("Failed to begin append_turn transaction")?;
         let messages = Self::bounded_transcript_messages(messages);
-        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+        let range_kind = TerminalRangeKind::for_terminal_batch(&messages);
+        Self::append_messages(&tx, session_uuid, session_id, &messages, &now, range_kind)?;
 
         tx.commit().context("Failed to commit append_turn")?;
         Ok(())
@@ -887,7 +1370,8 @@ impl AcpSessionStore {
             "ACP turn checkpoint identity mismatch"
         );
         let messages = Self::bounded_transcript_messages(messages);
-        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+        let range_kind = TerminalRangeKind::for_terminal_batch(&messages);
+        Self::append_messages(&tx, session_uuid, session_id, &messages, &now, range_kind)?;
         tx.execute(
             "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
             params![session_id, turn_id],
@@ -964,7 +1448,17 @@ impl AcpSessionStore {
         messages.push(ConversationMessage::Chat(ChatMessage::system(
             interruption_marker,
         )));
-        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+        // A recovered turn's rows settle in one transaction, but the turn
+        // itself was interrupted: the range records that so compaction never
+        // certifies it as completed coverage.
+        Self::append_messages(
+            &tx,
+            session_uuid,
+            session_id,
+            &messages,
+            &now,
+            TerminalRangeKind::Interrupted,
+        )?;
         let changed = tx
             .execute(
                 "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
@@ -1422,6 +1916,722 @@ impl AcpSessionStore {
         .context("Failed to touch ACP session")?;
         Ok(())
     }
+
+    // ── manual context compaction ─────────────────────────────────
+
+    fn active_checkpoint_row(
+        conn: &Connection,
+        session_id: i64,
+    ) -> Result<Option<AcpActiveCheckpointRecord>> {
+        conn.query_row(
+            "SELECT format_version, operation_id, source_first_message_id,
+                    covered_through_message_id, source_message_rows, summary,
+                    summary_model_provider, summary_model, input_tokens, output_tokens, created_at
+             FROM acp_compaction_checkpoints
+             WHERE session_id = ?1 AND active = 1
+             ORDER BY id DESC LIMIT 1",
+            params![session_id],
+            |row| {
+                Ok(AcpActiveCheckpointRecord {
+                    format_version: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    source_first_message_id: row.get(2)?,
+                    covered_through_message_id: row.get(3)?,
+                    source_message_rows: row.get(4)?,
+                    summary: row.get(5)?,
+                    summary_model_provider: row.get(6)?,
+                    summary_model: row.get(7)?,
+                    input_tokens: row.get::<_, Option<i64>>(8)?.map(|v| v.max(0) as u64),
+                    output_tokens: row.get::<_, Option<i64>>(9)?.map(|v| v.max(0) as u64),
+                    created_at: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to read active ACP compaction checkpoint")
+    }
+
+    fn terminal_range_rows(conn: &Connection, session_id: i64) -> Result<Vec<AcpTerminalRangeRow>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT first_message_id, last_message_id, terminal_kind
+                 FROM acp_terminal_ranges
+                 WHERE session_id = ?1
+                 ORDER BY first_message_id ASC",
+            )
+            .context("Failed to prepare terminal-range query")?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("Failed to read terminal ranges")?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (first, last, kind) = row.context("Failed to read terminal-range row")?;
+            out.push(AcpTerminalRangeRow {
+                first_message_id: first,
+                last_message_id: last,
+                kind: TerminalRangeKind::from_persisted(&kind)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Read the full compaction state for one operation in a single SQLite
+    /// read snapshot (one read transaction — not just the process mutex, so
+    /// a concurrent writer in another process cannot split the view).
+    /// Returns `None` when the session row does not exist.
+    pub fn read_compaction_snapshot(
+        &self,
+        session_uuid: &str,
+        operation_id: &str,
+    ) -> Result<Option<AcpCompactionSnapshot>> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("Failed to begin compaction snapshot read")?;
+
+        let row = tx
+            .query_row(
+                "SELECT id, agent_alias, workspace_dir, interaction_surface, killed_at
+                 FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("Failed to query ACP session for compaction")?;
+        let Some((session_row_id, agent_alias, workspace_dir, interaction_surface, killed_at)) =
+            row
+        else {
+            return Ok(None);
+        };
+
+        let message_rows = Self::load_message_rows(&tx, session_row_id)?;
+        let terminal_ranges = Self::terminal_range_rows(&tx, session_row_id)?;
+        let active_checkpoint = Self::active_checkpoint_row(&tx, session_row_id)?;
+        let operation_checkpoint: Option<i64> = tx
+            .query_row(
+                "SELECT active FROM acp_compaction_checkpoints
+                 WHERE session_id = ?1 AND operation_id = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![session_row_id, operation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read operation compaction checkpoint")?;
+        let inflight_turn_id: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_row_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read in-flight ACP turn checkpoint")?;
+        tx.commit()
+            .context("Failed to close compaction snapshot read")?;
+
+        Ok(Some(AcpCompactionSnapshot {
+            session_row_id,
+            session_uuid: session_uuid.to_string(),
+            agent_alias,
+            workspace_dir,
+            interaction_surface,
+            killed: killed_at.is_some(),
+            message_rows,
+            terminal_ranges,
+            active_checkpoint,
+            operation_checkpoint: operation_checkpoint.map(|active| {
+                if active == 1 {
+                    AcpCheckpointOperationState::Active
+                } else {
+                    AcpCheckpointOperationState::Inactive
+                }
+            }),
+            inflight_turn_id,
+        }))
+    }
+
+    /// Restore-mode load pairing durable originals with the active
+    /// compaction checkpoint in one read snapshot. Killed rows stay terminal
+    /// for runtime restore, exactly like [`Self::load_session_for_restore`].
+    pub fn load_session_for_restore_with_projection(
+        &self,
+        session_uuid: &str,
+    ) -> Result<AcpSessionRestoreProjection> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("Failed to begin projected restore read")?;
+
+        let row = tx
+            .query_row(
+                "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at
+                 FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("Failed to query ACP session for projected restore")?;
+        let Some((
+            session_id,
+            agent_alias,
+            workspace_dir,
+            interaction_surface,
+            token_count,
+            created_at_s,
+            last_activity_s,
+            killed_at,
+        )) = row
+        else {
+            return Ok(AcpSessionRestoreProjection::Missing);
+        };
+        if killed_at.is_some() {
+            return Ok(AcpSessionRestoreProjection::Killed);
+        }
+
+        let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
+        let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
+        let message_rows = Self::load_message_rows(&tx, session_id)?;
+        let checkpoint = Self::active_checkpoint_row(&tx, session_id)?;
+        tx.commit()
+            .context("Failed to close projected restore read")?;
+
+        Ok(AcpSessionRestoreProjection::Projected(
+            AcpProjectedRestore {
+                data: AcpSessionData {
+                    session_uuid: session_uuid.to_string(),
+                    agent_alias,
+                    workspace_dir,
+                    interaction_surface,
+                    token_count: token_count.max(0) as u64,
+                    created_at,
+                    last_activity,
+                    messages: message_rows
+                        .iter()
+                        .map(|(_, message)| message.clone())
+                        .collect(),
+                },
+                message_rows,
+                checkpoint,
+            },
+        ))
+    }
+
+    /// Validate that the terminal ranges exactly tile the span
+    /// [first, covered_through] with only completed turns, and that the
+    /// message-row count still matches the caller's snapshot. Returns a
+    /// human-readable detail on mismatch.
+    fn validate_source_identity(
+        conn: &Connection,
+        session_id: i64,
+        first_message_id: i64,
+        covered_through_message_id: i64,
+        expected_message_rows: i64,
+    ) -> std::result::Result<(), String> {
+        // Adjacency is SESSION-LOCAL: acp_messages ids are global, so
+        // another session's intervening rows create harmless numeric gaps
+        // between this session's ranges. Coverage is checked against this
+        // session's own ordered rows instead of `last_id + 1` contiguity.
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM acp_messages
+                 WHERE session_id = ?1 AND id >= ?2 AND id <= ?3
+                 ORDER BY id ASC",
+            )
+            .map_err(|error| format!("failed to read covered rows: {error}"))?;
+        let row_ids: Vec<i64> = stmt
+            .query_map(
+                params![session_id, first_message_id, covered_through_message_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to read covered rows: {error}"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| format!("failed to read covered rows: {error}"))?;
+        if row_ids.len() as i64 != expected_message_rows {
+            return Err(format!(
+                "covered row count changed: expected {expected_message_rows}, found {}",
+                row_ids.len()
+            ));
+        }
+
+        let ranges = Self::terminal_range_rows(conn, session_id)
+            .map_err(|error| format!("failed to read terminal ranges: {error}"))?;
+        // Only ranges that intersect the covered span participate; any range
+        // straddling the boundary proves the boundary is not a range end.
+        let mut covering: Vec<&AcpTerminalRangeRow> = ranges
+            .iter()
+            .filter(|range| {
+                range.first_message_id <= covered_through_message_id
+                    && range.last_message_id >= first_message_id
+            })
+            .collect();
+        covering.sort_by_key(|range| range.first_message_id);
+        if let Some(last) = covering.last()
+            && last.last_message_id > covered_through_message_id
+        {
+            return Err(format!(
+                "covered boundary {covered_through_message_id} is not a terminal \
+                 range end (range {first}..{last} straddles it)",
+                first = last.first_message_id,
+                last = last.last_message_id
+            ));
+        }
+
+        let row_position: std::collections::HashMap<i64, usize> = row_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect();
+        let mut next_row = 0usize;
+        for range in covering {
+            if range.kind != TerminalRangeKind::Completed {
+                return Err(format!(
+                    "range starting at row {first} settled as {kind}, not completed",
+                    first = range.first_message_id,
+                    kind = range.kind.as_str()
+                ));
+            }
+            // The range must start exactly at this session's next uncovered
+            // row and end on one of this session's later rows; anything
+            // else is a genuine gap or overlap inside the covered span.
+            let starts_at_next = row_ids
+                .get(next_row)
+                .is_some_and(|id| *id == range.first_message_id);
+            let ends_in_session = row_position
+                .get(&range.last_message_id)
+                .is_some_and(|end| *end >= next_row);
+            if !starts_at_next || !ends_in_session {
+                return Err(format!(
+                    "terminal ranges do not tile this session's rows \
+                     [row {first}..{covered_through_message_id}] without gaps",
+                    first = first_message_id
+                ));
+            }
+            next_row = row_position[&range.last_message_id] + 1;
+        }
+        if next_row != row_ids.len() {
+            return Err(format!(
+                "terminal ranges do not tile this session's rows \
+                 [row {first}..{covered_through_message_id}] without gaps",
+                first = first_message_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Activate (or idempotently recognize) one compaction checkpoint in a
+    /// single write transaction that rechecks the durable world: session
+    /// incarnation, not-killed state, absence of a durable in-flight turn,
+    /// and exact source identity. A pre-existing active checkpoint for a
+    /// different operation is deactivated (recompaction replaces the old
+    /// projection with one recomputed from originals); the same operation id
+    /// is recognized as a committed retry without a second write.
+    pub fn activate_compaction_checkpoint(
+        &self,
+        request: &CompactionActivationRequest<'_>,
+    ) -> std::result::Result<CompactionActivationOutcome, CompactionActivationError> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+
+        let row = tx
+            .query_row(
+                "SELECT id, killed_at FROM acp_sessions WHERE session_uuid = ?1",
+                params![request.session_uuid],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        let Some((session_row_id, killed_at)) = row else {
+            return Err(CompactionActivationError::SessionMissing);
+        };
+        if session_row_id != request.expected_session_row_id {
+            return Err(CompactionActivationError::IncarnationMismatch {
+                found_session_row_id: session_row_id,
+            });
+        }
+        if killed_at.is_some() {
+            return Err(CompactionActivationError::SessionKilled);
+        }
+        let inflight: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_row_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        if inflight.is_some() {
+            return Err(CompactionActivationError::InflightTurn);
+        }
+
+        if let Err(detail) = Self::validate_source_identity(
+            &tx,
+            session_row_id,
+            request.source_first_message_id,
+            request.covered_through_message_id,
+            request.source_message_rows,
+        ) {
+            return Err(CompactionActivationError::SourceMismatch { detail });
+        }
+
+        // Committed retry: the same operation is already active.
+        let active_operation: Option<String> = tx
+            .query_row(
+                "SELECT operation_id FROM acp_compaction_checkpoints
+                 WHERE session_id = ?1 AND active = 1",
+                params![session_row_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        if active_operation.as_deref() == Some(request.operation_id) {
+            return Ok(CompactionActivationOutcome::AlreadyActive);
+        }
+
+        // Fence on the caller's snapshotted prior active operation: only a
+        // request that saw THIS active checkpoint (or correctly saw none)
+        // may supersede it. A stale request must never overwrite a later
+        // compaction's committed projection.
+        if active_operation.as_deref() != request.expected_prior_active_operation {
+            return Err(CompactionActivationError::StaleActiveCheckpoint {
+                active_operation,
+                expected_operation: request.expected_prior_active_operation.map(str::to_string),
+            });
+        }
+
+        // A different active checkpoint is superseded: recompaction replaces
+        // the old projection with one recomputed from originals. Only an
+        // actual restore records deactivated_by_operation for restore retries.
+        tx.execute(
+            "UPDATE acp_compaction_checkpoints
+             SET active = 0, deactivated_at = ?2, deactivated_by_operation = NULL
+             WHERE session_id = ?1 AND active = 1",
+            params![session_row_id, now],
+        )
+        .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO acp_compaction_checkpoints
+               (session_id, format_version, operation_id, source_first_message_id,
+                covered_through_message_id, source_message_rows, summary,
+                summary_model_provider, summary_model, input_tokens, output_tokens,
+                created_at, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
+            params![
+                session_row_id,
+                request.format_version,
+                request.operation_id,
+                request.source_first_message_id,
+                request.covered_through_message_id,
+                request.source_message_rows,
+                request.summary,
+                request.summary_model_provider,
+                request.summary_model,
+                request.input_tokens.map(|v| v as i64),
+                request.output_tokens.map(|v| v as i64),
+                now,
+            ],
+        )
+        .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| CompactionActivationError::Storage(error.to_string()))?;
+        Ok(CompactionActivationOutcome::Activated)
+    }
+
+    /// Deactivate the active compaction checkpoint (restore) in one write
+    /// transaction rechecking incarnation, kill state, in-flight turns and
+    /// the identity of the checkpoint the caller snapshotted. Idempotent
+    /// per operation id: a retry of the same restore is recognized, a
+    /// restore of a session with no active checkpoint is a typed no-op, and
+    /// a stale request whose snapshotted checkpoint was replaced by a later
+    /// operation is refused instead of deactivating the successor. Restore
+    /// deactivates the checkpoint — it never deletes history, reruns tools,
+    /// or reverses external effects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deactivate_compaction_checkpoint(
+        &self,
+        session_uuid: &str,
+        expected_session_row_id: i64,
+        operation_id: &str,
+        expected_active_checkpoint: Option<(&str, i64)>,
+    ) -> std::result::Result<CompactionDeactivationOutcome, CompactionDeactivationError> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+
+        let row = tx
+            .query_row(
+                "SELECT id, killed_at FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        let Some((session_row_id, killed_at)) = row else {
+            return Err(CompactionDeactivationError::SessionMissing);
+        };
+        if session_row_id != expected_session_row_id {
+            return Err(CompactionDeactivationError::IncarnationMismatch {
+                found_session_row_id: session_row_id,
+            });
+        }
+        if killed_at.is_some() {
+            return Err(CompactionDeactivationError::SessionKilled);
+        }
+        let inflight: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_row_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        if inflight.is_some() {
+            return Err(CompactionDeactivationError::InflightTurn);
+        }
+
+        // Recognize this restore before inspecting the current checkpoint:
+        // an old retry must not deactivate a newer compaction.
+        let already_restored: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM acp_compaction_checkpoints
+                 WHERE session_id = ?1 AND deactivated_by_operation = ?2)",
+                params![session_row_id, operation_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        if already_restored {
+            return Ok(CompactionDeactivationOutcome::AlreadyDeactivated);
+        }
+
+        let active: Option<(String, i64, i64, i64)> = tx
+            .query_row(
+                "SELECT operation_id, covered_through_message_id, source_message_rows, id
+                 FROM acp_compaction_checkpoints
+                 WHERE session_id = ?1 AND active = 1",
+                params![session_row_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        let Some((active_operation, covered_through_message_id, source_message_rows, _row_id)) =
+            active
+        else {
+            return Ok(CompactionDeactivationOutcome::NoActiveCheckpoint);
+        };
+        // Fence on the caller's snapshotted checkpoint identity: a stale
+        // restore must not deactivate a checkpoint that a later compact or
+        // recompaction installed after this request's snapshot.
+        let expected =
+            expected_active_checkpoint.map(|(operation, covered)| (operation.to_string(), covered));
+        if expected.as_ref() != Some(&(active_operation.clone(), covered_through_message_id)) {
+            return Err(CompactionDeactivationError::StaleActiveCheckpoint {
+                active_operation: Some(active_operation),
+                expected_operation: expected.map(|(operation, _)| operation),
+            });
+        }
+        let changed = tx
+            .execute(
+                "UPDATE acp_compaction_checkpoints
+                 SET active = 0, deactivated_at = ?2, deactivated_by_operation = ?3
+                 WHERE session_id = ?1 AND active = 1",
+                params![session_row_id, now, operation_id],
+            )
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        if changed != 1 {
+            return Err(CompactionDeactivationError::Storage(format!(
+                "deactivation changed {changed} rows instead of 1"
+            )));
+        }
+        tx.commit()
+            .map_err(|error| CompactionDeactivationError::Storage(error.to_string()))?;
+        Ok(CompactionDeactivationOutcome::Deactivated {
+            covered_through_message_id,
+            covered_message_rows: source_message_rows,
+        })
+    }
+}
+
+/// Select the contiguous known-completed prefix that a manual compaction may
+/// cover, from the session's original rows and settled terminal ranges.
+///
+/// Coverage rules (v1, all fail-closed):
+/// - Coverage starts at the session's first message row and is certified by
+///   terminal ranges only. Legacy or unknown rows are refused — never
+///   inferred from user-message boundaries, token estimates, or audit rows.
+/// - Only `Completed` ranges may be covered. `Failed` and `Interrupted`
+///   ranges stay raw tail history rather than being certified complete.
+/// - The newest completed turn is always retained: coverage is truncated
+///   before it, and everything after it stays intact.
+/// - Every tool exchange in the covered span must pair unambiguously
+///   one-to-one with its immediately adjacent results, mirroring the
+///   replay filter's pairing contract but refusing instead of repairing.
+pub fn select_compaction_source(
+    message_rows: &[(i64, ConversationMessage)],
+    ranges: &[AcpTerminalRangeRow],
+) -> std::result::Result<CompactionSourceSelection, CompactionSourceError> {
+    let first_message_id = match message_rows.first() {
+        Some((id, _)) => *id,
+        None => {
+            return Err(CompactionSourceError::NoTerminalCoverage {
+                first_message_id: 0,
+            });
+        }
+    };
+
+    // Coverage must start with a completed range at the head row.
+    let head = ranges
+        .first()
+        .ok_or(CompactionSourceError::NoTerminalCoverage { first_message_id })?;
+    if head.first_message_id != first_message_id {
+        return Err(CompactionSourceError::NoTerminalCoverage { first_message_id });
+    }
+    if head.kind != TerminalRangeKind::Completed {
+        return Err(CompactionSourceError::LeadingRangeNotCompleted {
+            kind: head.kind,
+            first_message_id: head.first_message_id,
+        });
+    }
+
+    // The newest completed turn is always retained; coverage may only use
+    // ranges strictly before it. Range order is row order, so every range
+    // before that index ends before the newest completed turn begins.
+    let Some(newest_completed) = ranges
+        .iter()
+        .rposition(|range| range.kind == TerminalRangeKind::Completed)
+    else {
+        return Err(CompactionSourceError::NewestTurnMustBeRetained);
+    };
+
+    // Adjacency is SESSION-LOCAL: acp_messages ids are global, so another
+    // session's intervening rows create harmless numeric gaps between this
+    // session's ranges. A range continues the covered prefix only when it
+    // starts at THIS session's next uncovered row and ends on one of this
+    // session's later rows. Genuinely missing coverage of this session's
+    // own rows still stops the walk.
+    let row_position: std::collections::HashMap<i64, usize> = message_rows
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (*id, index))
+        .collect();
+    let mut next_row = 0usize;
+    let mut selected_ranges = 0usize;
+    for (index, range) in ranges.iter().enumerate() {
+        if index >= newest_completed {
+            break;
+        }
+        if range.kind != TerminalRangeKind::Completed {
+            break;
+        }
+        let starts_at_next = message_rows
+            .get(next_row)
+            .is_some_and(|(id, _)| *id == range.first_message_id);
+        let ends_in_session = row_position
+            .get(&range.last_message_id)
+            .is_some_and(|end| *end >= next_row);
+        if !starts_at_next || !ends_in_session {
+            break;
+        }
+        next_row = row_position[&range.last_message_id] + 1;
+        selected_ranges += 1;
+    }
+    if selected_ranges == 0 {
+        return Err(CompactionSourceError::NewestTurnMustBeRetained);
+    }
+    let covered_row_count = next_row;
+    let covered_through_message_id = message_rows[next_row - 1].0;
+
+    let covered: Vec<(i64, &ConversationMessage)> = message_rows
+        .iter()
+        .take_while(|(id, _)| *id <= covered_through_message_id)
+        .map(|(id, message)| (*id, message))
+        .collect();
+    // `covered_row_count` counts distinct message rows (the walk's
+    // positions); `covered` may hold more entries when one row decomposes
+    // into an AssistantToolCalls plus a ToolResults message.
+    let covered_message_rows = covered_row_count;
+
+    validate_covered_tool_pairing(&covered)?;
+
+    Ok(CompactionSourceSelection {
+        first_message_id,
+        covered_through_message_id,
+        covered_message_rows,
+        covered_ranges: selected_ranges,
+    })
+}
+
+/// Refuse ambiguous or unpaired tool exchanges inside the covered span.
+/// Every `AssistantToolCalls` must be immediately followed by the
+/// `ToolResults` message that resolves each call exactly once, with no
+/// duplicate call ids, no orphan results, and no dangling calls.
+fn validate_covered_tool_pairing(
+    covered: &[(i64, &ConversationMessage)],
+) -> std::result::Result<(), CompactionSourceError> {
+    let mut index = 0usize;
+    while index < covered.len() {
+        let (message_id, message) = covered[index];
+        match message {
+            ConversationMessage::Chat(_) => {
+                index += 1;
+            }
+            ConversationMessage::AssistantToolCalls { tool_calls, .. } => {
+                let Some((_, ConversationMessage::ToolResults(results))) = covered.get(index + 1)
+                else {
+                    return Err(CompactionSourceError::AmbiguousToolPairing { message_id });
+                };
+                let mut call_ids = std::collections::HashSet::new();
+                for call in tool_calls {
+                    if !call_ids.insert(call.id.as_str()) {
+                        return Err(CompactionSourceError::AmbiguousToolPairing { message_id });
+                    }
+                }
+                let mut result_ids = std::collections::HashSet::new();
+                for result in results {
+                    if !result_ids.insert(result.tool_call_id.as_str()) {
+                        return Err(CompactionSourceError::AmbiguousToolPairing { message_id });
+                    }
+                }
+                if call_ids.len() != results.len() || call_ids != result_ids {
+                    return Err(CompactionSourceError::AmbiguousToolPairing { message_id });
+                }
+                index += 2;
+            }
+            // A results message reached as a walk position has no preceding
+            // call inside the covered span: an orphan result.
+            ConversationMessage::ToolResults(_) => {
+                return Err(CompactionSourceError::AmbiguousToolPairing { message_id });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
@@ -2608,5 +3818,907 @@ mod tests {
         assert_eq!(store.list_sessions_by_agent("beta").unwrap().len(), 1);
         // unknown source → 0
         assert_eq!(store.rename_sessions_by_agent("ghost", "x").unwrap(), 0);
+    }
+
+    // ── manual context compaction ─────────────────────────────────
+
+    fn compaction_turn(store: &AcpSessionStore, session: &str, turn: &str) {
+        store
+            .append_turn(
+                session,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user(turn)),
+                    ConversationMessage::Chat(ChatMessage::assistant(&format!("answer to {turn}"))),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn failed_turn(store: &AcpSessionStore, session: &str, turn: &str) {
+        store
+            .append_turn(
+                session,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user(turn)),
+                    ConversationMessage::Chat(ChatMessage::system(FAILED_TURN_MARKER)),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn projected_for_test(restore: AcpSessionRestoreProjection) -> AcpProjectedRestore {
+        match restore {
+            AcpSessionRestoreProjection::Projected(projected) => projected,
+            AcpSessionRestoreProjection::Missing | AcpSessionRestoreProjection::Killed => {
+                panic!("expected projected restore, got Missing or Killed")
+            }
+        }
+    }
+
+    fn rows_and_ranges(
+        store: &AcpSessionStore,
+        session: &str,
+    ) -> (Vec<(i64, ConversationMessage)>, Vec<AcpTerminalRangeRow>) {
+        let snapshot = store.read_compaction_snapshot(session, "op-probe").unwrap();
+        let snapshot = snapshot.expect("session row must exist");
+        (snapshot.message_rows, snapshot.terminal_ranges)
+    }
+
+    #[test]
+    fn terminal_ranges_classify_completed_failed_and_interrupted() {
+        let (_tmp, store) = open_store();
+        store.create_session("ranges", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "ranges", "one");
+        failed_turn(&store, "ranges", "two");
+
+        // Interrupted: an in-flight checkpoint recovered with the marker.
+        store
+            .begin_turn_checkpoint(
+                "ranges",
+                "turn-3",
+                &[ConversationMessage::Chat(ChatMessage::user("three"))],
+            )
+            .unwrap();
+        assert!(
+            store
+                .recover_turn_checkpoint("ranges", "stream interrupted")
+                .unwrap()
+        );
+
+        let (_, ranges) = rows_and_ranges(&store, "ranges");
+        assert_eq!(
+            ranges.iter().map(|range| range.kind).collect::<Vec<_>>(),
+            vec![
+                TerminalRangeKind::Completed,
+                TerminalRangeKind::Failed,
+                TerminalRangeKind::Interrupted,
+            ]
+        );
+        // Ranges tile the rows in order with no gaps.
+        let mut expected_next = ranges[0].first_message_id;
+        for range in &ranges {
+            assert_eq!(range.first_message_id, expected_next);
+            expected_next = range.last_message_id + 1;
+        }
+    }
+
+    #[test]
+    fn select_source_covers_completed_prefix_and_retains_newest_completed() {
+        let (_tmp, store) = open_store();
+        store.create_session("select", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "select", "one");
+        compaction_turn(&store, "select", "two");
+        compaction_turn(&store, "select", "three");
+        let (rows, ranges) = rows_and_ranges(&store, "select");
+
+        let selection = select_compaction_source(&rows, &ranges).unwrap();
+        // Turn three (the newest completed) is retained; turns one and two
+        // are covered.
+        assert_eq!(selection.covered_ranges, 2);
+        assert_eq!(selection.first_message_id, rows[0].0);
+        assert_eq!(
+            selection.covered_through_message_id,
+            ranges[1].last_message_id
+        );
+        assert_eq!(selection.covered_message_rows, 4);
+    }
+
+    #[test]
+    fn select_source_refuses_legacy_interrupted_and_single_turn_history() {
+        // Legacy: rows exist but no terminal ranges certify them.
+        let (_tmp, store) = open_store();
+        store.create_session("legacy", "alpha", "/tmp/ws").unwrap();
+        store
+            .append_turn(
+                "legacy",
+                &[ConversationMessage::Chat(ChatMessage::user("old"))],
+            )
+            .unwrap();
+        let conn = store.conn.lock();
+        conn.execute("DELETE FROM acp_terminal_ranges", []).unwrap();
+        drop(conn);
+        let (rows, ranges) = rows_and_ranges(&store, "legacy");
+        assert!(matches!(
+            select_compaction_source(&rows, &ranges),
+            Err(CompactionSourceError::NoTerminalCoverage { .. })
+        ));
+
+        // Interrupted head: the oldest settled range is an interrupted turn.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("interrupted-head", "alpha", "/tmp/ws")
+            .unwrap();
+        store
+            .begin_turn_checkpoint(
+                "interrupted-head",
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::user("q"))],
+            )
+            .unwrap();
+        assert!(
+            store
+                .recover_turn_checkpoint("interrupted-head", "interrupted")
+                .unwrap()
+        );
+        compaction_turn(&store, "interrupted-head", "later");
+        let (rows, ranges) = rows_and_ranges(&store, "interrupted-head");
+        assert!(matches!(
+            select_compaction_source(&rows, &ranges),
+            Err(CompactionSourceError::LeadingRangeNotCompleted {
+                kind: TerminalRangeKind::Interrupted,
+                ..
+            })
+        ));
+
+        // Single completed turn: it is the newest, so it must be retained.
+        let (_tmp, store) = open_store();
+        store.create_session("single", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "single", "only");
+        let (rows, ranges) = rows_and_ranges(&store, "single");
+        assert_eq!(
+            select_compaction_source(&rows, &ranges),
+            Err(CompactionSourceError::NewestTurnMustBeRetained)
+        );
+
+        // Empty history.
+        let (_tmp, store) = open_store();
+        store.create_session("empty", "alpha", "/tmp/ws").unwrap();
+        let (rows, ranges) = rows_and_ranges(&store, "empty");
+        assert!(matches!(
+            select_compaction_source(&rows, &ranges),
+            Err(CompactionSourceError::NoTerminalCoverage { .. })
+        ));
+    }
+
+    #[test]
+    fn select_source_stops_at_failed_range_and_refuses_ambiguous_pairing() {
+        // A failed turn between completed turns halts coverage there.
+        let (_tmp, store) = open_store();
+        store.create_session("mixed", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "mixed", "one");
+        failed_turn(&store, "mixed", "two");
+        compaction_turn(&store, "mixed", "three");
+        let (rows, ranges) = rows_and_ranges(&store, "mixed");
+        let selection = select_compaction_source(&rows, &ranges).unwrap();
+        assert_eq!(selection.covered_ranges, 1);
+        assert_eq!(
+            selection.covered_through_message_id,
+            ranges[0].last_message_id
+        );
+
+        // Ambiguous pairing: a duplicate call id inside one exchange.
+        let covered = vec![
+            (1i64, ConversationMessage::Chat(ChatMessage::user("dup"))),
+            (
+                2,
+                ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "dup".into(),
+                            name: "shell".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        },
+                        ToolCall {
+                            id: "dup".into(),
+                            name: "shell".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        },
+                    ],
+                    reasoning_content: None,
+                },
+            ),
+            (
+                2,
+                ConversationMessage::ToolResults(vec![
+                    ToolResultMessage {
+                        tool_call_id: "dup".into(),
+                        content: "first".into(),
+                        tool_name: "shell".into(),
+                    },
+                    ToolResultMessage {
+                        tool_call_id: "dup".into(),
+                        content: "second".into(),
+                        tool_name: "shell".into(),
+                    },
+                ]),
+            ),
+        ];
+        let ranges = vec![
+            AcpTerminalRangeRow {
+                first_message_id: 1,
+                last_message_id: 2,
+                kind: TerminalRangeKind::Completed,
+            },
+            AcpTerminalRangeRow {
+                first_message_id: 3,
+                last_message_id: 4,
+                kind: TerminalRangeKind::Completed,
+            },
+        ];
+        let rows = [
+            covered,
+            vec![
+                (3, ConversationMessage::Chat(ChatMessage::user("tail"))),
+                (4, ConversationMessage::Chat(ChatMessage::assistant("done"))),
+            ],
+        ]
+        .concat();
+        assert!(matches!(
+            select_compaction_source(&rows, &ranges),
+            Err(CompactionSourceError::AmbiguousToolPairing { .. })
+        ));
+    }
+
+    #[test]
+    fn source_adjacency_is_session_local_not_global_id_contiguous() {
+        let (_tmp, store) = open_store();
+        // Two sessions share the global acp_messages id space: session B's
+        // rows interleave numerically between session A's turns.
+        store.create_session("inter-a", "alpha", "/tmp/ws").unwrap();
+        store.create_session("inter-b", "beta", "/tmp/ws").unwrap();
+        compaction_turn(&store, "inter-a", "one"); // A rows 1, 2
+        compaction_turn(&store, "inter-b", "other"); // B rows 3, 4
+        compaction_turn(&store, "inter-a", "two"); // A rows 5, 6
+        compaction_turn(&store, "inter-a", "three"); // A rows 7, 8
+
+        // A's coverage ignores B's intervening global ids: the completed
+        // ranges (1-2) and (5-6) are adjacent in A's own row list, so the
+        // prefix covers both while retaining the newest completed turn.
+        let (rows, ranges) = rows_and_ranges(&store, "inter-a");
+        let selection = select_compaction_source(&rows, &ranges).unwrap();
+        assert_eq!(selection.covered_ranges, 2);
+        assert_eq!(selection.covered_message_rows, 4);
+        assert_eq!(selection.covered_through_message_id, 6);
+        assert_eq!(selection.first_message_id, 1);
+
+        // The store's transactional source validation must agree: the
+        // activation of that interleaved coverage commits.
+        let snapshot = store
+            .read_compaction_snapshot("inter-a", "op-inter-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .activate_compaction_checkpoint(&activation_request(
+                    "inter-a",
+                    snapshot.session_row_id,
+                    "op-inter-1",
+                    None,
+                    selection
+                ))
+                .unwrap(),
+            CompactionActivationOutcome::Activated
+        );
+        assert!(
+            projected_for_test(
+                store
+                    .load_session_for_restore_with_projection("inter-a")
+                    .unwrap(),
+            )
+            .checkpoint
+            .is_some()
+        );
+
+        // Genuine missing coverage is different: when this session's own
+        // rows lack a certifying range, the walk stops there instead of
+        // treating the rows as covered.
+        store.create_session("inter-c", "gamma", "/tmp/ws").unwrap();
+        compaction_turn(&store, "inter-c", "one");
+        compaction_turn(&store, "inter-c", "two");
+        compaction_turn(&store, "inter-c", "three");
+        {
+            // Remove the middle turn's terminal range: C's rows for turn two
+            // become genuinely uncertified.
+            let conn = store.conn.lock();
+            conn.execute(
+                "DELETE FROM acp_terminal_ranges
+                 WHERE session_id = (SELECT id FROM acp_sessions WHERE session_uuid = 'inter-c')
+                   AND first_message_id = (
+                       SELECT first_message_id FROM acp_terminal_ranges
+                       WHERE session_id = (SELECT id FROM acp_sessions
+                                           WHERE session_uuid = 'inter-c')
+                       ORDER BY first_message_id LIMIT 1 OFFSET 1
+                   )",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+        }
+        let (rows, ranges) = rows_and_ranges(&store, "inter-c");
+        let selection = select_compaction_source(&rows, &ranges).unwrap();
+        assert_eq!(
+            selection.covered_ranges, 1,
+            "the walk must stop at C's genuinely uncertified rows"
+        );
+        assert_eq!(selection.covered_message_rows, 2);
+    }
+
+    #[test]
+    fn stale_activation_and_restore_are_fenced_by_prior_active_identity() {
+        let (_tmp, store) = open_store();
+        store.create_session("fence", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "fence", "one");
+        compaction_turn(&store, "fence", "two");
+        compaction_turn(&store, "fence", "three");
+
+        let snapshot = store
+            .read_compaction_snapshot("fence", "op-late")
+            .unwrap()
+            .unwrap();
+        let selection =
+            select_compaction_source(&snapshot.message_rows, &snapshot.terminal_ranges).unwrap();
+
+        // A later compaction commits first.
+        store
+            .activate_compaction_checkpoint(&activation_request(
+                "fence",
+                snapshot.session_row_id,
+                "op-late",
+                None,
+                selection,
+            ))
+            .unwrap();
+
+        // A stale request that snapshotted NO active checkpoint must not
+        // supersede the later operation.
+        let stale = store
+            .activate_compaction_checkpoint(&activation_request(
+                "fence",
+                snapshot.session_row_id,
+                "op-stale",
+                None,
+                selection,
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            CompactionActivationError::StaleActiveCheckpoint { .. }
+        ));
+        let snapshot_after = store
+            .read_compaction_snapshot("fence", "op-late")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot_after
+                .active_checkpoint
+                .as_ref()
+                .map(|c| c.operation_id.as_str()),
+            Some("op-late"),
+            "the stale request must not have superseded the later operation"
+        );
+
+        // A stale restore that snapshotted the pre-existing checkpoint's
+        // identity must not deactivate a DIFFERENT later checkpoint: replace
+        // the active checkpoint with a recompaction, then restore against
+        // the old identity.
+        let fenced_identity = snapshot_after
+            .active_checkpoint
+            .map(|c| (c.operation_id.clone(), c.covered_through_message_id))
+            .unwrap();
+        store
+            .deactivate_compaction_checkpoint(
+                "fence",
+                snapshot.session_row_id,
+                "op-restore-prepare",
+                Some((&fenced_identity.0, fenced_identity.1)),
+            )
+            .unwrap();
+        let snapshot = store
+            .read_compaction_snapshot("fence", "op-recompact")
+            .unwrap()
+            .unwrap();
+        let selection =
+            select_compaction_source(&snapshot.message_rows, &snapshot.terminal_ranges).unwrap();
+        store
+            .activate_compaction_checkpoint(&activation_request(
+                "fence",
+                snapshot.session_row_id,
+                "op-recompact",
+                None,
+                selection,
+            ))
+            .unwrap();
+
+        // The stale restore expects the OLD (fenced_identity) checkpoint but
+        // the active row is now op-recompact: refused, successor preserved.
+        let stale_restore = store
+            .deactivate_compaction_checkpoint(
+                "fence",
+                snapshot.session_row_id,
+                "op-restore-stale",
+                Some((&fenced_identity.0, fenced_identity.1)),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale_restore,
+            CompactionDeactivationError::StaleActiveCheckpoint { .. }
+        ));
+        let snapshot_after = store
+            .read_compaction_snapshot("fence", "op-recompact")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot_after.active_checkpoint.map(|c| c.operation_id),
+            Some("op-recompact".to_string()),
+            "the stale restore must not have deactivated the later checkpoint"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn activation_request<'a>(
+        session: &'a str,
+        session_row_id: i64,
+        operation_id: &'a str,
+        expected_prior_active_operation: Option<&'a str>,
+        selection: CompactionSourceSelection,
+    ) -> CompactionActivationRequest<'a> {
+        CompactionActivationRequest {
+            session_uuid: session,
+            expected_session_row_id: session_row_id,
+            format_version: 1,
+            operation_id,
+            expected_prior_active_operation,
+            source_first_message_id: selection.first_message_id,
+            covered_through_message_id: selection.covered_through_message_id,
+            source_message_rows: selection.covered_message_rows as i64,
+            summary: "bounded summary",
+            summary_model_provider: "provider",
+            summary_model: "model",
+            input_tokens: Some(120),
+            output_tokens: Some(30),
+        }
+    }
+
+    #[test]
+    fn activate_deactivate_round_trip_keeps_originals_and_one_active_checkpoint() {
+        let (_tmp, store) = open_store();
+        store.create_session("cycle", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "cycle", "one");
+        compaction_turn(&store, "cycle", "two");
+        compaction_turn(&store, "cycle", "three");
+
+        let snapshot = store
+            .read_compaction_snapshot("cycle", "op-compact-1")
+            .unwrap()
+            .unwrap();
+        let selection =
+            select_compaction_source(&snapshot.message_rows, &snapshot.terminal_ranges).unwrap();
+        assert_eq!(
+            store
+                .activate_compaction_checkpoint(&activation_request(
+                    "cycle",
+                    snapshot.session_row_id,
+                    "op-compact-1",
+                    None,
+                    selection
+                ))
+                .unwrap(),
+            CompactionActivationOutcome::Activated
+        );
+
+        // Originals are retained; the legacy reader rejects; the transcript
+        // and projected readers stay usable.
+        let originals = store.load_session_transcript("cycle").unwrap().unwrap();
+        assert_eq!(originals.messages.len(), 6);
+        assert!(store.load_session("cycle").is_err());
+        let projected = projected_for_test(
+            store
+                .load_session_for_restore_with_projection("cycle")
+                .unwrap(),
+        );
+        assert_eq!(projected.data.messages.len(), 6);
+        assert_eq!(
+            projected
+                .checkpoint
+                .as_ref()
+                .map(|c| c.operation_id.as_str()),
+            Some("op-compact-1")
+        );
+
+        // Later append-only turns extend the tail without invalidating.
+        compaction_turn(&store, "cycle", "four");
+        assert!(
+            projected_for_test(
+                store
+                    .load_session_for_restore_with_projection("cycle")
+                    .unwrap(),
+            )
+            .checkpoint
+            .is_some()
+        );
+
+        // Committed retry is recognized without a second write.
+        let snapshot = store
+            .read_compaction_snapshot("cycle", "op-compact-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.operation_checkpoint,
+            Some(AcpCheckpointOperationState::Active)
+        );
+        assert_eq!(
+            store
+                .activate_compaction_checkpoint(&activation_request(
+                    "cycle",
+                    snapshot.session_row_id,
+                    "op-compact-1",
+                    Some("op-compact-1"),
+                    selection
+                ))
+                .unwrap(),
+            CompactionActivationOutcome::AlreadyActive
+        );
+
+        // Restore deactivates; the retry of the old compact sees an inactive
+        // row (superseded), and a further restore is already-deactivated.
+        let active_checkpoint = snapshot.active_checkpoint.clone().unwrap();
+        assert!(matches!(
+            store
+                .deactivate_compaction_checkpoint(
+                    "cycle",
+                    snapshot.session_row_id,
+                    "op-restore-1",
+                    Some((
+                        active_checkpoint.operation_id.as_str(),
+                        active_checkpoint.covered_through_message_id
+                    )),
+                )
+                .unwrap(),
+            CompactionDeactivationOutcome::Deactivated { .. }
+        ));
+        let snapshot = store
+            .read_compaction_snapshot("cycle", "op-compact-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.operation_checkpoint,
+            Some(AcpCheckpointOperationState::Inactive)
+        );
+        assert!(snapshot.active_checkpoint.is_none());
+        assert_eq!(
+            store
+                .deactivate_compaction_checkpoint(
+                    "cycle",
+                    snapshot.session_row_id,
+                    "op-restore-1",
+                    None,
+                )
+                .unwrap(),
+            CompactionDeactivationOutcome::AlreadyDeactivated
+        );
+        assert_eq!(
+            store
+                .deactivate_compaction_checkpoint(
+                    "cycle",
+                    snapshot.session_row_id,
+                    "op-restore-2",
+                    None,
+                )
+                .unwrap(),
+            CompactionDeactivationOutcome::NoActiveCheckpoint
+        );
+
+        // Recompaction recomputes from originals and replaces: the new
+        // checkpoint is active, and only one active row exists.
+        let snapshot = store
+            .read_compaction_snapshot("cycle", "op-compact-2")
+            .unwrap()
+            .unwrap();
+        let selection =
+            select_compaction_source(&snapshot.message_rows, &snapshot.terminal_ranges).unwrap();
+        assert!(selection.covered_ranges >= 2);
+        assert_eq!(
+            store
+                .activate_compaction_checkpoint(&activation_request(
+                    "cycle",
+                    snapshot.session_row_id,
+                    "op-compact-2",
+                    None,
+                    selection
+                ))
+                .unwrap(),
+            CompactionActivationOutcome::Activated
+        );
+        // A delayed retry of the first restore preserves the newer compact,
+        // even when the caller has freshly observed that newer checkpoint.
+        assert_eq!(
+            store
+                .deactivate_compaction_checkpoint(
+                    "cycle",
+                    snapshot.session_row_id,
+                    "op-restore-1",
+                    Some(("op-compact-2", selection.covered_through_message_id)),
+                )
+                .unwrap(),
+            CompactionDeactivationOutcome::AlreadyDeactivated
+        );
+        let conn = store.conn.lock();
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_compaction_checkpoints WHERE session_id = \
+                 (SELECT id FROM acp_sessions WHERE session_uuid = 'cycle') AND active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(active, 1);
+        let snapshot = store
+            .read_compaction_snapshot("cycle", "op-compact-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.active_checkpoint.map(|c| c.operation_id),
+            Some("op-compact-2".to_string())
+        );
+
+        // A compact operation that supersedes another checkpoint is not a
+        // completed restore, even if the caller later reuses its ID.
+        store
+            .activate_compaction_checkpoint(&activation_request(
+                "cycle",
+                snapshot.session_row_id,
+                "op-compact-3",
+                Some("op-compact-2"),
+                selection,
+            ))
+            .unwrap();
+        assert!(matches!(
+            store
+                .deactivate_compaction_checkpoint(
+                    "cycle",
+                    snapshot.session_row_id,
+                    "op-compact-3",
+                    Some(("op-compact-3", selection.covered_through_message_id)),
+                )
+                .unwrap(),
+            CompactionDeactivationOutcome::Deactivated { .. }
+        ));
+    }
+
+    #[test]
+    fn activation_rejects_stale_source_killed_inflight_and_reincarnation() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("negatives", "alpha", "/tmp/ws")
+            .unwrap();
+        compaction_turn(&store, "negatives", "one");
+        compaction_turn(&store, "negatives", "two");
+        compaction_turn(&store, "negatives", "three");
+        let snapshot = store
+            .read_compaction_snapshot("negatives", "op-1")
+            .unwrap()
+            .unwrap();
+        let selection =
+            select_compaction_source(&snapshot.message_rows, &snapshot.terminal_ranges).unwrap();
+
+        // Stale source: boundary not at a terminal range end.
+        let mut stale = activation_request(
+            "negatives",
+            snapshot.session_row_id,
+            "op-1",
+            None,
+            selection,
+        );
+        stale.covered_through_message_id = selection.covered_through_message_id - 1;
+        stale.source_message_rows = selection.covered_message_rows as i64 - 1;
+        assert!(matches!(
+            store.activate_compaction_checkpoint(&stale).unwrap_err(),
+            CompactionActivationError::SourceMismatch { .. }
+        ));
+        // Nothing was written by the failed attempt.
+        let conn = store.conn.lock();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM acp_compaction_checkpoints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(conn);
+        assert_eq!(rows, 0);
+
+        // In-flight turn checkpoint blocks activation.
+        store
+            .begin_turn_checkpoint(
+                "negatives",
+                "turn-live",
+                &[ConversationMessage::Chat(ChatMessage::user("running"))],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .activate_compaction_checkpoint(&activation_request(
+                    "negatives",
+                    snapshot.session_row_id,
+                    "op-1",
+                    None,
+                    selection
+                ))
+                .unwrap_err(),
+            CompactionActivationError::InflightTurn
+        );
+        assert!(
+            store
+                .finalize_turn_checkpoint(
+                    "negatives",
+                    "turn-live",
+                    &[
+                        ConversationMessage::Chat(ChatMessage::user("running")),
+                        ConversationMessage::Chat(ChatMessage::assistant("done")),
+                    ],
+                )
+                .is_ok()
+        );
+
+        // Killed sessions refuse activation and restore.
+        store.mark_session_killed("negatives").unwrap();
+        assert_eq!(
+            store
+                .activate_compaction_checkpoint(&activation_request(
+                    "negatives",
+                    snapshot.session_row_id,
+                    "op-1",
+                    None,
+                    selection
+                ))
+                .unwrap_err(),
+            CompactionActivationError::SessionKilled
+        );
+        assert_eq!(
+            store
+                .deactivate_compaction_checkpoint(
+                    "negatives",
+                    snapshot.session_row_id,
+                    "op-r",
+                    None
+                )
+                .unwrap_err(),
+            CompactionDeactivationError::SessionKilled
+        );
+
+        // Delete + recreate: the new incarnation cannot reuse the stale row id.
+        let (_tmp, store) = open_store();
+        store.create_session("reinc", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "reinc", "one");
+        compaction_turn(&store, "reinc", "two");
+        let snapshot = store
+            .read_compaction_snapshot("reinc", "op-1")
+            .unwrap()
+            .unwrap();
+        let selection =
+            select_compaction_source(&snapshot.message_rows, &snapshot.terminal_ranges).unwrap();
+        store.delete_session("reinc").unwrap();
+        store.create_session("reinc", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "reinc", "one");
+        compaction_turn(&store, "reinc", "two");
+        assert_eq!(
+            store
+                .activate_compaction_checkpoint(&activation_request(
+                    "reinc",
+                    snapshot.session_row_id,
+                    "op-1",
+                    None,
+                    selection
+                ))
+                .unwrap_err(),
+            CompactionActivationError::IncarnationMismatch {
+                found_session_row_id: 2
+            }
+        );
+        assert_eq!(
+            store
+                .deactivate_compaction_checkpoint("reinc", snapshot.session_row_id, "op-r", None)
+                .unwrap_err(),
+            CompactionDeactivationError::IncarnationMismatch {
+                found_session_row_id: 2
+            }
+        );
+    }
+
+    #[test]
+    fn delete_session_cascades_to_ranges_and_checkpoints() {
+        let (_tmp, store) = open_store();
+        store.create_session("cascade", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "cascade", "one");
+        compaction_turn(&store, "cascade", "two");
+        compaction_turn(&store, "cascade", "three");
+        let snapshot = store
+            .read_compaction_snapshot("cascade", "op-1")
+            .unwrap()
+            .unwrap();
+        let selection =
+            select_compaction_source(&snapshot.message_rows, &snapshot.terminal_ranges).unwrap();
+        store
+            .activate_compaction_checkpoint(&activation_request(
+                "cascade",
+                snapshot.session_row_id,
+                "op-1",
+                None,
+                selection,
+            ))
+            .unwrap();
+
+        assert!(store.delete_session("cascade").unwrap());
+        let conn = store.conn.lock();
+        for table in ["acp_terminal_ranges", "acp_compaction_checkpoints"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "cascade should empty {table}");
+        }
+        drop(conn);
+        assert!(
+            store
+                .read_compaction_snapshot("cascade", "op-1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn checkpoint_survives_store_restart_under_synchronous_normal() {
+        let (tmp, store) = open_store();
+        store.create_session("durable", "alpha", "/tmp/ws").unwrap();
+        compaction_turn(&store, "durable", "one");
+        compaction_turn(&store, "durable", "two");
+        compaction_turn(&store, "durable", "three");
+        let snapshot = store
+            .read_compaction_snapshot("durable", "op-1")
+            .unwrap()
+            .unwrap();
+        let selection =
+            select_compaction_source(&snapshot.message_rows, &snapshot.terminal_ranges).unwrap();
+        store
+            .activate_compaction_checkpoint(&activation_request(
+                "durable",
+                snapshot.session_row_id,
+                "op-1",
+                None,
+                selection,
+            ))
+            .unwrap();
+
+        drop(store);
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        let snapshot = reopened
+            .read_compaction_snapshot("durable", "op-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.active_checkpoint.map(|c| c.operation_id),
+            Some("op-1".to_string())
+        );
+        assert!(reopened.load_session("durable").is_err());
+        assert!(
+            projected_for_test(
+                reopened
+                    .load_session_for_restore_with_projection("durable")
+                    .unwrap(),
+            )
+            .checkpoint
+            .is_some()
+        );
     }
 }
