@@ -1122,12 +1122,16 @@ impl DelegateTool {
     }
 
     fn execution_tree_budget_for_agentic_loop(
+        mode: DelegateExecutionMode,
         inherited: Option<ExecutionTreeBudget>,
         target_limit: Option<usize>,
     ) -> Option<ExecutionTreeBudget> {
-        inherited
-            .map(|budget| budget.child())
-            .or_else(|| ExecutionTreeBudget::from_limit(target_limit))
+        match mode {
+            DelegateExecutionMode::Bounded => inherited
+                .map(|budget| budget.child())
+                .or_else(|| ExecutionTreeBudget::from_limit(target_limit)),
+            DelegateExecutionMode::Independent => ExecutionTreeBudget::from_limit(target_limit),
+        }
     }
 
     fn resolve_loop_runtime(
@@ -3793,6 +3797,7 @@ impl DelegateTool {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
         let execution_tree_budget = Self::execution_tree_budget_for_agentic_loop(
+            target_mode,
             ExecutionTreeBudget::current(),
             loop_runtime.max_execution_tree_iterations,
         );
@@ -3846,7 +3851,7 @@ impl DelegateTool {
                 channel_reply_target: None,
                 cancellation_token: Some(self.cancellation_token.child_token()),
                 on_delta: None,
-                shared_budget: execution_tree_budget,
+                shared_budget: execution_tree_budget.clone(),
                 channel: None,
                 collected_receipts,
                 event_tx: None,
@@ -3865,6 +3870,8 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(agent_name)
             )),
         );
+        let execution =
+            ExecutionTreeBudget::scope_optional(execution_tree_budget, Box::pin(execution));
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -6236,13 +6243,14 @@ mod tests {
     }
 
     #[test]
-    fn agentic_budget_selects_inherited_child_or_target_root() {
+    fn agentic_tree_budget_selects_inherited_child_or_target_root() {
         use crate::agent::execution_tree_budget::{
             ExecutionTreeBudgetRole, ExecutionTreeReservation,
         };
 
         let inherited_root = ExecutionTreeBudget::root(5);
         let foreground = DelegateTool::execution_tree_budget_for_agentic_loop(
+            DelegateExecutionMode::Bounded,
             Some(inherited_root.clone()),
             Some(2),
         )
@@ -6255,13 +6263,37 @@ mod tests {
         );
         assert_eq!(inherited_root.remaining(), 4);
 
-        let detached = DelegateTool::execution_tree_budget_for_agentic_loop(None, Some(2))
-            .expect("background delegate should mint its target budget");
+        let detached = DelegateTool::execution_tree_budget_for_agentic_loop(
+            DelegateExecutionMode::Bounded,
+            None,
+            Some(2),
+        )
+        .expect("background delegate should mint its target budget");
         assert_eq!(detached.role(), ExecutionTreeBudgetRole::Root);
         assert_eq!(detached.reserve(), Ok(ExecutionTreeReservation::Iteration));
         assert_eq!(
             detached.reserve(),
             Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        let independent = DelegateTool::execution_tree_budget_for_agentic_loop(
+            DelegateExecutionMode::Independent,
+            Some(inherited_root.clone()),
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(independent.role(), ExecutionTreeBudgetRole::Root);
+        assert_eq!(
+            independent.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        assert_eq!(inherited_root.remaining(), 4);
+        assert!(
+            DelegateTool::execution_tree_budget_for_agentic_loop(
+                DelegateExecutionMode::Independent,
+                Some(inherited_root),
+                None,
+            )
+            .is_none()
         );
     }
 
@@ -6277,6 +6309,107 @@ mod tests {
 
         let resolved = tool.resolve_loop_runtime("target", &agentic_agent_config());
         assert_eq!(resolved.max_execution_tree_iterations, Some(9));
+    }
+
+    #[tokio::test]
+    async fn independent_agentic_delegate_uses_target_tree_budget_and_masks_caller() {
+        use crate::agent::execution_tree_budget::ExecutionTreeBudgetRole;
+
+        struct BudgetProbeModelProvider(Option<usize>);
+
+        impl ::zeroclaw_api::attribution::Attributable for BudgetProbeModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "BudgetProbeModelProvider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for BudgetProbeModelProvider {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                unreachable!("the agentic loop uses chat")
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                // Inspect the ambient scope at the production loop boundary,
+                // after its reservation, not just the selection helper's return.
+                assert_eq!(
+                    ExecutionTreeBudget::current()
+                        .map(|budget| (budget.role(), budget.remaining())),
+                    self.0
+                        .map(|limit| (ExecutionTreeBudgetRole::Root, limit - 1)),
+                );
+                assert_eq!(request.tools.is_none_or(<[_]>::is_empty), self.0 == Some(1));
+                Ok(ChatResponse {
+                    text: Some("independent completion".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        for (caller_limit, target_limit) in [(1, Some(3)), (5, Some(1)), (1, None)] {
+            let mut fixture = delegate_memory_fixture(None).await;
+            let config = Arc::make_mut(fixture.tool.root_config.as_mut().unwrap());
+            config.agents.get_mut("caller").unwrap().delegates = vec![DelegateTargetConfig {
+                agent: "target".into(),
+                mode: DelegateExecutionMode::Independent,
+            }];
+            config
+                .runtime_profiles
+                .get_mut("agentic_test")
+                .unwrap()
+                .max_execution_tree_iterations = target_limit;
+            fixture.tool = fixture.tool.with_runtime(Arc::new(DelegateTestRuntime));
+            let caller = ExecutionTreeBudget::root(caller_limit);
+            let provider = BudgetProbeModelProvider(target_limit);
+            ExecutionTreeBudget::scope(caller.clone(), async {
+                let result = fixture
+                    .tool
+                    .execute_agentic(
+                        "target",
+                        &fixture.target_config,
+                        "test",
+                        "test-model",
+                        &provider,
+                        "complete independently",
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "independent delegate failed: {result:?}");
+                assert_eq!(
+                    ExecutionTreeBudget::current().unwrap().remaining(),
+                    caller_limit
+                );
+            })
+            .await;
+            assert_eq!(caller.remaining(), caller_limit);
+            assert!(!fixture.tool.cancellation_token.is_cancelled());
+        }
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ pub struct ExecutionTreeBudget {
 }
 
 task_local! {
-    static ACTIVE_EXECUTION_TREE_BUDGET: ExecutionTreeBudget;
+    static ACTIVE_EXECUTION_TREE_BUDGET: Option<ExecutionTreeBudget>;
 }
 
 impl ExecutionTreeBudget {
@@ -99,24 +99,25 @@ impl ExecutionTreeBudget {
 
     #[must_use]
     pub fn current() -> Option<Self> {
-        ACTIVE_EXECUTION_TREE_BUDGET.try_with(Clone::clone).ok()
+        ACTIVE_EXECUTION_TREE_BUDGET
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
     }
 
     pub async fn scope<F>(budget: Self, future: F) -> F::Output
     where
         F: Future,
     {
-        ACTIVE_EXECUTION_TREE_BUDGET.scope(budget, future).await
+        Self::scope_optional(Some(budget), future).await
     }
 
     pub async fn scope_optional<F>(budget: Option<Self>, future: F) -> F::Output
     where
         F: Future,
     {
-        match budget {
-            Some(budget) => Self::scope(budget, future).await,
-            None => future.await,
-        }
+        // An uncapped independent turn must hide an enclosing caller's budget.
+        ACTIVE_EXECUTION_TREE_BUDGET.scope(budget, future).await
     }
 }
 
@@ -187,6 +188,12 @@ mod tests {
                 ExecutionTreeBudget::current().map(|budget| budget.role()),
                 Some(ExecutionTreeBudgetRole::Root)
             );
+            ExecutionTreeBudget::scope_optional(None, async {
+                tokio::task::yield_now().await;
+                assert!(ExecutionTreeBudget::current().is_none());
+            })
+            .await;
+            assert_eq!(ExecutionTreeBudget::current().unwrap().remaining(), 2);
             let detached = ::zeroclaw_spawn::spawn!(async { ExecutionTreeBudget::current() })
                 .await
                 .expect("detached budget probe should join");
