@@ -101,6 +101,8 @@ pub enum Method {
     SessionDelete,
     SessionApprove,
     SessionKill,
+    SessionCompactContext,
+    SessionRestoreContext,
 
     // Memory
     MemoryList,
@@ -225,6 +227,8 @@ impl Method {
         (Method::SessionDelete, "session/delete"),
         (Method::SessionApprove, "session/approve"),
         (Method::SessionKill, "session/kill"),
+        (Method::SessionCompactContext, "session/compact-context"),
+        (Method::SessionRestoreContext, "session/restore-context"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -337,7 +341,7 @@ impl Method {
 type RpcResult = Result<Value, JsonRpcError>;
 type BoxRpcFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RpcResult> + Send + 'a>>;
 
-fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
+pub(crate) fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     JsonRpcError {
         code,
         message: msg.into(),
@@ -979,6 +983,50 @@ impl RpcDispatcher {
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
+                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                        }
+                    }
+                });
+                self.prompt_tasks.push(task);
+                return;
+            }
+            Method::SessionCompactContext => {
+                // Spawn — the operation holds one bounded model call and a
+                // durable commit, so the read loop must stay live. Tracked
+                // in prompt_tasks like a turn: connection teardown joins it,
+                // and its blocking SQL is joined inside, so admission can
+                // never outlive a durable write.
+                let handle = self.spawn_handle();
+                let id_clone = req_id.clone();
+                let params_clone = req.params.clone();
+                let is_notif = is_notification;
+                self.prompt_tasks.retain(|task| !task.is_finished());
+                let task = zeroclaw_spawn::spawn!(async move {
+                    let result = handle.handle_session_compact_context(&params_clone).await;
+                    if !is_notif {
+                        match result {
+                            Ok(value) => handle.send_result(id_clone, value).await,
+                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                        }
+                    }
+                });
+                self.prompt_tasks.push(task);
+                return;
+            }
+            Method::SessionRestoreContext => {
+                // Same spawn-and-track shape as compact-context; restore
+                // performs no model call but still commits durably and
+                // installs a live projection.
+                let handle = self.spawn_handle();
+                let id_clone = req_id.clone();
+                let params_clone = req.params.clone();
+                let is_notif = is_notification;
+                self.prompt_tasks.retain(|task| !task.is_finished());
+                let task = zeroclaw_spawn::spawn!(async move {
+                    let result = handle.handle_session_restore_context(&params_clone).await;
+                    if !is_notif {
+                        match result {
+                            Ok(value) => handle.send_result(id_clone, value).await,
                             Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
                         }
                     }
@@ -1683,17 +1731,28 @@ impl RpcDispatcher {
         // resumes with an explicit cwd. Reload after recovery so the restored
         // agent sees the promoted history, not the pre-recovery snapshot. The
         // durable row also owns the original workspace and interaction surface.
-        let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpSessionData> = None;
+        // Projected resume read: originals plus the active compaction
+        // checkpoint (if any) in one snapshot, so the resumed Agent and a
+        // later rehydration select the same committed projection.
+        let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpProjectedRestore> =
+            None;
         if resuming
             && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(ref store) = self.ctx.acp_session_store
         {
             let store_cloned = store.clone();
             let sid = session_id.clone();
-            match tokio::task::spawn_blocking(move || store_cloned.load_session_for_restore(&sid))
-                .await
+            match tokio::task::spawn_blocking(move || {
+                store_cloned.load_session_for_restore_with_projection(&sid)
+            })
+            .await
             {
-                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => {
+                Ok(Ok(
+                    zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Projected(
+                        projected,
+                    ),
+                )) => {
+                    let data = &projected.data;
                     if data.agent_alias != req.agent_alias {
                         return Err(rpc_err(
                             INVALID_PARAMS,
@@ -1760,7 +1819,7 @@ impl RpcDispatcher {
                     let marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
                     let recovered = tokio::task::spawn_blocking(move || {
                         store_cloned.recover_turn_checkpoint(&sid, &marker)?;
-                        store_cloned.load_session_for_restore(&sid)
+                        store_cloned.load_session_for_restore_with_projection(&sid)
                     })
                     .await
                     .map_err(|join| {
@@ -1776,17 +1835,20 @@ impl RpcDispatcher {
                         )
                     })?;
                     match recovered {
-                        zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data) => {
-                            preloaded_acp = Some(data);
+                        zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Projected(
+                            projected,
+                        ) => {
+                            preloaded_acp = Some(projected);
                         }
-                        zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing
-                        | zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
+                        zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Missing
+                        | zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Killed => {
                             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                         }
                     }
                 }
-                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => {}
-                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Missing)) => {
+                }
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Killed)) => {
                     return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                 }
                 Ok(Err(e)) => {
@@ -1809,7 +1871,11 @@ impl RpcDispatcher {
         let cwd = req
             .cwd
             .clone()
-            .or_else(|| preloaded_acp.as_ref().map(|d| d.workspace_dir.clone()))
+            .or_else(|| {
+                preloaded_acp
+                    .as_ref()
+                    .map(|projected| projected.data.workspace_dir.clone())
+            })
             .unwrap_or_else(|| {
                 config
                     .agent_workspace_dir(&req.agent_alias)
@@ -1929,7 +1995,7 @@ impl RpcDispatcher {
         }
 
         enum AcpSessionNewLoad {
-            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
+            Restored(zeroclaw_infra::acp_session_store::AcpProjectedRestore),
             Created,
             Killed,
         }
@@ -1959,11 +2025,11 @@ impl RpcDispatcher {
                     let alias = req.agent_alias.clone();
                     let cwd_owned = cwd.clone();
                     tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
-                        match store_cloned.load_session_for_restore(&sid)? {
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
-                                data,
-                            ) => Ok(AcpSessionNewLoad::Restored(data)),
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
+                        match store_cloned.load_session_for_restore_with_projection(&sid)? {
+                            zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Projected(
+                                projected,
+                            ) => Ok(AcpSessionNewLoad::Restored(projected)),
+                            zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Missing => {
                                 store_cloned.create_session_with_interaction_surface(
                                     &sid,
                                     &alias,
@@ -1972,7 +2038,7 @@ impl RpcDispatcher {
                                 )?;
                                 Ok(AcpSessionNewLoad::Created)
                             }
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
+                            zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Killed => {
                                 Ok(AcpSessionNewLoad::Killed)
                             }
                         }
@@ -1980,8 +2046,8 @@ impl RpcDispatcher {
                     .await
                 };
                 match loaded {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
-                        if data.agent_alias != req.agent_alias {
+                    Ok(Ok(AcpSessionNewLoad::Restored(projected))) => {
+                        if projected.data.agent_alias != req.agent_alias {
                             if let Some(ref hooks) = self.ctx.hooks {
                                 hooks.fire_session_end(&session_id, "rpc").await;
                             }
@@ -1991,11 +2057,12 @@ impl RpcDispatcher {
                                 "ACP session belongs to a different agent",
                             ));
                         }
-                        message_count = conversation_message_entries(&data.messages).len();
-                        let provider_history =
-                            zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
-                                &data.messages,
-                            );
+                        message_count =
+                            conversation_message_entries(&projected.data.messages).len();
+                        let provider_history = super::compaction::projected_provider_history(
+                            &projected.message_rows,
+                            projected.checkpoint.as_ref(),
+                        );
                         let seed_event = self
                             .ctx
                             .sessions
@@ -2330,12 +2397,14 @@ impl RpcDispatcher {
         let sid_owned = sid.to_string();
         let store_for_load = Arc::clone(&store);
         let loaded = tokio::task::spawn_blocking(move || {
-            store_for_load.load_session_for_restore(&sid_owned)
+            store_for_load.load_session_for_restore_with_projection(&sid_owned)
         })
         .await;
-        let data = match loaded {
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
+        let projected = match loaded {
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Projected(
+                projected,
+            ))) => projected,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Killed)) => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2359,7 +2428,9 @@ impl RpcDispatcher {
                 );
                 return None;
             }
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Missing)) => {
+                return None;
+            }
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -2375,6 +2446,7 @@ impl RpcDispatcher {
                 return None;
             }
         };
+        let data = projected.data;
 
         if let Some(value) = data.interaction_surface.as_deref()
             && crate::agent::prompt::InteractionSurface::from_persisted(value).is_none()
@@ -2407,13 +2479,19 @@ impl RpcDispatcher {
         let sid_owned = sid.to_string();
         let store_for_reload = Arc::clone(&store);
         let loaded = tokio::task::spawn_blocking(move || {
-            store_for_reload.load_session_for_restore(&sid_owned)
+            store_for_reload.load_session_for_restore_with_projection(&sid_owned)
         })
         .await;
-        let data = match loaded {
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => return None,
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+        let projected = match loaded {
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Projected(
+                projected,
+            ))) => projected,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Killed)) => {
+                return None;
+            }
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Missing)) => {
+                return None;
+            }
             Ok(Err(error)) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -2444,10 +2522,13 @@ impl RpcDispatcher {
             }
         };
 
-        let provider_history =
-            zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
-                &data.messages,
-            );
+        // Same projected reader as explicit resume: rehydration and restart
+        // select the same committed projection.
+        let provider_history = super::compaction::projected_provider_history(
+            &projected.message_rows,
+            projected.checkpoint.as_ref(),
+        );
+        let data = projected.data;
         let interaction_surface = data
             .interaction_surface
             .as_deref()
@@ -2535,6 +2616,38 @@ impl RpcDispatcher {
         );
 
         self.ctx.sessions.get_agent(sid).await
+    }
+
+    /// Manual context compaction (native Code only). Thin: the operation
+    /// lives in `super::compaction`.
+    async fn handle_session_compact_context(&self, params: &Value) -> RpcResult {
+        let req: SessionCompactContextParams = parse_params(params)?;
+        to_result(
+            super::compaction::compact_context(
+                &self.ctx,
+                &self.rpc,
+                self.tui_id.as_deref(),
+                &self.connection_cancel,
+                req,
+            )
+            .await?,
+        )
+    }
+
+    /// Manual context restore (native Code only). Thin: the operation lives
+    /// in `super::compaction`.
+    async fn handle_session_restore_context(&self, params: &Value) -> RpcResult {
+        let req: SessionRestoreContextParams = parse_params(params)?;
+        to_result(
+            super::compaction::restore_context(
+                &self.ctx,
+                &self.rpc,
+                self.tui_id.as_deref(),
+                &self.connection_cancel,
+                req,
+            )
+            .await?,
+        )
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -3525,12 +3638,14 @@ impl RpcDispatcher {
                 let sid = req.session_id.clone();
                 let supported = run_blocking_rpc(
                     move || {
-                        Ok(store_for_surface.load_session(&sid)?.is_none_or(|data| {
-                            data.interaction_surface.as_deref().is_none_or(|value| {
-                                crate::agent::prompt::InteractionSurface::from_persisted(value)
-                                    .is_some()
-                            })
-                        }))
+                        Ok(store_for_surface
+                            .load_session_transcript(&sid)?
+                            .is_none_or(|data| {
+                                data.interaction_surface.as_deref().is_none_or(|value| {
+                                    crate::agent::prompt::InteractionSurface::from_persisted(value)
+                                        .is_some()
+                                })
+                            }))
                     },
                     "Failed to validate ACP interaction surface",
                 )
@@ -3546,10 +3661,14 @@ impl RpcDispatcher {
                         })?;
                 }
             }
+            // Intentional transcript read: the explicitly named raw
+            // transcript reader returns originals regardless of any active
+            // compaction checkpoint (the legacy `load_session` reader
+            // rejects compacted sessions instead).
             let store_for_load = store.clone();
             let session_id_for_load = req.session_id.clone();
             if let Some(data) = run_blocking_rpc(
-                move || store_for_load.load_session(&session_id_for_load),
+                move || store_for_load.load_session_transcript(&session_id_for_load),
                 "Failed to load ACP session messages",
             )
             .await?
@@ -6518,7 +6637,7 @@ fn plan_replay_notification(
     notification_for_turn_event(session_id, &event, None)
 }
 
-fn notification_for_turn_event(
+pub(crate) fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
     max_context_tokens: Option<u64>,
@@ -11930,6 +12049,956 @@ mod tests {
                     && chat.content
                         == crate::i18n::get_required_cli_string("turn-stream-interrupted")
         )));
+    }
+
+    // ── manual context compaction: composition + identity regressions ─────
+
+    /// One realistically-sized completed turn for compaction fixtures: the
+    /// covered prefix must be large enough that the framed summary message
+    /// clears the useful-savings bar, as in real sessions where compaction
+    /// is worth running at all.
+    fn compaction_fixture_turn(
+        store: &zeroclaw_infra::acp_session_store::AcpSessionStore,
+        sid: &str,
+        turn: &str,
+    ) {
+        let detail = "the token-position mapping must stay reconciled with the legacy error \
+                      codes, the streaming path needs the shim applied before the release \
+                      cut, and the three downstream consumers still migrate one by one; \
+                      the review also asked for a migration note per consumer, a rollback \
+                      plan for the release cut, and a coverage check that the shim keeps \
+                      the old error-code parity for every documented position";
+        let detail = detail.repeat(4);
+        store
+            .append_turn(
+                sid,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user(&format!(
+                        "{turn} question: continue the compatibility migration"
+                    ))),
+                    ConversationMessage::Chat(ChatMessage::assistant(&format!(
+                        "{turn} answer: keep the existing AST and add a compatibility \
+                         shim; the shim is written and covers the mapping plus the \
+                         streaming path, while the downstream migration remains \
+                         unfinished: {detail}"
+                    ))),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Whether the session has an active checkpoint row for `operation_id`.
+    fn store_has_active_checkpoint(
+        store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        session_id: &str,
+        operation_id: &str,
+    ) -> bool {
+        let snapshot = store
+            .read_compaction_snapshot(session_id, operation_id)
+            .unwrap();
+        snapshot
+            .map(|snapshot| {
+                snapshot
+                    .active_checkpoint
+                    .is_some_and(|checkpoint| checkpoint.operation_id == operation_id)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Provider that captures every provider-visible transcript and returns
+    /// canned responses: a bounded summary for `chat` (the compaction
+    /// operation) and a streamed reply for real turns. Captures are shared
+    /// through an `Arc` so tests can assert on them after each step.
+    struct CapturingCompactionProvider {
+        summary_text: &'static str,
+        captured: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for CapturingCompactionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.summary_text.to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(self.summary_text.to_string()),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(900),
+                    output_tokens: Some(40),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            use futures_util::StreamExt as _;
+            futures_util::stream::once(async {
+                Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk::delta(
+                        "assistant reply after compaction",
+                    ),
+                ))
+            })
+            .chain(futures_util::stream::once(async {
+                Ok(zeroclaw_providers::traits::StreamEvent::Final)
+            }))
+            .boxed()
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CapturingCompactionProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "capturing-compaction-provider"
+        }
+    }
+
+    /// One compact → real provider request → durable reload → restore →
+    /// recompact composition over a live ACP session with a capturing
+    /// provider. Asserts the frozen contract end to end: originals stay
+    /// unchanged, the lower-trust summary is placed at the request boundary,
+    /// later turns are retained, the inherited terminal writer never
+    /// appends the summary back into originals, and reload selects the same
+    /// committed projection.
+    #[tokio::test]
+    async fn compaction_composition_covers_reload_restore_and_recompact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.set_tui_id_for_test(Some("tui-compaction".to_string()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        dispatcher.rpc = Arc::new(RpcOutbound::new(tx));
+        let sid = "compaction-composition";
+        acp_store
+            .create_session_with_interaction_surface(
+                sid,
+                "test-agent",
+                tmp.path().to_str().unwrap(),
+                Some("zerocode_code"),
+            )
+            .unwrap();
+
+        // Three completed turns of realistic size so the framed summary
+        // clears the useful-savings bar.
+        for turn in ["first", "second", "third"] {
+            compaction_fixture_turn(&acp_store, sid, turn);
+        }
+
+        // Live session with a capturing provider, seeded exactly like the
+        // projected resume path would seed it.
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<ChatMessage>>::new()));
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(CapturingCompactionProvider {
+                summary_text: "Decision: keep the AST, add a shim. Unfinished: migration.",
+                captured: Arc::clone(&captured),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .unwrap();
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                )
+                .with_interaction_surface(Some(
+                    crate::agent::prompt::InteractionSurface::ZerocodeCode,
+                ))
+                .with_owner(Some("tui-compaction".to_string())),
+            )
+            .await
+            .unwrap();
+        {
+            let transcript = acp_store.load_session_transcript(sid).unwrap().unwrap();
+            let provider_history =
+                zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+                    &transcript.messages,
+                );
+            sessions
+                .seed_conversation_history(sid, provider_history)
+                .await;
+        }
+
+        // ── compact ──
+        let compact = dispatcher
+            .handle_session_compact_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-compact-1",
+            }))
+            .await
+            .expect("compaction should succeed");
+        let compact: SessionCompactContextResult = serde_json::from_value(compact).unwrap();
+        assert_eq!(compact.status, "activated");
+        assert_eq!(
+            compact.covered_turns, 2,
+            "the newest completed turn is retained"
+        );
+        assert!(compact.installed);
+        assert_eq!(
+            compact.summary,
+            "Decision: keep the AST, add a shim. Unfinished: migration."
+        );
+        assert_eq!(
+            compact.usage.as_ref().and_then(|u| u.input_tokens),
+            Some(900)
+        );
+        assert!(
+            compact.estimated_tokens_after < compact.estimated_tokens_before,
+            "the accepted summary must estimate smaller than the covered source"
+        );
+
+        // Originals unchanged; the legacy reader rejects; the transcript
+        // reader keeps working.
+        let transcript = acp_store.load_session_transcript(sid).unwrap().unwrap();
+        assert_eq!(
+            transcript.messages.len(),
+            6,
+            "compaction must not rewrite or append original transcript rows"
+        );
+        assert!(acp_store.load_session(sid).is_err());
+        let summary_label =
+            crate::i18n::get_required_cli_string("compaction-historical-summary-label");
+        assert!(
+            !transcript
+                .messages
+                .iter()
+                .any(|message| matches!(message, ConversationMessage::Chat(chat)
+                    if chat.content.contains(&summary_label)))
+        );
+
+        // Live projection: original user anchor, historical summary and tail.
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let agent = agent.lock().await;
+            let history = agent.history();
+            assert!(matches!(
+                history.get(2),
+                Some(ConversationMessage::Chat(chat))
+                    if chat.content.contains(&summary_label)
+                        && chat.content.contains("lower trust")
+                        && chat.role == "assistant"
+            ));
+            assert!(
+                !history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains("first answer"))),
+                "the covered answer must be replaced by the summary"
+            );
+            assert!(
+                history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains("third question"))),
+                "the newest completed turn stays in the tail"
+            );
+        }
+
+        // ── next real provider request ──
+        dispatcher
+            .handle_session_prompt(&serde_json::json!({
+                "session_id": sid,
+                "prompt": "post-compact turn: continue the migration",
+            }))
+            .await
+            .expect("the post-compaction turn should run");
+
+        // The provider saw the labeled summary at the request boundary, not
+        // the covered originals.
+        {
+            let captured = captured.lock().unwrap();
+            let turn_request = captured
+                .iter()
+                .rev()
+                .find(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message.content.contains("post-compact turn"))
+                })
+                .expect("the turn request must have been captured");
+            assert!(
+                turn_request
+                    .iter()
+                    .any(|message| message.role == "assistant"
+                        && message.content.contains(&summary_label)),
+                "the summary must ride in ordinary assistant context at the request boundary"
+            );
+            assert!(
+                !turn_request
+                    .iter()
+                    .any(|message| message.content.contains("first answer")),
+                "covered answers must not be re-sent after compaction"
+            );
+            assert_eq!(
+                turn_request
+                    .iter()
+                    .filter(|message| message.role == "user"
+                        && message.content.contains("first question"))
+                    .count(),
+                1,
+                "the original opening user message anchors the summary exactly once"
+            );
+            assert!(
+                turn_request
+                    .iter()
+                    .any(|message| message.content.contains("third question")),
+                "the retained tail must still be sent"
+            );
+        }
+
+        // The inherited terminal writer persisted the new turn without ever
+        // appending the summary back into originals.
+        let transcript = acp_store.load_session_transcript(sid).unwrap().unwrap();
+        assert_eq!(transcript.messages.len(), 8, "one new turn of two rows");
+        assert!(
+            transcript
+                .messages
+                .iter()
+                .any(|message| matches!(message, ConversationMessage::Chat(chat)
+                    if chat.content.contains("post-compact turn")))
+        );
+        assert!(
+            !transcript
+                .messages
+                .iter()
+                .any(|message| matches!(message, ConversationMessage::Chat(chat)
+                    if chat.content.contains(&summary_label))),
+            "the terminal writer must never persist the derived summary into originals"
+        );
+
+        // A committed retry of the same operation is recognized, not
+        // re-run: no additional provider capture occurs.
+        let captured_before = captured.lock().unwrap().len();
+        let retry = dispatcher
+            .handle_session_compact_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-compact-1",
+            }))
+            .await
+            .expect("the committed retry must be recognized");
+        let retry: SessionCompactContextResult = serde_json::from_value(retry).unwrap();
+        assert_eq!(retry.status, "already_committed");
+        assert_eq!(captured.lock().unwrap().len(), captured_before);
+
+        // ── restore ──
+        let restore = dispatcher
+            .handle_session_restore_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-restore-1",
+            }))
+            .await
+            .expect("restore should succeed");
+        let restore: SessionRestoreContextResult = serde_json::from_value(restore).unwrap();
+        assert_eq!(restore.status, "deactivated");
+        assert_eq!(restore.covered_turns, Some(2));
+        assert!(restore.installed);
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let agent = agent.lock().await;
+            assert!(
+                !agent.history().iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains(&summary_label))),
+                "restore removes the summary from the live projection"
+            );
+            assert!(
+                agent.history().iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains("first question"))),
+                "restore returns to retained originals"
+            );
+            assert!(
+                agent.history().iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat)
+                        if chat.content.contains("post-compact turn"))),
+                "later turns appended after compaction stay after restore"
+            );
+        }
+
+        // An old compact retry must not undo the later restore.
+        let stale_retry = dispatcher
+            .handle_session_compact_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-compact-1",
+            }))
+            .await
+            .expect("the stale retry must be answered, not errored");
+        let stale_retry: SessionCompactContextResult = serde_json::from_value(stale_retry).unwrap();
+        assert_eq!(stale_retry.status, "superseded");
+        let projected = match acp_store
+            .load_session_for_restore_with_projection(sid)
+            .unwrap()
+        {
+            zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Projected(
+                projected,
+            ) => projected,
+            zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Missing
+            | zeroclaw_infra::acp_session_store::AcpSessionRestoreProjection::Killed => {
+                panic!("expected a projected restore read")
+            }
+        };
+        assert!(
+            projected.checkpoint.is_none(),
+            "the stale retry must not reactivate the restored checkpoint"
+        );
+
+        // ── recompact from originals ──
+        let recompact = dispatcher
+            .handle_session_compact_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-compact-2",
+            }))
+            .await
+            .expect("recompaction should succeed");
+        let recompact: SessionCompactContextResult = serde_json::from_value(recompact).unwrap();
+        assert_eq!(recompact.status, "activated");
+        assert_eq!(
+            recompact.covered_turns, 3,
+            "recompaction recomputes coverage from originals, now covering the later turn"
+        );
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let agent = agent.lock().await;
+            let history = agent.history();
+            assert!(history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains(&summary_label))));
+            assert!(
+                !history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat)
+                        if chat.content.contains("first answer")
+                            || chat.content.contains("second question")
+                            || chat.content.contains("third question"))),
+                "recompaction covers the recomputed prefix from originals"
+            );
+            assert!(
+                history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat)
+                        if chat.content.contains("post-compact turn"))),
+                "the newest completed turn is retained again"
+            );
+        }
+
+        // Fail only the confirmation read AFTER activation commits. The
+        // previous live projection must not remain usable after this error.
+        dispatcher
+            .handle_session_restore_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-restore-before-read-failure",
+            }))
+            .await
+            .expect("restore before failure injection");
+        let conn = rusqlite::Connection::open(data_dir.join("sessions/acp-sessions.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_compaction_confirmation_read
+             AFTER INSERT ON acp_compaction_checkpoints
+             BEGIN
+                 UPDATE acp_terminal_ranges SET terminal_kind = 'injected-invalid-kind'
+                 WHERE session_id = NEW.session_id;
+             END;",
+        )
+        .unwrap();
+        let error = dispatcher
+            .handle_session_compact_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-compact-read-failure",
+            }))
+            .await
+            .expect_err("confirmation read must fail after commit");
+        assert!(error.message.contains("Failed to read compaction snapshot"));
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "failed postcommit reconciliation must invalidate the old live projection"
+        );
+        let committed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_compaction_checkpoints
+                 WHERE operation_id = 'op-compact-read-failure' AND active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            committed, 1,
+            "the failure must occur after durable activation"
+        );
+        conn.execute_batch(
+            "DROP TRIGGER fail_compaction_confirmation_read;
+             UPDATE acp_terminal_ranges SET terminal_kind = 'completed'
+             WHERE terminal_kind = 'injected-invalid-kind';",
+        )
+        .unwrap();
+        drop(conn);
+
+        // ── real production reload boundaries ──
+        // (a) Explicit native resume after the failed confirmation read:
+        // resume through the production session/new path; the projected
+        // reader must seed the exact committed projection.
+        dispatcher
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+                "interaction_surface": "zerocode_code",
+                "keep_siblings": true,
+                "tui_id": "tui-compaction",
+            }))
+            .await
+            .expect("resume through the projected reader must succeed");
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let agent = agent.lock().await;
+            let history = agent.history();
+            assert!(
+                history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains(&summary_label))),
+                "the explicit resume must seed the committed summary projection"
+            );
+            assert!(
+                !history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains("first answer"))),
+                "the resumed projection must not re-send the covered originals"
+            );
+            assert!(
+                history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat)
+                        if chat.content.contains("post-compact turn"))),
+                "later turns must survive the explicit resume"
+            );
+        }
+
+        // (b) Lazy rehydration: remove the live incarnation again and run
+        // the production rehydrate path the prompt handler uses; it must
+        // seed the same committed projection.
+        assert!(sessions.remove(sid).await);
+        let rehydrated = dispatcher
+            .rehydrate_reaped_session_under_guard(sid, None)
+            .await
+            .expect("the production rehydrate path must rebuild the session");
+        {
+            let agent = rehydrated.lock().await;
+            let history = agent.history();
+            assert!(
+                history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains(&summary_label))),
+                "lazy rehydration must seed the committed summary projection"
+            );
+            assert!(
+                !history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains("second question"))),
+                "the rehydrated projection must not re-send the covered originals"
+            );
+            assert!(
+                history.iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat)
+                        if chat.content.contains("post-compact turn"))),
+                "later turns must survive lazy rehydration"
+            );
+        }
+
+        // Originals are unchanged through both reload boundaries, and the
+        // inherited terminal writer never duplicated the summary into them.
+        let transcript = acp_store.load_session_transcript(sid).unwrap().unwrap();
+        assert_eq!(
+            transcript.messages.len(),
+            8,
+            "no reload boundary may append or rewrite original rows"
+        );
+        assert!(
+            !transcript
+                .messages
+                .iter()
+                .any(|message| matches!(message, ConversationMessage::Chat(chat)
+                    if chat.content.contains(&summary_label)))
+        );
+
+        // The queue drains cleanly after the whole composition.
+        assert_eq!(sessions.session_queue.queue_depth(sid).await, 0);
+        let _ = rx.try_recv();
+    }
+
+    /// The response-bearing manual operation runs on the spawned, tracked
+    /// task path: the read loop returns before the answer, the answer
+    /// carries the request id (never a TurnComplete, which could drain
+    /// queued prompts), and a busy session is a typed refusal that never
+    /// queues the compaction.
+    #[tokio::test]
+    async fn compact_context_spawns_keeps_read_loop_live_and_never_emits_turn_complete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.set_tui_id_for_test(Some("tui-compaction".to_string()));
+        dispatcher.authenticated = true;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        dispatcher.rpc = Arc::new(RpcOutbound::new(tx));
+        let sid = "compaction-spawn";
+        acp_store
+            .create_session_with_interaction_surface(
+                sid,
+                "test-agent",
+                tmp.path().to_str().unwrap(),
+                Some("zerocode_code"),
+            )
+            .unwrap();
+        for turn in ["one", "two", "three"] {
+            compaction_fixture_turn(&acp_store, sid, turn);
+        }
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedCompactionProvider {
+                started: std::sync::Mutex::new(Some(started_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .unwrap();
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                )
+                .with_interaction_surface(Some(
+                    crate::agent::prompt::InteractionSurface::ZerocodeCode,
+                ))
+                .with_owner(Some("tui-compaction".to_string())),
+            )
+            .await
+            .unwrap();
+        {
+            let transcript = acp_store.load_session_transcript(sid).unwrap().unwrap();
+            let provider_history =
+                zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+                    &transcript.messages,
+                );
+            sessions
+                .seed_conversation_history(sid, provider_history)
+                .await;
+        }
+
+        // Drive the real dispatch path: process_line spawns the operation
+        // and returns; the response arrives later on the same stream.
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7717,
+            "method": "session/compact-context",
+            "params": {"session_id": sid, "operation_id": "op-wire-1"},
+        });
+        dispatcher
+            .process_line(&serde_json::to_string(&request).unwrap())
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(20), started_rx)
+            .await
+            .expect("the spawned model call must start")
+            .expect("the provider signals entry");
+        assert!(
+            rx.try_recv().is_err(),
+            "process_line must return before the spawned operation answers"
+        );
+        release_tx.send(()).unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+            .await
+            .expect("the compact-context response must arrive")
+            .expect("channel stays open");
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["id"], 7717,
+            "the reply must correlate to its request"
+        );
+        assert_eq!(response["result"]["status"], "activated");
+        assert_eq!(response["result"]["operation_id"], "op-wire-1");
+
+        // Drain everything the operation emitted: no TurnComplete ever.
+        while let Ok(raw) = rx.try_recv() {
+            let notification: Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                notification["method"] != "session/update"
+                    || notification["params"]["type"] != "turn_complete",
+                "a manual compaction must never emit TurnComplete (it would drain queued \
+                 prompts): {raw}"
+            );
+        }
+
+        // Busy is a typed refusal: hold the session and observe SESSION_BUSY
+        // without the compaction ever queueing behind the holder.
+        let holder = sessions.session_queue.acquire(sid).await.unwrap();
+        let busy = dispatcher
+            .handle_session_compact_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-wire-2",
+            }))
+            .await
+            .expect_err("a held session must refuse compaction");
+        assert_eq!(busy.code, SESSION_BUSY);
+        assert_eq!(sessions.session_queue.queue_depth(sid).await, 1);
+        drop(holder);
+    }
+
+    /// Provider whose `chat` (the compaction summarization call) blocks on a
+    /// one-shot gate before returning the canned summary, so a test can hold
+    /// the settlement mid-model-call.
+    struct GatedCompactionProvider {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for GatedCompactionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("Decision kept; task unfinished.".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let release = self
+                .release
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the gated provider must be released exactly once");
+            self.started
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            let _ = release.await;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("Decision kept; task unfinished.".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GatedCompactionProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "gated-compaction-provider"
+        }
+    }
+
+    /// Outer-task abort regression: connection teardown aborts the response
+    /// task while the summarization call is gated mid-flight. The owned
+    /// settlement task must keep queue admission, finish the durable commit,
+    /// install the committed projection, and only then release admission —
+    /// no detached SQL, no lost reconciliation.
+    #[tokio::test]
+    async fn compact_context_settlement_outlives_aborted_response_task() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.set_tui_id_for_test(Some("tui-compaction".to_string()));
+        dispatcher.authenticated = true;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        dispatcher.rpc = Arc::new(RpcOutbound::new(tx));
+        let sid = "compaction-settlement-abort";
+        acp_store
+            .create_session_with_interaction_surface(
+                sid,
+                "test-agent",
+                tmp.path().to_str().unwrap(),
+                Some("zerocode_code"),
+            )
+            .unwrap();
+        for turn in ["one", "two", "three"] {
+            compaction_fixture_turn(&acp_store, sid, turn);
+        }
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedCompactionProvider {
+                started: std::sync::Mutex::new(Some(started_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .unwrap();
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                )
+                .with_interaction_surface(Some(
+                    crate::agent::prompt::InteractionSurface::ZerocodeCode,
+                ))
+                .with_owner(Some("tui-compaction".to_string())),
+            )
+            .await
+            .unwrap();
+        {
+            let transcript = acp_store.load_session_transcript(sid).unwrap().unwrap();
+            let provider_history =
+                zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+                    &transcript.messages,
+                );
+            sessions
+                .seed_conversation_history(sid, provider_history)
+                .await;
+        }
+
+        // Dispatch through the real path, then abort the response task the
+        // way connection teardown does (Drop aborts every prompt task).
+        dispatcher
+            .process_line(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 8844,
+                    "method": "session/compact-context",
+                    "params": {"session_id": sid, "operation_id": "op-abort-1"},
+                })
+                .to_string(),
+            )
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(20), started_rx)
+            .await
+            .expect("the settlement must enter the model call before abort")
+            .expect("the provider signals entry");
+        let response_task = dispatcher
+            .prompt_tasks
+            .pop()
+            .expect("the dispatched operation must be tracked");
+        response_task.abort();
+        let _ = response_task.await;
+
+        // The settlement still owns admission while the model call is
+        // gated: idle-only admission must observe a busy session.
+        assert!(
+            matches!(
+                sessions.session_queue.try_acquire_idle(sid).await,
+                Err(zeroclaw_infra::session_queue::SessionQueueError::Busy { .. })
+            ),
+            "aborting the response task must not release admission mid-operation"
+        );
+
+        // Release the gate: the settlement commits, installs, and settles.
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let committed = store_has_active_checkpoint(&acp_store, sid, "op-abort-1");
+                if committed && sessions.session_queue.try_acquire_idle(sid).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the settlement must commit and release admission after the abort");
+
+        // The settlement installed the committed projection onto the live
+        // incarnation, without any response future to help it.
+        let summary_label =
+            crate::i18n::get_required_cli_string("compaction-historical-summary-label");
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let agent = agent.lock().await;
+            assert!(
+                agent.history().iter().any(|message| matches!(message,
+                    ConversationMessage::Chat(chat) if chat.content.contains(&summary_label))),
+                "the settlement must install the committed summary projection"
+            );
+        }
+
+        // No JSON-RPC response for the aborted request ever reached the wire.
+        while let Ok(raw) = rx.try_recv() {
+            assert!(
+                !raw.contains("\"id\":8844"),
+                "the aborted response task must not answer: {raw}"
+            );
+        }
     }
 
     #[tokio::test]

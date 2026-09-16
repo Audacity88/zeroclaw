@@ -221,6 +221,38 @@ impl Drop for CancelTokenRegistration<'_> {
     }
 }
 
+/// Owned, generation-scoped handle for a non-turn session operation's
+/// cancellation token. Unlike [`CancelTokenRegistration`] (which borrows the
+/// store and is shaped for the prompt path's lifetimes), this handle owns an
+/// `Arc<SessionStore>` clone, so a spawned settlement task can hold it — and
+/// the admission it protects — across awaits and teardown aborts until the
+/// operation's durable work has settled.
+pub(crate) struct OperationCancelRegistration {
+    store: Arc<SessionStore>,
+    session_id: String,
+    generation: Option<u64>,
+}
+
+impl OperationCancelRegistration {
+    /// Drain the operation's cancellation attribution before unregistering
+    /// the token, mirroring `CancelTokenRegistration::finish`.
+    pub(crate) fn finish(mut self) -> Option<CancelCause> {
+        let cause = self.store.take_cancel_cause(&self.session_id);
+        if let Some(generation) = self.generation.take() {
+            self.store.remove_cancel_token(&self.session_id, generation);
+        }
+        cause
+    }
+}
+
+impl Drop for OperationCancelRegistration {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            self.store.remove_cancel_token(&self.session_id, generation);
+        }
+    }
+}
+
 impl SessionStore {
     pub fn new(max_sessions: usize, session_queue: Arc<SessionActorQueue>) -> Self {
         Self {
@@ -816,6 +848,17 @@ impl SessionStore {
         sessions.get(session_id).map(|s| s.owner_tui_id.clone())
     }
 
+    /// Read the live session's host-validated interaction surface. Same
+    /// `Option<Option>` contract as [`Self::session_owner_tui_id`]; used by
+    /// surface-authorization checks (manual compaction is native-Code only).
+    pub async fn interaction_surface(
+        &self,
+        session_id: &str,
+    ) -> Option<Option<crate::agent::prompt::InteractionSurface>> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(session_id).map(|s| s.interaction_surface)
+    }
+
     pub async fn list_ids(&self) -> Vec<String> {
         self.sessions.lock().await.keys().cloned().collect()
     }
@@ -895,6 +938,33 @@ impl SessionStore {
             )))
         })
         .await
+    }
+
+    /// Register a non-turn session operation's cancellation token under the
+    /// same generation discipline as an admitted prompt. Manual compaction
+    /// and restore operations use this so `session/cancel`, close, kill and
+    /// connection teardown can signal them, and so removal/kill handlers can
+    /// target the exact live incarnation they captured.
+    ///
+    /// Returns an OWNED handle (Arc, no borrowed lifetime) so a spawned
+    /// settlement task can hold the registration across awaits and
+    /// teardown aborts; the handle removes the exact generation it
+    /// registered on every exit path.
+    pub(crate) fn register_operation_cancel_token(
+        self: Arc<Self>,
+        id: &str,
+        session_generation: Option<u64>,
+        token: tokio_util::sync::CancellationToken,
+    ) -> OperationCancelRegistration {
+        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let generation =
+            self.register_cancel_token_locked(&mut tokens, id, session_generation, token);
+        drop(tokens);
+        OperationCancelRegistration {
+            store: self,
+            session_id: id.to_string(),
+            generation: Some(generation),
+        }
     }
 
     #[cfg(test)]

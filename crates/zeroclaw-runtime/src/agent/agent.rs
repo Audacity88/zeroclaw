@@ -349,6 +349,74 @@ async fn forward_history_trim_notice(
     }
 }
 
+/// Result of one bounded no-tool summarization operation.
+#[derive(Debug, Clone)]
+pub struct BoundedSummarization {
+    /// The accepted summary text (trimmed, bounded, non-empty).
+    pub summary: String,
+    /// Provider-reported token usage when available; `None` is honest
+    /// absence, never a fabricated value.
+    pub usage: Option<zeroclaw_api::model_provider::TokenUsage>,
+}
+
+/// Typed failures of a bounded summarization operation. Every variant
+/// leaves prior state unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedSummarizationError {
+    /// The operation's cancellation token fired before completion.
+    Cancelled,
+    /// The overall operation deadline expired.
+    Timeout,
+    /// The provider request failed under its own retry policy.
+    Provider(String),
+    /// The model returned tool calls; a summarization operation executes
+    /// none of them.
+    ToolCallsRejected,
+    /// The model returned no usable text.
+    EmptyOutput,
+    /// The model's output exceeded the accepted bound and was not accepted.
+    OutputTooLarge { length: usize, max: usize },
+}
+
+impl std::fmt::Display for BoundedSummarizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "summarization cancelled"),
+            Self::Timeout => write!(f, "summarization timed out"),
+            Self::Provider(detail) => write!(f, "summarization provider failure: {detail}"),
+            Self::ToolCallsRejected => {
+                write!(
+                    f,
+                    "summarization returned tool calls; refusing to execute them"
+                )
+            }
+            Self::EmptyOutput => write!(f, "summarization returned no usable text"),
+            Self::OutputTooLarge { length, max } => {
+                write!(f, "summarization output too large ({length} > {max} chars)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundedSummarizationError {}
+
+/// Outcome of installing a derived history projection onto a live Agent.
+#[derive(Debug)]
+pub enum HistoryProjectionInstall {
+    /// The live history matched the caller's captured projection and was
+    /// replaced; carries the structured-cap trim event, if any.
+    Installed { trim_event: Option<TurnEvent> },
+    /// The live history no longer matches the captured projection. Nothing
+    /// was changed; the caller must invalidate this incarnation so the next
+    /// prompt rehydrates from durable storage.
+    LiveHistoryMismatch,
+    /// The system prompt could not be rebuilt and the captured projection
+    /// carried no system row to preserve. Nothing was changed; the caller
+    /// must invalidate this incarnation rather than install a projection
+    /// with no system context at all.
+    SystemPromptFailed,
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     /// Sealed per-agent tool set. Stored as a [`crate::tools::scoped::ScopedToolRegistry`]
@@ -1287,6 +1355,170 @@ impl Agent {
         &self.channel_handles
     }
 
+    /// Canonical effective context-budget authority for this agent's runtime
+    /// profile — the same budget that governs preemptive history trimming.
+    pub fn effective_context_budget(&self) -> usize {
+        self.config.resolved.effective_context_budget()
+    }
+
+    /// Replace the entire derived provider-history projection in one
+    /// validated step. Unlike the seed methods — which only append onto
+    /// empty history — this installs onto the LIVE agent after confirming
+    /// its current history still matches the projection the caller captured
+    /// under session admission. A mismatch is fail-closed, matching
+    /// [`Self::replace_history_suffix`]: the caller must invalidate this
+    /// live incarnation and rehydrate from durable storage rather than mix
+    /// generations of provider history. Only the derived history (and its
+    /// trim breadcrumb flag) changes; every other Agent state is preserved.
+    pub fn install_conversation_history_projection(
+        &mut self,
+        expected_history: &[ConversationMessage],
+        messages: Vec<ConversationMessage>,
+    ) -> HistoryProjectionInstall {
+        if self.history.len() != expected_history.len()
+            || !self
+                .history
+                .iter()
+                .zip(expected_history)
+                .all(|(live, expected)| Self::conversation_messages_equal(live, expected))
+        {
+            return HistoryProjectionInstall::LiveHistoryMismatch;
+        }
+        // Build the system prompt BEFORE replacing anything: on failure the
+        // valid current system row is preserved through the replacement
+        // (checked below), and only when neither a fresh build nor a
+        // preserved system row exists does the install fail truthfully
+        // without touching live history.
+        let rebuilt_system = self.build_system_prompt().ok();
+        let preserved_system = if rebuilt_system.is_none() {
+            match expected_history.first() {
+                Some(ConversationMessage::Chat(chat)) if chat.role == "system" => {
+                    Some(chat.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if rebuilt_system.is_none() && preserved_system.is_none() {
+            return HistoryProjectionInstall::SystemPromptFailed;
+        }
+        self.history.clear();
+        self.history_has_trim_breadcrumb = false;
+        if let Some(sys) = rebuilt_system {
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(sys)));
+        } else if let Some(chat) = preserved_system {
+            self.history.push(ConversationMessage::Chat(chat));
+        }
+        for message in messages {
+            // The system prompt is rebuilt above; seeded system rows (for
+            // example durable failure markers) stay transcript-only.
+            if matches!(&message, ConversationMessage::Chat(m) if m.role == "system") {
+                continue;
+            }
+            self.history.push(message);
+        }
+        // Trim immediately so the installed projection is inside the
+        // configured limits from the start, exactly like a seeded restore.
+        let trim_event = self
+            .trim_history(None)
+            .map(HistoryTrimNotice::into_turn_event);
+        HistoryProjectionInstall::Installed { trim_event }
+    }
+
+    /// Canonical token estimate for the provider-message form of structured
+    /// history: the same `to_provider_messages` flattening the turn loop
+    /// uses, scored by the same `history::estimate_history_tokens`
+    /// heuristic. Manual compaction accounts its projections through this
+    /// one seam so there is no parallel budget or formula.
+    pub fn estimate_provider_messages(&self, messages: &[ConversationMessage]) -> usize {
+        crate::agent::history::estimate_history_tokens(
+            &self.tool_dispatcher.to_provider_messages(messages),
+        )
+    }
+
+    /// Whether a derived projection fits without immediately losing an old
+    /// turn to the same live message cap used by ordinary history trimming.
+    pub(crate) fn conversation_history_projection_fits(
+        &self,
+        messages: &[ConversationMessage],
+    ) -> bool {
+        messages
+            .iter()
+            .filter(|message| {
+                !matches!(message,
+                    ConversationMessage::Chat(chat) if chat.role == "system"
+                )
+            })
+            .count()
+            <= self.structured_history_cap()
+    }
+
+    /// One bounded logical no-tool summarization operation through the
+    /// Agent's existing routed provider, model and temperature. The
+    /// provider's own reliability policy may still make several HTTP
+    /// attempts — this bounds the operation as a whole (deadline,
+    /// cancellation, accepted-output size) rather than adding an outer
+    /// retry loop. Tool calls are rejected, never executed; usage is
+    /// returned when the provider reports it, never fabricated.
+    pub async fn run_bounded_summarization(
+        &self,
+        prompt: &str,
+        max_output_chars: usize,
+        deadline: std::time::Duration,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<BoundedSummarization, BoundedSummarizationError> {
+        let messages = [ChatMessage::user(prompt)];
+        let request = zeroclaw_providers::ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let model_access = crate::agent::loop_::ResolvedModelAccess {
+            model_provider: self.model_provider.as_ref(),
+            provider_name: &self.model_provider_name,
+            model: &self.model_name,
+            temperature: self.temperature,
+        };
+        let call = model_access.run_model_query(request);
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(BoundedSummarizationError::Cancelled);
+            }
+            response = tokio::time::timeout(deadline, call) => match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    if error.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>() {
+                        return Err(BoundedSummarizationError::EmptyOutput);
+                    }
+                    return Err(BoundedSummarizationError::Provider(error.to_string()));
+                }
+                Err(_) => return Err(BoundedSummarizationError::Timeout),
+            },
+        };
+        if !response.tool_calls.is_empty() {
+            return Err(BoundedSummarizationError::ToolCallsRejected);
+        }
+        let summary = response.text.unwrap_or_default();
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err(BoundedSummarizationError::EmptyOutput);
+        }
+        let length = summary.chars().count();
+        if length > max_output_chars {
+            return Err(BoundedSummarizationError::OutputTooLarge {
+                length,
+                max: max_output_chars,
+            });
+        }
+        Ok(BoundedSummarization {
+            summary: summary.to_string(),
+            usage: response.usage,
+        })
+    }
+
     pub fn populate_channels(
         &self,
         channel_map: &std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>,
@@ -2084,13 +2316,16 @@ impl Agent {
         Ok(agent)
     }
 
-    fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max = self
-            .structured_history_cap_resolver
+    fn structured_history_cap(&self) -> usize {
+        self.structured_history_cap_resolver
             .as_ref()
             .map_or(self.config.resolved.max_history_messages, |resolve| {
                 resolve()
-            });
+            })
+    }
+
+    fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
+        let max = self.structured_history_cap();
         if self.history.len() <= max {
             return None;
         }
@@ -4016,6 +4251,281 @@ mod tests {
             .await
             .expect_err("whitespace-only turn must fail");
         assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    // ── compaction projection install + bounded summarization ───────────
+
+    fn chat(role: &str, content: &str) -> ConversationMessage {
+        ConversationMessage::Chat(ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        })
+    }
+
+    #[test]
+    fn install_projection_replaces_validated_history_without_append_seeding() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        agent.seed_conversation_history(vec![
+            chat("user", "turn one"),
+            chat("assistant", "answer one"),
+            chat("user", "turn two"),
+            chat("assistant", "answer two"),
+        ]);
+        let expected: Vec<ConversationMessage> = agent.history().to_vec();
+        assert!(expected.len() >= 5, "seeded system prompt + four messages");
+
+        let cap = Arc::new(std::sync::atomic::AtomicUsize::new(4));
+        let live_cap = Arc::clone(&cap);
+        agent.structured_history_cap_resolver = Some(Arc::new(move || {
+            live_cap.load(std::sync::atomic::Ordering::SeqCst)
+        }));
+        assert!(agent.conversation_history_projection_fits(&expected));
+        cap.store(3, std::sync::atomic::Ordering::SeqCst);
+        assert!(!agent.conversation_history_projection_fits(&expected));
+        cap.store(4, std::sync::atomic::Ordering::SeqCst);
+
+        let replacement = vec![
+            chat("user", "[compaction summary] lossy historical record"),
+            chat("user", "turn two"),
+            chat("assistant", "answer two"),
+        ];
+        let install = agent.install_conversation_history_projection(&expected, replacement);
+        assert!(matches!(
+            install,
+            HistoryProjectionInstall::Installed { trim_event: None }
+        ));
+        let history = agent.history();
+        assert!(
+            matches!(&history[1], ConversationMessage::Chat(m) if m.content.contains("[compaction summary]")),
+            "the covered prefix must be replaced by the labeled summary, not appended"
+        );
+        assert_eq!(history.len(), 4, "system + summary + retained tail");
+        assert!(
+            matches!(&history[2], ConversationMessage::Chat(m) if m.content == "turn two"),
+            "retained tail turns stay intact"
+        );
+
+        // A second install validated against the STALE capture must fail
+        // closed and leave history unchanged.
+        let stale_install = agent.install_conversation_history_projection(
+            &expected,
+            vec![chat("user", "must not appear")],
+        );
+        assert!(matches!(
+            stale_install,
+            HistoryProjectionInstall::LiveHistoryMismatch
+        ));
+        assert_eq!(agent.history().len(), 4);
+        assert!(
+            !agent
+                .history()
+                .iter()
+                .any(|message| matches!(message, ConversationMessage::Chat(m) if m.content == "must not appear"))
+        );
+    }
+
+    #[test]
+    fn install_projection_skips_seeded_system_rows_and_keeps_agent_state() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let attribution_before = agent.attribution_fields();
+        agent.seed_conversation_history(vec![
+            chat("user", "turn one"),
+            chat("assistant", "answer one"),
+        ]);
+        let expected: Vec<ConversationMessage> = agent.history().to_vec();
+
+        let replacement = vec![
+            chat("user", "[compaction summary]"),
+            // Durable failure markers are transcript-only and must not reach
+            // the provider projection.
+            chat("system", "turn failed"),
+        ];
+        let install = agent.install_conversation_history_projection(&expected, replacement);
+        assert!(matches!(
+            install,
+            HistoryProjectionInstall::Installed { trim_event: None }
+        ));
+        assert!(
+            !agent
+                .history()
+                .iter()
+                .any(|message| matches!(message, ConversationMessage::Chat(m) if m.role == "system" && m.content == "turn failed")),
+            "seeded system rows must stay excluded from the projection"
+        );
+        // History was replaced, but other Agent state is untouched.
+        assert_eq!(agent.attribution_fields(), attribution_before);
+    }
+
+    fn summarize_response(
+        text: Option<&str>,
+        tool_calls: Vec<zeroclaw_api::model_provider::ToolCall>,
+        usage: Option<zeroclaw_api::model_provider::TokenUsage>,
+    ) -> zeroclaw_providers::ChatResponse {
+        zeroclaw_providers::ChatResponse {
+            text: text.map(str::to_string),
+            tool_calls,
+            usage,
+            reasoning_content: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_summarization_accepts_text_and_returns_reported_usage() {
+        let usage = zeroclaw_api::model_provider::TokenUsage {
+            input_tokens: Some(1200),
+            output_tokens: Some(80),
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![summarize_response(
+                Some("  summary text  "),
+                Vec::new(),
+                Some(usage.clone()),
+            )]),
+        });
+        let agent = blank_input_agent(model_provider);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = agent
+            .run_bounded_summarization(
+                "summarize this",
+                1000,
+                std::time::Duration::from_secs(30),
+                &cancel,
+            )
+            .await
+            .expect("summarization should succeed");
+        assert_eq!(result.summary, "summary text");
+        let reported = result.usage.expect("usage must pass through");
+        assert_eq!(reported.input_tokens, usage.input_tokens);
+        assert_eq!(reported.output_tokens, usage.output_tokens);
+    }
+
+    #[tokio::test]
+    async fn bounded_summarization_rejects_tools_empty_and_oversized_output() {
+        let tool_call = zeroclaw_api::model_provider::ToolCall {
+            id: "call-1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        };
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![
+                summarize_response(Some("plan"), vec![tool_call], None),
+                summarize_response(Some("   "), Vec::new(), None),
+                summarize_response(Some(&"x".repeat(64)), Vec::new(), None),
+            ]),
+        });
+        let agent = blank_input_agent(model_provider);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let deadline = std::time::Duration::from_secs(30);
+
+        assert_eq!(
+            agent
+                .run_bounded_summarization("p", 1000, deadline, &cancel)
+                .await
+                .unwrap_err(),
+            BoundedSummarizationError::ToolCallsRejected
+        );
+        assert_eq!(
+            agent
+                .run_bounded_summarization("p", 1000, deadline, &cancel)
+                .await
+                .unwrap_err(),
+            BoundedSummarizationError::EmptyOutput
+        );
+        assert_eq!(
+            agent
+                .run_bounded_summarization("p", 32, deadline, &cancel)
+                .await
+                .unwrap_err(),
+            BoundedSummarizationError::OutputTooLarge {
+                length: 64,
+                max: 32
+            }
+        );
+    }
+
+    struct HangingSummarizationProvider;
+
+    #[async_trait]
+    impl ModelProvider for HangingSummarizationProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("unused".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            unreachable!("the hanging provider must never complete in tests")
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for HangingSummarizationProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "HangingSummarizationProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_summarization_honours_deadline_and_cancellation() {
+        let agent = blank_input_agent(Box::new(HangingSummarizationProvider));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert_eq!(
+            agent
+                .run_bounded_summarization(
+                    "p",
+                    1000,
+                    std::time::Duration::from_millis(50),
+                    &cancel,
+                )
+                .await
+                .unwrap_err(),
+            BoundedSummarizationError::Timeout
+        );
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            agent
+                .run_bounded_summarization("p", 1000, std::time::Duration::from_secs(30), &cancel,)
+                .await
+                .unwrap_err(),
+            BoundedSummarizationError::Cancelled
+        );
+    }
+
+    #[test]
+    fn effective_context_budget_resolves_from_resolved_runtime() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let agent = blank_input_agent(model_provider);
+        // Default runtime profile budget.
+        assert_eq!(agent.effective_context_budget(), 32_000);
     }
 
     // ── model-fallback notice (silent downgrade surfacing) ──────────────
