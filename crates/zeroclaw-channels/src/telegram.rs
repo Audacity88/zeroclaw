@@ -1649,15 +1649,6 @@ impl TelegramChannel {
         value.trim().trim_start_matches('@').to_string()
     }
 
-    /// Write a paired user into `peer_groups` and save. Standalone callers
-    /// may provide a config Arc through [`Self::with_persistence`], which
-    /// pairs it with a local mutation witness; supervised callers use
-    /// [`Self::with_persistence_authority`] to share the daemon witness.
-    pub fn with_persistence(mut self, config: Arc<RwLock<Config>>) -> Self {
-        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
-        self
-    }
-
     /// Wire the daemon generation's live-config authority for pairing writes.
     pub fn with_persistence_authority(
         mut self,
@@ -6246,11 +6237,8 @@ mod tests {
         .with_persistence_authority(authority.clone());
         let stored = channel.persist.as_ref().expect("authority is stored");
 
-        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
-        assert!(Arc::ptr_eq(
-            &authority.config_write_lock(),
-            &stored.config_write_lock()
-        ));
+        assert!(authority.live_handle().same_storage(&stored.live_handle()));
+        assert_eq!(authority.config_epoch(), stored.config_epoch());
     }
 
     #[tokio::test]
@@ -6281,7 +6269,7 @@ mod tests {
 
         assert!(
             authority
-                .config()
+                .live_handle()
                 .read()
                 .channel_external_peers("telegram", "default")
                 .is_empty()

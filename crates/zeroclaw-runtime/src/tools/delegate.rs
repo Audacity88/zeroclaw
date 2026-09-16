@@ -232,7 +232,7 @@ pub struct DelegateTool {
     /// config reloads and credential rotation instead of the startup snapshot.
     /// `None` for one-shot / non-daemon callers, which keep the documented
     /// snapshot fallback.
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     /// Authority capability used to admit every independent target execution.
     execution_capability: Option<AgentExecutionCapability>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
@@ -539,7 +539,10 @@ impl DelegateTool {
     /// one-shot behavior and keeps the snapshot fallback; dropping the handle
     /// when the caller has one silently pins delegated plugin tools to startup
     /// config for the parent's whole lifetime.
-    pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
+    pub fn with_live_config(
+        mut self,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    ) -> Self {
         self.live_config = live_config;
         self
     }

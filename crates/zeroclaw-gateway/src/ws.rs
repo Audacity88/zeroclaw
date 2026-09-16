@@ -298,7 +298,7 @@ where
                     state.sop_audit.clone(),
                     &outcome,
                     Some(zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
-                        std::sync::Arc::clone(&state.config),
+                        state.config.clone(),
                         state.agent_lifecycle.clone(),
                     )),
                 );
@@ -522,12 +522,12 @@ async fn handle_socket(
     }
 
     let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
-        Arc::clone(&state.config),
+        state.config.clone(),
         state.agent_lifecycle.clone(),
     );
     let mut agent =
         match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-            Arc::clone(&state.config),
+            state.config.clone(),
             &agent_alias,
             Some(&session_cwd),
             true,

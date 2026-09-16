@@ -766,7 +766,7 @@ fn plugin_egress_policy(
 #[cfg(feature = "plugins-wasm")]
 fn plugin_egress_service(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::egress::EgressHostService {
     zeroclaw_plugins::egress::EgressHostService::new(
         zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
@@ -802,7 +802,7 @@ fn plugin_config_values(
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
     // A live daemon handle and a fallback snapshot are mutually exclusive in
     // the long-lived service, so the resolver never retains two config sources.
@@ -864,7 +864,7 @@ pub fn all_tools_with_runtime(
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> AllToolsResult {
     all_tools_with_runtime_and_execution_capability(
         config,
@@ -920,7 +920,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();

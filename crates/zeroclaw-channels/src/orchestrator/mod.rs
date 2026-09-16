@@ -95,7 +95,6 @@ pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use anyhow::{Context, Result};
-use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, AtomicUsize, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
 
@@ -10437,10 +10436,10 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
 
 #[cfg(feature = "channel-slack")]
 fn slack_thread_context_max_messages_resolver(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     alias: &str,
 ) -> Arc<dyn Fn() -> usize + Send + Sync> {
-    let cfg_arc = Arc::clone(config_arc);
+    let cfg_arc = config_arc.clone();
     let alias = alias.to_string();
     Arc::new(move || {
         cfg_arc
@@ -10477,9 +10476,15 @@ impl std::error::Error for UnknownChannelId {}
 
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     channel_id: &str,
 ) -> Result<Arc<dyn Channel>> {
+    // One-shot construction: a private, unsupervised authority seeded from
+    // the caller's own one-shot handle, matching that handle's semantics —
+    // a pairing write here would persist to disk but publish only into
+    // this throwaway storage, never entering a supervised publication
+    // domain (one-shot senders never pair).
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
     #[allow(unused_variables)]
     let config = config_arc.read();
     match channel_id {
@@ -10511,7 +10516,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_voice_peer_resolver(voice_peer_resolver)
-                .with_persistence(config_arc.clone())
+                .with_persistence_authority(authority.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
@@ -10702,9 +10707,9 @@ fn build_channel_by_id(
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
-                let transcription_config_arc = Arc::clone(config_arc);
+                let transcription_config_arc = config_arc.clone();
                 let transcription_channel_key = format!("matrix.{alias}");
-                let tts_config_arc = Arc::clone(config_arc);
+                let tts_config_arc = config_arc.clone();
                 let tts_channel_key = format!("matrix.{alias}");
                 let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
@@ -10782,7 +10787,7 @@ fn build_channel_by_id(
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
                     WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
-                        .with_persistence(config_arc.clone())
+                        .with_persistence_authority(authority.clone())
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -10967,7 +10972,7 @@ fn build_channel_by_id(
                     wc.cdn_base_url.clone(),
                     Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
                 )?
-                .with_persistence(config_arc.clone())
+                .with_persistence_authority(authority.clone())
                 .with_workspace_dir(workspace_dir),
             ))
         }
@@ -11280,7 +11285,7 @@ fn build_channel_by_id(
                 };
                 Ok(Arc::new(
                     LineChannel::from_config(ln, alias, peer_resolver, sender_name_resolver)
-                        .with_persistence(config_arc.clone()),
+                        .with_persistence_authority(authority.clone()),
                 ))
             }
             #[cfg(not(feature = "channel-line"))]
@@ -11315,9 +11320,10 @@ pub async fn send_channel_message(
     recipient: &str,
     message: &str,
 ) -> Result<()> {
-    // Wrap into the canonical shared handle for the builder; this is a
-    // one-shot path so the snapshot is dropped immediately after send.
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    // Wrap into a private one-shot storage for the builder; the snapshot
+    // is dropped immediately after send and never enters a supervised
+    // publication domain.
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     // The builder gets first refusal so families it already resolves natively
     // (notably `linq.<alias>`) keep their established route and their own
     // configuration errors. Only a dotted id the builder does not claim at all
@@ -11616,7 +11622,7 @@ impl ActiveChannelAliases {
 pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
     configured_channel_map(&configured)
 }
@@ -11702,7 +11708,7 @@ pub fn live_channel_map() -> HashMap<String, Arc<dyn zeroclaw_api::channel::Chan
 /// Return the daemon-owned live channels visible to one trusted local RPC
 /// session. This clones channel `Arc`s and never constructs duplicate clients.
 pub fn build_local_rpc_session_channels(
-    config: Arc<RwLock<Config>>,
+    config: zeroclaw_config::live::LiveConfigHandle,
     agent_alias: String,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let snapshot = config.read().clone();
@@ -11717,7 +11723,7 @@ pub fn register_channels_for_tools(
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
 
     let handles = [
@@ -11827,7 +11833,7 @@ fn configure_discord_transcription(
 
 #[cfg(feature = "channel-discord")]
 fn build_configured_discord_channel(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     config: &Config,
     alias: &str,
     dc: &zeroclaw_config::schema::DiscordConfig,
@@ -11908,7 +11914,7 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
 /// credential pair; the caller logs and skips the alias on `Err`.
 #[cfg(feature = "channel-matrix")]
 pub(crate) fn build_configured_matrix_channel(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     config: &Config,
     alias: &str,
     mx: &zeroclaw_config::schema::MatrixConfig,
@@ -11920,9 +11926,9 @@ pub(crate) fn build_configured_matrix_channel(
         Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
     };
     let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
-    let transcription_config_arc = Arc::clone(config_arc);
+    let transcription_config_arc = config_arc.clone();
     let transcription_channel_key = format!("matrix.{alias}");
-    let tts_config_arc = Arc::clone(config_arc);
+    let tts_config_arc = config_arc.clone();
     let tts_channel_key = format!("matrix.{alias}");
     let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
         let cfg_arc = config_arc.clone();
@@ -11959,13 +11965,16 @@ pub(crate) fn build_configured_matrix_channel(
 }
 
 fn collect_configured_channels(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Vec<ConfiguredChannel> {
-    let authority = zeroclaw_runtime::LiveConfigAuthority::from_config(config_arc.clone());
+    // One-shot construction from a static snapshot: a private,
+    // unsupervised storage that never enters a supervised publication
+    // domain (no supervised storage is ever exposed as a raw Arc).
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
     collect_configured_channels_with_authority(
         config_arc,
         &authority,
@@ -11977,14 +11986,13 @@ fn collect_configured_channels(
 }
 
 fn collect_configured_channels_with_authority(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     authority: &zeroclaw_runtime::LiveConfigAuthority,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Vec<ConfiguredChannel> {
-    let _ = authority;
     let _ = matrix_skip_context;
     let _ = tool_specs;
     #[cfg(not(feature = "channel-amqp"))]
@@ -13435,7 +13443,7 @@ fn collect_configured_channels_with_authority(
             continue;
         }
         let channel_key = format!("voice_wake.{alias}");
-        let transcription_config_arc = Arc::clone(config_arc);
+        let transcription_config_arc = config_arc.clone();
         let transcription_channel_key = channel_key.clone();
         channels.push(ConfiguredChannel {
             display_name: "VoiceWake",
@@ -13585,7 +13593,7 @@ fn peer_group_dangling_warning_lines(config: &Config) -> Vec<String> {
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let config_arc = Arc::new(RwLock::new(config));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
     #[allow(unused_mut)]
     let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
 
@@ -13594,7 +13602,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     let plugin_config = Arc::new(config_arc.read().clone());
     let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
         plugin_config,
-        Some(Arc::clone(&config_arc)),
+        Some(config_arc.clone()),
     )
     .await;
     append_configured_plugin_channels(&mut channels, plugin_channels);
@@ -14042,7 +14050,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     let plugin_webhook_registry_lease = plugin_webhooks
         .as_ref()
         .map(|registry| registry.start_generation());
-    let config_arc = authority.config();
+    let config_arc = authority.live_handle();
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
         .agents
@@ -14223,7 +14231,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
-            Some(Arc::clone(&config_arc)),
+            Some(config_arc.clone()),
             Some(authority.execution_capability()),
         );
         // Route the per-agent tool registry through the one gated seam - see
@@ -14506,7 +14514,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             let plugin_channels =
                 zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
                     Arc::new(config.clone()),
-                    Some(Arc::clone(&config_arc)),
+                    Some(config_arc.clone()),
                     plugin_webhook_registry_lease.as_ref(),
                 )
                 .await;
@@ -35223,7 +35231,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
@@ -35273,7 +35281,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
@@ -35309,7 +35317,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
@@ -35340,7 +35348,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
@@ -35390,7 +35398,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         let discord_channels: Vec<_> = channels
@@ -35447,7 +35455,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
         let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(
@@ -35514,7 +35522,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(channel_map.contains_key("discord.ops"));
@@ -35678,7 +35686,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::scattered_types::EmailConfig::default(),
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
@@ -35695,7 +35703,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::scattered_types::VoiceCallConfig::default(),
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels
@@ -35724,7 +35732,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
@@ -35746,7 +35754,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             channels.iter().any(|entry| entry.display_name == "Signal"),
@@ -35769,7 +35777,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             channels
@@ -35794,7 +35802,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels
@@ -35883,7 +35891,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channel = {
             let config = config_arc.read();
             build_configured_discord_channel(
@@ -36278,7 +36286,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         let entry = channels
             .iter()
@@ -38373,7 +38381,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unknown_channel_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "nonexistent") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -38388,7 +38396,7 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn compiled_channel_keys_have_intentional_one_shot_builder_support() {
-        let config_arc = Arc::new(RwLock::new(Config::default()));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(Config::default()).handle();
         let intentionally_unsupported = HashSet::from([
             "nextcloud",
             "feishu",
@@ -38467,7 +38475,7 @@ This is an example JSON object for profile settings."#;
                 ..Default::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let resolver = slack_thread_context_max_messages_resolver(&config_arc, "default");
 
         assert_eq!(resolver(), 3);
@@ -39114,7 +39122,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "telegram") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -39151,7 +39159,7 @@ This is an example JSON object for profile settings."#;
                 debounce_ms: None,
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
@@ -39317,7 +39325,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unconfigured_voice_call_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "voice-call") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -39351,7 +39359,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "voice-call") {
             Ok(channel) => assert_eq!(channel.name(), "voice_call"),
             Err(e) => panic!("should succeed when voice-call is configured: {e}"),
@@ -42420,7 +42428,7 @@ mod omitted_feature_tests {
                 ..Default::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             channels.iter().all(|c| c.display_name != "Telegram"),

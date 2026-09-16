@@ -1551,7 +1551,7 @@ impl Agent {
     /// Build a daemon-backed ACP/WS Agent whose structured-history cap follows
     /// the shared config after reloads.
     pub async fn from_live_config_with_session_cwd_and_mcp_backchannel(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -1577,7 +1577,7 @@ impl Agent {
     }
 
     pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -1668,7 +1668,7 @@ impl Agent {
     /// Build a daemon-backed TUI Agent whose structured-history cap follows
     /// the shared config after reloads.
     pub async fn from_live_config_with_tui_env(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -1692,7 +1692,7 @@ impl Agent {
     }
 
     pub async fn from_live_config_with_tui_env_with_capability(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -1735,7 +1735,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
-        live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Result<Self> {
         let agent_cfg = config

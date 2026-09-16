@@ -12,11 +12,14 @@
 //! cache).
 //!
 //! Writes go through the shared live-config authority the orchestrator wires
-//! into each channel: acquire its mutation witness, clone and mutate a
-//! snapshot, persist it with `Config::save()`, then publish it in memory.
-//! Channels constructed without the handle (tests, one-shot CLI runs) skip
-//! persistence with a warning: pairing still works for the process lifetime,
-//! it just isn't durable.
+//! into each channel: admit one serialized config commit, clone and mutate a
+//! snapshot, persist it with `Config::save()`, then publish the committed
+//! snapshot under the commit's allocated revision. The irreversible phase
+//! runs retained, so a dropped pairing continuation cannot strand a
+//! committed identity write without its publication. Channels constructed
+//! without the authority (tests, one-shot CLI runs) skip persistence with a
+//! warning: pairing still works for the process lifetime, it just isn't
+//! durable.
 
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::LiveConfigAuthority;
@@ -171,18 +174,37 @@ pub(crate) async fn persist_external_peer(
         );
         return Ok(());
     };
-    let config_write_lock = authority.config_write_lock();
-    let _config_write_guard = config_write_lock.lock().await;
-    let config = authority.config();
-    let mut snapshot = config.read().clone();
+    // Admit one serialized config commit: the pairing write shares the
+    // daemon's writer serialization with every HTTP/RPC config writer,
+    // and the config-work lease keeps an in-flight pairing write visible
+    // to a closing generation's drain.
+    let commit = authority
+        .begin_config_commit()
+        .await
+        .with_context(|| format!("Failed to admit the {channel_type} peer config commit"))?;
+    let mut snapshot = commit.current_config();
     if !merge_external_peer(&mut snapshot, channel_type, alias, identity)? {
         return Ok(());
     }
-    snapshot
-        .save()
-        .await
-        .with_context(|| format!("Failed to persist {channel_type} peer to config.toml"))?;
-    *config.write() = snapshot;
+    // Checked revision before the irreversible save.
+    let revision = commit
+        .next_revision()
+        .with_context(|| format!("Failed to allocate a revision for the {channel_type} peer"))?;
+    let persist_channel_type = channel_type.to_string();
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            snapshot.save().await.with_context(|| {
+                format!("Failed to persist {persist_channel_type} peer to config.toml")
+            })?;
+            // Publish the committed snapshot so the runtime reader sees the
+            // new peer without a reload.
+            commit
+                .publish(revision, snapshot)
+                .with_context(|| "Failed to publish the paired identity to the live config")?;
+            Ok::<(), anyhow::Error>(())
+        }));
+    task.await
+        .with_context(|| "Paired-identity persistence task failed")??;
     Ok(())
 }
 
@@ -522,7 +544,7 @@ mod tests {
 
         assert!(
             authority
-                .config()
+                .live_handle()
                 .read()
                 .channel_external_peers("whatsapp", "admin")
                 .is_empty()

@@ -675,7 +675,7 @@ pub async fn run_with_authority(
     DaemonExit,
     Option<crate::live_config_authority::ConfigOwnershipGuard>,
 )> {
-    let config = live_config_authority.config().read().clone();
+    let config = live_config_authority.snapshot_config();
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -981,12 +981,9 @@ pub async fn run_with_authority(
             None
         };
 
-        let (rpc_config, rpc_config_write_lock) =
-            RpcContext::config_handles_for_authority(&live_config_authority);
-
         Some(std::sync::Arc::new(RpcContext {
-            config: rpc_config,
-            config_write_lock: rpc_config_write_lock,
+            config: live_config_authority.live_handle(),
+            config_authority: live_config_authority.clone(),
             agent_lifecycle: live_config_authority.agent_lifecycle(),
             channel_generation_control: Some(channel_generation_control.clone()),
             sessions,
