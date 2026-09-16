@@ -2104,7 +2104,16 @@ impl RpcDispatcher {
             .acquire(&req.session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
-        if self.ctx.sessions.generation_and_mode(&req.session_id).await != requested_identity {
+        let current_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        if current_identity != requested_identity {
+            if current_identity.is_none() && requested_identity.is_some() {
+                // Hard-cancel finalization can already remove the captured owner.
+                // Acknowledge that close without repeating cleanup or end hooks.
+                return to_result(SessionCloseResult {
+                    session_id: req.session_id,
+                    closed: true,
+                });
+            }
             return Err(rpc_err(SESSION_NOT_FOUND, "Session was replaced"));
         }
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
@@ -14058,103 +14067,133 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn acp_session_kill_hard_aborts_turn_paused_before_provider() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
-        let data_dir = config.data_dir.clone();
-        let (dispatcher, sessions, _chat_backend, acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        let sid = "acp-hard-kill-entry-pause";
-        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
-        let (entry_pause, entered, _release) = crate::agent::agent::TestTurnEntryPause::new();
-        let agent = crate::agent::agent::Agent::builder()
-            .model_provider(Box::new(FailingProvider))
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![],
-            ))
-            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
-            .observer(Arc::new(crate::observability::noop::NoopObserver))
-            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
-            .workspace_dir(tmp.path().to_path_buf())
-            .agent_alias("test-agent".to_string())
-            .test_turn_entry_pause(entry_pause)
-            .build()
-            .unwrap();
-        sessions
-            .insert(
-                sid.to_string(),
-                crate::rpc::session::RpcSession::new(
-                    agent,
-                    "test-agent",
-                    tmp.path().to_str().unwrap(),
-                    crate::rpc::types::ChatMode::Acp,
-                ),
-            )
-            .await
-            .unwrap();
+    async fn acp_session_close_and_kill_hard_abort_turn_paused_before_provider() {
+        for method in ["close", "kill"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, _chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "acp-hard-removal-entry-pause";
+            acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+            let (entry_pause, entered, _release) = crate::agent::agent::TestTurnEntryPause::new();
+            let agent = crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(FailingProvider))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .agent_alias("test-agent".to_string())
+                .test_turn_entry_pause(entry_pause)
+                .build()
+                .unwrap();
+            sessions
+                .insert(
+                    sid.to_string(),
+                    crate::rpc::session::RpcSession::new(
+                        agent,
+                        "test-agent",
+                        tmp.path().to_str().unwrap(),
+                        crate::rpc::types::ChatMode::Acp,
+                    ),
+                )
+                .await
+                .unwrap();
 
-        let prompt_handle = dispatcher.spawn_handle();
-        let prompt_task = zeroclaw_spawn::spawn!(async move {
-            prompt_handle
-                .handle_session_prompt(&json!({
+            let prompt_handle = dispatcher.spawn_handle();
+            let prompt_task = zeroclaw_spawn::spawn!(async move {
+                prompt_handle
+                    .handle_session_prompt(&json!({
+                        "session_id": sid,
+                        "prompt": "pause before provider",
+                    }))
+                    .await
+            });
+            entered.notified().await;
+            assert!(
+                !prompt_task.is_finished(),
+                "the prompt must remain paused after acquiring the Agent"
+            );
+
+            let removal_handle = dispatcher.spawn_handle();
+            let removal_task = zeroclaw_spawn::spawn!(async move {
+                match method {
+                    "close" => {
+                        removal_handle
+                            .handle_session_close(&json!({"session_id": sid}))
+                            .await
+                    }
+                    _ => {
+                        removal_handle
+                            .handle_session_kill(&json!({"session_id": sid}))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while sessions.session_queue.queue_depth(sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removal must signal cancellation and queue behind the admitted turn");
+            assert!(!prompt_task.is_finished());
+            assert!(!removal_task.is_finished());
+
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            let prompt_result = prompt_task
+                .await
+                .expect("hard-aborted prompt task must not panic")
+                .expect("hard-aborted prompt must return a cancellation result");
+            assert_eq!(prompt_result["stop_reason"], json!("cancelled"));
+            assert_eq!(prompt_result["content"], json!(""));
+
+            let removed = removal_task
+                .await
+                .expect("removal task must not panic")
+                .expect("removal must succeed after hard cancellation");
+            assert!(sessions.get_agent(sid).await.is_none());
+            if method == "close" {
+                assert_eq!(removed["closed"], json!(true));
+                assert!(!acp_store.is_session_killed(sid).unwrap());
+                assert!(
+                    acp_store
+                        .recover_turn_checkpoint(sid, "interrupted")
+                        .unwrap(),
+                    "close must retain the recoverable checkpoint"
+                );
+                let restored = acp_store.load_session(sid).unwrap().unwrap();
+                assert!(restored.messages.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat) if chat.content == "pause before provider"
+                )));
+            } else {
+                assert_eq!(removed["killed"], json!(true));
+                assert!(acp_store.is_session_killed(sid).unwrap());
+                assert!(
+                    !acp_store
+                        .recover_turn_checkpoint(sid, "must not promote after hard kill")
+                        .unwrap(),
+                    "a killed session must reject checkpoint promotion"
+                );
+            }
+
+            let resumed = dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "acp",
                     "session_id": sid,
-                    "prompt": "pause before provider",
                 }))
-                .await
-        });
-        entered.notified().await;
-        assert!(
-            !prompt_task.is_finished(),
-            "the prompt must remain paused after acquiring the Agent"
-        );
-
-        let kill_handle = dispatcher.spawn_handle();
-        let kill_task = zeroclaw_spawn::spawn!(async move {
-            kill_handle
-                .handle_session_kill(&json!({"session_id": sid}))
-                .await
-        });
-        assert!(dispatcher.ctx.sessions.signal_session_kill(sid));
-        tokio::task::yield_now().await;
-        assert!(!prompt_task.is_finished());
-        assert!(
-            !kill_task.is_finished(),
-            "session/kill must wait for the admitted turn before durable fallback"
-        );
-
-        tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        let prompt_result = prompt_task
-            .await
-            .expect("hard-aborted prompt task must not panic")
-            .expect("hard-aborted prompt must return a cancellation result");
-        assert_eq!(prompt_result["stop_reason"], json!("cancelled"));
-        assert_eq!(prompt_result["content"], json!(""));
-
-        let killed = kill_task
-            .await
-            .expect("session/kill task must not panic")
-            .expect("session/kill durable fallback must succeed");
-        assert_eq!(killed["killed"], json!(true));
-        assert!(sessions.get_agent(sid).await.is_none());
-        assert!(acp_store.is_session_killed(sid).unwrap());
-        assert!(
-            !acp_store
-                .recover_turn_checkpoint(sid, "must not promote after hard kill")
-                .unwrap(),
-            "a killed session must reject checkpoint promotion"
-        );
-
-        let resumed = dispatcher
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "chat_mode": "acp",
-                "session_id": sid,
-            }))
-            .await;
-        assert!(
-            resumed.is_err(),
-            "a hard-killed ACP session must not resume"
-        );
+                .await;
+            assert_eq!(
+                resumed.is_ok(),
+                method == "close",
+                "only a closed ACP session may resume after hard cancellation"
+            );
+        }
     }
 
     #[tokio::test]

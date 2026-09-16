@@ -264,7 +264,7 @@ If a process stops during a turn, the next resume recovers the saved checkpoint 
 
 Sessions survive process restarts. A session created in one `zeroclaw acp` invocation can be loaded or resumed in a later one, as long as the same `workspace_dir` is in use (and therefore the same `acp-sessions.db` file).
 
-Sessions are not automatically deleted. `session/close` removes the live owner but retains ACP history so the session can be loaded or resumed. `session/kill` also records a durable tombstone, so the session cannot be resumed. `session/delete` removes the selected ACP history and checkpoint before releasing its live owner; if durable deletion fails, the live session remains available and the RPC returns an error.
+Sessions are not automatically deleted. `session/close` removes the live owner but retains ACP history so the session can be loaded or resumed. The separate [daemon RPC interface](../architecture/rpc-socket.md) also provides `session/kill`, which records a durable tombstone so the session cannot be resumed, and `session/delete`, which removes the selected ACP history and checkpoint before releasing its live owner. If durable deletion fails, the live session remains available and the RPC returns an error. These two methods are not served by `zeroclaw acp`.
 
 ### `session/load` _(ZeroClaw extension)_
 
