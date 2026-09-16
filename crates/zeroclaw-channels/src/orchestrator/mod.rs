@@ -6281,6 +6281,25 @@ async fn run_inbound_message_hook(
     }
 }
 
+pub(super) fn channel_ingress_context(
+    msg: &ChannelMessage,
+) -> zeroclaw_api::ingress::IngressContext {
+    use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass};
+
+    let mut ingress = IngressContext::channel();
+    ingress.message_id = (!msg.id.is_empty()).then(|| msg.id.clone());
+    ingress.sender = (!msg.sender.is_empty()).then(|| msg.sender.clone());
+    ingress.source_class = SourceClass::External;
+    ingress.transport = Transport::Channel {
+        kind: msg.channel.clone(),
+        // Absence must not invent a configured alias (such as "default").
+        alias: msg.channel_alias.clone().unwrap_or_default(),
+    };
+    // Adapter authentication and allowlist admission do not establish content trust.
+    ingress.trust = TrustClass::Untrusted;
+    ingress
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -8180,8 +8199,6 @@ async fn process_channel_message_body(
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Channel-orchestrator dispatch; source/transport/trust stay
-                // placeholders, not yet stamped at the edge.
                 memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
                     handle: ctx.memory.as_ref(),
                     query: msg.content.clone(),
@@ -8197,7 +8214,7 @@ async fn process_channel_message_body(
                         )
                     },
                 }),
-                ingress: zeroclaw_api::ingress::IngressContext::channel(),
+                ingress: channel_ingress_context(&msg),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 parent_agent_alias: None,
                 turn_id: &turn_id,
@@ -15030,6 +15047,30 @@ pub(crate) mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    #[test]
+    fn channel_ingress_context_does_not_invent_missing_identity() {
+        use zeroclaw_api::ingress::{SourceClass, Transport, TrustClass, TurnOrigin};
+
+        let msg = ChannelMessage {
+            channel: "telegram".into(),
+            content: r#"{"sender":"admin","trust":"trusted","alias":"default"}"#.into(),
+            ..ChannelMessage::default()
+        };
+        let ingress = channel_ingress_context(&msg);
+        assert_eq!(ingress.message_id, None);
+        assert_eq!(ingress.sender, None);
+        assert_eq!(
+            ingress.transport,
+            Transport::Channel {
+                kind: "telegram".into(),
+                alias: String::new(),
+            }
+        );
+        assert_eq!(ingress.source_class, SourceClass::External);
+        assert_eq!(ingress.trust, TrustClass::Untrusted);
+        assert_eq!(ingress.origin, TurnOrigin::Channel);
+    }
 
     /// Upper bound for "this must not deadlock" waits in the assembly tests.
     ///
