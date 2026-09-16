@@ -879,8 +879,10 @@ async fn prepare_messages_inner(
         });
     }
 
-    // Apply age-based trimming when configured: strip images from user messages
-    // older than `max_image_turns` turns back from the end of history.
+    // Apply age-based trimming when configured: strip images from user
+    // messages older than `max_image_turns` real user turns back from the end
+    // of history. Prompt-mode tool-result carriers never count as turns and
+    // are never aged out here; the stale-tool rule above owns their lifetime.
     // `max_image_turns == 0` means disabled — no age trimming.
     let age_trimmed = if config.max_image_turns > 0 {
         let before = count_image_markers(&normalized_messages);
@@ -928,12 +930,18 @@ async fn prepare_messages_inner(
         messages: capped_messages,
     })
 }
+
+/// Strip image markers from user messages older than `max_turns` conversation
+/// turns, where a turn opens at a user message that is not a prompt-mode
+/// tool-result carrier. Carriers never advance the turn count and are never
+/// stripped here; the stale-tool rule and the post-normalization image cap
+/// govern their lifetime, as the `max_image_turns` schema doc documents.
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
-    // Count user messages from the end to find the cutoff index.
+    // Count real user turns from the end to find the cutoff index.
     let mut user_turn_count = 0usize;
     let mut cutoff = 0usize; // messages at index < cutoff are "too old"
     for (i, m) in messages.iter().enumerate().rev() {
-        if m.role == "user" {
+        if m.role == "user" && !is_prompt_tool_result_message(m) {
             user_turn_count += 1;
             if user_turn_count > max_turns {
                 // Everything up to and including this index is too old.
@@ -951,7 +959,7 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if i < cutoff && m.role == "user" {
+            if i < cutoff && m.role == "user" && !is_prompt_tool_result_message(m) {
                 let (cleaned, refs) = parse_image_markers(&m.content);
                 if refs.is_empty() {
                     return m.clone();
@@ -2730,6 +2738,154 @@ mod tests {
                 .contains("same-turn-prompt-tool-result.png")
         );
         assert!(prepared.messages[2].content.contains("Sunny, 25C"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_prompt_mode_tool_images_within_turn_under_age_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_image_path = temp.path().join("age-limit-user-attachment.png");
+        let tool_image_path = temp.path().join("age-limit-tool-result.png");
+        // Minimal valid PNG (1x1 RGB pixel).
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&user_image_path, png_data).unwrap();
+        std::fs::write(&tool_image_path, png_data).unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "Inspect the attached image, then check session information\n[IMAGE:{}]",
+                user_image_path.display()
+            )),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "image_tool", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_tool\">Generated [IMAGE:{}]</tool_result>",
+                tool_image_path.display()
+            )),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_session", "name": "session_info", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"session_info\">session id: abc-123</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_turns: 1,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("one user turn holding two carriers must not age the turn's images out");
+
+        assert!(
+            prepared.contains_images,
+            "the user's own image and the same-turn tool image must both survive the age limit"
+        );
+
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("Inspect the attached image, then check session information")
+        );
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[0]
+                .content
+                .contains("age-limit-user-attachment.png")
+        );
+        assert!(prepared.messages[2].content.contains("[Tool results]"));
+        assert!(prepared.messages[2].content.contains("Generated"));
+        assert!(
+            prepared.messages[2]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[2]
+                .content
+                .contains("age-limit-tool-result.png")
+        );
+        assert!(prepared.messages[4].content.contains("session id: abc-123"));
+    }
+
+    #[test]
+    fn trim_images_by_age_still_strips_real_user_images_past_the_limit() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/old/user-image.png]".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Done.".to_string(),
+            },
+            ChatMessage::user("Next question".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Answered.".to_string(),
+            },
+            ChatMessage::user("Follow-up".to_string()),
+        ];
+
+        let trimmed = trim_images_by_age(&messages, 1);
+
+        assert_eq!(trimmed[0].content, "[image removed from history]");
+        assert_eq!(trimmed[1].content, "Done.");
+        assert_eq!(trimmed[2].content, "Next question");
+        assert_eq!(trimmed[3].content, "Answered.");
+        assert_eq!(trimmed[4].content, "Follow-up");
+    }
+
+    #[test]
+    fn trim_images_by_age_ignores_prompt_mode_carriers_when_counting() {
+        let messages = vec![
+            ChatMessage::user("Inspect this screenshot.".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "On it.".to_string(),
+            },
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:/tmp/tool-image.png]</tool_result>"
+                    .to_string(),
+            ),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Checked.".to_string(),
+            },
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let trimmed = trim_images_by_age(&messages, 1);
+
+        assert_eq!(trimmed[0].content, messages[0].content);
+        assert_eq!(trimmed[2].content, messages[2].content);
+        assert_eq!(trimmed[4].content, messages[4].content);
     }
 
     #[test]
