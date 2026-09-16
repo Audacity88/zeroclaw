@@ -12078,10 +12078,10 @@ mod tests {
             .append_turn(
                 sid,
                 &[
-                    ConversationMessage::Chat(ChatMessage::user(&format!(
+                    ConversationMessage::Chat(ChatMessage::user(format!(
                         "{turn} question: continue the compatibility migration"
                     ))),
-                    ConversationMessage::Chat(ChatMessage::assistant(&format!(
+                    ConversationMessage::Chat(ChatMessage::assistant(format!(
                         "{turn} answer: keep the existing AST and add a compatibility \
                          shim; the shim is written and covers the mapping plus the \
                          streaming path, while the downstream migration remains \

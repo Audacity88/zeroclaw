@@ -3145,12 +3145,13 @@ mod tests {
     }
 
     #[test]
-    fn derived_slash_command_set_matches_expected_twelve_entries() {
+    fn derived_slash_command_set_matches_expected_entries() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
             "/browse",
             "/clear-queue",
+            "/compact-context",
             "/detach",
             "/help",
             "/model",
@@ -3158,6 +3159,7 @@ mod tests {
             "/new",
             "/new-session",
             "/restart-session",
+            "/restore-context",
             "/toggle-thinking",
         ];
         let registry = command_registry();
