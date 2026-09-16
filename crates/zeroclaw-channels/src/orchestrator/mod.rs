@@ -6427,7 +6427,12 @@ pub(super) fn channel_ingress_context(
 
     let mut ingress = IngressContext::channel();
     ingress.message_id = (!msg.id.is_empty()).then(|| msg.id.clone());
-    ingress.sender = (!msg.sender.is_empty()).then(|| msg.sender.clone());
+    let sender = msg
+        .platform_sender_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(&msg.sender);
+    ingress.sender = (!sender.is_empty()).then(|| sender.to_owned());
     ingress.source_class = SourceClass::External;
     ingress.transport = Transport::Channel {
         kind: msg.channel.clone(),
@@ -15310,6 +15315,29 @@ pub(crate) mod tests {
         assert_eq!(ingress.source_class, SourceClass::External);
         assert_eq!(ingress.trust, TrustClass::Untrusted);
         assert_eq!(ingress.origin, TurnOrigin::Channel);
+    }
+
+    #[test]
+    fn channel_ingress_context_falls_back_without_stable_sender() {
+        for platform_sender_id in [None, Some(String::new())] {
+            for sender in ["legacy_sender", ""] {
+                let msg = ChannelMessage {
+                    channel: "telegram".into(),
+                    platform_sender_id: platform_sender_id.clone(),
+                    sender: sender.into(),
+                    ..ChannelMessage::default()
+                };
+                let ingress = channel_ingress_context(&msg);
+                assert_eq!(
+                    ingress.sender.as_deref(),
+                    if sender.is_empty() {
+                        None
+                    } else {
+                        Some(sender)
+                    }
+                );
+            }
+        }
     }
 
     /// Upper bound for "this must not deadlock" waits in the assembly tests.

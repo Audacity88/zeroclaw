@@ -11310,13 +11310,15 @@ mod tests {
                 "message": {
                     "message_id": 33,
                     "text": text,
-                    "from": {"id": 555},
+                    "from": {"id": 555, "username": "display_sender"},
                     "chat": {"id": 12345}
                 }
             });
             let msg = channel
                 .parse_update_message(&update)
                 .expect("numeric allowlisted sender should be admitted");
+            assert_eq!(msg.sender, "display_sender");
+            assert_eq!(msg.platform_sender_id.as_deref(), Some("555"));
             let ingress = crate::orchestrator::channel_ingress_context(&msg);
             assert_eq!(ingress.message_id.as_deref(), Some("telegram_12345_33"));
             assert_eq!(ingress.sender.as_deref(), Some("555"));
