@@ -5051,7 +5051,7 @@ mod tests {
                         let deliver_file = request
                             .tools
                             .and_then(|tools| tools.iter().find(|tool| tool.name == "deliver_file"))
-                            .ok_or_else(|| anyhow::anyhow!("deliver_file was not offered"))?;
+                            .ok_or_else(|| anyhow::Error::msg("deliver_file was not offered"))?;
                         anyhow::ensure!(
                             deliver_file.parameters["required"].as_array().is_some_and(
                                 |required| required.iter().any(|value| value == "path")
