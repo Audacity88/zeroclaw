@@ -138,7 +138,7 @@ pub(crate) fn resolve_vision_provider(
                         "latest_user_resolvable_marker_count":
                             latest_user_resolvable_marker_count,
                     })),
-                "no vision route for carried-over/tool-result image marker(s); degrading to text-only (markers stripped)"
+                "no vision route for image marker(s) that are carried over, tool results, or unresolvable; degrading to text-only (markers stripped)"
             );
             degrade_strip_images = true;
             None
