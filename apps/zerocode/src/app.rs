@@ -547,6 +547,40 @@ impl ConversationDock {
     }
 }
 
+fn set_dock_plan_visible(
+    dock: &mut ConversationDock,
+    mode: Mode,
+    chat: &mut chat::Chat,
+    acp: &mut acp::Acp,
+    visible: bool,
+) -> DockAction {
+    dock.plan_visible = visible;
+    dock.clear_capture();
+    match mode {
+        Mode::Chat => chat.set_plan_visible(visible),
+        Mode::Acp => acp.set_plan_visible(visible),
+        _ => {}
+    }
+    DockAction::TogglePlan
+}
+
+fn apply_dock_plan_key_request(
+    dock: &mut ConversationDock,
+    mode: Mode,
+    chat: &mut chat::Chat,
+    acp: &mut acp::Acp,
+) -> Option<DockAction> {
+    let (requested, pane_visible) = match mode {
+        Mode::Chat => (chat.take_plan_toggle_request(), chat.plan_visible()),
+        Mode::Acp => (acp.take_plan_toggle_request(), acp.plan_visible()),
+        _ => return None,
+    };
+    requested.then(|| {
+        let visible = !(dock.plan_visible && pane_visible);
+        set_dock_plan_visible(dock, mode, chat, acp, visible)
+    })
+}
+
 fn persist_dock_action(dock: &ConversationDock, action: DockAction) -> anyhow::Result<bool> {
     match action {
         DockAction::ToggleSessions => {
@@ -715,6 +749,21 @@ impl PostPollDispatchState {
         } else {
             None
         }
+    }
+}
+
+/// Project cached session state only while the daemon connection is
+/// authoritative. A disconnect keeps session state available for reconnection,
+/// but externally visible terminal state must become neutral instead of
+/// advertising a cached working or blocked turn indefinitely.
+fn terminal_status_for_connection<'a>(
+    connection: &ConnectionState,
+    sessions: impl IntoIterator<Item = (Option<&'a crate::turn_status::TurnStatus>, Option<&'a str>)>,
+) -> (Option<&'a crate::turn_status::TurnStatus>, Option<&'a str>) {
+    if matches!(connection, ConnectionState::Disconnected { .. }) {
+        (None, None)
+    } else {
+        crate::osc_status::most_urgent(sessions)
     }
 }
 
@@ -1844,6 +1893,20 @@ pub async fn run(
             connected: !matches!(conn_state, ConnectionState::Disconnected { .. }),
         };
 
+        // Report whichever session most wants the operator, not whichever is
+        // visible: the terminal status exists to be read from outside this
+        // window, so it has to answer "does anything here need me?". Emitted
+        // before `term.draw` so the OSC write never lands inside a frame.
+        let mut terminal_candidates = chat_pane.terminal_statuses();
+        terminal_candidates.extend(acp_pane.terminal_statuses());
+        let (terminal_status, terminal_agent) = terminal_status_for_connection(
+            &conn_state,
+            terminal_candidates
+                .iter()
+                .map(|(status, agent)| (Some(status), Some(agent.as_str()))),
+        );
+        crate::osc_status::sync(terminal_status, terminal_agent);
+
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active
             // theme's background first so every pane inherits it. The
@@ -2391,6 +2454,11 @@ pub async fn run(
                 if quit {
                     break;
                 }
+                if let Some(action) =
+                    apply_dock_plan_key_request(&mut dock, mode, &mut chat_pane, &mut acp_pane)
+                {
+                    reload_status = dock_save_message(action, persist_dock_action(&dock, action));
+                }
                 match mode {
                     Mode::Acp if acp_pane.take_help_request() => {
                         help_overlay = Some(HelpOverlayState::default());
@@ -2482,6 +2550,16 @@ pub async fn run(
                         _ => {}
                     }
                     if let Some(action) = dock_action {
+                        if action == DockAction::TogglePlan {
+                            let visible = dock.plan_visible;
+                            set_dock_plan_visible(
+                                &mut dock,
+                                mode,
+                                &mut chat_pane,
+                                &mut acp_pane,
+                                visible,
+                            );
+                        }
                         if !dock.sessions_visible {
                             sidebar.close_picker();
                         }
@@ -3548,6 +3626,91 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn dock_plan_mouse_and_keyboard_share_visibility() {
+        let area = Rect::new(0, 0, 120, 40);
+        for mode in [Mode::Chat, Mode::Acp] {
+            let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+            let client = Arc::new(RpcClient::with_rpc(Arc::new(
+                crate::jsonrpc::RpcOutbound::new(tx),
+            )));
+            let mut chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+            let mut acp = acp::Acp::new(client);
+            chat.activate_session_for_test("chat-session");
+            acp.activate_session_for_test("code-session");
+            let mut dock = test_dock();
+            set_dock_plan_visible(&mut dock, mode, &mut chat, &mut acp, true);
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(area),
+                },
+            )
+            .unwrap();
+            let key = KeyEvent::new(
+                KeyCode::Char('p'),
+                crate::keymap::Chord::primary('p').effective_modifiers(),
+            );
+
+            // Mouse close, keyboard reopen, keyboard close, mouse reopen.
+            for expected in [false, true] {
+                let layout = dock.layout(area, mode, true);
+                let target = if expected {
+                    layout.toggles[2]
+                } else {
+                    layout.close[2]
+                };
+                let (_, action) = dock.handle_mouse(&dock_mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    target.x,
+                    target.y,
+                ));
+                assert_eq!(action, Some(DockAction::TogglePlan));
+                let visible = dock.plan_visible;
+                set_dock_plan_visible(&mut dock, mode, &mut chat, &mut acp, visible);
+                assert_eq!(visible, expected);
+                for _ in 0..2 {
+                    match mode {
+                        Mode::Chat => {
+                            chat.handle_key(key, &mut term).await;
+                        }
+                        Mode::Acp => {
+                            acp.handle_key(key, &mut term).await;
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(
+                        apply_dock_plan_key_request(&mut dock, mode, &mut chat, &mut acp),
+                        Some(DockAction::TogglePlan)
+                    );
+                    let pane_visible = match mode {
+                        Mode::Chat => chat.plan_visible(),
+                        Mode::Acp => acp.plan_visible(),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(dock.plan_visible, pane_visible);
+                    assert_eq!(
+                        dock.layout(area, mode, pane_visible).plan.is_some(),
+                        pane_visible
+                    );
+                }
+            }
+            // A persisted hidden dock can coexist with a newly visible session.
+            dock.plan_visible = false;
+            match mode {
+                Mode::Chat => {
+                    chat.handle_key(key, &mut term).await;
+                }
+                Mode::Acp => {
+                    acp.handle_key(key, &mut term).await;
+                }
+                _ => unreachable!(),
+            }
+            assert!(apply_dock_plan_key_request(&mut dock, mode, &mut chat, &mut acp).is_some());
+            assert!(dock.plan_visible);
+        }
+    }
+
     #[test]
     fn dock_close_reopen_only_changes_the_selected_section() {
         let area = Rect::new(0, 0, 120, 40);
@@ -3723,6 +3886,46 @@ mod tests {
             dock.layout(Rect::new(0, 0, 120, 40), Mode::Chat, false);
             assert!(dock.capture.is_none());
         }
+    }
+
+    #[test]
+    fn disconnected_terminal_projection_is_neutral() {
+        let working = crate::turn_status::TurnStatus::Working;
+        let blocked = crate::turn_status::TurnStatus::WaitingForApproval;
+        let disconnected = ConnectionState::Disconnected {
+            reason: "test disconnect".to_string(),
+        };
+
+        let (status, agent) = terminal_status_for_connection(
+            &disconnected,
+            [
+                (Some(&working), Some("chat")),
+                (Some(&blocked), Some("code")),
+            ],
+        );
+
+        assert!(status.is_none());
+        assert!(agent.is_none());
+    }
+
+    #[test]
+    fn connected_terminal_projection_keeps_urgent_session() {
+        let working = crate::turn_status::TurnStatus::Working;
+        let blocked = crate::turn_status::TurnStatus::WaitingForApproval;
+
+        let (status, agent) = terminal_status_for_connection(
+            &ConnectionState::Connected,
+            [
+                (Some(&working), Some("chat")),
+                (Some(&blocked), Some("code")),
+            ],
+        );
+
+        assert!(matches!(
+            status,
+            Some(crate::turn_status::TurnStatus::WaitingForApproval)
+        ));
+        assert_eq!(agent, Some("code"));
     }
 
     #[tokio::test]

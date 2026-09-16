@@ -34,6 +34,10 @@ impl Acp {
         self.inner.commit_reconnect_handoff();
     }
 
+    pub(crate) fn terminal_statuses(&self) -> Vec<(crate::turn_status::TurnStatus, String)> {
+        self.inner.terminal_statuses()
+    }
+
     pub(crate) fn session_summaries(&self) -> Vec<chat::SidebarSessionSummary> {
         self.inner.session_summaries()
     }
@@ -126,6 +130,14 @@ impl Acp {
 
     pub(crate) fn plan_visible(&self) -> bool {
         self.inner.plan_visible()
+    }
+
+    pub(crate) fn set_plan_visible(&mut self, visible: bool) {
+        self.inner.set_plan_visible(visible);
+    }
+
+    pub(crate) fn take_plan_toggle_request(&mut self) -> bool {
+        self.inner.take_plan_toggle_request()
     }
 
     pub(crate) async fn handle_key(

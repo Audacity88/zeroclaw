@@ -310,6 +310,7 @@ pub(crate) struct Chat {
     /// One-shot app-level Help request, set by the `/help` slash command and
     /// drained immediately by `app.rs` after this pane handles the key.
     help_requested: bool,
+    plan_toggle_requested: bool,
     /// Owns the Chat-only entry retry so leaving the pane invalidates its result.
     entry_retry_attempt: Option<EntryRetryAttempt>,
     /// A temporary retry borrows retained queues until the resident pane adopts
@@ -556,6 +557,7 @@ impl Chat {
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
             help_requested: false,
+            plan_toggle_requested: false,
             entry_retry_attempt: None,
             entry_retry_preparing: false,
             entry_retry_session_ownership: None,
@@ -682,6 +684,20 @@ impl Chat {
 
     /// One summary per tracked session, in stable creation order, for the
     /// agent sidebar. Cheap: derives from live state, owns nothing.
+    /// Terminal status candidates for every live session this pane tracks,
+    /// focused or not, paired with the owning agent alias. Background sessions
+    /// keep draining transport events each tick, so their state is current.
+    pub(crate) fn terminal_statuses(&self) -> Vec<(TurnStatus, String)> {
+        let mut out = Vec::with_capacity(self.background.len() + 1);
+        if let ChatPhase::Active(state) = &self.phase {
+            out.push((state.terminal_status(), state.agent_alias.clone()));
+        }
+        for state in &self.background {
+            out.push((state.terminal_status(), state.agent_alias.clone()));
+        }
+        out
+    }
+
     pub(crate) fn session_summaries(&self) -> Vec<SidebarSessionSummary> {
         let active = match &self.phase {
             ChatPhase::Active(state) => Some(state.as_ref()),
@@ -3639,12 +3655,7 @@ impl Chat {
                 state.mark_dirty_full();
             }
             Some(ChatTabAction::TodoToggle) => {
-                state.todo_tracker.toggle();
-                #[cfg(test)]
-                {
-                    state.todo_close_hit_rect = None;
-                }
-                state.mark_dirty_full();
+                self.plan_toggle_requested = true;
             }
             Some(ChatTabAction::BrowseEnter) => {
                 if state.in_browse_mode() {
@@ -4672,6 +4683,19 @@ impl Chat {
             &self.phase,
             ChatPhase::Active(state) if state.todo_tracker.is_visible()
         )
+    }
+
+    pub(crate) fn set_plan_visible(&mut self, visible: bool) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            if state.todo_tracker.is_visible() != visible {
+                state.todo_tracker.toggle();
+            }
+            state.mark_dirty_full();
+        }
+    }
+
+    pub(crate) fn take_plan_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.plan_toggle_requested)
     }
 
     /// Whether the active chat session is in browse mode.
@@ -9503,6 +9527,23 @@ impl ChatState {
     /// running (the turn is still winding down); a pending elicitation
     /// counts only when it targets this session (defense against a stale
     /// modal surviving a session switch).
+    /// Terminal-facing turn status. An operator wait outranks whatever the
+    /// turn was doing, so the terminal reads as blocked while a prompt is up
+    /// and returns to the turn's own state once it is answered.
+    pub(crate) fn terminal_status(&self) -> TurnStatus {
+        if self
+            .pending_elicitation
+            .as_ref()
+            .is_some_and(|e| e.session_id == self.session_id)
+        {
+            TurnStatus::WaitingForInput
+        } else if self.pending_approval.is_some() {
+            TurnStatus::WaitingForApproval
+        } else {
+            self.turn_status.clone()
+        }
+    }
+
     pub(crate) fn sidebar_status(&self) -> SidebarStatus {
         if self.last_error.is_some() {
             SidebarStatus::Errored
@@ -10315,6 +10356,10 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
+    // The editor owned the terminal and may have set its own title, so the
+    // cached view of it is no longer true. Without this the next sync dedupes
+    // against a value the terminal no longer shows and never corrects it.
+    crate::osc_status::invalidate();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
@@ -10443,6 +10488,8 @@ mod tests {
                 )
                 .await
         );
+        assert!(chat.take_plan_toggle_request());
+        chat.set_plan_visible(false);
         let ChatPhase::Active(state) = &mut chat.phase else {
             unreachable!()
         };
@@ -10466,6 +10513,8 @@ mod tests {
                 )
                 .await
         );
+        assert!(chat.take_plan_toggle_request());
+        chat.set_plan_visible(true);
         let ChatPhase::Active(state) = &chat.phase else {
             unreachable!()
         };

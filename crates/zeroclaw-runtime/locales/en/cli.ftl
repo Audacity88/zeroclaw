@@ -957,6 +957,8 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-failed = [turn failed]
+turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn
@@ -993,6 +995,7 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large t
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
+channel-runtime-conversation-busy = This conversation has too many pending messages; this one was dropped. Wait for a reply, or send /stop to clear your queued requests.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
@@ -1249,6 +1252,17 @@ channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-not-accepted = Approval not accepted
 channel-telegram-approval-ack-unknown = Unknown action
 channel-telegram-approval-ack-already-resolved = Approval already resolved
+channel-telegram-model-picker-provider-title = Current: { $provider } / { $model }
+    Choose a provider:
+channel-telegram-model-picker-model-title = Choose a model from { $provider }:
+channel-telegram-model-picker-previous = ◀ Previous
+channel-telegram-model-picker-next = Next ▶
+channel-telegram-model-picker-back = ◀ Back
+channel-telegram-model-picker-cancel = Cancel
+channel-telegram-model-picker-cancelled = Cancelled
+channel-telegram-model-picker-queued = Switching model…
+channel-telegram-model-picker-rejected = This model picker is no longer valid.
+channel-telegram-model-picker-unavailable = Model switching is temporarily unavailable. Try again.
 channel-telegram-voice-drop-too-long = ⚠️ Audio message skipped: it is longer than the { $limit_secs }s limit. Send a shorter recording or split it into parts.
 channel-telegram-voice-drop-file-unavailable = ⚠️ Audio message skipped: the file could not be retrieved from Telegram — it may be too large or no longer available. Please try a smaller or shorter file.
 channel-telegram-voice-drop-empty-transcript = ⚠️ Audio message skipped: nothing could be recognized in the recording. Please try again with a clearer recording.
