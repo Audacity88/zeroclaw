@@ -47,11 +47,6 @@ pub enum SessionQueueError {
     QueueFull { session_id: String, depth: usize },
     /// Timed out waiting for the session lock.
     Timeout { session_id: String },
-    /// Fail-fast admission: the session is busy (a holder or a registered
-    /// waiter exists), so an idle-only caller must not queue behind it.
-    /// Returned by [`SessionActorQueue::try_acquire_idle`]; never produced by
-    /// the waiting [`SessionActorQueue::acquire`].
-    Busy { session_id: String },
 }
 
 impl std::fmt::Display for SessionQueueError {
@@ -65,12 +60,6 @@ impl std::fmt::Display for SessionQueueError {
             }
             Self::Timeout { session_id } => {
                 write!(f, "Timed out waiting for session {session_id}")
-            }
-            Self::Busy { session_id } => {
-                write!(
-                    f,
-                    "Session {session_id} is busy (idle-only admission refused)"
-                )
             }
         }
     }
@@ -150,8 +139,8 @@ impl SessionActorQueue {
     /// Fail-fast, idle-only admission for manual session operations.
     ///
     /// Admits only when the session is currently idle AND no other request is
-    /// registered (holding or waiting) for it. Busy is a typed
-    /// [`SessionQueueError::Busy`] result — this never queues the caller
+    /// registered (holding or waiting) for it. Returns `None` when busy;
+    /// this never queues the caller
     /// behind a running turn, and never barges ahead of a waiter that already
     /// registered on the semaphore.
     ///
@@ -162,14 +151,7 @@ impl SessionActorQueue {
     /// no holder and no waiter: the semaphore permit is then taken with
     /// `try_acquire_owned` under the same lock, so a request that registers
     /// afterwards queues behind this admission instead of racing it.
-    pub async fn try_acquire_idle(
-        &self,
-        session_id: &str,
-    ) -> Result<SessionGuard, SessionQueueError> {
-        let busy = || SessionQueueError::Busy {
-            session_id: session_id.to_string(),
-        };
-
+    pub async fn try_acquire_idle(&self, session_id: &str) -> Option<SessionGuard> {
         let mut slots = self.slots.lock().await;
         let slot = slots
             .entry(session_id.to_string())
@@ -204,7 +186,7 @@ impl SessionActorQueue {
         let current = slot.pending.fetch_add(1, Ordering::Relaxed);
         if current > 0 {
             drop(registration);
-            return Err(busy());
+            return None;
         }
 
         // current == 0: no other registration exists. The permit can still be
@@ -215,14 +197,14 @@ impl SessionActorQueue {
             Ok(permit) => {
                 *slot.last_active.lock().await = Instant::now();
                 drop(slots);
-                Ok(SessionGuard {
+                Some(SessionGuard {
                     _permit: permit,
                     _registration: registration,
                 })
             }
             Err(_) => {
                 drop(registration);
-                Err(busy())
+                None
             }
         }
     }
@@ -413,7 +395,7 @@ mod tests {
         let guard = queue.acquire("s1").await.unwrap();
 
         let result = queue.try_acquire_idle("s1").await;
-        assert!(matches!(result, Err(SessionQueueError::Busy { .. })));
+        assert!(result.is_none());
         // Fail-fast must not leave a phantom registration behind.
         assert_eq!(queue.queue_depth("s1").await, 1);
 
@@ -435,10 +417,7 @@ mod tests {
         }
 
         // Idle-only admission must refuse while a waiter is registered.
-        assert!(matches!(
-            queue.try_acquire_idle("s1").await,
-            Err(SessionQueueError::Busy { .. })
-        ));
+        assert!(queue.try_acquire_idle("s1").await.is_none());
 
         // Releasing the holder hands the session to the registered waiter,
         // not to the refused admission.

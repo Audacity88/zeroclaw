@@ -1734,7 +1734,7 @@ impl RpcDispatcher {
         // Projected resume read: originals plus the active compaction
         // checkpoint (if any) in one snapshot, so the resumed Agent and a
         // later rehydration select the same committed projection.
-        let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpProjectedRestore> =
+        let mut preloaded_acp: Option<Box<zeroclaw_infra::acp_session_store::AcpProjectedRestore>> =
             None;
         if resuming
             && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
@@ -1995,7 +1995,7 @@ impl RpcDispatcher {
         }
 
         enum AcpSessionNewLoad {
-            Restored(zeroclaw_infra::acp_session_store::AcpProjectedRestore),
+            Restored(Box<zeroclaw_infra::acp_session_store::AcpProjectedRestore>),
             Created,
             Killed,
         }
@@ -3151,7 +3151,12 @@ impl RpcDispatcher {
                 .ctx
                 .acp_session_store
                 .as_ref()
-                .and_then(|store| store.load_session(&req.session_id).ok().flatten())
+                .and_then(|store| {
+                    store
+                        .load_session_transcript(&req.session_id)
+                        .ok()
+                        .flatten()
+                })
                 .map(|data| conversation_message_entries(&data.messages).len()),
             crate::rpc::types::ChatMode::Chat => self
                 .ctx
@@ -12400,6 +12405,21 @@ mod tests {
         // appending the summary back into originals.
         let transcript = acp_store.load_session_transcript(sid).unwrap().unwrap();
         assert_eq!(transcript.messages.len(), 8, "one new turn of two rows");
+        let mut terminal_count = None;
+        while let Ok(raw) = rx.try_recv() {
+            let notification: Value = serde_json::from_str(&raw).unwrap();
+            if notification["method"] == "session/update"
+                && notification["params"]["type"] == "turn_complete"
+                && notification["params"]["session_id"] == sid
+            {
+                terminal_count = notification["params"]["message_count"].as_u64();
+            }
+        }
+        assert_eq!(
+            terminal_count,
+            Some(8),
+            "terminal count must include retained originals"
+        );
         assert!(
             transcript
                 .messages
@@ -12957,10 +12977,7 @@ mod tests {
         // The settlement still owns admission while the model call is
         // gated: idle-only admission must observe a busy session.
         assert!(
-            matches!(
-                sessions.session_queue.try_acquire_idle(sid).await,
-                Err(zeroclaw_infra::session_queue::SessionQueueError::Busy { .. })
-            ),
+            sessions.session_queue.try_acquire_idle(sid).await.is_none(),
             "aborting the response task must not release admission mid-operation"
         );
 
@@ -12969,7 +12986,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
             loop {
                 let committed = store_has_active_checkpoint(&acp_store, sid, "op-abort-1");
-                if committed && sessions.session_queue.try_acquire_idle(sid).await.is_ok() {
+                if committed && sessions.session_queue.try_acquire_idle(sid).await.is_some() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;

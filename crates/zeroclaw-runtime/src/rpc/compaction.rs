@@ -42,7 +42,7 @@ use zeroclaw_infra::acp_session_store::{
     CompactionDeactivationOutcome, CompactionSourceError, TerminalRangeKind,
     select_compaction_source,
 };
-use zeroclaw_infra::session_queue::{SessionGuard, SessionQueueError};
+use zeroclaw_infra::session_queue::SessionGuard;
 
 /// Checkpoint format version. Bump when the row's meaning changes in a way
 /// older readers cannot honor.
@@ -304,13 +304,12 @@ async fn admit_session(
         .session_queue
         .try_acquire_idle(session_id)
         .await
-        .map_err(|error| match error {
-            SessionQueueError::Busy { .. } => rpc_err(
+        .ok_or_else(|| {
+            rpc_err(
                 SESSION_BUSY,
                 "Session is busy with a running or queued turn; try compacting context \
                  when it is idle",
-            ),
-            error => rpc_err(SESSION_BUSY, format!("Session busy: {error}")),
+            )
         })?;
 
     // A resume may have rebound ownership while we acquired admission.

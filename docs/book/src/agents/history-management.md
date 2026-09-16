@@ -104,13 +104,13 @@ can trigger the runtime's reactive token-budget trim.
 
 Trimming drops history without describing what was dropped. Manual context compaction is the explicit, user-invoked alternative for native ZeroCode Code sessions (`chat_mode = "acp"`, the `zerocode_code` interaction surface): it summarizes a contiguous prefix of older completed turns into one bounded continuity summary while retaining the original transcript.
 
-The commands are local to the ZeroCode Code pane: `/compact-context` runs one manual compaction, `/restore-context` deactivates the active checkpoint. There is no automatic trigger, no ordinary-Chat or channel rollout, and no external ACP agent exposure. The daemon refuses the operation on a busy session with a typed busy result — it never queues behind a running turn and never cancels one.
+The commands are local to the ZeroCode Code pane: `/compact-context` runs one manual compaction, `/restore-context` deactivates the active checkpoint. There is no automatic trigger, no ordinary-Chat or channel rollout, and no external ACP agent exposure. The daemon refuses the operation on a busy session with a typed busy result; it never queues behind a running turn and never cancels one.
 
 ### What may be covered
 
 Coverage is certified by durable terminal ranges, not inferred. Every terminal append (turn finalization, failed-turn persistence, interrupted-turn recovery) records, in the same transaction, the span of message rows it settled and how the turn ended: `completed`, `failed`, or `interrupted`. Compaction may cover only:
 
-- a contiguous run of **completed** ranges starting at the session's first message row. Legacy rows with no range, interrupted turns, failed turns, and ambiguous or unpaired tool exchanges are refused with a typed, user-explainable error — never silently certified or repaired into coverage;
+- a contiguous run of **completed** ranges starting at the session's first message row. Legacy rows with no range, interrupted turns, failed turns, and ambiguous or unpaired tool exchanges are refused with a typed, user-explainable error, never silently certified or repaired into coverage;
 - a prefix that **excludes the newest completed turn**, which is always retained together with everything after it.
 
 Row-id adjacency is session-local: `acp_messages` ids are global, so another session's rows can sit numerically between this session's turns without affecting coverage.
@@ -119,7 +119,7 @@ Row-id adjacency is session-local: `acp_messages` ids are global, so another ses
 
 `/compact-context` runs while the session is idle (fail-fast, non-barging admission) and uses the admitted Agent's existing routed provider and model for exactly one bounded, no-tool summarization request under the agent's effective context budget. The request includes the original covered turns verbatim; the runtime refuses the result if the model returns tool calls, empty text, oversized output, a summary whose framed provider-message form would not usefully shrink the projection, or a projection that exceeds the live message-count limit. Provider retry policy may still make several HTTP attempts inside the one logical operation.
 
-Before the durable commit, every failure — cancellation, timeout, provider refusal, stale source, no useful savings — leaves the prior projection untouched. The commit is one SQLite write transaction that rechecks the session incarnation, kill state, in-flight turns, exact source identity, and the prior active checkpoint, so a stale request can never overwrite a later operation.
+Before the durable commit, every failure (cancellation, timeout, provider refusal, stale source, no useful savings) leaves the prior projection untouched. The commit is one SQLite write transaction that rechecks the session incarnation, kill state, in-flight turns, exact source identity, and the prior active checkpoint, so a stale request can never overwrite a later operation.
 
 ### The projection
 
@@ -129,7 +129,7 @@ Both explicit native resume and lazy rehydration seed from the same projected re
 
 ### Restore and recompaction
 
-`/restore-context` deactivates the checkpoint and rebuilds the projection from retained originals plus every turn appended after the compaction, subject to the ordinary visible limits. It never rewinds the conversation, reruns tools, or reverses files and external effects. A later `/compact-context` recomputes its coverage from the originals — never from the previous summary.
+`/restore-context` deactivates the checkpoint and rebuilds the projection from retained originals plus every turn appended after the compaction, subject to the ordinary visible limits. It never rewinds the conversation, reruns tools, or reverses files and external effects. A later `/compact-context` recomputes its coverage from the originals, never from the previous summary.
 
 Operation ids make retries idempotent: a retry of a committed compaction is recognized (`already_committed`) without a second model operation, and an old compact retry whose checkpoint was already restored or superseded reports `superseded` without touching the current projection. Restore is likewise fenced: a stale restore cannot deactivate a checkpoint a later compaction installed.
 

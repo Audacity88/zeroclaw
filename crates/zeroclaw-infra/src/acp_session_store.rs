@@ -201,7 +201,7 @@ pub struct AcpProjectedRestore {
 pub enum AcpSessionRestoreProjection {
     Missing,
     Killed,
-    Projected(AcpProjectedRestore),
+    Projected(Box<AcpProjectedRestore>),
 }
 
 /// Selected contiguous known-completed prefix coverage for a compaction.
@@ -2119,7 +2119,7 @@ impl AcpSessionStore {
         tx.commit()
             .context("Failed to close projected restore read")?;
 
-        Ok(AcpSessionRestoreProjection::Projected(
+        Ok(AcpSessionRestoreProjection::Projected(Box::new(
             AcpProjectedRestore {
                 data: AcpSessionData {
                     session_uuid: session_uuid.to_string(),
@@ -2137,7 +2137,7 @@ impl AcpSessionStore {
                 message_rows,
                 checkpoint,
             },
-        ))
+        )))
     }
 
     /// Validate that the terminal ranges exactly tile the span
@@ -3828,7 +3828,7 @@ mod tests {
                 session,
                 &[
                     ConversationMessage::Chat(ChatMessage::user(turn)),
-                    ConversationMessage::Chat(ChatMessage::assistant(&format!("answer to {turn}"))),
+                    ConversationMessage::Chat(ChatMessage::assistant(format!("answer to {turn}"))),
                 ],
             )
             .unwrap();
@@ -3848,7 +3848,7 @@ mod tests {
 
     fn projected_for_test(restore: AcpSessionRestoreProjection) -> AcpProjectedRestore {
         match restore {
-            AcpSessionRestoreProjection::Projected(projected) => projected,
+            AcpSessionRestoreProjection::Projected(projected) => *projected,
             AcpSessionRestoreProjection::Missing | AcpSessionRestoreProjection::Killed => {
                 panic!("expected projected restore, got Missing or Killed")
             }
