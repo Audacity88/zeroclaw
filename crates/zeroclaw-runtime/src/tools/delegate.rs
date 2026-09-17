@@ -3506,7 +3506,14 @@ impl DelegateTool {
                 )),
             });
         };
-        let approval_manager = Some(ApprovalManager::for_non_interactive(target_risk_profile));
+        let approval_manager = Some(match target_mode {
+            DelegateExecutionMode::Bounded => {
+                ApprovalManager::for_bounded_non_interactive(target_risk_profile)
+            }
+            DelegateExecutionMode::Independent => {
+                ApprovalManager::for_non_interactive(target_risk_profile)
+            }
+        });
         // Deferred-MCP side-channels for an INDEPENDENT target: its sub-agent turn must
         // inject the deferred-tools prompt section and thread the activated set, exactly as
         // a fresh target turn does. Bounded delegation leaves these empty (it starts from
@@ -5288,6 +5295,8 @@ mod tests {
     }
 
     struct ApprovalProbeModelProvider {
+        tool_name: &'static str,
+        tool_arguments: String,
         tool_messages: std::sync::Mutex<Vec<String>>,
     }
 
@@ -5329,8 +5338,8 @@ mod tests {
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "approval_probe".to_string(),
-                    name: "echo_tool".to_string(),
-                    arguments: "{\"value\":\"probe\"}".to_string(),
+                    name: self.tool_name.to_string(),
+                    arguments: self.tool_arguments.clone(),
                     extra_content: None,
                 }],
                 usage: None,
@@ -7013,6 +7022,8 @@ mod tests {
         let config = agentic_agent_config();
         let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = ApprovalProbeModelProvider {
+            tool_name: "echo_tool",
+            tool_arguments: "{\"value\":\"probe\"}".to_string(),
             tool_messages: std::sync::Mutex::new(Vec::new()),
         };
         let mut profiles = agentic_risk_profiles(vec!["echo_tool".to_string()]);
@@ -7160,6 +7171,83 @@ mod tests {
             messages
                 .iter()
                 .any(|message| message.contains("echo:probe"))
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn bounded_full_target_cannot_approve_inherited_caller_shell_command() {
+        use crate::tools::shell::ShellTool;
+
+        let workspace = TempDir::new().unwrap();
+        let marker = workspace.path().join("approval-probe.txt");
+        let command = "touch approval-probe.txt";
+        let shell_security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            allowed_commands: vec!["touch".to_string()],
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let shell = Arc::new(ShellTool::new(
+            shell_security,
+            Arc::new(NativeRuntime::new()),
+        ));
+        let mut profiles = agentic_risk_profiles(vec!["shell".to_string()]);
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        let tool = DelegateTool::new(HashMap::new(), None, security_allowing())
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_runtime(Arc::new(NativeRuntime::new()))
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(vec![shell])));
+        let provider = ApprovalProbeModelProvider {
+            tool_name: "shell",
+            tool_arguments: serde_json::json!({
+                "command": command,
+                "approved": true,
+            })
+            .to_string(),
+            tool_messages: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &agentic_agent_config(),
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "child should finish after shell refusal: {result:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "caller-owned shell command must not execute"
+        );
+        let messages = provider.tool_messages.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message
+                    .contains("Command requires explicit approval (approved=true)")),
+            "caller command policy must receive approved=false: {messages:?}"
         );
     }
 
