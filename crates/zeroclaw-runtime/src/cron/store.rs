@@ -1878,7 +1878,6 @@ fn with_existing_initialized_connection<T>(
             db_path.display().to_string()
         )
     })?;
-
     initialize_schema(&conn)?;
 
     f(&conn).map(Some)
@@ -1910,7 +1909,6 @@ fn with_initialized_connection<T>(
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
-
     initialize_schema(&conn)?;
 
     f(&conn)
@@ -1981,7 +1979,41 @@ fn apply_run_completion_state(
     Ok(())
 }
 
+/// Prepare a freshly opened connection: pragmas, schema, and every required
+/// recovery and data migration. Store operations run only after this
+/// returns `Ok`, so a failure here — including lock contention that
+/// outlasts the busy window in ANY phase — refuses the operation before it
+/// starts rather than letting it run against an incompletely recovered or
+/// migrated database.
 fn initialize_schema(conn: &Connection) -> Result<()> {
+    apply_schema_and_migrations(conn).map_err(|err| {
+        let contended = err
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+            .any(is_lock_contention);
+        if contended {
+            err.context(MIGRATION_CONTENTION_CONTEXT)
+        } else {
+            err
+        }
+    })
+}
+
+fn apply_schema_and_migrations(conn: &Connection) -> Result<()> {
+    // Wait for a competing writer instead of failing on first contention,
+    // and WAL so readers never block a migration commit — as the SOP, task,
+    // cert, and ACP stores do. Unlike them, synchronous stays FULL: a commit
+    // lost to power failure here can re-run a one-shot job's side effect or
+    // resurrect a removed job, so cron keeps the pre-WAL durability.
+    // Set before recovery below so its write transactions are covered too;
+    // contention that outlasts the busy window fails the open closed.
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = FULL;",
+    )
+    .context("Failed to set cron DB connection pragmas")?;
+
     // Before anything references cron_runs: in the between-DROP-and-RENAME
     // state an interrupted (predecessor, non-atomic) rebuild leaves behind,
     // the stranded working table is the ONLY holder of the run history, and
@@ -2109,10 +2141,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// True when SQLite reports lock contention with another connection. The
-/// one-time migration and recovery paths treat it as "another process is
-/// doing this work": their bodies are idempotent and re-run on the next
-/// open, so deferring beats failing the caller's cron operation.
+/// True when SQLite reports lock contention with another connection.
 fn is_lock_contention(err: &rusqlite::Error) -> bool {
     matches!(
         err,
@@ -2122,15 +2151,22 @@ fn is_lock_contention(err: &rusqlite::Error) -> bool {
     )
 }
 
-/// Begin an IMMEDIATE transaction (write lock taken up front, so no
-/// deferred read-to-write upgrade that SQLite refuses to retry), or `None`
-/// on lock contention.
-fn begin_immediate(conn: &Connection) -> Result<Option<Transaction<'_>>> {
-    match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
-        Ok(tx) => Ok(Some(tx)),
-        Err(e) if is_lock_contention(&e) => Ok(None),
-        Err(e) => Err(e).context("Failed to begin cron migration transaction"),
-    }
+/// Context added at the `initialize_schema` boundary when lock contention
+/// defeated any preparation phase: the caller's operation was refused
+/// before it started and is safe to retry once the competing writer
+/// finishes.
+const MIGRATION_CONTENTION_CONTEXT: &str = concat!(
+    "cron database is locked by another process while required recovery or migration is ",
+    "incomplete; the operation was not started and can be retried"
+);
+
+/// Begin an IMMEDIATE transaction for a recovery or migration write: the
+/// write lock is taken up front, so the busy timeout applies to acquiring
+/// it — unlike a deferred transaction's read-to-write upgrade, which SQLite
+/// fails immediately without consulting the busy handler.
+fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .with_context(|| format!("Failed to begin cron {phase} transaction"))
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
@@ -2149,11 +2185,21 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 /// committed or the migration re-runs on the next open.
 const OWNER_MIGRATION_COMPLETE: i64 = 1;
 
+/// Whether the ownership data migration's completion marker is recorded.
+fn owner_migration_complete(conn: &Connection) -> Result<bool> {
+    let migrated: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("Failed to read cron DB migration marker")?;
+    Ok(migrated >= OWNER_MIGRATION_COMPLETE)
+}
+
 /// One-time ownership migration for rows written before the cleanup owner
 /// existed, gated on the persisted completion marker so no per-open scan
 /// is paid afterwards. The body is idempotent (it touches only NULL-owner
-/// rows), so an interrupted or concurrent attempt simply re-runs to
-/// completion on a later open.
+/// rows), so an interrupted attempt re-runs to completion on a later open.
+/// Contention past the busy timeout fails the open: an operation is never
+/// authorized against a database whose ownership migration has not
+/// provably completed.
 ///
 /// A NULL-owner row whose job is LIVE has an unambiguous current owner:
 /// the job row itself (renames update it). Stamp those. A NULL-owner row
@@ -2164,16 +2210,16 @@ const OWNER_MIGRATION_COMPLETE: i64 = 1;
 /// cascade. They can still be removed by job id through remove_job, and a
 /// declarative id being reassigned purges them before the new job exists.
 fn run_owner_migration(conn: &Connection) -> Result<()> {
-    let migrated: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .context("Failed to read cron DB migration marker")?;
-    if migrated >= OWNER_MIGRATION_COMPLETE {
+    if owner_migration_complete(conn)? {
         return Ok(());
     }
 
-    let Some(tx) = begin_immediate(conn)? else {
+    let tx = begin_immediate(conn, "ownership migration")?;
+    // Re-checked under the write lock: a concurrent open may have
+    // completed the migration while we waited for the transaction.
+    if owner_migration_complete(&tx)? {
         return Ok(());
-    };
+    }
     // A fresh database — and one whose rows were all stamped at insert —
     // has nothing to migrate: skip the scans and just record completion.
     let needs_data_pass: bool = tx
@@ -2199,11 +2245,8 @@ fn run_owner_migration(conn: &Connection) -> Result<()> {
     }
     tx.execute_batch(&format!("PRAGMA user_version = {OWNER_MIGRATION_COMPLETE}"))
         .context("Failed to record the ownership migration marker")?;
-    match tx.commit() {
-        Ok(()) => {}
-        Err(e) if is_lock_contention(&e) => return Ok(()),
-        Err(e) => return Err(e).context("Failed to commit the ownership migration"),
-    }
+    tx.commit()
+        .context("Failed to commit the ownership migration")?;
 
     if needs_data_pass {
         warn_if_quarantined(conn)?;
@@ -2252,24 +2295,22 @@ fn warn_if_quarantined(conn: &Connection) -> Result<()> {
 /// migrations instead, where the live table is guaranteed to carry every
 /// stranded column.
 fn recover_stranded_cron_runs_table(conn: &Connection) -> Result<()> {
-    if !table_exists(conn, "cron_runs_no_fk")? {
+    // Only the sole-working-table state is this phase's to lock for; the
+    // beside-table state belongs to the later merge.
+    if !table_exists(conn, "cron_runs_no_fk")? || table_exists(conn, "cron_runs")? {
         return Ok(());
     }
-    let Some(tx) = begin_immediate(conn)? else {
-        return Ok(());
-    };
+    let tx = begin_immediate(conn, "stranded-table rename recovery")?;
     // Re-checked under the write lock: a concurrent open may have finished
-    // the recovery between the probe above and here.
+    // the recovery between the probe above and here — a verified
+    // completion, unlike contention, which fails the open.
     if !table_exists(&tx, "cron_runs_no_fk")? || table_exists(&tx, "cron_runs")? {
         return Ok(());
     }
     tx.execute_batch("ALTER TABLE cron_runs_no_fk RENAME TO cron_runs;")
         .context("Failed to finish interrupted cron_runs rebuild")?;
-    match tx.commit() {
-        Ok(()) => Ok(()),
-        Err(e) if is_lock_contention(&e) => Ok(()),
-        Err(e) => Err(e).context("Failed to commit cron_runs rebuild recovery"),
-    }
+    tx.commit()
+        .context("Failed to commit cron_runs rebuild recovery")
 }
 
 /// Merge a working table stranded BESIDE `cron_runs` back into it and give
@@ -2317,11 +2358,10 @@ fn merge_stranded_rows_locked(conn: &Connection) -> Result<i64> {
         Ok(names)
     }
 
-    let Some(tx) = begin_immediate(conn)? else {
-        return Ok(0);
-    };
+    let tx = begin_immediate(conn, "stranded-table merge recovery")?;
     // Re-checked under the write lock: a concurrent open may have already
-    // merged and dropped the working table.
+    // merged and dropped the working table — a verified completion, unlike
+    // contention, which fails the open.
     if !table_exists(&tx, "cron_runs_no_fk")? {
         return Ok(0);
     }
@@ -2367,11 +2407,9 @@ fn merge_stranded_rows_locked(conn: &Connection) -> Result<i64> {
         .context("Failed to count quarantined recovered rows")?;
     tx.execute_batch("DROP TABLE cron_runs_no_fk;")
         .context("Failed to drop the recovered cron_runs working table")?;
-    match tx.commit() {
-        Ok(()) => Ok(quarantined),
-        Err(e) if is_lock_contention(&e) => Ok(0),
-        Err(e) => Err(e).context("Failed to commit cron_runs rebuild recovery"),
-    }
+    tx.commit()
+        .context("Failed to commit cron_runs rebuild recovery")?;
+    Ok(quarantined)
 }
 
 /// One-time rebuild for legacy databases whose `cron_runs` still declares
@@ -2396,7 +2434,17 @@ fn drop_cron_runs_job_fk(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = begin_immediate(conn, "foreign-key rebuild")?;
+    // Re-checked under the write lock: a concurrent open may have rebuilt
+    // the table while we waited for the transaction.
+    let still_has_fk = {
+        let mut stmt = tx.prepare("PRAGMA foreign_key_list(cron_runs)")?;
+        let mut rows = stmt.query([])?;
+        rows.next()?.is_some()
+    };
+    if !still_has_fk {
+        return Ok(());
+    }
     tx.execute_batch(
         "CREATE TABLE cron_runs_no_fk (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3802,6 +3850,225 @@ mod tests {
         // removal succeeds and purges the quarantined record.
         remove_job(&config, "gone-one-shot").unwrap();
         assert!(list_runs(&config, "gone-one-shot", 10).unwrap().is_empty());
+    }
+
+    /// Open a second connection to the cron DB and take the write lock, so
+    /// the store's next open contends with a live writer.
+    fn hold_write_lock(config: &Config) -> Connection {
+        let conn = Connection::open(cron_db(config)).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn
+    }
+
+    /// Assert an operation was refused with the retryable contention
+    /// refusal, raised by the named preparation phase — not merely any
+    /// error, and not an earlier phase standing in for the one under test.
+    fn assert_refused_for_contention<T: std::fmt::Debug>(
+        result: Result<T>,
+        phase: &str,
+        what: &str,
+    ) {
+        let err = result.expect_err(what);
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(MIGRATION_CONTENTION_CONTEXT),
+            "{what}: expected the contention refusal, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("Failed to begin cron {phase} transaction")),
+            "{what}: expected the refusal from the {phase} phase, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn contended_merge_refuses_the_operation_and_never_collides_ids() {
+        // The beside-table stranded state with an EMPTY live cron_runs is
+        // the dangerous one: if an operation were authorized before the
+        // merge completed, its new row could occupy the stranded row's id
+        // and the later INSERT OR IGNORE would discard the only copy of
+        // the history. Under contention the operation must be refused
+        // outright — fail closed, retryable — and after the writer goes
+        // away the stranded row must survive exactly once.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "agent-a", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        with_initialized_connection(&config, |conn| {
+            conn.execute_batch(
+                "CREATE TABLE cron_runs_no_fk (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id      TEXT NOT NULL,
+                    started_at  TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    output      TEXT,
+                    duration_ms INTEGER,
+                    executing_agent TEXT,
+                    job_source  TEXT
+                );",
+            )
+            .map_err(anyhow::Error::from)?;
+            conn.execute(
+                "INSERT INTO cron_runs_no_fk (id, job_id, started_at, finished_at, status,
+                                              output, duration_ms, executing_agent, job_source)
+                 VALUES (1, ?1, ?2, ?3, 'ok', 'stranded-history', 5, 'agent-a', 'imperative')",
+                params![
+                    job.id,
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+                ],
+            )
+            .map_err(anyhow::Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let outcomes = RunOutcomes {
+            execution: "ok",
+            delivery: "not_required",
+            persistence: "not_bound",
+        };
+        let provenance = RunProvenance {
+            principal: None,
+            executing_agent: Some("agent-a"),
+            job_source: Some("imperative"),
+        };
+
+        let holder = hold_write_lock(&config);
+        let refused = record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(7),
+            "ok",
+            outcomes,
+            provenance,
+            Some("new-run"),
+            7,
+        );
+        assert_refused_for_contention(
+            refused,
+            "stranded-table merge recovery",
+            "an operation must be refused while required recovery is blocked",
+        );
+        drop(holder);
+
+        // The refused operation must not have written anything: after the
+        // writer releases, the merge completes and the stranded row is the
+        // only row, keeping its original id.
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].output.as_deref(), Some("stranded-history"));
+
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(7),
+            "ok",
+            outcomes,
+            provenance,
+            Some("new-run"),
+            7,
+        )
+        .unwrap();
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 2, "no id collision may discard either row");
+        assert!(
+            runs.iter()
+                .any(|r| r.output.as_deref() == Some("stranded-history")),
+            "the stranded row must survive the whole sequence"
+        );
+    }
+
+    #[test]
+    fn contended_sole_table_recovery_refuses_the_operation() {
+        // Between-DROP-and-RENAME state under a live writer: the rename
+        // recovery cannot run, so the open must fail rather than proceed
+        // against a database with no usable cron_runs.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_owner_schema(&conn);
+        insert_pre_owner_job(&conn, "live-legacy", "agent-a");
+        insert_pre_owner_run(&conn, "live-legacy", "agent-a", "sole-history");
+        // WAL, as any database this store has ever opened is: the pragma
+        // phase must pass so the lock blocks the rename recovery itself.
+        conn.execute_batch(
+            "ALTER TABLE cron_runs RENAME TO cron_runs_no_fk;
+             PRAGMA journal_mode = WAL;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let holder = hold_write_lock(&config);
+        assert_refused_for_contention(
+            list_runs(&config, "live-legacy", 10),
+            "stranded-table rename recovery",
+            "the open must fail while the rename recovery is blocked",
+        );
+        drop(holder);
+
+        let runs = list_runs(&config, "live-legacy", 10).unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].output.as_deref(), Some("sole-history"));
+    }
+
+    #[test]
+    fn contended_owner_migration_refuses_the_operation() {
+        // Modern schema, completion marker unset (the previous-build
+        // upgrade state): the ownership migration is required, so a
+        // contended open is refused; the next uncontended open completes
+        // the migration and ownership works.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "agent-a", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("agent-a"),
+                job_source: Some("imperative"),
+            },
+            Some("kept"),
+            5,
+        )
+        .unwrap();
+        with_initialized_connection(&config, |conn| {
+            conn.execute_batch(
+                "PRAGMA user_version = 0;
+                 UPDATE cron_runs SET owner_agent = NULL;",
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+
+        let holder = hold_write_lock(&config);
+        assert_refused_for_contention(
+            list_runs(&config, &job.id, 10),
+            "ownership migration",
+            "the open must fail while the required migration is blocked",
+        );
+        drop(holder);
+
+        let runs = list_runs_for_agent(&config, &job.id, "agent-a", 10).unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].owner_agent.as_deref(),
+            Some("agent-a"),
+            "the next uncontended open must complete the migration"
+        );
     }
 
     #[test]
