@@ -1981,6 +1981,30 @@ mod streaming_fallback_tests {
             "the reliability domain already walked its ladder inside the synthesized \
              call; the runtime must not re-walk it"
         );
+        // The typed terminal failure must ride the synthesized stream error's
+        // chain: the router boxes the completed call's failure, so the
+        // runtime's downcast walks through to the reliability classification
+        // instead of seeing only a flat string.
+        let terminal_failure = auth_error
+            .chain()
+            .find_map(|source| {
+                source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
+            })
+            .expect("the typed terminal failure must survive the synthesized stream");
+        assert_eq!(
+            terminal_failure.kind(),
+            zeroclaw_providers::ReliableProviderTerminalFailureKind::Authentication,
+            "the persistent 401 must classify as an authentication failure"
+        );
+        let projection = crate::agent::turn::outcome::terminal_completion_error_message_in_english(
+            &auth_error,
+            None,
+        )
+        .expect("the typed failure must project to auth guidance, not the generic terminal string");
+        assert!(
+            projection.contains("rejected its credentials"),
+            "the authentication projection must be selected by kind, got: {projection}"
+        );
     }
 
     #[tokio::test]
@@ -1989,7 +2013,11 @@ mod streaming_fallback_tests {
         let provider = router_over_reliable(
             Box::new(SynthesizedLadderCountingLeaf {
                 physical_requests: Arc::clone(&physical_requests),
-                error_text: "503 Service Unavailable",
+                // The classifier recognizes status codes in the wire shapes
+                // leaves actually surface ("modelprovider error: <code> ...")
+                // or as structured reqwest statuses; a bare "503 ..." string
+                // is not a promised classification input.
+                error_text: "modelprovider error: 503 Service Unavailable",
             }),
             2,
         );
@@ -2052,6 +2080,30 @@ mod streaming_fallback_tests {
             3,
             "retries=2 means the ladder makes 3 physical requests; the runtime must \
              not double them"
+        );
+        // Same chain requirement on the server-error shape: the typed
+        // classification and its projection must survive synthesis.
+        let terminal_failure = server_error
+            .chain()
+            .find_map(|source| {
+                source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
+            })
+            .expect("the typed terminal failure must survive the synthesized stream");
+        assert_eq!(
+            terminal_failure.kind(),
+            zeroclaw_providers::ReliableProviderTerminalFailureKind::ProviderServer,
+            "the persistent 503 must classify as a provider-server failure"
+        );
+        let projection = crate::agent::turn::outcome::terminal_completion_error_message_in_english(
+            &server_error,
+            None,
+        )
+        .expect(
+            "the typed failure must project to server guidance, not the generic terminal string",
+        );
+        assert!(
+            projection.contains("returned a server error"),
+            "the provider-server projection must be selected by kind, got: {projection}"
         );
     }
 

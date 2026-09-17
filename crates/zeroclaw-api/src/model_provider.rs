@@ -472,8 +472,10 @@ pub enum StreamError {
     /// completed non-streaming call is synthesized into a stream (the wrapped
     /// failure already survived the full ladder). A genuine streaming leg never
     /// emits it, so fallback recovery for streamed failures is unaffected.
+    /// The payload is the completed call's failure; consumers walk its chain
+    /// for the typed terminal cause beneath it.
     #[error("terminal provider error: {0}")]
-    Terminal(String),
+    Terminal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

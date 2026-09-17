@@ -457,8 +457,14 @@ impl ModelProvider for RouterModelProvider {
                     // runs: its failure already survived the provider's own
                     // retry/fallback budget. Mark the stream error terminal so
                     // the runtime recovers it as a plain failed chat instead of
-                    // re-running the whole non-streaming call.
-                    Err(error) => vec![Err(StreamError::Terminal(error.to_string()))],
+                    // re-running the whole non-streaming call. The typed
+                    // failure rides the payload, relocated into the box as the
+                    // original error (anyhow's reallocate conversion, so the
+                    // box keeps the original vtable and the terminal
+                    // projection can downcast the typed layer).
+                    Err(error) => vec![Err(StreamError::Terminal(
+                        error.reallocate_into_boxed_dyn_error_without_backtrace(),
+                    ))],
                 }
             })
             .flat_map(stream::iter)
@@ -1837,7 +1843,8 @@ mod tests {
             "a failed synthesized call surfaces as a single error event"
         );
         match &events[0] {
-            Err(StreamError::Terminal(message)) => {
+            Err(StreamError::Terminal(source)) => {
+                let message = source.to_string();
                 assert!(
                     message.contains("All model providers/models failed"),
                     "the reliability domain's terminal cause must survive synthesis verbatim: {message}"

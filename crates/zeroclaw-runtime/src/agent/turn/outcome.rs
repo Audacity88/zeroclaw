@@ -261,7 +261,7 @@ fn terminal_completion_error_message_with_renderer(
 }
 
 #[cfg(test)]
-fn terminal_completion_error_message_in_english(
+pub(crate) fn terminal_completion_error_message_in_english(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
