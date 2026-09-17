@@ -1346,107 +1346,51 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
 }
 
-/// Sniff decoded data-URI bytes and require the payload to frame a complete
-/// image of the sniffed type.
+/// Sniff decoded data-URI bytes and require the payload to decode as a
+/// complete image of the sniffed type.
 ///
 /// [`image_mime_from_magic`] matches leading signature bytes only, so a
 /// truncated fragment — a JPEG SOI plus the APP0 header of a segment it does
 /// not carry, a bare PNG signature — still sniffs as the declared type.
 /// Promoting marker-shaped text out of a tool result needs more than a
-/// prefix: the bytes must frame an image the provider can decode, otherwise
+/// prefix: the bytes must decode as an image the provider accepts, otherwise
 /// the marker keeps flowing as text.
 fn complete_image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
     let mime = image_mime_from_magic(bytes)?;
-    let framed = match mime {
-        "image/png" => is_framed_png(bytes),
-        "image/jpeg" => is_framed_jpeg(bytes),
-        "image/gif" => is_framed_gif(bytes),
-        "image/webp" => is_framed_webp(bytes),
+    let format = match mime {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/gif" => image::ImageFormat::Gif,
+        "image/webp" => image::ImageFormat::WebP,
         // BMP is recognized but never accepted by `PROVIDER_IMAGE_MIME_TYPES`,
-        // so callers reject it as a declared-type mismatch before framing
+        // so callers reject it as a declared-type mismatch before a decode
         // could matter.
-        _ => true,
+        _ => return Some(mime),
     };
-    framed.then_some(mime)
-}
-
-/// A PNG frames when the signature is followed by chunk-framed data: the
-/// first chunk is `IHDR` and the walk ends exactly at `IEND`.
-fn is_framed_png(bytes: &[u8]) -> bool {
-    // The caller reached this through the PNG sniff, so the 8-byte signature
-    // is present.
-    let mut offset = 8usize;
-    let mut first_chunk = true;
-    while offset < bytes.len() {
-        if bytes.len() - offset < 8 {
-            return false;
+    // A decompression-bomb cap for untrusted bytes, not a content policy.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(limits);
+    match reader.decode() {
+        // Decodability is the whole question: the decoded image is dropped
+        // here, and the original bytes are what travel to the provider.
+        Ok(_) => Some(mime),
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "mime": mime,
+                        "error": error.to_string(),
+                    })),
+                "multimodal: data-URI payload failed to decode as the sniffed image type"
+            );
+            None
         }
-        let data_len = u32::from_be_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]) as usize;
-        let chunk_type = &bytes[offset + 4..offset + 8];
-        if first_chunk {
-            if chunk_type != b"IHDR" || data_len != 13 {
-                return false;
-            }
-            first_chunk = false;
-        }
-        let Some(chunk_end) = (offset + 8)
-            .checked_add(data_len)
-            .and_then(|end| end.checked_add(4))
-        else {
-            return false;
-        };
-        if chunk_end > bytes.len() {
-            return false;
-        }
-        if chunk_type == b"IEND" {
-            return data_len == 0 && chunk_end == bytes.len();
-        }
-        offset = chunk_end;
     }
-    false
-}
-
-/// A JPEG frames when SOI is followed by a marker segment whose declared
-/// length fits and the file ends with an EOI marker. Complete JPEGs satisfy
-/// both; a truncated header loses the EOI, and a header-only stub announces a
-/// segment it does not carry.
-fn is_framed_jpeg(bytes: &[u8]) -> bool {
-    // The caller reached this through the JPEG sniff, so FF D8 FF is present.
-    if bytes.len() < 6 || !bytes.ends_with(&[0xFF, 0xD9]) {
-        return false;
-    }
-    let marker = bytes[3];
-    if matches!(marker, 0x01 | 0xD8 | 0xD9 | 0xD0..=0xD7) {
-        return false; // standalone marker: no length-prefixed segment to frame
-    }
-    let segment_len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
-    if segment_len < 2 {
-        return false; // the segment length counts itself; smaller is malformed
-    }
-    4 + segment_len <= bytes.len() - 2
-}
-
-/// A GIF frames when the logical screen descriptor is present and the stream
-/// ends with the 0x3B trailer byte.
-fn is_framed_gif(bytes: &[u8]) -> bool {
-    // The caller reached this through the GIF sniff, so the 6-byte header is
-    // present; the descriptor (7) plus the trailer (1) are the minimum
-    // remaining structure.
-    bytes.len() >= 14 && matches!(bytes.last(), Some(&0x3B))
-}
-
-/// A WebP frames when the RIFF size field accounts for every remaining byte:
-/// the container declares its own extent.
-fn is_framed_webp(bytes: &[u8]) -> bool {
-    // The caller reached this through the WebP sniff, so RIFF + size + WEBP
-    // (12 bytes) is present.
-    bytes.len() >= 12
-        && u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize == bytes.len() - 8
 }
 
 async fn normalize_remote_image(
@@ -1942,17 +1886,170 @@ mod tests {
     }
 
     #[test]
-    fn normalize_data_uri_accepts_framed_jpeg_header() {
-        // SOI plus a complete 16-byte APP0 JFIF segment plus EOI: the
-        // smallest payload that frames as a JPEG, and it round-trips
-        // unchanged.
+    fn normalize_data_uri_rejects_jpeg_header_without_frame() {
+        // The maintainer's named false positive: SOI plus a complete 16-byte
+        // APP0 JFIF segment plus EOI. Every byte of container framing is
+        // here, but there is no SOF, no SOS and no entropy data, so the
+        // payload is not an image any decoder would accept.
         let jpeg: &[u8] = &[
             0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00,
             0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
         ];
         let source = format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg));
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("header-only JPEG must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("/9j"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_png_without_idat() {
+        // Signature + IHDR (with a valid CRC) + IEND: the chunk walk of the
+        // old framing check ended exactly at IEND and accepted it. A decoder
+        // gets past the header and fails: there is no IDAT, so no image data.
+        let mut png: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00,
+        ]);
+        png.extend_from_slice(&[0x1F, 0x15, 0xC4, 0x89]);
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]);
+        let source = format!("data:image/png;base64,{}", STANDARD.encode(&png));
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("PNG without IDAT must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("iVBOR"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_gif_without_image_descriptor() {
+        // `GIF89a` + a 7-byte logical screen descriptor + the 0x3B trailer:
+        // header, descriptor and trailer are the whole file, which is all the
+        // old framing check asked for. No image descriptor, no image data.
+        let gif: &[u8] = &[
+            b'G', b'I', b'F', b'8', b'9', b'a', 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x3B,
+        ];
+        let source = format!("data:image/gif;base64,{}", STANDARD.encode(gif));
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("GIF without an image descriptor must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("R0lGOD"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_webp_without_bitstream() {
+        // `RIFF` + size + `WEBP` + four zero bytes, with the RIFF size
+        // accounting for every remaining byte: the container declares its
+        // own extent, which is all the old framing check verified. There is
+        // no VP8/VP8L/VP8X chunk, so no bitstream to decode.
+        let mut webp: Vec<u8> = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        webp.extend_from_slice(&8u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let source = format!("data:image/webp;base64,{}", STANDARD.encode(&webp));
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("WebP without a bitstream must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("UklGR"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    /// Encode a solid red 1x1 image in the given format, so accept-path
+    /// tests ride payloads a real encoder produced (and a real decoder
+    /// accepts) instead of hand-built byte stubs.
+    fn encoded_1x1(format: image::ImageFormat) -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, format)
+            .expect("1x1 test image should encode");
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_decodable_png() {
+        let source = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(encoded_1x1(image::ImageFormat::Png))
+        );
         let normalized = normalize_data_uri(&source, TEN_MB)
-            .unwrap_or_else(|error| panic!("framed JPEG must pass: {error}"));
+            .unwrap_or_else(|error| panic!("decodable PNG must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_decodable_jpeg() {
+        let source = format!(
+            "data:image/jpeg;base64,{}",
+            STANDARD.encode(encoded_1x1(image::ImageFormat::Jpeg))
+        );
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("decodable JPEG must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_decodable_gif() {
+        let source = format!(
+            "data:image/gif;base64,{}",
+            STANDARD.encode(encoded_1x1(image::ImageFormat::Gif))
+        );
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("decodable GIF must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_decodable_webp() {
+        let source = format!(
+            "data:image/webp;base64,{}",
+            STANDARD.encode(encoded_1x1(image::ImageFormat::WebP))
+        );
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("decodable WebP must pass: {error}"));
         assert_eq!(normalized, source);
     }
 
