@@ -37977,6 +37977,12 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "channel-line",
+        feature = "channel-wechat",
+        feature = "whatsapp-web"
+    ))]
     #[tokio::test]
     async fn supervised_listener_cancels_identity_persistence_waiting_for_config_lock() {
         use std::future::{Future, poll_fn};
