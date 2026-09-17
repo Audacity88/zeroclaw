@@ -1212,17 +1212,21 @@ async fn supervise_windows_service_child(
         .stderr()
         .take()
         .context("Windows service daemon stderr pipe unavailable")?;
+    let stdout_sink = writers.stdout.clone();
+    let stderr_sink = writers.stderr.clone();
+    let stdout_failure_sender = writers.failure_sender.clone();
+    let stderr_failure_sender = writers.failure_sender.clone();
     let stdout_task = zeroclaw_spawn::spawn!(drain_service_pipe(
         stdout,
-        writers.stdout.clone(),
+        stdout_sink,
         "Windows service",
-        writers.failure_sender.clone()
+        stdout_failure_sender
     ));
     let stderr_task = zeroclaw_spawn::spawn!(drain_service_pipe(
         stderr,
-        writers.stderr.clone(),
+        stderr_sink,
         "Windows service",
-        writers.failure_sender.clone()
+        stderr_failure_sender
     ));
     let outcome = loop {
         if let Ok(error) = failures.try_recv() {
