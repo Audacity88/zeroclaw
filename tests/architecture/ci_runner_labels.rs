@@ -23,7 +23,7 @@ const RUNNER_LABEL: &str = "blacksmith-8vcpu-ubuntu-2404";
 /// Every job that compiles the workspace on the Blacksmith fleet. A new compile
 /// job must be added here, which is the point: the list is the inventory this
 /// gate checks the workflow against.
-const COMPILE_JOBS: [&str; 11] = [
+const COMPILE_JOBS: [&str; 12] = [
     "lint",
     "build",
     "check",
@@ -32,6 +32,7 @@ const COMPILE_JOBS: [&str; 11] = [
     "check-32bit",
     "bench",
     "test",
+    "test-channel-features",
     "memory-postgres-test",
     "parallel-runtime-test",
     "installer-drift",
