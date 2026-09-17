@@ -340,7 +340,7 @@ impl<'a> TurnState<'a> {
         &mut self,
         assistant_history_content: String,
         native_tool_calls: &[zeroclaw_providers::ToolCall],
-        individual_results: &[(Option<String>, String)],
+        individual_results: &[results_collect::ToolRoundResult],
         tool_results: &str,
         use_native_tools: bool,
     ) {
@@ -1339,6 +1339,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             output: crate::i18n::get_required_cli_string(
                                 "turn-tool-interrupted-before-result",
                             ),
+                            attachments: Vec::new(),
                             success: false,
                             error_reason: None,
                             duration: std::time::Duration::ZERO,
@@ -1364,6 +1365,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         output: crate::i18n::get_required_cli_string(
                             "turn-tool-interrupted-before-result",
                         ),
+                        attachments: Vec::new(),
                         success: false,
                         error_reason: None,
                         duration: std::time::Duration::ZERO,
