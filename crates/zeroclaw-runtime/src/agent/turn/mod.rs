@@ -1510,7 +1510,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         config,
         multimodal_config,
         ctx.hooks,
-        image_cache.as_deref_mut(),
+        image_cache,
     )
     .await
 }
