@@ -373,6 +373,8 @@ impl AcpSessionStore {
     /// Load a durable ACP transcript only when both its UUID and owning agent
     /// match. Keeping the alias predicate in SQL makes an unknown UUID and a
     /// UUID owned by another agent indistinguishable to callers.
+    /// Killed sessions remain readable as history; killing prevents runtime
+    /// rehydration, not access to retained transcripts by their owner.
     pub fn load_session_for_agent(
         &self,
         session_uuid: &str,
@@ -601,9 +603,9 @@ impl AcpSessionStore {
     }
 
     /// List live ACP sessions owned by `agent_alias`, ordered by most recent
-    /// activity. Killed rows remain available to export through
-    /// `list_sessions_by_agent`, but are not live sessions for agent-facing
-    /// session tools.
+    /// activity. Killed rows are omitted from live discovery, but their retained
+    /// transcripts remain readable through `load_session_for_agent` and they
+    /// remain available to export through `list_sessions_by_agent`.
     pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
         let conn = self.conn.lock();
         let mut stmt = conn

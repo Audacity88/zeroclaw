@@ -15,10 +15,12 @@ use zeroclaw_infra::session_backend::SessionBackend;
 
 /// Agent-scoped access to the durable ACP session store.
 ///
-/// The handle is only attached to agents built by the ACP server. Each tool
+/// The handle is attached by ACP server and RPC ACP Agent construction. Each tool
 /// execution still verifies that the task-local session key names a live ACP
 /// session owned by `agent_alias`; construction for an alias alone is not an
 /// ACP invocation grant.
+/// Listing exposes live sessions only. History may read a killed target's
+/// retained transcript when it belongs to the same agent; this does not revive it.
 #[derive(Clone)]
 pub struct AcpSessionReadView {
     store: Arc<AcpSessionStore>,
@@ -2104,6 +2106,60 @@ mod tests {
                 assert!(other_history.output.contains("other answer"));
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn killed_acp_targets_are_hidden_from_list_but_owned_history_remains_readable() {
+        let (_acp_tmp, store, view, current, other, foreign) = acp_fixture();
+        store
+            .append_turn(
+                &foreign,
+                &[zeroclaw_api::model_provider::ConversationMessage::Chat(
+                    ChatMessage::assistant("foreign retained answer"),
+                )],
+            )
+            .unwrap();
+        assert!(store.mark_session_killed(&other).unwrap());
+        assert!(store.mark_session_killed(&foreign).unwrap());
+        let (_chat_tmp, backend) = test_backend();
+        let list = SessionsListTool::with_acp_sessions(backend.clone(), view.clone());
+        let history = SessionsHistoryTool::with_acp_sessions(backend, test_security(), view);
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current.clone()), async {
+                let listed = list.execute(json!({})).await.unwrap();
+                assert!(listed.success);
+                assert!(listed.output.contains(&current));
+                assert!(!listed.output.contains(&other));
+                assert!(!listed.output.contains(&foreign));
+
+                let owned = history.execute(json!({"session_id": other})).await.unwrap();
+                assert!(owned.success);
+                assert!(owned.output.contains("other answer"));
+
+                let denied = history
+                    .execute(json!({"session_id": foreign}))
+                    .await
+                    .unwrap();
+                let missing = history
+                    .execute(json!({"session_id": "missing-acp-session"}))
+                    .await
+                    .unwrap();
+                assert!(!denied.success);
+                assert!(!missing.success);
+                assert!(!denied.output.contains("foreign retained answer"));
+                assert_eq!(
+                    denied.error.unwrap().replace(&foreign, "<id>"),
+                    missing
+                        .error
+                        .unwrap()
+                        .replace("missing-acp-session", "<id>")
+                );
+            })
+            .await;
+
+        assert!(store.is_session_killed(&other).unwrap());
+        assert!(store.is_session_killed(&foreign).unwrap());
     }
 
     #[tokio::test]
