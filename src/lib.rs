@@ -71,8 +71,6 @@ pub mod memory;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod multimodal;
 #[cfg(feature = "agent-runtime")]
-pub mod nodes;
-#[cfg(feature = "agent-runtime")]
 pub mod observability;
 #[cfg(feature = "agent-runtime")]
 pub mod peripherals;
@@ -224,6 +222,12 @@ pub enum ServiceCommands {
     /// Internal launchd runner that owns bounded daemon output capture
     #[command(hide = true)]
     RunLaunchdDaemon,
+    /// Internal desktop runner that owns bounded combined daemon output capture
+    #[command(hide = true)]
+    RunDesktopDaemon {
+        #[arg(long, hide = true)]
+        port: u16,
+    },
     /// Internal OpenRC logger that drains one daemon stream into bounded storage
     #[command(hide = true)]
     RunOpenrcLogWriter {
