@@ -20,6 +20,7 @@ pub mod schedule;
 pub mod scoped;
 pub mod security_ops;
 pub mod send_message_to_peer;
+pub mod sessions_prompt;
 pub mod shell;
 pub(crate) mod shell_env;
 pub(crate) mod shell_output;
@@ -147,6 +148,7 @@ pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 pub use security_ops::SecurityOpsTool;
 pub use send_message_to_peer::SendMessageToPeerTool;
+pub use sessions_prompt::{SessionPromptOutcome, SessionsPromptTool};
 pub use shell::ShellTool;
 pub use skill_http::SkillHttpTool;
 pub use skill_tool::{SkillBuiltinTool, SkillShellTool};
@@ -1424,6 +1426,7 @@ fn all_tools_with_runtime_on_thread(
             live_config.clone(),
             execution_capability.clone(),
         )),
+        Arc::new(SessionsPromptTool::new(agent_alias)),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),

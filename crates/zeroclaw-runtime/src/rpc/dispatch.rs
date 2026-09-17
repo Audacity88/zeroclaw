@@ -2971,6 +2971,31 @@ impl RpcDispatcher {
         }
     }
 
+    /// Construct a pre-authenticated dispatcher around an existing outbound,
+    /// with no transport of its own and no TUI identity. Used for
+    /// daemon-initiated turns whose notifications must stream through the
+    /// session owner's writer.
+    pub(crate) fn new_with_outbound(
+        ctx: Arc<RpcContext>,
+        rpc: Arc<RpcOutbound>,
+        peer_label: String,
+    ) -> Self {
+        Self {
+            ctx,
+            rpc,
+            authenticated: true,
+            tui_id: None,
+            tui_epoch: None,
+            peer_label,
+            client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
+            connection_cancel: CancellationToken::new(),
+            owns_connection: true,
+            connection_activity: None,
+            prompt_tasks: Vec::new(),
+            peer_cert_fingerprint: None,
+        }
+    }
+
     /// Cancel and join every prompt accepted by this connection generation.
     /// The queue guard held by an in-flight turn is released only after its
     /// provider/tool future has observed cancellation and returned, so a
@@ -7078,6 +7103,96 @@ impl RpcDispatcher {
             if let Ok(s) = serde_json::to_string(&n) {
                 let _ = rpc.send_raw(s).await;
             }
+        }
+    }
+
+    /// Run a full `session/prompt` turn in a live session on behalf of a
+    /// calling agent (the `sessions_prompt` tool path). Authorization: the
+    /// target session's agent must be the caller itself or one of the
+    /// caller's reachable delegate targets. A busy target is refused rather
+    /// than queued. The turn streams to the session owner's connection when
+    /// one is live (see [`Self::turn_notification_outbound`]); the caller
+    /// receives the final content and stop reason.
+    pub(crate) async fn run_agent_injected_session_prompt(
+        ctx: &Arc<RpcContext>,
+        session_id: &str,
+        message: &str,
+        caller_alias: &str,
+    ) -> Result<crate::tools::sessions_prompt::SessionPromptOutcome, String> {
+        let Some(target_alias) = ctx.sessions.get_agent_alias(session_id).await else {
+            return Err(format!(
+                "session {session_id:?} not found: no live session with that id"
+            ));
+        };
+        let authorized = target_alias == caller_alias || {
+            let config = ctx.config.read();
+            config
+                .reachable_delegate_target_configs(caller_alias)
+                .iter()
+                .any(|target| target.agent == target_alias)
+        };
+        if !authorized {
+            return Err(format!(
+                "session {session_id:?} belongs to agent {target_alias:?}, which is \
+                 neither the calling agent ({caller_alias:?}) nor one of its reachable \
+                 delegate targets; add the target to the caller's `delegates` roster \
+                 before prompting it"
+            ));
+        }
+        let busy = ctx.sessions.inflight_turn_generation(session_id).is_some()
+            || ctx.sessions.session_queue.queue_depth(session_id).await > 0;
+        if busy {
+            return Err(format!(
+                "session {session_id} is busy (turn in flight); retry later"
+            ));
+        }
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "caller_alias": caller_alias,
+                    "target_alias": target_alias,
+                    "session_id": session_id,
+                })),
+            "agent-injected session prompt accepted"
+        );
+
+        // Stream through the session owner's writer when it is live, so the
+        // owner pane sees the turn; otherwise into a closed sink — the turn
+        // still runs and persists, and the pane resyncs later. This
+        // dispatcher has no TUI identity of its own.
+        let rpc = ctx
+            .sessions
+            .session_owner_tui_id(session_id)
+            .await
+            .flatten()
+            .and_then(|owner_tui_id| ctx.tui_registry.outbound_for(&owner_tui_id))
+            .unwrap_or_else(|| {
+                let (sink_tx, _) = mpsc::channel::<String>(1);
+                Arc::new(RpcOutbound::new(sink_tx))
+            });
+        let dispatcher = RpcDispatcher::new_with_outbound(
+            Arc::clone(ctx),
+            rpc,
+            "agent-session-prompt".to_string(),
+        );
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "prompt": message,
+            "injected_by": caller_alias,
+        });
+        match dispatcher.handle_session_prompt(&params).await {
+            Ok(value) => {
+                let parsed: SessionPromptResult = serde_json::from_value(value)
+                    .map_err(|e| format!("session/prompt returned an unreadable result: {e}"))?;
+                Ok(crate::tools::sessions_prompt::SessionPromptOutcome {
+                    content: parsed.content,
+                    stop_reason: parsed.stop_reason,
+                })
+            }
+            Err(e) => Err(e.message),
         }
     }
 
@@ -38168,6 +38283,295 @@ mod tests {
             // Ok(None): every sender was dropped with the registration, so
             // the closed channel resolves immediately — silent either way.
             "a disconnected owner's channel must stay silent"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // sessions_prompt gateway — authorization, busy refusal, and the tool's
+    // path through the daemon-registered runner
+    // -----------------------------------------------------------------------
+
+    fn make_session_prompt_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, DelegateTargetConfig};
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "tool-caller".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                delegates: vec![DelegateTargetConfig::bounded("test-agent")],
+                ..Default::default()
+            },
+        );
+        agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            agents,
+            ..Default::default()
+        }
+    }
+
+    /// One shared context whose single live session belongs to `test-agent`
+    /// and is owned by a registered TUI connection with a capture channel —
+    /// the shape the daemon presents to the injected-prompt gateway.
+    async fn session_prompt_gateway_harness(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        Arc<RpcContext>,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<TurnRecordingProvider>,
+        String,
+    ) {
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(make_session_prompt_test_config(tmp), Arc::clone(&sessions));
+        let provider = Arc::new(TurnRecordingProvider::default());
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(SharedRecordingProvider(Arc::clone(&provider))))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("gateway test agent should build");
+        let session_id = "gateway-target-session".to_string();
+        sessions
+            .insert(
+                session_id.clone(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                )
+                .with_owner(Some("tui-gateway-owner".to_string())),
+            )
+            .await
+            .expect("gateway test session should insert");
+        let (owner_tx, owner_rx) = tokio::sync::mpsc::channel::<String>(64);
+        ctx.tui_registry
+            .register(crate::rpc::tui_identity::TuiEntry {
+                tui_id: "tui-gateway-owner".to_string(),
+                connected_at: chrono::Utc::now(),
+                peer_label: "test-owner".to_string(),
+                transport: "unix".to_string(),
+                env: std::collections::HashMap::new(),
+                outbound: Some(Arc::new(RpcOutbound::new(owner_tx))),
+            });
+        (ctx, owner_rx, provider, session_id)
+    }
+
+    const GATEWAY_MESSAGE: &str = "[from agent tool-caller, session caller-1]\n\ndo the thing";
+
+    #[tokio::test]
+    async fn gateway_authorizes_own_alias_and_runs_the_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, mut owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+
+        let outcome = RpcDispatcher::run_agent_injected_session_prompt(
+            &ctx,
+            &sid,
+            GATEWAY_MESSAGE,
+            "test-agent",
+        )
+        .await
+        .expect("the session's own agent must be authorized to prompt it");
+
+        assert_eq!(outcome.stop_reason, "end_turn");
+        assert_eq!(outcome.content, "done");
+        let calls = provider.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one provider call must run");
+        assert!(
+            calls[0]
+                .1
+                .as_deref()
+                .is_some_and(|seen| seen.ends_with(GATEWAY_MESSAGE)),
+            "the target agent must receive the injected message (the agent loop \
+             prepends its own timestamp header, so match the tail), got: {:?}",
+            calls[0].1
+        );
+        let frames = collect_until_turn_complete(&mut owner_rx).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["params"]["type"] == "agent_message_chunk"),
+            "the owner pane must stream the injected turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_authorizes_a_reachable_delegate_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+
+        let outcome = RpcDispatcher::run_agent_injected_session_prompt(
+            &ctx,
+            &sid,
+            GATEWAY_MESSAGE,
+            "tool-caller",
+        )
+        .await
+        .expect("a delegate target listed on the caller's roster must pass");
+
+        assert_eq!(outcome.content, "done");
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_refuses_an_unreachable_target_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+
+        let error = RpcDispatcher::run_agent_injected_session_prompt(
+            &ctx,
+            &sid,
+            GATEWAY_MESSAGE,
+            "outsider",
+        )
+        .await
+        .expect_err("an agent with no delegate reach into the target must be refused");
+
+        assert!(
+            error.contains("reachable delegate targets"),
+            "the refusal must name the authorization gate, got: {error:?}"
+        );
+        assert!(
+            provider.calls.lock().unwrap().is_empty(),
+            "a refused prompt must not start a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_refuses_a_busy_session_without_queueing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+
+        // A registered cancel token is what `session/state` reads as a turn
+        // in flight.
+        ctx.sessions
+            .register_cancel_token(&sid, tokio_util::sync::CancellationToken::new());
+
+        let error = RpcDispatcher::run_agent_injected_session_prompt(
+            &ctx,
+            &sid,
+            GATEWAY_MESSAGE,
+            "test-agent",
+        )
+        .await
+        .expect_err("a busy session must be refused immediately");
+
+        assert_eq!(
+            error,
+            format!("session {sid} is busy (turn in flight); retry later"),
+            "the busy refusal is a fixed, retryable message"
+        );
+        assert!(
+            provider.calls.lock().unwrap().is_empty(),
+            "a refused prompt must not queue behind the running turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_refuses_unknown_session_without_listing_others() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+
+        let error = RpcDispatcher::run_agent_injected_session_prompt(
+            &ctx,
+            "no-such-session",
+            GATEWAY_MESSAGE,
+            "test-agent",
+        )
+        .await
+        .expect_err("an unknown session must be refused");
+
+        assert!(
+            error.contains("not found"),
+            "the refusal must say the session is missing, got: {error:?}"
+        );
+        assert!(
+            !error.contains(&sid),
+            "the refusal must not enumerate other agents' live sessions"
+        );
+        assert!(provider.calls.lock().unwrap().is_empty());
+    }
+
+    // The full path the daemon wires: the tool reads the registered runner,
+    // prefixes provenance, and the runner drives `session/prompt` with
+    // notifications reaching the owner pane. Registered once — the lock is
+    // process-global, exactly like the cron delivery hook.
+    #[tokio::test]
+    async fn sessions_prompt_tool_runs_end_to_end_through_the_registered_runner() {
+        use zeroclaw_api::tool::Tool as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, mut owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+        crate::tools::sessions_prompt::register_session_prompt_fn(Box::new(
+            move |session_id, message, caller_alias| {
+                let ctx = Arc::clone(&ctx);
+                Box::pin(async move {
+                    RpcDispatcher::run_agent_injected_session_prompt(
+                        &ctx,
+                        &session_id,
+                        &message,
+                        &caller_alias,
+                    )
+                    .await
+                })
+            },
+        ));
+
+        let tool = crate::tools::sessions_prompt::SessionsPromptTool::new("tool-caller");
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("caller-1".to_string()), async {
+                tool.execute(json!({
+                    "session_id": sid,
+                    "message": "do the thing",
+                }))
+                .await
+            })
+            .await
+            .expect("tool execution must not hard-fail");
+
+        assert!(
+            result.success,
+            "the authorized call must succeed: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.as_str().contains("done"),
+            "the target turn's final content must be the tool output, got: {}",
+            result.output
+        );
+        let calls = provider.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .1
+                .as_deref()
+                .is_some_and(|seen| seen
+                    .contains("[from agent tool-caller, session caller-1]\n\ndo the thing")),
+            "the target agent must see the runtime-derived provenance prefix \
+             (the agent loop prepends its own timestamp header), got: {:?}",
+            calls[0].1
+        );
+        let frames = collect_until_turn_complete(&mut owner_rx).await;
+        assert_eq!(
+            frames.last().expect("owner must see the terminal event")["params"]["type"],
+            "turn_complete"
         );
     }
 

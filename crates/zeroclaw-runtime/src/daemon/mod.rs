@@ -1133,6 +1133,27 @@ pub async fn run_with_authority(
         None
     };
 
+    // Agent-to-session prompting: register the runner the `sessions_prompt`
+    // tool calls. The closure captures the shared RPC context; without one
+    // (no RPC transports configured) the tool reports itself unavailable
+    // instead of failing silently.
+    if let Some(ctx) = rpc_ctx.clone() {
+        crate::tools::sessions_prompt::register_session_prompt_fn(Box::new(
+            move |session_id, message, caller_alias| {
+                let ctx = std::sync::Arc::clone(&ctx);
+                Box::pin(async move {
+                    crate::rpc::dispatch::RpcDispatcher::run_agent_injected_session_prompt(
+                        &ctx,
+                        &session_id,
+                        &message,
+                        &caller_alias,
+                    )
+                    .await
+                })
+            },
+        ));
+    }
+
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {
         socket_required = true;

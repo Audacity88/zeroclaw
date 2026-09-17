@@ -283,6 +283,13 @@ rpc_type! {
         /// entries — markers are appended to the prompt before the turn runs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub attachments: Vec<FileEntry>,
+        /// Set by the runtime when this prompt was injected by another agent
+        /// via the `sessions_prompt` tool: the calling agent's alias.
+        /// Human-typed prompts never set it. Drives the `user_message`
+        /// session update so the owner pane renders the injected prompt
+        /// before the turn streams.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub injected_by: Option<String>,
     }
 }
 
