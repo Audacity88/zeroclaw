@@ -119,7 +119,7 @@ pub struct RpcContext {
     /// Read-only live config handle: RPC readers observe the published
     /// config and its revision as one pair and cannot bypass publication
     /// with a raw write. Mutating handlers admit through
-    /// [`RpcContext::begin_config_commit`] instead.
+    /// `RpcContext::begin_config_commit` instead.
     pub config: LiveConfigHandle,
 
     /// The live-config authority that owns this context's publication
