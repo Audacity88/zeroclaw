@@ -763,6 +763,8 @@ pub struct TelegramChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    #[cfg(test)]
+    fixture_http_client: Option<reqwest::Client>,
     /// Pre-computed tool command specs (name, description) for bot command registration.
     tool_command_specs: Vec<(String, String)>,
     /// Pending approval requests: callback_data key → oneshot sender.
@@ -1098,6 +1100,8 @@ impl TelegramChannel {
             voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
+            #[cfg(test)]
+            fixture_http_client: None,
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
@@ -1660,6 +1664,11 @@ impl TelegramChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
+        #[cfg(test)]
+        if let Some(client) = &self.fixture_http_client {
+            return client.clone();
+        }
+
         zeroclaw_config::schema::build_channel_proxy_client(
             "channel.telegram",
             self.proxy_url.as_deref(),
@@ -6094,8 +6103,14 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
+        // Back-to-back cards from one message are otherwise indistinguishable
+        // before the operator taps, so say which call this is.
+        let position = Self::escape_html(&crate::util::approval_position_line(
+            request.position_counter(),
+        ));
         let text = format!(
             "\u{1f527} <b>{heading}</b>\n\n\
+             {position}\
              {tool_label}: <code>{tool}</code>\n\
              {args}\n\n\
              {tap_instruction}",
@@ -6153,9 +6168,13 @@ Ensure only one `zeroclaw` process is using this bot token."
                     "Telegram sendMessage (approval) with HTML failed; retrying without parse_mode"
                 );
 
-                // Fallback: plain text, no parse_mode, keep the buttons
+                // Fallback: plain text, no parse_mode, keep the buttons.
+                // Unescaped position line: this send has no parse_mode, so the
+                // HTML-escaped one above would show its entities literally.
+                let plain_position =
+                    crate::util::approval_position_line(request.position_counter());
                 let plain_text = format!(
-                    "🔧 {heading}\n\n{tool_label}: {}\n{}\n\n{tap_instruction}",
+                    "🔧 {heading}\n\n{plain_position}{tool_label}: {}\n{}\n\n{tap_instruction}",
                     request.tool_name, request.arguments_summary
                 );
                 let mut plain_body = serde_json::json!({
@@ -6251,6 +6270,23 @@ impl UpdateDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl TelegramChannel {
+        fn with_mock_api_base(mut self, api_base: String) -> Self {
+            // Mock servers can be pooled across tests whose Tokio runtimes are not.
+            // Keep connections within this fixture, using the normal proxy policy.
+            self.fixture_http_client = Some(
+                zeroclaw_config::schema::apply_channel_proxy_to_builder(
+                    reqwest::Client::builder(),
+                    "channel.telegram",
+                    self.proxy_url.as_deref(),
+                )
+                .build()
+                .expect("mock Telegram HTTP client"),
+            );
+            self.with_api_base(api_base)
+        }
+    }
 
     #[test]
     fn scrub_masks_poll_error_url() {
@@ -6957,7 +6993,7 @@ mod tests {
                 false,
             )
             .with_streaming(stream_mode, 0)
-            .with_api_base(mock_server.uri());
+            .with_mock_api_base(mock_server.uri());
 
             channel
                 .update_draft_lifecycle("123", "42", ProgressEvent::RunningTool)
@@ -6972,7 +7008,7 @@ mod tests {
             false,
         )
         .with_streaming(StreamMode::Partial, 60_000)
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
         throttled
             .last_draft_edit
             .lock()
@@ -6989,7 +7025,7 @@ mod tests {
             false,
         )
         .with_streaming(StreamMode::Partial, 0)
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         partial
             .update_draft_lifecycle("123", "42", ProgressEvent::RunningTool)
@@ -7024,7 +7060,7 @@ mod tests {
             false,
         )
         .with_streaming(StreamMode::Partial, 0)
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         partial
             .update_draft_progress("123", "42", RAW_TOOL_STATUS)
@@ -7191,7 +7227,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         assert_eq!(
             channel.listener_health(),
@@ -7239,7 +7275,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
 
@@ -7829,7 +7865,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
         // Genuine forum topic: isolated.
@@ -7916,7 +7952,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_transcription(tc);
 
         // Genuine forum topic: isolated.
@@ -8083,7 +8119,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
         // Minimal valid PNG header bytes
         let file_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -8436,7 +8472,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
         let file_bytes: Vec<u8> = vec![];
 
         let result = ch
@@ -8446,7 +8482,129 @@ mod tests {
         let err = result.expect_err("empty document send should fail");
         assert!(
             err.to_string().contains("empty document rejected"),
-            "expected mocked Telegram error, got: {err}"
+            "expected mocked Telegram error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn telegram_mock_client_survives_other_fixture_runtime_shutdown() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let controller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("mock setup runtime");
+        let (received_tx, received_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let rejection = ResponseTemplate::new(400).set_body_json(
+            serde_json::json!({ "ok": false, "description": "empty document rejected" }),
+        );
+        let server = controller.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/botfake-token-a/sendDocument"))
+                .respond_with(rejection.clone())
+                .expect(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/botfake-token-b/sendDocument"))
+                .respond_with(move |_: &wiremock::Request| {
+                    let _ = received_tx.try_send(());
+                    // Wiremock serves on its own thread. Do not release B's reply
+                    // until the test controller has joined runtime A's thread.
+                    if release_rx
+                        .lock()
+                        .expect("response gate lock")
+                        .recv_timeout(LISTEN_HANG_GUARD)
+                        .is_ok()
+                    {
+                        rejection.clone()
+                    } else {
+                        ResponseTemplate::new(500).set_body_string("response gate was not released")
+                    }
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            server
+        });
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let owner_url = server.uri();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fixture A runtime");
+            runtime.block_on(async {
+                let channel = TelegramChannel::new(
+                    "fake-token-a".into(),
+                    "telegram_test_alias",
+                    Arc::new(|| vec!["*".into()]),
+                    false,
+                )
+                .with_mock_api_base(owner_url);
+                for _ in 0..2 {
+                    let err = tokio::time::timeout(
+                        LISTEN_HANG_GUARD,
+                        channel.send_document_bytes("123456", None, vec![], "empty.txt", None),
+                    )
+                    .await
+                    .expect("fixture A send hung")
+                    .expect_err("mock should reject the empty document");
+                    assert!(
+                        err.to_string().contains("empty document rejected"),
+                        "{err:#}"
+                    );
+                }
+                ready_tx.send(()).expect("fixture A ready");
+                let _ = stop_rx.await;
+            });
+        });
+        ready_rx
+            .recv_timeout(LISTEN_HANG_GUARD)
+            .expect("fixture A did not complete its warm requests");
+
+        let borrower_url = server.uri();
+        let borrower = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fixture B runtime");
+            runtime.block_on(async {
+                let channel = TelegramChannel::new(
+                    "fake-token-b".into(),
+                    "telegram_test_alias",
+                    Arc::new(|| vec!["*".into()]),
+                    false,
+                )
+                .with_mock_api_base(borrower_url);
+                tokio::time::timeout(
+                    LISTEN_HANG_GUARD,
+                    channel.send_document_bytes("123456", None, vec![], "empty.txt", None),
+                )
+                .await
+            })
+        });
+
+        let receipt = received_rx.recv_timeout(LISTEN_HANG_GUARD);
+        let _ = stop_tx.send(());
+        let owner_result = owner.join();
+        // Release the mock even when receipt or owner teardown failed.
+        let _ = release_tx.send(());
+        let borrower_result = borrower.join();
+        receipt.expect("fixture B request did not reach the mock");
+        owner_result.expect("fixture A thread failed");
+        let err = borrower_result
+            .expect("fixture B thread failed")
+            .expect("fixture B send hung")
+            .expect_err("mock should reject the empty document");
+        assert!(
+            err.to_string().contains("empty document rejected"),
+            "fixture B lost its response after runtime A shutdown: {err:#}"
         );
     }
 
@@ -9641,7 +9799,7 @@ mod tests {
             mention_only,
         )
         .with_transcription(tc)
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
         let update = serde_json::json!({
             "message": {
                 "message_id": 2,
@@ -9692,7 +9850,7 @@ mod tests {
             false,
         )
         .with_transcription(tc)
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
         let update = serde_json::json!({
             "message": {
                 "message_id": 3,
@@ -9749,7 +9907,7 @@ mod tests {
             false,
         )
         .with_transcription(tc)
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
         let update = serde_json::json!({
             "message": {
                 "message_id": 4,
@@ -10126,7 +10284,7 @@ mod tests {
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_workspace_dir(workspace.path().to_path_buf()),
         );
 
@@ -10194,7 +10352,7 @@ mod tests {
             Arc::new(|| vec!["alice".to_string()]),
             false,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let handle = zeroclaw_spawn::spawn!(async move { ch.listen(tx).await });
@@ -10264,7 +10422,7 @@ mod tests {
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri()),
+            .with_mock_api_base(mock_server.uri()),
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -10357,7 +10515,7 @@ mod tests {
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_workspace_dir(workspace.path().to_path_buf()),
         );
 
@@ -10473,7 +10631,7 @@ mod tests {
                 Arc::new(|| vec!["zeroclaw_user".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri()),
+            .with_mock_api_base(mock_server.uri()),
         ));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -10566,7 +10724,7 @@ mod tests {
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_workspace_dir(workspace.path().to_path_buf()),
         );
 
@@ -10689,7 +10847,7 @@ mod tests {
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri()),
+            .with_mock_api_base(mock_server.uri()),
         );
 
         // Known approval callbacks must carry a live, same-chat pending entry
@@ -11065,7 +11223,7 @@ mod tests {
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_workspace_dir(workspace.path().to_path_buf()),
         );
 
@@ -11144,7 +11302,7 @@ mod tests {
                 false,
             )
             .with_transcription(tc)
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_voice_drop_notice_timeout(Duration::from_millis(250)),
         );
 
@@ -11217,7 +11375,7 @@ mod tests {
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_workspace_dir(workspace.path().to_path_buf()),
         );
 
@@ -11303,7 +11461,7 @@ mod tests {
                 Arc::new(|| vec!["alice".to_string()]),
                 false,
             )
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_workspace_dir(workspace.path().to_path_buf()),
         );
 
@@ -11599,7 +11757,7 @@ mod tests {
             Arc::new(Vec::new),
             false,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
         let mut update = telegram_document_update(
@@ -11694,7 +11852,7 @@ mod tests {
                 Arc::new(Vec::new),
                 false,
             )
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_workspace_dir(workspace.path().to_path_buf()),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -12035,7 +12193,7 @@ mod tests {
                 Arc::new(|| vec!["alice".into()]),
                 false,
             )
-            .with_api_base(server.uri())
+            .with_mock_api_base(server.uri())
             .with_workspace_dir(workspace.path().to_path_buf())
             .with_ack_reactions(true),
         );
@@ -12043,11 +12201,11 @@ mod tests {
         let listener_channel = Arc::clone(&channel);
         let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
 
-        let album = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("album should dispatch")
             .expect("listener should remain connected");
-        let follow_up = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let follow_up = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("follow-up should dispatch")
             .expect("listener should remain connected");
@@ -12059,7 +12217,7 @@ mod tests {
         telegram_expect_main_loop_offset(
             &server,
             14,
-            Duration::from_secs(1),
+            LISTEN_HANG_GUARD,
             "delivered album and follow-up",
         )
         .await;
@@ -12247,7 +12405,7 @@ mod tests {
                 Arc::new(|| vec!["alice".into()]),
                 false,
             )
-            .with_api_base(server.uri())
+            .with_mock_api_base(server.uri())
             .with_workspace_dir(workspace.path().to_path_buf())
             .with_ack_reactions(true),
         );
@@ -12258,7 +12416,7 @@ mod tests {
         // 1. Intermediate messages (3..=98) dispatch immediately, while the
         // albums wait for their settlement delays.
         for i in 3..=98 {
-            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
                 .await
                 .expect("intermediate message should dispatch")
                 .expect("listener should remain connected");
@@ -12266,7 +12424,7 @@ mod tests {
         }
 
         // 2. Album A arrives once settled
-        let album_a = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album_a = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("album a should dispatch")
             .expect("listener should remain connected");
@@ -12276,7 +12434,7 @@ mod tests {
         // 3. Album B arrives as one single turn containing all 3 photos,
         // because its settlement was held until the saturated page boundary
         // was cleared by the next poll page returning update 101.
-        let album_b = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album_b = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("album b should dispatch as a single combined turn")
             .expect("listener should remain connected");
@@ -12295,7 +12453,7 @@ mod tests {
         telegram_expect_main_loop_offset(
             &server,
             102,
-            Duration::from_secs(3),
+            LISTEN_HANG_GUARD,
             "delivered both albums and intermediate messages",
         )
         .await;
@@ -12512,7 +12670,7 @@ mod tests {
                 Arc::new(|| vec!["alice".into()]),
                 false,
             )
-            .with_api_base(server.uri())
+            .with_mock_api_base(server.uri())
             .with_workspace_dir(workspace.path().to_path_buf())
             .with_ack_reactions(true),
         );
@@ -12523,20 +12681,20 @@ mod tests {
         // 1. The ordinary updates on the page dispatch immediately, including
         // the one at the page boundary, while both albums wait to settle.
         for i in 3..=98 {
-            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
                 .await
                 .expect("intermediate message should dispatch")
                 .expect("listener should remain connected");
             assert_eq!(msg.content, format!("msg {i}"));
         }
-        let boundary = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let boundary = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("page-boundary message should dispatch")
             .expect("listener should remain connected");
         assert_eq!(boundary.content, "boundary");
 
         // 2. Album A settles first and releases the offset.
-        let album_a = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album_a = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("album a should dispatch")
             .expect("listener should remain connected");
@@ -12546,7 +12704,7 @@ mod tests {
         // 3. Album B arrives once, with the photo from update 99 and the photo
         // from update 101 in the same turn. Settling it from the replayed page
         // would have delivered only the first photo here.
-        let album_b = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album_b = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("album b should dispatch as a single combined turn")
             .expect("listener should remain connected");
@@ -12565,7 +12723,7 @@ mod tests {
         telegram_expect_main_loop_offset(
             &server,
             102,
-            Duration::from_secs(3),
+            LISTEN_HANG_GUARD,
             "delivered both albums and every ordinary update",
         )
         .await;
@@ -12694,14 +12852,14 @@ mod tests {
                 Arc::new(|| vec!["alice".into()]),
                 false,
             )
-            .with_api_base(server.uri())
+            .with_mock_api_base(server.uri())
             .with_workspace_dir(workspace.path().to_path_buf()),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listener_channel = Arc::clone(&channel);
         let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
 
-        let first = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let first = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("the ordinary update should dispatch first")
             .expect("listener should remain connected");
@@ -12710,7 +12868,7 @@ mod tests {
             "the ordinary same-chat update must be delivered before the album settles"
         );
 
-        let album = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("the album should dispatch once both photos are in")
             .expect("listener should remain connected");
@@ -12726,13 +12884,8 @@ mod tests {
             rx.try_recv().is_err(),
             "the album must not produce a second agent turn"
         );
-        telegram_expect_main_loop_offset(
-            &server,
-            14,
-            Duration::from_secs(2),
-            "whole album delivered",
-        )
-        .await;
+        telegram_expect_main_loop_offset(&server, 14, LISTEN_HANG_GUARD, "whole album delivered")
+            .await;
 
         let poll_offsets: Vec<i64> = server
             .received_requests()
@@ -12797,7 +12950,7 @@ mod tests {
             Arc::new(|| vec!["alice".into()]),
             false,
         )
-        .with_api_base(server.uri())
+        .with_mock_api_base(server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
         *channel.bot_username.lock() = Some("mybot".to_string());
 
@@ -12951,7 +13104,7 @@ mod tests {
             Arc::new(|| vec!["alice".into()]),
             true,
         )
-        .with_api_base(server.uri())
+        .with_mock_api_base(server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
         *channel.bot_username.lock() = Some("mybot".to_string());
 
@@ -13018,7 +13171,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(server.uri())
+        .with_mock_api_base(server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
         let video = serde_json::json!({
@@ -13107,7 +13260,7 @@ mod tests {
             Arc::new(|| vec!["alice".into()]),
             true,
         )
-        .with_api_base(server.uri())
+        .with_mock_api_base(server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
         *channel.bot_username.lock() = Some("mybot".to_string());
 
@@ -13260,7 +13413,7 @@ mod tests {
             Arc::new(|| vec!["alice".into()]),
             false,
         )
-        .with_api_base(server.uri())
+        .with_mock_api_base(server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
         let document_update = |update_id: i64, file_id: &str| {
             serde_json::json!({
@@ -13320,7 +13473,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(server.uri())
+        .with_mock_api_base(server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
         let first = media_group_update(1, 1, 100, "album");
         let mut second = media_group_update(2, 2, 100, "album");
@@ -13353,7 +13506,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(server.uri())
+        .with_mock_api_base(server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
         for mismatch in ["sender", "thread"] {
@@ -14212,7 +14365,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         ch.register_bot_commands().await;
 
@@ -14294,7 +14447,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         ch.register_bot_commands().await;
     }
@@ -14322,7 +14475,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         // Should not panic — errors are logged, not propagated.
         ch.register_bot_commands().await;
@@ -14504,7 +14657,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
         let update = serde_json::json!({
@@ -14569,7 +14722,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
         let update = serde_json::json!({
@@ -14636,7 +14789,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
         // An image uploaded as an extensionless document: no extension to
@@ -14720,7 +14873,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_workspace_dir(workspace.path().to_path_buf());
 
         ch.register_bot_commands().await;
@@ -14756,7 +14909,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_tool_command_specs(specs);
 
         ch.register_bot_commands().await;
@@ -14814,7 +14967,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_tool_command_specs(specs);
 
         // Install a broadcast hook so we can capture the WARN log event.
@@ -14956,7 +15109,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_tool_command_specs(specs);
 
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
@@ -15253,7 +15406,7 @@ mod tests {
                 Arc::new(|| vec!["operator".into(), "1001".into()]),
                 false,
             )
-            .with_api_base(mock_server.uri()),
+            .with_mock_api_base(mock_server.uri()),
         );
         let (approval_tx, mut approval_rx) = tokio::sync::oneshot::channel();
         channel.pending_approvals.lock().await.insert(
@@ -15365,7 +15518,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let approval_id = "abc-123".to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -15436,7 +15589,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let resp = ch
             .http_client()
@@ -15475,7 +15628,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let resp = ch
             .http_client()
@@ -15510,7 +15663,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let resp = ch
             .http_client()
@@ -15544,7 +15697,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let resp = ch
             .http_client()
@@ -15581,7 +15734,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let resp = ch
             .http_client()
@@ -15629,7 +15782,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri());
+        .with_mock_api_base(mock_server.uri());
 
         let approval_id = "cb-route-1".to_string();
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -15715,13 +15868,14 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_approval_timeout_secs(1);
 
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let attributed = ch
             .request_approval_attributed("12345", &request)
@@ -15806,7 +15960,7 @@ mod tests {
                 Arc::new(|| vec!["*".into()]),
                 mention_only,
             )
-            .with_api_base(mock_server.uri())
+            .with_mock_api_base(mock_server.uri())
             .with_approval_timeout_secs(120),
         );
 
@@ -15814,6 +15968,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let waiter = {
             let ch = Arc::clone(&ch);
@@ -15947,13 +16102,14 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_approval_timeout_secs(1);
 
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
@@ -15995,6 +16151,153 @@ mod tests {
         }
         assert_eq!(ids.len(), 1, "all three buttons share one approval id");
         assert_eq!(actions, vec!["approve", "deny", "always"]);
+    }
+
+    #[tokio::test]
+    async fn approval_card_shows_the_batch_position_in_html_and_in_the_plain_fallback() {
+        use wiremock::matchers::{body_string_contains, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // When the HTML send is rejected, the card is rebuilt from scratch
+        // without `parse_mode` and resent with the same buttons. That rebuild
+        // is a second renderer, and it has to carry the position too — the
+        // operator sees the fallback card, not the one that failed.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_string_contains("parse_mode"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
+        };
+
+        // Nothing resolves the pending oneshot; the short timeout returns a
+        // Deny instead of hanging the test.
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "HTML send then plain-text retry");
+
+        let raw = crate::util::approval_position_line(Some((2, 3)));
+        let raw = raw.trim_end();
+        assert!(!raw.is_empty(), "helper should render a 2-of-3 line");
+        // The two sends escape differently, so the expectations differ. Several
+        // locales put an apostrophe in this line (fr: `Appel d'outil 2 sur 3`),
+        // which the HTML send escapes and the fallback must not; comparing both
+        // against the raw string passes only in locales with nothing to escape.
+        let escaped = TelegramChannel::escape_html(raw);
+
+        let html: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            html["parse_mode"], "HTML",
+            "the first send is the HTML card"
+        );
+        let html_text = html["text"].as_str().unwrap();
+        assert!(
+            html_text.contains(escaped.as_str()),
+            "HTML card should carry the escaped position; want {escaped:?}, got {html_text}"
+        );
+        if escaped != raw {
+            assert!(
+                !html_text.contains(raw),
+                "the HTML position line must be escaped, not raw; got {html_text}"
+            );
+        }
+
+        let plain: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            plain.get("parse_mode").is_none(),
+            "the retry is the plain-text fallback"
+        );
+        let plain_text = plain["text"].as_str().unwrap();
+        assert!(
+            plain_text.contains(raw),
+            "plain fallback should carry the raw position; want {raw:?}, got {plain_text}"
+        );
+        // With no parse_mode, an escaped line would show its entities literally.
+        // Only meaningful in a locale where the two forms actually differ.
+        if escaped != raw {
+            assert!(
+                !plain_text.contains(escaped.as_str()),
+                "the fallback position line must not be HTML-escaped; got {plain_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_card_omits_the_position_for_a_single_call() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: Some(zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 }),
+        };
+
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let heading = i18n::get_required_cli_string("channel-approval-heading");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
+        assert_eq!(
+            body["text"],
+            format!(
+                "\u{1f527} <b>{heading}</b>\n\n{tool_label}: <code>shell</code>\nls -la\n\n{tap_instruction}",
+            ),
+            "a one-call batch renders exactly as an unpositioned card"
+        );
     }
 
     #[test]
