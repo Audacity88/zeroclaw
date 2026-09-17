@@ -10856,6 +10856,7 @@ mod tests {
             },
             false,
             false,
+            ToolDisclosure::Collapsed,
             80,
             &mut lines,
         );
