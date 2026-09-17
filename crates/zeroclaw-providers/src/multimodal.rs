@@ -5,10 +5,14 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use zeroclaw_api::media::{
-    PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension, image_mime_from_magic,
-    is_provider_image_mime,
+    MarkerKind, PROVIDER_IMAGE_MIME_TYPES, RenderedMarker, image_mime_from_extension,
+    image_mime_from_magic, is_provider_image_mime,
 };
 use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::tool_carrier::{
+    is_prompt_tool_carrier, parse_native_tool_carrier, parse_prompt_tool_carrier,
+    render_native_attachments, render_prompt_tool_carrier,
+};
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
@@ -434,7 +438,7 @@ fn count_image_markers_with_current_turn_tool_results(
         .filter(|(index, message)| {
             should_normalize_message_images(*index, message, current_turn_tool_result_indices)
         })
-        .map(|(_, message)| parse_image_markers(&message.content).1.len())
+        .map(|(_, message)| count_message_images(message))
         .sum()
 }
 
@@ -492,6 +496,29 @@ const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
 /// characters so a marker replaced inside a native tool-result blob leaves
 /// the surrounding object valid.
 pub const MEDIA_PLACEHOLDER: &str = "(media attachment omitted)";
+
+/// Degrade one message for a text-only route: a tool-result carrier loses
+/// exactly its declared attachments and keeps its body verbatim (legacy
+/// carriers included — a marker in tool body text is text, and rewriting it
+/// is the incident this contract exists to prevent); every other message has
+/// its media markers replaced with the placeholder as before.
+pub fn strip_message_media(message: &ChatMessage) -> ChatMessage {
+    if is_tool_result_carrier(message)
+        && let Some(parts) = carrier_parts(message)
+        && parts.declared
+    {
+        let emptied: Vec<RenderedMarker> = Vec::new();
+        return rebuild_carrier(message, &parts, &emptied);
+    }
+    if is_tool_result_carrier(message) {
+        // Legacy carrier: the body is text; nothing to degrade.
+        return message.clone();
+    }
+    ChatMessage {
+        role: message.role.clone(),
+        content: strip_media_markers(&message.content),
+    }
+}
 
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -556,11 +583,20 @@ fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
 ///
 /// Non-audio media markers pass through untouched; see `AUDIO_MARKER_KINDS`
 /// for why the split falls where it does.
+///
+/// A DECLARED carrier never has its text regex-stripped: its audio
+/// attachments drop from the declared list (the count the strict parser
+/// checks stays consistent, so a mixed declaration cannot degrade to legacy
+/// and lose its images), and its body is verbatim. Legacy carriers and
+/// ordinary messages keep the regex strip, which is the pre-attachment
+/// compatibility path.
 pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
-    if !messages
-        .iter()
-        .any(|m| AUDIO_MARKER_RE.is_match(&m.content))
-    {
+    // The gate also catches a declared native carrier whose attachments array
+    // names an audio kind: that shape never matches the marker regex, but the
+    // declared list is handled the same way as a marker line below.
+    if !messages.iter().any(|m| {
+        AUDIO_MARKER_RE.is_match(&m.content) || (m.role == "tool" && m.content.contains("audio"))
+    }) {
         return Cow::Borrowed(messages);
     }
 
@@ -568,6 +604,28 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
     let rebuilt: Vec<ChatMessage> = messages
         .iter()
         .map(|m| {
+            // A declared carrier handles audio as metadata. Its marker lines
+            // are the declaration the strict parser counts: rewriting one
+            // with the regex broke the count, degraded the whole carrier to
+            // legacy, and lost every attachment it declared — image included.
+            // Audio attachments drop from the declared list instead; the
+            // body is never touched, so a body quoting audio syntax stays
+            // verbatim under the attachment-identity contract.
+            if let Some(parts) = carrier_parts(m)
+                && parts.declared
+            {
+                let retained: Vec<RenderedMarker> = parts
+                    .attachments
+                    .iter()
+                    .filter(|marker| marker.kind != MarkerKind::Audio)
+                    .cloned()
+                    .collect();
+                if retained.len() != parts.attachments.len() {
+                    stripped += parts.attachments.len() - retained.len();
+                    return rebuild_carrier(m, &parts, &retained);
+                }
+                return m.clone();
+            }
             let (content, n) = strip_unplayable_audio_markers(&m.content);
             stripped += n;
             ChatMessage {
@@ -585,7 +643,7 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
                 .with_attrs(::serde_json::json!({
                     "markers_stripped": stripped,
                 })),
-            "multimodal: stripped unplayable audio marker(s) (AUDIO/VOICE); no provider resolves audio into content parts, so a raw path/URL was replaced with a placeholder instead of being sent to the model as text"
+            "multimodal: stripped unplayable audio marker(s) (AUDIO/VOICE); no provider resolves audio into content parts, so a raw path/URL was replaced with a placeholder (or dropped from a declared carrier's attachment list) instead of being sent to the model as text"
         );
     }
 
@@ -617,6 +675,194 @@ pub(crate) fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
 
 fn is_tool_result_carrier(message: &ChatMessage) -> bool {
     message.role == "tool" || is_prompt_tool_result_message(message)
+}
+
+/// Which carrier shape a tool-result carrier uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarrierKind {
+    /// `role = "tool"` with a JSON envelope.
+    Native,
+    /// `role = "user"` starting with the results prefix.
+    Prompt,
+}
+
+/// A carrier opened at its fixed position: the verbatim body, the declared
+/// attachments, and whether the position carried a declaration at all.
+#[derive(Debug, Clone)]
+struct CarrierParts {
+    text: String,
+    attachments: Vec<RenderedMarker>,
+    declared: bool,
+    kind: CarrierKind,
+}
+
+/// Open a tool-result carrier at its fixed position. `None` means the message
+/// is not shaped like a carrier at all (raw non-JSON tool text, or user text
+/// without the results prefix); callers treat those as legacy.
+fn carrier_parts(message: &ChatMessage) -> Option<CarrierParts> {
+    if message.role == "tool" {
+        return parse_native_tool_carrier(&message.content).map(|parsed| CarrierParts {
+            text: parsed.text,
+            attachments: parsed.attachments,
+            declared: parsed.declared,
+            kind: CarrierKind::Native,
+        });
+    }
+    if is_prompt_tool_result_message(message) {
+        return parse_prompt_tool_carrier(&message.content).map(|parsed| CarrierParts {
+            text: parsed.text,
+            attachments: parsed.attachments,
+            declared: parsed.declared,
+            kind: CarrierKind::Prompt,
+        });
+    }
+    None
+}
+
+/// The image references a carrier declared, in declaration order. Non-image
+/// kinds are carried but never resolved into image parts.
+fn carrier_image_refs(parts: &CarrierParts) -> Vec<String> {
+    parts
+        .attachments
+        .iter()
+        .filter(|marker| marker.kind == MarkerKind::Image)
+        .map(|marker| marker.target.clone())
+        .collect()
+}
+
+/// Rebuild a carrier message with new attachments, keeping the body verbatim
+/// and every other envelope field (call id, name) untouched.
+fn rebuild_carrier(
+    message: &ChatMessage,
+    parts: &CarrierParts,
+    attachments: &[RenderedMarker],
+) -> ChatMessage {
+    match parts.kind {
+        CarrierKind::Native => {
+            let Ok(serde_json::Value::Object(mut obj)) =
+                serde_json::from_str::<serde_json::Value>(&message.content)
+            else {
+                return message.clone();
+            };
+            // The body is re-written from `parts.text` so a load-failure note
+            // appended during normalization reaches the envelope; when the
+            // text is unchanged this is an identity write.
+            obj.insert(
+                "content".to_string(),
+                serde_json::Value::String(parts.text.clone()),
+            );
+            obj.insert(
+                "attachments".to_string(),
+                render_native_attachments(attachments),
+            );
+            ChatMessage {
+                role: message.role.clone(),
+                content: serde_json::Value::Object(obj).to_string(),
+            }
+        }
+        CarrierKind::Prompt => ChatMessage {
+            role: message.role.clone(),
+            content: render_prompt_tool_carrier(&parts.text, attachments),
+        },
+    }
+}
+
+/// Count the images a message contributes to the outbound request: a carrier
+/// counts its declared image attachments (its body is never scanned); a user
+/// message counts its text markers; everything else counts zero.
+fn count_message_images(message: &ChatMessage) -> usize {
+    if is_tool_result_carrier(message) {
+        let count = carrier_parts(message)
+            .map(|parts| carrier_image_refs(&parts).len())
+            .unwrap_or(0);
+        return count;
+    }
+    if message.role == "user" {
+        return parse_image_markers(&message.content).1.len();
+    }
+    0
+}
+
+/// Split user-role content for image lifting: a prompt-mode tool carrier
+/// contributes only its declared image attachment lines (the body is never
+/// scanned, and non-image attachment lines stay in the text); every other
+/// user message lifts text markers exactly as before.
+///
+/// Provider adapters that resolve user content into image parts call this
+/// instead of `parse_image_markers` so a carrier body containing literal
+/// marker syntax cannot smuggle an unintended image into the request.
+pub fn parse_user_message_image_refs(content: &str) -> (String, Vec<String>) {
+    if is_prompt_tool_carrier(content) {
+        // A carrier is never body-scanned: a declared carrier contributes
+        // its image attachment lines (non-image lines stay in the text), and
+        // a legacy carrier contributes nothing at all — its body is text
+        // under the attachment-identity contract.
+        let Some(parsed) = parse_prompt_tool_carrier(content) else {
+            return (content.to_string(), Vec::new());
+        };
+        if !parsed.declared {
+            return (content.to_string(), Vec::new());
+        }
+        let mut refs = Vec::new();
+        let mut retained = Vec::new();
+        for marker in &parsed.attachments {
+            if marker.kind == MarkerKind::Image {
+                refs.push(marker.target.clone());
+            } else {
+                retained.push(marker.clone());
+            }
+        }
+        let text = render_prompt_tool_carrier(&parsed.text, &retained);
+        return (text, refs);
+    }
+    parse_image_markers(content)
+}
+
+/// Emit one warning per request when a legacy-shaped carrier body carries
+/// image marker syntax. Under the attachment-identity contract those markers
+/// are text and are never promoted, so third-party or pre-upgrade tools that
+/// still emit them become visible instead of silently losing their images.
+/// No marker text is logged.
+fn warn_on_legacy_carrier_markers(messages: &[ChatMessage]) {
+    let mut native_carriers = 0usize;
+    let mut prompt_carriers = 0usize;
+    let mut marker_count = 0usize;
+    for message in messages {
+        if !is_tool_result_carrier(message) {
+            continue;
+        }
+        let Some(parts) = carrier_parts(message) else {
+            // Raw non-JSON tool text: legacy by shape.
+            if message.role == "tool" && message.content.contains(IMAGE_MARKER_PREFIX) {
+                native_carriers += 1;
+                marker_count += parse_image_markers(&message.content).1.len();
+            }
+            continue;
+        };
+        if parts.declared || !parts.text.contains(IMAGE_MARKER_PREFIX) {
+            continue;
+        }
+        match parts.kind {
+            CarrierKind::Native => native_carriers += 1,
+            CarrierKind::Prompt => prompt_carriers += 1,
+        }
+        marker_count += parse_image_markers(&parts.text).1.len();
+    }
+    if marker_count == 0 {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "native_carriers": native_carriers,
+                "prompt_carriers": prompt_carriers,
+                "image_marker_count": marker_count,
+            })),
+        "legacy tool-result carrier body contains image marker syntax; treated as text, not attachments"
+    );
 }
 
 /// Indices of every tool-result carrier in the CURRENT user turn: the
@@ -669,6 +915,17 @@ fn stripped_image_marker_text(content: &str) -> String {
 }
 
 fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
+    // A declared carrier empties its attachment list at the fixed position;
+    // the body was never scanned, so it stays verbatim. A legacy carrier
+    // (pre-upgrade, or a third-party shape) keeps the historical body strip
+    // so pre-upgrade sessions send exactly what they sent before.
+    if let Some(parts) = carrier_parts(message)
+        && parts.declared
+    {
+        let emptied: Vec<RenderedMarker> = Vec::new();
+        return rebuild_carrier(message, &parts, &emptied);
+    }
+
     if !message.content.contains(IMAGE_MARKER_PREFIX) {
         return message.clone();
     }
@@ -708,40 +965,59 @@ fn replay_message_without_stale_tool_images(
     }
 }
 
-async fn normalize_native_tool_result_json(
-    content: &str,
+/// Normalize a declared carrier's image attachments into data URIs at the
+/// fixed position, keeping the body verbatim (a load-failure note is the only
+/// text ever appended).
+///
+/// `None` when the message is not a carrier that declared image attachments:
+/// legacy carriers and text-only carriers pass through untouched, because
+/// their bodies are text under the attachment-identity contract and are never
+/// scanned.
+async fn normalize_carrier_attachments(
+    message: &ChatMessage,
     config: &MultimodalConfig,
     max_bytes: usize,
     remote_client: &Client,
     ctx: &ImageNormalizeCtx<'_>,
     cache: Option<&mut LocalImageCache>,
-) -> Option<(String, bool)> {
-    let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
-    else {
+) -> Option<(ChatMessage, bool)> {
+    let parts = carrier_parts(message)?;
+    if !parts.declared {
         return None;
-    };
-
-    let Some(serde_json::Value::String(inner)) = obj.get("content").cloned() else {
-        return None;
-    };
-
-    let (cleaned_text, refs) = parse_image_markers(&inner);
+    }
+    let refs = carrier_image_refs(&parts);
     if refs.is_empty() {
         return None;
     }
 
     let normalized =
         normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache).await;
-    let new_inner = compose_multimodal_content(
-        &cleaned_text,
-        &normalized.data_uris,
-        normalized.skipped_count,
-        refs.len(),
-    );
-    obj.insert("content".to_string(), serde_json::Value::String(new_inner));
-
+    // Non-image attachments carry through untouched; image entries become the
+    // successfully normalized URIs (in declaration order). Entries that could
+    // not be loaded drop out of the list and are reported in the body note.
+    let mut rebuilt: Vec<RenderedMarker> = parts
+        .attachments
+        .iter()
+        .filter(|marker| marker.kind != MarkerKind::Image)
+        .cloned()
+        .collect();
+    rebuilt.extend(normalized.data_uris.iter().map(|uri| RenderedMarker {
+        target: uri.clone(),
+        kind: MarkerKind::Image,
+    }));
+    let text = if normalized.skipped_count > 0 {
+        append_skipped_image_note(&parts.text, normalized.skipped_count, refs.len())
+    } else {
+        parts.text.clone()
+    };
+    let rebuilt_parts = CarrierParts {
+        text,
+        attachments: rebuilt,
+        declared: true,
+        kind: parts.kind,
+    };
     Some((
-        serde_json::Value::Object(obj).to_string(),
+        rebuild_carrier(message, &rebuilt_parts, &rebuilt_parts.attachments),
         !normalized.data_uris.is_empty(),
     ))
 }
@@ -781,6 +1057,8 @@ async fn prepare_messages_inner(
 
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
+
+    warn_on_legacy_carrier_markers(messages);
 
     let current_turn_tool_indices = current_turn_tool_result_indices(messages);
     let total_images =
@@ -826,9 +1104,13 @@ async fn prepare_messages_inner(
             continue;
         }
 
-        if message.role == "tool"
-            && let Some((prepared, contains_images)) = normalize_native_tool_result_json(
-                &message.content,
+        if is_tool_result_carrier(message) {
+            // Current-turn carrier: normalize the declared attachments at the
+            // fixed position. Legacy and text-only carriers pass through with
+            // the body untouched — a carrier body is never scanned for
+            // markers.
+            match normalize_carrier_attachments(
+                message,
                 config,
                 max_bytes,
                 &remote_client,
@@ -839,12 +1121,13 @@ async fn prepare_messages_inner(
                 cache.as_deref_mut(),
             )
             .await
-        {
-            normalized_messages.push(ChatMessage {
-                role: message.role.clone(),
-                content: prepared,
-            });
-            has_successful_images |= contains_images;
+            {
+                Some((prepared, contains_images)) => {
+                    normalized_messages.push(prepared);
+                    has_successful_images |= contains_images;
+                }
+                None => normalized_messages.push(message.clone()),
+            }
             continue;
         }
 
@@ -996,7 +1279,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
             should_normalize_message_images(*index, message, &current_turn_tool_indices)
         })
         .filter_map(|(i, m)| {
-            let count = parse_image_markers(&m.content).1.len();
+            let count = count_message_images(m);
             if count > 0 { Some((i, count)) } else { None }
         })
         .collect();
@@ -1062,6 +1345,29 @@ fn trim_image_markers(text: &str, drop_here: usize) -> String {
 /// mirroring [`strip_tool_result_image_markers`] and
 /// [`normalize_native_tool_result_json`].
 fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
+    // A declared carrier drops its oldest image attachments at the fixed
+    // position; the body is never touched. Non-image attachments always
+    // survive the image cap.
+    if let Some(parts) = carrier_parts(message)
+        && parts.declared
+    {
+        let mut dropped = 0usize;
+        let retained: Vec<RenderedMarker> = parts
+            .attachments
+            .iter()
+            .filter(|marker| {
+                if marker.kind == MarkerKind::Image && dropped < drop_here {
+                    dropped += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        return rebuild_carrier(message, &parts, &retained);
+    }
+
     if message.role == "tool"
         && let Ok(serde_json::Value::Object(mut obj)) =
             serde_json::from_str::<serde_json::Value>(&message.content)
@@ -1562,6 +1868,47 @@ fn normalize_content_type(content_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_marker(target: impl Into<String>) -> zeroclaw_api::media::RenderedMarker {
+        zeroclaw_api::media::RenderedMarker {
+            target: target.into(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        }
+    }
+
+    /// A native tool-result carrier in the shape the runtime writes: call id,
+    /// verbatim body, and the attachments array (always present).
+    fn native_carrier(tool_call_id: &str, body: &str, images: &[String]) -> String {
+        let attachments: Vec<_> = images.iter().map(|t| image_marker(t.clone())).collect();
+        serde_json::json!({
+            "tool_call_id": tool_call_id,
+            "content": body,
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string()
+    }
+
+    /// A prompt-mode tool-result carrier: results prefix, count header, marker
+    /// lines, verbatim body.
+    fn prompt_carrier(body: &str, images: &[String]) -> String {
+        let attachments: Vec<_> = images.iter().map(|t| image_marker(t.clone())).collect();
+        zeroclaw_api::tool_carrier::render_prompt_tool_carrier(body, &attachments)
+    }
+
+    /// The image targets a native carrier declares, read at the fixed
+    /// position.
+    fn carrier_image_targets(content: &str) -> Vec<String> {
+        zeroclaw_api::tool_carrier::parse_native_tool_carrier(content)
+            .map(|parsed| {
+                parsed
+                    .attachments
+                    .into_iter()
+                    .filter(|m| m.kind == zeroclaw_api::media::MarkerKind::Image)
+                    .map(|m| m.target)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     #[test]
     fn image_failure_reporting_tracks_reference_and_kind_until_success() {
@@ -2180,9 +2527,11 @@ mod tests {
         )
         .unwrap();
 
-        let messages = vec![ChatMessage::tool(format!(
-            "<tool_result name=\"image_gen\">\nGenerated image [IMAGE:{}]\n</tool_result>",
-            image_path.display()
+        let body = "<tool_result name=\"image_gen\">\nGenerated image\n</tool_result>".to_string();
+        let messages = vec![ChatMessage::tool(native_carrier(
+            "tc1",
+            &body,
+            &[image_path.display().to_string()],
         ))];
 
         let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
@@ -2193,11 +2542,16 @@ mod tests {
         assert_eq!(prepared.messages.len(), 1);
         assert_eq!(prepared.messages[0].role, "tool");
 
-        let (cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
-        assert!(cleaned.contains("<tool_result name=\"image_gen\">"));
-        assert!(cleaned.contains("Generated image"));
+        let refs = carrier_image_targets(&prepared.messages[0].content);
         assert_eq!(refs.len(), 1);
         assert!(refs[0].starts_with("data:image/png;base64,"));
+        // The body survives normalization byte for byte.
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[0].content)
+                .expect("prepared carrier must parse");
+        assert_eq!(parsed.text, body);
+        assert!(!parsed.text.contains("data:image/png;base64,"));
+        assert!(!parsed.text.contains("tool-sample.png"));
     }
 
     #[tokio::test]
@@ -2208,7 +2562,7 @@ mod tests {
         // serializers lost `tool_call_id`. Five images against the default cap
         // of four is enough to force a partial trim.
         let temp = tempfile::tempdir().unwrap();
-        let mut markers = Vec::new();
+        let mut marker_paths = Vec::new();
         for index in 0..5 {
             let image_path = temp.path().join(format!("shot-{index}.png"));
             std::fs::write(
@@ -2216,13 +2570,18 @@ mod tests {
                 [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
             )
             .unwrap();
-            markers.push(format!("[IMAGE:{}]", image_path.display()));
+            marker_paths.push(image_path.display().to_string());
         }
 
+        let attachments: Vec<_> = marker_paths
+            .iter()
+            .map(|t| image_marker(t.clone()))
+            .collect();
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc-overflow",
             "tool_name": "screenshot",
-            "content": format!("captured five {}", markers.join(" ")),
+            "content": "captured five screenshots",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
         })
         .to_string();
 
@@ -2255,12 +2614,16 @@ mod tests {
             inner.contains("captured five"),
             "surrounding text must survive trimming"
         );
+        assert_eq!(
+            inner, "captured five screenshots",
+            "the body is never rewritten by normalization or trimming"
+        );
 
-        let (_, refs) = parse_image_markers(inner);
+        let refs = carrier_image_targets(&prepared.messages[0].content);
         assert_eq!(
             refs.len(),
             config.max_images,
-            "exactly the budgeted images are retained, and they live inside `content`"
+            "exactly the budgeted images are retained, in the attachments array"
         );
         assert!(
             refs.iter()
@@ -2279,11 +2642,8 @@ mod tests {
         )
         .unwrap();
 
-        let native_tool_content = serde_json::json!({
-            "tool_call_id": "tc1",
-            "content": format!("see attached [IMAGE:{}]", image_path.display().to_string()),
-        })
-        .to_string();
+        let native_tool_content =
+            native_carrier("tc1", "see attached", &[image_path.display().to_string()]);
 
         let messages = vec![ChatMessage::tool(native_tool_content)];
 
@@ -2308,27 +2668,29 @@ mod tests {
             .get("content")
             .and_then(|v| v.as_str())
             .expect("content must remain a JSON string");
-        assert!(
-            inner.contains("see attached"),
-            "surrounding text in tool content should survive normalization"
+        assert_eq!(
+            inner, "see attached",
+            "the body must survive normalization byte for byte"
         );
+        let refs = carrier_image_targets(&prepared.messages[0].content);
+        assert_eq!(refs.len(), 1);
         assert!(
-            inner.contains("data:image/png;base64,"),
-            "local image path inside tool content should be rewritten to a data URI"
+            refs[0].starts_with("data:image/png;base64,"),
+            "the declared local image is rewritten to a data URI in the attachments array"
         );
         assert!(
             !inner.contains("native-tool-result.png"),
-            "raw local path must not leak after normalization"
+            "raw local path must not leak into the body"
         );
     }
 
     #[tokio::test]
     async fn prepare_messages_preserves_native_tool_json_when_image_is_skipped() {
-        let native_tool_content = serde_json::json!({
-            "tool_call_id": "tc1",
-            "content": "generated screenshot [IMAGE:https://example.com/missing.png]",
-        })
-        .to_string();
+        let native_tool_content = native_carrier(
+            "tc1",
+            "generated screenshot",
+            &["https://example.com/missing.png".to_string()],
+        );
 
         let prepared = prepare_messages_for_provider(
             &[ChatMessage::tool(native_tool_content)],
@@ -2355,6 +2717,10 @@ mod tests {
         assert!(inner.contains("1 attached image(s) could not be loaded"));
         assert!(!inner.contains("[IMAGE:"));
         assert!(!inner.contains("https://example.com/missing.png"));
+        assert!(
+            carrier_image_targets(&prepared.messages[0].content).is_empty(),
+            "the skipped entry drops out of the attachments array"
+        );
     }
 
     #[tokio::test]
@@ -2367,14 +2733,14 @@ mod tests {
         )
         .unwrap();
 
-        let native_tool_content = serde_json::json!({
-            "tool_call_id": "tc1",
-            "content": format!(
-                "generated [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
-                image_path.display()
-            ),
-        })
-        .to_string();
+        let native_tool_content = native_carrier(
+            "tc1",
+            "generated",
+            &[
+                image_path.display().to_string(),
+                "https://example.com/missing.png".to_string(),
+            ],
+        );
 
         let prepared = prepare_messages_for_provider(
             &[ChatMessage::tool(native_tool_content)],
@@ -2397,9 +2763,13 @@ mod tests {
             .get("content")
             .and_then(|v| v.as_str())
             .expect("content should remain a JSON string");
-        assert!(inner.contains("generated"));
-        assert!(inner.contains("data:image/png;base64,"));
-        assert!(inner.contains("1 of 2 attached image(s) could not be loaded"));
+        assert_eq!(
+            inner, "generated\n\nNote: 1 of 2 attached image(s) could not be loaded.",
+            "the body keeps its text and gains the load-failure note"
+        );
+        let refs = carrier_image_targets(&prepared.messages[0].content);
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
         assert!(!inner.contains("mixed-native-tool-result.png"));
         assert!(!inner.contains("https://example.com/missing.png"));
     }
@@ -2414,11 +2784,11 @@ mod tests {
         )
         .unwrap();
 
-        let native_tool_content = serde_json::json!({
-            "tool_call_id": "tc1",
-            "content": format!("generated screenshot [IMAGE:{}]", image_path.display().to_string()),
-        })
-        .to_string();
+        let native_tool_content = native_carrier(
+            "tc1",
+            "generated screenshot",
+            &[image_path.display().to_string()],
+        );
 
         let messages = vec![
             ChatMessage::tool(native_tool_content),
@@ -2449,8 +2819,15 @@ mod tests {
             .get("content")
             .and_then(|v| v.as_str())
             .expect("content should remain a JSON string");
-        assert!(inner.contains("generated screenshot"));
-        assert!(!inner.contains("[IMAGE:"));
+        assert_eq!(inner, "generated screenshot");
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[0].content)
+                .expect("stripped carrier must still parse");
+        assert!(parsed.declared);
+        assert!(
+            parsed.attachments.is_empty(),
+            "the stale strip empties the attachments array at the fixed position"
+        );
         assert!(!inner.contains("data:image"));
         assert!(!inner.contains("stale-native-tool-result.png"));
     }
@@ -2465,11 +2842,9 @@ mod tests {
         )
         .unwrap();
 
+        let body = "<tool_result name=\"image_gen\">Generated</tool_result>";
         let messages = vec![
-            ChatMessage::user(format!(
-                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
-                image_path.display()
-            )),
+            ChatMessage::user(prompt_carrier(body, &[image_path.display().to_string()])),
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
@@ -2482,9 +2857,15 @@ mod tests {
             .expect("preparation should strip stale prompt-mode tool images");
 
         assert!(!prepared.contains_images);
-        assert!(prepared.messages[0].content.contains("[Tool results]"));
-        assert!(prepared.messages[0].content.contains("Generated"));
-        assert!(!prepared.messages[0].content.contains("[IMAGE:"));
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&prepared.messages[0].content)
+                .expect("stripped prompt carrier must still parse");
+        assert!(parsed.declared);
+        assert!(
+            parsed.attachments.is_empty(),
+            "the stale strip rewrites the count header to zero"
+        );
+        assert_eq!(parsed.text, body, "the body survives the stale strip");
         assert!(!prepared.messages[0].content.contains("data:image"));
         assert!(
             !prepared.messages[0]
@@ -2502,11 +2883,11 @@ mod tests {
         std::fs::write(&stale_path, png).unwrap();
         std::fs::write(&fresh_path, png).unwrap();
 
-        let native_tool_content = serde_json::json!({
-            "tool_call_id": "tc1",
-            "content": format!("generated screenshot [IMAGE:{}]", stale_path.display().to_string()),
-        })
-        .to_string();
+        let native_tool_content = native_carrier(
+            "tc1",
+            "generated screenshot",
+            &[stale_path.display().to_string()],
+        );
 
         let messages = vec![
             ChatMessage::tool(native_tool_content),
@@ -2532,8 +2913,11 @@ mod tests {
             .get("content")
             .and_then(|v| v.as_str())
             .expect("content should remain a JSON string");
-        assert!(inner.contains("generated screenshot"));
-        assert!(!inner.contains("[IMAGE:"));
+        assert_eq!(inner, "generated screenshot");
+        assert!(
+            carrier_image_targets(&prepared.messages[0].content).is_empty(),
+            "the stale tool image is stripped from the attachments array"
+        );
         assert!(!inner.contains("data:image"));
         assert!(!inner.contains("stale-tool-result.png"));
 
@@ -2555,19 +2939,12 @@ mod tests {
         let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
         std::fs::write(&image_path, png).unwrap();
 
-        let image_tool_content = serde_json::json!({
-            "tool_call_id": "tc_image",
-            "content": format!(
-                "generated screenshot [IMAGE:{}]",
-                image_path.display().to_string()
-            ),
-        })
-        .to_string();
-        let weather_tool_content = serde_json::json!({
-            "tool_call_id": "tc_weather",
-            "content": "Sunny, 25C".to_string(),
-        })
-        .to_string();
+        let image_tool_content = native_carrier(
+            "tc_image",
+            "generated screenshot",
+            &[image_path.display().to_string()],
+        );
+        let weather_tool_content = native_carrier("tc_weather", "Sunny, 25C", &[]);
 
         let messages = vec![
             ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
@@ -2612,11 +2989,17 @@ mod tests {
             .get("content")
             .and_then(|v| v.as_str())
             .expect("content should remain a JSON string");
-        assert!(inner.contains("generated screenshot"));
-        // The marker is rewritten in place to wrap the data URI, so the raw
-        // filesystem path must be gone while the payload is inline.
-        assert!(inner.contains("data:image/png;base64,"));
-        assert!(!inner.contains("same-turn-tool-result.png"));
+        assert_eq!(inner, "generated screenshot");
+        // The declared attachment is rewritten to a data URI in place, so the
+        // raw filesystem path is gone from the whole message.
+        let refs = carrier_image_targets(&prepared.messages[2].content);
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+        assert!(
+            !prepared.messages[2]
+                .content
+                .contains("same-turn-tool-result.png")
+        );
     }
 
     #[tokio::test]
@@ -2626,19 +3009,12 @@ mod tests {
         let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
         std::fs::write(&image_path, png).unwrap();
 
-        let image_tool_content = serde_json::json!({
-            "tool_call_id": "tc_image",
-            "content": format!(
-                "generated screenshot [IMAGE:{}]",
-                image_path.display().to_string()
-            ),
-        })
-        .to_string();
-        let weather_tool_content = serde_json::json!({
-            "tool_call_id": "tc_weather",
-            "content": "Sunny, 25C".to_string(),
-        })
-        .to_string();
+        let image_tool_content = native_carrier(
+            "tc_image",
+            "generated screenshot",
+            &[image_path.display().to_string()],
+        );
+        let weather_tool_content = native_carrier("tc_weather", "Sunny, 25C", &[]);
 
         let messages = vec![
             ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
@@ -2684,8 +3060,11 @@ mod tests {
             .get("content")
             .and_then(|v| v.as_str())
             .expect("content should remain a JSON string");
-        assert!(inner.contains("generated screenshot"));
-        assert!(!inner.contains("[IMAGE:"));
+        assert_eq!(inner, "generated screenshot");
+        assert!(
+            carrier_image_targets(&prepared.messages[2].content).is_empty(),
+            "the turn's tool images are stale once the next user message arrives"
+        );
         assert!(!inner.contains("data:image"));
         assert!(!inner.contains("same-turn-tool-result.png"));
 
@@ -2704,16 +3083,14 @@ mod tests {
         let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
         std::fs::write(&image_path, png).unwrap();
 
+        let body = "<tool_result name=\"image_gen\">Generated</tool_result>";
         let messages = vec![
             ChatMessage::user("Compare these two.".to_string()),
-            ChatMessage::user(format!(
-                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
-                image_path.display()
+            ChatMessage::user(prompt_carrier(body, &[image_path.display().to_string()])),
+            ChatMessage::user(prompt_carrier(
+                "<tool_result name=\"weather\">Sunny, 25C</tool_result>",
+                &[],
             )),
-            ChatMessage::user(
-                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
-                    .to_string(),
-            ),
         ];
 
         let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
@@ -2725,13 +3102,18 @@ mod tests {
             "an earlier prompt-mode tool-result carrier in the same turn must stay normalized"
         );
 
-        assert!(prepared.messages[1].content.contains("[Tool results]"));
-        assert!(prepared.messages[1].content.contains("Generated"));
-        assert!(
-            prepared.messages[1]
-                .content
-                .contains("data:image/png;base64,")
-        );
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&prepared.messages[1].content)
+                .expect("prepared prompt carrier must parse");
+        assert_eq!(parsed.text, body);
+        let refs: Vec<String> = parsed
+            .attachments
+            .into_iter()
+            .filter(|m| m.kind == zeroclaw_api::media::MarkerKind::Image)
+            .map(|m| m.target)
+            .collect();
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
         assert!(
             !prepared.messages[1]
                 .content
@@ -2770,9 +3152,9 @@ mod tests {
                 })
                 .to_string(),
             ),
-            ChatMessage::user(format!(
-                "[Tool results]\n<tool_result name=\"image_tool\">Generated [IMAGE:{}]</tool_result>",
-                tool_image_path.display()
+            ChatMessage::user(prompt_carrier(
+                "<tool_result name=\"image_tool\">Generated</tool_result>",
+                &[tool_image_path.display().to_string()],
             )),
             ChatMessage::assistant(
                 serde_json::json!({
@@ -2783,10 +3165,10 @@ mod tests {
                 })
                 .to_string(),
             ),
-            ChatMessage::user(
-                "[Tool results]\n<tool_result name=\"session_info\">session id: abc-123</tool_result>"
-                    .to_string(),
-            ),
+            ChatMessage::user(prompt_carrier(
+                "<tool_result name=\"session_info\">session id: abc-123</tool_result>",
+                &[],
+            )),
         ];
 
         let config = MultimodalConfig {
@@ -2824,7 +3206,8 @@ mod tests {
         assert!(
             prepared.messages[2]
                 .content
-                .contains("data:image/png;base64,")
+                .contains("data:image/png;base64,"),
+            "the normalized attachment rides the carrier's marker lines"
         );
         assert!(
             !prepared.messages[2]
@@ -2867,18 +3250,18 @@ mod tests {
                 role: "assistant".to_string(),
                 content: "On it.".to_string(),
             },
-            ChatMessage::user(
-                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:/tmp/tool-image.png]</tool_result>"
-                    .to_string(),
-            ),
+            ChatMessage::user(prompt_carrier(
+                "<tool_result name=\"image_gen\">Generated</tool_result>",
+                &["/tmp/tool-image.png".to_string()],
+            )),
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Checked.".to_string(),
             },
-            ChatMessage::user(
-                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
-                    .to_string(),
-            ),
+            ChatMessage::user(prompt_carrier(
+                "<tool_result name=\"weather\">Sunny, 25C</tool_result>",
+                &[],
+            )),
         ];
 
         let trimmed = trim_images_by_age(&messages, 1);
@@ -2891,7 +3274,11 @@ mod tests {
     #[test]
     fn count_image_markers_ignores_stale_tool_results() {
         let messages = vec![
-            ChatMessage::tool("[IMAGE:/tmp/stale-tool.png]\nGenerated".to_string()),
+            ChatMessage::tool(native_carrier(
+                "tc1",
+                "Generated",
+                &["/tmp/stale-tool.png".to_string()],
+            )),
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Done.".to_string(),
@@ -2903,7 +3290,11 @@ mod tests {
 
         let messages = vec![
             ChatMessage::user("Create an image".to_string()),
-            ChatMessage::tool("[IMAGE:/tmp/latest-tool.png]\nGenerated".to_string()),
+            ChatMessage::tool(native_carrier(
+                "tc1",
+                "Generated",
+                &["/tmp/latest-tool.png".to_string()],
+            )),
         ];
 
         assert_eq!(count_image_markers(&messages), 1);
@@ -2915,12 +3306,16 @@ mod tests {
         // the same user turn; the vision gate must still see its image.
         let messages = vec![
             ChatMessage::user("Create an image, then check the weather.".to_string()),
-            ChatMessage::tool("[IMAGE:/tmp/same-turn-tool.png]\nGenerated".to_string()),
+            ChatMessage::tool(native_carrier(
+                "tc1",
+                "Generated",
+                &["/tmp/same-turn-tool.png".to_string()],
+            )),
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Checking the weather next.".to_string(),
             },
-            ChatMessage::tool("Sunny, 25C".to_string()),
+            ChatMessage::tool(native_carrier("tc2", "Sunny, 25C", &[])),
         ];
 
         assert_eq!(count_image_markers(&messages), 1);
@@ -2959,7 +3354,11 @@ mod tests {
         // message (its markers are not user-sent and must not be counted here).
         let trailing_tool_result = vec![
             ChatMessage::user("inspect [IMAGE:/tmp/a.png]".to_string()),
-            ChatMessage::tool("[IMAGE:/tmp/tool.png]\nGenerated".to_string()),
+            ChatMessage::tool(native_carrier(
+                "tc1",
+                "Generated",
+                &["/tmp/tool.png".to_string()],
+            )),
         ];
         assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
     }
@@ -3096,7 +3495,11 @@ mod tests {
     fn trim_old_images_counts_latest_tool_messages() {
         let messages = vec![
             ChatMessage::user("[IMAGE:/tmp/user-old.png]\nOldest".to_string()),
-            ChatMessage::tool("[IMAGE:/tmp/tool-new.png]\nGenerated".to_string()),
+            ChatMessage::tool(native_carrier(
+                "tc1",
+                "Generated",
+                &["/tmp/tool-new.png".to_string()],
+            )),
         ];
 
         let trimmed = trim_old_images(&messages, 1);
@@ -3104,8 +3507,14 @@ mod tests {
         assert!(refs0.is_empty(), "oldest user image should be stripped");
         assert!(trimmed[0].content.contains("Oldest"));
 
-        let (_, refs1) = parse_image_markers(&trimmed[1].content);
-        assert_eq!(refs1.len(), 1);
+        assert_eq!(
+            carrier_image_targets(&trimmed[1].content),
+            vec!["/tmp/tool-new.png".to_string()],
+            "the newest image, on a carrier, survives the cap"
+        );
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&trimmed[1].content).unwrap();
+        assert_eq!(parsed.text, "Generated", "the carrier body is untouched");
     }
 
     #[test]
@@ -3476,5 +3885,355 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+    // ── attachment-identity contract: tool text is never scanned ──────────
+
+    #[tokio::test]
+    async fn prepare_never_promotes_native_carrier_body_markers() {
+        // DECISIVE: a text-only tool result whose body carries a fake count
+        // header and a marker to an existing, valid PNG. The carrier declared
+        // zero attachments, so nothing in the body may be promoted, and the
+        // body must survive byte for byte.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("fake-body-marker.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let body = format!(
+            "[Tool attachments: 1]\n[IMAGE:{}]\nplain tool output",
+            image_path.display()
+        );
+
+        let messages = vec![ChatMessage::tool(native_carrier("tc1", &body, &[]))];
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(!prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].content, messages[0].content);
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[0].content)
+                .unwrap();
+        assert!(parsed.declared);
+        assert!(parsed.attachments.is_empty());
+        assert_eq!(parsed.text, body);
+        assert_eq!(count_image_markers(&prepared.messages), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_never_promotes_prompt_carrier_body_markers() {
+        // DECISIVE, prompt shape: the count header says zero, so the body's
+        // fake header and real-file marker are body.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("fake-prompt-body-marker.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let body = format!(
+            "<tool_result name=\"shell\">cat notes.txt\n[Tool attachments: 1]\n[IMAGE:{}]\n</tool_result>",
+            image_path.display()
+        );
+
+        let messages = vec![ChatMessage::user(prompt_carrier(&body, &[]))];
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(!prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].content, messages[0].content);
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&prepared.messages[0].content)
+                .unwrap();
+        assert!(parsed.declared);
+        assert!(parsed.attachments.is_empty());
+        assert_eq!(parsed.text, body);
+    }
+
+    #[tokio::test]
+    async fn prepare_warns_once_on_legacy_carrier_body_markers() {
+        // Observability: a pre-upgrade or third-party carrier with marker
+        // syntax in its body is visible as one WARN per request, with counts
+        // only — never marker text.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let body = format!(
+            "saw a marker in source: [IMAGE:/tmp/source-example.png]\n{}",
+            "x".repeat(80)
+        );
+        let messages = vec![
+            ChatMessage::user("read the file".to_string()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "tc1",
+                    "content": body,
+                })
+                .to_string(),
+            ),
+        ];
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+        assert!(!prepared.contains_images);
+        assert_eq!(
+            prepared.messages[1].content, messages[1].content,
+            "a legacy carrier passes through untouched"
+        );
+
+        let record = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Ok(value)
+                        if value.get("message").and_then(|v| v.as_str())
+                            == Some(
+                                "legacy tool-result carrier body contains image marker syntax; treated as text, not attachments",
+                            ) =>
+                    {
+                        break value
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("broadcast closed before the legacy-carrier warning arrived")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("legacy-carrier warning should arrive");
+
+        let attrs = record.get("attributes").expect("record carries attributes");
+        assert_eq!(
+            attrs.get("image_marker_count").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            attrs.get("native_carriers").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert!(
+            !serde_json::to_string(&record)
+                .unwrap()
+                .contains("/tmp/source-example.png"),
+            "the warning must not carry marker text"
+        );
+
+        // C6: exactly ONE matching record for one preparation. The original
+        // assertion stopped at the first match, so a second emission would
+        // have passed unnoticed. Emission is synchronous inside
+        // `prepare_messages_for_provider`, so anything beyond the first is
+        // already buffered here.
+        let mut extra_matches = 0usize;
+        while let Ok(value) = rx.try_recv() {
+            if value.get("message").and_then(|v| v.as_str())
+                == Some(
+                    "legacy tool-result carrier body contains image marker syntax; treated as text, not attachments",
+                )
+            {
+                extra_matches += 1;
+            }
+        }
+        assert_eq!(
+            extra_matches, 0,
+            "one preparation must emit the legacy-carrier warning exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_carrier_warns_once_per_preparation_not_once_per_request() {
+        // C6: a runtime-to-compatible request prepares the same history
+        // twice — the runtime's vision-route preparation, then the
+        // compatible provider's `normalize_messages_for_upstream` — so a
+        // surviving current-turn legacy body warns once per preparation,
+        // twice per request. Two is accepted and pinned here: the layers
+        // share no per-request state, and gating the second emission would
+        // mean threading a "already warned" flag through message values, a
+        // wider change than the log noise it removes.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let marker =
+            zeroclaw_api::tool_carrier::marker_line(&image_marker("/tmp/source-example.png"));
+        let body = format!("saw a marker in source: {marker}\n{}", "x".repeat(80));
+        let messages = vec![
+            ChatMessage::user("read the file".to_string()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "tc1",
+                    "content": body,
+                })
+                .to_string(),
+            ),
+        ];
+
+        // The runtime pass (vision_route.rs), then the compatible pass
+        // (normalize_messages_for_upstream) over the first pass's output.
+        let first = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+        let second = prepare_messages_for_provider(&first.messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            second.messages[1].content, messages[1].content,
+            "the legacy carrier survives both passes untouched"
+        );
+
+        let mut matches = 0usize;
+        while let Ok(value) = rx.try_recv() {
+            if value.get("message").and_then(|v| v.as_str())
+                == Some(
+                    "legacy tool-result carrier body contains image marker syntax; treated as text, not attachments",
+                )
+            {
+                matches += 1;
+            }
+        }
+        assert_eq!(
+            matches, 2,
+            "once per preparation invocation, twice for the runtime-then-compatible request shape"
+        );
+    }
+
+    #[test]
+    fn strip_message_media_keeps_carrier_bodies_verbatim() {
+        // No-vision degrade: a carrier with marker-looking body text keeps the
+        // body byte for byte; only declared attachments drop.
+        let body = "the source contains [IMAGE:/tmp/example.png] as literal text";
+        let declared = ChatMessage::tool(native_carrier(
+            "tc1",
+            body,
+            &["/tmp/real-attachment.png".to_string()],
+        ));
+        let stripped = strip_message_media(&declared);
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&stripped.content).unwrap();
+        assert!(parsed.declared);
+        assert!(parsed.attachments.is_empty());
+        assert_eq!(parsed.text, body);
+
+        // Legacy carrier: nothing to degrade, nothing to rewrite.
+        let legacy = ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "tc1",
+                "content": body,
+            })
+            .to_string(),
+        );
+        assert_eq!(strip_message_media(&legacy).content, legacy.content);
+
+        // User messages still degrade their markers as before.
+        let user = ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string());
+        assert_eq!(
+            strip_message_media(&user).content,
+            format!("look at this {MEDIA_PLACEHOLDER}")
+        );
+    }
+
+    #[test]
+    fn parse_user_message_image_refs_lifts_only_carrier_attachments() {
+        // Declared carrier: image lines lift, other lines stay, body verbatim.
+        let content = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+            "<tool_result name=\"shell\">ls\n</tool_result>",
+            &[
+                image_marker("/tmp/a.png"),
+                zeroclaw_api::media::RenderedMarker {
+                    target: "/tmp/clip.ogg".to_string(),
+                    kind: zeroclaw_api::media::MarkerKind::Audio,
+                },
+            ],
+        );
+        let (text, refs) = parse_user_message_image_refs(&content);
+        assert_eq!(refs, vec!["/tmp/a.png".to_string()]);
+        // The image line lifts; the audio line stays as a carried, non-image
+        // attachment line, and the header count reflects what is left.
+        let audio_line =
+            zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
+                target: "/tmp/clip.ogg".to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Audio,
+            });
+        assert_eq!(
+            text.lines().take(3).collect::<Vec<_>>(),
+            vec![
+                zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX,
+                "[Tool attachments: 1]",
+                audio_line.as_str(),
+            ]
+        );
+        assert!(text.contains("<tool_result name=\"shell\">"));
+
+        // Legacy carrier: no refs, text untouched.
+        let legacy = "[Tool results]\nbody mentions [IMAGE:/tmp/fake.png]";
+        let (text, refs) = parse_user_message_image_refs(legacy);
+        assert!(refs.is_empty());
+        assert_eq!(text, legacy);
+
+        // Plain user text keeps the marker-lifting behavior.
+        let user_text = "see [IMAGE:/tmp/a.png] now";
+        let (text, refs) = parse_user_message_image_refs(user_text);
+        assert_eq!(refs, vec!["/tmp/a.png".to_string()]);
+        // Marker lifting keeps the surrounding spaces, exactly as before.
+        assert_eq!(text, "see  now");
+    }
+
+    #[tokio::test]
+    async fn prepare_keeps_image_when_audio_attachment_drops_from_declared_carrier() {
+        // C1: the audio sanitizer used to run before carriers were parsed, so
+        // a declared carrier's audio marker line was rewritten, the count no
+        // longer matched, and the strict parser degraded the whole carrier to
+        // legacy — the image was lost with it. Audio now drops from the
+        // declared list: the image lifts, the body stays verbatim, and the
+        // carrier never falls back to legacy.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("mixed.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let attachments = vec![
+            image_marker(image_path.display().to_string()),
+            zeroclaw_api::media::RenderedMarker {
+                target: "/tmp/clip.ogg".to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Audio,
+            },
+        ];
+        let body = "tool text body";
+        let content = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(body, &attachments);
+        let messages = vec![ChatMessage::user(content)];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(
+            prepared.contains_images,
+            "the image must survive the audio drop"
+        );
+        assert_eq!(prepared.messages.len(), 1);
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&prepared.messages[0].content)
+                .expect("still a carrier, never legacy");
+        assert!(parsed.declared, "the carrier must not degrade to legacy");
+        assert_eq!(parsed.text, body, "the body stays verbatim");
+        // The image attachment is normalized to a data URI and survives; the
+        // audio attachment is gone from the declared list.
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(
+            parsed.attachments[0].kind,
+            zeroclaw_api::media::MarkerKind::Image
+        );
+        assert!(parsed.attachments[0].target.starts_with("data:image/"));
     }
 }
