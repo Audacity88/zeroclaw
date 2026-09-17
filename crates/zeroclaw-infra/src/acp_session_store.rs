@@ -1058,8 +1058,8 @@ impl AcpSessionStore {
 
     /// Produce provider-safe ACP history while preserving client-visible text.
     /// Only an immediately adjacent tool-call/result pair is retained, and one
-    /// result is kept for each unambiguous call id. Duplicate call IDs within
-    /// a batch are rejected; recovery markers stay transcript-only.
+    /// result is kept for each unambiguous call id. Duplicate call or result IDs
+    /// within a batch are rejected; recovery markers stay transcript-only.
     pub fn provider_safe_history(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
         let mut repaired = Vec::new();
         let mut index = 0;
@@ -1095,8 +1095,11 @@ impl AcpSessionStore {
                             if call_id_counts.get(call.id.as_str()) != Some(&1) {
                                 continue;
                             }
-                            if let Some(result) =
-                                results.iter().find(|result| result.tool_call_id == call.id)
+                            let mut matching_results = results
+                                .iter()
+                                .filter(|result| result.tool_call_id == call.id);
+                            if let Some(result) = matching_results.next()
+                                && matching_results.next().is_none()
                             {
                                 paired_calls.push(call.clone());
                                 paired_results.push(result.clone());
@@ -1963,18 +1966,11 @@ mod tests {
                 ],
                 reasoning_content: None,
             },
-            ConversationMessage::ToolResults(vec![
-                ToolResultMessage {
-                    tool_call_id: "paired".to_string(),
-                    tool_name: "shell".to_string(),
-                    content: "first".to_string(),
-                },
-                ToolResultMessage {
-                    tool_call_id: "paired".to_string(),
-                    tool_name: "shell".to_string(),
-                    content: "duplicate".to_string(),
-                },
-            ]),
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "paired".to_string(),
+                tool_name: "shell".to_string(),
+                content: "first".to_string(),
+            }]),
             ConversationMessage::ToolResults(vec![ToolResultMessage {
                 tool_call_id: "orphan".to_string(),
                 tool_name: "shell".to_string(),
@@ -2001,7 +1997,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_safe_history_rejects_duplicate_call_ids_per_batch() {
+    fn provider_safe_history_rejects_ambiguous_tool_ids_per_batch() {
         let call = |id: &str| ToolCall {
             id: id.into(),
             name: "shell".into(),
@@ -2013,9 +2009,9 @@ mod tests {
             tool_name: "shell".into(),
             content: format!("output for {id}"),
         };
-        for result_count in [1, 2] {
+        for (call_count, result_count) in [(2, 1), (2, 2), (1, 2)] {
             for keep_unique_peer in [false, true] {
-                let mut calls = vec![call("duplicate"), call("duplicate")];
+                let mut calls = vec![call("duplicate"); call_count];
                 let mut results = vec![result("duplicate"); result_count];
                 if keep_unique_peer {
                     calls.push(call("unique"));
@@ -2055,12 +2051,14 @@ mod tests {
                 let mut messages = messages;
                 messages.extend(later.clone());
                 expected.extend(later);
+                let original = serde_json::to_value(&messages).unwrap();
                 assert_eq!(
                     serde_json::to_value(AcpSessionStore::provider_safe_history(&messages))
                         .unwrap(),
                     serde_json::to_value(expected).unwrap(),
-                    "duplicate result count={result_count}, unique peer={keep_unique_peer}"
+                    "call count={call_count}, result count={result_count}, unique peer={keep_unique_peer}"
                 );
+                assert_eq!(serde_json::to_value(&messages).unwrap(), original);
             }
         }
     }

@@ -14067,8 +14067,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn acp_session_close_and_kill_hard_abort_turn_paused_before_provider() {
-        for method in ["close", "kill"] {
+    async fn acp_session_removal_hard_abort_and_storage_failure_recovery() {
+        for method in ["close", "kill", "kill_failure", "delete_failure"] {
+            let storage_failure = method.ends_with("_failure");
             let tmp = tempfile::TempDir::new().unwrap();
             let config = make_acp_test_config(&tmp);
             let data_dir = config.data_dir.clone();
@@ -14076,6 +14077,31 @@ mod tests {
                 make_persistence_test_dispatcher(config, &data_dir);
             let sid = "acp-hard-removal-entry-pause";
             acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+            acp_store
+                .append_turn(
+                    sid,
+                    &[
+                        ConversationMessage::Chat(ChatMessage::user("previous question")),
+                        ConversationMessage::Chat(ChatMessage::assistant(
+                            "previous durable answer",
+                        )),
+                    ],
+                )
+                .unwrap();
+            let db = rusqlite::Connection::open(data_dir.join("sessions/acp-sessions.db")).unwrap();
+            if storage_failure {
+                // Fail only the requested removal, not checkpoint persistence.
+                let operation = if method == "kill_failure" {
+                    "UPDATE OF killed_at"
+                } else {
+                    "DELETE"
+                };
+                db.execute_batch(&format!(
+                    "CREATE TRIGGER reject_removal BEFORE {operation} ON acp_sessions
+                     BEGIN SELECT RAISE(ABORT, 'injected removal failure'); END;"
+                ))
+                .unwrap();
+            }
             let (entry_pause, entered, _release) = crate::agent::agent::TestTurnEntryPause::new();
             let agent = crate::agent::agent::Agent::builder()
                 .model_provider(Box::new(FailingProvider))
@@ -14126,6 +14152,11 @@ mod tests {
                             .handle_session_close(&json!({"session_id": sid}))
                             .await
                     }
+                    "delete_failure" => {
+                        removal_handle
+                            .handle_session_delete(&json!({"session_id": sid}))
+                            .await
+                    }
                     _ => {
                         removal_handle
                             .handle_session_kill(&json!({"session_id": sid}))
@@ -14151,27 +14182,38 @@ mod tests {
             assert_eq!(prompt_result["stop_reason"], json!("cancelled"));
             assert_eq!(prompt_result["content"], json!(""));
 
-            let removed = removal_task
-                .await
-                .expect("removal task must not panic")
-                .expect("removal must succeed after hard cancellation");
+            let removal_result = removal_task.await.expect("removal task must not panic");
+            if storage_failure {
+                let error = removal_result.expect_err("durable removal must fail");
+                assert_eq!(error.code, INTERNAL_ERROR);
+                assert!(!acp_store.is_session_killed(sid).unwrap());
+                db.execute_batch("DROP TRIGGER reject_removal;").unwrap();
+            } else {
+                let removed = removal_result.expect("removal must succeed");
+                assert_eq!(
+                    removed[if method == "close" {
+                        "closed"
+                    } else {
+                        "killed"
+                    }],
+                    json!(true)
+                );
+            }
             assert!(sessions.get_agent(sid).await.is_none());
             if method == "close" {
-                assert_eq!(removed["closed"], json!(true));
                 assert!(!acp_store.is_session_killed(sid).unwrap());
                 assert!(
                     acp_store
                         .recover_turn_checkpoint(sid, "interrupted")
                         .unwrap(),
-                    "close must retain the recoverable checkpoint"
+                    "close or failed removal must retain the recoverable checkpoint"
                 );
                 let restored = acp_store.load_session(sid).unwrap().unwrap();
                 assert!(restored.messages.iter().any(|message| matches!(
                     message,
                     ConversationMessage::Chat(chat) if chat.content == "pause before provider"
                 )));
-            } else {
-                assert_eq!(removed["killed"], json!(true));
+            } else if method == "kill" {
                 assert!(acp_store.is_session_killed(sid).unwrap());
                 assert!(
                     !acp_store
@@ -14190,9 +14232,54 @@ mod tests {
                 .await;
             assert_eq!(
                 resumed.is_ok(),
-                method == "close",
-                "only a closed ACP session may resume after hard cancellation"
+                method == "close" || storage_failure,
+                "close and failed removal must remain resumable"
             );
+            if storage_failure {
+                // Exercise normal resume recovery, not a test-only promotion.
+                assert!(
+                    !acp_store
+                        .recover_turn_checkpoint(sid, "unexpected second recovery")
+                        .unwrap()
+                );
+                let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let (started, _started_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (chunk_seen, _chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+                sessions
+                    .get_agent(sid)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .set_model_provider(Box::new(AcpHistoryProbeProvider {
+                        seen_messages: Arc::clone(&seen),
+                        started,
+                        chunk_seen,
+                        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        cancel_first: false,
+                    }));
+                let result = dispatcher
+                    .handle_session_prompt(&json!({
+                        "session_id": sid,
+                        "prompt": "continue after failed removal",
+                    }))
+                    .await
+                    .expect("a fresh prompt must succeed after storage recovery");
+                assert_eq!(result["stop_reason"], json!("end_turn"));
+                assert_eq!(result["content"], json!("follow-up answer"));
+                let seen = seen.lock();
+                assert_eq!(seen.len(), 1);
+                assert!(
+                    seen[0]
+                        .iter()
+                        .any(|message| message.content == "pause before provider")
+                );
+                assert!(
+                    seen[0]
+                        .iter()
+                        .any(|message| message.content == "previous durable answer")
+                );
+            }
         }
     }
 
