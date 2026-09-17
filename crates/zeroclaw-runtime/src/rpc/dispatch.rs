@@ -3490,7 +3490,6 @@ impl RpcDispatcher {
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let req: SessionMessagesParams = parse_params(params)?;
         let mut messages = Vec::new();
-        let mut acp_session_found = false;
 
         // Resolve the canonical owner before reading either durable store.
         // ACP rows can outlive a Chat session that reused the same caller-
@@ -3567,12 +3566,13 @@ impl RpcDispatcher {
             )
             .await?
             {
-                acp_session_found = true;
                 messages = conversation_message_entries(&data.messages);
             }
         }
 
-        if !acp_session_found {
+        // A missing ACP row can be observed during deletion while its live
+        // owner still exists. Never cross into another owner's Chat history.
+        if !matches!(owner_mode, Some(ChatMode::Acp)) {
             let backend = self
                 .ctx
                 .session_backend
@@ -12383,6 +12383,44 @@ mod tests {
         assert_eq!(page.messages.len(), 2);
         assert_eq!(page.messages[0].content, "let me check the logs");
         assert_eq!(page.messages[1].tool_call_id.as_deref(), Some("tc-1"));
+    }
+
+    #[tokio::test]
+    async fn live_acp_session_messages_never_fall_back_after_durable_deletion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "live-acp-deleted-row";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .unwrap();
+        for key in [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")] {
+            chat_backend
+                .append(&key, &ChatMessage::assistant("unrelated Chat history"))
+                .unwrap();
+        }
+        // Hold deletion's admission guard and reproduce its durable-delete /
+        // live-removal window without timing-dependent task scheduling.
+        let _removal_guard = sessions.session_queue.acquire(sid).await.unwrap();
+        acp_store.delete_session(sid).unwrap();
+        assert_eq!(sessions.chat_mode(sid).await, Some(ChatMode::Acp));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatcher.handle_session_messages_for_test(&json!({ "session_id": sid })),
+        )
+        .await
+        .expect("live history reads must not wait for removal")
+        .unwrap();
+        assert_eq!(result["total"], json!(0));
+        assert_eq!(result["messages"], json!([]));
     }
 
     #[tokio::test]
