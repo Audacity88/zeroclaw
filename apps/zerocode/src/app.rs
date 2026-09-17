@@ -564,6 +564,26 @@ fn set_dock_plan_visible(
     DockAction::TogglePlan
 }
 
+fn handle_dock_mouse(
+    dock: &mut ConversationDock,
+    mode: Mode,
+    chat: &mut chat::Chat,
+    acp: &mut acp::Acp,
+    mouse: &crossterm::event::MouseEvent,
+) -> (bool, Option<DockAction>) {
+    let pane_visible = match mode {
+        Mode::Chat => chat.plan_visible(),
+        Mode::Acp => acp.plan_visible(),
+        _ => false,
+    };
+    let plan_was_visible = dock.plan_visible && pane_visible;
+    let result = dock.handle_mouse(mouse);
+    if result.1 == Some(DockAction::TogglePlan) {
+        set_dock_plan_visible(dock, mode, chat, acp, !plan_was_visible);
+    }
+    result
+}
+
 fn apply_dock_plan_key_request(
     dock: &mut ConversationDock,
     mode: Mode,
@@ -2542,7 +2562,8 @@ pub async fn run(
                     dock.clear_capture();
                     continue;
                 }
-                let (dock_consumed, dock_action) = dock.handle_mouse(&mouse);
+                let (dock_consumed, dock_action) =
+                    handle_dock_mouse(&mut dock, mode, &mut chat_pane, &mut acp_pane, &mouse);
                 if dock_consumed {
                     match mode {
                         Mode::Chat => chat_pane.finish_transcript_drag_if_released(&mouse),
@@ -2550,16 +2571,6 @@ pub async fn run(
                         _ => {}
                     }
                     if let Some(action) = dock_action {
-                        if action == DockAction::TogglePlan {
-                            let visible = dock.plan_visible;
-                            set_dock_plan_visible(
-                                &mut dock,
-                                mode,
-                                &mut chat_pane,
-                                &mut acp_pane,
-                                visible,
-                            );
-                        }
                         if !dock.sessions_visible {
                             sidebar.close_picker();
                         }
@@ -3660,14 +3671,15 @@ mod tests {
                 } else {
                     layout.close[2]
                 };
-                let (_, action) = dock.handle_mouse(&dock_mouse(
-                    MouseEventKind::Down(MouseButton::Left),
-                    target.x,
-                    target.y,
-                ));
+                let (_, action) = handle_dock_mouse(
+                    &mut dock,
+                    mode,
+                    &mut chat,
+                    &mut acp,
+                    &dock_mouse(MouseEventKind::Down(MouseButton::Left), target.x, target.y),
+                );
                 assert_eq!(action, Some(DockAction::TogglePlan));
                 let visible = dock.plan_visible;
-                set_dock_plan_visible(&mut dock, mode, &mut chat, &mut acp, visible);
                 assert_eq!(visible, expected);
                 for _ in 0..2 {
                     match mode {
@@ -3708,6 +3720,42 @@ mod tests {
             }
             assert!(apply_dock_plan_key_request(&mut dock, mode, &mut chat, &mut acp).is_some());
             assert!(dock.plan_visible);
+
+            // Hide here, reopen in the other mode, then reopen here in one click.
+            let other_mode = if mode == Mode::Chat {
+                Mode::Acp
+            } else {
+                Mode::Chat
+            };
+            for (active_mode, expected) in [(mode, false), (other_mode, true), (mode, true)] {
+                let pane_visible = match active_mode {
+                    Mode::Chat => chat.plan_visible(),
+                    Mode::Acp => acp.plan_visible(),
+                    _ => unreachable!(),
+                };
+                let target = dock.layout(area, active_mode, pane_visible).toggles[2];
+                assert_eq!(
+                    handle_dock_mouse(
+                        &mut dock,
+                        active_mode,
+                        &mut chat,
+                        &mut acp,
+                        &dock_mouse(MouseEventKind::Down(MouseButton::Left), target.x, target.y),
+                    ),
+                    (true, Some(DockAction::TogglePlan))
+                );
+                let pane_visible = match active_mode {
+                    Mode::Chat => chat.plan_visible(),
+                    Mode::Acp => acp.plan_visible(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(dock.plan_visible, expected);
+                assert_eq!(pane_visible, expected);
+                assert_eq!(
+                    dock.layout(area, active_mode, pane_visible).plan.is_some(),
+                    expected
+                );
+            }
         }
     }
 
