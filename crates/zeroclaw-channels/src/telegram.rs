@@ -1760,6 +1760,7 @@ impl TelegramChannel {
         let Some(config) = &self.persist else {
             return false;
         };
+        let config = config.config();
         let live = config.read();
         let Some(context) =
             Self::model_picker_context(&live, &self.alias, state.runtime_routes.as_ref())
@@ -1820,6 +1821,7 @@ impl TelegramChannel {
             return ModelPickerCallbackOutcome::Rejected;
         }
         let context = {
+            let config = config.config();
             let live = config.read();
             let Some(mut context) =
                 Self::model_picker_context(&live, &self.alias, state.runtime_routes.as_ref())
@@ -6657,6 +6659,7 @@ impl Channel for TelegramChannel {
                 .collect::<Vec<_>>(),
         );
         let context = {
+            let config = config.config();
             let live = config.read();
             let Some(mut context) =
                 Self::model_picker_context(&live, &self.alias, runtime_routes.as_ref())

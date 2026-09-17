@@ -153,6 +153,18 @@ pub(crate) async fn persist_external_peer(
     alias: &str,
     identity: &str,
 ) -> anyhow::Result<()> {
+    persist_external_peer_with_cancellation(persist, channel_type, alias, identity, None).await
+}
+
+/// Fence detached pairing callbacks with their listener's lifetime. Once a
+/// write owns the config lock, finish save and publication without cancellation.
+pub(crate) async fn persist_external_peer_with_cancellation(
+    persist: Option<&LiveConfigAuthority>,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> anyhow::Result<()> {
     use anyhow::Context;
 
     let Some(authority) = persist else {
@@ -172,7 +184,23 @@ pub(crate) async fn persist_external_peer(
         return Ok(());
     };
     let config_write_lock = authority.config_write_lock();
-    let _config_write_guard = config_write_lock.lock().await;
+    let _config_write_guard = match cancellation {
+        Some(cancel) => {
+            let guard = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => anyhow::bail!("pairing listener retired before persistence"),
+                guard = config_write_lock.lock() => guard,
+            };
+            // Gateway generation retirement holds this same lock. Logout/drop
+            // only stops admission; an already-admitted save must finish.
+            anyhow::ensure!(
+                !cancel.is_cancelled(),
+                "pairing listener retired before persistence"
+            );
+            guard
+        }
+        None => config_write_lock.lock().await,
+    };
     let config = authority.config();
     let mut snapshot = config.read().clone();
     if !merge_external_peer(&mut snapshot, channel_type, alias, identity)? {
@@ -504,6 +532,101 @@ mod tests {
         persist_external_peer(None, "whatsapp", "admin", "+15551234567")
             .await
             .expect("missing handle is a soft no-op");
+    }
+
+    #[tokio::test]
+    async fn retired_listener_cannot_persist_from_a_detached_callback() {
+        use std::future::Future;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = config_with_whatsapp("admin");
+        config.config_path = temp.path().join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = LiveConfigAuthority::new(config);
+        let config_write_lock = authority.config_write_lock();
+        let guard = config_write_lock.lock().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let listener_guard = cancel.clone().drop_guard();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let callback_authority = authority.clone();
+        let callback_cancel = cancel.clone();
+        let mut callback = tokio::spawn(async move {
+            let persistence = persist_external_peer_with_cancellation(
+                Some(&callback_authority),
+                "whatsapp",
+                "admin",
+                "+15551234567",
+                Some(&callback_cancel),
+            );
+            tokio::pin!(persistence);
+            let mut waiting_tx = Some(waiting_tx);
+            std::future::poll_fn(|cx| {
+                let result = persistence.as_mut().poll(cx);
+                if result.is_pending()
+                    && let Some(tx) = waiting_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+                result
+            })
+            .await
+        });
+
+        let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), waiting_rx).await;
+        drop(listener_guard);
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), &mut callback).await;
+        if settled.is_err() {
+            callback.abort();
+            let _ = callback.await;
+        }
+        waiting
+            .expect("callback must reach the held config lock")
+            .expect("callback must signal its pending write");
+        let error = settled
+            .expect("retired callback must settle before the config lock is released")
+            .expect("callback must not panic")
+            .expect_err("retired listener cannot authorize a peer");
+        assert!(error.to_string().contains("pairing listener retired"));
+        drop(guard);
+
+        // A callback delivered after retirement must also fail when the lock
+        // is immediately available and the same alias still exists.
+        persist_external_peer_with_cancellation(
+            Some(&authority),
+            "whatsapp",
+            "admin",
+            "+15551234567",
+            Some(&cancel),
+        )
+        .await
+        .expect_err("late callback cannot write after retirement");
+        assert!(authority.config().read().peer_groups.is_empty());
+        assert!(!temp.path().join("config.toml").exists());
+
+        let active = tokio_util::sync::CancellationToken::new();
+        persist_external_peer_with_cancellation(
+            Some(&authority),
+            "whatsapp",
+            "admin",
+            "+15551234567",
+            Some(&active),
+        )
+        .await
+        .expect("replacement listener can persist its own pairing");
+        assert_eq!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("whatsapp", "admin"),
+            vec!["+15551234567".to_string()]
+        );
+        let saved: Config =
+            toml::from_str(&std::fs::read_to_string(temp.path().join("config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved.channel_external_peers("whatsapp", "admin"),
+            vec!["+15551234567".to_string()]
+        );
     }
 
     #[tokio::test]

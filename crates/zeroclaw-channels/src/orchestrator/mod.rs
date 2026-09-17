@@ -32972,13 +32972,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(selection.clone()).await.unwrap();
         drop(tx);
-        let router = AgentRouter {
-            by_agent: Arc::new(HashMap::new()),
-            owner_by_channel_key: Arc::new(HashMap::new()),
-            single_ctx: None,
-            sop_engine: None,
-            sop_audit: None,
-        };
+        let router = AgentRouter::multi(HashMap::new(), HashMap::new(), None, None);
         run_message_dispatch_loop(rx, router, 1).await;
 
         assert!(
@@ -37981,6 +37975,110 @@ This is an example JSON object for profile settings."#;
             !map.contains_key("plugin"),
             "two instances must not collapse into a bare singleton key"
         );
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_cancels_identity_persistence_waiting_for_config_lock() {
+        use std::future::{Future, poll_fn};
+
+        struct PersistingChannel {
+            authority: zeroclaw_runtime::LiveConfigAuthority,
+            waiting: tokio::sync::Notify,
+            dropped: AtomicBool,
+        }
+
+        struct PersistenceDrop<'a>(&'a AtomicBool);
+
+        impl Drop for PersistenceDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        impl zeroclaw_api::attribution::Attributable for PersistingChannel {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Channel(
+                    zeroclaw_api::attribution::ChannelKind::Plugin,
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "identity-persistence-cancel"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for PersistingChannel {
+            fn name(&self) -> &str {
+                "test-identity-persistence-cancel"
+            }
+
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                let _drop = PersistenceDrop(&self.dropped);
+                let persistence = crate::identity_persist::persist_external_peer(
+                    Some(&self.authority),
+                    "wechat",
+                    "test",
+                    "test-peer",
+                );
+                tokio::pin!(persistence);
+                // Signal only after the real persistence future has parked on
+                // the lock, not merely when the listener starts running.
+                poll_fn(|cx| {
+                    let result = persistence.as_mut().poll(cx);
+                    if result.is_pending() {
+                        self.waiting.notify_one();
+                    }
+                    result
+                })
+                .await
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let config_write_lock = authority.config_write_lock();
+        let guard = config_write_lock.lock().await;
+        let channel = Arc::new(PersistingChannel {
+            authority: authority.clone(),
+            waiting: tokio::sync::Notify::new(),
+            dropped: AtomicBool::new(false),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut handle = spawn_supervised_listener(channel.clone(), None, tx, 1, 1, cancel.clone());
+
+        let waiting =
+            tokio::time::timeout(Duration::from_secs(5), channel.waiting.notified()).await;
+        cancel.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
+        if joined.is_err() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        assert!(
+            waiting.is_ok(),
+            "identity persistence must reach the held lock"
+        );
+        joined
+            .expect("listener must exit while the config write guard is still held")
+            .expect("listener must join without panicking");
+        assert!(channel.dropped.load(Ordering::SeqCst));
+        assert!(authority.config().read().peer_groups.is_empty());
+        assert!(!tmp.path().join("config.toml").exists());
+        drop(guard);
     }
 
     #[tokio::test]

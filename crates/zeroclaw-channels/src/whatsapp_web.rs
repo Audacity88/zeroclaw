@@ -2998,6 +2998,10 @@ impl Channel for WhatsAppWebChannel {
                 voice_chats: self.voice_chats.clone(),
             };
             let configured_push_name = self.push_name.clone();
+            // The SDK detaches event callbacks. Fence their config writes
+            // even when listener cancellation skips the shutdown code below.
+            let persistence_cancel = tokio_util::sync::CancellationToken::new();
+            let persistence_guard = persistence_cancel.clone().drop_guard();
 
             let mut builder = Bot::builder()
                 .with_backend_arc(backend)
@@ -3020,6 +3024,7 @@ impl Channel for WhatsAppWebChannel {
                     let bot_phone_inner = bot_phone_clone.clone();
                     let bot_lid_inner = bot_lid_clone.clone();
                     let persist_inner = persist_clone.clone();
+                    let persistence_cancel = persistence_cancel.clone();
                     let inbound_context = inbound_context.clone();
                     let configured_push_name = configured_push_name.clone();
                     async move {
@@ -3086,11 +3091,12 @@ impl Channel for WhatsAppWebChannel {
                                     let digits = Self::jid_digits(pn.user());
                                     if !digits.is_empty()
                                         && let Err(e) =
-                                            crate::identity_persist::persist_external_peer(
+                                            crate::identity_persist::persist_external_peer_with_cancellation(
                                                 persist_inner.as_ref(),
                                                 "whatsapp",
                                                 alias.as_ref(),
                                                 &format!("+{digits}"),
+                                                Some(&persistence_cancel),
                                             )
                                             .await
                                     {
@@ -3099,6 +3105,7 @@ impl Channel for WhatsAppWebChannel {
                                 }
                             }
                             Event::LoggedOut(_) => {
+                                persistence_cancel.cancel();
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
                                 crate::login_events::LoginEvent::LoggedOut.emit(
                                     "whatsapp",
@@ -3232,6 +3239,8 @@ impl Channel for WhatsAppWebChannel {
                 }
             };
 
+            // Stop admitting pairing writes before shutdown or reconnect awaits.
+            drop(persistence_guard);
             *self.client.lock() = None;
             let handle = self.bot_handle.lock().take();
             if let Some(handle) = handle {
