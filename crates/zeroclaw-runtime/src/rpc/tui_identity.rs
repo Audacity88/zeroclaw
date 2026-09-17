@@ -3,12 +3,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use zeroclaw_api::jsonrpc::RpcOutbound;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -26,6 +28,12 @@ pub struct TuiEntry {
     /// Used to pass the user's real env (PATH, SSH_AUTH_SOCK, etc.) through
     /// to subprocesses spawned by the daemon on their behalf.
     pub env: HashMap<String, String>,
+    /// The connection's outbound writer, when this registration came from a
+    /// live RPC connection. Turn streaming looks it up so notifications for
+    /// a session reach the pane that owns the session even when a different
+    /// connection triggered the turn. `None` for registrations that have no
+    /// writer to offer.
+    pub outbound: Option<Arc<RpcOutbound>>,
 }
 
 // ── Registry ─────────────────────────────────────────────────────
@@ -198,6 +206,18 @@ impl TuiRegistry {
             .filter(|(live, _)| *live == epoch)
             .map(|(_, entry)| entry.env.clone())
     }
+
+    /// The outbound writer of the live registration for `tui_id`, when that
+    /// registration carries one. Like the entry itself, the writer is only
+    /// resolvable while the registration is live: `unregister` removes it
+    /// with the entry, under the same epoch check.
+    pub fn outbound_for(&self, tui_id: &str) -> Option<Arc<RpcOutbound>> {
+        self.connected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tui_id)
+            .and_then(|(_, entry)| entry.outbound.clone())
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -285,6 +305,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            outbound: None,
         });
         assert_eq!(registry.list().len(), 1);
         assert_eq!(registry.list()[0].tui_id, "tui_aabb0011");
@@ -300,6 +321,7 @@ mod tests {
             peer_label: peer_label.to_string(),
             transport: "wss".to_string(),
             env: HashMap::new(),
+            outbound: None,
         }
     }
 
@@ -391,6 +413,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            outbound: None,
         });
         // generate_unique should return something different
         let id = registry.generate_unique_tui_id();
@@ -412,6 +435,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
         });
 
         let entries = registry.list();
@@ -437,6 +461,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env: HashMap::new(),
+            outbound: None,
         });
 
         let entries = registry.list();
@@ -455,6 +480,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
         });
         assert_eq!(registry.list().len(), 1);
 
@@ -477,6 +503,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
         };
         let cloned = entry.clone();
         assert_eq!(
@@ -498,6 +525,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
         });
 
         let got = registry
@@ -530,6 +558,7 @@ mod tests {
             peer_label: "test".to_string(),
             transport: "unix".to_string(),
             env,
+            outbound: None,
         });
         assert!(
             registry

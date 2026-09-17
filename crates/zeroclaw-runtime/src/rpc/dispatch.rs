@@ -2990,9 +2990,14 @@ impl RpcDispatcher {
         }
     }
 
-    async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
+    async fn forward_seed_event(
+        &self,
+        rpc: &Arc<RpcOutbound>,
+        session_id: &str,
+        event: Option<TurnEvent>,
+    ) {
         if let Some(event) = event {
-            forward_turn_event(&self.rpc, session_id, &event).await;
+            forward_turn_event(rpc, session_id, &event).await;
         }
     }
 
@@ -3640,6 +3645,11 @@ impl RpcDispatcher {
                     .to_string(),
                 peer_label: self.peer_label.clone(),
                 env,
+                // Carried so turns triggered by other connections can stream
+                // their notifications to this connection when it owns the
+                // session. Removed with the entry on disconnect, under the
+                // same epoch check.
+                outbound: Some(Arc::clone(&self.rpc)),
             });
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
@@ -4981,7 +4991,8 @@ impl RpcDispatcher {
             self.ctx.sessions.set_plan(&session_id, plan).await;
         }
         drop(config_generation_guard);
-        self.forward_seed_event(&session_id, seed_event).await;
+        self.forward_seed_event(&self.rpc, &session_id, seed_event)
+            .await;
         if let Some(notification) = plan_notification {
             let _ = self.rpc.send_raw(notification).await;
         }
@@ -5428,10 +5439,13 @@ impl RpcDispatcher {
     /// agent/workspace binding.
     ///
     /// Rehydrate a durable ACP session while the caller holds `session_queue`
-    /// for `sid`, covering the owner check through insertion.
+    /// for `sid`, covering the owner check through insertion. `rpc` is the
+    /// outbound the triggering turn's notifications are streaming through, so
+    /// the rehydrated history and plan replay reach the same connections.
     async fn rehydrate_reaped_session_under_guard(
         &self,
         sid: &str,
+        rpc: &Arc<RpcOutbound>,
         cancel_generation: Option<u64>,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
     ) -> Result<Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>>, JsonRpcError> {
@@ -5849,9 +5863,9 @@ impl RpcDispatcher {
                 }
             });
         }
-        self.forward_seed_event(sid, seed_event).await;
+        self.forward_seed_event(rpc, sid, seed_event).await;
         if let Some(notification) = plan_notification {
-            let _ = self.rpc.send_raw(notification).await;
+            let _ = rpc.send_raw(notification).await;
         }
         self.ctx.sessions.touch(sid).await;
 
@@ -5880,7 +5894,7 @@ impl RpcDispatcher {
         let Ok(_admission) = self.ctx.sessions.session_queue.acquire(sid).await else {
             return Ok(None);
         };
-        self.rehydrate_reaped_session_under_guard(sid, None, grants)
+        self.rehydrate_reaped_session_under_guard(sid, &self.rpc, None, grants)
             .await
     }
 
@@ -5996,6 +6010,28 @@ impl RpcDispatcher {
             .await
     }
 
+    /// Resolve the outbound every notification of a turn on `session_id`
+    /// must reach: the connection that issued the prompt, plus the session
+    /// owner's connection when that is a different live registration. When
+    /// issuer and owner are the same connection (or the owner is not
+    /// connected), this is just the issuer's own outbound — exactly one copy
+    /// of each notification, as before.
+    async fn turn_notification_outbound(&self, session_id: &str) -> Arc<RpcOutbound> {
+        let owner_outbound = self
+            .ctx
+            .sessions
+            .session_owner_tui_id(session_id)
+            .await
+            .flatten()
+            .and_then(|owner_tui_id| self.ctx.tui_registry.outbound_for(&owner_tui_id));
+        match owner_outbound {
+            Some(owner) if !Arc::ptr_eq(&owner, &self.rpc) => {
+                fanout_outbound(vec![Arc::clone(&self.rpc), owner])
+            }
+            _ => Arc::clone(&self.rpc),
+        }
+    }
+
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
         let req: SessionPromptParams = parse_params(params)?;
         let sid = &req.session_id;
@@ -6014,6 +6050,12 @@ impl RpcDispatcher {
                 "session/prompt requires a non-empty `prompt` or at least one attachment",
             ));
         }
+
+        // Stream every notification of this turn to the issuing connection
+        // and, when a different live connection owns the session, to that
+        // owner as well — a pane must see a turn triggered on its session by
+        // any caller, not only by itself.
+        let turn_rpc = self.turn_notification_outbound(sid).await;
 
         let live_generation_at_entry = self.ctx.sessions.get_generation(sid).await;
         if live_generation_at_entry.is_some() {
@@ -6054,6 +6096,7 @@ impl RpcDispatcher {
             && self.ctx.sessions.get_generation(sid).await != Some(live_generation_at_entry)
         {
             self.emit_turn_complete(
+                &turn_rpc,
                 sid,
                 crate::rpc::types::TurnCompletionOutcome::Failed,
                 "turn cancelled by daemon: stale_session_prompt".to_string(),
@@ -6091,6 +6134,7 @@ impl RpcDispatcher {
                 match self
                     .rehydrate_reaped_session_under_guard(
                         sid,
+                        &turn_rpc,
                         Some(cancel_registration.generation()),
                         grants.as_ref(),
                     )
@@ -6115,6 +6159,7 @@ impl RpcDispatcher {
                             "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
                         );
                         self.emit_turn_complete(
+                            &turn_rpc,
                             sid,
                             crate::rpc::types::TurnCompletionOutcome::Failed,
                             "turn cancelled by daemon: session_not_found".to_string(),
@@ -6320,6 +6365,7 @@ impl RpcDispatcher {
                     ),
                 };
                 self.emit_turn_complete(
+                    &turn_rpc,
                     sid,
                     crate::rpc::types::TurnCompletionOutcome::Cancelled,
                     cancel_message,
@@ -6516,6 +6562,7 @@ impl RpcDispatcher {
                 }
                 let message = format!("Failed to begin ACP turn checkpoint: {error}");
                 self.emit_turn_complete(
+                    &turn_rpc,
                     sid,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     message.clone(),
@@ -6551,7 +6598,7 @@ impl RpcDispatcher {
             (alias, mp, m)
         };
 
-        let rpc = self.rpc.clone();
+        let rpc = Arc::clone(&turn_rpc);
         let sid_owned = sid.to_string();
         // Clone of the session store so the turn-event closure can persist
         // the latest TodoWrite plan (store-then-emit) before the plan
@@ -6878,6 +6925,7 @@ impl RpcDispatcher {
                     safeguard_fallback.as_ref(),
                 );
                 self.emit_turn_complete(
+                    &turn_rpc,
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
                     text.clone(),
@@ -6926,6 +6974,7 @@ impl RpcDispatcher {
                     "turn cancelled; emitting attributed TurnComplete so the client exits the working state"
                 );
                 self.emit_turn_complete(
+                    &turn_rpc,
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Cancelled,
                     cancel_message,
@@ -6960,6 +7009,7 @@ impl RpcDispatcher {
                     "turn failed; emitting TurnComplete so the client exits the working state"
                 );
                 self.emit_turn_complete(
+                    &turn_rpc,
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     user_message
@@ -6991,6 +7041,7 @@ impl RpcDispatcher {
         denied: JsonRpcError,
     ) -> JsonRpcError {
         self.emit_turn_complete(
+            &self.rpc,
             session_id,
             crate::rpc::types::TurnCompletionOutcome::Failed,
             format!("turn refused by daemon: {}", denied.message),
@@ -7003,9 +7054,12 @@ impl RpcDispatcher {
 
     /// Emit the terminal `session/update` notification for a turn.
     /// The TUI uses this — not the JSON-RPC response — to flip
-    /// `turn_in_flight` back to false.
+    /// `turn_in_flight` back to false. `rpc` is the turn's notification
+    /// outbound, so the terminal event reaches the same connections as the
+    /// turn's streamed events.
     async fn emit_turn_complete(
         &self,
+        rpc: &Arc<RpcOutbound>,
         session_id: &str,
         outcome: crate::rpc::types::TurnCompletionOutcome,
         content: String,
@@ -7022,7 +7076,7 @@ impl RpcDispatcher {
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
             if let Ok(s) = serde_json::to_string(&n) {
-                let _ = self.rpc.send_raw(s).await;
+                let _ = rpc.send_raw(s).await;
             }
         }
     }
@@ -12942,6 +12996,36 @@ fn replace_rpc_chat_conversation_state(
             false
         }
     }
+}
+
+/// Build an [`RpcOutbound`] that forwards every raw frame to each target
+/// outbound, dropping a target whose writer has closed.
+///
+/// Wrapping the fanout as an `RpcOutbound` means the existing `&rpc`
+/// plumbing (checkpoint-persist-then-send, terminal notifications) is
+/// untouched: one `send_raw` reaches every target. The forwarder lives only
+/// as long as some handle to the fanout does — a turn drops it when its
+/// last notification is sent, so nothing long-lived is leaked per turn.
+fn fanout_outbound(targets: Vec<Arc<RpcOutbound>>) -> Arc<RpcOutbound> {
+    let (tx, mut rx) = mpsc::channel::<String>(64);
+    zeroclaw_spawn::spawn!(async move {
+        let mut targets = targets;
+        while let Some(frame) = rx.recv().await {
+            let mut index = 0;
+            while index < targets.len() {
+                if targets[index].send_raw(frame.clone()).await {
+                    index += 1;
+                } else {
+                    // Writer closed: stop forwarding to this connection.
+                    targets.remove(index);
+                }
+            }
+            if targets.is_empty() {
+                break;
+            }
+        }
+    });
+    Arc::new(RpcOutbound::new(tx))
 }
 
 #[cfg(test)]
@@ -29133,7 +29217,7 @@ mod tests {
         };
 
         dispatcher
-            .forward_seed_event("restored-session", Some(event))
+            .forward_seed_event(&dispatcher.rpc_for_test(), "restored-session", Some(event))
             .await;
 
         let raw = rx
@@ -29969,6 +30053,7 @@ mod tests {
                     dispatcher
                         .rehydrate_reaped_session_under_guard(
                             sid,
+                            &dispatcher.rpc_for_test(),
                             None,
                             dispatcher.stamped_grants(),
                         )
@@ -31763,7 +31848,12 @@ mod tests {
         let _guard = sessions.session_queue.acquire(sid).await.unwrap();
         assert!(
             dispatcher
-                .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+                .rehydrate_reaped_session_under_guard(
+                    sid,
+                    &dispatcher.rpc_for_test(),
+                    None,
+                    dispatcher.stamped_grants()
+                )
                 .await
                 .expect("an operator's rehydration is never refused")
                 .is_some()
@@ -31812,7 +31902,12 @@ mod tests {
         let _guard = sessions.session_queue.acquire(sid).await.unwrap();
         assert!(
             dispatcher
-                .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+                .rehydrate_reaped_session_under_guard(
+                    sid,
+                    &dispatcher.rpc_for_test(),
+                    None,
+                    dispatcher.stamped_grants()
+                )
                 .await
                 .expect("an operator's rehydration is never refused")
                 .is_none(),
@@ -32621,7 +32716,12 @@ mod tests {
 
         let _session_guard = sessions.session_queue.acquire(sid).await.unwrap();
         let recovered = dispatcher
-            .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                sid,
+                &dispatcher.rpc_for_test(),
+                None,
+                dispatcher.stamped_grants(),
+            )
             .await
             .expect("an operator's rehydration is never refused")
             .expect("a reaped ACP session must rehydrate to a working agent");
@@ -32801,7 +32901,12 @@ mod tests {
         );
         let _session_guard = sessions.session_queue.acquire(sid).await.unwrap();
         let recovered = dispatcher
-            .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                sid,
+                &dispatcher.rpc_for_test(),
+                None,
+                dispatcher.stamped_grants(),
+            )
             .await
             .expect("an operator's rehydration is never refused")
             .expect("the cancellation-produced ACP row must rehydrate");
@@ -37830,6 +37935,242 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // session/prompt owner fanout — a turn triggered by one connection must
+    // stream to the connection that owns the session
+    // -----------------------------------------------------------------------
+
+    /// Two dispatchers on one shared context: the session owner (registered
+    /// in the TUI registry with its writer, exactly as `initialize` does)
+    /// and a second, distinct issuer. The session's `owner_tui_id` points at
+    /// the owner, as `session/new` stamps it. Returns the registration epoch
+    /// so a test can disconnect the owner the same way the transport loop
+    /// does.
+    async fn owner_fanout_harness(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        String,
+        crate::rpc::tui_identity::TuiEpoch,
+    ) {
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let provider = Arc::new(TurnRecordingProvider::default());
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(SharedRecordingProvider(Arc::clone(&provider))))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("owner fanout test agent should build");
+        let session_id = "owner-fanout-session".to_string();
+        sessions
+            .insert(
+                session_id.clone(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                )
+                .with_owner(Some("tui-owner-fanout".to_string())),
+            )
+            .await
+            .expect("owner fanout test session should insert");
+
+        let (owner_tx, owner_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let owner_dispatcher =
+            RpcDispatcher::new(Arc::clone(&ctx), owner_tx, "test-owner:pid=1".into());
+        let epoch = ctx
+            .tui_registry
+            .register(crate::rpc::tui_identity::TuiEntry {
+                tui_id: "tui-owner-fanout".to_string(),
+                connected_at: chrono::Utc::now(),
+                peer_label: "test-owner".to_string(),
+                transport: "unix".to_string(),
+                env: std::collections::HashMap::new(),
+                outbound: Some(owner_dispatcher.rpc_for_test()),
+            });
+
+        let (issuer_tx, issuer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut issuer =
+            RpcDispatcher::new(Arc::clone(&ctx), issuer_tx, "test-issuer:pid=2".into());
+        issuer.set_tui_id_for_test(Some("tui-issuer-fanout".to_string()));
+        (
+            owner_dispatcher,
+            owner_rx,
+            issuer,
+            issuer_rx,
+            session_id,
+            epoch,
+        )
+    }
+
+    /// Collect notifications in order until the turn's terminal event
+    /// arrives (or a deadline passes, so a missing terminal fails loudly
+    /// instead of hanging the test). The fanout forwarder is a spawned task,
+    /// so frames may still be in flight when `handle_session_prompt`
+    /// returns — every read must be awaited, never `try_recv`'d.
+    async fn collect_until_turn_complete(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> Vec<serde_json::Value> {
+        let mut frames = Vec::new();
+        loop {
+            let Ok(Some(raw)) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await
+            else {
+                break;
+            };
+            let v: serde_json::Value =
+                serde_json::from_str(&raw).expect("notification must be JSON");
+            let terminal = v["params"]["type"] == "turn_complete";
+            frames.push(v);
+            if terminal {
+                break;
+            }
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn session_prompt_streams_turn_notifications_to_the_session_owner_connection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_owner, mut owner_rx, issuer, mut issuer_rx, sid, _epoch) =
+            owner_fanout_harness(&tmp).await;
+
+        issuer
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello from another connection",
+            }))
+            .await
+            .expect("a prompt from a non-owner connection must run");
+
+        let owner_frames = collect_until_turn_complete(&mut owner_rx).await;
+        let issuer_frames = collect_until_turn_complete(&mut issuer_rx).await;
+
+        assert!(
+            !owner_frames.is_empty(),
+            "the owner pane must see a turn triggered on its session by \
+             another connection — before the fanout it saw nothing until a \
+             durable resync"
+        );
+        assert_eq!(
+            owner_frames, issuer_frames,
+            "owner and issuer must receive the same notification sequence, \
+             including turn_complete, with no divergence or reordering"
+        );
+        assert_eq!(
+            owner_frames.last().expect("sequence must be non-empty")["params"]["type"],
+            "turn_complete"
+        );
+        assert_eq!(
+            owner_frames.last().expect("sequence must be non-empty")["params"]["outcome"],
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_dedups_notifications_when_issuer_is_the_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (owner, mut owner_rx, _issuer, mut issuer_rx, sid, _epoch) =
+            owner_fanout_harness(&tmp).await;
+
+        owner
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "the owner prompts its own session",
+            }))
+            .await
+            .expect("the owner's own prompt must run");
+
+        let owner_frames = collect_until_turn_complete(&mut owner_rx).await;
+        let chunk_count = owner_frames
+            .iter()
+            .filter(|f| f["params"]["type"] == "agent_message_chunk")
+            .count();
+        let terminal_count = owner_frames
+            .iter()
+            .filter(|f| f["params"]["type"] == "turn_complete")
+            .count();
+        assert_eq!(
+            terminal_count, 1,
+            "the owner must receive exactly one terminal event, not one per \
+             fanout target"
+        );
+        assert_eq!(
+            chunk_count, 1,
+            "the owner must receive exactly one copy of each streamed event"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), issuer_rx.recv()).await,
+                Err(_) | Ok(None)
+            ),
+            "a bystander connection must not receive the owner's own turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_survives_owner_disconnect_and_streams_to_the_issuer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (owner, mut owner_rx, issuer, mut issuer_rx, sid, epoch) =
+            owner_fanout_harness(&tmp).await;
+
+        // The owner's transport loop tore down: its registration (and with it
+        // the outbound writer) is gone.
+        issuer
+            .ctx
+            .tui_registry
+            .unregister("tui-owner-fanout", epoch);
+        drop(owner);
+
+        let result = issuer
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "prompt issued after the owner disconnected",
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "a disconnected owner must not fail the turn"
+        );
+
+        let issuer_frames = collect_until_turn_complete(&mut issuer_rx).await;
+        assert!(
+            !issuer_frames.is_empty(),
+            "the issuing connection must still receive the full turn"
+        );
+        assert_eq!(
+            issuer_frames.last().expect("sequence must be non-empty")["params"]["type"],
+            "turn_complete"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), owner_rx.recv()).await,
+                Err(_) | Ok(None)
+            ),
+            // Ok(None): every sender was dropped with the registration, so
+            // the closed channel resolves immediately — silent either way.
+            "a disconnected owner's channel must stay silent"
+        );
+    }
+
     #[tokio::test]
     async fn session_cancel_from_distinct_non_owner_dispatcher_is_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -42209,7 +42550,12 @@ mod tests {
         assert!(sessions.remove(&session_id).await);
         let _session_guard = sessions.session_queue.acquire(&session_id).await.unwrap();
         let rehydrated = dispatcher
-            .rehydrate_reaped_session_under_guard(&session_id, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                &session_id,
+                &dispatcher.rpc_for_test(),
+                None,
+                dispatcher.stamped_grants(),
+            )
             .await
             .expect("an operator's rehydration is never refused");
         assert!(
