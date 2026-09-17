@@ -1074,6 +1074,11 @@ pub struct RpcDispatcher {
     /// on its ledger status (a revoked cert cannot self-renew, A5) and authz still
     /// resolves from the registry.
     peer_cert_fingerprint: Option<String>,
+    /// Whether this dispatcher is the daemon-internal agent-prompt runner
+    /// rather than a client connection. Only the runner may mark a prompt as
+    /// agent-injected (`injected_by`); a client that sends the field is
+    /// forging provenance and is refused.
+    trusted_injector: bool,
 }
 
 /// Read an allowlisted personality file through a handle on `workspace`, with
@@ -1204,6 +1209,7 @@ impl RpcDispatcher {
             uploads: std::sync::Mutex::default(),
             initialize_deadline: None,
             peer_cert_fingerprint: None,
+            trusted_injector: false,
         }
     }
 
@@ -2968,6 +2974,7 @@ impl RpcDispatcher {
             // Prompt handles do not read frames.
             initialize_deadline: None,
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
+            trusted_injector: self.trusted_injector,
         }
     }
 
@@ -2993,6 +3000,7 @@ impl RpcDispatcher {
             connection_activity: None,
             prompt_tasks: Vec::new(),
             peer_cert_fingerprint: None,
+            trusted_injector: true,
         }
     }
 
@@ -6064,6 +6072,19 @@ impl RpcDispatcher {
             .authorize_session_owner(sid, Method::SessionPrompt)
             .await?;
 
+        // `injected_by` is provenance the owner pane renders as fact. Only the
+        // daemon's own runner may set it; a connection presenting the field
+        // is forging another agent's authorship.
+        if req.injected_by.is_some() && !self.trusted_injector {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "`injected_by` is set by the runtime for agent-injected prompts and \
+                 is not accepted from clients",
+            ));
+        }
+
+        // A leading `/effort:<level>` (or the older `/think:<level>`) names
+        // the depth for this turn only and never reaches the model.
         let (inline_level, prompt_body) =
             match crate::agent::thinking::parse_thinking_directive(&req.prompt) {
                 Some((level, remaining)) => (Some(level), remaining),
@@ -38628,6 +38649,46 @@ mod tests {
             rest.iter()
                 .any(|f| f["params"]["type"] == "agent_message_chunk"),
             "the turn's stream must follow the announced prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_connection_cannot_forge_injected_by_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _other, sessions) = make_two_dispatchers_sharing_context(config);
+        // The fixture registers a cancel token of its own (the ownership
+        // tests need one); a real turn would replace it under a new
+        // generation, so "no turn started" is "generation unchanged".
+        let fixture_token =
+            create_session_with_owner(&mut dispatcher, &sessions, "sess-forge", "tui-A").await;
+        let generation_before = sessions.inflight_turn_generation("sess-forge");
+
+        // A connection-backed dispatcher presenting `injected_by` is forging
+        // another agent's authorship of the prompt; refused before any turn
+        // state is touched.
+        let err = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": "sess-forge",
+                "prompt": "hello",
+                "injected_by": "some-other-agent",
+            }))
+            .await
+            .expect_err("a client-set injected_by must be refused");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("injected_by"),
+            "refusal must name the offending field: {}",
+            err.message
+        );
+        assert_eq!(
+            sessions.inflight_turn_generation("sess-forge"),
+            generation_before,
+            "a refused forge must not register a turn"
+        );
+        assert!(
+            !fixture_token.is_cancelled(),
+            "a refused forge must not touch the session's existing cancel token"
         );
     }
 
