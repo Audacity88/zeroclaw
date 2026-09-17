@@ -79,6 +79,12 @@ A vote may close early only when every member of the final active electorate has
 
 The current protocol applies to RFC votes opened after the documentation PR that ratifies that revision lands, unless Core explicitly records earlier use on a specific issue. It does not automatically invalidate earlier accepted RFCs; historical-process audit and correction work are tracked separately.
 
+### Vote records
+
+Use the prose requirements in this guide as the canonical format for vote-opening, continuation, and closing comments. There are no separate required vote-record templates; the RFC issue form collects the initial proposal, not the vote record. [FND-003](../foundations/fnd-003-governance.md#81-the-full-rfc-lifecycle) governs ballot validity, deadlines, and outcome precedence.
+
+An opening record includes the RFC trigger and why the snapshot is ready, alongside the ratification fields above. An unchanged-snapshot continuation lists carried ballots and sets a new exact UTC deadline; it does not leave the vote pending indefinitely. A closing or return record identifies the snapshot, eligible ballots, outcome and reason, and the required revision, implementation boundaries, or continuation. A valid eligible `REVISE` stops that snapshot rather than becoming a concern to tally past at closure.
+
 ## Implementing an accepted RFC
 
 Implementation PRs should:
