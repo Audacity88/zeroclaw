@@ -33499,7 +33499,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["123".into()]),
                 false,
             )
-            .with_persistence(Arc::new(RwLock::new(picker_config)))
+            .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(picker_config))
             .with_api_base(server.uri()),
         );
         let picker_request = zeroclaw_api::channel::ChannelModelPickerRequest {
@@ -39952,17 +39952,19 @@ This is an example JSON object for profile settings."#;
                 ..Default::default()
             },
         );
-        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
-        let resolver = slack_thread_context_max_messages_resolver(&config_arc, "default");
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let resolver = slack_thread_context_max_messages_resolver(&live.handle(), "default");
 
         assert_eq!(resolver(), 3);
-        config_arc
-            .write()
+        let mut updated = live.snapshot();
+        updated
             .channels
             .slack
             .get_mut("default")
             .unwrap()
             .thread_context_max_messages = Some(8);
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
         assert_eq!(resolver(), 8);
     }
 

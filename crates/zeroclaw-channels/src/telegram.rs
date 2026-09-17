@@ -1,6 +1,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -7757,6 +7757,7 @@ impl UpdateDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_runtime::LiveConfigAuthority;
 
     #[test]
     fn authority_persistence_preserves_live_handle_identity() {
@@ -9692,7 +9693,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -9774,7 +9775,7 @@ mod tests {
                 Arc::new(|| vec!["test_user".into()]),
                 false,
             )
-            .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+            .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
             .with_api_base(server.uri()),
         );
         let pacing = zeroclaw_config::schema::TelegramConfig {
@@ -9828,7 +9829,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -9885,7 +9886,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
@@ -10050,7 +10051,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())));
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()));
         let runtime_routes = model_picker_runtime_routes(&model_picker_config());
         let base = PendingModelPicker {
             created_at: Instant::now(),
@@ -10360,7 +10361,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -10436,7 +10437,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let open_token = uuid::Uuid::new_v4().to_string();
         let cancel_token = uuid::Uuid::new_v4().to_string();
@@ -10540,7 +10541,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let open_token = uuid::Uuid::new_v4().to_string();
         let cancel_token = uuid::Uuid::new_v4().to_string();
@@ -10696,7 +10697,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -10783,7 +10784,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -10890,7 +10891,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -10997,7 +10998,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
@@ -11104,7 +11105,7 @@ mod tests {
             Arc::new(|| vec!["test_user".into()]),
             false,
         )
-        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_persistence_authority(LiveConfigAuthority::new(model_picker_config()))
         .with_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
