@@ -168,23 +168,33 @@ pub(crate) fn open_file_nofollow(
     Ok(file)
 }
 
+fn regular_destination_metadata(
+    parent: &Dir,
+    destination: &Path,
+) -> Result<Option<cap_std::fs::Metadata>, FilesystemBoundaryError> {
+    match parent.symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
+        Ok(_) => Err(FilesystemBoundaryError::Denied {
+            key: "tool-filesystem-boundary-error-not-regular",
+            path: destination.to_path_buf(),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn copy_file_atomic(
     parent: &Dir,
     destination: &Path,
     input: &mut impl Read,
     source_permissions: Option<cap_std::fs::Permissions>,
-) -> io::Result<()> {
+) -> Result<(), FilesystemBoundaryError> {
+    let destination_metadata = regular_destination_metadata(parent, destination)?;
     static TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temp_name = format!(".zeroclaw-write-{}-{sequence}.tmp", std::process::id());
-    let permissions = match source_permissions {
-        Some(permissions) => Some(permissions),
-        None => match parent.symlink_metadata(destination) {
-            Ok(metadata) => Some(metadata.permissions()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        },
-    };
+    let permissions =
+        source_permissions.or_else(|| destination_metadata.map(|metadata| metadata.permissions()));
     let mut options = cap_std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     options.follow(FollowSymlinks::No);
@@ -206,7 +216,7 @@ pub(crate) fn copy_file_atomic(
     {
         drop(output);
         let _ = parent.remove_file(&temp_name);
-        return Err(error);
+        return Err(error.into());
     }
     let result = io::copy(input, &mut output)
         .and_then(|_| output.flush())
@@ -214,9 +224,15 @@ pub(crate) fn copy_file_atomic(
     if let Err(error) = result {
         drop(output);
         let _ = parent.remove_file(&temp_name);
-        return Err(error);
+        return Err(error.into());
     }
-    if let Err(error) = replace_open_file(parent, Path::new(&temp_name), destination, &output) {
+    // Recheck after copying: staging may take long enough for the leaf to change.
+    // This does not make the subsequent rename conditional on inode identity.
+    let publication = regular_destination_metadata(parent, destination).and_then(|_| {
+        replace_open_file(parent, Path::new(&temp_name), destination, &output)
+            .map_err(FilesystemBoundaryError::from)
+    });
+    if let Err(error) = publication {
         drop(output);
         let _ = parent.remove_file(&temp_name);
         return Err(error);
@@ -310,16 +326,20 @@ fn replace_open_file(
     }
 }
 
-pub(crate) fn write_file_atomic(parent: &Dir, destination: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_file_atomic(
+    parent: &Dir,
+    destination: &Path,
+    bytes: &[u8],
+) -> Result<(), FilesystemBoundaryError> {
     copy_file_atomic(parent, destination, &mut io::Cursor::new(bytes), None)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn write_file_atomic_replaces_existing_file_through_open_parent() -> io::Result<()> {
+    fn write_file_atomic_replaces_existing_file_through_open_parent() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let destination = root.path().join("existing.txt");
         std::fs::write(&destination, b"old")?;
@@ -336,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn write_file_atomic_creates_and_replaces_one_character_name() -> io::Result<()> {
+    fn write_file_atomic_creates_and_replaces_one_character_name() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let destination = root.path().join("x");
         let parent = Dir::open_ambient_dir(root.path(), ambient_authority())?;
@@ -346,6 +366,101 @@ mod tests {
 
         write_file_atomic(&parent, Path::new("x"), b"second")?;
         assert_eq!(std::fs::read(destination)?, b"second");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_copy_rejects_fifo_with_either_permission_source() -> anyhow::Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+
+        let root = tempfile::tempdir()?;
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(root.path().join("pipe"))
+                .status()?
+                .success()
+        );
+        let permissions = parent.symlink_metadata("pipe")?.permissions();
+        for source_permissions in [None, Some(permissions)] {
+            let error = copy_file_atomic(
+                &parent,
+                Path::new("pipe"),
+                &mut io::Cursor::new(b"replacement"),
+                source_permissions,
+            )
+            .unwrap_err();
+            assert!(error.is_denied());
+            assert!(
+                std::fs::symlink_metadata(root.path().join("pipe"))?
+                    .file_type()
+                    .is_fifo()
+            );
+            assert_eq!(std::fs::read_dir(root.path())?.count(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_copy_propagates_read_error_without_replacing_destination() -> anyhow::Result<()> {
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "fixture read failure",
+                ))
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+        parent.write("output", b"old")?;
+        let error =
+            copy_file_atomic(&parent, Path::new("output"), &mut FailedRead, None).unwrap_err();
+        assert!(matches!(error, FilesystemBoundaryError::Io(ref error)
+            if error.kind() == io::ErrorKind::UnexpectedEof));
+        assert_eq!(parent.read("output")?, b"old");
+        assert_eq!(std::fs::read_dir(root.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_copy_rechecks_destination_and_cleans_staging_file() -> anyhow::Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+
+        struct ChangeDestination<'a>(&'a Dir, &'a Path);
+        impl Read for ChangeDestination<'_> {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                self.0.remove_file("output")?;
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .arg(self.1.join("output"))
+                        .status()?
+                        .success()
+                );
+                Ok(0)
+            }
+        }
+
+        let root = tempfile::tempdir()?;
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+        parent.write("output", b"old")?;
+        let error = copy_file_atomic(
+            &parent,
+            Path::new("output"),
+            &mut ChangeDestination(&parent, root.path()),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.is_denied());
+        assert!(
+            std::fs::symlink_metadata(root.path().join("output"))?
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(std::fs::read_dir(root.path())?.count(), 1);
         Ok(())
     }
 }

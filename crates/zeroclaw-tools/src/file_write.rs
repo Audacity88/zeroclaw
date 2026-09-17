@@ -314,7 +314,16 @@ impl Tool for FileWriteTool {
                 Err(error) => return Err(error.into()),
             }
 
-            write_file_atomic(&parent_dir, Path::new(&file_name), &bytes)?;
+            if let Err(error) = write_file_atomic(&parent_dir, Path::new(&file_name), &bytes) {
+                if error.is_denied() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(localize_filesystem_boundary(&error)),
+                    });
+                }
+                return Err(error.into());
+            }
             Ok(ToolResult {
                 success: true,
                 output: format!("Written {} bytes to {display_path}", bytes.len()).into(),
@@ -411,6 +420,41 @@ mod tests {
         "/etc/evil"
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_preserves_special_file_destination() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(root.path().join("pipe"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let result = wrapped_tool(root.path().to_path_buf())
+            .execute(json!({"path": "pipe", "content": "replacement"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                tool_text_arg("tool-filesystem-boundary-error-not-regular", "path", "pipe")
+                    .as_str()
+            )
+        );
+        assert!(
+            std::fs::symlink_metadata(root.path().join("pipe"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn file_write_name() {
         let tool = test_tool(std::env::temp_dir());
@@ -451,16 +495,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_write_propagates_unexpected_install_error() {
+    async fn file_write_rejects_directory_destination() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("occupied")).unwrap();
         let tool = test_tool(dir.path().to_path_buf());
 
         let result = tool
             .execute(json!({"path": "occupied", "content": "data"}))
-            .await;
+            .await
+            .unwrap();
 
-        assert!(result.is_err());
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                tool_text_arg(
+                    "tool-filesystem-boundary-error-not-regular",
+                    "path",
+                    "occupied"
+                )
+                .as_str()
+            )
+        );
         assert!(dir.path().join("occupied").is_dir());
     }
 

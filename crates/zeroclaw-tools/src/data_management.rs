@@ -9,7 +9,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
-/// Workspace data lifecycle tool: retention status, purge preview, and storage
+/// Shared-data lifecycle tool: retention status, purge preview, and storage
 /// statistics. Confirmed purge is currently unavailable.
 #[derive(Clone)]
 pub struct DataManagementTool {

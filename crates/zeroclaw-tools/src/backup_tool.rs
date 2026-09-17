@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
-/// Workspace backup tool: create, list, verify, and restore timestamped backups
+/// Shared-data backup tool: create, list, verify, and restore timestamped backups
 /// with SHA-256 manifest integrity checking.
 #[derive(Clone)]
 pub struct BackupTool {
@@ -1254,6 +1254,16 @@ fn validate_copy_destination(
                 "path",
                 &path.display().to_string(),
             )));
+        } else if file_type.is_file()
+            && destination_metadata
+                .as_ref()
+                .is_some_and(|metadata| !metadata.is_file())
+        {
+            return Err(FilesystemBoundaryError::Denied {
+                key: "tool-filesystem-boundary-error-not-regular",
+                path,
+            }
+            .into());
         }
     }
     Ok(())
@@ -1672,6 +1682,67 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("memory/value.txt")).unwrap(),
             "current-memory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_preflights_special_file_before_earlier_root_mutation() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let workspace = TempDir::new().unwrap();
+        for directory in ["config", "memory"] {
+            std::fs::create_dir_all(workspace.path().join(directory)).unwrap();
+            std::fs::write(workspace.path().join(directory).join("value.txt"), "backup").unwrap();
+        }
+        let tool = make_tool(&workspace);
+        let created = tool.execute(json!({"command": "create"})).await.unwrap();
+        assert!(created.success);
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        std::fs::write(workspace.path().join("config/value.txt"), "current-config").unwrap();
+        let memory = Dir::open_ambient_dir(
+            workspace.path().join("memory"),
+            cap_std::ambient_authority(),
+        )
+        .unwrap();
+        memory.remove_file("value.txt").unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(workspace.path().join("memory/value.txt"))
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let result = tool
+            .execute(json!({
+                "command": "restore",
+                "backup_name": created["backup"],
+                "confirm": true
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("config/value.txt")).unwrap(),
+            "current-config"
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                tool_text_arg(
+                    "tool-filesystem-boundary-error-not-regular",
+                    "path",
+                    "memory/value.txt"
+                )
+                .as_str()
+            )
+        );
+        assert!(
+            std::fs::symlink_metadata(workspace.path().join("memory/value.txt"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
         );
     }
 
