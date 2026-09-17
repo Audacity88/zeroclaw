@@ -4515,6 +4515,7 @@ permissions = ["http_client"]
                 false,
                 None,
             )
+            .expect("test tool registry should initialize")
             .tools
             .iter()
             .map(|t| t.name().to_string())
