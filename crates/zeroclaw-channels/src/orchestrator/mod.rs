@@ -10696,7 +10696,8 @@ fn build_channel_by_id(
                 )
                 .with_team_ids(mm.team_ids.clone())
                 .with_discover_dms(mm.discover_dms.unwrap_or(true))
-                .with_listen_mode(mm.listen_mode),
+                .with_listen_mode(mm.listen_mode)
+                .with_approval_timeout_secs(mm.approval_timeout_secs),
             ))
         }
         #[cfg(not(feature = "channel-mattermost"))]
@@ -12185,7 +12186,8 @@ fn collect_configured_channels(
                         config.transcription.clone(),
                         resolved_transcription_manager(&config, &format!("mattermost.{alias}")),
                     )
-                    .with_listen_mode(mm.listen_mode),
+                    .with_listen_mode(mm.listen_mode)
+                    .with_approval_timeout_secs(mm.approval_timeout_secs),
                 ),
                 mm,
             ),
@@ -18865,6 +18867,26 @@ api_key = "anthropic-key"
         );
         assert_eq!(persisted[0].content, "first");
         assert_eq!(persisted[1].content, "ok");
+    }
+
+    #[test]
+    fn should_rollback_failed_user_turn_ignores_stream_idle_timeouts() {
+        // A stream idle timeout is a transport stall, not a client error: the
+        // elapsed-seconds bound in the message must never read as an HTTP
+        // status, or a stalled turn would delete the user's prompt.
+        let idle_error = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout; raise timeout_secs above 480s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !should_rollback_failed_user_turn(&idle_error),
+            "stream idle timeouts must stay retryable so the prompt is preserved"
+        );
+
+        let client_error = anyhow::Error::msg("HTTP 400 Bad Request");
+        assert!(
+            should_rollback_failed_user_turn(&client_error),
+            "genuine 4xx client errors must still roll the failed turn back"
+        );
     }
 
     pub(crate) struct DummyModelProvider;
@@ -36096,6 +36118,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                approval_timeout_secs: 300,
             },
         );
         // A channel is only collected when an enabled agent references it.
@@ -36145,6 +36168,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                approval_timeout_secs: 300,
             },
         );
         config.agents.clear();
