@@ -19,30 +19,35 @@ The control loop that delivers this is layered on purpose:
 - **Risk-based review depth**: high-risk consequences and security boundaries get deep review, while low-risk work stays fast.
 - **Rollback-first merge contract**: every merge path includes a concrete recovery story.
 
-Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals; automated review does not count as a Core Team approval. The only standing exception is the [expedited second-review lane](#expedited-second-review-lane).
+Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals; automated review does not count as a Core Team approval. The only standing exception is the [expedited unanswered-review lane](#expedited-unanswered-review-lane).
 
-## Expedited second-review lane
+## Expedited unanswered-review lane
 
-The two-Core rule remains the default for every PR carrying `risk:high` or `domain:security`. A human maintainer may instead evaluate the expedited lane when an active durable request to a second Core reviewer, distinct from the author and approving reviewer, has remained unanswered for five full business days. This is an optional accountable merge path, not an automatic timeout or permission to clear an objection.
+Two independent Core Team approvals remain the default for PRs carrying `risk:high` or `domain:security`. A human maintainer may propose an explicit exception when a durable public request for a required human review action remains unanswered across five subsequent UTC business dates. This covers initial review, second review, re-review, CODEOWNER review, dismissal, and reconsideration of a review-only hold. It is an accountable merge decision, not an automatic approval or authority for automation to merge.
 
-Start the clock at the later of the qualifying non-author Core approval and the active durable public request for that distinct second Core reviewer. Use UTC and count only Monday-through-Friday transitions, without a holiday calendar. The start day is not a full business day: the deadline is the same UTC time of day after five eligible weekday transitions. Record both source timestamps and the computed deadline in the final merge packet.
+FND-003 §5.1 supplies the responsibility to review within five business days. That responsibility alone does not waive required approvals. The final packet must identify the requested action, reviewer or reviewer group, requested head or change range, existing applicable approvals, and every unmet review or independence requirement. A missing first approval does not prevent the clock from starting, but author-side assessment and advisory automation do not count as independent human approval.
 
-The request must remain active and unanswered on the effective head. A formal review from the requested reviewer, removal or cancellation of the request, or a recorded decline ends that clock. If a second human review is still required, a new active durable request starts a new clock under the rule above.
+Start the clock at the durable public request covering the unanswered action. Use UTC calendar dates: the request date is day zero, and each subsequent Monday-through-Friday date counts once. No holiday calendar applies. Eligibility begins at 00:00 UTC on the fifth counted business date, not at the original request's time of day. Record the request timestamp, five counted dates, and eligibility date. For example, a request on Monday is eligible at 00:00 UTC the following Monday.
 
-Any head change requires a non-author Core approval and accepted advisory evidence applicable to the new effective head. A verified mechanical base integration may preserve only elapsed clock time when it selects no behavior and the new head obtains fresh required CI; every other head change restarts the clock.
+A response that supplies the requested review ends the unanswered request. A substantive objection remains a blocker until resolved; its age never clears it. A recorded decline or withdrawal is not silence and requires rerouting. Removing a request does not itself authorize an exception. A later request covering a materially different scope starts its own clock.
 
-The lane is eligible only when every condition below holds on the effective head:
+Approval covers the assessed contract and risk, not an immutable SHA. Preserve existing approvals and the request clock after checked mechanical integration or a repair that fulfills the already-reviewed contract without introducing a material new decision or risk. A new SHA, changed line count, or production-code edit alone does not require reviewer reconfirmation. When a change contradicts a load-bearing approval premise or introduces material scope, compatibility, security, or architecture decisions, require independent coverage of the affected decision and start any new timeout from the durable request covering it. Preserve unaffected evidence rather than restarting the whole review.
 
-- The PR is non-draft, mergeable, and fully passing every required check.
-- One Core Team member other than the PR author has approved the effective head.
-- `zeroclaw-reviewer[bot]` or an explicitly accepted equivalent advisory artifact has completed clean applicable exact-head review without tool failure, and a human has reconciled every finding. An equivalent artifact must identify its producer and link the durable public record that accepted it for this purpose.
-- Five full business days have elapsed since the clock began.
-- No `do-not-merge`, `needs-author-action`, stale-candidate, release hold, unresolved changes-requested review, review thread, human or automated finding, or other blocking condition remains.
-- The body, labels, linked work, validation, rollback account, compatibility disposition, and follow-ups are current.
+Assess advisory evidence separately. Mechanical base integration may preserve prior advisory evidence when it selects no behavior and the inspected integration leaves that evidence applicable; fresh passing required CI is still needed. A contract-preserving repair does not automatically make an older advisory result cover the repaired behavior. Record the actual evidence for the effective head and every material delta.
 
-An objection or hold is not silence and never expires through this lane. Broad governance, security-floor, release, migration, and irreversible architecture changes continue to default to two human approvals. If a maintainer proposes the lane for one of those categories, the final packet must explain why the exact change is bounded and why one human approval plus the named evidence is sufficient.
+Every condition below must hold before proposing the exception:
 
-The final merge packet names the approving Core maintainer; the distinct requested reviewer and active request; the source timestamps, clock calculation, and UTC deadline; the advisory producer, acceptance record when applicable, result, and reviewed head; current required CI; all reconciled holds and findings; and the consequence, likelihood, impact, and uncertainty of proceeding without the second human review. The merger remains responsible for that exact-head decision, and the ordinary exact merge approval is still required.
+- The PR is non-draft, mergeable, and passing every required check.
+- Completed technical assessment covers the effective head and every material change. A recognized repository advisory reviewer or an explicitly accepted equivalent artifact supplies applicable independent technical evidence, with identifiable producer, reviewed revision, result, and durable evidence. Failed or incomplete tool execution is not a clean assessment.
+- Five subsequent business dates have been counted for the specific outstanding request.
+- No substantive finding, unresolved review thread, failed required check, release incompatibility, security concern, or other technical blocker remains.
+- Review-only administrative holds or technically resolved stale verdicts are individually identified and supported by resolution evidence. Any proposed dismissal or hold removal requires exact approval and verified readback before merge. Unresolved objections never qualify.
+- The PR body, labels, linked work, validation, rollback, compatibility disposition, and follow-ups are current and truthful.
+- The final packet explicitly discloses missing human approvals, author or maintainer contributions, any CODEOWNER gap, and the likelihood, impact, and uncertainty of proceeding.
+
+Broad governance, security-floor, release, migration, and irreversible architecture changes still default to two human approvals. They are not automatically eligible because time elapsed. A proposed exception must explain why the exact change and available independent evidence justify proceeding; unresolved technical or governance ambiguity stops the merge.
+
+The final packet includes the clock calculation, applicable approvals and missing requirements, advisory evidence, fresh required CI, reconciled findings, compatibility and rollback, exact prospective public explanation, any hold removal or dismissal, and the guarded merge command. Publish the approved explanation before merging and state that routing labels are cleared under the exception, not because another human approval arrived. Neither silence nor automation supplies a vote. The accountable human merger must approve the exact packet.
 
 ## Project board contract
 
@@ -126,7 +131,7 @@ PR lanes are routing expectations, not another required label family. Use them t
 | A: maintenance fast lane | Docs-only corrections, small tests that leave behavior unchanged, metadata/template fixes, narrow examples, CI/tooling fixes that preserve permissions and release behavior | Lightest review; fast merge once CI, template, labels, and privacy checks are clean. Usually `risk:low` and `size:XS` or `size:S`. |
 | B: narrow bug/fix lane | Small bug fixes with clear failing behavior, targeted provider/channel/tool fixes with focused validation, compatibility fixes that preserve behavior outside the reported path | Normal review by one subsystem-aware reviewer unless risk or ownership says otherwise. Merge when the linked issue is actually satisfied, validation is credible, and CI is green. |
 | C: feature slice lane | Additive feature work, new provider/channel/tool support, new config surface, scoped user-visible behavior changes | Normal review plus boundary-specific validation. Milestone fit matters, and the PR should say whether it implements, depends on, or is related to a tracker. |
-| D: architecture, migration, and elevated-review lane | Concrete trust, credential, compatibility, governance, release-authority, migration, lifecycle, persistence, permission, or toolchain-floor boundary; any PR carrying `risk:high` or `domain:security` | Deep review, evidence matched to the changed risk, and rollback and compatibility analysis. A PR carrying `risk:high` or `domain:security` defaults to two independent Core Team approvals; only the [expedited second-review lane](#expedited-second-review-lane) provides a standing exception. |
+| D: architecture, migration, and elevated-review lane | Concrete trust, credential, compatibility, governance, release-authority, migration, lifecycle, persistence, permission, or toolchain-floor boundary; any PR carrying `risk:high` or `domain:security` | Deep review, evidence matched to the changed risk, and rollback and compatibility analysis. A PR carrying `risk:high` or `domain:security` defaults to two independent Core Team approvals; only the [expedited unanswered-review lane](#expedited-unanswered-review-lane) provides a standing exception. |
 | E: supersede, replacement, and overlap lane | Multiple PRs solving the same issue, newer PRs replacing older ones, contributor work carried forward from another PR, old PR made obsolete by current `master` | Coordinate before deep review. Choose one canonical path when possible, use `Supersedes #N` only when accurate, and preserve attribution when work is materially carried forward. |
 
 Do not build a separate manual PR board for these lanes unless native GitHub state and CODEOWNERS stop answering the routing question. Check native GitHub merge state before normal lane review: `DIRTY` means resolve conflicts first; `BEHIND` alone is mergeability housekeeping, not an author-facing blocker.
@@ -160,7 +165,7 @@ Before requesting review, the PR has all of these:
 Before merge:
 
 - `CI Required Gate` is green.
-- Required reviewers approved, including any CODEOWNERS paths; a PR carrying `risk:high` or `domain:security` satisfies the two-Core default or every condition of the [expedited second-review lane](#expedited-second-review-lane).
+- Required reviews, including CODEOWNERS review, are satisfied or explicitly accounted for under the exception below; a PR carrying `risk:high` or `domain:security` satisfies the two-Core default or every condition of the [expedited unanswered-review lane](#expedited-unanswered-review-lane).
 - Risk labels match the actual diff and consequence rather than broad component location. See [Labels](./labels.md).
 - Migration / compatibility impact is documented.
 - Rollback path is concrete and fast.
@@ -173,7 +178,7 @@ Every merge:
 - CI gate is green.
 - Docs-quality checks are green when docs changed.
 - Security and privacy fields are complete; evidence is redacted / anonymized.
-- A PR carrying `risk:high` or `domain:security` satisfies the two-Core default or every condition of the [expedited second-review lane](#expedited-second-review-lane); automated review never counts as a Core Team approval.
+- A PR carrying `risk:high` or `domain:security` satisfies the two-Core default or every condition of the [expedited unanswered-review lane](#expedited-unanswered-review-lane); automated review never counts as a Core Team approval.
 - Agent-workflow notes are sufficient for reproducibility (if AI-assisted).
 - Rollback plan is explicit.
 - Commit title follows Conventional Commits.
@@ -234,7 +239,7 @@ Path location alone does not select `risk:high`. Classify the actual diff and co
 
 Filesystem access boundaries and network or authentication behavior inside these crates deserve particular attention even when the diff is small.
 
-**Minimum for `risk:high` or `domain:security` PRs:** threat or risk statement, mitigation notes, rollback steps, and either two independent Core Team approvals or every condition of the [expedited second-review lane](#expedited-second-review-lane).
+**Minimum for `risk:high` or `domain:security` PRs:** threat or risk statement, mitigation notes, rollback steps, and either two independent Core Team approvals or every condition of the [expedited unanswered-review lane](#expedited-unanswered-review-lane).
 
 **Recommended for `risk:high` or `domain:security` PRs:** a focused test proving boundary behavior, plus one explicit failure-mode scenario with expected degradation.
 
