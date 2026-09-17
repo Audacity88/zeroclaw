@@ -11,6 +11,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::paths::{normalize_lexical, resolve_under};
+#[cfg(test)]
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;

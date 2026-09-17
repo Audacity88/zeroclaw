@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{Config, LineDmPolicy, LineGroupPolicy};
+#[cfg(test)]
+use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{LineDmPolicy, LineGroupPolicy};
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
