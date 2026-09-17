@@ -718,12 +718,6 @@ async fn run_compact(
         .take_while(|(id, _)| *id <= selection.covered_through_message_id)
         .map(|(_, message)| message.clone())
         .collect();
-    let tail: Vec<ConversationMessage> = snapshot
-        .message_rows
-        .iter()
-        .filter(|(id, _)| *id > selection.covered_through_message_id)
-        .map(|(_, message)| message.clone())
-        .collect();
 
     // Input bound against the canonical effective context budget, in the
     // canonical estimate over the ACTUAL one-shot request message (full
@@ -778,11 +772,10 @@ async fn run_compact(
     // included on both sides).
     let (before_estimate, after_estimate) = {
         let agent = admitted.agent.lock().await;
-        let before_messages = {
-            let mut messages = covered.clone();
-            messages.extend(tail.iter().cloned());
-            AcpSessionStore::provider_safe_history(&messages)
-        };
+        // Compare with the admitted live history, which may already have
+        // trimmed the checkpoint projection. Originals remain summary input.
+        // Normalize both sides without the separately rebuilt system prompt.
+        let before_messages = AcpSessionStore::provider_safe_history(&expected_history);
         let after_messages = projected_provider_history_from_summary(
             &snapshot.message_rows,
             &selection,

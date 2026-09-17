@@ -12115,7 +12115,7 @@ mod tests {
     /// operation) and a streamed reply for real turns. Captures are shared
     /// through an `Arc` so tests can assert on them after each step.
     struct CapturingCompactionProvider {
-        summary_text: &'static str,
+        summary_text: String,
         captured: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
     }
 
@@ -12238,7 +12238,7 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<ChatMessage>>::new()));
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(CapturingCompactionProvider {
-                summary_text: "Decision: keep the AST, add a shim. Unfinished: migration.",
+                summary_text: "Decision: keep the AST, add a shim. Unfinished: migration.".into(),
                 captured: Arc::clone(&captured),
             }))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -12349,6 +12349,58 @@ mod tests {
             );
         }
 
+        // A second operation must reduce the CURRENT context. This candidate
+        // grows it, while remaining small enough to pass the old originals-based
+        // check. Refusal must preserve both the live and durable projections.
+        let larger_summary = "Additional migration detail. ".repeat(4);
+        let snapshot = acp_store
+            .read_compaction_snapshot(sid, "op-grow")
+            .unwrap()
+            .unwrap();
+        let mut candidate = snapshot.active_checkpoint.clone().unwrap();
+        candidate.summary = larger_summary.clone();
+        let live_before = {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let mut agent = agent.lock().await;
+            let candidate_history = crate::rpc::compaction::projected_provider_history(
+                &snapshot.message_rows,
+                Some(&candidate),
+            );
+            let candidate_estimate = agent.estimate_provider_messages(&candidate_history) as u64;
+            assert!(candidate_estimate > compact.estimated_tokens_after);
+            assert!(
+                candidate_estimate * 2 < compact.estimated_tokens_before,
+                "the larger summary would pass an originals-based savings check"
+            );
+            agent.set_model_provider(Box::new(CapturingCompactionProvider {
+                summary_text: larger_summary,
+                captured: Arc::clone(&captured),
+            }));
+            serde_json::to_value(agent.history()).unwrap()
+        };
+        let refused = dispatcher
+            .handle_session_compact_context(&serde_json::json!({
+                "session_id": sid,
+                "operation_id": "op-grow",
+            }))
+            .await
+            .expect_err("recompaction that enlarges the active context must be refused");
+        assert_eq!(refused.code, INVALID_PARAMS);
+        assert!(
+            refused
+                .message
+                .contains("would not reduce context usefully")
+        );
+        assert!(store_has_active_checkpoint(&acp_store, sid, "op-compact-1"));
+        assert!(!store_has_active_checkpoint(&acp_store, sid, "op-grow"));
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(agent.lock().await.history()).unwrap(),
+                live_before
+            );
+        }
+
         // ── next real provider request ──
         dispatcher
             .handle_session_prompt(&serde_json::json!({
@@ -12435,6 +12487,82 @@ mod tests {
                     if chat.content.contains(&summary_label))),
             "the terminal writer must never persist the derived summary into originals"
         );
+
+        // Message-cap trimming can make live context smaller than a durable
+        // checkpoint reconstruction. Savings must use that live baseline.
+        let full_live = {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let mut agent = agent.lock().await;
+            let full_live = agent.history().to_vec();
+            let mut trimmed = crate::agent::history_trim::trim_conversation_to_recent_turns(
+                full_live.clone(),
+                2,
+                false,
+            );
+            assert!(trimmed.trimmed);
+            crate::agent::history_trim::insert_conversation_breadcrumb(&mut trimmed.history);
+            agent.clear_history();
+            agent.seed_conversation_history(trimmed.history);
+            let snapshot = acp_store
+                .read_compaction_snapshot(sid, "op-trimmed")
+                .unwrap()
+                .unwrap();
+            let selection = zeroclaw_infra::acp_session_store::select_compaction_source(
+                &snapshot.message_rows,
+                &snapshot.terminal_ranges,
+            )
+            .unwrap();
+            let mut candidate = snapshot.active_checkpoint.clone().unwrap();
+            candidate.covered_through_message_id = selection.covered_through_message_id;
+            candidate.source_message_rows = selection.covered_message_rows as i64;
+            candidate.summary = "Additional migration detail. ".repeat(4);
+            let candidate_history = crate::rpc::compaction::projected_provider_history(
+                &snapshot.message_rows,
+                Some(&candidate),
+            );
+            let durable_history = crate::rpc::compaction::projected_provider_history(
+                &snapshot.message_rows,
+                snapshot.active_checkpoint.as_ref(),
+            );
+            let candidate_estimate = agent.estimate_provider_messages(&candidate_history);
+            assert!(candidate_estimate * 2 < agent.estimate_provider_messages(&durable_history));
+            assert!(
+                candidate_estimate
+                    > agent.estimate_provider_messages(
+                        &zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+                            agent.history()
+                        ),
+                    )
+            );
+            full_live
+        };
+        let trimmed_before = {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            serde_json::to_value(agent.lock().await.history()).unwrap()
+        };
+        let refused = dispatcher
+            .handle_session_compact_context(&serde_json::json!({
+                "session_id": sid, "operation_id": "op-trimmed",
+            }))
+            .await
+            .expect_err("recompaction must not enlarge trimmed live context");
+        assert_eq!(refused.code, INVALID_PARAMS);
+        assert!(
+            refused
+                .message
+                .contains("would not reduce context usefully")
+        );
+        assert!(store_has_active_checkpoint(&acp_store, sid, "op-compact-1"));
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let mut agent = agent.lock().await;
+            assert_eq!(
+                serde_json::to_value(agent.history()).unwrap(),
+                trimmed_before
+            );
+            agent.clear_history();
+            agent.seed_conversation_history(full_live);
+        }
 
         // A committed retry of the same operation is recognized, not
         // re-run: no additional provider capture occurs.
