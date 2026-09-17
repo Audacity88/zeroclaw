@@ -636,7 +636,7 @@ pub struct AppState {
     /// Read-only live config handle: HTTP readers observe the published
     /// config and its revision as one pair and cannot bypass publication
     /// with a raw write. Mutating handlers admit through
-    /// [`AppState::begin_config_commit`] instead.
+    /// `AppState::begin_config_commit` instead.
     pub config: zeroclaw_config::live::LiveConfigHandle,
 
     /// The live-config authority owning this gateway run's publication
