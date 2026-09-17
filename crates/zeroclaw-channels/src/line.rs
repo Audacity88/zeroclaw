@@ -22,6 +22,8 @@ const MAX_LINE_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 const LINE_SENDER_NAME_MAX_CHARS: usize = 20;
 
 pub struct LineChannel {
+    #[cfg(test)]
+    persistence_waiting: Option<Arc<tokio::sync::Notify>>,
     /// Long-lived channel access token — used for both Reply and Push APIs.
     channel_access_token: String,
     /// Channel secret — used to verify the `X-Line-Signature` header.
@@ -75,6 +77,9 @@ struct BotInfo {
 // ---------------------------------------------------------------------------
 
 struct LineState {
+    #[cfg(test)]
+    persistence_waiting: Option<Arc<tokio::sync::Notify>>,
+    persistence_cancel: tokio_util::sync::CancellationToken,
     tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     channel_secret: String,
     bot_user_id: String,
@@ -248,13 +253,27 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     if normalized.is_empty() {
         anyhow::bail!("Cannot persist empty LINE userId");
     }
-    crate::identity_persist::persist_external_peer(
+    let persistence = crate::identity_persist::persist_external_peer_with_cancellation(
         Some(authority),
         "line",
         &state.alias,
         &normalized,
-    )
-    .await
+        Some(&state.persistence_cancel),
+    );
+    #[cfg(test)]
+    if let Some(waiting) = &state.persistence_waiting {
+        use std::future::Future;
+        tokio::pin!(persistence);
+        return std::future::poll_fn(|cx| {
+            let result = persistence.as_mut().poll(cx);
+            if result.is_pending() {
+                waiting.notify_one();
+            }
+            result
+        })
+        .await;
+    }
+    persistence.await
 }
 
 async fn handle_webhook(
@@ -734,6 +753,8 @@ impl LineChannel {
         };
 
         Self {
+            #[cfg(test)]
+            persistence_waiting: None,
             channel_access_token: token,
             channel_secret: secret,
             dm_policy,
@@ -1056,7 +1077,13 @@ impl LineChannel {
         bot_user_id: String,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        // Axum requests can outlive the listener during graceful shutdown.
+        let persistence_cancel = tokio_util::sync::CancellationToken::new();
+        let _persistence_guard = persistence_cancel.clone().drop_guard();
         let state = Arc::new(LineState {
+            #[cfg(test)]
+            persistence_waiting: self.persistence_waiting.clone(),
+            persistence_cancel,
             tx,
             channel_secret: self.channel_secret.clone(),
             bot_user_id,
@@ -1235,6 +1262,8 @@ mod tests {
         let channel = make_channel().with_persistence_authority(authority.clone());
         let (tx, _rx) = mpsc::channel(1);
         let state = LineState {
+            persistence_waiting: None,
+            persistence_cancel: tokio_util::sync::CancellationToken::new(),
             tx,
             channel_secret: channel.channel_secret.clone(),
             bot_user_id: "bot-user".to_string(),
@@ -2589,6 +2618,89 @@ mod tests {
     }
 
     // ---- Bind Reply Feedback ------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_listener_rejects_in_flight_webhook_pairing() {
+        use std::time::Duration;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&api_server)
+            .await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config
+            .channels
+            .line
+            .insert("line_test_alias".into(), Default::default());
+        config.config_path = temp.path().join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let mut channel = LineChannel::new(
+            "tok".into(),
+            "secret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_persistence_authority(authority.clone());
+        let code = channel.pairing.as_ref().unwrap().pairing_code().unwrap();
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        channel.persistence_waiting = Some(Arc::clone(&waiting));
+        let lock = authority.config_write_lock();
+        let guard = lock.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, _rx) = mpsc::channel(1);
+        let server = zeroclaw_spawn::spawn!(async move {
+            channel
+                .listen_with_listener(listener, "bot".into(), tx)
+                .await
+        });
+        let request = zeroclaw_spawn::spawn!(async move {
+            post_signed(
+                port,
+                "secret",
+                &dm_event("line-user", &format!("/bind {code}"), ""),
+            )
+            .await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(5), waiting.notified()).await;
+        server.abort();
+        let _ = server.await;
+        if pending.is_err() {
+            request.abort();
+            panic!("webhook did not reach pairing persistence");
+        }
+        let mut request = request;
+        let settled = tokio::time::timeout(Duration::from_secs(5), &mut request).await;
+        if settled.is_err() {
+            request.abort();
+            let _ = request.await;
+        }
+        assert_eq!(
+            settled
+                .expect("retired request must settle while lock remains held")
+                .unwrap(),
+            200
+        );
+        drop(guard);
+        assert!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("line", "line_test_alias")
+                .is_empty()
+        );
+        assert!(!temp.path().join("config.toml").exists());
+    }
 
     #[tokio::test]
     async fn webhook_bind_success_sends_paired_reply() {

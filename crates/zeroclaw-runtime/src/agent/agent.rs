@@ -1703,8 +1703,38 @@ impl Agent {
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Result<Self> {
         let config = live_config.read().clone();
-        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+        Self::from_snapshot_with_tui_env_with_capability(
             &config,
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            execution_capability,
+        )
+        .await
+    }
+
+    /// Build static inputs from the caller's snapshot while retaining canonical
+    /// live policy access. The caller must validate the snapshot at publication.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn from_snapshot_with_tui_env_with_capability(
+        config: &Config,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        execution_capability: Option<AgentExecutionCapability>,
+    ) -> Result<Self> {
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            config,
             agent_alias,
             session_cwd,
             initialize_mcp,

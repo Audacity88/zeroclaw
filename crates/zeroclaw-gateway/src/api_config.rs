@@ -403,7 +403,6 @@ fn config_commit_publish_error(
         format!("config publication failed: {error}"),
     )
 }
-
 fn channel_generation_projection(config: &zeroclaw_config::schema::Config) -> serde_json::Value {
     let agents: std::collections::BTreeMap<&str, serde_json::Value> = config
         .agents
@@ -423,38 +422,6 @@ fn channel_generation_projection(config: &zeroclaw_config::schema::Config) -> se
         "peer_groups": &config.peer_groups,
         "agents": agents,
     })
-}
-
-enum ConfigDiskSnapshot {
-    Absent,
-    Present(Vec<u8>),
-    ExistingUnreadable,
-    ExistenceUnknown,
-}
-
-async fn snapshot_config_disk_state(config_path: &std::path::Path) -> ConfigDiskSnapshot {
-    match config_path.try_exists() {
-        Ok(false) => ConfigDiskSnapshot::Absent,
-        Ok(true) => match tokio::fs::read(config_path).await {
-            Ok(bytes) => ConfigDiskSnapshot::Present(bytes),
-            Err(_) => ConfigDiskSnapshot::ExistingUnreadable,
-        },
-        Err(_) => ConfigDiskSnapshot::ExistenceUnknown,
-    }
-}
-
-async fn rollback_config_disk_state(config_path: &std::path::Path, snapshot: ConfigDiskSnapshot) {
-    match snapshot {
-        ConfigDiskSnapshot::Absent => {
-            if matches!(config_path.try_exists(), Ok(true)) {
-                let _ = tokio::fs::remove_file(config_path).await;
-            }
-        }
-        ConfigDiskSnapshot::Present(bytes) => {
-            let _ = tokio::fs::write(config_path, bytes).await;
-        }
-        ConfigDiskSnapshot::ExistingUnreadable | ConfigDiskSnapshot::ExistenceUnknown => {}
-    }
 }
 
 fn schedule_channel_generation_reload(
@@ -481,7 +448,7 @@ fn schedule_channel_generation_reload(
 /// save. The prepared channel-generation drain runs inside the same task,
 /// preserving the historical serialization boundary between config
 /// commits and channel retirement.
-async fn persist_and_publish(
+pub(crate) async fn persist_and_publish(
     state: &AppState,
     commit: zeroclaw_runtime::live_config_authority::ConfigCommit,
     new_config: zeroclaw_config::schema::Config,
@@ -589,13 +556,19 @@ async fn save_and_publish_config_retained(
 ) -> Result<(), ConfigApiError> {
     let config_path = new_config.config_path.clone();
 
-    // Snapshot pre-write disk state (used for revert on save failure). When
-    // the file doesn't exist yet, snapshot is None — we'll remove the file
-    // again on rollback so a failed first-write doesn't leak partial state.
-    let snapshot = snapshot_config_disk_state(&config_path).await;
+    // Snapshot pre-write disk state (used for revert on save failure). Only
+    // NotFound means the file was absent. Any other read failure must stop
+    // before the save because treating an unreadable file as absent would
+    // let the rollback path delete an existing canonical config.
+    let snapshot = read_config_snapshot(&config_path).await?;
 
     if let Err(e) = new_config.save_dirty().await {
-        rollback_config_disk_state(&config_path, snapshot).await;
+        if let Some(prev) = snapshot {
+            let _ = tokio::fs::write(&config_path, prev).await;
+        }
+        // When the path was absent, the atomic writer either leaves it absent
+        // on failure or reports a visible rename as success. Do not remove a
+        // path here: an external writer may have created it after admission.
         return Err(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("save failed: {e}"),
@@ -628,6 +601,39 @@ async fn finish_prepared_channel_generation(
         prepared.begin().wait().await;
         schedule_channel_generation_reload(pending_reload, controls);
     }
+}
+
+async fn read_config_snapshot(
+    config_path: &std::path::Path,
+) -> Result<Option<Vec<u8>>, ConfigApiError> {
+    match tokio::fs::read(config_path).await {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ConfigApiError::new(
+            ConfigApiCode::ReloadFailed,
+            format!("failed to snapshot existing config before save: {error}"),
+        )),
+    }
+}
+
+/// Reject masked or empty values from writes to secret-bearing properties.
+/// Dashboard surfaces may send the masked display sentinel when no real edit
+/// was made; accepting it would replace the live secret with that sentinel.
+fn reject_masked_secret_value(
+    path: &str,
+    is_sensitive: bool,
+    value: &str,
+) -> Result<(), ConfigApiError> {
+    if is_sensitive
+        && (value == zeroclaw_config::traits::MASKED_SECRET || value == "****" || value.is_empty())
+    {
+        return Err(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!("Refusing to overwrite secret `{path}` with a masked or empty value"),
+        )
+        .with_path(path));
+    }
+    Ok(())
 }
 
 /// `POST /api/channels/bind` request body. The GUI/HTTP equivalent of
@@ -783,25 +789,32 @@ fn is_gateway_managed_field(name: &str) -> bool {
 }
 
 pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<DriftEntry> {
-    let path = &in_memory.config_path;
-    if !path.exists() {
-        return Vec::new();
-    }
+    try_compute_drift(in_memory).await.unwrap_or_default()
+}
 
+pub(crate) async fn try_compute_drift(
+    in_memory: &zeroclaw_config::schema::Config,
+) -> Result<Vec<DriftEntry>, ConfigApiError> {
+    let path = &in_memory.config_path;
     let raw = match tokio::fs::read_to_string(path).await {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ConfigApiError::new(
+                ConfigApiCode::ConfigChangedExternally,
+                format!("cannot inspect the canonical config before comparing changes: {error}"),
+            ));
+        }
     };
 
     // Re-parse the on-disk form into a fresh Config for value-by-value comparison.
-    let on_disk: zeroclaw_config::schema::Config =
-        match toml::from_str::<zeroclaw_config::schema::Config>(&raw) {
-            Ok(mut cfg) => {
-                cfg.config_path = path.clone();
-                cfg
-            }
-            Err(_) => return Vec::new(),
-        };
+    let mut on_disk = toml::from_str::<zeroclaw_config::schema::Config>(&raw).map_err(|_| {
+        ConfigApiError::new(
+            ConfigApiCode::ConfigChangedExternally,
+            "cannot compare changes because the canonical config is malformed",
+        )
+    })?;
+    on_disk.config_path = path.clone();
 
     let in_memory_props: std::collections::HashMap<String, zeroclaw_config::traits::PropFieldInfo> =
         in_memory
@@ -871,7 +884,7 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
 
     // Stable order so callers can diff snapshots.
     drift.sort_by(|a, b| a.path.cmp(&b.path));
-    drift
+    Ok(drift)
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
@@ -966,26 +979,9 @@ pub async fn handle_prop_put(
         Err(e) => return error_response(e.with_path(&body.path)),
     };
 
-    // Reject the masked sentinel for secrets — surfaces occasionally
-    // echo the masked display value back when no real edit happened.
-    // Letting that through would overwrite the live secret with the
-    // literal masked string.
     let is_sensitive = info.is_secret || info.derived_from_secret;
-    if is_sensitive
-        && (value_str == zeroclaw_config::traits::MASKED_SECRET
-            || value_str == "****"
-            || value_str.is_empty())
-    {
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::ValidationFailed,
-                format!(
-                    "Refusing to overwrite secret `{}` with a masked or empty value",
-                    body.path
-                ),
-            )
-            .with_path(&body.path),
-        );
+    if let Err(e) = reject_masked_secret_value(&body.path, is_sensitive, &value_str) {
+        return error_response(e);
     }
 
     if let Err(e) = new_config.set_prop_persistent(&body.path, &value_str) {
@@ -2485,6 +2481,9 @@ pub async fn handle_patch(
                         return error_response(e.with_path(&path).with_op_index(idx));
                     }
                 };
+                if let Err(e) = reject_masked_secret_value(&path, is_sensitive, &value_str) {
+                    return error_response(e.with_op_index(idx));
+                }
                 if let Err(e) = working.set_prop_persistent(&path, &value_str) {
                     return error_response(map_prop_error(e, &path).with_op_index(idx));
                 }
@@ -2789,6 +2788,7 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
             let replace_config_path = config_path.clone();
             let replace_parent = parent.clone();
             let response_backup_path = backup_path.display().to_string();
+            let pending_reload = Arc::clone(&state.pending_reload);
             let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(
                 Box::pin(async move {
                     // 1. Write migrated content to temp + fsync.
@@ -2858,6 +2858,7 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
                     commit
                         .publish(revision, prepared)
                         .map_err(config_commit_publish_error)?;
+                    pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
                     Ok(())
                 }),
             );
@@ -3539,6 +3540,134 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(!state.config.read().agents.contains_key("recreated"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_patch_route_rejects_masked_or_empty_secret_values_without_mutation() {
+        use axum::body::Body;
+        use axum::routing::patch;
+        use tower::ServiceExt;
+
+        let token = "patch-secret-test-token";
+        for op in ["add", "replace"] {
+            for value in [zeroclaw_config::traits::MASKED_SECRET, "****", ""] {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut config = temp_config(&tmp);
+                config.gateway.webhook_secret = Some("original-secret".into());
+                config.save().await.unwrap();
+                let disk_before = tokio::fs::read(&config.config_path).await.unwrap();
+                let live_before = config.gateway.webhook_secret.clone();
+                let mut state = test_state(config);
+                state.pairing = Arc::new(PairingGuard::new(
+                    true,
+                    &[token.to_string()],
+                    zeroclaw_config::pairing::PairingCodePolicy::default(),
+                ));
+                let app = axum::Router::new()
+                    .route("/api/config", patch(handle_patch))
+                    .with_state(state.clone());
+
+                let (status, json) = response_json(
+                    app.oneshot(
+                        axum::http::Request::builder()
+                            .method("PATCH")
+                            .uri("/api/config")
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header("x-zeroclaw-override-drift", "true")
+                            .body(Body::from(
+                                serde_json::json!([{
+                                    "op": op,
+                                    "path": "/gateway/webhook_secret",
+                                    "value": value,
+                                }])
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(json["code"], "validation_failed");
+                assert_eq!(json["path"], "gateway.webhook_secret");
+                assert_eq!(json["op_index"], 0);
+                let disk_path = state.config.read().config_path.clone();
+                let disk_after = tokio::fs::read(disk_path).await.unwrap();
+                assert_eq!(
+                    disk_after, disk_before,
+                    "rejected {op} value {value:?} must not change disk"
+                );
+                assert_eq!(
+                    state.config.read().gateway.webhook_secret,
+                    live_before,
+                    "rejected {op} value {value:?} must not change live config"
+                );
+                assert!(
+                    !state
+                        .pending_reload
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_runtime_paths_and_publishes_schema_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("selected-config.toml");
+        let data_dir = tmp.path().join("selected-data");
+        let legacy = zeroclaw_config::migration::generate(
+            2,
+            &zeroclaw_config::migration::GenerateOptions::default(),
+        )
+        .unwrap();
+        tokio::fs::write(&config_path, legacy).await.unwrap();
+        let state = test_state(zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: data_dir.clone(),
+            ..Default::default()
+        });
+
+        let (status, json) =
+            response_json(handle_migrate(State(state.clone()), HeaderMap::new()).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["migrated"], true);
+        assert_eq!(
+            state.config.read().config_path,
+            config_path,
+            "migration must retain the runtime-selected config path"
+        );
+        assert_eq!(
+            state.config.read().data_dir,
+            data_dir,
+            "migration must retain the runtime-selected data directory"
+        );
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let raw = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let disk_value: toml::Value = toml::from_str(&raw).unwrap();
+        let live_schema_version = state.config.read().schema_version;
+        assert_eq!(
+            live_schema_version,
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+            "migration must publish the upgraded schema version live"
+        );
+        assert_eq!(
+            disk_value
+                .get("schema_version")
+                .and_then(toml::Value::as_integer),
+            Some(i64::from(
+                zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+            ))
+        );
     }
 
     /// Regression test for the lost-update race `persist_and_publish`
