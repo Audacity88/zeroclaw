@@ -228,6 +228,7 @@ impl ProviderImageState {
 fn suppress_quarantined_provider_images(
     messages: &[ChatMessage],
     quarantined: &[zeroclaw_providers::multimodal::ProviderImageId],
+    has_new_user_input: bool,
 ) -> Vec<ChatMessage> {
     let newest_user_message = messages
         .iter()
@@ -239,7 +240,8 @@ fn suppress_quarantined_provider_images(
         .map(|(index, message)| (index, message.clone()));
     let mut filtered =
         zeroclaw_providers::multimodal::omit_provider_image_ids(messages, quarantined);
-    if let Some((index, message)) = newest_user_message
+    if has_new_user_input
+        && let Some((index, message)) = newest_user_message
         && let Some(slot) = filtered.get_mut(index)
     {
         *slot = message;
@@ -393,10 +395,17 @@ mod provider_image_state_tests {
         ];
         let id = image_id("AAAA");
 
-        let filtered = suppress_quarantined_provider_images(&messages, &[id]);
+        let filtered = suppress_quarantined_provider_images(&messages, &[id], true);
 
         assert!(!filtered[0].content.contains("[IMAGE:"));
         assert!(filtered[2].content.contains("[IMAGE:"));
+
+        let continued = suppress_quarantined_provider_images(&messages, &[id], false);
+        assert!(
+            continued
+                .iter()
+                .all(|message| !message.content.contains("[IMAGE:"))
+        );
     }
 }
 
@@ -887,6 +896,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         std::collections::HashMap::new();
 
     for iteration in 0..max_iterations {
+        let mut has_new_user_input = iteration == 0;
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -905,6 +915,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 IngressDecision::Drop { .. } => continue,
             }
             let msg = ChatMessage::user(steering_message);
+            has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
             turn_state.push_dual(msg);
         }
 
@@ -1020,10 +1031,26 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        // Check if model switch was requested via model_switch tool
-        if let Some(ref callback) = model_switch_callback
-            && let Ok(guard) = callback.lock()
-            && let Some((new_model_provider, new_model)) = guard.as_ref()
+        // Check if model switch was requested via model_switch tool. The tool
+        // writes the request through a poisoned guard (`ModelSwitchTool::handle_set`),
+        // so this read must recover a poisoned guard too or the request is lost.
+        let pending_model_switch = model_switch_callback.as_ref().and_then(|callback| {
+            let guard = match callback.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "model-switch lock poisoned while checking for a pending switch; recovering guard for read"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            guard.clone()
+        });
+        if let Some((new_model_provider, new_model)) = pending_model_switch.as_ref()
             && (new_model_provider != provider_name || new_model != model)
         {
             ::zeroclaw_log::record!(
@@ -1107,6 +1134,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         provider_request_messages = suppress_quarantined_provider_images(
             &provider_request_messages,
             &quarantined_image_ids,
+            has_new_user_input,
         );
         // Only direct Agent turns scope the complete prompt variants. Preserve
         // the channel loop's existing hook/protocol behavior rather than

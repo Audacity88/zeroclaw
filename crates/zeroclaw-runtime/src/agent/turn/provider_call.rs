@@ -232,7 +232,7 @@ pub(crate) async fn call_provider(
                                     .is_some()
                                 || stream_err
                                     .downcast_ref::<StreamProviderFailure>()
-                                    .is_some_and(|error| !error.replay_safe()) =>
+                                    .is_some_and(|error| !error.fallback_safe()) =>
                         {
                             if let Some(usage) = stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
@@ -333,7 +333,10 @@ pub(crate) async fn call_provider(
                             );
                             scope.clear_provisional_provider_route();
                             let image_recovery_candidate = is_http_bad_request(&stream_err)
-                                && image_recovery_messages.is_some();
+                                && image_recovery_messages.is_some()
+                                && stream_err
+                                    .downcast_ref::<StreamProviderFailure>()
+                                    .is_none_or(StreamProviderFailure::replay_safe);
                             let recover_images = image_recovery_candidate
                                 && active_model_provider
                                     .supports_exact_request_replay(original_request, active_model);
@@ -2049,6 +2052,7 @@ mod streaming_fallback_tests {
         non_stream_calls: Arc<AtomicUsize>,
         recovery_succeeds: bool,
         thinking_before_error: bool,
+        draft_before_error: bool,
     }
 
     #[async_trait]
@@ -2080,8 +2084,8 @@ mod streaming_fallback_tests {
             self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(
                 zeroclaw_providers::multimodal::count_image_markers(request.messages),
-                0,
-                "recovery request must contain only the provider-only replacement view"
+                usize::from(self.draft_before_error),
+                "draft-only fallback must retain the original image; no-output recovery omits it"
             );
             if !self.recovery_succeeds {
                 anyhow::bail!("recovery failed");
@@ -2110,6 +2114,13 @@ mod streaming_fallback_tests {
                     Ok(StreamEvent::ThinkingDelta("working".to_string())),
                     error,
                 ]))
+            } else if self.draft_before_error {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk::delta("draft text"),
+                    )),
+                    error,
+                ]))
             } else {
                 Box::pin(futures_util::stream::iter(vec![error]))
             }
@@ -2132,6 +2143,7 @@ mod streaming_fallback_tests {
             non_stream_calls: Arc::new(AtomicUsize::new(0)),
             recovery_succeeds: true,
             thinking_before_error: false,
+            draft_before_error: false,
         };
         let non_stream_calls = Arc::clone(&provider.non_stream_calls);
         let provider = ReliableModelProvider::new(
@@ -2177,6 +2189,7 @@ mod streaming_fallback_tests {
                 non_stream_calls: Arc::new(AtomicUsize::new(0)),
                 recovery_succeeds: false,
                 thinking_before_error,
+                draft_before_error: false,
             };
             let non_stream_calls = Arc::clone(&provider.non_stream_calls);
             let provider = ReliableModelProvider::new(
@@ -2210,6 +2223,59 @@ mod streaming_fallback_tests {
                 non_stream_calls.load(Ordering::Relaxed),
                 usize::from(!thinking_before_error)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_draft_only_fallback_preserves_original_request() {
+        for committed_output in [false, true] {
+            let provider = ImageRecoveryStreamProvider {
+                non_stream_calls: Arc::new(AtomicUsize::new(0)),
+                recovery_succeeds: true,
+                thinking_before_error: false,
+                draft_before_error: true,
+            };
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let mut ctx = recovery_test_ctx(&observer, &pacing);
+            let (draft_tx, mut draft_rx) = tokio::sync::mpsc::channel(16);
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+            ctx.on_delta = Some(&draft_tx);
+            ctx.event_tx = committed_output.then_some(&event_tx);
+            let original = [ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")];
+            let recovery = [ChatMessage::user("[image removed]")];
+
+            let outcome = call_provider(
+                &ctx,
+                &provider,
+                "test-model",
+                &original,
+                Some(&recovery),
+                None,
+                true,
+                0,
+            )
+            .await
+            .expect("provider call completes");
+
+            assert!(draft_rx.try_recv().is_ok(), "draft text must be delivered");
+            assert!(!outcome.image_recovery_succeeded);
+            assert_eq!(
+                provider.non_stream_calls.load(Ordering::Relaxed),
+                usize::from(!committed_output)
+            );
+            if committed_output {
+                assert!(outcome.chat_result.is_err());
+            } else {
+                assert_eq!(
+                    outcome
+                        .chat_result
+                        .expect("ordinary fallback succeeds")
+                        .text
+                        .as_deref(),
+                    Some("recovered")
+                );
+            }
         }
     }
 }

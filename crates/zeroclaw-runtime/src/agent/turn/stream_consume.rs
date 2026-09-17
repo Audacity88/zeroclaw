@@ -21,6 +21,7 @@ pub(crate) struct StreamProviderFailure {
     #[source]
     source: zeroclaw_api::model_provider::StreamError,
     usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    fallback_safe: bool,
     replay_safe: bool,
 }
 
@@ -31,6 +32,10 @@ impl StreamProviderFailure {
 
     pub(crate) fn replay_safe(&self) -> bool {
         self.replay_safe
+    }
+
+    pub(crate) fn fallback_safe(&self) -> bool {
+        self.fallback_safe
     }
 }
 
@@ -197,6 +202,9 @@ pub(crate) async fn consume_provider_streaming_response(
                 return Err(StreamProviderFailure {
                     source: err,
                     usage: outcome.usage,
+                    // Mutable drafts allow the original request's fallback, but
+                    // image-free recovery requires no output on either sink.
+                    fallback_safe: !replay_blocking_activity,
                     replay_safe: !replay_blocking_activity && !outcome.forwarded_live_deltas,
                 }
                 .into());
