@@ -12649,7 +12649,8 @@ impl ChatState {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::UserMessage { session_id, .. } => session_id.as_str(),
         };
         if update_sid != self.session_id {
             return;
@@ -12913,6 +12914,36 @@ impl ChatState {
             // already enforced by the session_id check above.
             SessionUpdate::Plan { entries, .. } => {
                 self.todo_tracker.set_plan(entries);
+            }
+            // Another agent injected this prompt (the sessions_prompt tool
+            // path). The pane never typed it, so it is appended here with
+            // its provenance label; the turn is already running daemon-side
+            // and its stream follows as ordinary turn events.
+            SessionUpdate::UserMessage { text, source, .. } => {
+                self.freeze_prompt_settled_stream();
+                if let Some(source) = source.as_deref() {
+                    let notice = crate::i18n::t_args(
+                        "zc-chat-injected-prompt-source",
+                        &[("source", source)],
+                    );
+                    self.entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                }
+                if self.first_message.is_none() && !text.trim().is_empty() {
+                    self.first_message = Some(text.clone());
+                }
+                self.entries.push(ChatEntry::UserMessage {
+                    text: Some(Arc::<str>::from(text.as_str())),
+                    attachments: Vec::new(),
+                });
+                self.mark_dirty_append();
+                self.message_count = self.message_count.saturating_add(1);
+                self.turn_in_flight = true;
+                self.turn_generation = self.turn_generation.wrapping_add(1);
+                self.turn_had_streaming_text = false;
+                self.turn_had_tool_calls = false;
+                self.turn_status = TurnStatus::Working;
+                self.turn_started_at = Instant::now();
             }
         }
     }
@@ -25742,6 +25773,83 @@ mod tests {
             text: "streaming...".to_string(),
         });
         assert_eq!(s.current_agent_text(), "streaming...");
+    }
+
+    // An injected prompt arrives as an update the pane never typed: exactly
+    // one user entry, the source shown via the provenance label, and the
+    // turn tracked as in flight so the following stream renders normally.
+    // The state object is the same one background sessions use, so routing
+    // through drain_notifications needs no separate handling.
+    #[test]
+    fn user_message_update_appends_one_user_entry_with_source_label() {
+        let mut s = state();
+        let prior_count = s.message_count;
+        s.apply_update(SessionUpdate::UserMessage {
+            session_id: "sess-1".to_string(),
+            text: "[from agent helper, session helper-1]\n\nplease summarize".to_string(),
+            source: Some("helper".to_string()),
+        });
+        let user_entries = s
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ChatEntry::UserMessage { .. }))
+            .count();
+        assert_eq!(user_entries, 1, "exactly one user entry must be appended");
+        match s.entries.last() {
+            Some(ChatEntry::UserMessage { text, .. }) => assert_eq!(
+                text.as_deref(),
+                Some("[from agent helper, session helper-1]\n\nplease summarize")
+            ),
+            other => panic!("last entry must be the user message, got {other:?}"),
+        }
+        assert!(
+            s.entries.iter().any(|e| matches!(
+                e,
+                ChatEntry::SystemMessage(label) if label.contains("helper")
+            )),
+            "the source must be shown via the provenance label"
+        );
+        assert_eq!(s.message_count, prior_count + 1);
+        assert!(s.turn_in_flight, "the injected turn must read as in flight");
+    }
+
+    #[test]
+    fn user_message_update_without_source_appends_without_label() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::UserMessage {
+            session_id: "sess-1".to_string(),
+            text: "injected prompt".to_string(),
+            source: None,
+        });
+        assert!(
+            !s.entries
+                .iter()
+                .any(|e| matches!(e, ChatEntry::SystemMessage(_))),
+            "no source label when no source is given"
+        );
+        assert_eq!(
+            s.entries
+                .iter()
+                .filter(|e| matches!(e, ChatEntry::UserMessage { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn user_message_update_for_other_session_is_ignored() {
+        let mut s = state();
+        let prior = s.entries.len();
+        s.apply_update(SessionUpdate::UserMessage {
+            session_id: "sess-other".to_string(),
+            text: "not this pane".to_string(),
+            source: Some("someone".to_string()),
+        });
+        assert_eq!(
+            s.entries.len(),
+            prior,
+            "updates for other sessions are dropped"
+        );
     }
 
     #[test]

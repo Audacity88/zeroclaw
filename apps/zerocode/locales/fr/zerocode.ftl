@@ -417,6 +417,8 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = Aucun agent activé. Configurez un agent dans l'onglet Config.
 zc-chat-error-fetch-agents = Échec de la récupération des agents : { $error }
 zc-chat-history-trimmed = L’historique antérieur de la conversation a été tronqué : { $reason } ({ $dropped } messages supprimés ; { $kept } tours conservés).
+
+zc-chat-injected-prompt-source = Invite injectée par l’agent { $source } :
 zc-chat-error-create-session = Échec de la création de la session : { $error }
 zc-chat-session-switch-error = Échec du changement de session : { $error }
 zc-chat-status-working = en cours

@@ -6561,6 +6561,25 @@ impl RpcDispatcher {
                 .with_attrs(::serde_json::json!({ "session_id": sid })),
             "turn dispatch: registered cancel token, starting turn"
         );
+        // An agent-injected prompt was not typed by the pane that owns this
+        // session: tell that pane the message exists before the turn starts,
+        // so the stream it is about to receive reads as a reply to a visible
+        // prompt instead of appearing from nowhere.
+        if let Some(source) = req.injected_by.as_deref() {
+            let update = SessionUpdateEvent::UserMessage {
+                session_id: sid.to_string(),
+                text: prompt.clone(),
+                source: Some(source.to_string()),
+            };
+            if let Ok(params) = serde_json::to_value(update)
+                && let Ok(frame) = serde_json::to_string(&JsonRpcNotification::new(
+                    notification::SESSION_UPDATE,
+                    params,
+                ))
+            {
+                let _ = turn_rpc.send_raw(frame).await;
+            }
+        }
         let checkpoint_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
         let checkpoint_turn_id = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             let turn_id = uuid::Uuid::new_v4().to_string();
@@ -38572,6 +38591,43 @@ mod tests {
         assert_eq!(
             frames.last().expect("owner must see the terminal event")["params"]["type"],
             "turn_complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_prompt_emits_user_message_before_the_turn_streams() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, mut owner_rx, _provider, sid) = session_prompt_gateway_harness(&tmp).await;
+
+        let outcome = RpcDispatcher::run_agent_injected_session_prompt(
+            &ctx,
+            &sid,
+            GATEWAY_MESSAGE,
+            "test-agent",
+        )
+        .await
+        .expect("own-alias prompt must run");
+        assert_eq!(outcome.stop_reason, "end_turn");
+
+        // The first frame the owner pane sees is the injected user message
+        // with its provenance, before any turn events — one channel, one
+        // forwarder, so ordering is preserved end to end.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), owner_rx.recv())
+            .await
+            .expect("the injected prompt must be announced")
+            .expect("owner channel must stay open");
+        let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(v["method"], notification::SESSION_UPDATE);
+        assert_eq!(v["params"]["type"], "user_message");
+        assert_eq!(v["params"]["session_id"], sid);
+        assert_eq!(v["params"]["text"], GATEWAY_MESSAGE);
+        assert_eq!(v["params"]["source"], "test-agent");
+
+        let rest = collect_until_turn_complete(&mut owner_rx).await;
+        assert!(
+            rest.iter()
+                .any(|f| f["params"]["type"] == "agent_message_chunk"),
+            "the turn's stream must follow the announced prompt"
         );
     }
 

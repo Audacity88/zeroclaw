@@ -331,6 +331,15 @@ pub enum SessionUpdate {
         session_id: String,
         entries: Vec<crate::wire::PlanEntry>,
     },
+    /// A user message was injected into the session by another agent (the
+    /// `sessions_prompt` tool path); `source` names the injecting agent.
+    /// The pane never typed it, so it arrives as an update instead of being
+    /// rendered locally.
+    UserMessage {
+        session_id: String,
+        text: String,
+        source: Option<String>,
+    },
 }
 
 impl SessionUpdate {
@@ -346,7 +355,8 @@ impl SessionUpdate {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id,
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::UserMessage { session_id, .. } => session_id,
         }
     }
 }
@@ -449,6 +459,14 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 entries,
             })
         }
+        "user_message" => Some(SessionUpdate::UserMessage {
+            session_id: sid,
+            text: params.get("text")?.as_str()?.to_string(),
+            source: params
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
         _ => None,
     }
 }
@@ -7091,6 +7109,50 @@ mod plan_parse_tests {
     fn plan_update_missing_entries_is_none() {
         let params = serde_json::json!({ "type": "plan", "session_id": "s" });
         assert!(parse_session_update(&params).is_none());
+    }
+
+    #[test]
+    fn parse_user_message_round_trips_source_and_text() {
+        let update = parse_session_update(&serde_json::json!({
+            "type": "user_message",
+            "session_id": "s1",
+            "text": "[from agent helper, session helper-1]\n\nhi",
+            "source": "helper",
+        }))
+        .expect("user message parses");
+        assert!(matches!(
+            update,
+            SessionUpdate::UserMessage {
+                ref session_id,
+                ref text,
+                ref source,
+            } if session_id == "s1"
+                && text.starts_with("[from agent helper")
+                && source.as_deref() == Some("helper")
+        ));
+
+        let sourceless = parse_session_update(&serde_json::json!({
+            "type": "user_message",
+            "session_id": "s1",
+            "text": "hi",
+        }))
+        .expect("user message without source parses");
+        assert!(matches!(
+            sourceless,
+            SessionUpdate::UserMessage { source: None, .. }
+        ));
+    }
+
+    #[test]
+    fn parse_unknown_update_type_is_none() {
+        let params = serde_json::json!({
+            "type": "definitely_not_a_real_update_kind",
+            "session_id": "s1",
+        });
+        assert!(
+            parse_session_update(&params).is_none(),
+            "an unknown update kind must stay a no-op for older clients"
+        );
     }
 }
 

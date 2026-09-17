@@ -417,6 +417,8 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = 没有已启用的代理。请在配置选项卡中配置代理。
 zc-chat-error-fetch-agents = 获取代理失败：{ $error }
 zc-chat-history-trimmed = 较早的对话历史已被截断：{ $reason }（已删除 { $dropped } 条消息；保留 { $kept } 轮对话）。
+
+zc-chat-injected-prompt-source = 由代理 { $source } 注入的提示：
 zc-chat-error-create-session = 创建会话失败：{ $error }
 zc-chat-session-switch-error = 切换会话失败：{ $error }
 zc-chat-status-working = 工作中

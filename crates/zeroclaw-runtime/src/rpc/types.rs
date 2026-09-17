@@ -1717,6 +1717,18 @@ pub enum SessionUpdateEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_count: Option<usize>,
     },
+    /// A user message was appended to the session by something other than
+    /// the owning client — e.g. another agent prompted this session via the
+    /// `sessions_prompt` tool. Emitted before the injected turn starts so
+    /// the owner pane renders the prompt it is about to see stream.
+    /// `source` names the injecting agent. Human-typed prompts do not emit
+    /// this: the typing client already renders its own message.
+    UserMessage {
+        session_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
     /// was cut here" marker so trimming is never silent. `dropped_messages` is

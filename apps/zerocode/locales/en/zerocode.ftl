@@ -479,6 +479,8 @@ zc-chat-history-trimmed-token-source-provider = provider-reported
 zc-chat-history-trimmed-token-source-estimate = estimated
 zc-chat-history-trimmed-token-source-calibrated = provider + estimate
 zc-chat-history-trimmed-token-sources = ({ $before } before; { $after } after)
+
+zc-chat-injected-prompt-source = Prompt injected by agent { $source }:
 zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-error-resume-history = The session reattached, but its durable transcript could not be loaded: { $error }
 zc-chat-session-switch-error = Failed to switch session: { $error }

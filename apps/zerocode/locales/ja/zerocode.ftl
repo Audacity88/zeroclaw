@@ -417,6 +417,8 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = 有効なエージェントがありません。Configタブでエージェントを設定してください。
 zc-chat-error-fetch-agents = エージェントの取得に失敗しました: { $error }
 zc-chat-history-trimmed = 以前の会話履歴が短縮されました: { $reason }（{ $dropped } 件のメッセージを削除、{ $kept } ターンを保持）。
+
+zc-chat-injected-prompt-source = エージェント { $source } から注入されたプロンプト:
 zc-chat-error-create-session = セッションの作成に失敗しました: { $error }
 zc-chat-session-switch-error = セッションの切り替えに失敗しました: { $error }
 zc-chat-status-working = 作業中
