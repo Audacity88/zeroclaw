@@ -731,7 +731,7 @@ pub async fn handle_api_channel_bind(
             }
             commit
                 .publish(revision, working)
-                .map_err(|e| config_commit_publish_error(e))?;
+                .map_err(config_commit_publish_error)?;
             pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
             finish_prepared_channel_generation(prepared_channel_generation, pending_reload).await;
             Ok(())
