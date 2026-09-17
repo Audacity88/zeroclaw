@@ -1405,7 +1405,14 @@ pub fn all_tools_with_runtime_and_execution_capability(
                 root_config.config_path.clone(),
                 root_config.secrets.encrypt,
             )
-            .with_serply_api_key_override(serply_api_key_override(root_config)),
+            .with_serply_api_key_override(serply_api_key_override(root_config))
+            // The loader applies `ZEROCLAW_web_search__keenable_api_key` in
+            // memory only. Without handing it over, the tool would reread
+            // `config.toml` and miss an env-only key, or send a stored key
+            // that a blank override was meant to suppress.
+            .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
+                root_config,
+            )),
             security.clone(),
         )));
     }
