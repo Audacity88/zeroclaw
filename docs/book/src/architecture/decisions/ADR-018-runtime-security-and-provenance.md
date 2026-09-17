@@ -43,7 +43,7 @@ That split creates two failure modes. A new action path can forget one step, suc
 Three accepted RFCs describe the architecture that fixes this at the runtime boundary:
 
 - [#7142](https://github.com/zeroclaw-labs/zeroclaw/issues/7142) accepts a runtime-owned security decision pipeline for protected actions. The pipeline combines built-in policy, canonical principal grants, approval requirements, sandbox constraints, restrictive overlays, action fingerprints, single-use runtime permits, canonical audit events, and outcome records.
-- [#6971](https://github.com/zeroclaw-labs/zeroclaw/issues/6971) accepts security posture reporting and one runtime-owned model-admission path. Every model-bound turn and steering injection receives a trusted ingress envelope before the model sees it, while transport-edge authentication and abuse controls stay outside that shared model-admission layer.
+- [#6971](https://github.com/zeroclaw-labs/zeroclaw/issues/6971) accepts credential-surface authority, security posture reporting, and one runtime-owned model-admission path. Credential-shaped config fields require explicit handling classifications, protected values stay out of save and property-readback paths, and the runtime credential-boundary map identifies where plaintext credentials may flow. Every model-bound turn and steering injection receives a trusted ingress envelope before the model sees it, while transport-edge authentication and abuse controls stay outside that shared model-admission layer.
 - [#6954](https://github.com/zeroclaw-labs/zeroclaw/issues/6954) accepts runtime-owned provenance for internally initiated turns. Cron, daemon, SOP, subagent, and peer-agent work must carry internal principals, conversation binding, reply provenance, explicit missing-context behavior, and separate execution, delivery, and persistence outcomes.
 
 These decisions are adjacent to, but not replacements for, the canonical-principal decision in [#7141](https://github.com/zeroclaw-labs/zeroclaw/issues/7141), the command/tool confirmation decision in [#7155](https://github.com/zeroclaw-labs/zeroclaw/issues/7155), the filesystem sandbox decision in [#6996](https://github.com/zeroclaw-labs/zeroclaw/issues/6996), and consumer-specific target validation such as [#6909](https://github.com/zeroclaw-labs/zeroclaw/issues/6909).
@@ -67,6 +67,14 @@ Restrictive overlays may deny an action, narrow its resources, or require strong
 Optional audit sinks and responders are separate extension points. They can receive redacted projections or add containment and notification behavior, but they cannot remove, rewrite, delay, or replace the runtime-created canonical event and baseline runtime hooks.
 
 Future public plugin, WIT, remote-policy, dynamic-library, or incident-responder APIs require their own implementation and trust review. This ADR accepts the authority boundaries, not a speculative third-party security-provider ABI.
+
+### Keep credential surfaces classified and protected
+
+Credential-shaped config fields must have explicit handling classifications, such as encrypted secret, path-only reference, public value, external auth store, compatibility environment path, or requires follow-up. A new credential-shaped field cannot enter the schema without a classification test, audit, or mechanically equivalent ratchet.
+
+Protected credential values must stay out of save and property-readback paths. The classification layer says how values are stored or exposed; it does not by itself decide every runtime component that may receive plaintext.
+
+A separate runtime credential-boundary map names where plaintext may flow across provider and channel clients, tools, MCP servers, delegated work, CLI wrappers, gateway handlers, logs, receipts, events, and error paths. This ADR records that map as a required implementation gate and allows focused hardening driven by it, but it does not accept a full credential broker or a new default isolation profile.
 
 ### Use one model-admission path for inbound content
 
@@ -108,7 +116,7 @@ When the canonical durable audit sink is enabled, the pre-execution event is com
 
 ### Keep rollout sliced and reversible
 
-Implementation follows the routing tracker in [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) and the focused implementation issues and PRs linked from the source RFCs. The runtime security pipeline, canonical audit sink, ingress stamping, non-`Loop` policy, internal-principal envelope, conversation binding, peer reply provenance, and durable-dispatch follow-up must land as independently reviewable slices.
+Implementation follows the routing tracker in [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) and the focused implementation issues and PRs linked from the source RFCs. The runtime security pipeline, canonical audit sink, credential-surface classification, runtime credential-boundary map, ingress stamping, non-`Loop` policy, internal-principal envelope, conversation binding, peer reply provenance, and durable-dispatch follow-up must land as independently reviewable slices.
 
 No single PR should attempt to route every action, every transport, every audit sink, and every internal-turn consumer through the full target at once. Each slice must preserve existing default behavior unless that slice explicitly owns a compatibility change.
 
@@ -119,6 +127,9 @@ This ADR remains proposed until all of these conditions are met:
 - the runtime action pipeline has a typed request and decision vocabulary, an action inventory or equivalent ratchet for protected boundaries, a single-use unforgeable permit, generation and runtime-epoch freshness checks, and final target revalidation at the owned execution or mutation boundary;
 - direct, nested, scheduled, delegated, SOP, gateway, RPC, and security-sensitive tool paths cannot bypass the registered pipeline boundary, and unknown or unclassified protected actions fail closed;
 - built-in policy, #7141 principal grants, no-escalation, #7155 approval provenance, #6996 sandbox constraints, and consumer-specific revalidation such as #6909 remain mandatory layers outside restrictive-overlay control;
+- credential-shaped config fields have explicit handling classifications, with a schema audit, test, or equivalent ratchet that fails new unclassified fields;
+- protected credential values remain absent from save and property-readback paths, with non-exposure coverage where applicable;
+- the runtime credential-boundary map covers provider and channel clients, tools, MCP servers, delegated work, CLI wrappers, gateway handlers, logs, receipts, events, and error paths, with resulting hardening gaps routed to focused follow-ups rather than treated as an accepted credential broker;
 - the canonical minimized security event is runtime-created, includes policy decisions and outcome evidence without secret payloads, and the enabled durable sink commits the pre-execution event before mutation or denies the mutation on persistence failure;
 - optional audit sinks and incident responders can add projections or responses but cannot suppress, replace, delay, or rewrite canonical evidence or baseline runtime hooks;
 - every model-bound turn and steering injection receives its own trusted ingress envelope with transport, sender or principal, message identity where available, origin, and trust facts stamped by entry code rather than message content;
