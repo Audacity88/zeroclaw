@@ -423,6 +423,7 @@ mod tests {
         let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
 
         assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("not found"));
         assert!(
             !format!("{:?}", result.output).contains("private-output"),
             "another agent's job output must not leak"
