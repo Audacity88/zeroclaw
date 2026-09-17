@@ -550,7 +550,7 @@ mod tests {
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let callback_authority = authority.clone();
         let callback_cancel = cancel.clone();
-        let mut callback = tokio::spawn(async move {
+        let mut callback = ::zeroclaw_spawn::spawn!(async move {
             let persistence = persist_external_peer_with_cancellation(
                 Some(&callback_authority),
                 "whatsapp",
