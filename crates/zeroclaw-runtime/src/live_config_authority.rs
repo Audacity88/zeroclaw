@@ -1290,9 +1290,11 @@ mod tests {
     #[tokio::test]
     async fn dispatched_config_commit_publishes_despite_requester_cancellation() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = Config::default();
-        config.config_path = tmp.path().join("config.toml");
-        config.data_dir = tmp.path().join("data");
+        let config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
         config.save().await.unwrap();
         let config_path = config.config_path.clone();
         let authority = LiveConfigAuthority::new(config);

@@ -1134,22 +1134,18 @@ impl RpcDispatcher {
             let result =
                 save_and_publish_config_detached(&commit, revision, snapshot.clone()).await;
             if result.is_ok() {
-                if let Some((config_path, annotations)) = effects.comments {
-                    if let Err(error) =
+                if let Some((config_path, annotations)) = effects.comments
+                    && let Err(error) =
                         zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations)
                             .await
-                    {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                            "failed to apply config/set comment to config.toml"
-                        );
-                    }
+                        "failed to apply config/set comment to config.toml"
+                    );
                 }
                 drain_channel_generation_without_dispatcher(
                     Arc::clone(&sessions),

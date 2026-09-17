@@ -3852,9 +3852,11 @@ mod tests {
     async fn committed_quickstart_publishes_despite_personality_install_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
-        let mut config = Config::default();
-        config.config_path = config_path.clone();
-        config.data_dir = tmp.path().join("data");
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
         let authority = crate::LiveConfigAuthority::new(config);
         let published_before = authority.published_revision();
 

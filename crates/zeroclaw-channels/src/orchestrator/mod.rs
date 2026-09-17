@@ -10693,6 +10693,12 @@ fn build_channel_by_id(
     // a pairing write here would persist to disk but publish only into
     // this throwaway storage, never entering a supervised publication
     // domain (one-shot senders never pair).
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "whatsapp-web",
+        feature = "channel-wechat",
+        feature = "channel-line"
+    ))]
     let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
     #[allow(unused_variables)]
     let config = config_arc.read();
@@ -12204,6 +12210,13 @@ fn collect_configured_channels_with_authority(
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
+    #[cfg(not(any(
+        feature = "channel-telegram",
+        feature = "whatsapp-web",
+        feature = "channel-wechat",
+        feature = "channel-line"
+    )))]
+    let _ = authority;
     #[cfg(not(feature = "channel-amqp"))]
     let _ = (&sop_engine, &sop_audit);
     #[allow(unused_mut)]

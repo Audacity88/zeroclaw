@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use tempfile::TempDir;
 use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
