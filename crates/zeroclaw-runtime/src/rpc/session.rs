@@ -187,6 +187,9 @@ pub struct SessionStore {
     pub(crate) rehydration_publication_waiting: tokio::sync::Notify,
     #[cfg(test)]
     pub(crate) test_rehydration_published_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    #[cfg(test)]
+    pub(crate) test_construction_publication_pause:
+        std::sync::Mutex<Option<PromptRegistrationPause>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -242,6 +245,8 @@ impl SessionStore {
             rehydration_publication_waiting: tokio::sync::Notify::new(),
             #[cfg(test)]
             test_rehydration_published_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_construction_publication_pause: std::sync::Mutex::new(None),
         }
     }
 
