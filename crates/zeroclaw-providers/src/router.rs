@@ -46,8 +46,12 @@ pub struct Route {
 /// dispatched non-streaming and its result is delivered through the same
 /// event contract a streaming route would emit (durable reasoning first,
 /// then visible text, tool calls, usage, final), so consumers need no
-/// special-casing.
-fn synthesize_stream_events(response: ChatResponse) -> Vec<StreamResult<StreamEvent>> {
+/// special-casing. `count_tokens` mirrors the SSE paths: when set, the text
+/// delta carries the same token estimate a genuine stream would.
+fn synthesize_stream_events(
+    response: ChatResponse,
+    count_tokens: bool,
+) -> Vec<StreamResult<StreamEvent>> {
     let mut events = Vec::new();
     if let Some(reasoning) = response.reasoning_content {
         events.push(Ok(StreamEvent::ReasoningFinalized(reasoning)));
@@ -55,7 +59,11 @@ fn synthesize_stream_events(response: ChatResponse) -> Vec<StreamResult<StreamEv
     if let Some(text) = response.text
         && !text.is_empty()
     {
-        events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
+        let mut chunk = StreamChunk::delta(text);
+        if count_tokens {
+            chunk = chunk.with_token_estimate();
+        }
+        events.push(Ok(StreamEvent::TextDelta(chunk)));
     }
     for tool_call in response.tool_calls {
         events.push(Ok(StreamEvent::ToolCall(tool_call)));
@@ -434,6 +442,7 @@ impl ModelProvider for RouterModelProvider {
             let provider = Arc::clone(model_provider);
             let provider_name = provider_name.clone();
             let resolved_model = resolved_model.clone();
+            let count_tokens = options.count_tokens;
             let messages: Vec<ChatMessage> = request.messages.to_vec();
             let tools: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
                 request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
@@ -458,7 +467,7 @@ impl ModelProvider for RouterModelProvider {
                 )
                 .await
                 {
-                    Ok(response) => synthesize_stream_events(response),
+                    Ok(response) => synthesize_stream_events(response, count_tokens),
                     // The non-streaming call is complete by the time this arm
                     // runs: its failure already survived the provider's own
                     // retry/fallback budget. Mark the stream error terminal so
@@ -1944,6 +1953,65 @@ mod tests {
                 .iter()
                 .any(|event| { matches!(event, Ok(StreamEvent::TextDelta(_))) }),
             "the synthesized sequence carries visible text: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_text_delta_honors_count_tokens() {
+        // The synthesized text delta must mirror the SSE paths: a token
+        // estimate when counting is on, none when it is off.
+        let leaf = Arc::new(NonStreamingChatMock::new(
+            r#"{"thinking":"t","signature":"sig"}"#,
+        ));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![(
+                "leaf".into(),
+                Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+            )],
+            vec![],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let counting: Vec<_> = router
+            .stream_chat(
+                request,
+                "default-model",
+                None,
+                StreamOptions::new(true).with_token_count(),
+            )
+            .collect()
+            .await;
+        let delta = counting
+            .iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::TextDelta(chunk)) => Some(chunk.token_count),
+                _ => None,
+            })
+            .expect("the synthesized sequence carries a text delta");
+        // The mock's text is "ok" (2 bytes); the estimate is len/4 rounded up.
+        assert_eq!(delta, 1, "counting on: the delta carries the estimate");
+
+        let plain: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(true))
+            .collect()
+            .await;
+        let plain_delta = plain
+            .iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::TextDelta(chunk)) => Some(chunk.token_count),
+                _ => None,
+            })
+            .expect("the synthesized sequence carries a text delta");
+        assert_eq!(
+            plain_delta, 0,
+            "counting off: the delta carries no estimate"
         );
     }
 
