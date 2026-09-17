@@ -419,12 +419,18 @@ impl ModelProvider for RouterModelProvider {
         mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
-        if !options.enabled || !model_provider.supports_streaming() {
-            // Capabilities describe the served route: a resolved route that
-            // disclaims streaming is dispatched non-streaming and its complete
-            // response is synthesized into the event sequence. Streaming a
-            // route that cannot preserve its own contract (or skipping it for
-            // a later fallback) would invert the operator's route ranking.
+        if options.enabled && !model_provider.supports_streaming() {
+            // Only an ENABLED stream synthesizes. Capabilities describe the
+            // served route: a resolved route that disclaims streaming is
+            // dispatched non-streaming and its complete response is
+            // synthesized into the event sequence; streaming a route that
+            // cannot preserve its own contract (or skipping it for a later
+            // fallback) would invert the operator's route ranking. A DISABLED
+            // stream is not the router's to synthesize: the leaf provider
+            // owns that contract (the compatible and OpenRouter leaves return
+            // a terminal Final event and make no request), so the request
+            // falls through to the leaf's own stream_chat below, exactly as
+            // it did before route synthesis existed.
             let provider = Arc::clone(model_provider);
             let provider_name = provider_name.clone();
             let resolved_model = resolved_model.clone();
@@ -1476,9 +1482,14 @@ mod tests {
             _request: ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
-            _options: StreamOptions,
+            options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !options.enabled {
+                // Mirror the compatible leaf's disabled contract: no
+                // request, a terminal Final event.
+                return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            }
             stream::once(async {
                 Err(StreamError::ModelProvider(
                     "non-streaming route must never be streamed".to_string(),
@@ -1852,6 +1863,88 @@ mod tests {
             }
             other => panic!("the synthesized arm must emit Terminal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_streaming_options_delegate_to_the_leaf_contract() {
+        // Disabled streaming is a no-request terminal event owned by the
+        // leaf provider, not synthesis territory: the router forwards the
+        // request to the leaf's stream_chat exactly as it did before route
+        // synthesis, never dispatching a chat call behind a disabled flag.
+        // Enabled streaming on the same disclaiming route still synthesizes,
+        // so the split is pinned from both sides.
+        let leaf = Arc::new(NonStreamingChatMock::new(
+            r#"{"thinking":"t","signature":"sig"}"#,
+        ));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![(
+                "leaf".into(),
+                Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+            )],
+            vec![],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let events: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(false))
+            .collect()
+            .await;
+        assert_eq!(
+            events.len(),
+            1,
+            "disabled streaming yields the leaf's single terminal event"
+        );
+        assert!(
+            matches!(&events[0], Ok(StreamEvent::Final)),
+            "the leaf's disabled contract is a no-request Final event, got {:?}",
+            events[0]
+        );
+        assert_eq!(
+            leaf.chat_calls.load(Ordering::SeqCst),
+            0,
+            "a disabled stream must not dispatch a chat call"
+        );
+        assert_eq!(
+            leaf.stream_calls.load(Ordering::SeqCst),
+            1,
+            "the leaf's stream_chat owns the disabled contract"
+        );
+
+        let events: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(true))
+            .collect()
+            .await;
+        assert_eq!(
+            leaf.chat_calls.load(Ordering::SeqCst),
+            1,
+            "an enabled stream on the same disclaiming route synthesizes one chat call"
+        );
+        assert_eq!(
+            leaf.stream_calls.load(Ordering::SeqCst),
+            1,
+            "no streaming leg may touch the disclaiming route"
+        );
+        assert!(
+            events.iter().all(Result::is_ok),
+            "the synthesized sequence must complete: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Final))),
+            "the synthesized sequence ends in Final: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event, Ok(StreamEvent::TextDelta(_))) }),
+            "the synthesized sequence carries visible text: {events:?}"
+        );
     }
 
     #[tokio::test]
