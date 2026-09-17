@@ -103,7 +103,7 @@ pub fn render_native_attachments(attachments: &[RenderedMarker]) -> serde_json::
     serde_json::Value::Array(
         attachments
             .iter()
-            .map(|marker| serde_json::to_value(marker).unwrap_or_else(|_| serde_json::Value::Null))
+            .map(|marker| serde_json::to_value(marker).unwrap_or_default())
             .collect(),
     )
 }

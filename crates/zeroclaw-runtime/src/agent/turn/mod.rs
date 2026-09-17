@@ -5084,7 +5084,7 @@ mod active_route_context_tests {
             axum::serve(listener, app).await.expect("vision serves");
         });
 
-        // A tempfile PNG the injected marker points at, so image preparation
+        // A tempfile PNG the declared attachment points at, so image preparation
         // has a real file to load.
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("shot.png");
@@ -5121,7 +5121,7 @@ vision_model_provider = "custom.vision"
         // Text primary: iteration 0 emits a native tool call; iteration 1 (after
         // the tool injects an image and the route switches to vision) ends the
         // turn. `ProviderCapabilities::default()` has `vision = false`, so the
-        // image marker forces the vision route.
+        // declared image forces the vision route.
         struct TextPrimary {
             calls: Arc<AtomicUsize>,
         }
@@ -5129,7 +5129,7 @@ vision_model_provider = "custom.vision"
         impl ModelProvider for TextPrimary {
             fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
                 // Native tool calling so the structured `tool_calls` below are
-                // honored; vision stays false so an image marker forces routing.
+                // honored; vision stays false so a declared image forces routing.
                 zeroclaw_api::model_provider::ProviderCapabilities {
                     native_tool_calling: true,
                     ..Default::default()
@@ -5203,7 +5203,14 @@ vision_model_provider = "custom.vision"
                 serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
-                Ok(ToolResult::ok(format!("here it is [IMAGE:{}]", self.path)))
+                // The producer declares its image; under the attachment
+                // contract nothing in the result text is promoted.
+                Ok(ToolResult::ok("here it is").with_attachment(
+                    zeroclaw_api::media::RenderedMarker {
+                        target: self.path.clone(),
+                        kind: zeroclaw_api::media::MarkerKind::Image,
+                    },
+                ))
             }
         }
         impl zeroclaw_api::attribution::Attributable for AttachImage {

@@ -315,4 +315,67 @@ mod tests {
             assert!(!result.success, "expected non-fatal failure for {non_obj}");
         }
     }
+    // ── attachment wiring on the success branch ────────────────────────────
+
+    #[tokio::test]
+    async fn execute_success_branch_carries_mcp_image_as_attachment() {
+        // Drives production `execute` against a canned registry instead of
+        // reconstructing the success glue: deleting the declaration loop in
+        // `execute` fails this test, which the old reconstruction could not.
+        let dir = tempfile::tempdir().unwrap();
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        );
+        let result = json!({
+            "content": [
+                { "type": "image", "data": b64, "mimeType": "image/png" }
+            ]
+        });
+        let registry = Arc::new(McpRegistry::for_test_with_tool_server(
+            "fake",
+            "make_image",
+            result,
+        ));
+        let def = make_def("make_image", Some("Make an image"), json!({}));
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let wrapper = McpToolWrapper::new("fake__make_image".to_string(), def, registry, security);
+
+        let tool_result = wrapper
+            .execute(json!({}))
+            .await
+            .expect("execute must succeed against the canned registry");
+        assert!(
+            tool_result.success,
+            "execute failed: {:?}",
+            tool_result.error
+        );
+
+        assert_eq!(
+            tool_result.output.attachments().len(),
+            1,
+            "the success branch declares the formatted result's attachments"
+        );
+        assert_eq!(
+            tool_result.output.attachments()[0].kind,
+            zeroclaw_api::media::MarkerKind::Image
+        );
+        assert!(
+            tool_result.output.attachments()[0].target.ends_with(".png"),
+            "the materialized file keeps a loadable extension"
+        );
+        assert!(
+            !tool_result.output.contains("[IMAGE:"),
+            "the text references the saved path, never marker syntax"
+        );
+        assert!(
+            tool_result
+                .output
+                .contains(tool_result.output.attachments()[0].target.as_str()),
+            "the text keeps the path visible to the model"
+        );
+    }
 }
