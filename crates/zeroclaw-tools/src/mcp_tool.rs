@@ -96,11 +96,17 @@ impl Tool for McpToolWrapper {
         match self.registry.call_tool(&self.prefixed_name, args).await {
             Ok(result) => {
                 match format_mcp_tool_result_for_model(result, &self.security.workspace_dir) {
-                    Ok(output) => Ok(ToolResult {
-                        success: true,
-                        output: output.into(),
-                        error: None,
-                    }),
+                    Ok((output, attachments)) => {
+                        let mut tool_output = ToolOutput::text(output);
+                        for marker in attachments {
+                            tool_output = tool_output.with_attachment(marker);
+                        }
+                        Ok(ToolResult {
+                            success: true,
+                            output: tool_output,
+                            error: None,
+                        })
+                    }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
