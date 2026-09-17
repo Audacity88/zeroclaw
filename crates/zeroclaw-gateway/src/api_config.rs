@@ -486,6 +486,15 @@ async fn persist_and_publish(
     commit: zeroclaw_runtime::live_config_authority::ConfigCommit,
     new_config: zeroclaw_config::schema::Config,
 ) -> Result<(), ConfigApiError> {
+    persist_and_publish_with_comments(state, commit, new_config, Vec::new()).await
+}
+
+async fn persist_and_publish_with_comments(
+    state: &AppState,
+    commit: zeroclaw_runtime::live_config_authority::ConfigCommit,
+    new_config: zeroclaw_config::schema::Config,
+    annotations: Vec<(String, String)>,
+) -> Result<(), ConfigApiError> {
     let prepared_channel_generation = prepare_channel_generation_drain(
         &commit.current_config(),
         &new_config,
@@ -497,15 +506,26 @@ async fn persist_and_publish(
             format!("config revision unavailable: {e}"),
         )
     })?;
+    let config_path = new_config.config_path.clone();
     let pending_reload = Arc::clone(&state.pending_reload);
     let task =
         zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
             // `commit` is owned by this task: serialization and drain
-            // accounting live until the channel-generation drain below
-            // finishes.
+            // accounting cover the drain and the whole-file comment rewrite.
             save_and_publish_config_retained(&commit, revision, pending_reload.clone(), new_config)
                 .await?;
             finish_prepared_channel_generation(prepared_channel_generation, pending_reload).await;
+            if let Err(e) =
+                zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "failed to apply config comments to config.toml"
+                );
+            }
             Ok(())
         }));
     task.await.map_err(|e| {
@@ -977,25 +997,16 @@ pub async fn handle_prop_put(
         Err(err) => return error_response(err),
     };
 
-    let config_path = new_config.config_path.clone();
     let mut warnings = new_config.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    if let Err(e) = persist_and_publish(&state, commit, new_config).await {
+    let annotations = body
+        .comment
+        .as_ref()
+        .map(|comment| vec![(body.path.clone(), comment.clone())])
+        .unwrap_or_default();
+    if let Err(e) = persist_and_publish_with_comments(&state, commit, new_config, annotations).await
+    {
         return error_response(e);
-    }
-    if let Some(comment) = body.comment.as_ref() {
-        let annotations = [(body.path.clone(), comment.clone())];
-        if let Err(e) =
-            zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "failed to apply PUT comment to config.toml"
-            );
-        }
     }
 
     if info.is_secret || info.derived_from_secret {
@@ -2581,29 +2592,14 @@ pub async fn handle_patch(
         .filter_map(|(op, res)| op.comment.as_ref().map(|c| (res.path.clone(), c.clone())))
         .collect();
 
-    let config_path = working.config_path.clone();
     // Collect non-fatal validation warnings against the post-save state
     // before working is moved into persist_and_publish. Same signal as
     // `zeroclaw_log::record!` from `validate()`, surfaced structured so dashboard
     // callers see it.
     let mut warnings = working.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    if let Err(e) = persist_and_publish(&state, commit, working).await {
+    if let Err(e) = persist_and_publish_with_comments(&state, commit, working, annotations).await {
         return error_response(e);
-    }
-    if !annotations.is_empty()
-        && let Err(e) =
-            zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
-    {
-        // Comments are best-effort decoration; surface as a non-fatal warn.
-        // The patch itself succeeded — return success but log the failure.
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "failed to apply PATCH op comments to config.toml"
-        );
     }
 
     axum::Json(PatchResponse {
@@ -3617,6 +3613,78 @@ mod tests {
             live.channels.telegram.contains_key("newbot"),
             "handle_prop_put's own change must also land"
         );
+    }
+
+    #[tokio::test]
+    async fn http_annotations_retain_commit_through_whole_file_rewrite() {
+        for patch in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = temp_config(&tmp);
+            config.save().await.unwrap();
+            let config_path = config.config_path.clone();
+            let state = test_state(config);
+            let mut gate =
+                zeroclaw_config::comment_writer::test_post_read_pause::arm(config_path.clone());
+            let writer_state = state.clone();
+            let writer = zeroclaw_spawn::spawn!(async move {
+                if patch {
+                    handle_patch(
+                        State(writer_state),
+                        HeaderMap::new(),
+                        axum::Json(serde_json::json!([{
+                            "op": "comment",
+                            "path": "/gateway/host",
+                            "comment": "annotation overlap",
+                        }])),
+                    )
+                    .await
+                } else {
+                    handle_prop_put(
+                        State(writer_state),
+                        HeaderMap::new(),
+                        axum::Json(PropPutBody {
+                            path: "gateway.host".into(),
+                            value: serde_json::json!("127.0.0.1"),
+                            comment: Some("annotation overlap".into()),
+                        }),
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_paused())
+                .await
+                .expect("HTTP annotation must reach the post-read pause");
+
+            // Admission itself must park, not just a later asynchronous save.
+            let next_commit = state.begin_config_commit();
+            tokio::pin!(next_commit);
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            assert!(std::future::Future::poll(next_commit.as_mut(), &mut cx).is_pending());
+            assert!(state.config_authority.config_write_lock_is_held());
+
+            gate.release();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let commit = next_commit.await.unwrap();
+            let mut later = commit.current_config();
+            later
+                .set_prop_persistent("gateway.websocket_ping_interval_secs", "45")
+                .unwrap();
+            persist_and_publish(&state, commit, later).await.unwrap();
+
+            assert_eq!(state.config.read().gateway.websocket_ping_interval_secs, 45);
+            let raw = tokio::fs::read_to_string(&config_path).await.unwrap();
+            let disk: toml::Value = toml::from_str(&raw).unwrap();
+            assert_eq!(
+                disk["gateway"]["websocket_ping_interval_secs"].as_integer(),
+                Some(45)
+            );
+            assert!(raw.contains("# annotation overlap"));
+        }
     }
 
     /// Real cross-surface composition: ONE shared `LiveConfigAuthority`

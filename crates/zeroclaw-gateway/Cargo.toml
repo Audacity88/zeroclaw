@@ -84,6 +84,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 libc = "0.2"
 
 [dev-dependencies]
+zeroclaw-config = { workspace = true, features = ["test-helpers"] }
 # Enables the runtime crate's test-only `RpcContext::for_authority` and
 # `LiveConfigAuthority::publish_for_test` so gateway tests can build the
 # cross-surface composition (one shared authority behind both the HTTP
