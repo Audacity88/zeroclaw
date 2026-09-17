@@ -2055,11 +2055,8 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
-        let out =
-            run_capture(Command::new("schtasks").args(["/Query", "/TN", task_name, "/FO", "LIST"]));
-        match out {
-            Ok(text) => {
-                let running = text.contains("Running");
+        match windows_task_running(task_name) {
+            Ok(Some(running)) => {
                 println!(
                     "Service: {}",
                     if running {
@@ -2070,9 +2067,10 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
                 );
                 println!("Task: {}", task_name);
             }
-            Err(_) => {
+            Ok(None) => {
                 println!("Service: ❌ not installed");
             }
+            Err(error) => return Err(error),
         }
         return Ok(());
     }
@@ -2230,7 +2228,7 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
 fn get_content_command(path: &Path, lines: usize, follow: bool) -> String {
     let quoted = path.display().to_string().replace('\'', "''");
     let wait = if follow { " -Wait" } else { "" };
-    format!("Get-Content -LiteralPath '{quoted}' -Tail {lines}{wait}")
+    format!("Get-Content -LiteralPath '{quoted}' -Encoding UTF8 -Tail {lines}{wait}")
 }
 
 fn run_get_content(path: &Path, lines: usize, follow: bool) -> Result<()> {
@@ -2242,6 +2240,39 @@ fn run_get_content(path: &Path, lines: usize, follow: bool) -> Result<()> {
         bail!("PowerShell Get-Content exited with non-zero status");
     }
     Ok(())
+}
+
+fn windows_task_state_command(task_name: &str) -> String {
+    let quoted = task_name.replace('\'', "''");
+    format!(
+        "$task = Get-ScheduledTask -TaskName '{quoted}' -ErrorAction SilentlyContinue; \
+         if ($null -eq $task) {{ exit 2 }}; \
+         if ([int]$task.State -eq 4) {{ exit 0 }}; \
+         exit 1"
+    )
+}
+
+fn windows_task_state_from_exit_code(code: Option<i32>) -> Result<Option<bool>> {
+    match code {
+        Some(0) => Ok(Some(true)),
+        Some(1) => Ok(Some(false)),
+        Some(2) => Ok(None),
+        Some(code) => bail!("PowerShell task-state query exited with status {code}"),
+        None => bail!("PowerShell task-state query terminated without an exit code"),
+    }
+}
+
+fn windows_task_running(task_name: &str) -> Result<Option<bool>> {
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &windows_task_state_command(task_name),
+        ])
+        .status()
+        .context("Failed to query the Windows scheduled task state")?;
+    windows_task_state_from_exit_code(status.code())
 }
 
 fn service_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
@@ -4280,6 +4311,25 @@ mod service_helper_tests {
     }
 
     #[test]
+    fn windows_task_state_probe_uses_invariant_numeric_state_and_exit_codes() {
+        assert_eq!(
+            windows_task_state_command("ZeroClaw Daemon"),
+            "$task = Get-ScheduledTask -TaskName 'ZeroClaw Daemon' -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 2 }; if ([int]$task.State -eq 4) { exit 0 }; exit 1"
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(0)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(1)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(windows_task_state_from_exit_code(Some(2)).unwrap(), None);
+        assert!(windows_task_state_from_exit_code(Some(17)).is_err());
+        assert!(windows_task_state_from_exit_code(None).is_err());
+    }
+
+    #[test]
     fn windows_task_action_binds_the_config_directory_without_cmd_redirection() {
         let action = windows_task_action(
             Path::new(r"C:\Program Files\ZeroClaw\zeroclaw.exe"),
@@ -4599,7 +4649,7 @@ mod service_helper_tests {
         let command = get_content_command(Path::new("C:\\logs\\o'brien[1].log"), 25, true);
         assert_eq!(
             command,
-            "Get-Content -LiteralPath 'C:\\logs\\o''brien[1].log' -Tail 25 -Wait"
+            "Get-Content -LiteralPath 'C:\\logs\\o''brien[1].log' -Encoding UTF8 -Tail 25 -Wait"
         );
     }
 
@@ -4608,7 +4658,7 @@ mod service_helper_tests {
         let command = get_content_command(Path::new("C:\\logs\\daemon.stdout.log"), 50, false);
         assert_eq!(
             command,
-            "Get-Content -LiteralPath 'C:\\logs\\daemon.stdout.log' -Tail 50"
+            "Get-Content -LiteralPath 'C:\\logs\\daemon.stdout.log' -Encoding UTF8 -Tail 50"
         );
     }
 
