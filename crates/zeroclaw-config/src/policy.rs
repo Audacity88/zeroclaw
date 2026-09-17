@@ -7740,17 +7740,21 @@ mod tests {
     #[test]
     fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
         let p = unix_forbidden_path_policy();
-        let posix_path =
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
             |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
 
         assert_eq!(
-            posix_path("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
+            posix("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
             Some("/etc/shadow".into())
         );
 
         // Single-quoted variant of the same shape.
         assert_eq!(
-            posix_path("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            posix("printf '<<EOF\nbody\nEOF' /etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
@@ -7781,69 +7785,113 @@ mod tests {
     #[test]
     fn forbidden_path_argument_allows_safe_device_redirect_targets() {
         let p = unix_forbidden_path_policy();
-        let posix_path =
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
             |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
-        assert_eq!(posix_path("ls missing 2>/dev/null"), None);
-        assert_eq!(posix_path("ls missing 2> /dev/null"), None);
-        assert_eq!(posix_path("echo hi >/dev/stdout"), None);
-        assert_eq!(posix_path("echo hi > /dev/stdout"), None);
-        assert_eq!(posix_path("echo err 1>/dev/stderr"), None);
-        assert_eq!(posix_path("echo err 1> /dev/stderr"), None);
-        assert_eq!(posix_path("cat </dev/zero"), None);
-        assert_eq!(posix_path("cat < /dev/zero"), None);
+        assert_eq!(posix("ls missing 2>/dev/null"), None);
+        assert_eq!(posix("ls missing 2> /dev/null"), None);
+        assert_eq!(posix("echo hi >/dev/stdout"), None);
+        assert_eq!(posix("echo hi > /dev/stdout"), None);
+        assert_eq!(posix("echo err 1>/dev/stderr"), None);
+        assert_eq!(posix("echo err 1> /dev/stderr"), None);
+        assert_eq!(posix("cat </dev/zero"), None);
+        assert_eq!(posix("cat < /dev/zero"), None);
+        // Bare-argument device classification is host-gated BENEATH the
+        // dialect: the harmless-device carve-out for a bare `/dev/null`
+        // argument exists only on Unix hosts, so pinning Posix does not
+        // unify this case. Assert both arms so the split stays visible.
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(posix_path("cat /dev/null"), None);
-        assert_eq!(posix_path("cat ./safe.txt>/dev/null"), None);
-        assert_eq!(posix_path("cat> /dev/null"), None);
-        assert_eq!(posix_path("cat ./safe.txt>&2"), None);
+        assert_eq!(posix("cat /dev/null"), None);
+        #[cfg(target_os = "windows")]
+        assert_eq!(posix("cat /dev/null"), Some("/dev/null".into()));
+        assert_eq!(posix("cat ./safe.txt>/dev/null"), None);
+        assert_eq!(posix("cat> /dev/null"), None);
+        assert_eq!(posix("cat ./safe.txt>&2"), None);
     }
 
     #[test]
     fn forbidden_path_argument_blocks_unsafe_redirect_targets() {
         let p = unix_forbidden_path_policy();
-        let posix_path =
+        // These assertions encode POSIX shell semantics against a Unix
+        // policy fixture, so pin the dialect instead of inheriting the
+        // host default (WindowsCmd on Windows, where `/dev` devices and
+        // heredoc forms classify differently by design).
+        let posix =
             |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix("echo hi >/etc/passwd"), Some("/etc/passwd".into()));
+        assert_eq!(posix("echo hi > /etc/passwd"), Some("/etc/passwd".into()));
         assert_eq!(
-            posix_path("echo hi >/etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            posix_path("echo hi > /etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            posix_path("echo hi >/dev/stderr.log"),
+            posix("echo hi >/dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            posix_path("echo hi > /dev/stderr.log"),
+            posix("echo hi > /dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            posix_path("cat </dev/zero/etc/passwd"),
+            posix("cat </dev/zero/etc/passwd"),
             Some("/dev/zero/etc/passwd".into())
         );
         assert_eq!(
-            posix_path("echo hi >/dev/null/../../etc/passwd"),
+            posix("echo hi >/dev/null/../../etc/passwd"),
             Some("/dev/null/../../etc/passwd".into())
         );
         assert_eq!(
-            posix_path("cat</dev/null /etc/passwd"),
+            posix("cat</dev/null /etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            posix_path("cat /etc/passwd>/dev/null"),
+            posix("cat /etc/passwd>/dev/null"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            posix_path("cat /etc/passwd> /dev/null"),
+            posix("cat /etc/passwd> /dev/null"),
             Some("/etc/passwd".into())
         );
-        assert_eq!(posix_path("cat /etc/passwd>&2"), Some("/etc/passwd".into()));
+        assert_eq!(posix("cat /etc/passwd>&2"), Some("/etc/passwd".into()));
         assert_eq!(
-            posix_path("grep --file=/etc/passwd>/dev/null root"),
+            posix("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
         );
+    }
+
+    /// The dialect divergence that broke the host-defaulting tests on Windows,
+    /// pinned as intended behavior: under `cmd.exe` the safe null device is
+    /// `nul`, while `/dev/null` is an ordinary forbidden-prefix path, and a
+    /// bare leading-slash redirect target is rooted on the current drive
+    /// rather than being workspace-relative.
+    #[test]
+    fn forbidden_path_argument_windows_cmd_classifies_devices_by_dialect() {
+        let p = unix_forbidden_path_policy();
+        let windows_cmd =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::WindowsCmd);
+
+        // Host-independent dialect facts: the cmd.exe null device is safe,
+        // and a drive-relative form fails closed on every host because it
+        // resolves against a per-drive current directory.
+        assert_eq!(windows_cmd("dir missing 2>nul"), None);
+        assert_eq!(windows_cmd("dir missing 2> nul"), None);
+        assert_eq!(
+            windows_cmd("type C:relative.txt"),
+            Some("C:relative.txt".into())
+        );
+
+        // The `/dev/null` classification under the Windows dialect is
+        // host-gated, not dialect-gated: on a Windows host a bare leading
+        // slash is rooted on the current drive and fails closed, while on
+        // POSIX hosts the Unix device path remains acceptable. Assert both
+        // arms so the split stays visible instead of surprising the next
+        // host-defaulting caller.
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            windows_cmd("dir missing 2>/dev/null"),
+            Some("/dev/null".into())
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(windows_cmd("dir missing 2>/dev/null"), None);
     }
 
     // ── Edge cases: path traversal ──────────────────────────
