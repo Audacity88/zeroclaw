@@ -421,6 +421,21 @@ mod tests {
         ChatMessage::tool(c)
     }
 
+    /// A declared native tool-result carrier for one image: the envelope the
+    /// runtime writes, with the attachment at the fixed position.
+    fn image_tool_carrier(target: &str) -> String {
+        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+            target: target.to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        }];
+        serde_json::json!({
+            "tool_call_id": "call_image",
+            "content": "",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string()
+    }
+
     fn conversation_system(content: &str) -> ConversationMessage {
         ConversationMessage::Chat(ChatMessage::system(content))
     }
@@ -1559,10 +1574,11 @@ mod tests {
             .collect::<Vec<ChatMessage>>()
         };
 
-        // Path markers: five images coming back in one native-tool round.
+        // Path targets: five images coming back in one native-tool round as
+        // declared carriers, the shape the runtime writes.
         let history = image_history(
             (0..5)
-                .map(|index| format!("[IMAGE:/tmp/slide-{index}.png]"))
+                .map(|index| image_tool_carrier(&format!("/tmp/slide-{index}.png")))
                 .collect(),
         );
         assert!(
@@ -1593,12 +1609,14 @@ mod tests {
             "the newest round must keep all five image results whole"
         );
 
-        // The same round as ~600 KB data URIs: per-image pricing keeps the
-        // history under a 20k budget, where per-byte pricing would see ~150k
-        // tokens per result and throw the old turn away.
+        // The same round as ~600 KB data-URI attachments: per-image pricing
+        // keeps the history under a 20k budget, where per-byte pricing would
+        // see ~150k tokens per result and throw the old turn away.
         let history = image_history(
             (0..5)
-                .map(|_| format!("[IMAGE:data:image/png;base64,{}]", "A".repeat(600_000)))
+                .map(|_| {
+                    image_tool_carrier(&format!("data:image/png;base64,{}", "A".repeat(600_000)))
+                })
                 .collect(),
         );
         let before = history.len();
@@ -1618,6 +1636,83 @@ mod tests {
         );
     }
 
+    // A stale legacy carrier with a huge inline payload: preparation strips
+    // the marker before dispatch, so the estimator must price the message as
+    // the text the stale pass delivers. Priced on the retained body (the old
+    // contract), the same history evicts a whole turn that actually fits.
+    #[tokio::test]
+    async fn stale_legacy_inline_payload_is_priced_as_delivered_text() {
+        let marker = format!(
+            "[{}:data:image/png;base64,{}]",
+            "IMAGE",
+            "A".repeat(600_000)
+        );
+        let body = format!("a\n{marker}\nb");
+        let stale_tool = tool(&body);
+        let history = vec![
+            sys("s"),
+            user("u"),
+            asst("a"),
+            stale_tool.clone(),
+            user("v"),
+        ];
+
+        // The old turn survives at a 32,000-token budget.
+        let result = trim_to_recent_turns(history.clone(), 32_000);
+        assert!(
+            !result.trimmed,
+            "a stale legacy inline payload must be priced as its delivered text, not its body: {} tokens estimated",
+            result.tokens_before
+        );
+        assert_eq!(result.dropped_turns, 0);
+        assert_eq!(result.history.len(), 5);
+
+        // The estimator's charge for the stale tool message equals the text
+        // heuristic on the content preparation actually delivers, computed
+        // here through the real preparation route.
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+            &history,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        let prepared_tool = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message survives preparation");
+        assert_eq!(
+            prepared_tool.content, "a\n\nb",
+            "the stale pass strips the inline marker from the legacy body"
+        );
+        let without_tool = vec![sys("s"), user("u"), asst("a"), user("v")];
+        let stale_tool_tokens =
+            estimate_history_tokens(&history) - estimate_history_tokens(&without_tool);
+        assert_eq!(
+            stale_tool_tokens,
+            prepared_tool.content.len().div_ceil(4) + 4,
+            "the stale tool message is charged as the text the stale pass delivers"
+        );
+
+        // Current-turn control: the same legacy tool message as the LAST
+        // message (no trailing user turn) is charged as the text of its full
+        // body, exactly as dispatched.
+        let current_history = vec![sys("s"), user("u"), asst("a"), stale_tool.clone()];
+        let current_without = vec![sys("s"), user("u"), asst("a")];
+        let current_tool_tokens =
+            estimate_history_tokens(&current_history) - estimate_history_tokens(&current_without);
+        assert_eq!(
+            current_tool_tokens,
+            body.len().div_ceil(4) + 4,
+            "a current-turn legacy carrier is charged as its full body text"
+        );
+    }
+
+    // Short legacy path markers fit the 32k budget whether the tool run is
+    // stale or current, so this fixture no longer separates stale from
+    // current pricing by itself; the large-payload counterexample in
+    // `stale_legacy_inline_payload_is_priced_as_delivered_text` carries that
+    // property.
     #[test]
     fn stale_tool_images_do_not_force_a_trim() {
         let markers: Vec<String> = (0..30)
