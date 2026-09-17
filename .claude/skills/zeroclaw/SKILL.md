@@ -55,7 +55,7 @@ If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), gu
 ```bash
 zeroclaw quickstart                                              # Interactive — picks a provider + agent
 zeroclaw quickstart --model-provider ollama --model qwen2.5:7b   # Non-interactive
-zeroclaw config set channels.<name>.<field> <value>             # Configure a channel after quickstart
+zeroclaw config set channels.<type>.<alias>.<field> <value>     # Configure a channel after quickstart
 ```
 
 After quickstart, verify everything works:
@@ -64,7 +64,7 @@ zeroclaw status
 zeroclaw doctor
 ```
 
-If they already have a config but a channel is broken, edit just that channel's fields with `zeroclaw config set channels.<name>.<field> <value>` rather than re-running quickstart (quickstart leaves an existing config alone).
+If they already have a config but a channel is broken, edit just that channel's fields with `zeroclaw config set channels.<type>.<alias>.<field> <value>` rather than re-running quickstart (quickstart leaves an existing config alone). For example, `zeroclaw config set channels.telegram.default.bot-token` prompts for the token without putting it on the command line.
 
 ## Building from Source
 
@@ -225,7 +225,7 @@ Here are multi-step sequences you're likely to need:
 
 **"Set up a new channel"**
 1. Inspect the relevant channel's configuration fields without printing credentials.
-2. Configure the channel with `zeroclaw config set channels.<name>.<field> <value>`; omit secret values to use the masked input prompt.
+2. Configure the channel with `zeroclaw config set channels.<type>.<alias>.<field> <value>`; omit secret values to use the masked input prompt.
 3. Restart: `zeroclaw service restart` (or restart daemon manually)
 4. Verify: `zeroclaw channel doctor`
 
