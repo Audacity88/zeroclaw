@@ -251,8 +251,8 @@ pub async fn handle_command(
 
             let (installed_dir, files_scanned) = if well_known {
                 let skill_name = skill.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!(get_required_cli_string(
-                        "cli-skills-install-well-known-requires-skill"
+                    anyhow::Error::msg(get_required_cli_string(
+                        "cli-skills-install-well-known-requires-skill",
                     ))
                 })?;
                 println!(

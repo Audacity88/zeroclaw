@@ -166,8 +166,9 @@ fn validate_url_shape(url: &Url) -> Result<()> {
 }
 
 fn validate_skill_name(name: &str) -> Result<()> {
-    zeroclaw_runtime::skills::scaffold::validate_name(name)
-        .map_err(|error| anyhow::anyhow!("invalid discovered skill name '{name}': {error}"))
+    zeroclaw_runtime::skills::scaffold::validate_name(name).map_err(|error| {
+        anyhow::Error::msg(format!("invalid discovered skill name '{name}': {error}"))
+    })
 }
 
 fn parse_index(bytes: &[u8]) -> Result<DiscoveryIndex> {
@@ -212,7 +213,7 @@ fn select_entry(index: DiscoveryIndex, selected_name: &str) -> Result<DiscoveryE
         .skills
         .into_iter()
         .find(|entry| entry.name == selected_name)
-        .ok_or_else(|| anyhow::anyhow!("selected skill '{selected_name}' was not found in the well-known index"))
+        .ok_or_else(|| anyhow::Error::msg(format!("selected skill '{selected_name}' was not found in the well-known index")))
         .and_then(|entry| {
             if entry.artifact_type != "skill-md" && entry.artifact_type != "archive" {
                 bail!("selected skill '{selected_name}' has unsupported artifact type '{}'; choose a supported skill", entry.artifact_type)
@@ -222,9 +223,9 @@ fn select_entry(index: DiscoveryIndex, selected_name: &str) -> Result<DiscoveryE
 }
 
 fn validate_digest(raw: &str) -> Result<[u8; 32]> {
-    let hex_digest = raw
-        .strip_prefix("sha256:")
-        .ok_or_else(|| anyhow::anyhow!("digest must use the sha256:<64 lowercase hex> format"))?;
+    let hex_digest = raw.strip_prefix("sha256:").ok_or_else(|| {
+        anyhow::Error::msg("digest must use the sha256:<64 lowercase hex> format")
+    })?;
     if hex_digest.len() != 64
         || !hex_digest
             .bytes()
@@ -235,7 +236,7 @@ fn validate_digest(raw: &str) -> Result<[u8; 32]> {
     let decoded = hex::decode(hex_digest).context("invalid sha256 digest")?;
     decoded
         .try_into()
-        .map_err(|_| anyhow::anyhow!("sha256 digest must be exactly 32 bytes"))
+        .map_err(|_| anyhow::Error::msg("sha256 digest must be exactly 32 bytes"))
 }
 
 async fn fetch_bounded_with_transport<T: DiscoveryTransport>(
@@ -284,7 +285,9 @@ async fn read_response_bounded(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let mut body = Vec::with_capacity(declared as usize);
+    let mut body = Vec::with_capacity(
+        usize::try_from(declared).context("response size is not representable")?,
+    );
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("failed to read well-known response")?;
@@ -304,7 +307,7 @@ async fn validate_target(
     let host = zeroclaw_infra::net_guard::normalize_host(
         url.host_str().context("URL must include a host")?,
     )
-    .map_err(|_| anyhow::anyhow!("URL host is invalid"))?;
+    .map_err(|_| anyhow::Error::msg("URL host is invalid"))?;
     let port = url.port_or_known_default().unwrap_or(443);
     let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
@@ -323,13 +326,15 @@ async fn validate_target(
         nat64_prefixes,
     )
     .map_err(|error| {
-        anyhow::anyhow!("discovery destination rejected by network policy: {error}")
+        anyhow::Error::msg(format!(
+            "discovery destination rejected by network policy: {error}"
+        ))
     })?;
     let mut pinned_url = url.clone();
     if host.parse::<IpAddr>().is_err() {
         pinned_url
             .set_host(Some(destination.host()))
-            .map_err(|_| anyhow::anyhow!("URL host is invalid"))?;
+            .map_err(|_| anyhow::Error::msg("URL host is invalid"))?;
     }
     Ok(ValidatedTarget {
         url: pinned_url,
@@ -620,8 +625,9 @@ fn validate_archive_unix_mode(mode: u32, is_dir: bool) -> Result<()> {
     if mode & 0o6000 != 0 {
         bail!("archive contains setuid or setgid permissions")
     }
-    let file_type = mode & 0o170000;
-    if file_type != 0 && ((is_dir && file_type != 0o040000) || (!is_dir && file_type != 0o100000)) {
+    let file_type = mode & 0o170_000;
+    if file_type != 0 && ((is_dir && file_type != 0o040_000) || (!is_dir && file_type != 0o100_000))
+    {
         bail!("archive contains a special file")
     }
     Ok(())
@@ -1108,7 +1114,7 @@ mod tests {
             .unwrap();
         let address = listener.local_addr().unwrap();
         let body = vec![b'x'; MAX_INDEX_BYTES + 1];
-        let server = tokio::spawn(async move {
+        let server = ::zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request).await;
