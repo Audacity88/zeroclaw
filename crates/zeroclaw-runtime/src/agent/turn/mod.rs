@@ -611,12 +611,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         temperature,
                         pacing,
                         cancellation_token.as_ref(),
-                        max_iterations,
+                        max_iter::CompletionLimit::ExecutionTree,
                         accumulated_display_text,
                         turn_id,
                         &final_knobs,
                         event_tx.as_ref(),
                         turn_state.canonical.as_deref_mut(),
+                        config,
+                        multimodal_config,
+                        ctx.hooks,
+                        image_cache.as_deref_mut(),
                     )
                     .await;
                 }
@@ -1497,12 +1501,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         temperature,
         pacing,
         cancellation_token.as_ref(),
-        max_iterations,
+        max_iter::CompletionLimit::LocalIterations(max_iterations),
         accumulated_display_text,
         turn_id,
         knobs,
         event_tx.as_ref(),
         turn_state.canonical.as_deref_mut(),
+        config,
+        multimodal_config,
+        ctx.hooks,
+        image_cache.as_deref_mut(),
     )
     .await
 }
@@ -3262,6 +3270,27 @@ mod sop_step_reassembly_tests {
         cancellation_token: CancellationToken,
         max_tool_iterations: usize,
     ) -> Result<String> {
+        run_budgeted_test_loop_with_hooks(
+            provider,
+            history,
+            tools,
+            budget,
+            cancellation_token,
+            max_tool_iterations,
+            None,
+        )
+        .await
+    }
+
+    async fn run_budgeted_test_loop_with_hooks(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        tools: &crate::tools::scoped::ScopedToolRegistry,
+        budget: ExecutionTreeBudget,
+        cancellation_token: CancellationToken,
+        max_tool_iterations: usize,
+        hooks: Option<&crate::hooks::HookRunner>,
+    ) -> Result<String> {
         let observer = crate::observability::NoopObserver {};
         let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
         let pacing = zeroclaw_config::schema::PacingConfig {
@@ -3290,7 +3319,7 @@ mod sop_step_reassembly_tests {
                     approval: None,
                     multimodal_config: &multimodal,
                     config: None,
-                    hooks: None,
+                    hooks,
                     activated_tools: None,
                     model_switch_callback: None,
                     receipt_generator: None,
@@ -3326,6 +3355,150 @@ mod sop_step_reassembly_tests {
             turn_id: &turn_id,
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn tree_budget_final_completion_prepares_images_and_honors_hooks() {
+        struct SummaryProbe(Arc<AtomicUsize>);
+        impl zeroclaw_api::attribution::Attributable for SummaryProbe {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&TextProvider)
+            }
+            fn alias(&self) -> &str {
+                "summary-probe"
+            }
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for SummaryProbe {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    vision: true,
+                    ..Default::default()
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                anyhow::bail!("summary must use chat")
+            }
+            async fn chat(
+                &self,
+                request: zeroclaw_providers::ChatRequest<'_>,
+                model: &str,
+                _: Option<f64>,
+            ) -> Result<ChatResponse> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(model, "hook-selected-model");
+                assert!(request.tools.is_none());
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|m| m.content.contains("data:image/png;base64,"))
+                );
+                assert!(request.messages.iter().any(|m| m.content == "hook-rewrite"));
+                Ok(ChatResponse {
+                    text: Some("prepared summary".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        struct SummaryHook {
+            cancel: bool,
+        }
+        #[async_trait::async_trait]
+        impl crate::hooks::HookHandler for SummaryHook {
+            fn name(&self) -> &str {
+                "summary-hook"
+            }
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> crate::hooks::HookResult<()> {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| m.content.contains("data:image/png;base64,")),
+                    "hooks must see prepared images"
+                );
+                if self.cancel {
+                    return crate::hooks::HookResult::Cancel("summary denied".into());
+                }
+                *model = "hook-selected-model".into();
+                messages.push(ChatMessage::user("hook-rewrite"));
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("summary.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let prompt = format!("describe [IMAGE:{}]", image.display());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = SummaryProbe(calls.clone());
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        for cancel in [false, true] {
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SummaryHook { cancel }));
+            let budget = ExecutionTreeBudget::root(1);
+            let mut history = vec![ChatMessage::user(prompt.clone())];
+            let result = run_budgeted_test_loop_with_hooks(
+                &provider,
+                &mut history,
+                &tools,
+                budget.clone(),
+                CancellationToken::new(),
+                10,
+                Some(&hooks),
+            )
+            .await;
+            assert_eq!(budget.remaining(), 0);
+            if cancel {
+                assert!(format!("{:#}", result.unwrap_err()).contains("summary denied"));
+                assert_eq!(
+                    history.len(),
+                    1,
+                    "cancelled preparation must remove the synthetic summary prompt"
+                );
+            } else {
+                let response = result.unwrap();
+                assert!(response.contains("execution-tree iteration budget"));
+                assert!(!response.contains("maximum tool iterations"));
+            }
+            assert_eq!(
+                history[0].content, prompt,
+                "preparation must not rewrite durable user history"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "hook cancellation must prevent dispatch"
+            );
+        }
+        let mut history = vec![ChatMessage::user(prompt)];
+        let result = run_budgeted_test_loop(
+            &TextProvider,
+            &mut history,
+            &tools,
+            ExecutionTreeBudget::root(1),
+            CancellationToken::new(),
+            10,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+                .is_some(),
+            "synthetic prompt must not hide a fresh image from a text-only provider"
+        );
+        assert_eq!(history.len(), 1);
     }
 
     #[tokio::test]
