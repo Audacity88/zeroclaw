@@ -3,7 +3,7 @@
 use super::protocol_detect::{
     complete_json_fence_protocol_state, complete_non_protocol_json,
     find_embedded_protocol_candidate_start, find_incomplete_protocol_candidate_start,
-    json_fence_has_trailing_text, longest_suffix_matching_prefix,
+    json_fence_close_end, json_fence_has_trailing_text, longest_suffix_matching_prefix,
     starts_suspicious_protocol_prefix, starts_suspicious_tag_or_fence_prefix,
 };
 use std::collections::HashSet;
@@ -38,13 +38,59 @@ pub(crate) struct StreamTextGuard {
     known_tool_names: HashSet<String>,
     has_active_tools: bool,
     // Text already delivered to the caller before the current candidate was
-    // established. Prose released ahead of a candidate makes the candidate
-    // embedded: the model is quoting protocol, not emitting it.
+    // established, plus the inline-code and fence parity of that text so a
+    // later candidate can tell whether it sits inside a code span. The raw
+    // released text is deliberately not stored.
     released_bytes: usize,
     released_prose: bool,
+    released_inline_code: bool,
+    // Length of the backtick run that opened the currently open inline code
+    // span in released text (0 when none is open): a closing run must match
+    // it exactly.
+    released_open_code_run: usize,
+    released_in_fence: bool,
+    released_backtick_run: usize,
     pub(crate) suppress_forwarding: bool,
     pub(crate) suppressed_protocol: bool,
     pub(crate) suppression: Option<ProtocolSuppressionDiagnostic>,
+}
+
+/// How the quoted region around a buffered candidate is bounded, so an
+/// exemption for quoted protocol covers exactly the quotation and never
+/// the text that follows its closing delimiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteRegion {
+    /// The candidate is quoted material and the quotation ends at this byte
+    /// offset in `pending`, just past its closing delimiter: the closing
+    /// backtick run of an inline code span, or the real closing fence line
+    /// of a json fence that carries text after it.
+    Closed(usize),
+    /// An inline code span is open ahead of the candidate and its closing
+    /// run has not arrived: the candidate cannot be judged yet.
+    Open,
+    /// No code span or fence quotes the candidate.
+    Unquoted,
+}
+
+/// Fold one completed backtick run into the code-span/fence parity: a run
+/// of three or more backticks is a fence marker and toggles fence state,
+/// while a run of one or two backticks opens an inline code span when none
+/// is open and closes the open one only when its length matches the opening
+/// run. A different-length run is literal content inside the span, and no
+/// run toggles code parity inside a fence, where backticks are literal
+/// content.
+fn toggle_backtick_run(run: usize, in_code: &mut bool, open_run: &mut usize, in_fence: &mut bool) {
+    if run >= 3 {
+        *in_fence = !*in_fence;
+    } else if !*in_fence {
+        if !*in_code {
+            *in_code = true;
+            *open_run = run;
+        } else if run == *open_run {
+            *in_code = false;
+            *open_run = 0;
+        }
+    }
 }
 
 impl StreamTextGuard {
@@ -66,6 +112,12 @@ impl StreamTextGuard {
             return None;
         }
 
+        // A chunk carrying a full protocol pattern (a key, tag, or fence) is
+        // evaluated as soon as it is buffered; a speculative seed from a
+        // bare delimiter is not: the fragment alone can look malformed
+        // while the completed shape is ordinary quoted prose, so it waits
+        // for more candidate text.
+        let mut evaluate_now = false;
         if self.pending.is_empty() && !starts_suspicious_protocol_prefix(chunk) {
             // Buffer the whole chunk with the candidate offset intact: the
             // prose ahead of the candidate is not protocol and stays
@@ -73,18 +125,22 @@ impl StreamTextGuard {
             if let Some(start) = find_embedded_protocol_candidate_start(chunk) {
                 self.pending_candidate_start = Some(start);
                 self.pending.push_str(chunk);
-                return self.evaluate_pending(false);
-            }
-            if let Some(start) = find_incomplete_protocol_candidate_start(chunk) {
+                evaluate_now = true;
+            } else if let Some(start) = find_incomplete_protocol_candidate_start(chunk) {
                 self.pending_candidate_start = Some(start);
                 self.pending.push_str(chunk);
-                return None;
+            } else {
+                self.note_released(chunk);
+                return Some(chunk.to_string());
             }
-            self.note_released(chunk);
-            return Some(chunk.to_string());
+        } else {
+            self.pending.push_str(chunk);
+            evaluate_now = true;
         }
 
-        self.pending.push_str(chunk);
+        if !evaluate_now {
+            return None;
+        }
         self.evaluate_pending(false)
     }
 
@@ -92,27 +148,34 @@ impl StreamTextGuard {
         if self.suppress_forwarding || self.pending.is_empty() {
             return None;
         }
-        if let Some(release) = self.evaluate_pending(true) {
-            return Some(release);
+        let mut forwarded = String::new();
+        // A quoted-span release re-scans its remainder into a new candidate,
+        // so keep resolving while the buffer still holds decidable text.
+        while !self.suppress_forwarding && !self.pending.is_empty() {
+            let Some(text) = self.evaluate_pending(true) else {
+                // A malformed verdict on the whole buffer can only apply to
+                // a candidate the model is not quoting: a preamble ahead of
+                // it does not make a call envelope legitimate, a closed
+                // quotation already released through its closer, and an
+                // unclosed opener is not a quote.
+                if looks_like_malformed_tool_protocol_envelope_for_known_tools(
+                    &self.pending,
+                    &self.known_tool_names,
+                ) && let Some(prefix) = self.suppress_protocol("malformed")
+                {
+                    forwarded.push_str(&prefix);
+                }
+                break;
+            };
+            forwarded.push_str(&text);
         }
         if self.suppressed_protocol || self.pending.is_empty() {
-            return None;
+            return (!forwarded.is_empty()).then_some(forwarded);
         }
-        // A malformed verdict on the whole buffer can only apply to a
-        // leading candidate: prose around the buffer head (or a fenced
-        // block with text after it) makes this quoted material, which the
-        // embedded gate inside `candidate_is_embedded` recognizes.
-        if !self.candidate_is_embedded(&self.pending)
-            && looks_like_malformed_tool_protocol_envelope_for_known_tools(
-                &self.pending,
-                &self.known_tool_names,
-            )
-        {
-            return self.suppress_protocol("malformed");
-        }
-        let release = std::mem::take(&mut self.pending);
-        self.note_released(&release);
-        Some(release)
+        let tail = std::mem::take(&mut self.pending);
+        self.note_released(&tail);
+        forwarded.push_str(&tail);
+        Some(forwarded)
     }
 
     fn evaluate_pending(&mut self, finalizing: bool) -> Option<String> {
@@ -123,17 +186,50 @@ impl StreamTextGuard {
             return None;
         }
 
-        if let Some(detector) = self.protocol_suppression_detector(candidate) {
-            return self.suppress_protocol(detector);
+        // Teaching examples are the parser's explicit exception, and tagged
+        // tool-call markup is a machine directive that is withheld wherever
+        // it appears: neither verdict depends on the quoting state, so both
+        // are checked before a quoted region is resolved.
+        if !looks_like_tool_protocol_example(candidate) {
+            if contains_tool_protocol_tag_call(candidate) {
+                return self.suppress_protocol("tagged");
+            }
+            if let Some(kind) = classify_tool_protocol_envelope(candidate)
+                && matches!(kind, ToolProtocolEnvelopeKind::TaggedToolCall)
+            {
+                return self.suppress_protocol("tagged");
+            }
+
+            match self.candidate_quote_region(finalizing) {
+                // The candidate is quoted material: deliver the text
+                // through its closing delimiter and re-scan the remainder
+                // like a fresh chunk, so a later unquoted envelope in that
+                // remainder is still judged.
+                QuoteRegion::Closed(boundary) => {
+                    return self.release_through_quote(boundary, finalizing);
+                }
+                // An open span cannot be judged yet: keep buffering. At
+                // finish the unclosed opener is not a quote, so the
+                // detectors below then judge the candidate as unquoted.
+                QuoteRegion::Open if !finalizing => return None,
+                QuoteRegion::Open | QuoteRegion::Unquoted => {}
+            }
+
+            if let Some(detector) = self.protocol_suppression_detector(candidate) {
+                return self.suppress_protocol(detector);
+            }
         }
 
         if let Some(is_protocol) =
             complete_json_fence_protocol_state(candidate, &self.known_tool_names)
         {
             // A fence carrying a known-tool envelope is an internal protocol
-            // leak only when the fence is the whole message; prose around it
-            // makes it quoted material.
-            if is_protocol && self.has_active_tools && !self.candidate_is_embedded(candidate) {
+            // leak unless the fence is quoted material: a preamble ahead of
+            // it does not make a call envelope legitimate, but a code span
+            // or surrounding text does. A fence with text after its real
+            // close never reaches here; it already released through that
+            // close as quoted material.
+            if is_protocol && self.has_active_tools {
                 return self.suppress_protocol("function_call");
             }
             self.pending_candidate_start = None;
@@ -154,28 +250,183 @@ impl StreamTextGuard {
 
     /// Text delivered to the caller before a later candidate appears: it is
     /// part of the message, not protocol, and it positions any later
-    /// candidate past the start of the message.
+    /// candidate past the start of the message. The backtick parity of the
+    /// released text is folded into the running code-span/fence state so a
+    /// later candidate can tell whether it sits inside an inline code span.
     fn note_released(&mut self, text: &str) {
         self.released_bytes += text.len();
         self.released_prose |= !text.trim().is_empty();
+        let mut run = self.released_backtick_run;
+        let mut in_code = self.released_inline_code;
+        let mut open_run = self.released_open_code_run;
+        let mut in_fence = self.released_in_fence;
+        for ch in text.chars() {
+            if ch == '`' {
+                run += 1;
+            } else if run > 0 {
+                toggle_backtick_run(run, &mut in_code, &mut open_run, &mut in_fence);
+                run = 0;
+            }
+        }
+        self.released_backtick_run = run;
+        self.released_inline_code = in_code;
+        self.released_open_code_run = open_run;
+        self.released_in_fence = in_fence;
     }
 
-    /// A candidate is embedded (quoted material, not a leaked envelope) when
-    /// prose was already released or is buffered ahead of it, or when it sits
-    /// in a fenced block that carries text beyond its closing fence.
-    fn candidate_is_embedded(&self, candidate: &str) -> bool {
+    /// A candidate is quoted (the model showing protocol to the reader, not
+    /// emitting it) only when the inline code span that opened ahead of it
+    /// CLOSES: the closer is a backtick run of the same length (one or two;
+    /// runs of three or more are fence markers and never close an inline
+    /// span) appearing at or after the candidate start. A json fence is
+    /// quoted material only when its real closing fence line arrives with
+    /// text after it, and the quoted region then ends at that close. An
+    /// opener whose closer has not arrived leaves the candidate unquoted at
+    /// finish, so an unclosed span can never exempt a leaked envelope.
+    fn candidate_quote_region(&self, finalizing: bool) -> QuoteRegion {
         let candidate_start = self.pending_candidate_start.unwrap_or(0);
-        if self.released_prose {
-            return true;
+        let candidate = self.pending.get(candidate_start..).unwrap_or(&self.pending);
+        // A json fence carrying text beyond its real closing fence line is
+        // quoted material inside a larger message: the quotation ends at
+        // that close, so the text after it is re-scanned rather than
+        // exempted. A fence with no text after its close is the whole
+        // candidate and is judged by the detectors like any other envelope.
+        if json_fence_has_trailing_text(candidate) {
+            // Trailing text implies a real closing fence line.
+            let close_end = json_fence_close_end(candidate).unwrap_or(candidate.len());
+            return QuoteRegion::Closed(candidate_start + close_end);
         }
-        if self
-            .pending
-            .get(..candidate_start)
-            .is_some_and(|prefix| !prefix.trim().is_empty())
+
+        // Fold the released text and the buffered prefix ahead of the
+        // candidate into the running code-span/fence parity; a run dangling
+        // at the prefix edge resolves against the candidate's first
+        // character, exactly as `note_released` folds it.
+        let mut in_code = self.released_inline_code;
+        let mut open_run = self.released_open_code_run;
+        let mut in_fence = self.released_in_fence;
+        let mut run = self.released_backtick_run;
+        if let Some(prefix) = self.pending.get(..candidate_start) {
+            for ch in prefix.chars() {
+                if ch == '`' {
+                    run += 1;
+                } else if run > 0 {
+                    toggle_backtick_run(run, &mut in_code, &mut open_run, &mut in_fence);
+                    run = 0;
+                }
+            }
+        }
+        if run > 0
+            && let Some(first) = candidate.chars().next()
+            && first != '`'
         {
-            return true;
+            toggle_backtick_run(run, &mut in_code, &mut open_run, &mut in_fence);
         }
-        json_fence_has_trailing_text(candidate)
+        if !in_code {
+            return QuoteRegion::Unquoted;
+        }
+        self.inline_closer_boundary(candidate_start, open_run, finalizing)
+            .map_or(QuoteRegion::Open, QuoteRegion::Closed)
+    }
+
+    /// Byte offset into `pending` just past the backtick run that closes the
+    /// open inline code span, when that run has arrived at or after the
+    /// candidate start. The closer must be a completed run of exactly the
+    /// opening length; a run still growing at the end of the buffer counts
+    /// only once the stream is finishing.
+    fn inline_closer_boundary(
+        &self,
+        candidate_start: usize,
+        open_run: usize,
+        finalizing: bool,
+    ) -> Option<usize> {
+        let scan = self.pending.get(candidate_start..).unwrap_or("");
+        let mut run_len = 0usize;
+        for (offset, ch) in scan.char_indices() {
+            if ch == '`' {
+                run_len += 1;
+                continue;
+            }
+            if run_len == open_run {
+                return Some(candidate_start + offset);
+            }
+            run_len = 0;
+        }
+        (run_len == open_run && finalizing).then_some(candidate_start + scan.len())
+    }
+
+    /// A candidate's quoted region closed at `boundary`, a byte offset into
+    /// `pending` just past the closing delimiter. The text through the
+    /// closer is prose plus a quotation, so deliver it, then re-scan the
+    /// remainder exactly as `push` treats a fresh chunk: a later unquoted
+    /// envelope in that remainder is still found and withheld, with its own
+    /// prose prefix released. Another closed quotation in the remainder
+    /// releases the same way, so the re-scan loops instead of recursing.
+    fn release_through_quote(&mut self, mut boundary: usize, finalizing: bool) -> Option<String> {
+        let mut release = String::new();
+        loop {
+            let head = self.pending[..boundary].to_string();
+            self.pending.drain(..boundary);
+            self.pending_candidate_start = None;
+            self.note_released(&head);
+            release.push_str(&head);
+            // The release ends with the closing delimiter, which the parity
+            // fold leaves as a dangling run: complete it against the known
+            // boundary so the stored state reflects the closed span rather
+            // than an open one.
+            let closer_run = self.released_backtick_run;
+            if closer_run > 0 {
+                self.released_backtick_run = 0;
+                toggle_backtick_run(
+                    closer_run,
+                    &mut self.released_inline_code,
+                    &mut self.released_open_code_run,
+                    &mut self.released_in_fence,
+                );
+            }
+
+            // Re-scan the remainder with the same routing `push` applies to
+            // a fresh chunk: release it outright, or seed a candidate. A
+            // seeded candidate inside another closed quotation releases the
+            // same way (the loop above); anything else is left to the
+            // normal evaluation paths.
+            if let Some(start) = find_embedded_protocol_candidate_start(&self.pending) {
+                self.pending_candidate_start = Some(start);
+                if let QuoteRegion::Closed(next) = self.candidate_quote_region(finalizing) {
+                    boundary = next;
+                    continue;
+                }
+                // A full pattern is evaluated immediately, exactly like
+                // `push` treats a fresh chunk carrying one.
+                if let Some(text) = self.evaluate_pending(finalizing) {
+                    release.push_str(&text);
+                }
+                return Some(release);
+            }
+            if let Some(start) = find_incomplete_protocol_candidate_start(&self.pending) {
+                // A speculative seed waits for more candidate text, exactly
+                // like `push` treats a fresh chunk whose delimiter may yet
+                // be ordinary prose JSON.
+                self.pending_candidate_start = Some(start);
+                return Some(release);
+            }
+            release.push_str(&self.pending);
+            let tail = std::mem::take(&mut self.pending);
+            self.note_released(&tail);
+            return Some(release);
+        }
+    }
+
+    /// A candidate has a prose prefix when prose was already released or is
+    /// buffered ahead of it. A preamble makes a tool-result shape quoted
+    /// prose (the model cannot legitimately emit a tool result), but it
+    /// never legitimizes a tool-call envelope.
+    fn candidate_has_prose_prefix(&self) -> bool {
+        let candidate_start = self.pending_candidate_start.unwrap_or(0);
+        self.released_prose
+            || self
+                .pending
+                .get(..candidate_start)
+                .is_some_and(|prefix| !prefix.trim().is_empty())
     }
 
     fn suppress_protocol(&mut self, detector: &'static str) -> Option<String> {
@@ -249,45 +500,46 @@ impl StreamTextGuard {
     /// Which detector (if any) marks `text` as an internal tool-protocol
     /// envelope that must be withheld from channel output.
     ///
-    /// Tagged tool-call markup is a machine directive, never legitimate
-    /// prose: it is withheld wherever it appears. Every other detector is a
-    /// JSON-envelope verdict, and those only apply to a candidate that leads
-    /// the message: a candidate embedded in surrounding prose (text released
-    /// or buffered ahead of it, or a fenced block that is not the whole
-    /// message) is the model quoting the protocol, not leaking it.
+    /// This runs only after the quoting state has been resolved: a candidate
+    /// inside a closed code span, or a json fence with text after its real
+    /// close, was already delivered as quoted prose, and an open span kept
+    /// the guard buffering until its closer arrived or the stream finished.
+    /// What reaches here is therefore unquoted: a preamble ahead of a
+    /// tool-result shape still makes it quoted prose the model cannot
+    /// legitimately emit, while call-shaped envelopes (malformed or valid,
+    /// naming a known tool) are the ordinary non-native tool-call leak and
+    /// are withheld even after a preamble. Once the classifier returns a
+    /// verdict, that verdict alone decides: unclassified protocol-only JSON
+    /// is judged by the envelope-shape and active-tool detectors.
     fn protocol_suppression_detector(&self, text: &str) -> Option<&'static str> {
-        if looks_like_tool_protocol_example(text) {
-            return None;
-        }
-
-        if contains_tool_protocol_tag_call(text) {
-            return Some("tagged");
-        }
-
-        if let Some(kind) = classify_tool_protocol_envelope(text)
-            && matches!(kind, ToolProtocolEnvelopeKind::TaggedToolCall)
-        {
-            return Some("tagged");
-        }
-
-        if self.candidate_is_embedded(text) {
-            return None;
-        }
+        let prose_prefixed = self.candidate_has_prose_prefix();
 
         if looks_like_malformed_tool_protocol_envelope_for_known_tools(text, &self.known_tool_names)
         {
             return Some("malformed");
         }
 
-        if let Some(kind) = classify_tool_protocol_envelope(text)
-            && self.has_active_tools
-        {
+        if let Some(kind) = classify_tool_protocol_envelope(text) {
             if matches!(kind, ToolProtocolEnvelopeKind::ToolResult) {
-                return Some("tool_result");
+                // A tool result is never legitimate model output, so it is
+                // withheld whenever it leads the message, whether or not
+                // tool specs reached this guard (text-protocol turns hand
+                // the guard none while the model still cannot emit results).
+                if !prose_prefixed {
+                    return Some("tool_result");
+                }
+                return None;
             }
-            if tool_protocol_envelope_mentions_known_tool(text, &self.known_tool_names) {
+            if self.has_active_tools
+                && tool_protocol_envelope_mentions_known_tool(text, &self.known_tool_names)
+            {
                 return Some("function_call");
             }
+            // A classified call-shaped envelope is judged solely by the
+            // verdict above: without active tool specs it is the text-tool
+            // channel, not a leak, and an unknown tool name is left to the
+            // parse-issue detectors downstream.
+            return None;
         }
 
         // Parsed JSON that carries protocol-only fields but cannot yield a valid
@@ -296,8 +548,11 @@ impl StreamTextGuard {
             return Some("malformed");
         }
 
-        self.looks_like_active_tool_json(text)
-            .then_some("active_tool_json")
+        if self.looks_like_active_tool_json(text) {
+            return Some("active_tool_json");
+        }
+
+        None
     }
 }
 
@@ -427,6 +682,269 @@ mod stream_text_guard_tests {
             guard.suppression,
             Some(ProtocolSuppressionDiagnostic {
                 detector: "tagged",
+                candidate_offset: prefix.len(),
+            })
+        );
+    }
+
+    /// A preamble followed by a known-tool call envelope is the ordinary
+    /// non-native tool-call leak: the envelope is withheld and the preamble
+    /// is delivered.
+    #[test]
+    fn prose_prefix_then_known_tool_envelope_is_suppressed_and_prefix_released() {
+        let mut guard = guard_with_tool();
+        let prefix = "Let me check.\n";
+        let forwarded = push_all(
+            &mut guard,
+            &[
+                prefix,
+                "{\"tool_calls\": [{\"function\": {\"name\": \"shell\",",
+                " \"arguments\": {\"command\": \"ls\"}}}]}",
+            ],
+        );
+        assert_eq!(forwarded, prefix);
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "function_call",
+                candidate_offset: prefix.len(),
+            })
+        );
+    }
+
+    /// The malformed toolcalls-key variant after a preamble is withheld the
+    /// same way, with the preamble delivered.
+    #[test]
+    fn prose_prefix_then_malformed_known_tool_envelope_is_suppressed() {
+        let mut guard = guard_with_tool();
+        let prefix = "Let me check.\n";
+        let forwarded = push_all(
+            &mut guard,
+            &[
+                prefix,
+                "{\"toolcalls\": [{\"call_id\": \"call_1\",",
+                " \"arguments\": {\"command\": \"ls\"}}",
+            ],
+        );
+        assert_eq!(forwarded, prefix);
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "malformed",
+                candidate_offset: prefix.len(),
+            })
+        );
+    }
+
+    /// The same known-tool call envelope inside an inline code span is the
+    /// model quoting the protocol: forwarded byte-for-byte, nothing flagged.
+    #[test]
+    fn code_span_known_tool_envelope_is_forwarded() {
+        let mut guard = guard_with_tool();
+        let message = "The call is `{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}` exactly.";
+        let forwarded = push_all(
+            &mut guard,
+            &[
+                "The call is `",
+                "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}` exactly.",
+            ],
+        );
+        assert_eq!(forwarded, message);
+        assert!(!guard.suppressed_protocol);
+        assert!(guard.suppression.is_none());
+    }
+
+    /// A tool-result shape after a prose preamble, with no code span at all,
+    /// is still quoted prose: the model cannot legitimately emit a tool
+    /// result as its own output.
+    #[test]
+    fn prose_prefix_then_tool_result_object_is_forwarded() {
+        let mut guard = guard_with_tool();
+        let message = "The history message is {\"tool_call_id\": \"call_1\", \"content\": \"ok\"}";
+        let forwarded = push_all(
+            &mut guard,
+            &[
+                "The history message is ",
+                "{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}",
+            ],
+        );
+        assert_eq!(forwarded, message);
+        assert!(!guard.suppressed_protocol);
+        assert!(guard.suppression.is_none());
+    }
+
+    /// A backtick with no matching closer never exempts a call envelope: at
+    /// finish the unclosed opener is not a quote, so the envelope is
+    /// withheld with the prose through the backtick delivered (the
+    /// reattack's unmatched-opener escape).
+    #[test]
+    fn unclosed_code_span_opener_does_not_exempt_later_call_envelope() {
+        let mut guard = guard_with_tool();
+        let prefix = "The shell prompt shows `";
+        let envelope = "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}";
+        let forwarded = push_all(&mut guard, &[prefix, envelope]);
+        assert_eq!(
+            forwarded, prefix,
+            "the prose through the dangling backtick is delivered, the envelope is not"
+        );
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "function_call",
+                candidate_offset: prefix.len(),
+            })
+        );
+    }
+
+    /// A closed inline quotation exempts only the quoted region: everything
+    /// through the closing backtick plus the prose after it is delivered,
+    /// and a later unquoted call envelope in the same buffered suffix is
+    /// still withheld (the reattack's closed-quote escape).
+    #[test]
+    fn closed_code_span_quote_does_not_exempt_later_call_envelope() {
+        let mut guard = guard_with_tool();
+        let quoted =
+            "The history message looks like `{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}`";
+        let prose = " and the tool call is ";
+        let envelope = "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}";
+        let forwarded = push_all(
+            &mut guard,
+            &[
+                "The history message looks like `{",
+                "\"tool_call_id\": \"call_1\",",
+                " \"content\": \"ok\"}",
+                format!("`{prose}{envelope}").as_str(),
+            ],
+        );
+        assert_eq!(
+            forwarded,
+            format!("{quoted}{prose}"),
+            "the quotation and the prose after it are delivered, the later envelope is not"
+        );
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "function_call",
+                candidate_offset: quoted.len() + prose.len(),
+            })
+        );
+    }
+
+    /// The same closed-quote shape with the closer arriving in a later chunk
+    /// than the opener and the object: identical outcome, so chunk
+    /// boundaries cannot reopen the leak.
+    #[test]
+    fn closed_code_span_quote_with_split_closer_still_bounded() {
+        let mut guard = guard_with_tool();
+        let quoted =
+            "The history message looks like `{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}`";
+        let prose = " and the tool call is ";
+        let envelope = "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}";
+        let forwarded = push_all(
+            &mut guard,
+            &[
+                "The history message looks like `{",
+                "\"tool_call_id\": \"call_1\", \"content\": \"ok\"}",
+                "`",
+                format!("{prose}{envelope}").as_str(),
+            ],
+        );
+        assert_eq!(
+            forwarded,
+            format!("{quoted}{prose}"),
+            "the quotation and the prose after it are delivered, the later envelope is not"
+        );
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "function_call",
+                candidate_offset: quoted.len() + prose.len(),
+            })
+        );
+    }
+
+    /// A fence run never closes an inline span: a two-backtick opener
+    /// followed by a three-backtick run leaves the span open, so a later
+    /// call envelope is withheld at finish (the reattack's matrix row).
+    #[test]
+    fn fence_run_does_not_close_inline_code_span_opener() {
+        let mut guard = guard_with_tool();
+        let prefix = "Compare `` and ``` output: ";
+        let envelope = "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}";
+        let forwarded = push_all(&mut guard, &[format!("{prefix}{envelope}").as_str()]);
+        assert_eq!(forwarded, prefix);
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "function_call",
+                candidate_offset: prefix.len(),
+            })
+        );
+    }
+
+    /// A triple-backtick run inside a JSON string is not a closing fence: an
+    /// unterminated json fence carrying a known-tool call body is withheld
+    /// at finish as malformed, not released as quoted material (the
+    /// reattack's inner-backticks escape).
+    #[test]
+    fn unterminated_json_fence_with_inner_backticks_is_suppressed_as_malformed() {
+        let mut guard = guard_with_tool();
+        let message = "```json\n{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"echo ```done\"}}}]}";
+        let forwarded = push_all(&mut guard, &[message]);
+        assert_eq!(forwarded, "");
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "malformed",
+                candidate_offset: 0,
+            })
+        );
+    }
+
+    /// The one-chunk variant of the preamble leak: the prefix and the
+    /// envelope arrive in a single delta, so the prefix is buffered ahead
+    /// of the candidate and must be released by the suppression itself (the
+    /// split-chunk variant forwarded the prefix before any candidate
+    /// existed, so it never exercised the release).
+    #[test]
+    fn prose_prefix_and_known_tool_envelope_in_one_chunk_is_suppressed_and_prefix_released() {
+        let mut guard = guard_with_tool();
+        let prefix = "Sure! ";
+        let envelope = "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}";
+        let forwarded = push_all(&mut guard, &[format!("{prefix}{envelope}").as_str()]);
+        assert_eq!(forwarded, prefix);
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "function_call",
+                candidate_offset: prefix.len(),
+            })
+        );
+    }
+
+    /// The one-chunk variant of the malformed preamble leak: the forwarded
+    /// text is exactly the prefix.
+    #[test]
+    fn prose_prefix_and_malformed_known_tool_envelope_in_one_chunk_is_suppressed() {
+        let mut guard = guard_with_tool();
+        let prefix = "Sure! ";
+        let envelope =
+            "{\"toolcalls\": [{\"call_id\": \"call_1\", \"arguments\": {\"command\": \"ls\"}}";
+        let forwarded = push_all(&mut guard, &[format!("{prefix}{envelope}").as_str()]);
+        assert_eq!(forwarded, prefix);
+        assert!(guard.suppressed_protocol);
+        assert_eq!(
+            guard.suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "malformed",
                 candidate_offset: prefix.len(),
             })
         );
@@ -703,6 +1221,37 @@ mod terminal_marker_stripper_tests {
         assert_eq!(
             streamed, quoted,
             "the streaming guard must forward quoted protocol prose byte-for-byte"
+        );
+        assert!(!guard.suppressed_protocol);
+
+        // Parity for a tool-result shape after a prose preamble (no code
+        // span): the non-streaming detector raises nothing on the whole
+        // text, so the streaming guard must deliver it too. A call envelope
+        // after a preamble is deliberately NOT a parity case: the
+        // non-streaming whole-text detector does not flag it, while the
+        // streaming guard withholds it as a tool-call leak (pinned by the
+        // dedicated suppression test above).
+        let prefixed = "The history message is {\"tool_call_id\": \"call_1\", \"content\": \"ok\"}";
+        assert!(
+            super::super::protocol_detect::detect_tool_call_parse_issue_for_known_tools(
+                prefixed,
+                &[],
+                &known_tool_names
+            )
+            .is_none(),
+            "the non-streaming detector must not flag a prefixed tool-result quote"
+        );
+        let mut guard = StreamTextGuard::new(Some(&guard_tools));
+        let live = guard.push(prefixed);
+        let flushed = guard.finish();
+        let streamed = format!(
+            "{}{}",
+            live.unwrap_or_default(),
+            flushed.unwrap_or_default()
+        );
+        assert_eq!(
+            streamed, prefixed,
+            "the streaming guard must forward a tool-result quote after a preamble"
         );
         assert!(!guard.suppressed_protocol);
     }
