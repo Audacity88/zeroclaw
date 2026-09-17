@@ -29,6 +29,7 @@ use zeroclaw_api::a2a_wire::{
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 use zeroclaw_config::live::LiveConfigHandle;
+#[cfg(test)]
 use zeroclaw_config::schema::Config;
 
 #[cfg(test)]

@@ -116,7 +116,7 @@ loop to signal.
 
 The supervised process keeps one canonical published pair: the `Config` together with its revision, an opaque authority epoch plus a checked sequence. Readers receive a read-only live handle (`zeroclaw_config::live::LiveConfigHandle`) and observe the config and its revision as one unit; there is no writable handle and no second cache.
 
-Every participating HTTP, RPC, TUI, Quickstart, pairing, and channel-identity writer admits through the daemon generation's `LiveConfigAuthority` (`begin_config_commit`): the commit owns the daemon-wide writer serialization and a config-work lifecycle lease from admission through publication. The irreversible phase — persist, then publish under a revision allocated before any disk I/O — runs retained, so a cancelled request cannot abandon a dispatched commit between the atomic file replacement and its publication. Commits fail closed once the generation is closing; a full reload starts a fresh authority with a fresh epoch (sequences compare only within one epoch).
+Every participating HTTP, RPC, TUI, Quickstart, pairing, and channel-identity writer admits through the daemon generation's `LiveConfigAuthority` (`begin_config_commit`): the commit owns the daemon-wide writer serialization and a config-work lifecycle lease from admission through publication. The irreversible phase (persist, then publish under a revision allocated before any disk I/O) runs retained, so a cancelled request cannot abandon a dispatched commit between the atomic file replacement and its publication. Commits fail closed once the generation is closing; a full reload starts a fresh authority with a fresh epoch (sequences compare only within one epoch).
 
 Two boundaries worth naming:
 
