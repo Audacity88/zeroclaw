@@ -585,9 +585,9 @@ pub struct ChannelBindBody {
 /// allowlist. Shares the exact bind core the CLI uses
 /// (`bind_channel_identity_into`), writes ONLY to
 /// `peer_groups.<type>_<alias>.external_peers`, and is gated by the same
-/// bearer auth as every other config write. Because the gateway and the
-/// running channels share one `Arc<RwLock<Config>>`, the swap makes the new
-/// peer live immediately — no daemon restart, and no `/bind` message.
+/// bearer auth as every other config write. Publishes the shared config,
+/// drains the supervised channel generation and schedules daemon reload
+/// without requiring an in-chat `/bind` message.
 pub async fn handle_api_channel_bind(
     State(state): State<AppState>,
     headers: HeaderMap,
