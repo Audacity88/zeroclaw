@@ -417,31 +417,39 @@ fn schedule_channel_generation_reload(
 
 /// Save `new_config` to disk, then install it as the live config.
 ///
-/// `_guard` is never read — it is a witness reminding the caller to
-/// serialize the whole read-mutate-swap critical section on
-/// `state.config_write_lock`, acquired before the caller's read-for-modify.
-/// This function deliberately does NOT lock internally: the caller already
-/// holds the guard, so re-locking here would deadlock. The `debug_assert!`
-/// below catches a caller that passed a look-alike guard from the wrong
-/// mutex instead of the one actually held.
+/// The retained job owns the writer guard through save, publication and channel
+/// retirement/reload even if the request is dropped. Return the guard so callers
+/// can keep subsequent annotation writes in the same critical section.
 pub(crate) async fn persist_and_swap(
     state: &AppState,
     new_config: zeroclaw_config::schema::Config,
-    _guard: &ConfigWriteGuard,
-) -> Result<(), ConfigApiError> {
+    guard: ConfigWriteGuard,
+) -> Result<ConfigWriteGuard, ConfigApiError> {
     debug_assert!(
         state.config_write_lock.try_lock().is_err(),
         "persist_and_swap caller must hold state.config_write_lock"
     );
-    let prepared = persist_and_swap_prepared(
-        Arc::clone(&state.config),
-        Arc::clone(&state.pending_reload),
-        state.reload_tx.clone(),
-        new_config,
-    )
-    .await?;
-    finish_prepared_channel_generation(prepared, Arc::clone(&state.pending_reload)).await;
-    Ok(())
+    let config = Arc::clone(&state.config);
+    let pending_reload = Arc::clone(&state.pending_reload);
+    let controls = state.reload_tx.clone();
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            let prepared = persist_and_swap_prepared(
+                config,
+                Arc::clone(&pending_reload),
+                controls,
+                new_config,
+            )
+            .await?;
+            finish_prepared_channel_generation(prepared, pending_reload).await;
+            Ok(guard)
+        }));
+    task.await.map_err(|e| {
+        ConfigApiError::new(
+            ConfigApiCode::ReloadFailed,
+            format!("config completion task failed: {e}"),
+        )
+    })?
 }
 
 /// Save-and-swap half of the config persistence sequence, split from the
@@ -665,19 +673,28 @@ pub async fn handle_api_channel_bind(
         },
         None => None,
     };
-    if let Err(e) = working.save().await {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ReloadFailed,
-            format!("save failed: {e}"),
-        ));
-    }
-    *state.config.write() = working;
-    state
-        .pending_reload
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Some((prepared, controls)) = prepared_channel_generation {
-        prepared.begin().wait().await;
-        schedule_channel_generation_reload(Arc::clone(&state.pending_reload), controls);
+    let config = Arc::clone(&state.config);
+    let pending_reload = Arc::clone(&state.pending_reload);
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            let _guard = _cfg_guard;
+            working.save().await.map_err(|e| {
+                ConfigApiError::new(ConfigApiCode::ReloadFailed, format!("save failed: {e}"))
+            })?;
+            *config.write() = working;
+            pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
+            finish_prepared_channel_generation(prepared_channel_generation, pending_reload).await;
+            Ok::<(), ConfigApiError>(())
+        }));
+    match task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return error_response(error),
+        Err(error) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                format!("channel bind completion task failed: {error}"),
+            ));
+        }
     }
 
     Json(serde_json::json!({
@@ -904,9 +921,10 @@ pub async fn handle_prop_put(
     let config_path = new_config.config_path.clone();
     let mut warnings = new_config.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    if let Err(e) = persist_and_swap(&state, new_config, &_cfg_guard).await {
-        return error_response(e);
-    }
+    let _cfg_guard = match persist_and_swap(&state, new_config, _cfg_guard).await {
+        Ok(guard) => guard,
+        Err(error) => return error_response(error),
+    };
     if let Some(comment) = body.comment.as_ref() {
         let annotations = [(body.path.clone(), comment.clone())];
         if let Err(e) =
@@ -978,7 +996,7 @@ pub async fn handle_prop_delete(
 
     let mut warnings = new_config.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    if let Err(e) = persist_and_swap(&state, new_config, &_cfg_guard).await {
+    if let Err(e) = persist_and_swap(&state, new_config, _cfg_guard).await {
         return error_response(e);
     }
 
@@ -1248,7 +1266,7 @@ pub async fn handle_delete_map_key(
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let working = state.config.read().clone();
     if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
-        return delete_config_cascade(&state, working, &kind, &q.path, &q.key, &_cfg_guard).await;
+        return delete_config_cascade(&state, working, &kind, &q.path, &q.key, _cfg_guard).await;
     }
     let mut working = working;
     let removed = match working.delete_map_key(&q.path, &q.key) {
@@ -1261,7 +1279,7 @@ pub async fn handle_delete_map_key(
     };
     if removed {
         working.mark_dirty(&format!("{}.{}", q.path, q.key));
-        if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+        if let Err(e) = persist_and_swap(&state, working, _cfg_guard).await {
             return error_response(e);
         }
     }
@@ -1427,7 +1445,7 @@ async fn delete_config_cascade(
     kind: &zeroclaw_config::alias_refs::AliasKind,
     path: &str,
     key: &str,
-    guard: &ConfigWriteGuard,
+    guard: ConfigWriteGuard,
 ) -> Response {
     let report = match zeroclaw_config::alias_refs::delete_with_cascade(
         &mut working,
@@ -1534,7 +1552,7 @@ pub async fn handle_map_key(
         }
 
         working.mark_dirty(&format!("{path}.{key}"));
-        if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+        if let Err(e) = persist_and_swap(&state, working, _cfg_guard).await {
             return error_response(e);
         }
     }
@@ -1795,7 +1813,7 @@ pub async fn handle_rename_map_key(
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
             rename_agent_cascade(&state, working, &body, _cfg_guard, agent_lifecycle_leases).await
         }
-        Some(kind) => rename_config_cascade(&state, working, &kind, &body, &_cfg_guard).await,
+        Some(kind) => rename_config_cascade(&state, working, &kind, &body, _cfg_guard).await,
         None => {
             // Non-aliased section: the generic key-swap rename (unchanged).
             let mut working = working;
@@ -1811,7 +1829,7 @@ pub async fn handle_rename_map_key(
             if renamed {
                 working.mark_dirty(&format!("{}.{}", body.path, body.from));
                 working.mark_dirty(&format!("{}.{}", body.path, body.to));
-                if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+                if let Err(e) = persist_and_swap(&state, working, _cfg_guard).await {
                     return error_response(e);
                 }
             }
@@ -1834,7 +1852,7 @@ async fn rename_config_cascade(
     mut working: zeroclaw_config::schema::Config,
     kind: &zeroclaw_config::alias_refs::AliasKind,
     body: &RenameMapKeyBody,
-    guard: &ConfigWriteGuard,
+    guard: ConfigWriteGuard,
 ) -> Response {
     let report = match zeroclaw_config::alias_refs::rename_with_cascade(
         &mut working,
@@ -2171,7 +2189,7 @@ pub async fn handle_refresh_context_window(
     }
 
     working.mark_dirty(&format!("{path}.context_window"));
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+    if let Err(e) = persist_and_swap(&state, working, _cfg_guard).await {
         return error_response(e);
     }
 
@@ -2462,9 +2480,10 @@ pub async fn handle_patch(
     // callers see it.
     let mut warnings = working.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
-        return error_response(e);
-    }
+    let _cfg_guard = match persist_and_swap(&state, working, _cfg_guard).await {
+        Ok(guard) => guard,
+        Err(error) => return error_response(error),
+    };
     if !annotations.is_empty()
         && let Err(e) =
             zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
@@ -2543,7 +2562,7 @@ pub async fn handle_init(
     if let Err(err) = scoped_validate(&working) {
         return error_response(err);
     }
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+    if let Err(e) = persist_and_swap(&state, working, _cfg_guard).await {
         return error_response(e);
     }
 
@@ -3078,7 +3097,7 @@ mod tests {
         working.mark_dirty("channels.cli");
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
 
-        assert!(persist_and_swap(&state, working, &guard).await.is_err());
+        assert!(persist_and_swap(&state, working, guard).await.is_err());
         assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!*reload_rx.borrow_and_update());
     }
@@ -3099,7 +3118,7 @@ mod tests {
         config.mark_dirty("channels.cli");
         let state = test_state(config.clone());
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let result = persist_and_swap(&state, config, &guard).await;
+        let result = persist_and_swap(&state, config, guard).await;
 
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(
@@ -3127,7 +3146,7 @@ mod tests {
         working.mark_dirty("channels.cli");
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
 
-        persist_and_swap(&state, working, &guard).await.unwrap();
+        let _guard = persist_and_swap(&state, working, guard).await.unwrap();
         assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!*reload_rx.borrow_and_update());
         tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())

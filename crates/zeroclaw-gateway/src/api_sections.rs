@@ -1119,7 +1119,7 @@ pub async fn handle_section_select(
         .into_response();
     }
 
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+    if let Err(e) = persist_and_swap(&state, working, _cfg_guard).await {
         return error_response(e);
     }
 

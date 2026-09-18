@@ -976,14 +976,32 @@ impl RpcDispatcher {
     async fn finish_channel_generation_mutation(
         &self,
         prepared: Option<PreparedChannelGenerationMutation>,
-    ) {
-        drain_channel_generation_without_dispatcher(
-            Arc::clone(&self.ctx.sessions),
-            prepared,
-            self.ctx.reload_tx.clone(),
-            self.ctx.gateway_shutdown_tx.clone(),
-        )
-        .await;
+        guard: ConfigWriteGuard,
+    ) -> Result<ConfigWriteGuard, JsonRpcError> {
+        if prepared.is_none() {
+            return Ok(guard);
+        }
+        let sessions = Arc::clone(&self.ctx.sessions);
+        let reload_tx = self.ctx.reload_tx.clone();
+        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+        // Retirement is irreversible. Keep its completion and serialization
+        // alive even when the requesting future is dropped mid-drain.
+        let task = crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            drain_channel_generation_without_dispatcher(
+                sessions,
+                prepared,
+                reload_tx,
+                gateway_shutdown_tx,
+            )
+            .await;
+            guard
+        }));
+        task.await.map_err(|error| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("Channel completion task failed: {error}"),
+            )
+        })
     }
 
     async fn refresh_live_channel_handles_between_configs(
@@ -4430,6 +4448,9 @@ impl RpcDispatcher {
         let config_path = config.config_path.clone();
         self.save_and_swap_config(*config, &config_write_guard)
             .await?;
+        let _config_write_guard = self
+            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
+            .await?;
         if let Some(comment) = req.comment.as_ref().filter(|comment| !comment.is_empty()) {
             let annotations = [(req.prop.clone(), comment.clone())];
             if let Err(error) =
@@ -4444,8 +4465,6 @@ impl RpcDispatcher {
                 );
             }
         }
-        self.finish_channel_generation_mutation(channel_generation_revocation)
-            .await;
         if let Some(agent_alias) = refresh_channel_agent.as_deref() {
             let new_config = self.ctx.config.read().clone();
             self.refresh_live_channel_handles_between_configs(
@@ -4772,8 +4791,9 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
         self.save_and_swap_config(working, &config_write_guard)
             .await?;
-        self.finish_channel_generation_mutation(channel_generation_revocation)
-            .await;
+        let _config_write_guard = self
+            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
+            .await?;
         if let Some(agent_alias) = refresh_channel_agent.as_deref() {
             let new_config = self.ctx.config.read().clone();
             self.refresh_live_channel_handles_between_configs(
@@ -4881,8 +4901,12 @@ impl RpcDispatcher {
             working.mark_dirty(&format!("{}.{}", req.path, req.key));
             self.save_and_swap_config(working, &config_write_guard)
                 .await?;
-            self.finish_channel_generation_mutation(channel_generation_revocation)
-                .await;
+            let _config_write_guard = self
+                .finish_channel_generation_mutation(
+                    channel_generation_revocation,
+                    config_write_guard,
+                )
+                .await?;
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -4967,8 +4991,12 @@ impl RpcDispatcher {
                 working.mark_dirty(&format!("{}.{}", req.path, req.to));
                 self.save_and_swap_config(working, &config_write_guard)
                     .await?;
-                self.finish_channel_generation_mutation(channel_generation_revocation)
-                    .await;
+                let _config_write_guard = self
+                    .finish_channel_generation_mutation(
+                        channel_generation_revocation,
+                        config_write_guard,
+                    )
+                    .await?;
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -5121,14 +5149,17 @@ impl RpcDispatcher {
                     )
                 })??
             } else {
-                // Non-agent alias renames hold no lifecycle lease: unchanged
-                // inline save-and-drain sequence.
+                // Non-agent alias renames retain the writer through retirement.
                 if !resume_committed_to {
                     self.save_and_swap_config(working, &config_write_guard)
                         .await?;
                 }
-                self.finish_channel_generation_mutation(channel_generation_revocation)
-                    .await;
+                let config_write_guard = self
+                    .finish_channel_generation_mutation(
+                        channel_generation_revocation,
+                        config_write_guard,
+                    )
+                    .await?;
                 drop(config_write_guard);
                 Vec::new()
             };
@@ -13923,6 +13954,53 @@ mod tests {
                 .reserve_turn_at("referenced", generation)
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn config_completion_survives_request_cancellation_during_channel_drain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_secret_test_config(&tmp);
+        let new_cli = !config.channels.cli;
+        config.save().await.unwrap();
+        let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+        let ctx = Arc::clone(&dispatcher.ctx);
+        let mut reload = ctx.reload_tx.as_ref().unwrap().subscribe();
+        let token = tokio_util::sync::CancellationToken::new();
+        let generation = ctx
+            .sessions
+            .register_cancel_token("drain-gate", token.clone());
+        let request = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_config_set(&json!({"prop": "channels.cli", "value": new_cli}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
+            .await
+            .expect("committed config must begin channel retirement");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ctx.config.read().channels.cli, new_cli);
+        assert!(
+            ctx.config_write_lock.try_lock().is_err(),
+            "retained drain must still own serialization"
+        );
+        assert!(
+            !*reload.borrow(),
+            "reload must not precede drain completion"
+        );
+        ctx.sessions.remove_cancel_token("drain-gate", generation);
+        tokio::time::timeout(std::time::Duration::from_secs(5), reload.changed())
+            .await
+            .expect("retained completion must reload after caller cancellation")
+            .unwrap();
+        assert!(*reload.borrow());
+        let _guard = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ctx.config_write_lock.lock(),
+        )
+        .await
+        .expect("completed drain must release the writer");
     }
 
     #[test]
