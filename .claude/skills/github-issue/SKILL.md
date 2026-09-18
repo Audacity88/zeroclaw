@@ -132,19 +132,29 @@ For checkbox fields, render each option as:
 
 Show the final constructed issue (title + labels + full body) for one last confirmation. If the selected template has no labels, show `Labels: none` and omit `--label` from the create command.
 
-Save the final body to `tmp/issue-body.md`, preview that file, and submit it unchanged:
+Create a private scratch directory outside the checkout, then save the final body to `$BODY_FILE`:
 
 ```bash
-gh issue create --title "<title prefix><user title>" --label "<label1>,<label2>" --body-file tmp/issue-body.md
+umask 077
+BODY_DIR=$(mktemp -d /tmp/zeroclaw-issue.XXXXXX) || exit 1
+BODY_FILE="$BODY_DIR/body.md"
+```
+
+Use the trusted system temporary directory on your platform if `/tmp` is unavailable; never substitute a checkout-controlled directory. Preview the saved file for confirmation and reread it immediately before submission. If its contents changed, obtain confirmation again. This avoids predictable checkout paths and other-user writes, not interference by a malicious process running as your user.
+
+Submit the confirmed file unchanged:
+
+```bash
+gh issue create --title "<title prefix><user title>" --label "<label1>,<label2>" --body-file "$BODY_FILE"
 ```
 
 When the selected template has no labels:
 
 ```bash
-gh issue create --title "<title prefix><user title>" --body-file tmp/issue-body.md
+gh issue create --title "<title prefix><user title>" --body-file "$BODY_FILE"
 ```
 
-Return the resulting issue URL to the user.
+Return the resulting issue URL to the user. After successful submission, remove only `$BODY_FILE` and its empty `$BODY_DIR`; retain the file on failure so it can be inspected.
 
 ### Important Rules
 

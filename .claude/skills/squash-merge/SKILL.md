@@ -275,12 +275,16 @@ printf '%s\n' "$COMMITS" | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):
 If this prints anything, stop and strip the remaining bot attribution or
 generated footer before continuing.
 
-Save the sanitized body before confirmation and show that file's contents with the merge command. Submit the same file unchanged:
+Save the sanitized body in a private scratch directory outside the checkout before confirmation and show that file's contents with the merge command:
 
 ```bash
-BODY_FILE="tmp/merge-body-${NUMBER}.md"
-printf '%s' "$COMMITS" > "$BODY_FILE"
+umask 077
+BODY_DIR=$(mktemp -d /tmp/zeroclaw-merge.XXXXXX) || exit 1
+BODY_FILE="$BODY_DIR/body.md"
+printf '%s' "$COMMITS" > "$BODY_FILE" || exit 1
 ```
+
+Use the trusted system temporary directory on your platform if `/tmp` is unavailable; never substitute a checkout-controlled directory. This avoids predictable checkout paths and other-user writes, not interference by a malicious process running as your user.
 
 ```bash
 PR_TITLE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title --jq '.title')
@@ -356,7 +360,7 @@ if [[ -z "$CURRENT_RELEASE_LINE_DISPOSITION" || "$CURRENT_RELEASE_LINE_DISPOSITI
 fi
 ```
 
-Only then run the merge command:
+Only then reread `$BODY_FILE` and confirm it still matches the approved body. If it changed, restart Step 3 to sanitize the intended body, save it in a new private scratch directory, and obtain confirmation again. Submit the same file unchanged:
 
 ```bash
 gh pr merge "$NUMBER" --repo zeroclaw-labs/zeroclaw --squash \
@@ -377,7 +381,7 @@ gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
 
 If `state` is not `MERGED`, report the discrepancy and stop — do not assume success.
 
-Report to the user: merge commit SHA and PR URL.
+Report to the user: merge commit SHA and PR URL. After verification, remove only `$BODY_FILE` and its empty `$BODY_DIR`; retain the file on failure so it can be inspected.
 
 **Post-merge (optional, only if user asks):**
 - Fetch latest master: `git checkout master && git pull upstream master` (or `origin master` if no upstream remote)
