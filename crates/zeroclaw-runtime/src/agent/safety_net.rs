@@ -2337,6 +2337,99 @@ async fn safety_net_live_streamed_tool_turn_does_not_duplicate_narration_chunk()
     );
 }
 
+/// Round 1 streams a live prefix, then a delta whose trailing `<tool` is held
+/// by the stream guard as a possible incomplete protocol opener; the guard
+/// releases it at `finish()` and the release still streams live, so the
+/// remainder the tool-call branch computes is empty on this path. This pins
+/// that the event consumer receives the complete narration exactly once,
+/// before the round's `ToolCall`, and that the branch does not replay text the
+/// live stream already delivered.
+#[tokio::test]
+async fn safety_net_guard_held_narration_suffix_reaches_event_consumer_live_before_tool_call() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedStreamProvider::new(vec![
+            vec![
+                text_delta("About to "),
+                text_delta("check the <tool"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::ToolCall(
+                    tool_call("tc-1", "echo"),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+            vec![
+                text_delta("all done"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("guard-held suffix", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("ToolCall event must be emitted");
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { id, .. } if id == "tc-1"))
+        .expect("ToolResult event must be emitted");
+
+    let chunk_text = |slice: &[TurnEvent]| -> String {
+        slice
+            .iter()
+            .filter_map(|e| match e {
+                TurnEvent::Chunk { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        chunk_text(&events[..pos_tool_call]),
+        "About to check the <tool",
+        "pre-ToolCall Chunks must concatenate to the full narration, live, exactly once"
+    );
+    assert!(
+        !events[pos_tool_call..pos_tool_result]
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Chunk { .. })),
+        "no Chunk may be emitted between the round's ToolCall and its ToolResult"
+    );
+    assert_eq!(
+        chunk_text(&events[pos_tool_result..]),
+        "all done",
+        "post-ToolResult Chunks must concatenate to the final-round text"
+    );
+    assert_eq!(
+        chunk_text(&events).matches("About to ").count(),
+        1,
+        "the live-streamed prefix must occur exactly once across the whole turn"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the tool must run exactly once"
+    );
+}
+
 #[tokio::test]
 async fn safety_net_protocol_suppressed_tool_turn_emits_no_narration_chunk() {
     let calls = Arc::new(AtomicUsize::new(0));
