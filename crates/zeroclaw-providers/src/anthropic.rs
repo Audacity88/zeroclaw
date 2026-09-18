@@ -1423,13 +1423,16 @@ impl AnthropicModelProvider {
                             }
                         } else {
                             // Counted exactly like the tool-result arm. The
-                            // multimodal normalizer is the only component that
-                            // may turn a file reference into inline image
-                            // content, and it has already run by the time a
-                            // message reaches this adapter; reading the path
-                            // here (extension-inferred MIME, no size or
-                            // content validation) would reopen the hole the
-                            // normalizer exists to close.
+                            // multimodal normalizer is the only component
+                            // allowed to turn a file reference into inline
+                            // image content: callers that want images run it
+                            // before dispatch, and the seam replaces any
+                            // path/URL marker that reaches it with a
+                            // placeholder. This adapter therefore counts a
+                            // non-inline reference as omitted instead of
+                            // reading it; reading the path (extension-inferred
+                            // MIME, no size or content validation) would
+                            // reopen the hole the normalizer exists to close.
                             omitted += 1;
                             continue;
                         };
