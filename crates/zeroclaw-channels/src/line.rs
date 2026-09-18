@@ -518,10 +518,11 @@ async fn handle_webhook(
                             if let Some(ref guard) = state.pairing {
                                 match guard.try_pair(code, user_id).await {
                                     Ok(Some(_)) => {
-                                        if let Err(e) =
+                                        let reply_key = if let Err(e) =
                                             persist_line_paired_identity(&*state, user_id).await
                                         {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "e": e.to_string()})), "paired userId= but persist failed");
+                                            "channel-line-bind-persist-failed"
                                         } else {
                                             ::zeroclaw_log::record!(
                                                 INFO,
@@ -534,16 +535,15 @@ async fn handle_webhook(
                                                 ),
                                                 "paired userId="
                                             );
-                                        }
+                                            "channel-line-bind-success"
+                                        };
                                         if let Some(ref token) = bind_reply_token {
                                             send_bind_reply(
                                                 &state.client,
                                                 &state.channel_access_token,
                                                 &state.api_base_url,
                                                 token,
-                                                &i18n::get_required_cli_string(
-                                                    "channel-line-bind-success",
-                                                ),
+                                                &i18n::get_required_cli_string(reply_key),
                                                 bind_sender.clone(),
                                             )
                                             .await;
@@ -2622,12 +2622,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn retired_listener_rejects_in_flight_webhook_pairing() {
         use std::time::Duration;
-        use wiremock::matchers::method;
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let api_server = MockServer::start().await;
         Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
             .respond_with(ResponseTemplate::new(200))
+            .expect(1)
             .mount(&api_server)
             .await;
         let temp = tempfile::TempDir::new().unwrap();
@@ -2667,7 +2669,7 @@ mod tests {
             post_signed(
                 port,
                 "secret",
-                &dm_event("line-user", &format!("/bind {code}"), ""),
+                &dm_event("line-user", &format!("/bind {code}"), "rt-retired"),
             )
             .await
         });
@@ -2700,6 +2702,22 @@ mod tests {
                 .is_empty()
         );
         assert!(!temp.path().join("config.toml").exists());
+        let requests = api_server.received_requests().await.unwrap();
+        let reply = requests
+            .iter()
+            .find(|request| request.url.path() == "/v2/bot/message/reply")
+            .expect("persistence rejection must send a failure reply");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["replyToken"], "rt-retired");
+        assert_eq!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-persist-failed")
+        );
+        assert_ne!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-success")
+        );
+        api_server.verify().await;
     }
 
     #[tokio::test]

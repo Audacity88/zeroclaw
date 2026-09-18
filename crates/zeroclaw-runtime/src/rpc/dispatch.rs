@@ -14055,6 +14055,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn config_completion_survives_request_cancellation_during_channel_drain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_secret_test_config(&tmp);
+        let new_cli = !config.channels.cli;
+        config.save().await.unwrap();
+        let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+        let ctx = Arc::clone(&dispatcher.ctx);
+        let mut reload = ctx.reload_tx.as_ref().unwrap().subscribe();
+        let token = tokio_util::sync::CancellationToken::new();
+        let generation = ctx
+            .sessions
+            .register_cancel_token("drain-gate", token.clone());
+        let request = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_config_set(&json!({"prop": "channels.cli", "value": new_cli}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
+            .await
+            .expect("committed config must begin channel retirement");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ctx.config.read().channels.cli, new_cli);
+        assert!(
+            ctx.config_authority.config_write_lock_is_held(),
+            "retained drain must still own serialization"
+        );
+        assert!(
+            !*reload.borrow(),
+            "reload must not precede drain completion"
+        );
+        ctx.sessions.remove_cancel_token("drain-gate", generation);
+        tokio::time::timeout(std::time::Duration::from_secs(5), reload.changed())
+            .await
+            .expect("retained completion must reload after caller cancellation")
+            .unwrap();
+        assert!(*reload.borrow());
+        let _guard =
+            tokio::time::timeout(std::time::Duration::from_secs(5), ctx.begin_config_commit())
+                .await
+                .expect("completed drain must release the writer")
+                .expect("config admission remains open");
+    }
+
     #[test]
     fn agent_delete_cancelled_after_commit_still_drains_and_cleans_up() {
         // The restructured delete handler future exceeds the default

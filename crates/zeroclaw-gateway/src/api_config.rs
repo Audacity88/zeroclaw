@@ -652,10 +652,9 @@ pub struct ChannelBindBody {
 /// allowlist. Shares the exact bind core the CLI uses
 /// (`bind_channel_identity_into`), writes ONLY to
 /// `peer_groups.<type>_<alias>.external_peers`, and is gated by the same
-/// bearer auth as every other config write. Because the gateway and the
-/// running channels share one published config, the committed publication
-/// makes the new peer live immediately — no daemon restart, and no `/bind`
-/// message.
+/// bearer auth as every other config write. Publishes the shared config,
+/// drains the supervised channel generation and schedules daemon reload
+/// without requiring an in-chat `/bind` message.
 pub async fn handle_api_channel_bind(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3752,7 +3751,8 @@ mod tests {
     async fn http_annotations_retain_commit_through_whole_file_rewrite() {
         for patch in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
-            let config = temp_config(&tmp);
+            let mut config = temp_config(&tmp);
+            config.gateway.host = "127.0.0.2".into();
             config.save().await.unwrap();
             let config_path = config.config_path.clone();
             let state = test_state(config);
@@ -3777,7 +3777,7 @@ mod tests {
                         HeaderMap::new(),
                         axum::Json(PropPutBody {
                             path: "gateway.host".into(),
-                            value: serde_json::json!("127.0.0.1"),
+                            value: serde_json::json!("127.0.0.2"),
                             comment: Some("annotation overlap".into()),
                         }),
                     )
@@ -3802,6 +3802,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                tokio::fs::read_to_string(&config_path)
+                    .await
+                    .unwrap()
+                    .contains("# annotation overlap")
+            );
             let commit = next_commit.await.unwrap();
             let mut later = commit.current_config();
             later

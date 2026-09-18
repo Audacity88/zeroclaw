@@ -437,6 +437,7 @@ channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} 
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
 channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-persist-failed = Pairing could not be saved. Ask the bot administrator for a new pairing code and try again.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
 channel-telegram-cmd-new-desc = Start a new conversation session
