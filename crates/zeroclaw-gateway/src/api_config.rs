@@ -762,11 +762,15 @@ pub async fn handle_api_channel_bind(
             finish_prepared_channel_generation(prepared_channel_generation, pending_reload).await;
             Ok(())
         }));
-    if let Err(e) = task.await {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ReloadFailed,
-            format!("config commit task failed: {e}"),
-        ));
+    match task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return error_response(error),
+        Err(error) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                format!("config commit task failed: {error}"),
+            ));
+        }
     }
 
     Json(serde_json::json!({
@@ -5670,6 +5674,47 @@ mod tests {
                 .is_empty(),
             "a phantom-alias bind must not create a peer group"
         );
+    }
+
+    #[tokio::test]
+    async fn channel_bind_save_failure_does_not_report_success_or_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        let blocked_parent = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"preserve").unwrap();
+        config.config_path = blocked_parent.join("config.toml");
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert!(status.is_server_error(), "{json}");
+        assert_ne!(json.get("saved"), Some(&serde_json::Value::Bool(true)));
+        assert!(
+            state
+                .config
+                .read()
+                .channel_external_peers("telegram", "alerts")
+                .is_empty(),
+            "a failed save must not publish the bound peer"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert_eq!(std::fs::read(&blocked_parent).unwrap(), b"preserve");
     }
 
     #[tokio::test]

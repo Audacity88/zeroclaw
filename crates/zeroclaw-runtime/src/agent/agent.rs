@@ -1488,6 +1488,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1543,7 +1544,39 @@ impl Agent {
             sop_audit,
             canvas_store,
             None,
+            None,
             execution_capability,
+        )
+        .await
+    }
+
+    pub async fn from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+        config: &Config,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            acp_delivery,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            Some(acp_session_store),
+            None,
+            None,
         )
         .await
     }
@@ -1601,6 +1634,69 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
+            Some(live_config),
+            execution_capability,
+        )
+        .await
+    }
+
+    pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+        live_config: zeroclaw_config::live::LiveConfigHandle,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        Self::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            acp_delivery,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            acp_session_store,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
+        live_config: zeroclaw_config::live::LiveConfigHandle,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        execution_capability: Option<AgentExecutionCapability>,
+    ) -> Result<Self> {
+        let config = live_config.read().clone();
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            &config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            acp_delivery,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            Some(acp_session_store),
             Some(live_config),
             execution_capability,
         )
@@ -1660,6 +1756,7 @@ impl Agent {
             sop_audit,
             None,
             None,
+            None,
             execution_capability,
         )
         .await
@@ -1714,6 +1811,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             execution_capability,
+            None,
         )
         .await
     }
@@ -1732,6 +1830,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         execution_capability: Option<AgentExecutionCapability>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -1746,6 +1845,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            acp_session_store,
             Some(live_config),
             execution_capability,
         )
@@ -1765,6 +1865,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
         live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Result<Self> {
@@ -1881,7 +1982,9 @@ impl Agent {
             _ => (None, None),
         };
 
-        let all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
+        let acp_sessions =
+            acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
+        let all_tools_result = tools::all_tools_with_runtime_context(
             Arc::new(config.clone()),
             &security,
             risk_profile,
@@ -1910,6 +2013,7 @@ impl Agent {
             // pass `None` and keep the documented snapshot fallback.
             live_config.clone(),
             execution_capability,
+            acp_sessions,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -7167,6 +7271,142 @@ mod tests {
             "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
             result.err().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_session_tools_receive_the_owned_store_view() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig,
+        };
+        use zeroclaw_infra::acp_session_store::AcpSessionStore;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let mut config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let store = Arc::new(AcpSessionStore::new(tmp.path()).expect("ACP store"));
+        let current = "11111111-1111-4111-8111-111111111111";
+        let previous = "22222222-2222-4222-8222-222222222222";
+        store
+            .create_session(current, "test-agent", "/current")
+            .unwrap();
+        store
+            .create_session(previous, "test-agent", "/previous")
+            .unwrap();
+        store
+            .append_turn(
+                previous,
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "durable previous answer",
+                ))],
+            )
+            .unwrap();
+
+        let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+            &config,
+            "test-agent",
+            Some(&data_dir),
+            false,
+            true,
+            true,
+            None,
+            None,
+            None,
+            Arc::clone(&store),
+        )
+        .await
+        .expect("ACP agent construction");
+
+        let authority = crate::live_config_authority::LiveConfigAuthority::new(config);
+        let managed = Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
+            authority.live_handle(),
+            "test-agent",
+            Some(&data_dir),
+            false,
+            true,
+            true,
+            None,
+            None,
+            None,
+            Arc::clone(&store),
+            Some(authority.execution_capability()),
+        )
+        .await
+        .expect("managed ACP agent construction");
+
+        for agent in [&agent, &managed] {
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .scope(Some(current.to_string()), async {
+                    let listed = agent
+                        .execute_tool_for_test("sessions_list", serde_json::json!({}))
+                        .await
+                        .expect("sessions_list registered")
+                        .unwrap();
+                    assert!(listed.success);
+                    assert!(listed.output.contains(current));
+                    assert!(listed.output.contains(previous));
+
+                    let history = agent
+                        .execute_tool_for_test(
+                            "sessions_history",
+                            serde_json::json!({"session_id": previous}),
+                        )
+                        .await
+                        .expect("sessions_history registered")
+                        .unwrap();
+                    assert!(history.success);
+                    assert!(history.output.contains("durable previous answer"));
+                })
+                .await;
+        }
+
+        let _deletion = authority
+            .agent_lifecycle()
+            .begin_delete("test-agent")
+            .unwrap();
+        let error = managed
+            .delegate_tool
+            .as_ref()
+            .expect("constructed delegate tool")
+            .execute(serde_json::json!({"agent": "test-agent", "prompt": "blocked"}))
+            .await
+            .expect_err("constructed delegate must retain lifecycle admission");
+        assert!(matches!(
+            error.downcast_ref::<crate::live_config_authority::AgentExecutionError>(),
+            Some(crate::live_config_authority::AgentExecutionError::Admission(
+                crate::live_config_authority::AgentAdmissionError::Deleting { alias }
+            )) if alias == "test-agent"
+        ));
     }
 
     #[tokio::test]
