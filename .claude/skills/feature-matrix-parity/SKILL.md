@@ -137,7 +137,7 @@ gh search issues --repo openclaw/openclaw --state open "<slot> in:title" --json 
 gh search issues --repo NousResearch/hermes-agent --state open "<slot> in:title" --json number,title,url
 ```
 
-A raw keyword count is noise: an issue that merely mentions "bedrock" is not a roadmap commitment. Bug reports and merged feature requests are leads to inspect the implementing tree and wiring, not proof of `supported`. Record the supporting issue or roadmap reference and check date in the TOML header so the verdict is auditable.
+A raw keyword count is noise: an issue that merely mentions "bedrock" is not a roadmap commitment. Read candidate issue bodies and comments for an explicit maintainer acceptance, or inspect the maintained roadmap entry; a requester's proposal alone is insufficient. Bug reports and merged feature requests are leads to inspect the implementing tree and wiring, not proof of `supported`. Record the supporting issue/comment or roadmap reference and check date in the TOML header so the verdict is auditable. Use `unknown` when the available evidence cannot establish a verdict.
 
 ### Step 5: Write the TOML
 
