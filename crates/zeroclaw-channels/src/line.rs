@@ -2655,8 +2655,7 @@ mod tests {
         let code = channel.pairing.as_ref().unwrap().pairing_code().unwrap();
         let waiting = Arc::new(tokio::sync::Notify::new());
         channel.persistence_waiting = Some(Arc::clone(&waiting));
-        let lock = authority.config_write_lock();
-        let guard = lock.lock().await;
+        let guard = authority.begin_config_commit().await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, _rx) = mpsc::channel(1);
@@ -2696,7 +2695,7 @@ mod tests {
         drop(guard);
         assert!(
             authority
-                .config()
+                .live_handle()
                 .read()
                 .channel_external_peers("line", "line_test_alias")
                 .is_empty()
