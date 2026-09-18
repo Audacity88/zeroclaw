@@ -4830,8 +4830,9 @@ pub(crate) mod tests {
             zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
             "imperative jobs default to wrapped"
         );
-        // Imperative jobs get UUID ids; the scheduler resolves owning agent
-        // by reverse-lookup against `agent.cron_jobs`, same as
+        // The stored alias resolves ownership when `test-agent` is an enabled
+        // configured agent; the `cron_jobs` claim is the single-enabled-claimant
+        // fallback for rows without one, same as
         // `cron_api_run_executes_shell_job_and_records_run`.
         link_job_to_test_agent(&state, &job.id);
 
@@ -5144,8 +5145,9 @@ pub(crate) mod tests {
         )
         .expect("job added");
 
-        // Imperative jobs get UUID ids; the scheduler resolves owning
-        // agent by reverse-lookup against `agent.cron_jobs`.
+        // The stored alias resolves ownership when `test-agent` is an enabled
+        // configured agent; the `cron_jobs` claim is the single-enabled-claimant
+        // fallback for rows without one.
         link_job_to_test_agent(&state, &job.id);
 
         let response =

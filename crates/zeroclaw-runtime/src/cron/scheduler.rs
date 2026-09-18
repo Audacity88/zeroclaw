@@ -279,6 +279,49 @@ async fn run_manual_job_inner(
     // row's empty `agent_alias` falls back to config ownership); the record
     // must report that identity, or honest absence when none resolves.
     let executing_agent = resolve_owning_agent(config, job).map(str::to_string);
+    // A job with no single owner is refused before anything runs, exactly as
+    // the scheduled path refuses it: nothing is delivered under no identity,
+    // and no run row is written (an owner-less row under a live job is the
+    // state reserved for quarantined history whose job is gone). The job's
+    // last-run summary still records the refusal so operators can see it.
+    if executing_agent.is_none() {
+        let finished_at = Utc::now();
+        let output = format!("cron job {id:?}: {NO_OWNER_MESSAGE}", id = job.id);
+        if let Err(e) = super::store::record_last_run_with_status(
+            config,
+            &job.id,
+            finished_at,
+            "error",
+            &output,
+        ) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+                "manual cron trigger: failed to record refusal"
+            );
+        }
+        if let Some(tx) = event_tx {
+            let _ = tx.send(serde_json::json!({
+                "type": "cron_result",
+                "job_id": job.id,
+                "success": false,
+                "output": &output,
+                "manual": true,
+                "timestamp": finished_at.to_rfc3339(),
+            }));
+        }
+        return ManualCronRunResult {
+            job_id: job.id.clone(),
+            success: false,
+            status: "error".to_string(),
+            output,
+            duration_ms: (finished_at - started_at).num_milliseconds(),
+            started_at,
+            finished_at,
+        };
+    }
     let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
@@ -470,17 +513,7 @@ pub async fn run(
     }
 }
 
-fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
-    if !job.agent_alias.is_empty()
-        && let Some((alias, _)) = config
-            .agents
-            .iter()
-            .find(|(alias, _)| alias.as_str() == job.agent_alias)
-    {
-        return Some(alias.as_str());
-    }
-    config.agent_for_cron_job(&job.id)
-}
+use super::store::{NO_OWNER_MESSAGE, resolve_owning_agent};
 
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
 /// Called once at scheduler startup so that jobs missed during downtime
@@ -621,10 +654,7 @@ async fn execute_job_now_with_runtime(
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
         return (
             false,
-            format!(
-                "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
-                id = job.id
-            ),
+            format!("cron job {id:?}: {NO_OWNER_MESSAGE}", id = job.id),
         );
     };
     let agent_alias = agent_alias.to_string();
@@ -763,8 +793,10 @@ async fn process_due_jobs(
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
+        // Selection already drops unowned jobs; this guards a caller that
+        // hands in jobs from elsewhere.
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(super::store::ownership_refusal_attrs(config, &job)), NO_OWNER_MESSAGE);
             let _ = release_job(config, &job.id);
             return None;
         };
@@ -3700,6 +3732,142 @@ mod tests {
             cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
             "a skipped orphan job's in-flight lock must be released, not leaked"
         );
+    }
+
+    /// Claim `ids` for an enabled agent that is fully executable (risk and
+    /// runtime profiles present), so a refusal can only come from ownership.
+    fn claim_with_profiles(config: &mut Config, alias: &str, ids: &[&str]) {
+        crate::cron::store::claim_job_in_config(config, alias, true, ids);
+        config
+            .risk_profiles
+            .entry(alias.to_string())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+    }
+
+    #[tokio::test]
+    async fn contested_config_only_job_is_not_executed_by_either_claimant() {
+        // A legacy job (empty stored alias) claimed by TWO fully executable
+        // enabled agents is unowned for cleanup; execution must agree on every
+        // path: selection never offers it (so it is never claimed and cannot
+        // spin), the defensive guard refuses it, the manual path refuses it,
+        // and no run record exists under either identity.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo contested").unwrap();
+        claim_with_profiles(&mut config, "agent-a", &[&job.id]);
+        claim_with_profiles(&mut config, "agent-b", &[&job.id]);
+        let contested = CronJob {
+            agent_alias: String::new(),
+            ..job.clone()
+        };
+        assert!(
+            resolve_owning_agent(&config, &contested).is_none(),
+            "two enabled claimants must resolve to no owner"
+        );
+
+        // Selection: make the stored row legacy-shaped and overdue.
+        crate::cron::store::with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET agent_alias = '', next_run = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                [&job.id],
+            )
+            .map_err(anyhow::Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+        let due = cron::due_jobs(&config, Utc::now()).unwrap();
+        assert!(
+            due.iter().all(|j| j.id != job.id),
+            "selection must not offer a contested job: {due:?}"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "selection must not have claimed the contested job"
+        );
+        cron::release_job(&config, &job.id).unwrap();
+
+        // Defensive guard in process_due_jobs for jobs handed in directly.
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        process_due_jobs(
+            &config,
+            vec![contested.clone()],
+            &unique_component("contested"),
+            &None,
+        )
+        .await;
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "the guard must release the lock it was handed"
+        );
+        cron::release_job(&config, &job.id).unwrap();
+
+        // Manual path: refused, and no owner-less run row is written.
+        let result =
+            run_manual_job(&config, &contested, CronDeliveryContext::RpcManual, &None).await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("no single owning agent"),
+            "{}",
+            result.output
+        );
+        assert!(
+            cron::list_runs(&config, &job.id, 10).unwrap().is_empty(),
+            "no run may be recorded under any claimant"
+        );
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            after.last_status.as_deref(),
+            Some("error"),
+            "refusal is visible on the job"
+        );
+        assert!(
+            after
+                .last_output
+                .unwrap_or_default()
+                .contains("no single owning agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_config_claimant_executes_a_legacy_job_under_its_identity() {
+        // Positive control for the unique-claimant fallback: one enabled
+        // claimant, an empty stored alias, and the job actually runs — the
+        // run is recorded under that claimant as executing agent.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo owned").unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .expect("fixture agent")
+            .cron_jobs
+            .push(job.id.clone());
+        let legacy = CronJob {
+            agent_alias: String::new(),
+            ..job.clone()
+        };
+        assert_eq!(resolve_owning_agent(&config, &legacy), Some(TEST_AGENT));
+
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        process_due_jobs(&config, vec![legacy], &unique_component("sole"), &None).await;
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "the sole claimant must execute the job: {runs:?}"
+        );
+        assert_eq!(runs[0].executing_agent.as_deref(), Some(TEST_AGENT));
     }
 
     #[tokio::test]

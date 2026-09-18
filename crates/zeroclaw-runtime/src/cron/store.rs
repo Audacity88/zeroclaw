@@ -542,6 +542,52 @@ pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usi
     Ok(changed)
 }
 
+/// The agent a job executes under and is cleaned up by: its stored alias when
+/// that names an ENABLED configured agent, otherwise the single enabled agent
+/// claiming the id through `[agents.<x>].cron_jobs`. A stored alias is not
+/// re-checked against live `cron_jobs` membership (a declarative move is
+/// reconciled by sync, not here), but a disabled agent runs nothing through
+/// either arm — otherwise ownership recovery, which stamps a then-enabled
+/// claimant onto the row, would turn a job that is refused today into one
+/// that keeps running after its agent is disabled. Because the fallback is the
+/// same unique-claimant rule recovery and declarative sync apply, a job that
+/// recovery leaves unowned is not executed under an arbitrary claimant.
+pub(crate) fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
+    if !job.agent_alias.is_empty()
+        && let Some((alias, agent)) = config.agents.get_key_value(job.agent_alias.as_str())
+        && agent.enabled
+    {
+        return Some(alias.as_str());
+    }
+    config.agent_for_cron_job(&job.id)
+}
+
+/// Log attributes explaining why a job has no owner, so an operator can tell
+/// a contested claim (remove one) from a disabled-only claim (enable the
+/// agent) from an unclaimed job (add a claim) or a stale stored alias.
+pub(crate) fn ownership_refusal_attrs(config: &Config, job: &CronJob) -> serde_json::Value {
+    let (claim, claimants): (&str, Vec<&str>) = match config.cron_job_claim(&job.id) {
+        zeroclaw_config::schema::CronJobClaim::Unclaimed => ("unclaimed", Vec::new()),
+        zeroclaw_config::schema::CronJobClaim::DisabledOnly => ("disabled_only", Vec::new()),
+        zeroclaw_config::schema::CronJobClaim::Sole(alias) => ("sole", vec![alias]),
+        zeroclaw_config::schema::CronJobClaim::Contested(aliases) => ("contested", aliases),
+    };
+    let stored_alias_disabled = config
+        .agents
+        .get(job.agent_alias.as_str())
+        .is_some_and(|agent| !agent.enabled);
+    serde_json::json!({
+        "job_id": job.id,
+        "stored_alias": job.agent_alias,
+        "stored_alias_disabled": stored_alias_disabled,
+        "claim": claim,
+        "claimants": claimants,
+    })
+}
+
+pub(crate) const NO_OWNER_MESSAGE: &str = "Cron job has no single owning agent; exactly one \
+                                           enabled [agents.<x>].cron_jobs list must claim it";
+
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = config.scheduler.max_tasks.max(1);
     let Some(jobs) = with_read_connection(config, |conn| {
@@ -576,6 +622,23 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                         );
                         continue;
                     }
+                    // Selected before it is claimed: a job with no single
+                    // owner must not be claimed, refused, and released every
+                    // poll — that would spin forever at the head of the queue
+                    // and hold a max_tasks slot without ever advancing.
+                    if resolve_owning_agent(config, &job).is_none() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(ownership_refusal_attrs(config, &job)),
+                            NO_OWNER_MESSAGE
+                        );
+                        continue;
+                    }
                     resolve_declarative_shell_output_format(config, &mut job);
                     jobs.push(job);
                 }
@@ -597,6 +660,10 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     Ok(jobs.into_iter().take(lim).collect())
 }
 
+/// Every overdue row, including rows with no single owner: startup
+/// catch-up must be able to retire or advance an unowned one-shot rather
+/// than leave it overdue until a claim appears and the stale occurrence
+/// fires. Execution paths refuse unowned rows themselves.
 pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -1859,16 +1926,17 @@ pub fn sync_declarative_jobs(
                 );
             } else {
                 // Reverse-resolve the owning agent from
-                // `[agents.<x>].cron_jobs` membership. Orphan declarative
-                // entries that no agent claims are skipped with a warning
-                // rather than silently bound to a magic alias.
+                // `[agents.<x>].cron_jobs` membership. A declarative entry
+                // that no enabled agent claims, or that more than one claims,
+                // is skipped with a warning rather than bound to a magic or
+                // arbitrary alias that execution would then honor.
                 let Some(agent_alias) = config.agent_for_cron_job(id) else {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"job_id": id})),
-                        "Skipping declarative cron job: no [agents.<x>].cron_jobs entry claims this id"
+                        "Skipping declarative cron job: exactly one enabled [agents.<x>].cron_jobs entry must claim this id"
                     );
                     continue;
                 };
@@ -2403,40 +2471,27 @@ fn ownership_migration_complete(conn: &Connection) -> Result<bool> {
     Ok(migrated >= CRON_OWNERSHIP_MIGRATION_VERSION)
 }
 
-/// One-time ownership migration for rows written before the cleanup owner
-/// existed, gated on the persisted completion marker so no per-open scan
-/// is paid afterwards. The body is idempotent (it touches only NULL-owner
-/// rows), so an interrupted attempt re-runs to completion on a later open.
-/// Contention past the busy timeout fails the open: an operation is never
-/// authorized against a database whose ownership migration has not
-/// provably completed.
-///
-/// A NULL-owner row whose job is LIVE has an unambiguous current owner:
-/// the job row itself (renames update it). Stamp those. A NULL-owner row
-/// with NO live job is different — the immutable executing_agent cannot
-/// stand in for the current owner (a pre-owner-schema rename updated only
-/// live jobs, and a reused alias may denote a different agent), so those
-/// rows are QUARANTINED: no agent-scoped read, skipped by the owner
-/// cascade. They can still be removed by job id through remove_job, and a
-/// declarative id being reassigned purges them before the new job exists.
-/// Recover ownership that lives only in configuration, on every open rather
-/// than once: a claim can become resolvable long after the upgrade (an agent
-/// re-enabled, a contested id disambiguated, a claim added), and nothing else
-/// ever writes `agent_alias` onto an existing row. The probe reads only
-/// `cron_jobs`, which holds one row per scheduled job, and takes no write lock
-/// unless a row is actually unowned.
+/// Recover ownership that lives only in configuration (the unique-claimant
+/// rule of `Config::agent_for_cron_job`; contested, disabled-only and
+/// unclaimed ids keep an empty alias), on every open rather than once: a
+/// claim can become resolvable long after the upgrade (an agent re-enabled, a
+/// contested id disambiguated, a claim added), and nothing else ever writes
+/// `agent_alias` onto an existing row. The probe reads only `cron_jobs`, which
+/// holds one row per scheduled job, and the write lock is taken only when at
+/// least one unowned row actually resolves — a permanently unowned row must not
+/// cost every open a write transaction.
 fn recover_config_only_ownership(conn: &Connection, config: &Config) -> Result<()> {
-    let unowned = unowned_job_ids(conn)?;
-    if unowned.is_empty() {
+    let resolvable: Vec<(String, &str)> = unowned_job_ids(conn)?
+        .into_iter()
+        .filter_map(|id| config.agent_for_cron_job(&id).map(|owner| (id, owner)))
+        .collect();
+    if resolvable.is_empty() {
         return Ok(());
     }
 
     let tx = begin_immediate(conn, "config ownership recovery")?;
     let mut stamped = 0usize;
-    for id in unowned {
-        let Some(owner) = sole_enabled_claimant(config, &id) else {
-            continue;
-        };
+    for (id, owner) in resolvable {
         let changed = tx
             .execute(
                 "UPDATE cron_jobs SET agent_alias = ?2
@@ -2491,25 +2546,22 @@ fn unowned_job_ids(conn: &Connection) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// The single enabled agent claiming `job_id` through
-/// `[agents.<alias>].cron_jobs`, mirroring `Config::agent_for_cron_job`'s
-/// enabled-only rule. `None` when nobody claims it, or when more than one
-/// enabled agent does: `Config::agents` is a hash map, so a contested id
-/// resolves to an arbitrary claimant that can differ between processes, and
-/// freezing one of them as the durable owner would make a coin-flip authority
-/// permanent. Contested ids, disabled-only claims, and imperative jobs claimed
-/// by nobody therefore keep their empty alias and stay fail-closed: their
-/// history is quarantined rather than attributed to a guess.
-fn sole_enabled_claimant<'a>(config: &'a Config, job_id: &str) -> Option<&'a str> {
-    let mut claimants = config
-        .agents
-        .iter()
-        .filter(|(_, agent)| agent.enabled && agent.cron_jobs.iter().any(|c| c == job_id))
-        .map(|(alias, _)| alias.as_str());
-    let owner = claimants.next()?;
-    claimants.next().is_none().then_some(owner)
-}
-
+/// One-time ownership migration for rows written before the cleanup owner
+/// existed, gated on the persisted completion marker so no per-open scan
+/// is paid afterwards. The body is idempotent (it touches only NULL-owner
+/// rows), so an interrupted attempt re-runs to completion on a later open.
+/// Contention past the busy timeout fails the open: an operation is never
+/// authorized against a database whose ownership migration has not
+/// provably completed.
+///
+/// A NULL-owner row whose job is LIVE has an unambiguous current owner:
+/// the job row itself (renames update it). Stamp those. A NULL-owner row
+/// with NO live job is different — the immutable executing_agent cannot
+/// stand in for the current owner (a pre-owner-schema rename updated only
+/// live jobs, and a reused alias may denote a different agent), so those
+/// rows are QUARANTINED: no agent-scoped read, skipped by the owner
+/// cascade. They can still be removed by job id through remove_job, and a
+/// declarative id being reassigned purges them before the new job exists.
 fn run_ownership_migration(conn: &Connection) -> Result<()> {
     if ownership_migration_complete(conn)? {
         return Ok(());
@@ -2785,6 +2837,18 @@ fn drop_cron_runs_job_fk(conn: &Connection) -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn claim_job_in_config(config: &mut Config, alias: &str, enabled: bool, ids: &[&str]) {
+    config.agents.insert(
+        alias.to_string(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled,
+            cron_jobs: ids.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        },
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
@@ -2792,11 +2856,14 @@ mod tests {
     use zeroclaw_config::schema::Config;
 
     fn test_config(tmp: &TempDir) -> Config {
-        let config = Config {
+        let mut config = Config {
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        // Selection only offers jobs whose owner resolves, so the fixture's
+        // default owner must exist as an enabled agent, as it would live.
+        claim_job_in_config(&mut config, "test-agent", true, &[]);
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config
     }
@@ -4275,17 +4342,6 @@ mod tests {
         .unwrap();
     }
 
-    fn claim_job_in_config(config: &mut Config, alias: &str, enabled: bool, ids: &[&str]) {
-        config.agents.insert(
-            alias.to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled,
-                cron_jobs: ids.iter().map(|s| (*s).to_string()).collect(),
-                ..Default::default()
-            },
-        );
-    }
-
     /// Build a pre-`agent_alias` database holding `job_id` and one run row.
     fn seed_pre_agent_alias_db(config: &Config, job_id: &str) {
         std::fs::create_dir_all(cron_dir(config)).unwrap();
@@ -4470,6 +4526,81 @@ mod tests {
     }
 
     #[test]
+    fn declarative_sync_skips_a_contested_id() {
+        // Sync must not insert a job under an arbitrary one of two claimants:
+        // the stored alias is what execution honors first, so a coin-flip
+        // insert would become a coin-flip authority on every later run.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        claim_job_in_config(&mut config, "agent-b", true, &["daily-report"]);
+        let decls = decls_map(vec![make_shell_decl(
+            "daily-report",
+            "0 2 * * *",
+            "echo report",
+        )]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert!(
+            get_job(&config, "daily-report").is_err(),
+            "a contested declarative id must not be inserted under either claimant"
+        );
+    }
+
+    #[test]
+    fn overdue_query_keeps_unowned_rows_for_startup_retirement() {
+        // due_jobs never offers an unowned row, but all_overdue_jobs must,
+        // so startup catch-up can retire or advance it instead of leaving
+        // it overdue until a claim appears and the stale occurrence fires.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        claim_job_in_config(&mut config, "agent-b", true, &["daily-report"]);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_agent_alias_schema(&conn);
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+             VALUES ('daily-report', '0 2 * * *', 'echo legacy', '2000-01-01T00:00:00Z',
+                     '2000-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let now = Utc::now();
+        assert!(
+            due_jobs(&config, now).unwrap().is_empty(),
+            "contested: never selected"
+        );
+        assert_eq!(
+            all_overdue_jobs(&config, now).unwrap().len(),
+            1,
+            "the overdue view must still surface it for retirement"
+        );
+    }
+
+    #[test]
+    fn a_disabled_agent_runs_nothing_through_its_stored_alias() {
+        // Recovery stamps a then-enabled claimant onto the row. Disabling
+        // that agent afterwards must stop the job, or "disabled" would only
+        // hold until the first open while the agent was enabled.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "* * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        assert_eq!(due_jobs(&config, Utc::now()).unwrap().len(), 1);
+
+        config.agents.get_mut("test-agent").unwrap().enabled = false;
+        assert!(resolve_owning_agent(&config, &job).is_none());
+        assert!(
+            due_jobs(&config, Utc::now()).unwrap().is_empty(),
+            "a disabled agent's job must not be selected"
+        );
+        let attrs = ownership_refusal_attrs(&config, &job);
+        assert_eq!(attrs["stored_alias_disabled"], true, "{attrs}");
+    }
+
+    #[test]
     fn contested_config_ownership_stays_fail_closed() {
         // `Config::agents` is a hash map, so two enabled claimants resolve
         // arbitrarily per process. Stamping either one would make a coin-flip
@@ -4503,9 +4634,10 @@ mod tests {
 
     #[test]
     fn unclaimed_and_disabled_config_ownership_stay_fail_closed() {
-        // An imperative legacy job nobody claims, and a job claimed only by a
-        // disabled agent (which the scheduler's resolver also refuses), are
-        // genuinely owner-unknown and stay quarantined.
+        // An imperative legacy job nobody claims, and an empty-alias job
+        // claimed only by a disabled agent (which the scheduler's config
+        // fallback also refuses), are genuinely owner-unknown and stay
+        // quarantined.
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         claim_job_in_config(&mut config, "agent-off", false, &["disabled-owner"]);
@@ -5842,6 +5974,9 @@ mod tests {
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
         };
         config.cron.insert("raw-shadow".to_string(), decl);
+        // Selection only offers a declarative job that exactly one enabled
+        // agent claims, as a live config would.
+        seed_claiming_agent(&mut config, &["raw-shadow"]);
 
         // --- NULL shadow ---
         // DB column is NULL (from the nullable table above), config says Raw.
@@ -5974,6 +6109,9 @@ mod tests {
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
         };
         config.cron.insert("blob-shadow".to_string(), decl);
+        // Selection only offers a declarative job that exactly one enabled
+        // agent claims, as a live config would.
+        seed_claiming_agent(&mut config, &["blob-shadow"]);
 
         // get_job must succeed despite the BLOB shadow: the ownership branch
         // skips reading column 21 for declarative rows entirely.
@@ -6258,14 +6396,7 @@ mod tests {
     /// Seed an enabled agent that claims `ids` via its `cron_jobs` list so
     /// `sync_declarative_jobs` can resolve an owning agent for each entry.
     fn seed_claiming_agent(config: &mut Config, ids: &[&str]) {
-        config.agents.insert(
-            "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                cron_jobs: ids.iter().map(|s| (*s).to_string()).collect(),
-                ..Default::default()
-            },
-        );
+        claim_job_in_config(config, "test-agent", true, ids);
     }
 
     #[test]
