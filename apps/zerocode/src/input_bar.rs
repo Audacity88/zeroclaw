@@ -4290,12 +4290,15 @@ mod tests {
     #[test]
     fn thinking_command_autocomplete_appends_space() {
         let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/eff");
         bar.apply_autocomplete_choice("/effort");
         assert_eq!(bar.input(), "/effort ");
         bar.clear_input();
+        bar.insert_text("/disp");
         bar.apply_autocomplete_choice("/display");
         assert_eq!(bar.input(), "/display ");
         bar.clear_input();
+        bar.insert_text("/toggle-th");
         bar.apply_autocomplete_choice("/toggle-thinking");
         assert_eq!(bar.input(), "/toggle-thinking");
     }
