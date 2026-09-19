@@ -416,7 +416,7 @@ jobs:
         run: |
           ./scripts/ci/windows_service_smoke.ps1 `
             -FixturePath "target/x86_64-pc-windows-msvc/ci/examples/windows_service_smoke_fixture.exe" `
-            -ConfigDir "$env:RUNNER_TEMP/zeroclaw service smoke 界" `
+            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
             -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence"
       - name: Clean up Windows service smoke
         if: always()
@@ -425,7 +425,7 @@ jobs:
         run: |
           ./scripts/ci/windows_service_smoke.ps1 `
             -FixturePath "target/x86_64-pc-windows-msvc/ci/examples/windows_service_smoke_fixture.exe" `
-            -ConfigDir "$env:RUNNER_TEMP/zeroclaw service smoke 界" `
+            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
             -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence" `
             -CleanupOnly
       - name: Upload Windows service smoke evidence
