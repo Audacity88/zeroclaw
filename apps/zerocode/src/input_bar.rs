@@ -2835,6 +2835,48 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    #[test]
+    fn explicit_input_binding_replaces_selection_default_and_claim() {
+        use crate::keymap::{Chord, InputBarAction as KeymapInputAction, overrides};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        overrides::reset();
+        let mut table = overrides::OverrideTable::new();
+        table.insert(
+            KeymapInputAction::TAG.to_string(),
+            std::collections::HashMap::from([(
+                "cursor_left".to_string(),
+                vec![Chord::shift(KeyCode::Left)],
+            )]),
+        );
+        overrides::set_active(table);
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("draft");
+        assert_eq!(
+            KeymapInputAction::from_chord(&key),
+            Some(KeymapInputAction::CursorLeft)
+        );
+        assert!(!bar.claims_edit_key(&key));
+
+        let mut table = overrides::OverrideTable::new();
+        table.insert(
+            KeymapInputAction::TAG.to_string(),
+            std::collections::HashMap::from([("copy_selection".to_string(), Vec::new())]),
+        );
+        overrides::set_active(table);
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("draft");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(bar.has_selection());
+        let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!bar.claims_edit_key(&copy));
+        assert!(matches!(bar.handle_key(copy), InputBarAction::NotHandled));
+        overrides::reset();
+    }
+
     fn test_attachment(name: &str) -> PendingAttachment {
         PendingAttachment {
             path: PathBuf::from(name),
