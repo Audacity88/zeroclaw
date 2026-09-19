@@ -98,6 +98,9 @@ if ($CleanupOnly) {
 
 $transcript = Join-Path $EvidenceDir 'windows-service-smoke-transcript.txt'
 $transcriptStarted = $false
+$stdoutLog = Join-Path $ConfigDir 'logs\daemon.stdout.log'
+$stderrLog = Join-Path $ConfigDir 'logs\daemon.stderr.log'
+$descendantPidFile = Join-Path $ConfigDir 'descendant.pid'
 
 try {
     New-Item -ItemType Directory -Force -Path $EvidenceDir | Out-Null
@@ -122,10 +125,15 @@ try {
 
     $startedAt = [DateTime]::UtcNow
     Invoke-Fixture service start | Write-Host
-    $stdoutLog = Join-Path $ConfigDir 'logs\daemon.stdout.log'
-    $stderrLog = Join-Path $ConfigDir 'logs\daemon.stderr.log'
-    $descendantPidFile = Join-Path $ConfigDir 'descendant.pid'
     Wait-Until -Description 'both bounded Unicode markers' -TimeoutSeconds 90 -Condition {
+        $taskState = Get-ScheduledTask -TaskName $taskName
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
+        if ([int]$taskState.State -ne 4 -and
+            $taskInfo.LastRunTime.ToUniversalTime() -ge $startedAt.AddSeconds(-2) -and
+            $taskInfo.LastTaskResult -ne 267009 -and
+            $taskInfo.LastTaskResult -ne 267011) {
+            throw "Windows service task exited before markers: state=$($taskState.State) result=$($taskInfo.LastTaskResult)"
+        }
         if (-not (Test-Path -LiteralPath $stdoutLog) -or
             -not (Test-Path -LiteralPath $stderrLog)) {
             return $false
@@ -210,6 +218,28 @@ try {
     $evidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDir 'windows-service-smoke.json') -Encoding UTF8
 }
 finally {
+    try {
+        $taskState = Get-ScheduledTask -TaskName $taskName
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
+        [ordered]@{
+            state = [string]$taskState.State
+            last_run_time_utc = $taskInfo.LastRunTime.ToUniversalTime().ToString('O')
+            last_task_result = $taskInfo.LastTaskResult
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir 'service-task.json') -Encoding UTF8
+    } catch {
+        Write-Warning "Task evidence capture failed: $_"
+    }
+    foreach ($logPath in @($stdoutLog, $stderrLog)) {
+        if (Test-Path -LiteralPath $logPath) {
+            $logName = Split-Path -Leaf $logPath
+            Get-Content -LiteralPath $logPath -Encoding UTF8 -Tail 4 |
+                Set-Content -LiteralPath (Join-Path $EvidenceDir "$logName.tail.txt") -Encoding UTF8
+            [ordered]@{
+                bytes = (Get-Item -LiteralPath $logPath).Length
+                last_write_time_utc = (Get-Item -LiteralPath $logPath).LastWriteTimeUtc.ToString('O')
+            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "$logName.json") -Encoding UTF8
+        }
+    }
     try { Remove-SmokeTask } catch { Write-Warning "Cleanup failed: $_" }
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($transcriptStarted) { Stop-Transcript | Out-Null }
