@@ -101,6 +101,7 @@ $transcriptStarted = $false
 $stdoutLog = Join-Path $ConfigDir 'logs\daemon.stdout.log'
 $stderrLog = Join-Path $ConfigDir 'logs\daemon.stderr.log'
 $descendantPidFile = Join-Path $ConfigDir 'descendant.pid'
+$runnerError = Join-Path $ConfigDir 'runner-error.txt'
 
 try {
     New-Item -ItemType Directory -Force -Path $EvidenceDir | Out-Null
@@ -239,6 +240,9 @@ finally {
                 last_write_time_utc = (Get-Item -LiteralPath $logPath).LastWriteTimeUtc.ToString('O')
             } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDir "$logName.json") -Encoding UTF8
         }
+    }
+    if (Test-Path -LiteralPath $runnerError) {
+        Copy-Item -LiteralPath $runnerError -Destination (Join-Path $EvidenceDir 'runner-error.txt') -Force
     }
     try { Remove-SmokeTask } catch { Write-Warning "Cleanup failed: $_" }
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue

@@ -104,7 +104,13 @@ async fn main() -> anyhow::Result<()> {
     match command.as_slice() {
         [daemon] if daemon == "daemon" => run_fixture_daemon(&config_dir),
         [service, action] if service == "service" && action == "run-windows-daemon" => {
-            run_windows_daemon(&config_dir).await
+            let result = run_windows_daemon(&config_dir).await;
+            if let Err(error) = &result {
+                // Task Scheduler does not retain stderr from the runner. Keep a
+                // fixture-only receipt so hosted smoke failures remain diagnosable.
+                let _ = std::fs::write(config_dir.join("runner-error.txt"), format!("{error:#}\n"));
+            }
+            result
         }
         [service, action] if service == "service" => {
             let config = config_at(&config_dir);
