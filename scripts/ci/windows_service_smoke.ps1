@@ -63,6 +63,13 @@ function Wait-Until {
     throw "Timed out waiting for $Description"
 }
 
+function Set-CurrentUserOwner {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
 function Remove-SmokeTask {
     $descendantPid = if (Test-Path -LiteralPath (Join-Path $ConfigDir 'descendant.pid')) {
         [int](Get-Content -LiteralPath (Join-Path $ConfigDir 'descendant.pid') -Raw).Trim()
@@ -110,9 +117,13 @@ try {
     Remove-SmokeTask
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
-    $configAcl = Get-Acl -LiteralPath $ConfigDir
-    $configAcl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
-    Set-Acl -LiteralPath $ConfigDir -AclObject $configAcl
+    Set-CurrentUserOwner -Path $ConfigDir
+    New-Item -ItemType Directory -Force -Path (Join-Path $ConfigDir 'logs') | Out-Null
+    Set-CurrentUserOwner -Path (Join-Path $ConfigDir 'logs')
+    foreach ($logPath in @($stdoutLog, $stderrLog)) {
+        New-Item -ItemType File -Force -Path $logPath | Out-Null
+        Set-CurrentUserOwner -Path $logPath
+    }
 
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $evidence.administrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
