@@ -4292,8 +4292,10 @@ mod tests {
         let mut bar = input_bar_with_shared_commands();
         bar.apply_autocomplete_choice("/effort");
         assert_eq!(bar.input(), "/effort ");
+        bar.clear_input();
         bar.apply_autocomplete_choice("/display");
         assert_eq!(bar.input(), "/display ");
+        bar.clear_input();
         bar.apply_autocomplete_choice("/toggle-thinking");
         assert_eq!(bar.input(), "/toggle-thinking");
     }
