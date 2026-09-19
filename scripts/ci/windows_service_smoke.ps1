@@ -261,3 +261,5 @@ finally {
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($transcriptStarted) { Stop-Transcript | Out-Null }
 }
+
+exit 0
