@@ -23,10 +23,20 @@ pub enum TurnOutcome {
 #[derive(Debug)]
 pub enum TurnError {
     Panicked(String),
-    AgentError(String),
+    AgentError {
+        message: String,
+        /// Messages the turn produced before failing: the accepted user
+        /// prompt plus whatever assistant/tool exchanges completed. Carried
+        /// so persistence can keep the prompt and completed exchanges; an
+        /// empty vec means nothing reached history (e.g. blank-prompt
+        /// refusal).
+        messages: Vec<ConversationMessage>,
+    },
     TerminalCompletion {
         diagnostic: String,
         user_message: String,
+        /// Same contract as `AgentError.messages`.
+        messages: Vec<ConversationMessage>,
     },
 }
 
@@ -34,7 +44,9 @@ impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Panicked(msg) => write!(f, "Turn task panicked: {msg}"),
-            Self::AgentError(msg) => write!(f, "Agent turn failed: {msg}"),
+            Self::AgentError { message, .. } => {
+                write!(f, "Agent turn failed: {message}")
+            }
             Self::TerminalCompletion { diagnostic, .. } => {
                 write!(f, "Agent turn failed: {diagnostic}")
             }
@@ -50,7 +62,19 @@ impl TurnError {
     pub fn user_message(&self) -> Option<&str> {
         match self {
             Self::TerminalCompletion { user_message, .. } => Some(user_message),
-            Self::Panicked(_) | Self::AgentError(_) => None,
+            Self::Panicked(_) | Self::AgentError { .. } => None,
+        }
+    }
+
+    /// Messages the turn produced before the failure (accepted prompt plus
+    /// completed assistant/tool exchanges). Empty for `Panicked`, which by
+    /// definition has none.
+    pub fn turn_messages(&self) -> &[ConversationMessage] {
+        match self {
+            Self::AgentError { messages, .. } | Self::TerminalCompletion { messages, .. } => {
+                messages
+            }
+            Self::Panicked(_) => &[],
         }
     }
 }
@@ -66,6 +90,10 @@ pub struct TurnAttribution {
     pub channel: &'static str,
 }
 
+/// Run one turn on `agent`, draining its events to `on_event` until it
+/// completes or `cancel` fires. `thinking` is the native reasoning request
+/// for this turn, resolved by the caller from the inline prefix, the session
+/// override and the profile; `None` leaves the model to its own defaults.
 pub async fn execute_turn<F, Fut>(
     agent: Arc<Mutex<Agent>>,
     prompt: String,
@@ -73,6 +101,7 @@ pub async fn execute_turn<F, Fut>(
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
     connection_activity: Option<crate::rpc::ConnectionActivity>,
+    thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -102,17 +131,23 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            TOOL_LOOP_COST_TRACKING_CONTEXT
+            // Task-locals installed by the caller do not survive the spawn
+            // above, so the turn's thinking request is scoped here, inside
+            // the task that runs the tool loop.
+            zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            None,
-                        )
-                        .instrument(span),
+                    thinking,
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_context,
+                        guard
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_clone),
+                                None,
+                            )
+                            .instrument(span),
+                    ),
                 )
                 .await
         })
@@ -233,16 +268,24 @@ fn outcome_from_task_result(
             },
             messages: new_messages,
         }),
-        Err(StreamedTurnError { error, .. }) => {
+        Err(StreamedTurnError {
+            error,
+            new_messages,
+            ..
+        }) => {
             if let Some(user_message) =
                 crate::agent::terminal_completion_error_message(&error, None)
             {
                 return Err(TurnError::TerminalCompletion {
                     diagnostic: error.to_string(),
                     user_message,
+                    messages: new_messages,
                 });
             }
-            Err(TurnError::AgentError(error.to_string()))
+            Err(TurnError::AgentError {
+                message: error.to_string(),
+                messages: new_messages,
+            })
         }
     }
 }
@@ -656,10 +699,99 @@ mod tests {
         };
         let outcome = outcome_from_task_result(Err(err), String::new());
         assert!(
-            matches!(outcome, Err(TurnError::AgentError(_))),
+            matches!(outcome, Err(TurnError::AgentError { .. })),
             "a genuine agent failure must surface as an error, not a silent \
              cancel"
         );
+    }
+
+    #[test]
+    fn agent_error_carries_the_failed_turn_messages() {
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
+        let new_messages = vec![
+            ConversationMessage::Chat(zeroclaw_providers::ChatMessage::user("do the thing")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("running".into()),
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "file.txt".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc-2".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"echo hi"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+        ];
+        let err = StreamedTurnError {
+            error: anyhow::Error::msg("provider exploded"),
+            committed_response: String::new(),
+            new_messages,
+        };
+        match outcome_from_task_result(Err(err), String::new()) {
+            Err(TurnError::AgentError { message, messages }) => {
+                assert!(
+                    message.contains("provider exploded"),
+                    "diagnostic text must survive the repack: {message}"
+                );
+                assert_eq!(
+                    messages.len(),
+                    4,
+                    "the accepted prompt and every exchange the turn produced \
+                     before the failure must be carried for persistence"
+                );
+                assert!(matches!(
+                    &messages[0],
+                    ConversationMessage::Chat(m) if m.role == "user"
+                ));
+                assert!(matches!(
+                    &messages[3],
+                    ConversationMessage::AssistantToolCalls { .. }
+                ));
+            }
+            _ => panic!("expected AgentError carrying the turn messages"),
+        }
+    }
+
+    #[test]
+    fn terminal_completion_carries_the_failed_turn_messages() {
+        let new_messages = vec![ConversationMessage::Chat(
+            zeroclaw_providers::ChatMessage::user("summarize this"),
+        )];
+        let err = StreamedTurnError {
+            error: anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ),
+            committed_response: String::new(),
+            new_messages,
+        };
+        match outcome_from_task_result(Err(err), String::new()) {
+            Err(TurnError::TerminalCompletion {
+                messages,
+                user_message,
+                ..
+            }) => {
+                assert_eq!(messages.len(), 1);
+                assert!(
+                    !user_message.is_empty(),
+                    "terminal completion keeps its localized delivery text"
+                );
+            }
+            _ => panic!("expected TerminalCompletion carrying the turn messages"),
+        }
     }
 
     #[test]
@@ -840,6 +972,7 @@ mod tests {
             },
             Some(cost_context),
             None,
+            None,
             noop,
         )
         .await
@@ -992,6 +1125,7 @@ mod tests {
                 model: "test-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             move |event| {
@@ -1165,6 +1299,7 @@ mod tests {
                     model: "matrix-model".into(),
                     channel: "rpc",
                 },
+                None,
                 None,
                 None,
                 move |event| {
@@ -1428,6 +1563,7 @@ mod tests {
                 model: "w1-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             move |event| {
@@ -1724,6 +1860,7 @@ mod tests {
                 },
                 None,
                 Some(activity),
+                None,
                 noop,
             )
             .await;
@@ -1770,6 +1907,178 @@ mod tests {
         assert!(
             unwind_ended.load(Ordering::SeqCst),
             "the count may only reach zero after the turn task's cleanup ended"
+        );
+    }
+}
+
+#[cfg(test)]
+mod thinking_scope_tests {
+    use super::*;
+    use crate::agent::agent::Agent;
+    use crate::agent::dispatcher::NativeToolDispatcher;
+    use crate::observability::{NoopObserver, Observer};
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{
+        ModelProvider, NativeThinkingParams, ThinkingDisplay, ThinkingEffort,
+    };
+    use zeroclaw_memory::Memory;
+    use zeroclaw_providers::ChatRequest;
+
+    /// Records the thinking request each call carried.
+    #[derive(Default)]
+    struct ThinkingRecordingProvider {
+        seen: StdMutex<Vec<Option<NativeThinkingParams>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.seen.lock().unwrap().push(request.thinking);
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for ThinkingRecordingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "recording-provider"
+        }
+    }
+
+    fn agent_with(provider: Arc<ThinkingRecordingProvider>) -> Agent {
+        struct Shared(Arc<ThinkingRecordingProvider>);
+
+        #[async_trait]
+        impl ModelProvider for Shared {
+            async fn chat_with_system(
+                &self,
+                system_prompt: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.0
+                    .chat_with_system(system_prompt, message, model, temperature)
+                    .await
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                self.0.chat(request, model, temperature).await
+            }
+        }
+
+        impl Attributable for Shared {
+            fn role(&self) -> Role {
+                self.0.role()
+            }
+            fn alias(&self) -> &str {
+                self.0.alias()
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        Agent::builder()
+            .model_provider(Box::new(Shared(provider)))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("recording-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed")
+    }
+
+    async fn noop(_event: TurnEvent) {}
+
+    #[tokio::test]
+    async fn execute_turn_scopes_native_thinking_override() {
+        let provider = Arc::new(ThinkingRecordingProvider::default());
+        let agent = Arc::new(Mutex::new(agent_with(Arc::clone(&provider))));
+        let attribution = TurnAttribution {
+            session_key: Some("s1".into()),
+            agent_alias: "rpc-agent".into(),
+            model_provider: "recording-provider".into(),
+            model: "test-model".into(),
+            channel: "rpc",
+        };
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+            display: Some(ThinkingDisplay::Summarized),
+        };
+
+        execute_turn(
+            Arc::clone(&agent),
+            "hello".to_string(),
+            CancellationToken::new(),
+            attribution.clone(),
+            None,
+            None,
+            Some(params),
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        execute_turn(
+            agent,
+            "again".to_string(),
+            CancellationToken::new(),
+            attribution,
+            None,
+            None,
+            None,
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Some(params), None],
+            "the thinking request must be scoped inside the spawned turn task, \
+             and must not leak into the next turn"
         );
     }
 }

@@ -1365,9 +1365,9 @@ mod tests {
                 &[("raw", "banana")][..],
                 [
                     "banana",
-                    "/thinking off|minimal|low|medium|high|max",
-                    "/thinking on",
-                    "/thinking reset",
+                    "/effort off|minimal|low|medium|high|xhigh|max",
+                    "/effort on",
+                    "/effort reset",
                 ]
                 .as_slice(),
             ),
@@ -1811,6 +1811,40 @@ mod tests {
                     "{locale}: {key} left an unformatted placeholder: {formatted}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn provider_refusal_messages_are_owned_by_each_locale() {
+        for (source, locale) in committed_locale_sources() {
+            for key in [
+                "cli-agent-error-provider-refused-category-cyber",
+                "cli-agent-error-provider-refused-category-bio",
+                "cli-agent-error-provider-refused-category-reasoning-extraction",
+                "cli-agent-error-provider-refused-category-frontier-llm",
+                "cli-agent-error-provider-refused-category-unspecified",
+                "cli-agent-error-provider-refused-category-other",
+            ] {
+                let label = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(!label.is_empty(), "{locale}: {key}");
+            }
+
+            let formatted = format_ftl_message(
+                source,
+                locale,
+                "cli-agent-error-provider-refused",
+                &[("category", "REFUSAL_LABEL_SENTINEL")],
+            )
+            .unwrap_or_else(|| panic!("{locale}: refusal message should format"));
+            assert!(
+                formatted.contains("REFUSAL_LABEL_SENTINEL"),
+                "{locale}: refusal message must place the category: {formatted}"
+            );
+            assert!(
+                !formatted.contains("{$category}"),
+                "{locale}: refusal message left the placeholder unformatted: {formatted}"
+            );
         }
     }
 

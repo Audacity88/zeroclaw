@@ -939,7 +939,7 @@ channel-runtime-thinking-cleared = thinking 覆盖已清除。此发送者会话
 channel-runtime-thinking-default =
     thinking 已经在此发送者会话中使用 agent 默认值 `{ $default }`。
     使用 `/thinking high`、`/thinking max` 或 `/thinking off` 覆盖。
-channel-runtime-thinking-invalid = 未知 thinking 等级 `{ $raw }`。使用 `/thinking off|minimal|low|medium|high|max`、`/thinking on` 或 `/thinking reset`。
+channel-runtime-thinking-invalid = 未知 thinking 等级 `{ $raw }`。使用 `/effort off|minimal|low|medium|high|xhigh|max`、`/effort on` 或 `/effort reset`。
 channel-runtime-provider-turn-init-failed =
     ⚠️ 初始化 model_provider `{ $provider }` 失败。请运行 `/models` 选择另一个 model_provider。
     详情：{ $error }
@@ -1107,3 +1107,31 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = 收到 {$marker_count} 个图像标记，但回退 model_provider={$fallback_name} 不支持视觉输入
+cli-agent-vision-unsupported-by-provider = 收到 {$marker_count} 个图像标记，但此 model_provider 不支持视觉输入
+cli-agent-error-provider-context-window = 请求超过了所选模型的上下文窗口。请缩短对话或选择上下文窗口更大的模型。
+cli-agent-error-provider-credentials-missing = 所选模型提供商未配置凭据。请添加其 API 密钥或选择其他提供商。
+cli-agent-error-provider-credentials-missing-named = 模型提供商 {$provider} 未配置凭据。请添加其 API 密钥或选择其他提供商。
+cli-agent-error-provider-authentication = 所选模型提供商拒绝了凭据。请检查已配置的凭据。
+cli-agent-error-provider-authentication-named = 模型提供商 {$provider} 拒绝了凭据。请检查已配置的凭据。
+cli-agent-error-provider-rate-limited = 所选模型提供商对请求进行了速率限制。请等待、检查配额或选择其他提供商。
+cli-agent-error-provider-server = 所选模型提供商返回了服务器错误。请重试或选择其他提供商。
+cli-agent-error-provider-model-not-found = 所选模型不可用。请检查已配置的模型名称。
+cli-agent-error-provider-client-request = 所选模型提供商拒绝了请求。请检查提供商配置和请求。
+cli-agent-error-provider-connection-local = {$endpoint} 上的本地模型服务器不可用。请启动它或更新端点。
+cli-agent-error-provider-connection-remote = 无法连接到 {$endpoint} 上的模型提供商。请检查网络访问或选择其他提供商。
+cli-agent-error-provider-connection = 无法连接到所选模型提供商。请检查网络访问或选择其他提供商。
+cli-agent-error-provider-timeout = 所选模型提供商超时。请重试或选择其他提供商。
+cli-agent-error-provider-generic = 所选模型提供商失败。请检查提供商配置或选择其他提供商。
+cli-agent-error-provider-refused = 模型提供商拒绝了此请求（{$category}）。未在该模型上重试。请改写请求、选择其他模型或配置备用模型。
+cli-agent-error-provider-refused-category-cyber = 网络安全策略
+cli-agent-error-provider-refused-category-bio = 生物安全策略
+cli-agent-error-provider-refused-category-reasoning-extraction = 推理提取策略
+cli-agent-error-provider-refused-category-frontier-llm = 前沿模型策略
+cli-agent-error-provider-refused-category-unspecified = 未指定的安全策略
+cli-agent-error-provider-refused-category-other = 其他安全策略
+cli-delegate-error-invalid-semantic-completion = 代理 '{$agent_name}' 失败：模型提供商返回了无效的语义完成结果。
+cli-agent-error-invalid-semantic-completion = 模型提供商返回了无效的语义完成结果。
+cli-delegate-error-incomplete-after-provider-tools = 代理 '{$agent_name}' 失败：模型提供商执行工具后未返回最终响应便结束了。
+cli-agent-error-incomplete-after-provider-tools = 模型提供商执行工具后未返回最终响应便结束了。

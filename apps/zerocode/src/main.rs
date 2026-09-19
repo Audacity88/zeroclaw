@@ -51,8 +51,10 @@ mod test_support;
 mod text_navigation;
 mod text_selection;
 mod theme;
+mod thought_layout;
 mod todo_tracker;
 mod turn_status;
+mod url_open;
 mod widgets;
 mod wire;
 mod zerocode_pane;
@@ -600,6 +602,7 @@ fn force_restore_terminal() {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableBracketedPaste,
+            crossterm::style::Print(config_manager::mouse_shift_capture_sequence(false)),
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen
         );

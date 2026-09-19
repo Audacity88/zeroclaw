@@ -100,7 +100,14 @@ impl ConnField {
 
 // ── Todo tracker fields (Task 7) ────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "legacy geometry variants remain for migration persistence tests"
+    )
+)]
 enum TrackerField {
     Enabled,
     EnabledAtStart,
@@ -109,13 +116,10 @@ enum TrackerField {
     MaxHeight,
 }
 
-const TRACKER_FIELDS: [TrackerField; 5] = [
-    TrackerField::Enabled,
-    TrackerField::EnabledAtStart,
-    TrackerField::Location,
-    TrackerField::Width,
-    TrackerField::MaxHeight,
-];
+// Legacy location and sizing remain parseable for migration, but the shared
+// conversation dock now owns geometry. Do not offer controls that production
+// rendering no longer consumes.
+const TRACKER_FIELDS: [TrackerField; 2] = [TrackerField::Enabled, TrackerField::EnabledAtStart];
 
 impl TrackerField {
     fn fluent_key(self) -> &'static str {
@@ -213,6 +217,9 @@ pub(crate) struct ZerocodePane {
     /// action. While set, tracker edits are refused and the error is surfaced,
     /// leaving the file untouched for the user to repair by hand.
     tracker_load_error: Option<String>,
+    /// Effective shared-dock geometry captured when this pane is opened. The
+    /// Config screen must not re-read and parse the file on every draw.
+    dock_summary: String,
 }
 
 /// Truncate `s` to at most `width` terminal cells, marking elision with `…`.
@@ -247,6 +254,24 @@ fn truncate_to_width(s: &str, width: u16) -> String {
     }
     out.push('…');
     out
+}
+
+fn effective_dock_summary(dock_config: &config::ZerocodeConfig) -> String {
+    dock_summary(
+        dock_config.effective_sidebar_side(),
+        dock_config.effective_sidebar_width(),
+    )
+}
+
+fn dock_summary(side: config::SidebarSide, width: u16) -> String {
+    let dock_side = match side {
+        config::SidebarSide::Left => crate::i18n::t("zc-dock-side-left"),
+        config::SidebarSide::Right => crate::i18n::t("zc-dock-side-right"),
+    };
+    crate::i18n::t_args(
+        "zc-dock-config-summary",
+        &[("side", &dock_side), ("width", &width.to_string())],
+    )
 }
 
 /// The innermost cause of an error chain, as a display string.
@@ -293,7 +318,9 @@ impl ZerocodePane {
             .iter()
             .position(|n| theme::theme_by_name(n).map(|t| t.title) == Some(active.title))
             .unwrap_or(0);
-        let agent_overrides: HashMap<String, String> = config::ensure_and_load(config_dir)
+        let effective_config = config::ensure_and_load(config_dir);
+        let agent_overrides: HashMap<String, String> = effective_config
+            .as_ref()
             .ok()
             .map(|c| {
                 c.agent_override_aliases()
@@ -327,7 +354,8 @@ impl ZerocodePane {
             capture: None,
             locales: Vec::new(),
             locale_cursor: 0,
-            active_locale: config::ensure_and_load(config_dir)
+            active_locale: effective_config
+                .as_ref()
                 .ok()
                 .and_then(|c| c.resolve_locale()),
             pending_fetch: None,
@@ -337,9 +365,10 @@ impl ZerocodePane {
             focus_area: Rect::default(),
             content_area: Rect::default(),
             double_click: crate::mouse::DoubleClickTracker::new(),
-            conn: config::ensure_and_load(config_dir)
+            conn: effective_config
+                .as_ref()
                 .ok()
-                .map(|c| c.connection.wss)
+                .map(|c| c.connection.wss.clone())
                 .unwrap_or_default(),
             conn_cursor: 0,
             conn_edit: None,
@@ -366,6 +395,15 @@ impl ZerocodePane {
             tracker_load_error: tracker_loaded
                 .err()
                 .map(|e| collapse_whitespace(&root_cause_of(&e))),
+            dock_summary: effective_config
+                .as_ref()
+                .map(effective_dock_summary)
+                .unwrap_or_else(|error| {
+                    crate::i18n::t_args(
+                        "zc-dock-config-unavailable",
+                        &[("error", &collapse_whitespace(&root_cause_of(error)))],
+                    )
+                }),
         };
         pane.rebuild_rows();
         pane
@@ -382,6 +420,17 @@ impl ZerocodePane {
 
     pub(crate) fn wants_text_input(&self) -> bool {
         self.conn_edit.is_some() || self.tracker_edit.is_some()
+    }
+
+    pub(crate) fn set_dock_summary(&mut self, side: config::SidebarSide, width: u16) {
+        self.dock_summary = dock_summary(side, width);
+    }
+
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        self.capture.is_some()
+            || self.conn_edit.is_some()
+            || self.tracker_edit.is_some()
+            || crate::keymap::ConfigTabAction::from_chord(key).is_some()
     }
 
     // ── Draw ─────────────────────────────────────────────────────
@@ -855,8 +904,26 @@ impl ZerocodePane {
     }
 
     fn draw_todo_tracker(&self, frame: &mut Frame, area: Rect) {
+        use ratatui::layout::{Constraint, Direction, Layout};
+
+        let area = if self.tracker_load_error.is_some() {
+            area
+        } else {
+            let dock_rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(area);
+            frame.render_widget(
+                Paragraph::new(Span::styled(self.dock_summary.as_str(), theme::dim_style())),
+                dock_rows[0],
+            );
+            dock_rows[1]
+        };
+        if area.height == 0 {
+            return;
+        }
+
         if let Some(edit) = &self.tracker_edit {
-            use ratatui::layout::{Constraint, Direction, Layout};
             let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
             let hint = match edit.field {
                 TrackerField::Enabled | TrackerField::EnabledAtStart => {
@@ -2215,6 +2282,19 @@ mod tests {
         overrides::set_row(tag, variant, chords);
     }
 
+    #[test]
+    fn session_shortcut_is_captured_by_the_binding_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let row = focus_binding(&mut pane, "input_bar.clear_input");
+        pane.capture = Some(Capture { row, error: None });
+
+        assert!(pane.claims_session_shortcut(&KeyEvent::new(
+            KeyCode::Char('1'),
+            Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL).effective_modifiers(),
+        )));
+    }
+
     /// The bot's round-2 finding, at both call sites. An operator already owning
     /// `alt+backspace` on a *different* input-bar action must not end up with two
     /// explicit owners of it, because nothing arbitrates that pair: dispatch
@@ -2329,18 +2409,45 @@ mod tests {
     }
 
     fn edit_tracker_number(pane: &mut ZerocodePane, field: TrackerField, value: &str) {
-        pane.tracker_cursor = TRACKER_FIELDS
-            .iter()
-            .position(|candidate| *candidate == field)
-            .expect("tracker field is registered");
-        pane.activate_tracker();
-        pane.tracker_edit
-            .as_mut()
-            .expect("numeric tracker field opens an editor")
-            .buf = value.to_string();
+        assert!(matches!(
+            field,
+            TrackerField::Width | TrackerField::MaxHeight
+        ));
+        // Legacy geometry is intentionally unreachable from the current UI,
+        // but its format-preserving persistence remains compatibility code.
+        pane.tracker_edit = Some(TrackerEdit {
+            field,
+            buf: value.to_string(),
+        });
         pane.handle_tracker_edit_key(key(KeyCode::Enter));
     }
 
+    #[test]
+    fn config_pane_summary_uses_effective_shared_dock_side_and_width() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config::config_path(dir.path()),
+            "[todotracker]\nlocation = \"left\"\n\n[sidebar]\nwidth = 31\n",
+        )
+        .unwrap();
+        let legacy = effective_dock_summary(&config::ensure_and_load(dir.path()).unwrap());
+        assert!(legacy.contains(&crate::i18n::t("zc-dock-side-left")));
+        assert!(legacy.contains("31"));
+
+        config::persist_sidebar_side(dir.path(), config::SidebarSide::Right).unwrap();
+        let explicit = effective_dock_summary(&config::ensure_and_load(dir.path()).unwrap());
+        assert!(explicit.contains(&crate::i18n::t("zc-dock-side-right")));
+        assert!(explicit.contains("31"));
+    }
+
+    #[test]
+    fn tracker_field_registry_hides_legacy_geometry_controls() {
+        assert_eq!(
+            TRACKER_FIELDS,
+            [TrackerField::Enabled, TrackerField::EnabledAtStart]
+        );
+    }
     // Current-head smoke of the Config-pane Todo-tracker save path, driven
     // through the real edit/persist/resolve functions (no interactive TUI is
     // available in CI). Run with:
@@ -3312,17 +3419,13 @@ mod tests {
         std::fs::write(config::config_path(dir.path()), malformed).unwrap();
 
         let mut pane = ZerocodePane::new(dir.path());
-        // The editor must refuse to open at all: there is no real persisted
-        // value to edit, so offering a prefilled default would invite a save
-        // that silently replaces the malformed section.
-        pane.tracker_cursor = TRACKER_FIELDS
-            .iter()
-            .position(|c| *c == TrackerField::Width)
-            .expect("tracker field is registered");
-        pane.activate_tracker();
+        // Exercise the retained compatibility writer directly. Legacy geometry
+        // is hidden from the current UI, but malformed canonical data must still
+        // be protected if this path is reused during migration.
+        edit_tracker_number(&mut pane, TrackerField::Width, "48");
         assert!(
             pane.tracker_edit.is_none(),
-            "a malformed section must not open a numeric editor"
+            "a malformed section must close a refused compatibility edit"
         );
 
         let after = std::fs::read_to_string(config::config_path(dir.path())).unwrap();

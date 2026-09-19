@@ -16,6 +16,24 @@ use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
+/// What a reasoning chunk should show a person.
+///
+/// Some providers stream each reasoning block as the signed record they later
+/// expect replayed, which is machine input, not prose. Show only its text, and
+/// show nothing when the provider withheld that text. Anything else is prose
+/// already and passes through.
+pub(crate) fn reasoning_display_text(chunk: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct SignedReasoningRecord {
+        thinking: String,
+    }
+
+    match serde_json::from_str::<SignedReasoningRecord>(chunk.trim_start_matches('\n')) {
+        Ok(record) => (!record.thinking.is_empty()).then_some(record.thinking),
+        Err(_) => Some(chunk.to_string()),
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
     pub(crate) response_text: String,
@@ -150,7 +168,18 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
-                let provider_error = anyhow::Error::msg(message.clone());
+                // A refusal keeps its type so the reliability layer can tell
+                // a declined request from a transport failure.
+                let refused = matches!(err, zeroclaw_api::model_provider::StreamError::Refusal(_));
+                let provider_error = match &err {
+                    zeroclaw_api::model_provider::StreamError::Refusal(category) => {
+                        anyhow::Error::new(zeroclaw_api::model_provider::ProviderRefusal {
+                            category: *category,
+                            usage: outcome.usage.clone(),
+                        })
+                    }
+                    _ => anyhow::Error::msg(message.clone()),
+                };
                 if visible_event_output {
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
@@ -168,19 +197,29 @@ pub(crate) async fn consume_provider_streaming_response(
                     )
                     .with_terminal_cause(anyhow::Error::new(err));
                     return Err(StreamInterruptedAfterOutput {
-                        partial_text: forwarded_text,
+                        partial_text: if refused {
+                            String::new()
+                        } else {
+                            forwarded_text
+                        },
                         message,
                         usage,
                         cause,
                     }
                     .into());
                 }
-                return Err(StreamErrorWithUsage {
+                let error = StreamErrorWithUsage {
                     message,
                     usage: outcome.usage,
                     source: err,
-                }
-                .into());
+                };
+                // Keep the concrete stream error for upstream recovery callers
+                // and the category-bearing refusal for Reliable classification.
+                return Err(if refused {
+                    provider_error.context(error)
+                } else {
+                    error.into()
+                });
             }
         };
         match event {
@@ -266,20 +305,18 @@ pub(crate) async fn consume_provider_streaming_response(
                     // providers must use StreamEvent::ReasoningFinalized for
                     // that.
                     outcome.reasoning_content.push_str(reasoning);
-                    if draft_reasoning == StreamReasoningMode::Full
-                        && let Some(tx) = on_delta
-                    {
-                        let _ = tx.send(StreamDelta::Reasoning(reasoning.to_string())).await;
-                    }
-                    // Thinking is surfaced as its own TurnEvent variant; it
-                    // must never reach the Chunk/draft text surfaces.
-                    if let Some(tx) = event_tx {
-                        visible_event_output = true;
-                        let _ = tx
-                            .send(TurnEvent::Thinking {
-                                delta: reasoning.to_string(),
-                            })
-                            .await;
+                    if let Some(shown) = reasoning_display_text(reasoning) {
+                        if draft_reasoning == StreamReasoningMode::Full
+                            && let Some(tx) = on_delta
+                        {
+                            let _ = tx.send(StreamDelta::Reasoning(shown.clone())).await;
+                        }
+                        // Thinking is surfaced as its own TurnEvent variant; it
+                        // must never reach the Chunk/draft text surfaces.
+                        if let Some(tx) = event_tx {
+                            visible_event_output = true;
+                            let _ = tx.send(TurnEvent::Thinking { delta: shown }).await;
+                        }
                     }
                 }
 
@@ -341,6 +378,23 @@ pub(crate) async fn consume_provider_streaming_response(
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
+    if text_guard.suppressed_protocol
+        && let Some(diagnostic) = text_guard.suppression
+    {
+        // Attributes carry only the detector and the candidate offset so a
+        // false positive can be diagnosed without logging the withheld text.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({
+                    "detector": diagnostic.detector,
+                    "candidate_offset": diagnostic.candidate_offset,
+                })),
+            "streaming text guard suppressed protocol candidate"
+        );
+    }
 
     if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
         ::zeroclaw_log::record!(
@@ -371,6 +425,36 @@ pub(crate) async fn consume_provider_streaming_response(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reasoning_display_shows_only_the_text_of_a_signed_record() {
+        let record = r#"{"thinking":"  Step one","signature":"sig_a"}"#;
+        assert_eq!(
+            reasoning_display_text(record).as_deref(),
+            Some("  Step one")
+        );
+    }
+
+    #[test]
+    fn reasoning_display_shows_nothing_when_the_text_was_withheld() {
+        let record = r#"{"thinking":"","signature":"sig_b"}"#;
+        assert_eq!(reasoning_display_text(record), None);
+    }
+
+    #[test]
+    fn reasoning_display_reads_a_record_that_carries_its_separator() {
+        let record = "\n{\"thinking\":\"later\",\"signature\":\"sig_c\"}";
+        assert_eq!(reasoning_display_text(record).as_deref(), Some("later"));
+    }
+
+    #[test]
+    fn reasoning_display_passes_plain_prose_through() {
+        assert_eq!(
+            reasoning_display_text("thinking out loud").as_deref(),
+            Some("thinking out loud")
+        );
+    }
+
     use super::*;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
@@ -1522,7 +1606,8 @@ mod tests {
     }
 
     struct VisibleOutputThenRefusalProvider {
-        refusal: zeroclaw_api::model_provider::ModelRefusalError,
+        refusal: std::sync::Mutex<Option<zeroclaw_api::model_provider::StreamError>>,
+        usage: Option<TokenUsage>,
     }
 
     impl ::zeroclaw_api::attribution::Attributable for VisibleOutputThenRefusalProvider {
@@ -1571,15 +1656,21 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            let refusal = self.refusal.clone();
-            Box::pin(futures_util::stream::iter(vec![
-                Ok(StreamEvent::TextDelta(StreamChunk::delta(
-                    "Visible partial text before refusal",
-                ))),
-                Err(zeroclaw_api::model_provider::StreamError::ModelRefusal(
-                    Box::new(refusal),
-                )),
-            ]))
+            let refusal = self
+                .refusal
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one stream call");
+            let mut events = Vec::new();
+            if let Some(usage) = self.usage.clone() {
+                events.push(Ok(StreamEvent::Usage(usage)));
+            }
+            events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                "Visible partial text before refusal",
+            ))));
+            events.push(Err(refusal));
+            Box::pin(futures_util::stream::iter(events))
         }
     }
 
@@ -1589,16 +1680,21 @@ mod tests {
             input_tokens: Some(412),
             output_tokens: Some(15),
             cached_input_tokens: Some(50),
-            cache_creation_input_tokens: None,
+            cache_creation_input_tokens: Some(25),
         };
         let provider = VisibleOutputThenRefusalProvider {
-            refusal: zeroclaw_api::model_provider::ModelRefusalError {
-                requested_model: "claude-sonnet-4-6".to_string(),
-                category: Some("hate".to_string()),
-                usage: Some(Box::new(refusal_usage)),
-                attempted_candidate: None,
-                attempted_candidate_index: None,
-            },
+            refusal: std::sync::Mutex::new(Some(
+                zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
+                    zeroclaw_api::model_provider::ModelRefusalError {
+                        requested_model: "claude-sonnet-4-6".to_string(),
+                        category: Some("hate".to_string()),
+                        usage: Some(Box::new(refusal_usage)),
+                        attempted_candidate: None,
+                        attempted_candidate_index: None,
+                    },
+                )),
+            )),
+            usage: None,
         };
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
@@ -1631,6 +1727,7 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(412));
         assert_eq!(usage.output_tokens, Some(15));
         assert_eq!(usage.cached_input_tokens, Some(50));
+        assert_eq!(usage.cache_creation_input_tokens, Some(25));
         let cause_err = interrupted
             .cause
             .terminal_cause()
@@ -1653,5 +1750,68 @@ mod tests {
             }
         }
         assert_eq!(chunks, vec!["Visible partial text before refusal"]);
+    }
+
+    #[tokio::test]
+    async fn category_refusal_preserves_classification_and_usage_across_output_boundary() {
+        use zeroclaw_api::model_provider::{ProviderRefusal, RefusalCategory, StreamError};
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        for visible in [false, true] {
+            let provider = VisibleOutputThenRefusalProvider {
+                refusal: std::sync::Mutex::new(Some(StreamError::Refusal(RefusalCategory::Cyber))),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(10),
+                    cached_input_tokens: Some(20),
+                    cache_creation_input_tokens: Some(30),
+                }),
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let error = consume_provider_streaming_response(
+                &provider,
+                &[ChatMessage::user("go")],
+                None,
+                "claude-fable-5-1",
+                Some(0.0),
+                None,
+                None,
+                visible.then_some(&tx),
+                false,
+                StreamReasoningMode::Status,
+            )
+            .await
+            .expect_err("a refusal must not become a successful answer");
+
+            let (usage, kind) = if visible {
+                let interrupted = error
+                    .downcast_ref::<StreamInterruptedAfterOutput>()
+                    .unwrap();
+                assert!(
+                    interrupted.partial_text.is_empty(),
+                    "refused text is withdrawn"
+                );
+                (
+                    interrupted.usage.as_ref().unwrap(),
+                    interrupted.cause.kind(),
+                )
+            } else {
+                let streamed = error.downcast_ref::<StreamErrorWithUsage>().unwrap();
+                assert!(matches!(
+                    streamed.source,
+                    StreamError::Refusal(RefusalCategory::Cyber)
+                ));
+                assert!(error.chain().any(|cause| cause.is::<ProviderRefusal>()));
+                let failure = ReliableProviderTerminalFailure::from_error(&error);
+                (streamed.usage.as_ref().unwrap(), failure.kind())
+            };
+            assert_eq!(usage.cache_creation_input_tokens, Some(30));
+            assert!(matches!(
+                kind,
+                ReliableProviderTerminalFailureKind::Refused(RefusalCategory::Cyber)
+            ));
+        }
     }
 }

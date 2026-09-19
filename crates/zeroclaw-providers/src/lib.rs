@@ -6,6 +6,7 @@ pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
+pub mod claude_models;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;
@@ -691,6 +692,11 @@ pub struct ModelProviderRuntimeOptions {
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
     pub reasoning_effort: Option<String>,
+    /// Forward the runtime-configured `reasoning_effort` to every model on
+    /// OpenAI-compatible providers, bypassing the OpenAI-reasoning-family
+    /// name filter. Propagated from
+    /// `ModelProviderConfig::reasoning_effort_passthrough`.
+    pub reasoning_effort_passthrough: bool,
     /// HTTP request timeout in seconds for LLM model_provider API calls.
     /// `None` uses the model_provider's built-in default (120s for compatible model_providers).
     pub provider_timeout_secs: Option<u64>,
@@ -711,11 +717,21 @@ pub struct ModelProviderRuntimeOptions {
     /// When `Some(false)`, strip assistant reasoning fields from outbound
     /// history replay. `None` honours provider default.
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic extended thinking through OpenAI-compatible
+    /// providers: inject the runtime thinking params as an Anthropic-shaped
+    /// `thinking` request object and normalize gateway thinking responses
+    /// for replay. Propagated from `ModelProviderConfig::thinking_passthrough`.
+    pub thinking_passthrough: bool,
     /// Forward Anthropic prompt caching through OpenAI-compatible providers:
-    /// inject `cache_control` breakpoints (system prompt; rolling last
-    /// message) into request bodies and capture gateway-reported cache
+    /// inject `cache_control` breakpoints (system prompt, rolling eligible
+    /// message, and prior-turn anchor) and capture gateway-reported cache
     /// usage. Propagated from `ModelProviderConfig::cache_passthrough`.
     pub cache_passthrough: bool,
+    /// Prompt-cache entry lifetime for providers that place Anthropic
+    /// cache markers (native Anthropic; compatible ones behind
+    /// `cache_passthrough`). `None` keeps the 5-minute default.
+    /// Propagated from `ModelProviderConfig::cache_ttl`.
+    pub cache_ttl: Option<zeroclaw_config::schema::CacheTtl>,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -763,6 +779,7 @@ impl Default for ModelProviderRuntimeOptions {
             secrets_encrypt: true,
             reasoning_enabled: None,
             reasoning_effort: None,
+            reasoning_effort_passthrough: false,
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
@@ -770,7 +787,9 @@ impl Default for ModelProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
+            thinking_passthrough: false,
             cache_passthrough: false,
+            cache_ttl: None,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -829,6 +848,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
+        reasoning_effort_passthrough: entry.is_some_and(|e| e.reasoning_effort_passthrough),
         provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
         api_path: None,
@@ -836,7 +856,9 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
+        thinking_passthrough: entry.is_some_and(|e| e.thinking_passthrough),
         cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
+        cache_ttl: entry.and_then(|e| e.cache_ttl),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
@@ -2992,6 +3014,40 @@ mod tests {
         // `[multimodal]` is root-scoped, so unlike the provider-specific
         // `tool_result_image_policy` it must survive a bare family ref.
         assert_eq!(options.multimodal.max_images, 1);
+    }
+
+    #[test]
+    fn cache_passthrough_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_passthrough: true,
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert!(opts.cache_passthrough);
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert!(!defaults.cache_passthrough);
+    }
+
+    #[test]
+    fn cache_ttl_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{CacheTtl, Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_ttl: Some(CacheTtl::OneHour),
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.cache_ttl, Some(CacheTtl::OneHour));
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert_eq!(defaults.cache_ttl, None);
     }
 
     #[test]

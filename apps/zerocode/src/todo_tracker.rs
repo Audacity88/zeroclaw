@@ -148,11 +148,11 @@ impl TodoTracker {
 
         use crate::theme;
 
+        let total = self.total().to_string();
+        let done = self.done().to_string();
         let title = format!(
-            " Plan ({}) — {}/{} done ",
-            self.total(),
-            self.done(),
-            self.total()
+            " {} ",
+            crate::i18n::t_args("zc-todo-plan-title", &[("total", &total), ("done", &done)],)
         );
         // Themed pane chrome: dim border + bold themed title, matching
         // every other split-pane in the Code/Chat view. `fill_style`
@@ -162,9 +162,12 @@ impl TodoTracker {
         let block = theme::panel_block(&title).style(theme::fill_style());
 
         if self.entries.is_empty() {
-            let placeholder = Paragraph::new(Span::styled("No active plan", theme::dim_style()))
-                .style(theme::fill_style())
-                .block(block);
+            let placeholder = Paragraph::new(Span::styled(
+                crate::i18n::t("zc-todo-plan-empty"),
+                theme::dim_style(),
+            ))
+            .style(theme::fill_style())
+            .block(block);
             frame.render_widget(placeholder, area);
             if let Some(rect) = close_rect {
                 frame.render_widget(

@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 pub mod audit;
 pub mod bundle;
@@ -19,6 +20,7 @@ pub mod constants;
 pub mod creator;
 pub mod document;
 pub mod frontmatter;
+mod git_sync;
 pub mod improver;
 pub mod reference;
 pub mod review;
@@ -41,6 +43,88 @@ pub(crate) use suggestions::render_missing_skill_install_suggestion;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
+// Coalesce a burst of failed loads without disabling recovery in a long-lived daemon.
+const OPEN_SKILLS_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct OpenSkillsSyncState {
+    completed: Option<Instant>,
+    cleanup_pending: bool,
+}
+
+type OpenSkillsSyncGate = parking_lot::Mutex<OpenSkillsSyncState>;
+
+#[derive(Default)]
+struct OpenSkillsSyncs {
+    repos: parking_lot::Mutex<HashMap<PathBuf, Arc<OpenSkillsSyncGate>>>,
+}
+
+impl OpenSkillsSyncs {
+    fn sync_if_due<R: Into<git_sync::Outcome>>(
+        &self,
+        repo_dir: &Path,
+        now: impl Fn() -> Instant,
+        pull: impl FnOnce(&Path) -> R,
+    ) -> Option<git_sync::Outcome> {
+        // Keep the same key before and after a first clone creates missing parents.
+        let key = repo_dir
+            .ancestors()
+            .find_map(|ancestor| {
+                let existing = if ancestor.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    ancestor
+                };
+                std::fs::canonicalize(existing).ok().and_then(|base| {
+                    repo_dir
+                        .strip_prefix(ancestor)
+                        .ok()
+                        .map(|suffix| base.join(suffix))
+                })
+            })
+            .unwrap_or_else(|| repo_dir.to_path_buf());
+        let gate = {
+            let mut repos = self.repos.lock();
+            if !repos.contains_key(&key) {
+                let checked_at = now();
+                // Do not evict a gate retained by a caller, even after its cooldown expires.
+                repos.retain(|_, gate| {
+                    Arc::strong_count(gate) > 1
+                        || gate.try_lock().is_none_or(|state| {
+                            state.cleanup_pending
+                                || state.completed.is_some_and(|at| {
+                                    checked_at.saturating_duration_since(at)
+                                        < OPEN_SKILLS_RETRY_DELAY
+                                })
+                        })
+                });
+            }
+            Arc::clone(repos.entry(key).or_default())
+        };
+        // Followers wait for the pull to finish before proceeding to local skill reads.
+        // The global lookup lock is never held across Git or marker I/O.
+        let mut state = gate.lock();
+        if state.cleanup_pending {
+            return Some(git_sync::Outcome::CleanupPending);
+        }
+        if !should_sync_open_skills(repo_dir)
+            || state
+                .completed
+                .is_some_and(|at| now().saturating_duration_since(at) < OPEN_SKILLS_RETRY_DELAY)
+        {
+            return None;
+        }
+        let outcome = pull(repo_dir).into();
+        if outcome == git_sync::Outcome::Success {
+            let _ = mark_open_skills_synced(repo_dir);
+        }
+        // Success with an unwritable marker also needs burst suppression. Skips above
+        // must not advance this timestamp, or steady loads could postpone retry forever.
+        state.completed = Some(now());
+        state.cleanup_pending = outcome == git_sync::Outcome::CleanupPending;
+        Some(outcome)
+    }
+}
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -1173,124 +1257,385 @@ fn ensure_open_skills_repo(
 
     let repo_dir = resolve_open_skills_dir(config_open_skills_dir)?;
 
-    if !repo_dir.exists() {
-        if !clone_open_skills_repo(&repo_dir) {
-            return None;
-        }
-        let _ = mark_open_skills_synced(&repo_dir);
-        return Some(repo_dir);
+    static SYNCS: OnceLock<OpenSkillsSyncs> = OnceLock::new();
+    let outcome =
+        SYNCS
+            .get_or_init(OpenSkillsSyncs::default)
+            .sync_if_due(&repo_dir, Instant::now, |repo| {
+                if repo.exists() {
+                    pull_open_skills_repo(repo)
+                } else {
+                    clone_open_skills_repo(repo)
+                }
+            });
+    if outcome == Some(git_sync::Outcome::CleanupPending) {
+        return None;
     }
-
-    if should_sync_open_skills(&repo_dir) {
-        if pull_open_skills_repo(&repo_dir) {
-            let _ = mark_open_skills_synced(&repo_dir);
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "open-skills update failed; using local copy from {}",
-                    repo_dir.display().to_string()
-                )
-            );
-        }
-    }
-
-    Some(repo_dir)
-}
-
-fn clone_open_skills_repo(repo_dir: &Path) -> bool {
-    if let Some(parent) = repo_dir.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
+    if outcome == Some(git_sync::Outcome::Failed) && repo_dir.is_dir() {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             &format!(
-                "failed to create open-skills parent directory {}: {err}",
-                parent.display().to_string()
+                "open-skills update failed; using local copy from {}",
+                repo_dir.display().to_string()
             )
         );
-        return false;
     }
 
-    let output = Command::new("git")
-        .args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL])
-        .arg(repo_dir)
-        .output();
+    repo_dir.is_dir().then_some(repo_dir)
+}
 
-    match output {
-        Ok(result) if result.status.success() => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "initialized open-skills at {}",
-                    repo_dir.display().to_string()
-                )
+#[cfg(test)]
+mod open_skills_sync_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    use tempfile::TempDir;
+
+    #[test]
+    fn failed_clone_keeps_its_cooldown_after_creating_parent_directories() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path().join("new-parent").join("skills");
+        let syncs = OpenSkillsSyncs::default();
+        assert_eq!(
+            syncs.sync_if_due(&repo, Instant::now, |_| {
+                std::fs::create_dir_all(repo.parent().unwrap()).unwrap();
+                false
+            }),
+            Some(git_sync::Outcome::Failed)
+        );
+        assert_eq!(
+            syncs.sync_if_due(&repo, Instant::now, |_| -> bool {
+                panic!("clone cooldown")
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn uncertain_cleanup_prevents_reads_and_retries_even_after_cooldown() {
+        let repo = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let syncs = OpenSkillsSyncs::default();
+        let now = Instant::now();
+        assert_eq!(
+            syncs.sync_if_due(repo.path(), || now, |_| git_sync::Outcome::CleanupPending),
+            Some(git_sync::Outcome::CleanupPending)
+        );
+        syncs.sync_if_due(other.path(), || now + OPEN_SKILLS_RETRY_DELAY, |_| true);
+        assert_eq!(
+            syncs.sync_if_due(
+                repo.path(),
+                || now + OPEN_SKILLS_RETRY_DELAY,
+                |_| -> bool { panic!("quarantined repository") }
+            ),
+            Some(git_sync::Outcome::CleanupPending)
+        );
+    }
+
+    #[test]
+    fn cooldown_starts_at_completion_and_skips_do_not_postpone_recovery() {
+        let repo = TempDir::new().unwrap();
+        let syncs = OpenSkillsSyncs::default();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let now = || clock.get();
+        let calls = Cell::new(0);
+        assert_eq!(
+            syncs.sync_if_due(repo.path(), now, |_| {
+                calls.set(calls.get() + 1);
+                clock.set(start + Duration::from_secs(120));
+                false
+            }),
+            Some(git_sync::Outcome::Failed)
+        );
+        assert!(!repo.path().join(OPEN_SKILLS_SYNC_MARKER).exists());
+
+        for seconds in [120, 140, 179] {
+            clock.set(start + Duration::from_secs(seconds));
+            assert_eq!(
+                syncs.sync_if_due(repo.path(), now, |_| {
+                    calls.set(calls.get() + 1);
+                    false
+                }),
+                None
             );
-            true
         }
-        Ok(result) => {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"stderr": stderr})),
-                "failed to clone open-skills: "
+        assert_eq!(calls.get(), 1);
+        clock.set(start + Duration::from_secs(180));
+        assert_eq!(
+            syncs.sync_if_due(repo.path(), now, |_| {
+                calls.set(calls.get() + 1);
+                true
+            }),
+            Some(git_sync::Outcome::Success)
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(!should_sync_open_skills(repo.path()));
+        clock.set(start + Duration::from_secs(241));
+        assert_eq!(
+            syncs.sync_if_due(repo.path(), now, |_| -> bool {
+                panic!("fresh success marker")
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn successful_pull_with_unwritable_marker_is_also_rate_limited() {
+        let repo = TempDir::new().unwrap();
+        let syncs = OpenSkillsSyncs::default();
+        let start = Instant::now();
+        let marker = repo.path().join(OPEN_SKILLS_SYNC_MARKER);
+        assert_eq!(
+            syncs.sync_if_due(
+                repo.path(),
+                || start,
+                |_| {
+                    // A directory cannot be overwritten by the marker writer, even as root.
+                    std::fs::create_dir(&marker).unwrap();
+                    filetime::set_file_mtime(&marker, filetime::FileTime::from_unix_time(1, 0))
+                        .unwrap();
+                    true
+                }
+            ),
+            Some(git_sync::Outcome::Success)
+        );
+        assert!(should_sync_open_skills(repo.path()));
+        assert_eq!(
+            syncs.sync_if_due(repo.path(), || start, |_| -> bool { panic!("cooldown") }),
+            None
+        );
+        assert_eq!(
+            syncs.sync_if_due(repo.path(), || start + OPEN_SKILLS_RETRY_DELAY, |_| true),
+            Some(git_sync::Outcome::Success)
+        );
+    }
+
+    #[test]
+    fn concurrent_same_repo_waits_and_other_repo_can_progress() {
+        let repo = TempDir::new().unwrap();
+        let other_repo = TempDir::new().unwrap();
+        let syncs = Arc::new(OpenSkillsSyncs::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = {
+            let syncs = Arc::clone(&syncs);
+            let calls = Arc::clone(&calls);
+            let path = repo.path().to_path_buf();
+            std::thread::spawn(move || {
+                syncs.sync_if_due(&path, Instant::now, |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    false
+                })
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (following_tx, following_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let follower = {
+            let syncs = Arc::clone(&syncs);
+            let calls = Arc::clone(&calls);
+            // Two spellings must resolve to the same repository gate.
+            let path = repo
+                .path()
+                .join("..")
+                .join(repo.path().file_name().unwrap());
+            std::thread::spawn(move || {
+                following_tx.send(()).unwrap();
+                let result = syncs.sync_if_due(&path, Instant::now, |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    false
+                });
+                finished_tx.send(()).unwrap();
+                result
+            })
+        };
+        following_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let (other_tx, other_rx) = mpsc::channel();
+        let other = {
+            let syncs = Arc::clone(&syncs);
+            let path = other_repo.path().to_path_buf();
+            std::thread::spawn(move || {
+                other_tx
+                    .send(syncs.sync_if_due(&path, Instant::now, |_| false))
+                    .unwrap();
+            })
+        };
+        assert_eq!(
+            other_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Some(git_sync::Outcome::Failed)
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Some(git_sync::Outcome::Failed));
+        assert_eq!(follower.join().unwrap(), None);
+        other.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn agent_loads_reuse_local_skills_after_one_real_failed_pull() {
+        const CHILD_ROOT: &str = "ZEROCLAW_SYNC_LOADER_TEST_ROOT";
+        let Some(root) = std::env::var_os(CHILD_ROOT).map(PathBuf::from) else {
+            // Isolate environment-based skill routing and Git configuration from the
+            // user's environment and other parallel tests. No production test hook.
+            let root = TempDir::new().unwrap();
+            let git_config = root.path().join("empty-gitconfig");
+            std::fs::write(&git_config, "").unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "skills::open_skills_sync_tests::agent_loads_reuse_local_skills_after_one_real_failed_pull", "--nocapture"]);
+            for key in [
+                "ZEROCLAW_OPEN_SKILLS_ENABLED",
+                "ZEROCLAW_OPEN_SKILLS_DIR",
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_CONFIG",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_TEMPLATE_DIR",
+            ] {
+                child.env_remove(key);
+            }
+            let output = child
+                .env(CHILD_ROOT, root.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", git_config)
+                .env("GIT_TRACE2_EVENT", root.path().join("git-trace.jsonl"))
+                .env("ZEROCLAW_SKILLS_CACHE_ENABLED", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
-            false
-        }
-        Err(err) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                "failed to run git clone for open-skills"
+            return;
+        };
+        let repo = root.join("repo");
+        let init = Command::new("git")
+            .args(["init", "--quiet", "--template="])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        // No remote: the real pull fails locally, with no network access.
+        let skill_dir = repo.join("skills/local-check");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_file, "# Local Check\nFirst local instructions.\n").unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = true;
+        config.skills.open_skills_dir = Some(repo.to_string_lossy().into_owned());
+        for alias in ["first", "second", "third"] {
+            let skills = load_skills_for_agent(&root.join(alias), &config, alias);
+            assert_eq!(skills.len(), 1);
+            assert!(
+                skills[0]
+                    .prompts
+                    .iter()
+                    .any(|p| p.contains("First local instructions"))
             );
-            false
         }
+        std::fs::write(&skill_file, "# Local Check\nFresh local instructions.\n").unwrap();
+        let skills = load_skills_for_agent(&root.join("first"), &config, "first");
+        assert!(
+            skills[0]
+                .prompts
+                .iter()
+                .any(|p| p.contains("Fresh local instructions"))
+        );
+        assert!(!repo.join(OPEN_SKILLS_SYNC_MARKER).exists());
+        let trace = std::fs::read_to_string(root.join("git-trace.jsonl")).unwrap();
+        let pulls = trace
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "cmd_name" && event["name"] == "pull")
+            .count();
+        assert_eq!(
+            pulls, 1,
+            "count real Git commands through the per-agent loader"
+        );
+
+        config.skills.open_skills_enabled = false;
+        assert!(load_skills_for_agent(&root.join("first"), &config, "first").is_empty());
+        config.skills.open_skills_enabled = true;
+        // Audit policy is still evaluated while synchronization is suppressed.
+        std::fs::write(skill_dir.join("run.sh"), "#!/bin/sh\necho fixture\n").unwrap();
+        assert!(load_skills_for_agent(&root.join("first"), &config, "first").is_empty());
+        config.skills.allow_scripts = true;
+        assert_eq!(
+            load_skills_for_agent(&root.join("first"), &config, "first").len(),
+            1
+        );
+
+        let plain = root.join("plain");
+        let plain_skill = plain.join("skills/plain-check");
+        std::fs::create_dir_all(&plain_skill).unwrap();
+        std::fs::write(
+            plain_skill.join("SKILL.md"),
+            "# Plain Check\nLocal directory instructions.\n",
+        )
+        .unwrap();
+        config.skills.open_skills_dir = Some(plain.to_string_lossy().into_owned());
+        assert_eq!(
+            load_skills_for_agent(&root.join("first"), &config, "first").len(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("git-trace.jsonl")).unwrap(),
+            trace,
+            "disabled, cooldown, and non-Git loads must not run Git"
+        );
     }
 }
 
-fn pull_open_skills_repo(repo_dir: &Path) -> bool {
-    // If user points to a non-git directory via env var, keep using it without pulling.
+fn clone_open_skills_repo(repo_dir: &Path) -> git_sync::Outcome {
+    open_skills_git_outcome(git_sync::clone_repo(repo_dir, OPEN_SKILLS_REPO_URL))
+}
+
+fn pull_open_skills_repo(repo_dir: &Path) -> git_sync::Outcome {
+    // Reviewed non-Git directories remain usable without network access.
     if !repo_dir.join(".git").exists() {
-        return true;
+        return git_sync::Outcome::Success;
     }
+    open_skills_git_outcome(git_sync::pull(repo_dir))
+}
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        .args(["pull", "--ff-only"])
-        .output();
-
-    match output {
-        Ok(result) if result.status.success() => true,
-        Ok(result) => {
-            let stderr = String::from_utf8_lossy(&result.stderr);
+fn open_skills_git_outcome(
+    result: std::result::Result<(), git_sync::Failure>,
+) -> git_sync::Outcome {
+    match result {
+        Ok(()) => git_sync::Outcome::Success,
+        Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"stderr": stderr})),
-                "failed to pull open-skills updates: "
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &error.to_string()
             );
-            false
-        }
-        Err(err) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                "failed to run git pull for open-skills"
-            );
-            false
+            error.outcome
         }
     }
 }

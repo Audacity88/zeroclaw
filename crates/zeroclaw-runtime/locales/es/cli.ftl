@@ -940,7 +940,7 @@ channel-runtime-thinking-cleared = Sobrescritura de thinking borrada. Usando el 
 channel-runtime-thinking-default =
     Thinking ya está usando el valor predeterminado del agente `{ $default }` para esta sesión del remitente.
     Usa `/thinking high`, `/thinking max` o `/thinking off` para sobrescribirlo.
-channel-runtime-thinking-invalid = Nivel de thinking desconocido `{ $raw }`. Usa `/thinking off|minimal|low|medium|high|max`, `/thinking on` o `/thinking reset`.
+channel-runtime-thinking-invalid = Nivel de thinking desconocido `{ $raw }`. Usa `/effort off|minimal|low|medium|high|xhigh|max`, `/effort on` o `/effort reset`.
 channel-runtime-provider-turn-init-failed =
     ⚠️ Error al inicializar model_provider `{ $provider }`. Ejecuta `/models` para elegir otro model_provider.
     Detalles: { $error }
@@ -1108,3 +1108,31 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = Se recibieron {$marker_count} marcadores de imagen, pero el model_provider alternativo={$fallback_name} no admite entrada de visión
+cli-agent-vision-unsupported-by-provider = Se recibieron {$marker_count} marcadores de imagen, pero este model_provider no admite entrada de visión
+cli-agent-error-provider-context-window = La solicitud es demasiado grande para el modelo seleccionado. Reduce la conversación o elige un modelo con una ventana de contexto mayor.
+cli-agent-error-provider-credentials-missing = El proveedor de modelo seleccionado no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
+cli-agent-error-provider-credentials-missing-named = El proveedor de modelo {$provider} no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
+cli-agent-error-provider-authentication = El proveedor de modelo seleccionado rechazó sus credenciales. Revisa las credenciales configuradas.
+cli-agent-error-provider-authentication-named = El proveedor de modelo {$provider} rechazó sus credenciales. Revisa las credenciales configuradas.
+cli-agent-error-provider-rate-limited = El proveedor de modelo seleccionado limitó la solicitud. Espera, revisa la cuota o elige otro proveedor.
+cli-agent-error-provider-server = El proveedor de modelo seleccionado devolvió un error de servidor. Inténtalo de nuevo o elige otro proveedor.
+cli-agent-error-provider-model-not-found = El modelo seleccionado no está disponible. Revisa el nombre de modelo configurado.
+cli-agent-error-provider-client-request = El proveedor de modelo seleccionado rechazó la solicitud. Revisa la configuración del proveedor y la solicitud.
+cli-agent-error-provider-connection-local = El servidor de modelo local en {$endpoint} no está disponible. Inícialo o actualiza el endpoint.
+cli-agent-error-provider-connection-remote = No se puede alcanzar el proveedor de modelo en {$endpoint}. Revisa el acceso de red o elige otro proveedor.
+cli-agent-error-provider-connection = No se puede alcanzar el proveedor de modelo seleccionado. Revisa el acceso de red o elige otro proveedor.
+cli-agent-error-provider-timeout = El proveedor de modelo seleccionado agotó el tiempo de espera. Inténtalo de nuevo o elige otro proveedor.
+cli-agent-error-provider-generic = El proveedor de modelo seleccionado falló. Revisa la configuración del proveedor o elige otro proveedor.
+cli-agent-error-provider-refused = El proveedor de modelos rechazó esta solicitud ({$category}). No se reintentó con ese modelo. Reformula la solicitud, elige otro modelo o configura un modelo de reserva.
+cli-agent-error-provider-refused-category-cyber = política de seguridad cibernética
+cli-agent-error-provider-refused-category-bio = política de seguridad biológica
+cli-agent-error-provider-refused-category-reasoning-extraction = política de extracción de razonamiento
+cli-agent-error-provider-refused-category-frontier-llm = política de modelos de frontera
+cli-agent-error-provider-refused-category-unspecified = política de seguridad no especificada
+cli-agent-error-provider-refused-category-other = otra política de seguridad
+cli-delegate-error-invalid-semantic-completion = El agente '{$agent_name}' falló: el proveedor de modelo devolvió una finalización semántica no válida.
+cli-agent-error-invalid-semantic-completion = El proveedor de modelo devolvió una finalización semántica no válida.
+cli-delegate-error-incomplete-after-provider-tools = El agente '{$agent_name}' falló: el proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.
+cli-agent-error-incomplete-after-provider-tools = El proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.

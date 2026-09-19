@@ -13,21 +13,22 @@ use serde::{Deserialize, Serialize};
 pub use zeroclaw_api::model_provider::ModelRefusalError as AnthropicRefusalError;
 use zeroclaw_api::model_provider::ThinkingDisplay;
 use zeroclaw_api::tool::ToolSpec;
+use zeroclaw_config::schema::CacheTtl;
 
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Per-image ceiling for base64-encoded payloads, shared with the multimodal
+/// structural check so this adapter and the pre-dispatch resolvability count
+/// cannot drift apart on what an image may weigh (see
+/// `MAX_ENCODED_IMAGE_PAYLOAD_BYTES` in `crate::multimodal`). Anthropic
+/// documents 10 MB encoded per image for the direct API; its separate
+/// per-request budget (32 MB across all images) is not enforced here.
+use crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES;
 use crate::safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
-/// Anthropic's documented per-image ceiling for the direct API: 10 MB
-/// **base64-encoded**. Measured on the encoded payload length, unlike the
-/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
-/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
-/// two ceilings stay consistent with each other. Anthropic's separate
-/// per-request budget (32 MB across all images) is not enforced here.
-const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
 /// parsing and would otherwise sit in a text position. See
 /// [`AnthropicModelProvider::sweep_residual_image_data`].
@@ -80,6 +81,18 @@ use crate::stream_guard::AbortOnDrop;
 use std::borrow::Cow;
 
 /// Maximum silence between body reads for Anthropic SSE streams.
+/// Beta features the Claude Code subscription credential needs.
+#[cfg(test)]
+const SETUP_TOKEN_BETAS: &str =
+    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14";
+
+/// Beta feature that returns the model's between-tool progress notes.
+#[cfg(test)]
+const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
+
+/// Stop reason the API uses when its safety classifiers decline a request.
+const REFUSAL_STOP_REASON: &str = "refusal";
+
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub struct AnthropicModelProvider {
@@ -94,6 +107,12 @@ pub struct AnthropicModelProvider {
     /// non-streaming requests only. Empty means requests are byte-identical to
     /// the pre-opt-in wire format.
     server_fallback_models: Vec<String>,
+    thinking_display: Option<zeroclaw_config::schema::AnthropicThinkingDisplay>,
+    /// Cache entry lifetime carried by every cache marker this provider
+    /// places (OAuth prefix blocks, tools block, prior turn, rolling last message).
+    /// One TTL per request by design. Defaults to the 5-minute API
+    /// default.
+    cache_ttl: CacheTtl,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -137,6 +156,15 @@ struct ContentBlock {
     text: Option<String>,
 }
 
+/// Why the model stopped, when it stopped for a reason that carries detail.
+/// The provider's free-text explanation is deliberately not read: it is
+/// untrusted prose that must never reach a user-facing message or a log.
+#[derive(Debug, Deserialize)]
+struct NativeStopDetails {
+    #[serde(default)]
+    category: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct NativeChatRequest {
     model: String,
@@ -158,6 +186,36 @@ struct NativeChatRequest {
     /// only; `None` (the default) keeps the request byte-identical to today.
     #[serde(skip_serializing_if = "Option::is_none")]
     fallbacks: Option<Vec<NativeFallbackEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+/// The parts of a request the model generation constrains together.
+struct ResolvedRequestTuning {
+    temperature: Option<f64>,
+    thinking: Option<NativeThinkingConfig>,
+    output_config: Option<OutputConfig>,
+    max_tokens: u32,
+    /// The display the request carries, when it carries one. The beta header
+    /// that progress notes need follows this rather than the alias setting.
+    display: Option<zeroclaw_api::model_provider::ThinkingDisplay>,
+}
+
+impl ResolvedRequestTuning {
+    /// Whether this request names a thinking token budget, which the
+    /// streaming path cannot carry.
+    fn uses_fixed_budget(&self) -> bool {
+        self.thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.budget_tokens.is_some())
+    }
+}
+
+/// Output-level request controls. Currently only reasoning depth, which the
+/// adaptive-thinking generations take here rather than on the thinking object.
+#[derive(Debug, Serialize)]
+struct OutputConfig {
+    effort: &'static str,
 }
 
 /// One entry in the native `fallbacks` array: a model Anthropic may serve
@@ -260,20 +318,19 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
-/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
-/// require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles shared with compatible passthroughs.
+/// The centralized Claude model table owns the generation classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicThinkingStyle {
+pub(crate) enum AnthropicThinkingStyle {
     Budget,
     Adaptive,
 }
 
-fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
-        AnthropicThinkingStyle::Adaptive
-    } else {
-        AnthropicThinkingStyle::Budget
+pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    use crate::claude_models::{ClaudeThinkingShape, claude_thinking_shape};
+    match claude_thinking_shape(model) {
+        ClaudeThinkingShape::FixedBudget => AnthropicThinkingStyle::Budget,
+        ClaudeThinkingShape::Adaptive => AnthropicThinkingStyle::Adaptive,
     }
 }
 
@@ -474,12 +531,33 @@ struct NativeToolSpec {
 pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     cache_type: String,
+    /// Wire `ttl` on the cache breakpoint. `None` serializes nothing,
+    /// keeping requests byte-identical to the 5-minute API default; only
+    /// the configured 1-hour lifetime emits the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
 }
 
 impl CacheControl {
     pub(crate) fn ephemeral() -> Self {
         Self {
             cache_type: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
+
+    /// Ephemeral breakpoint carrying the configured cache entry lifetime.
+    /// `FiveMinutes` serializes exactly like [`Self::ephemeral`] — the API
+    /// default needs no explicit `ttl` — so call sites can pass the
+    /// resolved TTL unconditionally without perturbing default-config
+    /// requests.
+    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Self {
+        match ttl {
+            CacheTtl::FiveMinutes => Self::ephemeral(),
+            CacheTtl::OneHour => Self {
+                cache_type: "ephemeral".to_string(),
+                ttl: Some("1h".to_string()),
+            },
         }
     }
 }
@@ -515,14 +593,6 @@ struct NativeChatResponse {
     /// read by [`AnthropicModelProvider::server_fallback_notice`].
     #[serde(default)]
     model: Option<String>,
-}
-
-/// `stop_details` on a refusal response. `explanation` is deliberately not
-/// deserialized: it is unstable and may describe flagged content.
-#[derive(Debug, Deserialize)]
-struct NativeStopDetails {
-    #[serde(default)]
-    category: Option<String>,
 }
 
 #[cfg(test)]
@@ -595,6 +665,8 @@ pub struct AnthropicBuilder {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
+    thinking_display: Option<zeroclaw_config::schema::AnthropicThinkingDisplay>,
+    cache_ttl: Option<CacheTtl>,
 }
 
 impl AnthropicBuilder {
@@ -638,6 +710,22 @@ impl AnthropicBuilder {
         self
     }
 
+    /// How much of the model's reasoning the API should return.
+    pub fn thinking_display(
+        mut self,
+        display: Option<zeroclaw_config::schema::AnthropicThinkingDisplay>,
+    ) -> Self {
+        self.thinking_display = display;
+        self
+    }
+
+    /// Request the given cache entry lifetime on every cache marker this
+    /// provider places. Defaults to the 5-minute API default when unset.
+    pub fn cache_ttl(mut self, cache_ttl: CacheTtl) -> Self {
+        self.cache_ttl = Some(cache_ttl);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -650,6 +738,8 @@ impl AnthropicBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             server_fallback_models: self.server_fallback_models,
+            thinking_display: self.thinking_display,
+            cache_ttl: self.cache_ttl.unwrap_or_default(),
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -666,6 +756,8 @@ impl AnthropicModelProvider {
             max_tokens: None,
             timeout_secs: None,
             server_fallback_models: Vec::new(),
+            thinking_display: None,
+            cache_ttl: None,
         }
     }
 
@@ -744,11 +836,15 @@ impl AnthropicModelProvider {
 
     /// For OAuth tokens, Anthropic requires the system prompt to start with the
     /// Claude Code identity prefix. This prepends it to any existing system prompt.
-    fn apply_oauth_system_prompt(system: Option<SystemPrompt>) -> Option<SystemPrompt> {
+    /// Every block this writes carries the configured cache entry lifetime.
+    fn apply_oauth_system_prompt(
+        system: Option<SystemPrompt>,
+        cache_ttl: CacheTtl,
+    ) -> Option<SystemPrompt> {
         let prefix = SystemBlock {
             block_type: "text".to_string(),
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-            cache_control: Some(CacheControl::ephemeral()),
+            cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
         };
         match system {
             Some(SystemPrompt::Blocks(mut blocks)) => {
@@ -760,7 +856,7 @@ impl AnthropicModelProvider {
                 SystemBlock {
                     block_type: "text".to_string(),
                     text: s,
-                    cache_control: Some(CacheControl::ephemeral()),
+                    cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
                 },
             ])),
             None => Some(SystemPrompt::Blocks(vec![prefix])),
@@ -772,20 +868,162 @@ impl AnthropicModelProvider {
         messages.iter().filter(|m| m.role != "system").count() > 1
     }
 
-    /// Apply cache control to the last message content block
-    fn apply_cache_to_last_message(messages: &mut [NativeMessage]) {
-        if let Some(last_msg) = messages.last_mut()
-            && let Some(last_content) = last_msg.content.last_mut()
-        {
-            match last_content {
+    /// Place one rolling breakpoint on the last text or tool-result block,
+    /// scanning earlier messages when the newest message cannot host it.
+    /// Images, thinking, and tool-use blocks never carry the marker.
+    fn apply_cache_to_last_message(messages: &mut [NativeMessage], cache_ttl: CacheTtl) {
+        for message in messages.iter_mut().rev() {
+            if Self::apply_cache_to_message(message, cache_ttl) {
+                return;
+            }
+        }
+    }
+
+    fn apply_cache_to_message(message: &mut NativeMessage, cache_ttl: CacheTtl) -> bool {
+        for content in message.content.iter_mut().rev() {
+            match content {
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. } => {
-                    *cache_control = Some(CacheControl::ephemeral());
+                    *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                    return true;
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
                 | NativeContentOut::Thinking { .. } => {}
             }
+        }
+        false
+    }
+
+    /// Apply the prior-turn breakpoint only to the trailing block selected
+    /// by the independent prior-turn rule, without the rolling fallback scan.
+    fn apply_cache_to_message_at(
+        messages: &mut [NativeMessage],
+        index: usize,
+        cache_ttl: CacheTtl,
+    ) {
+        if let Some(last_content) = messages
+            .get_mut(index)
+            .and_then(|message| message.content.last_mut())
+        {
+            match last_content {
+                NativeContentOut::Text { cache_control, .. }
+                | NativeContentOut::ToolResult { cache_control, .. } => {
+                    *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                }
+                NativeContentOut::ToolUse { .. }
+                | NativeContentOut::Image { .. }
+                | NativeContentOut::Thinking { .. } => {}
+            }
+        }
+    }
+
+    /// Whether a prior-turn breakpoint would land: the trailing block must
+    /// be text or a tool result. Assistant tool-call carriers always end
+    /// on a `tool_use` block (text precedes the calls in the converted
+    /// block order), so they are never cacheable.
+    fn has_cacheable_trailing_block(message: &NativeMessage) -> bool {
+        matches!(
+            message.content.last(),
+            Some(NativeContentOut::Text { .. } | NativeContentOut::ToolResult { .. })
+        )
+    }
+
+    /// Index of the prior turn's final message for the third cache
+    /// breakpoint, or `None` when no valid placement exists.
+    ///
+    /// The last user message starts the current turn, so the message before
+    /// it is the previous turn's last message (usually the assistant's final
+    /// text), and every request within the current turn shares the wire
+    /// prefix through that index byte-for-byte. A candidate with no markable
+    /// trailing block is rejected, walking back at most two steps
+    /// (tool-call carriers and image-only messages are breakpoint-transparent)
+    /// before giving up, because a marker placed further back would not
+    /// survive the turn and prefix stability is worth more than the extra
+    /// cache hit. The candidate can never be the final message: it starts at
+    /// least one index before the last user message and only moves backwards,
+    /// but a rolling fallback can co-locate with it. The system prompt is a
+    /// separate request field here, never a list element, so the shared
+    /// rule's system/carrier clause is vacuous on this side.
+    ///
+    /// Twin of `prior_turn_breakpoint_index` in `compatible.rs`; duplicated
+    /// because a shared trait would drag the two providers' wire message
+    /// types across module boundaries.
+    fn prior_turn_breakpoint_index(messages: &[NativeMessage]) -> Option<usize> {
+        let last_user = messages.iter().rposition(|m| m.role == "user")?;
+        let mut candidate = last_user.checked_sub(1)?;
+        for _ in 0..3 {
+            if candidate > 0 && Self::has_cacheable_trailing_block(&messages[candidate]) {
+                return Some(candidate);
+            }
+            candidate = candidate.checked_sub(1)?;
+        }
+        None
+    }
+
+    /// Place the prior-turn breakpoint when the request's marker budget
+    /// allows it.
+    ///
+    /// Anthropic caps a request at four `cache_control` blocks counting
+    /// tools, system, and messages together. OAuth requests spend two system
+    /// slots (the identity prefix and the system text) and tool-bearing
+    /// requests spend one on the last tool definition, so the prior-turn
+    /// marker is placed only when those committed markers plus the rolling
+    /// marker leave a free slot. Placing past the cap would 400 every
+    /// request in that configuration, so the marker is skipped there instead;
+    /// the rolling breakpoint still covers the newest history.
+    fn apply_prior_turn_breakpoint_within_budget(
+        system: Option<&SystemPrompt>,
+        is_oauth: bool,
+        has_tools: bool,
+        messages: &mut [NativeMessage],
+        cache_ttl: CacheTtl,
+    ) {
+        let Some(index) = Self::prior_turn_breakpoint_index(messages) else {
+            return;
+        };
+        // A co-located rolling marker already anchors this prefix and consumes
+        // no additional slot. Do not overwrite its configured lifetime.
+        if messages[index]
+            .content
+            .last()
+            .is_some_and(Self::content_has_cache_control)
+        {
+            return;
+        }
+        let committed_markers = Self::marked_system_block_count(system)
+            + usize::from(is_oauth)
+            + usize::from(has_tools)
+            + messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|content| Self::content_has_cache_control(content))
+                .count();
+        if committed_markers >= 4 {
+            return;
+        }
+        Self::apply_cache_to_message_at(messages, index, cache_ttl);
+    }
+
+    fn content_has_cache_control(content: &NativeContentOut) -> bool {
+        match content {
+            NativeContentOut::Text { cache_control, .. }
+            | NativeContentOut::ToolResult { cache_control, .. }
+            | NativeContentOut::ToolUse { cache_control, .. } => cache_control.is_some(),
+            NativeContentOut::Image { .. } | NativeContentOut::Thinking { .. } => false,
+        }
+    }
+
+    /// Number of system blocks that already carry a marker. The converted
+    /// system prompt is a single marked block today, so this is 0 or 1; the
+    /// count reads the blocks rather than assuming that shape.
+    fn marked_system_block_count(system: Option<&SystemPrompt>) -> usize {
+        match system {
+            Some(SystemPrompt::Blocks(blocks)) => blocks
+                .iter()
+                .filter(|block| block.cache_control.is_some())
+                .count(),
+            _ => 0,
         }
     }
 
@@ -809,15 +1047,34 @@ impl AnthropicModelProvider {
             })
             .collect();
 
-        // Cache the last tool definition (caches all tools)
+        // Cache the last tool definition (caches all tools); the tools
+        // marker carries the configured cache entry lifetime.
         if let Some(last_tool) = native_tools.last_mut() {
-            last_tool.cache_control = Some(CacheControl::ephemeral());
+            last_tool.cache_control = Some(CacheControl::ephemeral_with_ttl(self.cache_ttl));
         }
 
         Some(native_tools)
     }
 
-    fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<NativeContentOut>> {
+    /// Rebuild an assistant turn's blocks from the stored envelope.
+    ///
+    /// `replay_thinking` gates the signed reasoning blocks. On models whose
+    /// API keeps earlier turns' thinking in context, every assistant message
+    /// replays its blocks: dropping them rewrites the wire bytes of finished
+    /// turns, which breaks the cached prefix that starts at the first such
+    /// message and re-bills everything after it at full input price. On
+    /// models whose API strips old thinking server-side, replaying finished
+    /// rounds buys nothing, so only the round still in flight is sent.
+    ///
+    /// Replayed blocks stay valid only while the conversation prefix they
+    /// were signed over is unchanged. When the runtime itself rewrites that
+    /// prefix — a history trim, chiefly — it drops the reasoning the rewrite
+    /// invalidated, so what reaches the wire here is either intact or absent,
+    /// never stale.
+    fn parse_assistant_tool_call_message(
+        content: &str,
+        replay_thinking: bool,
+    ) -> Option<Vec<NativeContentOut>> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
         let tool_calls = value
             .get("tool_calls")
@@ -829,10 +1086,11 @@ impl AnthropicModelProvider {
         // with thinking blocks (including signatures) before any tool_use
         // blocks. The reasoning_content field stores JSON-encoded thinking
         // blocks from the original response.
-        if let Some(reasoning) = value
-            .get("reasoning_content")
-            .and_then(serde_json::Value::as_str)
-            .filter(|r| !r.is_empty())
+        if replay_thinking
+            && let Some(reasoning) = value
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str)
+                .filter(|r| !r.is_empty())
         {
             for part in reasoning.split('\n') {
                 if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
@@ -1269,10 +1527,31 @@ impl AnthropicModelProvider {
         })
     }
 
-    fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
+    /// Index of the last message that opened a fresh exchange, meaning a
+    /// message the person sent rather than a system note or a tool result.
+    /// Everything after it is the tool round still in flight.
+    fn last_exchange_start(messages: &[ChatMessage]) -> Option<usize> {
+        messages.iter().enumerate().rev().find_map(|(index, msg)| {
+            let opens_exchange = !matches!(msg.role.as_str(), "system" | "assistant" | "tool");
+            (opens_exchange && !ChatMessage::should_skip_internal_pruning_marker(messages, index))
+                .then_some(index)
+        })
+    }
+
+    fn convert_messages(
+        messages: &[ChatMessage],
+        cache_ttl: CacheTtl,
+        model: &str,
+    ) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
+        use crate::claude_models::claude_keeps_prior_thinking;
         let mut system_text = None;
         let mut native_messages = Vec::new();
         let mut run = ToolResultRun::default();
+        let last_exchange_start = Self::last_exchange_start(messages);
+        // Models whose API keeps old thinking in context must see every
+        // stored reasoning block again; the others only need the round still
+        // in flight.
+        let keeps_prior_thinking = claude_keeps_prior_thinking(model);
 
         for (index, msg) in messages.iter().enumerate() {
             if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
@@ -1293,7 +1572,11 @@ impl AnthropicModelProvider {
                     }
                 }
                 "assistant" => {
-                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                    let replay_thinking = keeps_prior_thinking
+                        || last_exchange_start.is_some_and(|start| index > start);
+                    if let Some(blocks) =
+                        Self::parse_assistant_tool_call_message(&msg.content, replay_thinking)
+                    {
                         run.begin(
                             blocks
                                 .iter()
@@ -1513,12 +1796,13 @@ impl AnthropicModelProvider {
         Self::order_tool_results_first(&mut native_messages);
         Self::backfill_orphaned_tool_uses(&mut native_messages, run.undelivered_ids());
 
-        // Always use Blocks format with cache_control for system prompts
+        // Always use Blocks format with cache_control for system prompts;
+        // the system marker carries the configured cache entry lifetime.
         let system_prompt = system_text.map(|text| {
             SystemPrompt::Blocks(vec![SystemBlock {
                 block_type: "text".to_string(),
                 text,
-                cache_control: Some(CacheControl::ephemeral()),
+                cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
             }])
         });
 
@@ -1957,7 +2241,24 @@ impl AnthropicModelProvider {
         })
     }
 
-    fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+    /// One thinking block in the form the runtime stores and later replays:
+    /// a single JSON line holding the text exactly as received and the
+    /// signature it was signed with. `None` when there is nothing to replay.
+    ///
+    /// A block whose text was withheld still carries a signature, and the
+    /// signature is what the next request in the round has to send back, so
+    /// emptiness alone is not a reason to drop it.
+    fn thinking_block_record(thinking: &str, signature: Option<&str>) -> Option<String> {
+        let signature = signature.unwrap_or_default();
+        (!thinking.is_empty() || !signature.is_empty()).then(|| {
+            serde_json::json!({ "thinking": thinking, "signature": signature }).to_string()
+        })
+    }
+
+    fn parse_native_response(
+        response: NativeChatResponse,
+        requested_model: &str,
+    ) -> Result<ProviderChatResponse, AnthropicRefusalError> {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
         let mut content_block_types = Vec::with_capacity(content_block_count);
@@ -1966,6 +2267,13 @@ impl AnthropicModelProvider {
         let mut tool_calls = Vec::new();
 
         let usage = Self::normalize_usage(response.usage.as_ref());
+
+        // Checked before the blocks are read: a refusal before any output
+        // has empty content, which would otherwise look like a provider that
+        // simply returned nothing and get retried on the same model.
+        if stop_reason == REFUSAL_STOP_REASON {
+            Self::check_refusal(&response, requested_model)?;
+        }
 
         for block in response.content {
             let kind = block.kind;
@@ -1984,14 +2292,11 @@ impl AnthropicModelProvider {
                         .thinking
                         .as_deref()
                         .or(block.text.as_deref())
-                        .unwrap_or("");
-                    let signature = block.signature.as_deref().unwrap_or("");
-                    if !thinking.is_empty() || !signature.is_empty() {
-                        let json_block = serde_json::json!({
-                            "thinking": thinking,
-                            "signature": signature,
-                        });
-                        thinking_parts.push(json_block.to_string());
+                        .unwrap_or_default();
+                    if let Some(record) =
+                        Self::thinking_block_record(thinking, block.signature.as_deref())
+                    {
+                        thinking_parts.push(record);
                     }
                 }
                 "tool_use" => {
@@ -2048,7 +2353,7 @@ impl AnthropicModelProvider {
             );
         }
 
-        parsed
+        Ok(parsed)
     }
 
     /// Project a native completion into the legacy string-only API without
@@ -2179,58 +2484,154 @@ impl AnthropicModelProvider {
         }
     }
 
-    /// Resolve thinking parameters for an API request. Returns the effective
-    /// temperature (forced to 1.0 when thinking is active), the thinking
-    /// config for the request body, and the effective max_tokens (raised to
-    /// meet budget_tokens minimum when needed).
+    /// Resolve the request tuning for one call: reasoning depth, sampling
+    /// temperature, and the output cap, all of which the model generation
+    /// constrains together.
     fn resolve_thinking(
         &self,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
         temperature: Option<f64>,
         model: &str,
-    ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
-        match thinking {
-            Some(params) => {
-                let style = anthropic_thinking_style(model);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "model": model,
-                            "style": match style {
-                                AnthropicThinkingStyle::Budget => "enabled",
-                                AnthropicThinkingStyle::Adaptive => "adaptive",
-                            },
-                        })),
-                    "Native extended thinking enabled; forcing temperature=1.0"
-                );
-                // Thinking mode requires temperature 1.0 regardless of style.
-                let (config, max_tokens) = match style {
-                    AnthropicThinkingStyle::Budget => {
-                        // API requires max_tokens > budget_tokens (strictly greater).
-                        let min_required = params.budget_tokens + 1;
-                        (
-                            NativeThinkingConfig {
-                                kind: "enabled",
-                                budget_tokens: Some(params.budget_tokens),
-                                display: params.display,
-                            },
-                            self.max_tokens.max(min_required),
-                        )
-                    }
-                    AnthropicThinkingStyle::Adaptive => (
-                        NativeThinkingConfig {
-                            kind: "adaptive",
-                            budget_tokens: None,
-                            display: params.display,
-                        },
-                        self.max_tokens,
-                    ),
+    ) -> ResolvedRequestTuning {
+        use crate::claude_models::{
+            ClaudeProviderSlot, ClaudeThinkingShape, thinking_capabilities,
+        };
+
+        let capabilities = thinking_capabilities(ClaudeProviderSlot::Anthropic, model);
+        if capabilities.shape == ClaudeThinkingShape::FixedBudget {
+            let Some(budget) = thinking.and_then(|params| params.budget_tokens) else {
+                // No budget to spend, so the request carries no thinking at
+                // all and the caller's temperature stands.
+                return ResolvedRequestTuning {
+                    temperature,
+                    thinking: None,
+                    output_config: None,
+                    max_tokens: self.max_tokens,
+                    display: None,
                 };
-                (Some(1.0), Some(config), max_tokens)
-            }
-            None => (temperature, None, self.max_tokens),
+            };
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"budget_tokens": budget})),
+                "Native extended thinking enabled; forcing temperature=1.0"
+            );
+            return ResolvedRequestTuning {
+                // The API pins sampling when a budget is in play.
+                temperature: Some(1.0),
+                thinking: Some(NativeThinkingConfig {
+                    kind: "enabled",
+                    budget_tokens: Some(budget),
+                    // The budget generations take no display.
+                    display: None,
+                }),
+                output_config: None,
+                // The API requires max_tokens strictly above the budget.
+                max_tokens: self.max_tokens.max(budget + 1),
+                display: None,
+            };
         }
+
+        let requested_effort = thinking.and_then(|params| params.effort);
+        let effort = requested_effort.and_then(|effort| capabilities.fit_effort(effort));
+        if requested_effort != effort {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "requested": requested_effort.map(|effort| effort.as_str()),
+                        "sent": effort.map(|effort| effort.as_str()),
+                    })),
+                "reasoning depth fitted to what this model generation accepts"
+            );
+        }
+        if thinking.and_then(|params| params.budget_tokens).is_some() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"model": model})),
+                "fixed thinking budget ignored; this model generation thinks adaptively"
+            );
+        }
+        if let Some(temperature) = temperature {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "temperature": temperature,
+                    })),
+                "temperature dropped: this model generation rejects sampling parameters"
+            );
+        }
+        if self.max_tokens <= zeroclaw_api::model_provider::BASELINE_MAX_TOKENS {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "max_tokens": self.max_tokens,
+                    })),
+                "max_tokens is at the baseline; reasoning counts toward it on this model generation, so raise it on the provider entry"
+            );
+        }
+        // The request's own choice wins over the alias setting, so a session
+        // control can narrow or widen what the operator configured. A choice
+        // the generation does not take is dropped, and a choice that matches
+        // the API default sends nothing.
+        let requested_display = thinking
+            .and_then(|params| params.display)
+            .or_else(|| self.thinking_display.map(Into::into));
+        let display = requested_display.and_then(|display| capabilities.fit_display(display));
+        if requested_display != display {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "requested": requested_display.map(|display| display.as_str()),
+                        "sent": display.map(|display| display.as_str()),
+                    })),
+                "thinking display fitted to what this model takes"
+            );
+        }
+        let display = display.filter(|display| display.wire_value().is_some());
+        // Asking for the object turns thinking on for the generations that
+        // default it off, so only send it when a depth was chosen or the
+        // caller asked to see the reasoning.
+        let thinking = (effort.is_some() || display.is_some()).then_some(NativeThinkingConfig {
+            kind: "adaptive",
+            budget_tokens: None,
+            display,
+        });
+        ResolvedRequestTuning {
+            temperature: None,
+            thinking,
+            output_config: effort.map(|effort| OutputConfig {
+                effort: effort.as_str(),
+            }),
+            max_tokens: self.max_tokens,
+            display,
+        }
+    }
+
+    /// The `anthropic-beta` value for this request, or `None` when no beta
+    /// feature is in play. The subscription credential and the progress-note
+    /// display each contribute, and both can apply at once. `display` is the
+    /// display the request carries, so the header follows what is sent rather
+    /// than what the alias asked for.
+    #[cfg(test)]
+    fn beta_header_value(
+        &self,
+        credential: &str,
+        display: Option<zeroclaw_api::model_provider::ThinkingDisplay>,
+    ) -> Option<String> {
+        anthropic_beta_features(
+            Self::is_setup_token(credential),
+            display == Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
+            &[],
+        )
     }
 
     fn http_client(&self) -> Client {
@@ -2533,7 +2934,7 @@ impl AnthropicModelProvider {
                     if let Some(v) = observed_output {
                         output_tokens = Some(v);
                     }
-                    if stop_reason == "refusal" {
+                    if stop_reason == REFUSAL_STOP_REASON {
                         // Carry billed partial tokens on the typed cause. The
                         // recovery owner accounts them once and can skip the
                         // already-refused candidate instead of replaying it.
@@ -2566,7 +2967,12 @@ impl AnthropicModelProvider {
                             .send(Err(StreamError::ModelRefusal(Box::new(
                                 AnthropicRefusalError {
                                     requested_model: requested_model.to_string(),
-                                    category: None,
+                                    category: event
+                                        .get("delta")
+                                        .and_then(|delta| delta.get("stop_details"))
+                                        .and_then(|details| details.get("category"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned),
                                     usage: usage.map(Box::new),
                                     attempted_candidate: None,
                                     attempted_candidate_index: None,
@@ -2646,14 +3052,19 @@ impl AnthropicModelProvider {
                     return;
                 }
                 "error" => {
-                    let msg = event
-                        .get("error")
+                    let error = event.get("error");
+                    let msg = error
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(msg.to_string())))
-                        .await;
+                    // Carry the machine-readable type (`overloaded_error`,
+                    // `rate_limit_error`, ...) so downstream retry
+                    // classification can match on it.
+                    let msg = match error.and_then(|e| e.get("type")).and_then(|t| t.as_str()) {
+                        Some(error_type) => format!("{error_type}: {msg}"),
+                        None => msg.to_string(),
+                    };
+                    let _ = tx.send(Err(StreamError::ModelProvider(msg))).await;
                     return;
                 }
                 _ => {}
@@ -2697,7 +3108,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let system = system_prompt.map(|s| SystemPrompt::String(s.to_string()));
         let system = if Self::is_setup_token(credential) {
-            Self::apply_oauth_system_prompt(system)
+            Self::apply_oauth_system_prompt(system, self.cache_ttl)
         } else {
             system
         };
@@ -2733,6 +3144,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: None,
             fallbacks,
+            output_config: None,
         };
 
         let mut request = self
@@ -2754,7 +3166,7 @@ impl ModelProvider for AnthropicModelProvider {
         commit_safeguard_fallback(None);
         Self::check_refusal(&chat_response, model)?;
         let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
-        let parsed = Self::parse_native_response(chat_response);
+        let parsed = Self::parse_native_response(chat_response, model)?;
         let result = Self::require_terminal_text(parsed);
         if result.is_ok() {
             commit_safeguard_fallback(safeguard_notice);
@@ -2786,11 +3198,19 @@ impl ModelProvider for AnthropicModelProvider {
             )
         })?;
 
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        let (system_prompt, mut messages) =
+            Self::convert_messages(request.messages, self.cache_ttl, model);
 
         // Auto-cache last message if conversation is long
         if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
+            Self::apply_cache_to_last_message(&mut messages, self.cache_ttl);
+            Self::apply_prior_turn_breakpoint_within_budget(
+                system_prompt.as_ref(),
+                Self::is_setup_token(credential),
+                request.tools.is_some_and(|tools| !tools.is_empty()),
+                &mut messages,
+                self.cache_ttl,
+            );
         }
 
         // Check for tool_choice override from the agent loop (e.g. "any"
@@ -2809,16 +3229,16 @@ impl ModelProvider for AnthropicModelProvider {
 
         // For OAuth tokens, prepend Claude Code identity to system prompt
         let system_prompt = if Self::is_setup_token(credential) {
-            Self::apply_oauth_system_prompt(system_prompt)
+            Self::apply_oauth_system_prompt(system_prompt, self.cache_ttl)
         } else {
             system_prompt
         };
 
-        let (effective_temperature, thinking_config, effective_max_tokens) =
-            self.resolve_thinking(request.thinking, temperature, model);
-        let thinking_display_beta = thinking_config
-            .as_ref()
-            .is_some_and(|config| config.display.is_some());
+        let tuning = self.resolve_thinking(request.thinking, temperature, model);
+        let effective_temperature = tuning.temperature;
+        let effective_max_tokens = tuning.max_tokens;
+        // Only the progress-note display needs its beta feature.
+        let thinking_display_beta = tuning.display == Some(ThinkingDisplay::Updates);
 
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -2833,14 +3253,15 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking": tuning.thinking.as_ref().map(|thinking| thinking.kind),
+                        "effort": tuning.output_config.as_ref().map(|output| output.effort),
                     })),
                 "anthropic provider request prepared"
             );
         }
         // Non-streaming: opt into server-side fallback when configured, unless
         // native thinking is active on this request.
-        let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
+        let fallbacks = self.server_fallbacks_for(model, tuning.thinking.as_ref());
         let extra_betas: &[&str] = if fallbacks.is_some() {
             &[ANTHROPIC_SERVER_FALLBACK_BETA]
         } else {
@@ -2855,8 +3276,9 @@ impl ModelProvider for AnthropicModelProvider {
             tools: native_tools,
             tool_choice,
             stream: None,
-            thinking: thinking_config,
+            thinking: tuning.thinking,
             fallbacks,
+            output_config: tuning.output_config,
         };
 
         let req = self
@@ -2878,7 +3300,7 @@ impl ModelProvider for AnthropicModelProvider {
         commit_safeguard_fallback(None);
         Self::check_refusal(&native_response, model)?;
         let safeguard_notice = Self::server_fallback_notice(&native_response, model);
-        let parsed = Self::parse_native_response(native_response);
+        let parsed = Self::parse_native_response(native_response, model)?;
         if !parsed.is_semantically_empty_terminal() {
             commit_safeguard_fallback(safeguard_notice);
         }
@@ -3007,9 +3429,17 @@ impl ModelProvider for AnthropicModelProvider {
             }
         };
 
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        let (system_prompt, mut messages) =
+            Self::convert_messages(request.messages, self.cache_ttl, model);
         if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
+            Self::apply_cache_to_last_message(&mut messages, self.cache_ttl);
+            Self::apply_prior_turn_breakpoint_within_budget(
+                system_prompt.as_ref(),
+                Self::is_setup_token(&credential),
+                request.tools.is_some_and(|tools| !tools.is_empty()),
+                &mut messages,
+                self.cache_ttl,
+            );
         }
 
         let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
@@ -3025,18 +3455,25 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let system_prompt = if Self::is_setup_token(&credential) {
-            Self::apply_oauth_system_prompt(system_prompt)
+            Self::apply_oauth_system_prompt(system_prompt, self.cache_ttl)
         } else {
             system_prompt
         };
 
-        let (effective_temperature, thinking_config, effective_max_tokens) =
-            self.resolve_thinking(request.thinking, temperature, model);
-        let thinking_display_beta = thinking_config
+        let tuning = self.resolve_thinking(request.thinking, temperature, model);
+        let effective_temperature = tuning.temperature;
+        let effective_max_tokens = tuning.max_tokens;
+        let display_sent = tuning
+            .thinking
             .as_ref()
             .is_some_and(|config| config.display.is_some());
+        // Only the progress-note display needs its beta feature.
+        let thinking_display_beta = tuning.display == Some(ThinkingDisplay::Updates);
 
-        if thinking_config.is_some() && !thinking_display_beta {
+        // Only a fixed budget without a display takes the non-streaming
+        // path: adaptive requests stream, so long turns are not bound by the
+        // whole-request timeout.
+        if tuning.uses_fixed_budget() && !display_sent {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3060,10 +3497,11 @@ impl ModelProvider for AnthropicModelProvider {
                 tools: native_tools,
                 tool_choice,
                 stream: None,
-                thinking: thinking_config,
+                thinking: tuning.thinking,
                 // Streaming path (incl. this thinking `stream: None` request):
                 // never opts into server-side fallback.
                 fallbacks: None,
+                output_config: tuning.output_config,
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -3114,7 +3552,8 @@ impl ModelProvider for AnthropicModelProvider {
                 Self::check_refusal(&parsed, &requested_model)
                     .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
                 let safeguard_notice = Self::server_fallback_notice(&parsed, &requested_model);
-                let response = Self::parse_native_response(parsed);
+                let response = Self::parse_native_response(parsed, &requested_model)
+                    .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
                 if !response.is_semantically_empty_terminal() {
                     commit_safeguard_fallback(safeguard_notice);
                 }
@@ -3167,7 +3606,8 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking": tuning.thinking.as_ref().map(|thinking| thinking.kind),
+                        "effort": tuning.output_config.as_ref().map(|output| output.effort),
                         "thinking_display_beta": thinking_display_beta,
                     })),
                 "anthropic streaming provider request prepared"
@@ -3182,9 +3622,10 @@ impl ModelProvider for AnthropicModelProvider {
             tools: native_tools,
             tool_choice,
             stream: Some(true),
-            thinking: thinking_config,
+            thinking: tuning.thinking,
             // Streaming never opts into server-side fallback.
             fallbacks: None,
+            output_config: tuning.output_config,
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -3583,6 +4024,263 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
     }
 
+    /// Two thinking blocks around a text block, with a tool call after, so
+    /// ordering and separation are both covered.
+    fn fake_anthropic_thinking_sse() -> &'static [u8] {
+        b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"  Step \"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"one\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_a\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_b\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":2}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    async fn drain_sse(bytes: &'static [u8]) -> Vec<StreamResult<StreamEvent>> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn reasoning_records(events: &[StreamResult<StreamEvent>]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::ReasoningFinalized(payload)) => Some(payload.clone()),
+                Ok(StreamEvent::TextDelta(chunk)) => chunk.reasoning.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn refusal_before_any_output_is_reported_as_a_refusal() {
+        let json = r#"{
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber", "explanation": "ignored"}
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let refusal = AnthropicModelProvider::parse_native_response(response, "claude-sonnet-4-6")
+            .expect_err("a declined request is not an empty completion");
+        assert_eq!(refusal.category.as_deref(), Some("cyber"));
+    }
+
+    #[test]
+    fn refusal_without_details_reports_an_unspecified_category() {
+        for json in [
+            r#"{"content": [], "stop_reason": "refusal"}"#,
+            r#"{"content": [], "stop_reason": "refusal", "stop_details": null}"#,
+            r#"{"content": [], "stop_reason": "refusal", "stop_details": {"type": "refusal"}}"#,
+        ] {
+            let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+            let refusal =
+                AnthropicModelProvider::parse_native_response(response, "claude-sonnet-4-6")
+                    .expect_err("still a refusal without a category");
+            assert_eq!(refusal.category, None, "{json}");
+        }
+    }
+
+    #[test]
+    fn unrecognised_refusal_category_does_not_leak_provider_text() {
+        let json = r#"{
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"category": "some_new_policy"}
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let refusal = AnthropicModelProvider::parse_native_response(response, "claude-sonnet-4-6")
+            .unwrap_err();
+        assert_eq!(refusal.category.as_deref(), Some("some_new_policy"));
+        assert!(
+            !refusal.to_string().contains("some_new_policy"),
+            "provider text must not reach the rendered error"
+        );
+    }
+
+    #[test]
+    fn stop_details_are_ignored_for_other_stop_reasons() {
+        let json = r#"{
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "stop_details": {"category": "cyber"}
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(response, "claude-sonnet-4-6")
+            .expect("a normal completion is not a refusal");
+        assert_eq!(parsed.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn refusal_message_avoids_the_reliability_layer_heuristics() {
+        use zeroclaw_api::model_provider::ModelRefusalError;
+        for category in [
+            Some("cyber"),
+            Some("bio"),
+            Some("reasoning_extraction"),
+            Some("frontier_llm"),
+            None,
+            Some("some_new_policy"),
+        ] {
+            let rendered = ModelRefusalError {
+                requested_model: "claude-sonnet-4-6".to_string(),
+                category: category.map(str::to_owned),
+                usage: None,
+                attempted_candidate: None,
+                attempted_candidate_index: None,
+            }
+            .to_string();
+            let has_status_number = rendered
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|run| run.len() == 3 && run.starts_with('4'));
+            assert!(!has_status_number, "{rendered}");
+            for hint in ["context", "token", "limit", "quota", "denied", "forbidden"] {
+                assert!(
+                    !rendered.to_ascii_lowercase().contains(hint),
+                    "{rendered} must not read as {hint}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_refusal_after_output_reports_usage_then_ends() {
+        let sse: &[u8] = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"category\":\"bio\"}},\"usage\":{\"output_tokens\":7}}\n\n";
+        let events = drain_sse(sse).await;
+
+        assert!(
+            matches!(
+                events.last(),
+                Some(Err(StreamError::ModelRefusal(refusal))) if refusal.category.as_deref() == Some("bio")
+            ),
+            "the stream must end on the refusal: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            "a declined turn never completes"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Ok(StreamEvent::Usage(_)))),
+            "output already produced was billed"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_refusal_before_output_preserves_reported_zero_usage() {
+        let sse: &[u8] = b"event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n";
+        let events = drain_sse(sse).await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            matches!(&events[0], Ok(StreamEvent::Usage(usage)) if usage.output_tokens == Some(0))
+        );
+        assert!(
+            matches!(&events[1], Err(StreamError::ModelRefusal(refusal)) if refusal.usage.as_ref().is_some_and(|usage| usage.output_tokens == Some(0)))
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_block_is_emitted_once_with_verbatim_text() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let records = reasoning_records(&events);
+        assert_eq!(records.len(), 2, "one record per thinking block");
+
+        let first: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
+        assert_eq!(
+            first["thinking"], "  Step one",
+            "signatures cover the exact bytes, so leading space must survive"
+        );
+        assert_eq!(first["signature"], "sig_a");
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_block_without_text_is_kept_for_its_signature() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let records = reasoning_records(&events);
+        let second = records[1].trim_start_matches('\n');
+        let parsed: serde_json::Value = serde_json::from_str(second).unwrap();
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sig_b");
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_records_are_separated_for_replay() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let records = reasoning_records(&events);
+        // The consumer concatenates with no separator; the replay parser reads
+        // one record per line, so the joined form must split back cleanly.
+        let joined: String = records.concat();
+        let lines: Vec<&str> = joined.split('\n').collect();
+        assert_eq!(lines.len(), 2, "joined records: {joined}");
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("record must parse: {line}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_does_not_disturb_text_or_tool_ordering() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let labels: Vec<&str> = events
+            .iter()
+            .map(|event| match event {
+                Ok(StreamEvent::ThinkingDelta(_)) => "thinking_delta",
+                Ok(StreamEvent::ReasoningFinalized(_)) => "reasoning",
+                Ok(StreamEvent::TextDelta(chunk)) if chunk.reasoning.is_some() => "reasoning",
+                Ok(StreamEvent::TextDelta(_)) => "text",
+                Ok(StreamEvent::ToolCall(_)) => "tool_call",
+                Ok(StreamEvent::Usage(_)) => "usage",
+                Ok(StreamEvent::Final) => "final",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "thinking_delta",
+                "thinking_delta",
+                "reasoning",
+                "text",
+                "reasoning",
+                "usage",
+                "final"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn streaming_usage_emitted_before_final() {
         // The originallive repro was Anthropic streaming; before this
@@ -3606,6 +4304,7 @@ data: {\"type\":\"message_stop\"}\n\n"
         let states: Vec<&str> = events
             .iter()
             .map(|e| match e.as_ref() {
+                Ok(StreamEvent::TextDelta(chunk)) if chunk.reasoning.is_some() => "reasoning",
                 Ok(StreamEvent::TextDelta(_)) => "text",
                 Ok(StreamEvent::ThinkingDelta(_)) => "thinking",
                 Ok(StreamEvent::ReasoningFinalized(_)) => "reasoning_final",
@@ -3659,6 +4358,66 @@ data: {\"type\":\"message_stop\"}\n\n"
             Some(42),
             "cache_read_input_tokens from message_start"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_carries_error_type() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(err) = ev {
+                last_err = Some(err);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(msg) => {
+                assert_eq!(
+                    msg, "overloaded_error: Overloaded",
+                    "the machine-readable type must prefix the message so retry classification can match it"
+                );
+            }
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_without_type_keeps_message() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(err) = ev {
+                last_err = Some(err);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(msg) => {
+                assert_eq!(
+                    msg, "Overloaded",
+                    "message must be unchanged when the type is absent"
+                );
+            }
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
     }
 
     /// A reader that yields one buffer of bytes, then parks forever — models
@@ -4275,41 +5034,53 @@ data: {\"type\":\"message_stop\"}\n\n";
             anthropic_thinking_style("claude-fable-5-1-20260815"),
             AnthropicThinkingStyle::Adaptive
         );
-        // Budget-based families keep the `enabled` shape.
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-group/claude-fable-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
         assert_eq!(
             anthropic_thinking_style("claude-opus-4-6"),
-            AnthropicThinkingStyle::Budget
+            AnthropicThinkingStyle::Adaptive
         );
         assert_eq!(
             anthropic_thinking_style("claude-sonnet-4-6"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        // Budget-based families keep the `enabled` shape.
+        assert_eq!(
+            anthropic_thinking_style("claude-haiku-4-5"),
             AnthropicThinkingStyle::Budget
         );
         assert_eq!(
-            anthropic_thinking_style("claude-haiku-4-5"),
+            anthropic_thinking_style("claude-sonnet-4-5"),
             AnthropicThinkingStyle::Budget
         );
     }
 
     #[test]
-    fn resolve_thinking_uses_adaptive_for_opus_4_7() {
-        // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
-        // Native thinking is now sent in adaptive form instead of being
-        // dropped to prompt-based reasoning.
+    fn resolve_thinking_drops_the_budget_on_adaptive_generations() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         };
-        let (temp, config, max_tokens) =
-            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
-        let config = config.expect("adaptive thinking config for opus-4-7");
-        assert_eq!(config.kind, "adaptive");
-        assert_eq!(config.budget_tokens, None);
-        assert_eq!(config.display, None);
-        assert_eq!(temp, Some(1.0));
-        assert_eq!(max_tokens, provider.max_tokens);
+        let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
+        assert!(
+            tuning.thinking.is_none(),
+            "a budget without a depth sends no thinking object on this generation"
+        );
+        assert!(
+            tuning.temperature.is_none(),
+            "this generation rejects sampling parameters"
+        );
+        assert_eq!(tuning.max_tokens, provider.max_tokens);
     }
 
     #[test]
@@ -4318,36 +5089,432 @@ data: {\"type\":\"message_stop\"}\n\n";
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: Some(ThinkingDisplay::Updates),
         };
-        let (temp, config, max_tokens) =
+        let tuning =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1-20260815");
-        let config = config.expect("adaptive thinking config for fable-5-1");
-        assert_eq!(config.kind, "adaptive");
-        assert_eq!(config.budget_tokens, None);
-        assert_eq!(config.display, Some(ThinkingDisplay::Updates));
-        assert_eq!(temp, Some(1.0));
-        assert_eq!(max_tokens, provider.max_tokens);
+        let thinking = tuning
+            .thinking
+            .expect("adaptive thinking config for fable-5-1");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(thinking.budget_tokens, None);
+        // Progress notes are sent as a summary until a model is known to take them.
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+        assert!(tuning.temperature.is_none());
+        assert_eq!(tuning.max_tokens, provider.max_tokens);
     }
 
     #[test]
-    fn resolve_thinking_keeps_native_for_supported_models() {
+    fn resolve_thinking_keeps_the_budget_on_older_generations() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         };
-        let (temp, config, _) =
-            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
-        assert!(
-            config.is_some(),
-            "native thinking should activate on supported models"
-        );
+        let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-5");
+        assert!(tuning.uses_fixed_budget());
         // Forced to 1.0 per Anthropic native-thinking contract.
-        assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        assert!((tuning.temperature.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        let thinking = tuning
+            .thinking
+            .expect("a budget generation should carry the thinking object");
+        assert_eq!(thinking.kind, "enabled");
+        assert_eq!(thinking.budget_tokens, Some(10_000));
+    }
+
+    #[test]
+    fn resolve_thinking_sends_adaptive_shape_with_effort() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .max_tokens(32_000)
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: Some(10_000),
+            effort: Some(ThinkingEffort::High),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("a chosen depth should carry the thinking object");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(
+            thinking.budget_tokens, None,
+            "the budget must not reach this generation"
+        );
+        assert!(!tuning.uses_fixed_budget());
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high")
+        );
+        assert!(tuning.temperature.is_none());
+        assert_eq!(tuning.max_tokens, 32_000);
+    }
+
+    #[test]
+    fn thinking_display_is_sent_even_without_a_chosen_depth() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .expect("asking to see the reasoning must send the object");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+        assert!(
+            tuning.output_config.is_none(),
+            "visibility is not a depth setting"
+        );
+    }
+
+    #[test]
+    fn thinking_display_omitted_sends_no_display_value() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Omitted))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        assert!(
+            tuning.thinking.is_none(),
+            "the API default needs no request field"
+        );
+    }
+
+    #[test]
+    fn request_display_beats_the_alias_display() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        // The alias asks for the API default, which sends nothing; the
+        // request asks for a summary and gets it.
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Omitted))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Summarized),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("a chosen display sends the object");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn request_omitted_display_silences_the_alias_display() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Omitted),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
+        assert!(
+            tuning.thinking.is_none(),
+            "the request chose the API default, so the alias summary must not leak in"
+        );
+        assert_eq!(tuning.display, None);
+    }
+
+    #[test]
+    fn alias_display_applies_when_the_request_names_none() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("a chosen depth sends the object");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn resolve_thinking_drops_the_display_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("the chosen depth still sends the object");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(
+            thinking.display, None,
+            "this generation takes no display, whichever side asked"
+        );
+        assert_eq!(tuning.display, None);
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn progress_notes_are_sent_as_summaries_until_a_model_takes_them() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        for model in ["claude-opus-4-7", "claude-fable-5-1"] {
+            let tuning = provider.resolve_thinking(Some(params), None, model);
+            assert_eq!(
+                tuning
+                    .thinking
+                    .as_ref()
+                    .and_then(|thinking| thinking.display),
+                Some(ThinkingDisplay::Summarized),
+                "{model} gets a summary in place of progress notes"
+            );
+            assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+        }
+
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
+        assert!(
+            tuning.thinking.is_none(),
+            "a generation that takes no display sends nothing"
+        );
+        assert_eq!(tuning.display, None);
+    }
+
+    #[test]
+    fn progress_notes_display_asks_for_its_beta_feature() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-key"))
+            .build();
+        assert_eq!(
+            provider
+                .beta_header_value("sk-ant-key", Some(ThinkingDisplay::Updates))
+                .as_deref(),
+            Some(THINKING_DISPLAY_UPDATES_BETA)
+        );
+    }
+
+    #[test]
+    fn progress_notes_display_joins_the_subscription_betas() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-oat01-token"))
+            .build();
+        let header = provider
+            .beta_header_value("sk-ant-oat01-token", Some(ThinkingDisplay::Updates))
+            .expect("both beta features apply");
+        assert!(header.starts_with(SETUP_TOKEN_BETAS), "{header}");
+        assert!(header.ends_with(THINKING_DISPLAY_UPDATES_BETA), "{header}");
+    }
+
+    #[test]
+    fn beta_header_follows_the_display_actually_sent() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        // The alias asks for progress notes, but the request that goes out
+        // carries a summary, so the beta the notes need stays off.
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Updates))
+            .build();
+        assert!(
+            provider
+                .beta_header_value("sk-ant-key", Some(ThinkingDisplay::Summarized))
+                .is_none()
+        );
+        assert!(provider.beta_header_value("sk-ant-key", None).is_none());
+    }
+
+    #[test]
+    fn plain_credential_without_display_asks_for_no_beta() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-key"))
+            .build();
+        assert!(provider.beta_header_value("sk-ant-key", None).is_none());
+    }
+
+    #[test]
+    fn resolve_thinking_sends_nothing_without_a_chosen_depth() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        assert!(tuning.thinking.is_none());
+        assert!(tuning.output_config.is_none());
+        assert!(tuning.temperature.is_none());
+    }
+
+    #[test]
+    fn resolve_thinking_maps_every_depth_to_its_wire_value() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        for (effort, expected) in [
+            (ThinkingEffort::Low, "low"),
+            (ThinkingEffort::High, "high"),
+            (ThinkingEffort::XHigh, "xhigh"),
+            (ThinkingEffort::Max, "max"),
+        ] {
+            let params = NativeThinkingParams {
+                budget_tokens: None,
+                effort: Some(effort),
+                display: None,
+            };
+            let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-5");
+            assert_eq!(
+                tuning.output_config.as_ref().map(|output| output.effort),
+                Some(expected),
+                "wire value for {effort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_thinking_fits_xhigh_to_high_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::XHigh),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high"),
+            "the depth just below stands in for one the generation lacks"
+        );
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn resolve_thinking_ignores_depth_on_older_generations() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), Some(0.3_f64), "claude-haiku-4-5");
+        assert!(tuning.thinking.is_none());
+        assert!(
+            tuning.output_config.is_none(),
+            "older generations have no depth setting"
+        );
+        assert!(
+            (tuning.temperature.unwrap() - 0.3_f64).abs() < f64::EPSILON,
+            "older generations still accept sampling parameters"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_serializes_adaptive_thinking_and_effort() {
+        let req = NativeChatRequest {
+            model: "claude-fable-5-1".to_string(),
+            max_tokens: 32_000,
+            system: None,
+            messages: vec![],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: Some(true),
+            thinking: Some(NativeThinkingConfig {
+                kind: "adaptive",
+                budget_tokens: None,
+                display: Some(ThinkingDisplay::Summarized),
+            }),
+            output_config: Some(OutputConfig { effort: "max" }),
+            fallbacks: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""thinking":{"type":"adaptive","display":"summarized"}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""output_config":{"effort":"max"}"#),
+            "{json}"
+        );
+        assert!(!json.contains("budget_tokens"), "{json}");
+        assert!(!json.contains("temperature"), "{json}");
+    }
+
+    #[test]
+    fn native_chat_request_serializes_the_budget_shape_unchanged() {
+        let req = NativeChatRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 11_000,
+            system: None,
+            messages: vec![],
+            temperature: Some(1.0),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: Some(NativeThinkingConfig {
+                kind: "enabled",
+                budget_tokens: Some(10_000),
+                display: None,
+            }),
+            output_config: None,
+            fallbacks: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""thinking":{"type":"enabled","budget_tokens":10000}"#),
+            "{json}"
+        );
+        assert!(!json.contains("output_config"), "{json}");
+        assert!(!json.contains("display"), "{json}");
     }
 
     #[test]
@@ -4363,6 +5530,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -4385,6 +5553,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -4404,6 +5573,197 @@ data: {\"type\":\"message_stop\"}\n\n";
         let cache = CacheControl::ephemeral();
         let json = serde_json::to_string(&cache).unwrap();
         assert_eq!(json, r#"{"type":"ephemeral"}"#);
+    }
+
+    /// D5 pin: the default (5m) lifetime serializes byte-identically to the
+    /// pre-TTL wire, and only the 1h lifetime adds the `ttl` field.
+    #[test]
+    fn cache_control_ttl_serialization_pinned() {
+        let five_minutes = CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes);
+        assert_eq!(
+            serde_json::to_string(&five_minutes).unwrap(),
+            r#"{"type":"ephemeral"}"#,
+            "5m must serialize exactly like the pre-TTL default marker"
+        );
+        let one_hour = CacheControl::ephemeral_with_ttl(CacheTtl::OneHour);
+        assert_eq!(
+            serde_json::to_string(&one_hour).unwrap(),
+            r#"{"type":"ephemeral","ttl":"1h"}"#,
+            "1h must emit exactly one added field, in declaration order"
+        );
+    }
+
+    /// Collect every `cache_control` object in a serialized request body so
+    /// TTL tests can assert on all markers at once (system, tools, prior turn, rolling).
+    #[cfg(test)]
+    fn collect_cache_controls(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(control) = map.get("cache_control") {
+                    out.push(control.clone());
+                }
+                for nested in map.values() {
+                    collect_cache_controls(nested, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_cache_controls(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// D2: the OAuth identity prefix and the system block are separate
+    /// markers; both carry the configured lifetime, never a mix.
+    #[test]
+    fn oauth_system_prompt_carries_configured_ttl_on_every_block() {
+        let one_hour = AnthropicModelProvider::apply_oauth_system_prompt(
+            Some(SystemPrompt::String("be brief".to_string())),
+            CacheTtl::OneHour,
+        );
+        let Some(SystemPrompt::Blocks(blocks)) = one_hour else {
+            panic!("oauth system prompt must produce blocks");
+        };
+        assert_eq!(blocks.len(), 2, "prefix plus system block");
+        for block in &blocks {
+            let control = block.cache_control.as_ref().expect("marker on each block");
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral","ttl":"1h"}"#,
+                "every oauth block carries the 1h lifetime"
+            );
+        }
+
+        let default = AnthropicModelProvider::apply_oauth_system_prompt(
+            Some(SystemPrompt::String("be brief".to_string())),
+            CacheTtl::default(),
+        );
+        let Some(SystemPrompt::Blocks(blocks)) = default else {
+            panic!("oauth system prompt must produce blocks");
+        };
+        for block in &blocks {
+            let control = block.cache_control.as_ref().expect("marker on each block");
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default lifetime keeps the pre-TTL wire form"
+            );
+        }
+    }
+
+    /// D2 + D5 mock pin: with the 1h lifetime configured, every marker the
+    /// native provider places in one request (system block, last tool,
+    /// prior turn, rolling last message) carries `"ttl":"1h"`; with the default, the
+    /// body contains no `ttl` key at all.
+    #[tokio::test]
+    async fn native_cache_ttl_marks_every_marker_per_request() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async fn run_request(cache_ttl: CacheTtl) -> serde_json::Value {
+            let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+            let captured_clone = Arc::clone(&captured);
+
+            let app = Router::new().route(
+                "/v1/messages",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let cap = captured_clone.clone();
+                    async move {
+                        *cap.lock().unwrap() = Some(body);
+                        Json(serde_json::json!({
+                            "id": "msg_ttl",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "model": "claude-sonnet-4-5",
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 10, "output_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&format!("http://{addr}"))
+                .cache_ttl(cache_ttl)
+                .build();
+
+            let messages = vec![
+                ChatMessage::system("You are a helpful assistant."),
+                ChatMessage::user("gen a 2 sum in golang"),
+                ChatMessage::assistant("```go\nfunc twoSum() {}\n```"),
+                ChatMessage::user("what's meaning of make here?"),
+            ];
+            let tools = vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"]
+                    }
+                }
+            })];
+
+            let result = provider
+                .chat_with_tools(&messages, &tools, "claude-sonnet-4-5", Some(0.7))
+                .await;
+            assert!(result.is_ok(), "request failed: {:?}", result.err());
+            server.abort();
+
+            captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("request body captured")
+        }
+
+        let one_hour = run_request(CacheTtl::OneHour).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            4,
+            "system + tools + prior-turn + rolling last message markers expected: {one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["type"], "ephemeral",
+                "one TTL per request: every marker carries the 1h lifetime"
+            );
+            assert_eq!(
+                control["ttl"], "1h",
+                "one TTL per request: every marker carries the 1h lifetime"
+            );
+        }
+
+        let default = run_request(CacheTtl::default()).await;
+        assert!(
+            !default.to_string().contains("\"ttl\""),
+            "default config must produce requests with no ttl key anywhere: {default}"
+        );
+        let mut controls = Vec::new();
+        collect_cache_controls(&default, &mut controls);
+        assert_eq!(controls.len(), 4, "marker placement unchanged by the field");
+        for control in &controls {
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default markers serialize byte-identically to the pre-TTL wire"
+            );
+        }
     }
 
     #[test]
@@ -4588,7 +5948,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }],
         }];
 
-        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
 
         match &messages[0].content[0] {
             NativeContentOut::Text { cache_control, .. } => {
@@ -4609,7 +5969,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }],
         }];
 
-        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
 
         match &messages[0].content[0] {
             NativeContentOut::ToolResult { cache_control, .. } => {
@@ -4631,7 +5991,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }],
         }];
 
-        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
 
         // ToolUse should not be affected
         match &messages[0].content[0] {
@@ -4642,12 +6002,636 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    /// A message ending in an image takes the rolling breakpoint on its text
+    /// block; the image block never carries one.
+    #[test]
+    fn apply_cache_to_last_message_text_then_image_marks_text() {
+        let mut messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "look at this".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: CANONICAL_PNG_B64.to_string(),
+                    },
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[0].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[0]["content"][1].get("cache_control").is_none(),
+            "the trailing image must not gain a cache marker: {wire}"
+        );
+    }
+
+    /// An image-only last message cannot host the breakpoint, so it rolls back
+    /// to the nearest earlier message that can; the image-only message itself
+    /// stays unmarked.
+    #[test]
+    fn apply_cache_to_last_message_image_only_rolls_back() {
+        let mut messages = vec![
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: CANONICAL_PNG_B64.to_string(),
+                    },
+                }],
+            },
+        ];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[1].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "the nearest earlier text block must carry the rolling breakpoint"
+                );
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[2]["content"][0].get("cache_control").is_none(),
+            "the image-only last message must stay unmarked: {wire}"
+        );
+    }
+
+    /// The realistic unmarkable-trailing shape: an assistant tool-call message
+    /// holds thinking, then text, then tool_use. The backward scan skips the
+    /// tool_use and the thinking and marks the text, leaving both unmarkable
+    /// blocks alone.
+    #[test]
+    fn apply_cache_to_last_message_skips_thinking_and_tool_use_to_mark_text() {
+        let mut messages = vec![NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                NativeContentOut::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+                NativeContentOut::Text {
+                    text: "checking the weather".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::ToolUse {
+                    id: "tool_123".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({}),
+                    cache_control: None,
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[0].content[1] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[0]["content"][0].get("cache_control").is_none()
+                && wire[0]["content"][2].get("cache_control").is_none(),
+            "thinking and tool_use blocks must stay unmarked: {wire}"
+        );
+    }
+
+    /// Whatever the last message's shape, the rolling pass leaves exactly one
+    /// breakpoint in the whole message list.
+    #[test]
+    fn apply_cache_to_last_message_places_exactly_one_breakpoint() {
+        let mut messages = vec![
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![
+                    NativeContentOut::Text {
+                        text: "look at this".to_string(),
+                        cache_control: None,
+                    },
+                    NativeContentOut::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: CANONICAL_PNG_B64.to_string(),
+                        },
+                    },
+                ],
+            },
+        ];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        let breakpoints = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| match block {
+                NativeContentOut::Text { cache_control, .. }
+                | NativeContentOut::ToolResult { cache_control, .. }
+                | NativeContentOut::ToolUse { cache_control, .. } => cache_control.is_some(),
+                NativeContentOut::Image { .. } | NativeContentOut::Thinking { .. } => false,
+            })
+            .count();
+        assert_eq!(
+            breakpoints, 1,
+            "exactly one rolling breakpoint per request, got {breakpoints}"
+        );
+    }
+
     #[test]
     fn apply_cache_empty_messages() {
         let mut messages = vec![];
-        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
         // Should not panic
         assert!(messages.is_empty());
+    }
+
+    /// Native text message with one unmarked text block.
+    fn native_text_message(role: &str, text: &str) -> NativeMessage {
+        NativeMessage {
+            role: role.to_string(),
+            content: vec![NativeContentOut::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// Native assistant message whose trailing block is a tool call, the
+    /// shape `parse_assistant_tool_call_message` always produces (text
+    /// precedes the calls).
+    fn native_tool_call_carrier() -> NativeMessage {
+        NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![NativeContentOut::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// Native user message carrying one tool result, the wire shape of
+    /// `tool_result_message`.
+    fn native_tool_result_carrier() -> NativeMessage {
+        NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: ToolResultContent::Text("result".to_string()),
+                cache_control: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_lands_on_previous_assistant_text() {
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(1),
+            "the message before the last user message is the previous turn's last message"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_is_none_without_a_previous_turn() {
+        let single_exchange = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&single_exchange),
+            None,
+            "the only user message opens the turn, so nothing sits before it"
+        );
+        let single_message = vec![native_text_message("user", "q1")];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&single_message),
+            None
+        );
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&[]),
+            None,
+            "empty history has no placement"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_lands_on_tool_result() {
+        // The previous turn was cut short after its tool result.
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_tool_call_carrier(),
+            native_tool_result_carrier(),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(2),
+            "a trailing tool_result block is cacheable, the same gate the rolling marker uses"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_walks_back_over_tool_call_carrier() {
+        // Mid-loop: the last user-role message is the tool-result carrier, so
+        // the first candidate is the tool-call carrier; the rule steps back
+        // onto the turn's opening user message.
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+            native_tool_call_carrier(),
+            native_tool_result_carrier(),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_gives_up_after_two_walk_back_steps() {
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_tool_call_carrier(),
+            native_tool_call_carrier(),
+            native_tool_call_carrier(),
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            None,
+            "candidates three, two, and one are all carriers; the search stops after two \
+             walk-back steps instead of landing further back"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_index_skips_trailing_image() {
+        let image_only = NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![NativeContentOut::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                },
+            }],
+        };
+        let messages = vec![
+            native_text_message("user", "q1"),
+            image_only,
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            None,
+            "a message ending on an image block is breakpoint-transparent; walking back \
+             reaches index zero, which is out of bounds"
+        );
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_places_marker_for_plain_keys() {
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            false,
+            true,
+            &mut messages,
+            CacheTtl::default(),
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_skips_oauth_tool_requests() {
+        // OAuth prefix (1) + system text (1) + last tool definition (1) +
+        // rolling marker (1) = 4: the cap is already spent, so the marker
+        // must be skipped rather than 400 the request.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            true,
+            &mut messages,
+            CacheTtl::default(),
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_allows_oauth_without_tools() {
+        // OAuth prefix (1) + system text (1) + rolling marker (1) = 3: one
+        // slot left, so the marker lands.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            false,
+            &mut messages,
+            CacheTtl::default(),
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_breakpoint_within_budget_without_rolling_marker() {
+        // No rolling pass has run: OAuth prefix (1) + system text (1) +
+        // tools (1) = 3, leaving one slot for the prior-turn marker.
+        let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        let mut messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "a1"),
+            native_text_message("user", "q2"),
+            native_tool_call_carrier(),
+        ];
+        AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+            system.as_ref(),
+            true,
+            true,
+            &mut messages,
+            CacheTtl::default(),
+        );
+        assert!(matches!(
+            &messages[1].content[0],
+            NativeContentOut::Text {
+                cache_control: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prior_turn_budget_with_rolling_fallback_preserves_cap_and_ttl() {
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+            // Exercise both a same-message backward scan and a fallback to
+            // an earlier message, distinct from the prior-turn anchor.
+            for earlier_message in [false, true] {
+                for has_tools in [false, true] {
+                    let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+                        block_type: "text".to_string(),
+                        text: "be brief".to_string(),
+                        cache_control: Some(CacheControl::ephemeral_with_ttl(ttl)),
+                    }]));
+                    let mut messages = vec![
+                        native_text_message("user", "q1"),
+                        native_text_message("assistant", "a1"),
+                        native_text_message("user", "q2"),
+                    ];
+                    if earlier_message {
+                        messages.push(native_tool_call_carrier());
+                    } else {
+                        messages[2]
+                            .content
+                            .extend(native_tool_call_carrier().content);
+                    }
+                    assert_eq!(
+                        AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+                        Some(1)
+                    );
+                    AnthropicModelProvider::apply_cache_to_last_message(&mut messages, ttl);
+                    AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+                        system.as_ref(),
+                        true,
+                        has_tools,
+                        &mut messages,
+                        ttl,
+                    );
+                    let wire = serde_json::json!({
+                        "system": AnthropicModelProvider::apply_oauth_system_prompt(system, ttl),
+                        "tools": if has_tools { vec![NativeToolSpec {
+                            name: "get_weather".to_string(),
+                            description: "Get weather".to_string(),
+                            input_schema: std::sync::Arc::new(serde_json::json!({"type": "object"})),
+                            cache_control: Some(CacheControl::ephemeral_with_ttl(ttl)),
+                        }] } else { vec![] },
+                        "messages": messages,
+                    });
+                    let mut controls = Vec::new();
+                    collect_cache_controls(&wire, &mut controls);
+                    assert_eq!(controls.len(), 4, "{wire}");
+                    let expected =
+                        serde_json::to_value(CacheControl::ephemeral_with_ttl(ttl)).unwrap();
+                    assert!(
+                        controls.iter().all(|control| control == &expected),
+                        "{wire}"
+                    );
+                    assert_eq!(
+                        wire["messages"][1]["content"][0]
+                            .get("cache_control")
+                            .is_some(),
+                        !has_tools,
+                        "a distinct prior anchor needs a free slot: {wire}"
+                    );
+                    assert_eq!(wire["messages"][2]["content"][0]["cache_control"], expected);
+                    let last = wire["messages"].as_array().unwrap().last().unwrap();
+                    assert!(
+                        last["content"]
+                            .as_array()
+                            .unwrap()
+                            .last()
+                            .unwrap()
+                            .get("cache_control")
+                            .is_none(),
+                        "{wire}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prior_turn_budget_colocated_with_rolling_fallback_uses_one_slot() {
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+            let system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "be brief".to_string(),
+                cache_control: Some(CacheControl::ephemeral_with_ttl(ttl)),
+            }]));
+            let mut messages = vec![
+                native_text_message("user", "q1"),
+                native_text_message("assistant", "a1"),
+                NativeMessage {
+                    role: "user".to_string(),
+                    content: vec![NativeContentOut::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: CANONICAL_PNG_B64.to_string(),
+                        },
+                    }],
+                },
+            ];
+            AnthropicModelProvider::apply_cache_to_last_message(&mut messages, ttl);
+            let before = serde_json::to_value(&messages).unwrap();
+            AnthropicModelProvider::apply_prior_turn_breakpoint_within_budget(
+                system.as_ref(),
+                true,
+                true,
+                &mut messages,
+                ttl,
+            );
+            let after = serde_json::to_value(&messages).unwrap();
+            assert_eq!(
+                before, after,
+                "co-location must preserve the existing marker"
+            );
+            let mut controls = Vec::new();
+            collect_cache_controls(&after, &mut controls);
+            assert_eq!(
+                controls,
+                vec![serde_json::to_value(CacheControl::ephemeral_with_ttl(ttl)).unwrap()]
+            );
+            assert_eq!(
+                AnthropicModelProvider::marked_system_block_count(system.as_ref())
+                    + 1
+                    + 1
+                    + controls.len(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn prior_turn_selector_does_not_adopt_rolling_block_scan() {
+        let mut carrier = native_text_message("assistant", "incidental text");
+        carrier.content.extend(native_tool_call_carrier().content);
+        let messages = vec![
+            native_text_message("user", "q1"),
+            native_text_message("assistant", "stable anchor"),
+            carrier,
+            native_text_message("user", "q2"),
+        ];
+        assert_eq!(
+            AnthropicModelProvider::prior_turn_breakpoint_index(&messages),
+            Some(1),
+            "the prior-turn selector must skip a text-plus-tool-use carrier"
+        );
+    }
+
+    #[test]
+    fn marked_system_block_count_reads_block_markers() {
+        assert_eq!(AnthropicModelProvider::marked_system_block_count(None), 0);
+        assert_eq!(
+            AnthropicModelProvider::marked_system_block_count(Some(&SystemPrompt::String(
+                "be brief".to_string()
+            ))),
+            0
+        );
+        let marked = Some(SystemPrompt::Blocks(vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: "be brief".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }]));
+        assert_eq!(
+            AnthropicModelProvider::marked_system_block_count(marked.as_ref()),
+            1
+        );
     }
 
     /// Provider instance for `convert_tools` tests — conversion is a `&self`
@@ -4805,7 +6789,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: "Short system prompt".to_string(),
         }];
 
-        let (system_prompt, _) = AnthropicModelProvider::convert_messages(&messages);
+        let (system_prompt, _) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         match system_prompt.unwrap() {
             SystemPrompt::Blocks(blocks) => {
@@ -4830,7 +6818,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: large_content.clone(),
         }];
 
-        let (system_prompt, _) = AnthropicModelProvider::convert_messages(&messages);
+        let (system_prompt, _) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         match system_prompt.unwrap() {
             SystemPrompt::Blocks(blocks) => {
@@ -4866,6 +6858,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -4895,6 +6888,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -4932,7 +6926,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (system, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         // System prompt extracted
         assert!(system.is_some());
@@ -5075,6 +7073,126 @@ data: {\"type\":\"message_stop\"}\n\n";
         server_handle.abort();
     }
 
+    /// OAuth setup token, tools, and multi-turn history: the request already
+    /// spends all four breakpoint slots (identity prefix, system text, last
+    /// tool definition, rolling marker), so the prior-turn marker must be
+    /// skipped rather than exceed the API's four-block cap and 400 every
+    /// request.
+    #[tokio::test]
+    async fn oauth_tool_request_stays_inside_four_breakpoint_cap() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    Json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "model": "claude-opus-4-6",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 100, "output_tokens": 20}
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Setup-token shape: routes through the OAuth system prefix.
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-oat01-test"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build();
+
+        let messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("gen a 2 sum in golang"),
+            ChatMessage::assistant("here is the code"),
+            ChatMessage::user("what's meaning of make here?"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"}
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+
+        let result = model_provider
+            .chat_with_tools(&messages, &tools, "claude-opus-4-6", None)
+            .await;
+        assert!(result.is_ok(), "chat_with_tools failed: {:?}", result.err());
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+
+        // Total markers: OAuth prefix + system text + last tool + rolling.
+        // The prior-turn slot is the one the budget skips.
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            4,
+            "OAuth tool request must carry exactly the four committed breakpoints: {body}"
+        );
+
+        // The system field carries both the identity prefix and the system
+        // text markers.
+        let system_blocks = body["system"].as_array().expect("system blocks");
+        assert_eq!(system_blocks.len(), 2, "OAuth prefix must be present");
+        assert!(
+            system_blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are Claude Code"),
+            "identity prefix must stay first"
+        );
+        assert_eq!(
+            system_blocks[0]["cache_control"]["type"], "ephemeral",
+            "prefix block keeps its marker"
+        );
+        assert_eq!(
+            system_blocks[1]["cache_control"]["type"], "ephemeral",
+            "system text block keeps its marker"
+        );
+
+        // The middle assistant message (the previous turn's last message)
+        // carries no marker: the budget skipped the prior-turn placement.
+        let wire_messages = body["messages"].as_array().unwrap();
+        let assistant_message = &wire_messages[1];
+        assert_eq!(assistant_message["role"], "assistant");
+        assert!(
+            !assistant_message.to_string().contains("cache_control"),
+            "prior-turn marker must be skipped on the OAuth tool path: {assistant_message}"
+        );
+
+        server_handle.abort();
+    }
+
     #[test]
     fn native_response_parses_usage() {
         let json = r#"{
@@ -5082,7 +7200,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "usage": {"input_tokens": 300, "output_tokens": 75}
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("response is not a refusal");
         let usage = result.usage.unwrap();
         assert_eq!(usage.input_tokens, Some(300));
         assert_eq!(usage.output_tokens, Some(75));
@@ -5100,7 +7219,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             }
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("response is not a refusal");
         let usage = result.usage.expect("usage should be Some");
         assert_eq!(
             usage.input_tokens,
@@ -5120,7 +7240,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_response_parses_without_usage() {
         let json = r#"{"content": [{"type": "text", "text": "Hello"}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("response is not a refusal");
         assert!(result.usage.is_none());
     }
 
@@ -5132,7 +7253,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         }"#;
         let response: NativeChatResponse = serde_json::from_str(json).unwrap();
         let error = AnthropicModelProvider::require_terminal_text(
-            AnthropicModelProvider::parse_native_response(response),
+            AnthropicModelProvider::parse_native_response(response, "claude-sonnet-4-6")
+                .expect("response is not a refusal"),
         )
         .expect_err("thinking alone is not a string-only final answer");
 
@@ -5151,7 +7273,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ]
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("response is not a refusal");
 
         assert!(result.is_semantically_empty_terminal());
         assert!(result.reasoning_content.is_some());
@@ -5173,7 +7296,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ]
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("response is not a refusal");
         let reasoning = result.reasoning_content.expect("thinking preserved");
         let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
         assert_eq!(
@@ -5187,9 +7311,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_response_keeps_signature_only_blocks() {
-        // `omitted` display yields empty `thinking` with a required
-        // signature; dropping the block would break tool-use replay.
+    fn native_response_keeps_a_signature_only_thinking_block() {
+        // Withheld reasoning still arrives signed, and the signature is what
+        // the next request in the round has to replay.
         let json = r#"{
             "content": [
                 {"type": "thinking", "thinking": "", "signature": "sig_xyz"},
@@ -5197,14 +7321,28 @@ data: {\"type\":\"message_stop\"}\n\n";
             ]
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("response is not a refusal");
         let reasoning = result
             .reasoning_content
-            .expect("signature-only block must reach replay");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&reasoning).expect("replay line must be a JSON object");
+            .expect("a signed block must survive for replay");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
         assert_eq!(parsed["thinking"], "");
         assert_eq!(parsed["signature"], "sig_xyz");
+    }
+
+    #[test]
+    fn native_response_drops_thinking_blocks_with_nothing_to_replay() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": ""},
+                {"type": "text", "text": "hello"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("response is not a refusal");
+        assert!(result.reasoning_content.is_none());
     }
 
     #[test]
@@ -5228,7 +7366,11 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].role, "user");
@@ -5269,7 +7411,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
         }];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].content.len(), 2);
@@ -5298,7 +7444,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: "Hello, how are you?".to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].content.len(), 1);
@@ -5330,6 +7480,160 @@ data: {\"type\":\"message_stop\"}\n\n";
             json
         );
         assert!(json.contains(r#""data":"testdata""#), "JSON: {}", json);
+    }
+
+    #[test]
+    fn thinking_replays_only_the_in_flight_round_on_models_that_strip_old_thinking() {
+        let messages = thinking_replay_messages();
+        let (_, native) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-haiku-4-5",
+        );
+        let wire = serde_json::to_value(&native).unwrap();
+        let signatures: Vec<&str> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .filter_map(|block| block.get("signature").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            signatures,
+            vec!["sig_new"],
+            "only the in-flight round replays its reasoning: {wire:#}"
+        );
+        let assistant_turns: Vec<&serde_json::Value> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|msg| msg["role"] == "assistant")
+            .collect();
+        let in_flight = assistant_turns
+            .last()
+            .expect("the in-flight assistant turn must survive");
+        assert_eq!(
+            in_flight["content"][0]["type"], "thinking",
+            "an assistant message must start with its thinking: {in_flight:#}"
+        );
+    }
+
+    #[test]
+    fn thinking_replays_every_turn_on_models_that_keep_it() {
+        let messages = thinking_replay_messages();
+        let (_, native) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-opus-4-5",
+        );
+        let wire = serde_json::to_value(&native).unwrap();
+        let signatures: Vec<&str> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .filter_map(|block| block.get("signature").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            signatures,
+            vec!["sig_old", "sig_new"],
+            "a model that keeps prior turns' thinking replays every signed block: {wire:#}"
+        );
+        let assistant_turns: Vec<&serde_json::Value> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|msg| msg["role"] == "assistant")
+            .collect();
+        for (position, turn) in assistant_turns.iter().enumerate() {
+            let has_reasoning = turn["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "thinking"));
+            if has_reasoning {
+                assert_eq!(
+                    turn["content"][0]["type"], "thinking",
+                    "an assistant turn carrying reasoning must start with it (turn {position}): {turn:#}"
+                );
+            }
+        }
+    }
+
+    /// Two finished tool rounds, each with a signed reasoning block, plus the
+    /// round still in flight. Shared by the replay-policy tests.
+    fn thinking_replay_messages() -> Vec<ChatMessage> {
+        let envelope = |thinking: &str, signature: &str, call_id: &str| {
+            serde_json::json!({
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "name": "shell",
+                    "arguments": "{}",
+                }],
+                "reasoning_content": serde_json::json!({
+                    "thinking": thinking,
+                    "signature": signature,
+                })
+                .to_string(),
+            })
+            .to_string()
+        };
+        vec![
+            ChatMessage::user("first ask"),
+            ChatMessage::assistant(envelope("earlier", "sig_old", "call_1")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+            ChatMessage::assistant("finished the first ask"),
+            ChatMessage::user("second ask"),
+            ChatMessage::assistant(envelope("current", "sig_new", "call_2")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_2", "content": "done"})
+                    .to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn thinking_replay_boundary_ignores_internal_pruning_markers() {
+        let envelope = serde_json::json!({
+            "content": "",
+            "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": serde_json::json!({
+                "thinking": "current",
+                "signature": "sig_new",
+            })
+            .to_string(),
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("the ask"),
+            ChatMessage::assistant(&envelope),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+        ];
+
+        let (_, native) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
+        let wire = serde_json::to_value(&native).unwrap();
+        let has_signature = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .any(|block| block.get("signature").is_some());
+        assert!(
+            has_signature,
+            "the only round present is in flight: {wire:#}"
+        );
     }
 
     #[test]
@@ -5374,7 +7678,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (system, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         assert!(system.is_some());
         // Should be: user, assistant, user (merged tool results)
@@ -5424,7 +7732,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let assistant_idx = native_msgs
             .iter()
@@ -5475,7 +7787,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let last = native_msgs.last().expect("messages present");
         assert_eq!(last.role, "user");
@@ -5521,7 +7837,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         assert!(
             roles_alternate(&native_msgs),
@@ -5550,7 +7870,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::assistant("done"),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         assert!(
             roles_alternate(&native_msgs),
@@ -5615,7 +7939,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let wire = serde_json::to_value(&native_msgs).expect("serialize native messages");
 
         for message in wire.as_array().expect("messages") {
@@ -5886,7 +8214,11 @@ data: {\"type\":\"message_stop\"}\n\n";
              and [IMAGE:data:image/jpeg;base64,{CANONICAL_JPEG_B64}]"
         ));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         let blocks = tool_result["content"]
             .as_array()
@@ -5932,7 +8264,11 @@ data: {\"type\":\"message_stop\"}\n\n";
              [IMAGE:http://example.com/remote.png]"
         ));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         let blocks = tool_result["content"]
             .as_array()
@@ -5981,7 +8317,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
         ));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         let blocks = tool_result["content"]
             .as_array()
@@ -6030,7 +8370,11 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "prose [IMAGE:{rejected}] [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
             ));
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+                &messages,
+                CacheTtl::default(),
+                "claude-sonnet-4-5",
+            );
             let tool_result = first_tool_result_on_the_wire(&native_msgs);
             let blocks = tool_result["content"]
                 .as_array()
@@ -6081,12 +8425,16 @@ data: {\"type\":\"message_stop\"}\n\n";
             "shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
         ));
 
-        let (_, mut native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, mut native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         assert!(
             AnthropicModelProvider::should_cache_conversation(&messages),
             "this history must be long enough to be cached, or the test is vacuous"
         );
-        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs, CacheTtl::default());
 
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         let blocks = tool_result["content"]
@@ -6099,6 +8447,60 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(
             tool_result["cache_control"]["type"], "ephemeral",
             "block-list content must not cost the request its cache breakpoint: {tool_result}"
+        );
+    }
+
+    /// A user turn that carries an attachment keeps its rolling breakpoint:
+    /// the marker lands on the turn's text block, the image block stays
+    /// unmarked, and the message list holds exactly one breakpoint.
+    #[test]
+    fn image_carrying_user_turn_keeps_rolling_breakpoint_on_text() {
+        let messages = vec![
+            ChatMessage::system("You look at pictures."),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+
+        let (_, mut native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-6",
+        );
+        assert!(
+            AnthropicModelProvider::should_cache_conversation(&messages),
+            "this history must be long enough to be cached, or the test is vacuous"
+        );
+        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs, CacheTtl::default());
+
+        let wire = serde_json::to_value(&native_msgs).expect("serialize native messages");
+        let last = wire
+            .as_array()
+            .and_then(|on_wire| on_wire.last())
+            .expect("a last message");
+        let blocks = last["content"].as_array().expect("content blocks");
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .expect("a text block in the image turn");
+        assert_eq!(
+            text["cache_control"]["type"], "ephemeral",
+            "the image turn's text block must carry the rolling breakpoint: {last}"
+        );
+        let image = blocks
+            .iter()
+            .find(|block| block["type"] == "image")
+            .expect("an image block in the image turn");
+        assert!(
+            image.get("cache_control").is_none(),
+            "the image block must not carry a cache marker: {last}"
+        );
+        assert_eq!(
+            wire.to_string().matches("cache_control").count(),
+            1,
+            "exactly one rolling breakpoint in the message list: {wire}"
         );
     }
 
@@ -6128,7 +8530,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6203,9 +8609,17 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, from_two) = AnthropicModelProvider::convert_messages(&two_candidates);
+        let (_, from_two) = AnthropicModelProvider::convert_messages(
+            &two_candidates,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         assert_tool_output_omitted("two unanswered tool_use blocks", &from_two, "raw output");
-        let (_, from_none) = AnthropicModelProvider::convert_messages(&no_candidates);
+        let (_, from_none) = AnthropicModelProvider::convert_messages(
+            &no_candidates,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         assert_tool_output_omitted("no assistant turn at all", &from_none, "raw output");
 
         // Both calls are still open after the drop, so each gets its own stub:
@@ -6257,7 +8671,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool("raw output".to_string()),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let stubs = tool_results_on_the_wire(&native_msgs);
         assert_eq!(stubs.len(), 2, "one stub per open call: {stubs:?}");
@@ -6390,7 +8808,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::user("what happened?"),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let calls = tool_use_ids_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6456,7 +8878,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6511,7 +8937,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(envelope),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(tool_results.len(), 1, "{tool_results:?}");
@@ -6588,7 +9018,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6657,7 +9091,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6714,7 +9152,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6772,7 +9214,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6822,7 +9268,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(injection.to_string()),
         ];
 
-        let (_, from_carrier) = AnthropicModelProvider::convert_messages(&ambiguous_carrier);
+        let (_, from_carrier) = AnthropicModelProvider::convert_messages(
+            &ambiguous_carrier,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         assert!(
             no_block_text_contains(&top_level_user_blocks(&from_carrier), injection),
             "an unpairable tool's instructions must not be promoted to user-authored \
@@ -6856,7 +9306,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, from_duplicate) = AnthropicModelProvider::convert_messages(&duplicate_result);
+        let (_, from_duplicate) = AnthropicModelProvider::convert_messages(
+            &duplicate_result,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         assert!(
             no_block_text_contains(&top_level_user_blocks(&from_duplicate), injection),
             "a duplicate result's instructions must not be promoted to user-authored \
@@ -6901,7 +9355,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(tool_results.len(), 1, "{tool_results:?}");
@@ -6930,7 +9388,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\n{CANONICAL_PNG_B64}");
         let messages = history_with_tool_result(&format!("saved {wrapped}"));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
         assert!(
             !wire.contains(CANONICAL_PNG_B64),
@@ -6946,7 +9408,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let with_prose = history_with_tool_result(&format!(
             "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\nthe screenshot was truncated"
         ));
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&with_prose);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &with_prose,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
         assert!(
             wire.contains("the screenshot was truncated"),
@@ -7006,7 +9472,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             format!("what does data:application/json;base64,{CANONICAL_PNG_B64} decode to?");
         let messages = vec![ChatMessage::user(&quoted)];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
         assert!(
@@ -7036,7 +9506,11 @@ data: {\"type\":\"message_stop\"}\n\n";
              — also what does {quoted} decode to?"
         ))];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let wire = serde_json::to_value(&native_msgs).expect("serialize");
 
         let text = wire[0]["content"]
@@ -7072,7 +9546,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let truncated = format!("here it is [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}");
         let messages = vec![ChatMessage::user(&truncated)];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
         assert!(
@@ -7137,7 +9615,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             format!("[IMAGE:data:image/png;base64,AAAAdata:image/png;base64,{CANONICAL_PNG_B64}");
         let messages = history_with_tool_result(&format!("saved {overlapped}"));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
         assert!(
@@ -7382,7 +9864,11 @@ data: {\"type\":\"message_stop\"}\n\n";
                 ChatMessage::tool(envelope.to_string()),
             ];
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+                &messages,
+                CacheTtl::default(),
+                "claude-sonnet-4-5",
+            );
             let wire = serde_json::to_value(&native_msgs).expect("serialize");
             let mut texts = Vec::new();
             text_fields(&wire, &mut texts);
@@ -7420,7 +9906,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(serde_json::json!({"tool_call_id": null}).to_string()),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
         assert!(
@@ -7450,7 +9940,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         ] {
             let messages = vec![ChatMessage::user(format!("look at [IMAGE:{reference}]"))];
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+                &messages,
+                CacheTtl::default(),
+                "claude-sonnet-4-5",
+            );
             let blocks = last_user_blocks(&native_msgs);
 
             assert!(
@@ -7500,7 +9994,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let blocks = last_user_blocks(&native_msgs);
 
         let last_tool_result = blocks
@@ -7543,7 +10041,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ("tool result", tool_messages),
             ("user message", user_messages),
         ] {
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+                &messages,
+                CacheTtl::default(),
+                "claude-sonnet-4-5",
+            );
             // The whole serialized request, not just `text` fields: an
             // image-free tool result carries its prose as a bare JSON string on
             // `content`, which is a text position all the same.
@@ -7602,7 +10104,11 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "prose [IMAGE:{rejected}] [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
             ))];
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+                &messages,
+                CacheTtl::default(),
+                "claude-sonnet-4-5",
+            );
             let blocks = last_user_blocks(&native_msgs);
 
             let images: Vec<&serde_json::Value> = blocks
@@ -7642,7 +10148,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let only_rejected = vec![ChatMessage::user(
             "[IMAGE:data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=]",
         )];
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&only_rejected);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &only_rejected,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let blocks = last_user_blocks(&native_msgs);
 
         assert!(
@@ -7718,7 +10228,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         ];
 
         for (label, messages) in histories {
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+                &messages,
+                CacheTtl::default(),
+                "claude-sonnet-4-5",
+            );
             // Without an image on the wire the invariant holds for free, and a
             // reference the converter quietly rejected would make it do so.
             assert!(
@@ -7739,10 +10253,11 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// Fails before the change: preparation already produced the data URI, and
     /// the converter then stripped it and wrote an omission note.
     ///
-    /// The tool message has to be last. `latest_tool_result_indices` only
-    /// normalizes the trailing run of tool results; anywhere else the marker is
-    /// replaced with `[image removed from history]` and this test asserts
-    /// nothing.
+    /// The tool message has to stay inside the current user turn.
+    /// `current_turn_tool_result_indices` normalizes tool-result images only
+    /// for the turn that produced them; once a later user message arrives the
+    /// marker is replaced with `[image removed from history]` and this test
+    /// asserts nothing.
     #[tokio::test]
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -7788,7 +10303,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             "preparation must have found the marker, or the rest asserts nothing"
         );
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &prepared.messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         assert_eq!(tool_result["tool_use_id"], "toolu_shot");
 
@@ -7839,7 +10358,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             "what is this [IMAGE:data:image/jpeg;base64,/9j/4AAQ]",
         )];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let has_image = native_msgs
             .iter()
@@ -7870,7 +10393,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             image_path.display()
         ))];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-6",
+        );
         let blocks = last_user_blocks(&native_msgs);
 
         assert!(
@@ -7910,7 +10437,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         .to_string();
         let messages = vec![ChatMessage::user("list"), ChatMessage::tool(tool_env)];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         assert!(
@@ -7940,7 +10471,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         .to_string();
         let messages = vec![ChatMessage::user("doc"), ChatMessage::tool(tool_env)];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(
+            &messages,
+            CacheTtl::default(),
+            "claude-sonnet-4-5",
+        );
 
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         assert_eq!(tool_result["content"], "see [IMAGE:<path>] for details");
@@ -8368,7 +10903,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                 messages: messages.as_slice(),
                 tools: None,
                 thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 1024,
+                    budget_tokens: Some(1024),
+                    effort: None,
                     display: None,
                 }),
             };
@@ -8411,7 +10947,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             messages: messages.as_slice(),
             tools: None,
             thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                budget_tokens: 1024,
+                budget_tokens: Some(1024),
+                effort: None,
                 display: None,
             }),
         };
@@ -8658,7 +11195,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         // The new fields must not cause a normal completion to be flagged.
         AnthropicModelProvider::check_refusal(&resp, "claude-sonnet-4-6")
             .expect("end_turn must not be treated as a refusal");
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("normal completion");
         assert_eq!(result.text.as_deref(), Some("Hello there"));
         let usage = result.usage.expect("usage should be present");
         assert_eq!(usage.input_tokens, Some(300));
@@ -8708,7 +11246,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             messages: messages.as_slice(),
             tools: None,
             thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                budget_tokens: 10_000,
+                budget_tokens: Some(10_000),
+                effort: None,
                 display: None,
             }),
         };
@@ -9162,21 +11701,29 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         let model_provider = AnthropicModelProvider::builder("test").build();
 
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: Some(ThinkingDisplay::Updates),
         };
-        let (_, config, _) =
-            model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
-        let config = config.expect("thinking config for supported model");
-        assert_eq!(config.display, Some(ThinkingDisplay::Updates));
+        // Generation 4.6 takes no display; the families that write progress
+        // notes do.
+        let tuning =
+            model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1");
+        let config = tuning
+            .thinking
+            .expect("thinking config for supported model");
+        assert_eq!(config.display, Some(ThinkingDisplay::Summarized));
 
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         };
-        let (_, config, _) =
-            model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
-        let config = config.expect("thinking config for supported model");
+        let tuning =
+            model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-5");
+        let config = tuning
+            .thinking
+            .expect("thinking config for supported model");
         assert_eq!(config.display, None);
     }
 
@@ -9204,6 +11751,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
@@ -9466,11 +12014,12 @@ data: {\"type\":\"message_stop\"}\n\n";
                 messages: &messages,
                 tools: None,
                 thinking: Some(NativeThinkingParams {
-                    budget_tokens: 2_048,
+                    budget_tokens: Some(2_048),
+                    effort: None,
                     display: Some(ThinkingDisplay::Updates),
                 }),
             },
-            "claude-sonnet-4-6",
+            "claude-fable-5-1",
             None,
             StreamOptions {
                 enabled: true,
@@ -9501,8 +12050,12 @@ data: {\"type\":\"message_stop\"}\n\n";
             .clone()
             .expect("streaming request body must be captured");
         assert_eq!(body["stream"], serde_json::json!(true));
-        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
-        assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(2_048));
+        assert_eq!(body["thinking"]["display"], serde_json::json!("summarized"));
+        assert_eq!(body["thinking"]["type"], serde_json::json!("adaptive"));
+        assert!(
+            body["thinking"].get("budget_tokens").is_none(),
+            "an adaptive request carries no budget: {body}"
+        );
     }
 
     #[test]
@@ -9529,6 +12082,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
@@ -9657,7 +12211,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "usage": {"input_tokens": 10, "output_tokens": 5}
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result = AnthropicModelProvider::parse_native_response(resp, "claude-sonnet-4-6")
+            .expect("response is not a refusal");
         let reasoning = result
             .reasoning_content
             .expect("signature-only block must reach replay");

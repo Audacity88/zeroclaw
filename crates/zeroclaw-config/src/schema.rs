@@ -831,6 +831,28 @@ pub enum AuthMode {
     OAuth,
 }
 
+/// Prompt-cache entry lifetime to request for this provider's Anthropic
+/// cache markers. `"5m"` is the API default; `"1h"` extends the cache
+/// entry lifetime to one hour so a pause longer than five minutes does
+/// not force a full-price rewrite of the cached prefix. Meaningful only
+/// where Anthropic-shaped `cache_control` markers reach the API: the
+/// native Anthropic provider always places them, compatible providers
+/// only behind `cache_passthrough` (with passthrough off the setting is
+/// inert). One TTL applies to every marker in a request.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum CacheTtl {
+    /// Standard 5-minute cache lifetime (the API default).
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// 1-hour cache lifetime; cache writes bill at a premium write rate.
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
 /// Named model_provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -937,13 +959,26 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic extended thinking through this OpenAI-compatible
+    /// provider. When true and the runtime requests native thinking, request
+    /// bodies gain an Anthropic-shaped `thinking` object
+    /// (`{"type":"enabled","budget_tokens":N}`), and gateway thinking
+    /// responses are normalized into replayable signed blocks. Only
+    /// gateways that translate between OpenAI Chat Completions and the
+    /// Anthropic API support this (e.g. LiteLLM); a non-translating upstream
+    /// rejects the injected object with HTTP 400. Default `false`: request
+    /// bodies and response handling are unchanged.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub thinking_passthrough: bool,
     /// Forward Anthropic prompt caching through this OpenAI-compatible
     /// provider. When true, request bodies on the structured paths (agent
     /// turns, tool calls, structured streaming) gain an Anthropic-shaped
-    /// `cache_control` breakpoint on the system prompt and on the last
-    /// message once the conversation has more than one non-system message,
-    /// mirroring the native Anthropic provider's placement strategy, and
-    /// gateway-reported cache usage populates the cached-token counters.
+    /// `cache_control` breakpoint on the system prompt, a rolling marker
+    /// once the conversation has more than one non-system message, and an
+    /// independently selected prior-turn marker. Rolling placement scans
+    /// backward for non-empty text; co-located anchors serialize one marker.
+    /// Gateway-reported cache usage populates the cached-token counters.
     /// With `merge_system_into_user`, the merged first user message carries
     /// the system breakpoint instead. The text-only helpers (`chat_with_system`,
     /// `chat_with_history`, the legacy chunk-stream APIs) deliberately emit
@@ -960,6 +995,36 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub cache_passthrough: bool,
+    /// Cache entry lifetime requested for this provider's Anthropic
+    /// prompt-cache markers. `"5m"` (default) keeps the standard
+    /// 5-minute lifetime; `"1h"` requests a 1-hour lifetime so a pause
+    /// longer than five minutes does not force a full-price rewrite of
+    /// the cached prefix. The 1h lifetime bills cache writes at a
+    /// premium write rate (nominal planning figure: twice the input
+    /// price), so it pays off only when turns regularly resume more
+    /// than five minutes after the last request.
+    ///
+    /// The native Anthropic provider applies this to every cache marker
+    /// it places in a request. Compatible providers apply it only when
+    /// `cache_passthrough` is enabled; without passthrough no markers
+    /// are placed at all and this field is inert (no parse-time warning:
+    /// an operator may stage the key before switching passthrough on).
+    /// Providers that emit their own cache markers by other means
+    /// (openrouter) ignore this setting.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
+    /// Forward the runtime-configured `reasoning_effort` to every model on
+    /// this OpenAI-compatible provider, not only OpenAI reasoning-family
+    /// names (o1*/o3*/o4*/gpt-5*/gpt-*codex*). The name filter exists because
+    /// some strict backends reject unknown request params with HTTP 400;
+    /// enable this only on a backend verified to accept `reasoning_effort`
+    /// (GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+    /// gateways commonly do). Default `false`: the name filter keeps
+    /// deciding, and non-OpenAI model names never receive the param.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reasoning_effort_passthrough: bool,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
@@ -1197,9 +1262,47 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model model_provider config. No family-specific extras yet — typed
-/// slot reserved for future Anthropic-only knobs (cache_control, beta
-/// headers) so they land cleanly without another schema rework.
+/// How much of the model's reasoning comes back inside thinking blocks.
+/// Applies to the Claude generations that think adaptively; older ones ignore
+/// it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicThinkingDisplay {
+    /// Blocks arrive signed but with their text withheld, which is the API's
+    /// own default.
+    #[default]
+    Omitted,
+    /// Blocks carry a readable summary of the reasoning.
+    Summarized,
+    /// Blocks carry the short progress notes the model writes between tool
+    /// calls. Newer models only.
+    Updates,
+}
+
+impl From<AnthropicThinkingDisplay> for zeroclaw_api::model_provider::ThinkingDisplay {
+    fn from(display: AnthropicThinkingDisplay) -> Self {
+        match display {
+            AnthropicThinkingDisplay::Omitted => Self::Omitted,
+            AnthropicThinkingDisplay::Summarized => Self::Summarized,
+            AnthropicThinkingDisplay::Updates => Self::Updates,
+        }
+    }
+}
+
+impl AnthropicThinkingDisplay {
+    /// Wire value, or `None` to let the API apply its own default.
+    #[must_use]
+    pub fn wire_value(self) -> Option<&'static str> {
+        zeroclaw_api::model_provider::ThinkingDisplay::from(self).wire_value()
+    }
+}
+
+/// Anthropic model model_provider config. Carries the Anthropic-only reasoning
+/// visibility knob; the typed slot stays the landing place for future
+/// Anthropic-only extras (cache_control, beta headers).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1219,6 +1322,13 @@ pub struct AnthropicModelProviderConfig {
     /// sends no fallback parameter and no beta value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_fallback_models: Vec<String>,
+    /// How much of the model's reasoning is returned: `summarized` for a
+    /// readable summary, `updates` for the short progress notes written
+    /// between tool calls. Leave unset for the API default, which withholds
+    /// the text. Signed reasoning is replayed within a tool round either way;
+    /// this only controls what a person can read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<AnthropicThinkingDisplay>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -3682,6 +3792,11 @@ impl Default for DelegateToolConfig {
 
 // ── Aliased Agents ───────────────────────────────────────────────
 
+/// Default fraction of `max_history_messages` that a whole-turn history trim
+/// drops the history to. Strictly below 1.0 so a trim leaves headroom and
+/// the next turns do not immediately trigger another trim.
+pub const DEFAULT_HISTORY_TRIM_LOW_WATER: f32 = 0.7;
+
 /// Runtime tunables resolved from the agent's runtime profile. Populated
 /// by `Config::resolved_agent_config`; never deserialized from the agent
 /// table. The runtime profile is the sole config surface for these.
@@ -3690,6 +3805,9 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
+    /// Fraction of `max_history_messages` a whole-turn trim drops to
+    /// (hysteresis low-water mark; 1.0 disables hysteresis).
+    pub history_trim_low_water: f32,
     /// Token budget for preemptive context/history trimming (from runtime profile).
     /// NOT the provider `max_tokens` output limit.
     pub max_context_tokens: usize,
@@ -3732,6 +3850,7 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_history_messages: 50,
+            history_trim_low_water: DEFAULT_HISTORY_TRIM_LOW_WATER,
             max_context_tokens: 32_000,
             model_context_window: 32_000,
             parallel_tools: false,
@@ -4347,6 +4466,17 @@ impl Config {
             .unwrap_or(50)
     }
 
+    /// Resolve the fraction of the history cap that a whole-turn trim drops
+    /// to (hysteresis low-water mark). Same resolution chain as
+    /// `effective_max_history_messages`: the agent's runtime profile value
+    /// when set, otherwise [`DEFAULT_HISTORY_TRIM_LOW_WATER`].
+    #[must_use]
+    pub fn effective_history_trim_low_water(&self, agent_alias: &str) -> f32 {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.history_trim_low_water)
+            .unwrap_or(DEFAULT_HISTORY_TRIM_LOW_WATER)
+    }
+
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
     ///
     /// An explicit runtime-profile cap remains authoritative. When omitted, the
@@ -4517,6 +4647,7 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
+            history_trim_low_water: self.effective_history_trim_low_water(agent_alias),
             // Token budget for context/history trimming — from runtime profile
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             // Model's context window (max input tokens) — from provider config
@@ -13721,6 +13852,11 @@ pub struct RuntimeProfileConfig {
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.
     pub max_history_messages: Option<usize>,
+    /// Fraction of `max_history_messages` that a whole-turn history trim
+    /// drops the history to (the hysteresis low-water mark). Valid range is
+    /// `(0.0, 1.0]`; `1.0` disables hysteresis and trims straight back to
+    /// the cap. `None` inherits the default (0.7).
+    pub history_trim_low_water: Option<f32>,
     /// Maximum estimated tokens for context before compaction. `None` inherits.
     pub max_context_tokens: Option<usize>,
     /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
@@ -13776,6 +13912,7 @@ impl Default for RuntimeProfileConfig {
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
             max_history_messages: None,
+            history_trim_low_water: None,
             max_context_tokens: None,
             compact_context: None,
             parallel_tools: None,
@@ -23676,6 +23813,25 @@ impl Config {
             );
         }
 
+        // Per-profile validation: the whole-turn history-trim hysteresis
+        // fraction must be in (0.0, 1.0]. Zero or negative would request an
+        // empty refill target; anything above 1.0 would trim deeper than the
+        // cap itself. Sorted iteration keeps error ordering stable.
+        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
+        profile_aliases.sort();
+        for palias in profile_aliases {
+            let Some(low_water) = self.runtime_profiles[palias].history_trim_low_water else {
+                continue;
+            };
+            if !low_water.is_finite() || low_water <= 0.0 || low_water > 1.0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{palias}.history_trim_low_water"),
+                    "runtime_profiles.{palias}.history_trim_low_water must be a finite number in (0.0, 1.0] (got {low_water})",
+                );
+            }
+        }
+
         // Per-profile validation: the context-compression summarizer provider
         // ref must resolve to a configured `[providers.models.*]` alias.
         // Empty = inherit (valid). A shared profile fails loud at config time
@@ -26222,6 +26378,34 @@ mod tests {
         );
     }
 
+    #[::core::prelude::v1::test]
+    fn cache_ttl_deserializes_and_defaults_to_omitted() {
+        let one_hour: ModelProviderConfig = toml::from_str("cache_ttl = \"1h\"").unwrap();
+        assert_eq!(one_hour.cache_ttl, Some(CacheTtl::OneHour));
+        assert_eq!(
+            toml::to_string(&one_hour).unwrap(),
+            "cache_ttl = \"1h\"\n",
+            "an explicitly configured cache_ttl must round-trip its wire string"
+        );
+
+        let five_minutes: ModelProviderConfig = toml::from_str("cache_ttl = \"5m\"").unwrap();
+        assert_eq!(five_minutes.cache_ttl, Some(CacheTtl::FiveMinutes));
+
+        let serialized = toml::to_string(&ModelProviderConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("cache_ttl"),
+            "absent cache_ttl must be omitted from serialized config"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cache_ttl_rejects_unknown_lifetime() {
+        let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
+        assert!(
+            parsed.is_err(),
+            "cache_ttl is a closed enum; unknown lifetimes must not parse into a silent default"
+        );
+    }
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //
     // Nextcloud installs ONE secret per bot and uses it to verify inbound webhook
@@ -30644,6 +30828,7 @@ reasoning_effort = "turbo"
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
         assert_eq!(cfg.resolved.max_history_messages, 50);
+        assert_eq!(cfg.resolved.history_trim_low_water, 0.7);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
@@ -30840,6 +31025,105 @@ runtime_profile = "long_turn"
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
             50
+        );
+    }
+
+    #[test]
+    async fn default_history_trim_low_water_is_seven_tenths() {
+        let raw = r#"
+[runtime_profiles.plain]
+
+[agents.default]
+runtime_profile = "plain"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.7);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.7);
+    }
+
+    #[test]
+    async fn runtime_profile_history_trim_low_water_is_honored() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.9
+
+[agents.default]
+runtime_profile = "mem_saver"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.9);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.9);
+    }
+
+    #[test]
+    async fn validate_accepts_history_trim_low_water_of_one() {
+        let raw = r#"
+[runtime_profiles.no_hysteresis]
+history_trim_low_water = 1.0
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed
+                .runtime_profiles
+                .get("no_hysteresis")
+                .and_then(|p| p.history_trim_low_water),
+            Some(1.0)
+        );
+        parsed
+            .validate()
+            .expect("history_trim_low_water = 1.0 must be accepted");
+    }
+
+    #[test]
+    async fn validate_rejects_zero_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.0
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water = 0.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_history_trim_low_water_above_one() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 1.5
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water above 1.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_non_finite_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = nan
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("non-finite history_trim_low_water must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
         );
     }
 
@@ -45060,6 +45344,50 @@ group_policy = "all"
                 .as_str(),
             "custom.kimi-k2-5"
         );
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_round_trips_through_toml() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+thinking_display = "summarized"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config
+            .providers
+            .models
+            .anthropic
+            .get("fable")
+            .expect("alias should exist");
+        assert_eq!(
+            entry.thinking_display,
+            Some(AnthropicThinkingDisplay::Summarized)
+        );
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(rendered.contains("thinking_display = \"summarized\""));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_is_absent_when_unset() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config.providers.models.anthropic.get("fable").unwrap();
+        assert_eq!(entry.thinking_display, None);
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(!rendered.contains("thinking_display"));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_rejects_an_unknown_value() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+thinking_display = "verbose"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 pub mod keybindings;
 
 use std::collections::HashMap;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -273,16 +274,58 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// The `[sidebar]` section: the shell-level agent sidebar.
+/// The `[sidebar]` section: the shell-level sessions sidebar.
+pub(crate) const SIDEBAR_WIDTH_MIN: u16 = 18;
+pub(crate) const SIDEBAR_WIDTH_MAX: u16 = 40;
+pub(crate) const SIDEBAR_SESSIONS_PERCENT_MIN: u16 = 20;
+pub(crate) const SIDEBAR_SESSIONS_PERCENT_MAX: u16 = 80;
+pub(crate) const SIDEBAR_QUEUE_PERCENT_MIN: u16 = 1;
+pub(crate) const SIDEBAR_QUEUE_PERCENT_MAX: u16 = 99;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SidebarSide {
+    Left,
+    Right,
+}
+
+impl SidebarSide {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    pub(crate) fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidebarSection {
-    /// Whether the agent sidebar is shown. Toggled at runtime and persisted.
+    /// Whether the sessions sidebar is shown. Toggled at runtime and persisted.
     #[serde(default = "default_sidebar_visible")]
     pub visible: bool,
     /// Sidebar width in terminal columns. Clamped to the widget's supported
     /// range at render time; edited on disk only (no runtime writer).
     #[serde(default = "default_sidebar_width")]
     pub width: u16,
+    /// Explicit dock side. `None` preserves the legacy Todo location
+    /// migration until the user switches the dock explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<SidebarSide>,
+    /// Percentage of the dock body allocated to Sessions when Plan is also
+    /// visible. Clamped at the shell boundary.
+    #[serde(default = "default_sidebar_sessions_percent")]
+    pub sessions_percent: u16,
+    /// Percentage of the lower dock region allocated to Queue while Plan is
+    /// visible. Clamped at the shell boundary.
+    #[serde(default = "default_sidebar_queue_percent")]
+    pub queue_percent: u16,
 }
 
 impl Default for SidebarSection {
@@ -290,7 +333,43 @@ impl Default for SidebarSection {
         Self {
             visible: default_sidebar_visible(),
             width: default_sidebar_width(),
+            side: None,
+            sessions_percent: default_sidebar_sessions_percent(),
+            queue_percent: default_sidebar_queue_percent(),
         }
+    }
+}
+
+// ── Tracked sessions ────────────────────────────────────────────────────────
+
+pub(crate) const DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
+pub(crate) const MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE: usize = 32;
+
+/// The `[sessions]` section: client-side tracked-session capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionsSection {
+    /// Maximum focused, background, and retained resume sessions tracked by
+    /// each chat-like pane.
+    #[serde(default = "default_max_tracked_sessions_per_pane")]
+    pub max_tracked_per_pane: usize,
+}
+
+impl Default for SessionsSection {
+    fn default() -> Self {
+        Self {
+            max_tracked_per_pane: default_max_tracked_sessions_per_pane(),
+        }
+    }
+}
+
+impl SessionsSection {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !(1..=MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE).contains(&self.max_tracked_per_pane) {
+            anyhow::bail!(
+                "max_tracked_per_pane must be between 1 and {MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE}"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -334,11 +413,23 @@ impl Default for TodoTrackerSection {
 }
 
 fn default_sidebar_visible() -> bool {
-    true
+    false
 }
 
 fn default_sidebar_width() -> u16 {
     24
+}
+
+fn default_sidebar_sessions_percent() -> u16 {
+    60
+}
+
+const fn default_max_tracked_sessions_per_pane() -> usize {
+    DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE
+}
+
+fn default_sidebar_queue_percent() -> u16 {
+    50
 }
 
 impl TodoTrackerSection {
@@ -459,6 +550,8 @@ pub(crate) struct ZerocodeConfig {
     pub connection: ConnectionSection,
     #[serde(default)]
     pub sidebar: SidebarSection,
+    #[serde(default)]
+    pub sessions: SessionsSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -474,6 +567,7 @@ impl Default for ZerocodeConfig {
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
             sidebar: SidebarSection::default(),
+            sessions: SessionsSection::default(),
             keybindings: HashMap::new(),
             todotracker: TodoTrackerSection::default(),
         }
@@ -550,6 +644,40 @@ impl ZerocodeConfig {
             .map(|s| s.to_string())
     }
 
+    /// Effective dock side, with the legacy Todo location providing the
+    /// read-only migration fallback until the user explicitly switches side.
+    pub(crate) fn effective_sidebar_side(&self) -> SidebarSide {
+        self.sidebar
+            .side
+            .unwrap_or(match self.todotracker.location {
+                TodoTrackerLocation::Left => SidebarSide::Left,
+                TodoTrackerLocation::Right | TodoTrackerLocation::Bottom => SidebarSide::Right,
+            })
+    }
+
+    pub(crate) fn effective_sidebar_width(&self) -> u16 {
+        self.sidebar
+            .width
+            .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX)
+    }
+
+    pub(crate) fn effective_sidebar_sessions_percent(&self) -> u16 {
+        self.sidebar
+            .sessions_percent
+            .clamp(SIDEBAR_SESSIONS_PERCENT_MIN, SIDEBAR_SESSIONS_PERCENT_MAX)
+    }
+
+    pub(crate) fn resolve_max_tracked_sessions_per_pane(&self) -> Result<usize> {
+        self.sessions.validate()?;
+        Ok(self.sessions.max_tracked_per_pane)
+    }
+
+    pub(crate) fn effective_sidebar_queue_percent(&self) -> u16 {
+        self.sidebar
+            .queue_percent
+            .clamp(SIDEBAR_QUEUE_PERCENT_MIN, SIDEBAR_QUEUE_PERCENT_MAX)
+    }
+
     /// Convert the `[todotracker]` section into the runtime settings type
     /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
     ///
@@ -584,6 +712,26 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
     let mut config = load_persisted(config_dir)?;
     apply_env_overrides(&mut config)?;
     Ok(config)
+}
+
+/// Resolve the effective client-side tracked-session limit, rejecting a
+/// malformed section or an out-of-range file/environment value rather than
+/// silently falling back to the default.
+pub(crate) fn resolve_max_tracked_sessions_per_pane_checked(config_dir: &Path) -> Result<usize> {
+    let path = config_path(config_dir);
+    if path.exists() {
+        let doc = load_document(&path)?;
+        if let Some(value) = doc.get("sessions") {
+            value
+                .clone()
+                .try_into::<SessionsSection>()
+                .with_context(|| format!("[sessions] in {} is malformed", path.display()))?;
+        }
+    }
+    let config = ensure_and_load(config_dir)?;
+    config
+        .resolve_max_tracked_sessions_per_pane()
+        .map_err(|error| anyhow::Error::msg(format!("[sessions] is invalid: {error}")))
 }
 
 /// Resolve the effective `[todotracker]` settings for a session boundary,
@@ -701,6 +849,15 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
             ),
         }
     }
+    if let Some(v) = doc.get("sessions") {
+        match v.clone().try_into::<SessionsSection>() {
+            Ok(section) => config.sessions = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [sessions] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
     if let Some(v) = doc.get("keybindings") {
         let mut migrated_value = v.clone();
         let migrated_legacy = migrate_legacy_ctrl_bindings(&mut migrated_value);
@@ -803,6 +960,28 @@ fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
 }
 
+fn write_document_atomically(path: &Path, body: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".zerocode-config-")
+        .tempfile_in(parent)
+        .with_context(|| format!("creating temporary config beside {}", path.display()))?;
+    temporary
+        .write_all(body.as_bytes())
+        .with_context(|| format!("writing temporary config beside {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("flushing temporary config beside {}", path.display()))?;
+    temporary.persist(path).map_err(|error| {
+        anyhow::Error::msg(format!("replacing {}: {}", path.display(), error.error))
+    })?;
+    Ok(())
+}
+
 /// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
 fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::Table> {
     doc.entry(key)
@@ -811,14 +990,139 @@ fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::
         .ok_or_else(|| anyhow::Error::msg(format!("'{key}' is not a table")))
 }
 
-/// Persist the sidebar visibility toggle, writing only `[sidebar].visible`.
-pub(crate) fn persist_sidebar_visible(config_dir: &Path, visible: bool) -> Result<()> {
+/// Persist one sidebar leaf without rewriting unrelated TOML formatting.
+/// Returns whether a valid environment override will shadow the saved value on
+/// the next effective load.
+fn persist_sidebar_leaf(
+    config_dir: &Path,
+    leaf: &str,
+    replacement: toml_edit::Item,
+    shadowed: bool,
+) -> Result<bool> {
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("creating config dir {}", config_dir.display()))?;
     let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    section_mut(&mut doc, "sidebar")?.insert("visible".to_string(), toml::Value::Boolean(visible));
-    write_document(&path, &doc)
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let semantic: toml::Table = if raw.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+    };
+    if let Some(value) = semantic.get("sidebar") {
+        value
+            .clone()
+            .try_into::<SidebarSection>()
+            .with_context(|| {
+                format!(
+                    "refusing to update {leaf} in malformed [sidebar] section in {}",
+                    path.display()
+                )
+            })?;
+    }
+
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing {} for an in-place edit", path.display()))?;
+    let sidebar = doc
+        .entry("sidebar")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let sidebar = sidebar.as_table_like_mut().ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "refusing to update non-table [sidebar] in {}",
+            path.display()
+        ))
+    })?;
+    let mut replacement = replacement;
+    if let Some(existing) = sidebar.get_mut(leaf) {
+        if let (Some(existing), Some(replacement)) =
+            (existing.as_value(), replacement.as_value_mut())
+        {
+            *replacement.decor_mut() = existing.decor().clone();
+        }
+        *existing = replacement;
+    } else {
+        sidebar.insert(leaf, replacement);
+    }
+    write_document_atomically(&path, &doc.to_string())?;
+    Ok(shadowed)
 }
 
+/// Persist the sidebar visibility toggle, writing only `[sidebar].visible`.
+pub(crate) fn persist_sidebar_visible(config_dir: &Path, visible: bool) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__visible")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .is_some_and(|effective| effective != visible);
+    persist_sidebar_leaf(config_dir, "visible", toml_edit::value(visible), shadowed)
+}
+
+pub(crate) fn persist_sidebar_side(config_dir: &Path, side: SidebarSide) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__side")
+        .ok()
+        .and_then(|value| match value.as_str() {
+            "left" => Some(SidebarSide::Left),
+            "right" => Some(SidebarSide::Right),
+            _ => None,
+        })
+        .is_some_and(|effective| effective != side);
+    persist_sidebar_leaf(
+        config_dir,
+        "side",
+        toml_edit::value(side.as_str()),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_width(config_dir: &Path, width: u16) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__width")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX))
+        .is_some_and(|effective| effective != width);
+    persist_sidebar_leaf(
+        config_dir,
+        "width",
+        toml_edit::value(i64::from(width)),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_sessions_percent(
+    config_dir: &Path,
+    sessions_percent: u16,
+) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__sessions_percent")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_SESSIONS_PERCENT_MIN, SIDEBAR_SESSIONS_PERCENT_MAX))
+        .is_some_and(|effective| effective != sessions_percent);
+    persist_sidebar_leaf(
+        config_dir,
+        "sessions_percent",
+        toml_edit::value(i64::from(sessions_percent)),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_queue_percent(config_dir: &Path, queue_percent: u16) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__queue_percent")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_QUEUE_PERCENT_MIN, SIDEBAR_QUEUE_PERCENT_MAX))
+        .is_some_and(|effective| effective != queue_percent);
+    persist_sidebar_leaf(
+        config_dir,
+        "queue_percent",
+        toml_edit::value(i64::from(queue_percent)),
+        shadowed,
+    )
+}
 /// Persist the selected theme name, editing only the `[theme]` section.
 pub(crate) fn persist_theme(config_dir: &Path, theme_name: &str) -> Result<()> {
     let path = config_path(config_dir);
@@ -872,6 +1176,116 @@ fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a m
         cur = section_mut(cur, key)?;
     }
     Ok(cur)
+}
+
+// ── Per-agent thinking memory ─────────────────────────────────────────────────
+
+/// The last effort level and thinking display the user chose for an agent:
+/// `[thinking.agent_override.<alias>]` in `zerocode-config.toml`. A UI memory
+/// re-applied at session start only when the session's model offers the
+/// value; the daemon stays the authority on what is valid, and the file is
+/// re-read at every session boundary rather than cached.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AgentThinkingMemory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+/// One remembered thinking control, named by the key it is stored under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentThinkingKey {
+    Level,
+    Display,
+}
+
+impl AgentThinkingKey {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Level => "level",
+            Self::Display => "display",
+        }
+    }
+}
+
+/// Remember (`Some`) or forget (`None`) one thinking control for `alias`,
+/// editing only `[thinking.agent_override.<alias>].<key>`. Forgetting drops
+/// tables that become empty so the last forgotten value leaves no scaffold;
+/// other agents and every other section are preserved.
+pub(crate) fn persist_agent_thinking(
+    config_dir: &Path,
+    alias: &str,
+    key: AgentThinkingKey,
+    value: Option<&str>,
+) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    match value {
+        Some(value) => {
+            section_mut_path(&mut doc, &["thinking", "agent_override", alias])?.insert(
+                key.as_str().to_string(),
+                toml::Value::String(value.to_string()),
+            );
+        }
+        None => forget_agent_thinking(&mut doc, alias, key),
+    }
+    write_document(&path, &doc)
+}
+
+fn forget_agent_thinking(doc: &mut toml::Table, alias: &str, key: AgentThinkingKey) {
+    let Some(thinking) = doc.get_mut("thinking").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+    if let Some(overrides) = thinking
+        .get_mut("agent_override")
+        .and_then(toml::Value::as_table_mut)
+    {
+        if let Some(agent) = overrides.get_mut(alias).and_then(toml::Value::as_table_mut) {
+            agent.remove(key.as_str());
+            if agent.is_empty() {
+                overrides.remove(alias);
+            }
+        }
+        if overrides.is_empty() {
+            thinking.remove("agent_override");
+        }
+    }
+    if thinking.is_empty() {
+        doc.remove("thinking");
+    }
+}
+
+/// The remembered thinking controls for `alias`, read fresh from the file.
+/// No file is created and no `ZEROCODE_*` override applies: this is a UI
+/// memory, not runtime config. A missing file or entry is an empty memory; a
+/// malformed entry is an error so a hand-edit typo is reported rather than
+/// silently forgotten.
+pub(crate) fn remembered_agent_thinking(
+    config_dir: &Path,
+    alias: &str,
+) -> Result<AgentThinkingMemory> {
+    let path = config_path(config_dir);
+    if !path.exists() {
+        return Ok(AgentThinkingMemory::default());
+    }
+    let doc = load_document(&path)?;
+    let Some(entry) = doc
+        .get("thinking")
+        .and_then(|thinking| thinking.get("agent_override"))
+        .and_then(|overrides| overrides.get(alias))
+    else {
+        return Ok(AgentThinkingMemory::default());
+    };
+    entry
+        .clone()
+        .try_into::<AgentThinkingMemory>()
+        .with_context(|| {
+            format!(
+                "[thinking.agent_override.{alias}] in {} is malformed",
+                path.display()
+            )
+        })
 }
 
 pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> {
@@ -1151,6 +1565,22 @@ fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
         .split_last()
         .ok_or_else(|| anyhow::Error::msg("empty config path"))?;
 
+    // `ZerocodeConfig` intentionally omits a default `[sidebar]` table from
+    // serialization. Materialize that sparse section for a known environment
+    // leaf, while retaining the strict unknown-path rejection below.
+    if parents.first().is_some_and(|parent| *parent == "sidebar") {
+        let root_table = root
+            .as_table_mut()
+            .ok_or_else(|| anyhow::Error::msg("serialized config root is not a table"))?;
+        if !root_table.contains_key("sidebar") {
+            root_table.insert(
+                "sidebar".to_string(),
+                toml::Value::try_from(SidebarSection::default())
+                    .context("serializing default sidebar for set_prop")?,
+            );
+        }
+    }
+
     let mut cursor = &mut root;
     for seg in parents {
         cursor = cursor
@@ -1163,6 +1593,13 @@ fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     let table = cursor.as_table_mut().ok_or_else(|| {
         anyhow::Error::msg(format!("path '{path}' did not resolve to a config field"))
     })?;
+    if *leaf == "side"
+        && parents.len() == 1
+        && parents[0] == "sidebar"
+        && !table.contains_key(*leaf)
+    {
+        table.insert((*leaf).to_string(), toml::Value::String(value.to_string()));
+    }
     if !table.contains_key(*leaf) {
         anyhow::bail!("path '{path}' did not resolve to a config field");
     }
@@ -1402,6 +1839,132 @@ mod tests {
         assert!(
             !on_disk.contains("agent_override"),
             "clearing the last override must drop the table; got:\n{on_disk}"
+        );
+    }
+
+    #[test]
+    fn persist_agent_thinking_round_trips_per_agent_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord_dark\"\n\n[future]\nkeep = true\n",
+        );
+
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Level, Some("high")).unwrap();
+        persist_agent_thinking(
+            dir.path(),
+            "coder",
+            AgentThinkingKey::Display,
+            Some("summarized"),
+        )
+        .unwrap();
+        persist_agent_thinking(dir.path(), "writer", AgentThinkingKey::Level, Some("low")).unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["thinking"]["agent_override"]["coder"]["level"].as_str(),
+            Some("high")
+        );
+        assert_eq!(
+            doc["thinking"]["agent_override"]["coder"]["display"].as_str(),
+            Some("summarized")
+        );
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord_dark"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "coder").unwrap(),
+            AgentThinkingMemory {
+                level: Some("high".into()),
+                display: Some("summarized".into()),
+            }
+        );
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "writer").unwrap(),
+            AgentThinkingMemory {
+                level: Some("low".into()),
+                display: None,
+            }
+        );
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "ghost").unwrap(),
+            AgentThinkingMemory::default()
+        );
+    }
+
+    #[test]
+    fn persist_agent_thinking_forget_drops_empty_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Level, Some("high")).unwrap();
+        persist_agent_thinking(
+            dir.path(),
+            "coder",
+            AgentThinkingKey::Display,
+            Some("updates"),
+        )
+        .unwrap();
+
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Level, None).unwrap();
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "coder").unwrap(),
+            AgentThinkingMemory {
+                level: None,
+                display: Some("updates".into()),
+            }
+        );
+
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Display, None).unwrap();
+        let on_disk = read(dir.path());
+        assert!(
+            !on_disk.contains("thinking"),
+            "forgetting the last value must drop the tables; got:\n{on_disk}"
+        );
+
+        // Forgetting for an agent with no memory is a no-op.
+        persist_agent_thinking(dir.path(), "ghost", AgentThinkingKey::Level, None).unwrap();
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "ghost").unwrap(),
+            AgentThinkingMemory::default()
+        );
+    }
+
+    #[test]
+    fn remembered_agent_thinking_is_empty_without_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "coder").unwrap(),
+            AgentThinkingMemory::default()
+        );
+        assert!(
+            !config_path(dir.path()).exists(),
+            "reading the memory must not scaffold a config file"
+        );
+    }
+
+    #[test]
+    fn remembered_agent_thinking_rejects_a_malformed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[thinking.agent_override.coder]\nlevel = 3\n");
+        let err = remembered_agent_thinking(dir.path(), "coder")
+            .expect_err("a non-string level must be reported");
+        assert!(
+            format!("{err:#}").contains("[thinking.agent_override.coder]"),
+            "error should name the entry: {err:#}"
+        );
+    }
+
+    #[test]
+    fn persist_agent_thinking_survives_other_section_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Level, Some("max")).unwrap();
+        persist_agent_theme(dir.path(), "coder", "dracula").unwrap();
+        persist_theme(dir.path(), "nord_dark").unwrap();
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "coder")
+                .unwrap()
+                .level
+                .as_deref(),
+            Some("max")
         );
     }
 
@@ -1816,20 +2379,39 @@ mod tests {
     fn sidebar_section_round_trips() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
-        seed(dir.path(), "[sidebar]\nvisible = false\nwidth = 30\n");
+        seed(
+            dir.path(),
+            "[sidebar]\nvisible = false\nwidth = 30\nside = \"left\"\nsessions_percent = 55\nqueue_percent = 65\n",
+        );
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert!(!cfg.sidebar.visible);
         assert_eq!(cfg.sidebar.width, 30);
+        assert_eq!(cfg.sidebar.side, Some(SidebarSide::Left));
+        assert_eq!(cfg.sidebar.sessions_percent, 55);
+        assert_eq!(cfg.sidebar.queue_percent, 65);
     }
 
     #[test]
     fn sidebar_partial_section_fills_field_defaults() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
-        seed(dir.path(), "[sidebar]\nvisible = false\n");
+        seed(dir.path(), "[sidebar]\n");
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            !cfg.sidebar.visible,
+            "missing visibility defaults to hidden"
+        );
+        assert_eq!(cfg.sidebar.width, 24, "unset width falls back to default");
+        assert_eq!(cfg.sidebar.side, None);
+        assert_eq!(cfg.sidebar.sessions_percent, 60);
+        assert_eq!(cfg.sidebar.queue_percent, 50);
+    }
+
+    #[test]
+    fn sidebar_defaults_hidden_without_saved_preference() {
+        let dir = tempfile::tempdir().unwrap();
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert!(!cfg.sidebar.visible);
-        assert_eq!(cfg.sidebar.width, 24, "unset width falls back to default");
     }
 
     #[test]
@@ -1842,7 +2424,10 @@ mod tests {
         );
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert_eq!(cfg.theme.name, "dracula");
-        assert!(cfg.sidebar.visible, "bad [sidebar] drops to default");
+        assert!(
+            !cfg.sidebar.visible,
+            "bad [sidebar] drops to hidden default"
+        );
     }
 
     #[test]
@@ -1851,6 +2436,57 @@ mod tests {
         assert!(
             body.contains("[sidebar]") && body.contains("visible = true"),
             "the default document must materialize [sidebar] so schema-mirror env overrides resolve; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn tracked_session_limit_defaults_and_round_trips() {
+        let default = ZerocodeConfig::default();
+        assert_eq!(default.resolve_max_tracked_sessions_per_pane().unwrap(), 8);
+        let default_body = toml::to_string_pretty(&default).unwrap();
+        assert!(
+            default_body.contains("[sessions]")
+                && default_body.contains("max_tracked_per_pane = 8"),
+            "default config must materialize [sessions] for schema-mirror overrides; got:\n{default_body}"
+        );
+
+        let config: ZerocodeConfig =
+            toml::from_str("[sessions]\nmax_tracked_per_pane = 12\n").unwrap();
+        assert_eq!(config.resolve_max_tracked_sessions_per_pane().unwrap(), 12);
+    }
+
+    #[test]
+    fn checked_tracked_session_limit_rejects_invalid_values() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+
+        for value in [0, MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE + 1] {
+            seed(
+                dir.path(),
+                &format!("[sessions]\nmax_tracked_per_pane = {value}\n"),
+            );
+            let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("max_tracked_per_pane must be between 1 and 32"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+
+        seed(dir.path(), "[sessions]\nmax_tracked_per_pane = \"many\"\n");
+        let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("[sessions]"));
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_tracked_session_limit() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sessions]\nmax_tracked_per_pane = 10\n");
+        let _value = EnvVarGuard::set("ZEROCODE_sessions__max_tracked_per_pane", "14");
+
+        assert_eq!(
+            resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap(),
+            14
         );
     }
 
@@ -1873,6 +2509,107 @@ mod tests {
         persist_sidebar_visible(dir.path(), true).unwrap();
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert!(cfg.sidebar.visible);
+    }
+
+    #[test]
+    fn sidebar_leaf_writes_round_trip_side_width_and_split() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_sidebar_side(dir.path(), SidebarSide::Left).unwrap();
+        persist_sidebar_width(dir.path(), 31).unwrap();
+        persist_sidebar_sessions_percent(dir.path(), 45).unwrap();
+        persist_sidebar_queue_percent(dir.path(), 65).unwrap();
+
+        let config = load_persisted(dir.path()).unwrap();
+        assert_eq!(config.sidebar.side, Some(SidebarSide::Left));
+        assert_eq!(config.sidebar.width, 31);
+        assert_eq!(config.sidebar.sessions_percent, 45);
+        assert_eq!(config.sidebar.queue_percent, 65);
+    }
+
+    #[test]
+    fn sidebar_effective_size_clamps_to_shell_bounds() {
+        let mut config = ZerocodeConfig::default();
+        config.sidebar.width = 1;
+        config.sidebar.sessions_percent = u16::MAX;
+        config.sidebar.queue_percent = u16::MAX;
+        assert_eq!(config.effective_sidebar_width(), SIDEBAR_WIDTH_MIN);
+        assert_eq!(
+            config.effective_sidebar_sessions_percent(),
+            SIDEBAR_SESSIONS_PERCENT_MAX
+        );
+        assert_eq!(
+            config.effective_sidebar_queue_percent(),
+            SIDEBAR_QUEUE_PERCENT_MAX
+        );
+        config.sidebar.width = u16::MAX;
+        config.sidebar.sessions_percent = 1;
+        config.sidebar.queue_percent = 1;
+        assert_eq!(config.effective_sidebar_width(), SIDEBAR_WIDTH_MAX);
+        assert_eq!(
+            config.effective_sidebar_sessions_percent(),
+            SIDEBAR_SESSIONS_PERCENT_MIN
+        );
+        assert_eq!(
+            config.effective_sidebar_queue_percent(),
+            SIDEBAR_QUEUE_PERCENT_MIN
+        );
+    }
+
+    #[test]
+    fn sidebar_leaf_write_preserves_comments_and_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "# operator note\n[future] # keep this heading\nkeep   =   true # inline note\n\n[sidebar]\n# dock note\nvisible = false # keep this comment\nfuture_key = \"keep-me\"\n",
+        );
+
+        assert!(!persist_sidebar_visible(dir.path(), true).unwrap());
+        let after = read(dir.path());
+        assert!(after.contains("# operator note"));
+        assert!(after.contains("keep   =   true # inline note"));
+        assert!(after.contains("# dock note"));
+        assert!(after.contains("visible = true # keep this comment"));
+        assert!(after.contains("future_key = \"keep-me\""));
+    }
+
+    #[test]
+    fn sidebar_leaf_write_reports_valid_environment_shadowing() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _visible = EnvVarGuard::set("ZEROCODE_sidebar__visible", "false");
+        let _side = EnvVarGuard::set("ZEROCODE_sidebar__side", "left");
+        let _width = EnvVarGuard::set("ZEROCODE_sidebar__width", "30");
+        let _split = EnvVarGuard::set("ZEROCODE_sidebar__sessions_percent", "45");
+        let _queue_split = EnvVarGuard::set("ZEROCODE_sidebar__queue_percent", "40");
+
+        assert!(persist_sidebar_visible(dir.path(), true).unwrap());
+        assert!(persist_sidebar_side(dir.path(), SidebarSide::Right).unwrap());
+        assert!(persist_sidebar_width(dir.path(), 24).unwrap());
+        assert!(persist_sidebar_sessions_percent(dir.path(), 60).unwrap());
+        assert!(persist_sidebar_queue_percent(dir.path(), 50).unwrap());
+    }
+
+    #[test]
+    fn sidebar_leaf_write_refuses_malformed_or_non_table_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = "[sidebar]\nwidth = \"bad\"\n";
+        seed(dir.path(), before);
+        assert!(persist_sidebar_width(dir.path(), 28).is_err());
+        assert_eq!(read(dir.path()), before);
+
+        let before = "sidebar = \"not-a-table\"\n";
+        seed(dir.path(), before);
+        assert!(persist_sidebar_width(dir.path(), 28).is_err());
+        assert_eq!(read(dir.path()), before);
+    }
+
+    #[test]
+    fn effective_sidebar_side_migrates_legacy_todo_location_until_switch() {
+        let mut config = ZerocodeConfig::default();
+        config.todotracker.location = TodoTrackerLocation::Left;
+        assert_eq!(config.effective_sidebar_side(), SidebarSide::Left);
+        config.sidebar.side = Some(SidebarSide::Right);
+        assert_eq!(config.effective_sidebar_side(), SidebarSide::Right);
     }
 
     #[test]
@@ -2147,6 +2884,21 @@ mod tests {
         let mut c = ZerocodeConfig::default();
         set_prop(&mut c, "todotracker.location", "left").unwrap();
         assert_eq!(c.todotracker.location, TodoTrackerLocation::Left);
+    }
+
+    #[test]
+    fn set_prop_sidebar_leaves_can_materialize_sparse_section() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "sidebar.visible", "true").unwrap();
+        set_prop(&mut c, "sidebar.side", "left").unwrap();
+        set_prop(&mut c, "sidebar.width", "31").unwrap();
+        set_prop(&mut c, "sidebar.sessions_percent", "45").unwrap();
+        set_prop(&mut c, "sidebar.queue_percent", "65").unwrap();
+        assert!(c.sidebar.visible);
+        assert_eq!(c.sidebar.side, Some(SidebarSide::Left));
+        assert_eq!(c.sidebar.width, 31);
+        assert_eq!(c.sidebar.sessions_percent, 45);
+        assert_eq!(c.sidebar.queue_percent, 65);
     }
 
     // ── Resolver validation / normalization (untrusted config boundary) ──────

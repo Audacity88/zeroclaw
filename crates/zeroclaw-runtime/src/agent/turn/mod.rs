@@ -573,6 +573,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    // Text withheld by the streaming text guard on a previous attempt. An
+    // identical repeat means the model produced the same protocol-shaped
+    // prose again; another retry would suppress it again, so the turn ends
+    // with a notice instead of spending more provider calls.
+    let mut last_guard_suppressed_text: Option<String> = None;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
@@ -1049,6 +1054,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
+                    provider_request_model,
                     &e,
                     iteration,
                     event_tx.as_ref(),
@@ -1135,6 +1141,25 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     })),
                 "tool_call_parse_feedback_details"
             );
+
+            if protocol_suppressed {
+                if last_guard_suppressed_text.as_deref() == Some(response_text.as_str()) {
+                    // The guard withheld the same text twice: retrying cannot
+                    // recover prose the guard keeps suppressing, so end the
+                    // turn with a notice instead of another provider call.
+                    let notice = crate::i18n::get_required_cli_string(
+                        "cli-agent-error-protocol-guard-withheld",
+                    );
+                    accumulated_display_text.push_str(&notice);
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(StreamDelta::Text(notice.to_string())).await;
+                    }
+                    let msg = ChatMessage::assistant(notice.to_string());
+                    turn_state.push_dual(msg);
+                    return Ok(accumulated_display_text);
+                }
+                last_guard_suppressed_text = Some(response_text.clone());
+            }
 
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
                 // This is model feedback, not a tool result: malformed protocol

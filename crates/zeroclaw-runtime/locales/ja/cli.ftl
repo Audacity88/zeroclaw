@@ -938,7 +938,7 @@ channel-runtime-thinking-cleared = thinking の上書きをクリアしました
 channel-runtime-thinking-default =
     thinking はすでにこの送信者セッションで agent デフォルト `{ $default }` を使用しています。
     上書きするには `/thinking high`、`/thinking max`、または `/thinking off` を使用してください。
-channel-runtime-thinking-invalid = 不明な thinking レベル `{ $raw }` です。`/thinking off|minimal|low|medium|high|max`、`/thinking on`、または `/thinking reset` を使用してください。
+channel-runtime-thinking-invalid = 不明な thinking レベル `{ $raw }` です。`/effort off|minimal|low|medium|high|xhigh|max`、`/effort on`、または `/effort reset` を使用してください。
 channel-runtime-provider-turn-init-failed =
     ⚠️ model_provider `{ $provider }` の初期化に失敗しました。`/models` を実行して別の model_provider を選択してください。
     詳細: { $error }
@@ -1106,3 +1106,31 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = {$marker_count} 個の画像マーカーを受信しましたが、フォールバック model_provider={$fallback_name} は画像入力をサポートしていません
+cli-agent-vision-unsupported-by-provider = {$marker_count} 個の画像マーカーを受信しましたが、この model_provider は画像入力をサポートしていません
+cli-agent-error-provider-context-window = リクエストが選択したモデルのコンテキストウィンドウを超えています。会話を短くするか、より大きなコンテキストウィンドウを持つモデルを選択してください。
+cli-agent-error-provider-credentials-missing = 選択したモデルプロバイダーの認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-credentials-missing-named = モデルプロバイダー {$provider} の認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-authentication = 選択したモデルプロバイダーが認証情報を拒否しました。設定した認証情報を確認してください。
+cli-agent-error-provider-authentication-named = モデルプロバイダー {$provider} が認証情報を拒否しました。設定した認証情報を確認してください。
+cli-agent-error-provider-rate-limited = 選択したモデルプロバイダーがリクエストをレート制限しました。待機するか、クォータを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-server = 選択したモデルプロバイダーがサーバーエラーを返しました。再試行するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-model-not-found = 選択したモデルを利用できません。設定したモデル名を確認してください。
+cli-agent-error-provider-client-request = 選択したモデルプロバイダーがリクエストを拒否しました。プロバイダー設定とリクエストを確認してください。
+cli-agent-error-provider-connection-local = {$endpoint} のローカルモデルサーバーを利用できません。起動するか、エンドポイントを更新してください。
+cli-agent-error-provider-connection-remote = {$endpoint} のモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-connection = 選択したモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-timeout = 選択したモデルプロバイダーがタイムアウトしました。再試行するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-generic = 選択したモデルプロバイダーで失敗しました。プロバイダー設定を確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-refused = モデルプロバイダーがこのリクエストを拒否しました（{$category}）。そのモデルでの再試行は行いません。リクエストを言い換えるか、別のモデルを選ぶか、フォールバックモデルを設定してください。
+cli-agent-error-provider-refused-category-cyber = サイバー安全ポリシー
+cli-agent-error-provider-refused-category-bio = 生物学的安全ポリシー
+cli-agent-error-provider-refused-category-reasoning-extraction = 推論抽出ポリシー
+cli-agent-error-provider-refused-category-frontier-llm = フロンティアモデルポリシー
+cli-agent-error-provider-refused-category-unspecified = 未指定の安全ポリシー
+cli-agent-error-provider-refused-category-other = 別の安全ポリシー
+cli-delegate-error-invalid-semantic-completion = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-agent-error-invalid-semantic-completion = モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-delegate-error-incomplete-after-provider-tools = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
+cli-agent-error-incomplete-after-provider-tools = モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。

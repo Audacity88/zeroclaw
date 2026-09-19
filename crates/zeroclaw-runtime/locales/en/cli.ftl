@@ -997,6 +997,10 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+# Safe reply delivered when the streaming protocol guard withholds the same
+# response text twice: retrying cannot recover prose the guard keeps
+# suppressing, so the turn ends instead of spending another model call.
+cli-agent-error-protocol-guard-withheld = I withheld this reply because its text matched the internal tool-protocol guard, and a retry produced the same text. Nothing from the reply was delivered.
 channel-runtime-progress-received = Received
 channel-runtime-progress-planning = Planning
 channel-runtime-progress-waiting-on-model = Waiting on model
@@ -1062,7 +1066,7 @@ channel-runtime-thinking-cleared = Thinking override cleared. Using agent defaul
 channel-runtime-thinking-default =
     Thinking is already using agent default `{ $default }` for this sender session.
     Use `/thinking high`, `/thinking max`, or `/thinking off` to override it.
-channel-runtime-thinking-invalid = Unknown thinking level `{ $raw }`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`.
+channel-runtime-thinking-invalid = Unknown thinking level `{ $raw }`. Use `/effort off|minimal|low|medium|high|xhigh|max`, `/effort on`, or `/effort reset`.
 channel-runtime-provider-turn-init-failed =
     ⚠️ Failed to initialize model_provider `{ $provider }`. Please run `/models` to choose another model_provider.
     Details: { $error }
@@ -1196,6 +1200,13 @@ cli-agent-error-provider-connection = Cannot reach the selected model provider. 
 cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
 cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
 cli-agent-error-provider-refusal = The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.
+cli-agent-error-provider-refused = The model provider declined this request ({$category}). It was not retried on that model. Rephrase the request, choose another model, or configure a fallback model.
+cli-agent-error-provider-refused-category-cyber = cyber safety policy
+cli-agent-error-provider-refused-category-bio = biological safety policy
+cli-agent-error-provider-refused-category-reasoning-extraction = reasoning extraction policy
+cli-agent-error-provider-refused-category-frontier-llm = frontier model policy
+cli-agent-error-provider-refused-category-unspecified = unspecified safety policy
+cli-agent-error-provider-refused-category-other = another safety policy
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile

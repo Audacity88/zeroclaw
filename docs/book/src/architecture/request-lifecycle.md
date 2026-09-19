@@ -96,3 +96,5 @@ Since #7415, every transport (channels, CLI, cron, gateway WebSocket, RPC/zeroco
 | `approval_gate.rs` · `call_prep.rs` | tool-call approval and preparation (dedup, hooks, delivery defaults) |
 | `post_exec.rs` · `results_collect.rs` · `history_append.rs` · `max_iter.rs` | result recording, loop detection, history append, iteration cap |
 | `context.rs` · `events.rs` · `knobs.rs` · `steering.rs` · `outcome.rs` · `redact.rs` · `delivery_defaults.rs` | shared types: turn context, events, per-caller knobs, steering, outcomes, credential scrubbing |
+
+The mid-stream protocol guard delivers protocol the model is quoting: shapes inside an inline code span or a fenced block with text after it, and tool-result shapes embedded in surrounding prose. A tool-call envelope that follows a preamble is still withheld as a leak, with the preamble itself delivered; tagged tool-call markup is withheld wherever it appears.

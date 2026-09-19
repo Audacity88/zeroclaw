@@ -186,6 +186,18 @@ impl std::fmt::Display for ImageDataUriRejection {
     }
 }
 
+/// Per-image ceiling on the **base64-encoded** payload length accepted by
+/// `split_base64_image_data_uri`: 10 MB. Measured on the encoded payload,
+/// unlike the multimodal config's `max_image_size_mb`, which bounds decoded
+/// bytes. MB is read as 1024 * 1024, the same way `max_image_size_mb` reads
+/// it, so the two ceilings stay consistent with each other. Anthropic
+/// documents 10 MB encoded as its per-image limit for the direct API; its
+/// separate per-request budget (32 MB across all images) is not enforced
+/// here. The adapters pass this same const so the structural check, the
+/// adapter sweeps and the resolvability count cannot drift apart on what an
+/// image may weigh.
+pub(crate) const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
 /// Splits a `data:` image reference into its media type and base64 payload,
 /// checking the structure without decoding it.
 ///
@@ -449,19 +461,19 @@ pub fn image_marker_summary(content: &str) -> ImageMarkerSummary {
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    count_image_markers_with_latest_tool_results(messages, &latest_tool_indices)
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
+    count_image_markers_with_current_turn_tool_results(messages, &current_turn_tool_indices)
 }
 
-fn count_image_markers_with_latest_tool_results(
+fn count_image_markers_with_current_turn_tool_results(
     messages: &[ChatMessage],
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> usize {
     messages
         .iter()
         .enumerate()
         .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, latest_tool_result_indices)
+            should_normalize_message_images(*index, message, current_turn_tool_result_indices)
         })
         .map(|(_, message)| parse_image_markers(&message.content).1.len())
         .sum()
@@ -486,6 +498,49 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
         .map(|message| parse_image_markers(&message.content).1.len())
         .unwrap_or(0)
+}
+
+/// Count image markers in the latest user message whose references would
+/// actually resolve to an attachment: an inline `data:` URI that passes the
+/// shared structural check, a remote `http(s)` URL when `remote_allowed` is
+/// set (counted without any network access), or a local path that exists as
+/// a file. Marker syntax alone does not count, so prose that merely looks
+/// like a marker cannot fail a turn on a text-only model.
+///
+/// This touches at most the markers of the latest user message and performs
+/// only synchronous filesystem metadata checks (`Path::is_file`); it does no
+/// network I/O and no decoding. `parse_image_markers` remains the single
+/// source of truth for what a marker reference is, and
+/// `split_base64_image_data_uri` for what a valid inline data URI is.
+pub fn count_latest_user_resolvable_image_markers(
+    messages: &[ChatMessage],
+    remote_allowed: bool,
+) -> usize {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| {
+            parse_image_markers(&message.content)
+                .1
+                .into_iter()
+                .filter(|reference| image_reference_resolves(reference, remote_allowed))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// True when a parsed marker reference would resolve to a loadable image:
+/// structurally valid inline data URIs, remote URLs when allowed (cheap to
+/// count, impossible to verify without a fetch), and existing local files.
+fn image_reference_resolves(reference: &str, remote_allowed: bool) -> bool {
+    if reference.starts_with("data:") {
+        return split_base64_image_data_uri(reference, MAX_ENCODED_IMAGE_PAYLOAD_BYTES).is_ok();
+    }
+    if reference.starts_with("http://") || reference.starts_with("https://") {
+        return remote_allowed;
+    }
+    Path::new(reference).is_file()
 }
 
 /// Media-marker kinds this module recognizes. `IMAGE` is the only kind
@@ -738,36 +793,37 @@ fn is_tool_result_carrier(message: &ChatMessage) -> bool {
     message.role == "tool" || is_prompt_tool_result_message(message)
 }
 
-fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+/// Indices of every tool-result carrier in the CURRENT user turn: the
+/// carriers after the most recent user message that is not itself a
+/// prompt-mode tool-result carrier. If no such user message exists, every
+/// tool-result carrier qualifies. Tool images stay live for the user turn
+/// that produced them; they are stripped once the next user message
+/// arrives, so a tool image is never replayed on every later request
+/// forever.
+fn current_turn_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+    let current_turn_start = messages
+        .iter()
+        .rposition(|message| message.role == "user" && !is_prompt_tool_result_message(message));
+
     let mut indices = HashSet::new();
-    let Some((last_index, last_message)) = messages.iter().enumerate().next_back() else {
-        return indices;
-    };
-
-    if is_prompt_tool_result_message(last_message) {
-        indices.insert(last_index);
-        return indices;
-    }
-
-    if last_message.role == "tool" {
-        for (index, message) in messages.iter().enumerate().rev() {
-            if message.role != "tool" {
-                break;
-            }
+    for (index, message) in messages.iter().enumerate() {
+        if current_turn_start.is_some_and(|start| index < start) {
+            continue;
+        }
+        if is_tool_result_carrier(message) {
             indices.insert(index);
         }
     }
-
     indices
 }
 
 fn should_normalize_message_images(
     index: usize,
     message: &ChatMessage,
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> bool {
     if is_tool_result_carrier(message) {
-        return latest_tool_result_indices.contains(&index);
+        return current_turn_tool_result_indices.contains(&index);
     }
 
     message.role == "user"
@@ -778,25 +834,25 @@ fn should_normalize_message_images(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageMarkerDisposition {
     /// Loadable markers become provider image blocks: user messages and the
-    /// latest run of tool-result carriers.
+    /// current user turn's tool-result carriers.
     Normalized,
     /// Markers are stripped before dispatch: tool-result carriers outside the
-    /// latest run.
+    /// current user turn.
     Stripped,
     /// Content is dispatched verbatim as text: system and assistant messages.
     Literal,
 }
 
 /// One disposition per message, computed with the same predicates preparation
-/// uses (`is_tool_result_carrier`, `latest_tool_result_indices`,
+/// uses (`is_tool_result_carrier`, `current_turn_tool_result_indices`,
 /// `should_normalize_message_images`).
 pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDisposition> {
-    let latest_indices = latest_tool_result_indices(messages);
+    let current_indices = current_turn_tool_result_indices(messages);
     messages
         .iter()
         .enumerate()
         .map(|(index, message)| {
-            if should_normalize_message_images(index, message, &latest_indices) {
+            if should_normalize_message_images(index, message, &current_indices) {
                 ImageMarkerDisposition::Normalized
             } else if is_tool_result_carrier(message) {
                 ImageMarkerDisposition::Stripped
@@ -851,9 +907,9 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
 fn replay_message_without_stale_tool_images(
     index: usize,
     message: &ChatMessage,
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> ChatMessage {
-    if is_tool_result_carrier(message) && !latest_tool_result_indices.contains(&index) {
+    if is_tool_result_carrier(message) && !current_turn_tool_result_indices.contains(&index) {
         strip_tool_result_image_markers(message)
     } else {
         message.clone()
@@ -934,8 +990,9 @@ async fn prepare_messages_inner(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
+    let total_images =
+        count_image_markers_with_current_turn_tool_results(messages, &current_turn_tool_indices);
 
     if total_images == 0 {
         return Ok(PreparedMessages {
@@ -943,7 +1000,11 @@ async fn prepare_messages_inner(
                 .iter()
                 .enumerate()
                 .map(|(index, message)| {
-                    replay_message_without_stale_tool_images(index, message, &latest_tool_indices)
+                    replay_message_without_stale_tool_images(
+                        index,
+                        message,
+                        &current_turn_tool_indices,
+                    )
                 })
                 .collect(),
             contains_images: false,
@@ -959,16 +1020,16 @@ async fn prepare_messages_inner(
     // prevents conversations from sticking once the cumulative count crosses
     // the threshold, so no pre-normalization trim is needed here.
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
-    let latest_tool_indices = latest_tool_result_indices(messages);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
     for (index, message) in messages.iter().enumerate() {
-        if !should_normalize_message_images(index, message, &latest_tool_indices) {
+        if !should_normalize_message_images(index, message, &current_turn_tool_indices) {
             normalized_messages.push(replay_message_without_stale_tool_images(
                 index,
                 message,
-                &latest_tool_indices,
+                &current_turn_tool_indices,
             ));
             continue;
         }
@@ -1026,8 +1087,10 @@ async fn prepare_messages_inner(
         });
     }
 
-    // Apply age-based trimming when configured: strip images from user messages
-    // older than `max_image_turns` turns back from the end of history.
+    // Apply age-based trimming when configured: strip images from user
+    // messages older than `max_image_turns` real user turns back from the end
+    // of history. Prompt-mode tool-result carriers never count as turns and
+    // are never aged out here; the stale-tool rule above owns their lifetime.
     // `max_image_turns == 0` means disabled — no age trimming.
     let age_trimmed = if config.max_image_turns > 0 {
         let before = count_image_markers(&normalized_messages);
@@ -1075,12 +1138,18 @@ async fn prepare_messages_inner(
         messages: capped_messages,
     })
 }
+
+/// Strip image markers from user messages older than `max_turns` conversation
+/// turns, where a turn opens at a user message that is not a prompt-mode
+/// tool-result carrier. Carriers never advance the turn count and are never
+/// stripped here; the stale-tool rule and the post-normalization image cap
+/// govern their lifetime, as the `max_image_turns` schema doc documents.
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
-    // Count user messages from the end to find the cutoff index.
+    // Count real user turns from the end to find the cutoff index.
     let mut user_turn_count = 0usize;
     let mut cutoff = 0usize; // messages at index < cutoff are "too old"
     for (i, m) in messages.iter().enumerate().rev() {
-        if m.role == "user" {
+        if m.role == "user" && !is_prompt_tool_result_message(m) {
             user_turn_count += 1;
             if user_turn_count > max_turns {
                 // Everything up to and including this index is too old.
@@ -1098,7 +1167,7 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if i < cutoff && m.role == "user" {
+            if i < cutoff && m.role == "user" && !is_prompt_tool_result_message(m) {
                 let (cleaned, refs) = parse_image_markers(&m.content);
                 if refs.is_empty() {
                     return m.clone();
@@ -1126,13 +1195,13 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
 /// are dropped, so a message holding more images than the budget allows keeps
 /// its newest ones instead of losing all of them.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
-    let latest_tool_indices = latest_tool_result_indices(messages);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
     let image_positions: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
         .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, &latest_tool_indices)
+            should_normalize_message_images(*index, message, &current_turn_tool_indices)
         })
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
@@ -1164,7 +1233,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
         .enumerate()
         .map(|(i, m)| {
             let Some(&drop_here) = drop_counts.get(&i) else {
-                return replay_message_without_stale_tool_images(i, m, &latest_tool_indices);
+                return replay_message_without_stale_tool_images(i, m, &current_turn_tool_indices);
             };
 
             trim_message_images(m, drop_here)
@@ -1476,7 +1545,130 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
 
     validate_size(source, decoded.len(), max_bytes)?;
 
+    match complete_image_mime_from_magic(&decoded) {
+        None => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!("decoded payload is not a recognized image (declared {mime})"),
+            }
+            .into());
+        }
+        Some(sniffed) if sniffed != mime.as_str() => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!(
+                    "decoded image signature is {sniffed}, but the marker declared {mime}"
+                ),
+            }
+            .into());
+        }
+        Some(_) => {}
+    }
+
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
+}
+
+/// Sniff decoded data-URI bytes and require the payload to frame a complete
+/// image of the sniffed type.
+///
+/// [`image_mime_from_magic`] matches leading signature bytes only, so a
+/// truncated fragment — a JPEG SOI plus the APP0 header of a segment it does
+/// not carry, a bare PNG signature — still sniffs as the declared type.
+/// Promoting marker-shaped text out of a tool result needs more than a
+/// prefix: the bytes must frame an image the provider can decode, otherwise
+/// the marker keeps flowing as text.
+fn complete_image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    let mime = image_mime_from_magic(bytes)?;
+    let framed = match mime {
+        "image/png" => is_framed_png(bytes),
+        "image/jpeg" => is_framed_jpeg(bytes),
+        "image/gif" => is_framed_gif(bytes),
+        "image/webp" => is_framed_webp(bytes),
+        // BMP is recognized but never accepted by `PROVIDER_IMAGE_MIME_TYPES`,
+        // so callers reject it as a declared-type mismatch before framing
+        // could matter.
+        _ => true,
+    };
+    framed.then_some(mime)
+}
+
+/// A PNG frames when the signature is followed by chunk-framed data: the
+/// first chunk is `IHDR` and the walk ends exactly at `IEND`.
+fn is_framed_png(bytes: &[u8]) -> bool {
+    // The caller reached this through the PNG sniff, so the 8-byte signature
+    // is present.
+    let mut offset = 8usize;
+    let mut first_chunk = true;
+    while offset < bytes.len() {
+        if bytes.len() - offset < 8 {
+            return false;
+        }
+        let data_len = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        let chunk_type = &bytes[offset + 4..offset + 8];
+        if first_chunk {
+            if chunk_type != b"IHDR" || data_len != 13 {
+                return false;
+            }
+            first_chunk = false;
+        }
+        let Some(chunk_end) = (offset + 8)
+            .checked_add(data_len)
+            .and_then(|end| end.checked_add(4))
+        else {
+            return false;
+        };
+        if chunk_end > bytes.len() {
+            return false;
+        }
+        if chunk_type == b"IEND" {
+            return data_len == 0 && chunk_end == bytes.len();
+        }
+        offset = chunk_end;
+    }
+    false
+}
+
+/// A JPEG frames when SOI is followed by a marker segment whose declared
+/// length fits and the file ends with an EOI marker. Complete JPEGs satisfy
+/// both; a truncated header loses the EOI, and a header-only stub announces a
+/// segment it does not carry.
+fn is_framed_jpeg(bytes: &[u8]) -> bool {
+    // The caller reached this through the JPEG sniff, so FF D8 FF is present.
+    if bytes.len() < 6 || !bytes.ends_with(&[0xFF, 0xD9]) {
+        return false;
+    }
+    let marker = bytes[3];
+    if matches!(marker, 0x01 | 0xD8 | 0xD9 | 0xD0..=0xD7) {
+        return false; // standalone marker: no length-prefixed segment to frame
+    }
+    let segment_len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    if segment_len < 2 {
+        return false; // the segment length counts itself; smaller is malformed
+    }
+    4 + segment_len <= bytes.len() - 2
+}
+
+/// A GIF frames when the logical screen descriptor is present and the stream
+/// ends with the 0x3B trailer byte.
+fn is_framed_gif(bytes: &[u8]) -> bool {
+    // The caller reached this through the GIF sniff, so the 6-byte header is
+    // present; the descriptor (7) plus the trailer (1) are the minimum
+    // remaining structure.
+    bytes.len() >= 14 && matches!(bytes.last(), Some(&0x3B))
+}
+
+/// A WebP frames when the RIFF size field accounts for every remaining byte:
+/// the container declares its own extent.
+fn is_framed_webp(bytes: &[u8]) -> bool {
+    // The caller reached this through the WebP sniff, so RIFF + size + WEBP
+    // (12 bytes) is present.
+    bytes.len() >= 12
+        && u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize == bytes.len() - 8
 }
 
 async fn normalize_remote_image(
@@ -1711,6 +1903,8 @@ mod tests {
             ChatMessage::tool("early result"),
             ChatMessage::user("turn two"),
             ChatMessage::assistant("calling"),
+            ChatMessage::tool("first result this turn"),
+            ChatMessage::assistant("calling again"),
             ChatMessage::tool("latest result"),
         ];
         assert_eq!(
@@ -1723,12 +1917,16 @@ mod tests {
                 ImageMarkerDisposition::Normalized,
                 ImageMarkerDisposition::Literal,
                 ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Normalized,
             ]
         );
 
         let prompt_mode = vec![
             ChatMessage::user("[Tool results]\nearly carrier"),
             ChatMessage::user("turn"),
+            ChatMessage::user("[Tool results]\nfirst carrier this turn"),
+            ChatMessage::assistant("calling again"),
             ChatMessage::user("[Tool results]\nlatest carrier"),
         ];
         assert_eq!(
@@ -1736,6 +1934,8 @@ mod tests {
             vec![
                 ImageMarkerDisposition::Stripped,
                 ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Literal,
                 ImageMarkerDisposition::Normalized,
             ]
         );
@@ -2002,6 +2202,147 @@ mod tests {
         assert_eq!(
             ImageDataUriRejection::MalformedBase64.to_string(),
             "malformed base64 payload"
+        );
+    }
+
+    /// A structurally complete 1x1 PNG — IHDR, IDAT and an exact IEND
+    /// termination: the smallest payload that frames as a PNG through the
+    /// decoded-byte check.
+    const MINIMAL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn normalize_data_uri_rejects_truncated_jpeg_fragment() {
+        // The regression payload: canonical base64 that decodes to six bytes —
+        // a JPEG SOI plus the APP0 header of a segment it does not carry.
+        // Prefix sniffing alone would accept it; framing must not.
+        let source = format!("data:image/jpeg;base64,{}", "/9j/4AAQ");
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("truncated JPEG fragment must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("/9j"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_framed_jpeg_header() {
+        // SOI plus a complete 16-byte APP0 JFIF segment plus EOI: the
+        // smallest payload that frames as a JPEG, and it round-trips
+        // unchanged.
+        let jpeg: &[u8] = &[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        let source = format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg));
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("framed JPEG must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_signature_that_disagrees_with_declaration() {
+        // A framed PNG declared as JPEG is rejected, not re-labelled: a marker
+        // lifted out of arbitrary tool text has no provenance, so the bytes
+        // and the declaration must agree.
+        let source = format!("data:image/jpeg;base64,{MINIMAL_PNG_B64}");
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("sniffed/declared mismatch must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("image/png") && reason.contains("image/jpeg"),
+            "reason should name both types: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_truncated_tool_result_marker_as_text() {
+        // The reported scenario: a text-returning tool printed marker-shaped
+        // text whose payload decodes but does not frame an image. The tool
+        // result must stay textual — the skipped-image note replaces the
+        // marker — so nothing image-shaped reaches the provider.
+        let marker = format!("[{}:{}]", "IMAGE", "data:image/jpeg;base64,/9j/4AAQ");
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "call_shell",
+            "content": format!("rg done\n{marker}"),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("marker-shaped text must not fail preparation");
+
+        assert!(!prepared.contains_images);
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_shell")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("rg done"));
+        assert!(
+            inner.contains("1 attached image(s) could not be loaded"),
+            "the skipped-image note is the safe textual representation: {inner}"
+        );
+        assert!(
+            !inner.contains(IMAGE_MARKER_PREFIX),
+            "no marker may survive: {inner}"
+        );
+        assert!(
+            !inner.contains("data:image"),
+            "no image payload may survive: {inner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_promotes_framed_tool_result_image_marker() {
+        // The other side of the boundary: a tool result whose marker decodes
+        // to a framed image of the declared type still rides as an image
+        // marker for the provider to lift.
+        let marker = format!("[{}:data:image/png;base64,{}]", "IMAGE", MINIMAL_PNG_B64);
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "call_snapshot",
+            "content": format!("snapshot captured\n{marker}"),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("a framed tool-result image must prepare");
+
+        assert!(prepared.contains_images);
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_snapshot")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("snapshot captured"));
+        assert!(
+            inner.contains("data:image/png;base64,"),
+            "the promoted marker rides inside the tool content: {inner}"
         );
     }
 
@@ -2837,6 +3178,346 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prepare_messages_keeps_tool_image_after_unrelated_tool_call_in_same_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let image_tool_content = serde_json::json!({
+            "tool_call_id": "tc_image",
+            "content": format!(
+                "generated screenshot [IMAGE:{}]",
+                image_path.display().to_string()
+            ),
+        })
+        .to_string();
+        let weather_tool_content = serde_json::json!({
+            "tool_call_id": "tc_weather",
+            "content": "Sunny, 25C".to_string(),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(image_tool_content),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_weather", "name": "weather", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(weather_tool_content),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("tool images stay live for the user turn that produced them");
+
+        assert!(
+            prepared.contains_images,
+            "an image tool result followed by an unrelated tool result in the same turn must stay normalized"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content)
+            .expect("tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc_image")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        // The marker is rewritten in place to wrap the data URI, so the raw
+        // filesystem path must be gone while the payload is inline.
+        assert!(inner.contains("data:image/png;base64,"));
+        assert!(!inner.contains("same-turn-tool-result.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_tool_image_after_next_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let image_tool_content = serde_json::json!({
+            "tool_call_id": "tc_image",
+            "content": format!(
+                "generated screenshot [IMAGE:{}]",
+                image_path.display().to_string()
+            ),
+        })
+        .to_string();
+        let weather_tool_content = serde_json::json!({
+            "tool_call_id": "tc_weather",
+            "content": "Sunny, 25C".to_string(),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(image_tool_content),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_weather", "name": "weather", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(weather_tool_content),
+            ChatMessage::user("What did you find?".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("stale tool images should strip without loading them");
+
+        assert!(
+            !prepared.contains_images,
+            "once the next user message arrives the turn's tool images are stale"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content)
+            .expect("stale native tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc_image")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("same-turn-tool-result.png"));
+
+        let weather_value: serde_json::Value = serde_json::from_str(&prepared.messages[4].content)
+            .expect("the text-only tool result should remain valid JSON");
+        assert_eq!(
+            weather_value.get("content").and_then(|v| v.as_str()),
+            Some("Sunny, 25C")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_prompt_mode_tool_images_within_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-prompt-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let messages = vec![
+            ChatMessage::user("Compare these two.".to_string()),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
+                image_path.display()
+            )),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("prompt-mode tool images stay live for the user turn that produced them");
+
+        assert!(
+            prepared.contains_images,
+            "an earlier prompt-mode tool-result carrier in the same turn must stay normalized"
+        );
+
+        assert!(prepared.messages[1].content.contains("[Tool results]"));
+        assert!(prepared.messages[1].content.contains("Generated"));
+        assert!(
+            prepared.messages[1]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[1]
+                .content
+                .contains("same-turn-prompt-tool-result.png")
+        );
+        assert!(prepared.messages[2].content.contains("Sunny, 25C"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_prompt_mode_tool_images_within_turn_under_age_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_image_path = temp.path().join("age-limit-user-attachment.png");
+        let tool_image_path = temp.path().join("age-limit-tool-result.png");
+        // Minimal valid PNG (1x1 RGB pixel).
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&user_image_path, png_data).unwrap();
+        std::fs::write(&tool_image_path, png_data).unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "Inspect the attached image, then check session information\n[IMAGE:{}]",
+                user_image_path.display()
+            )),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "image_tool", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_tool\">Generated [IMAGE:{}]</tool_result>",
+                tool_image_path.display()
+            )),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_session", "name": "session_info", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"session_info\">session id: abc-123</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_turns: 1,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("one user turn holding two carriers must not age the turn's images out");
+
+        assert!(
+            prepared.contains_images,
+            "the user's own image and the same-turn tool image must both survive the age limit"
+        );
+
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("Inspect the attached image, then check session information")
+        );
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[0]
+                .content
+                .contains("age-limit-user-attachment.png")
+        );
+        assert!(prepared.messages[2].content.contains("[Tool results]"));
+        assert!(prepared.messages[2].content.contains("Generated"));
+        assert!(
+            prepared.messages[2]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[2]
+                .content
+                .contains("age-limit-tool-result.png")
+        );
+        assert!(prepared.messages[4].content.contains("session id: abc-123"));
+    }
+
+    #[test]
+    fn trim_images_by_age_still_strips_real_user_images_past_the_limit() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/old/user-image.png]".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Done.".to_string(),
+            },
+            ChatMessage::user("Next question".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Answered.".to_string(),
+            },
+            ChatMessage::user("Follow-up".to_string()),
+        ];
+
+        let trimmed = trim_images_by_age(&messages, 1);
+
+        assert_eq!(trimmed[0].content, "[image removed from history]");
+        assert_eq!(trimmed[1].content, "Done.");
+        assert_eq!(trimmed[2].content, "Next question");
+        assert_eq!(trimmed[3].content, "Answered.");
+        assert_eq!(trimmed[4].content, "Follow-up");
+    }
+
+    #[test]
+    fn trim_images_by_age_ignores_prompt_mode_carriers_when_counting() {
+        let messages = vec![
+            ChatMessage::user("Inspect this screenshot.".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "On it.".to_string(),
+            },
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:/tmp/tool-image.png]</tool_result>"
+                    .to_string(),
+            ),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Checked.".to_string(),
+            },
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let trimmed = trim_images_by_age(&messages, 1);
+
+        assert_eq!(trimmed[0].content, messages[0].content);
+        assert_eq!(trimmed[2].content, messages[2].content);
+        assert_eq!(trimmed[4].content, messages[4].content);
+    }
+
     #[test]
     fn count_image_markers_ignores_stale_tool_results() {
         let messages = vec![
@@ -2853,6 +3534,23 @@ mod tests {
         let messages = vec![
             ChatMessage::user("Create an image".to_string()),
             ChatMessage::tool("[IMAGE:/tmp/latest-tool.png]\nGenerated".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    #[test]
+    fn count_image_markers_counts_tool_images_within_turn() {
+        // The image tool result sits before a later, text-only tool result in
+        // the same user turn; the vision gate must still see its image.
+        let messages = vec![
+            ChatMessage::user("Create an image, then check the weather.".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/same-turn-tool.png]\nGenerated".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Checking the weather next.".to_string(),
+            },
+            ChatMessage::tool("Sunny, 25C".to_string()),
         ];
 
         assert_eq!(count_image_markers(&messages), 1);
@@ -2894,6 +3592,82 @@ mod tests {
             ChatMessage::tool("[IMAGE:/tmp/tool.png]\nGenerated".to_string()),
         ];
         assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
+    }
+
+    #[test]
+    fn resolvable_count_ignores_missing_path() {
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE:{}]",
+            "/definitely/not/a/real/screenshot.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            0
+        );
+    }
+
+    #[test]
+    fn resolvable_count_accepts_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"not a real png; existence is all that counts").unwrap();
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE:{}]",
+            image_path.display()
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            1
+        );
+    }
+
+    #[test]
+    fn resolvable_count_accepts_structurally_valid_data_uri() {
+        let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            1
+        );
+    }
+
+    #[test]
+    fn resolvable_count_rejects_malformed_data_uri() {
+        let uri = "data:image/png;base64,%%%";
+        let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            0
+        );
+    }
+
+    #[test]
+    fn resolvable_count_remote_follows_flag() {
+        let reference = "https://example.com/cat.png";
+        let messages = vec![ChatMessage::user(format!("see [IMAGE:{reference}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            0
+        );
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, true),
+            1
+        );
+    }
+
+    #[test]
+    fn resolvable_count_looks_only_at_latest_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("older.png");
+        std::fs::write(&image_path, b"an older turn's real image").unwrap();
+        let messages = vec![
+            ChatMessage::user(format!("look [IMAGE:{}]", image_path.display())),
+            ChatMessage::user("what is WAL?".to_string()),
+        ];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            0
+        );
     }
 
     #[tokio::test]

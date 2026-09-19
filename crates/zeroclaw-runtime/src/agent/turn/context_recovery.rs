@@ -58,6 +58,7 @@ pub(crate) fn record_llm_failure(
 
 pub(crate) async fn try_recover_context_overflow(
     history: &mut Vec<ChatMessage>,
+    model: &str,
     e: &anyhow::Error,
     iteration: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
@@ -102,6 +103,32 @@ pub(crate) async fn try_recover_context_overflow(
                 .take_while(|m| m.role == "system")
                 .count();
             recovered_history.insert(system_count, crate::agent::history_trim::breadcrumb());
+            // The trim rewrote the prefix the reasoning was signed over, so
+            // no stored block after the edit can be replayed: one whose
+            // prefix changed would be stale. Two model classes are exposed —
+            // adaptive-shape models, whose in-flight block must never be
+            // stale, and models whose API keeps earlier turns' thinking,
+            // which replay every block on every request. A trim drops the
+            // reasoning of both kinds everywhere, not only in flight.
+            if zeroclaw_providers::claude_models::claude_thinking_shape(model)
+                == zeroclaw_providers::claude_models::ClaudeThinkingShape::Adaptive
+                || zeroclaw_providers::claude_models::claude_keeps_prior_thinking(model)
+            {
+                let stripped =
+                    crate::agent::history_trim::strip_all_reasoning(&mut recovered_history);
+                if stripped > 0 {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "model": model,
+                                "turns": stripped,
+                            })),
+                        "dropped replayed reasoning after an in-loop history trim"
+                    );
+                }
+            }
         }
         *history = recovered_history;
         if trimmed {
@@ -170,6 +197,115 @@ pub(crate) async fn try_recover_context_overflow(
 
 #[cfg(test)]
 mod tests {
+
+    /// Build an overflowing history where the trim drops the oldest turn while
+    /// its successor round and the in-flight round survive, both carrying
+    /// signed reasoning. The surviving prior-turn block is what separates
+    /// dropping all replayed reasoning from dropping only the in-flight one.
+    fn history_with_in_flight_reasoning() -> Vec<ChatMessage> {
+        let big = "x".repeat(4_000);
+        let envelope = |call_id: &str, signature: &str| {
+            serde_json::json!({
+                "content": "",
+                "tool_calls": [{"id": call_id, "name": "shell", "arguments": "{}"}],
+                "reasoning_content": serde_json::json!({
+                    "thinking": "thought",
+                    "signature": signature,
+                })
+                .to_string(),
+            })
+            .to_string()
+        };
+        vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("older ask {big}").as_str()),
+            ChatMessage::assistant(format!("older answer {big}").as_str()),
+            ChatMessage::user("newer ask"),
+            ChatMessage::assistant(envelope("call_1", "sig_old")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+            ChatMessage::user("current ask"),
+            ChatMessage::assistant(envelope("call_2", "sig_new")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_2", "content": "done"})
+                    .to_string(),
+            },
+        ]
+    }
+
+    fn in_flight_carries_reasoning(history: &[ChatMessage]) -> bool {
+        history.iter().any(|msg| msg.content.contains("sig_new"))
+    }
+
+    fn any_signature_survives(history: &[ChatMessage]) -> bool {
+        history
+            .iter()
+            .any(|msg| msg.content.contains("sig_old") || msg.content.contains("sig_new"))
+    }
+
+    #[tokio::test]
+    async fn recovery_drops_in_flight_reasoning_when_the_model_binds_it() {
+        let mut history = history_with_in_flight_reasoning();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            "claude-fable-5-1",
+            &err,
+            1,
+            None,
+            None,
+            &observer,
+            100,
+        )
+        .await;
+
+        assert!(recovered, "an oversized history must trim");
+        assert!(
+            !any_signature_survives(&history),
+            "the trim rewrote the prefix every replayed block was signed over, \
+             so no signed reasoning may survive anywhere"
+        );
+        assert!(
+            history.iter().any(|msg| msg.content.contains("call_1")),
+            "the tool call itself must survive the strip"
+        );
+        assert!(
+            history.iter().any(|msg| msg.content.contains("call_2")),
+            "the in-flight tool call itself must survive the strip"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_keeps_in_flight_reasoning_on_older_models() {
+        let mut history = history_with_in_flight_reasoning();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let observer = NoopObserver;
+
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            "claude-sonnet-4-5",
+            &err,
+            1,
+            None,
+            None,
+            &observer,
+            100,
+        )
+        .await;
+
+        assert!(recovered, "an oversized history must trim");
+        assert!(
+            in_flight_carries_reasoning(&history),
+            "older models require their in-flight thinking block"
+        );
+    }
+
     use super::*;
     use crate::observability::NoopObserver;
     use zeroclaw_providers::ChatMessage;
@@ -197,6 +333,7 @@ mod tests {
 
         let recovered = try_recover_context_overflow(
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             None,
@@ -229,6 +366,7 @@ mod tests {
 
         let recovered = try_recover_context_overflow(
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             None,
@@ -264,6 +402,7 @@ mod tests {
 
         let recovered = try_recover_context_overflow(
             &mut history,
+            "claude-sonnet-4-5",
             &err,
             1,
             None,
@@ -295,9 +434,17 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            "claude-sonnet-4-5",
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            32_000,
+        )
+        .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -341,9 +488,17 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 100)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            "claude-sonnet-4-5",
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            100,
+        )
+        .await;
 
         assert!(
             !recovered,
@@ -369,9 +524,17 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            "claude-sonnet-4-5",
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            32_000,
+        )
+        .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -402,9 +565,17 @@ mod tests {
         // Drain any pre-existing broadcast traffic from parallel tests.
         while rx.try_recv().is_ok() {}
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, None, &observer, budget)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            "claude-sonnet-4-5",
+            &err,
+            1,
+            None,
+            None,
+            &observer,
+            budget,
+        )
+        .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s

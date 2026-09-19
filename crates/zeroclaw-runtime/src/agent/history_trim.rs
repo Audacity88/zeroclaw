@@ -46,11 +46,37 @@ fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool)
     )
 }
 
+/// Compute the hysteresis low-water target for a whole-turn trim: the
+/// largest number of non-system messages a trim should leave behind.
+/// `low_water` of 1.0 (or anything non-finite, zero, or negative) keeps the
+/// no-hysteresis behavior of trimming straight back to the cap; a fractional
+/// value floors to at least 1 so a trim never aims at an empty history.
+#[must_use]
+pub(crate) fn history_trim_target(max_messages: usize, low_water: f32) -> usize {
+    if !(low_water > 0.0 && low_water < 1.0) {
+        return max_messages;
+    }
+    // Evaluated in f32, the field's own type: the product rounds to the
+    // value a reader of the fraction expects (10 * 0.7 floors to 7, not to
+    // the 6 an exact f64 promotion of 0.7f32 would produce).
+    let scaled = (max_messages as f32 * low_water).floor();
+    if scaled < 1.0 {
+        1
+    } else {
+        // Float-to-int casts saturate, which is the right behavior for
+        // degenerate caps close to usize::MAX.
+        scaled as usize
+    }
+}
+
 /// Drop the oldest whole conversation turns until the non-system body fits
-/// `max_messages`, while always retaining the newest complete turn.
+/// `max_messages`, trimming down to `target` messages (the caller computes
+/// it from the hysteresis low-water fraction) while always retaining the
+/// newest complete turn.
 pub(crate) fn trim_conversation_to_recent_turns(
     history: Vec<ConversationMessage>,
     max_messages: usize,
+    target: usize,
     has_leading_breadcrumb: bool,
 ) -> MessageCountTrimResult {
     let first_non_system = history
@@ -104,7 +130,7 @@ pub(crate) fn trim_conversation_to_recent_turns(
     for (turn_index, &boundary) in boundaries.iter().enumerate().skip(1) {
         first_kept = boundary;
         dropped_turns = turn_index;
-        if body.len() - boundary <= max_messages || turn_index == boundaries.len() - 1 {
+        if body.len() - boundary <= target || turn_index == boundaries.len() - 1 {
             break;
         }
     }
@@ -257,6 +283,106 @@ pub fn breadcrumb() -> ChatMessage {
     ChatMessage::user(crate::i18n::get_required_cli_string("history-trim-breadcrumb").as_str())
 }
 
+/// Drop replayable reasoning from the exchange still in flight.
+///
+/// Call this after editing the history of a live turn. A model that binds its
+/// reasoning to the conversation prefix rejects blocks whose prefix has since
+/// changed, and an in-loop trim changes exactly that. The text and tool calls
+/// of each turn stay; only the stored reasoning goes. Returns how many turns
+/// were touched.
+pub fn strip_in_flight_reasoning(history: &mut [ChatMessage]) -> usize {
+    let Some(exchange_start) = history
+        .iter()
+        .rposition(|msg| !matches!(msg.role.as_str(), "system" | "assistant" | "tool"))
+    else {
+        return 0;
+    };
+    let mut stripped = 0;
+    for msg in history.iter_mut().skip(exchange_start + 1) {
+        if msg.role != "assistant" {
+            continue;
+        }
+        if strip_reasoning_from_assistant_content(&mut msg.content) {
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
+/// Drop every stored reasoning block from the history, not only the round
+/// still in flight.
+///
+/// Call this after editing the history of a model whose API keeps earlier
+/// turns' thinking in context. Such models replay every stored reasoning
+/// block on every request, so an edit that rewrites the conversation prefix
+/// — dropping old turns chiefly — leaves the signature of every later block
+/// pointing at a prefix that no longer exists; the safe wire is one that
+/// carries no stale block at all. The text and tool calls of each turn
+/// stay; only the stored reasoning goes. Returns how many messages were
+/// touched.
+pub fn strip_all_reasoning(history: &mut [ChatMessage]) -> usize {
+    let mut stripped = 0;
+    for msg in history.iter_mut() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        if strip_reasoning_from_assistant_content(&mut msg.content) {
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
+/// Drop every stored reasoning block from structured conversation history.
+///
+/// Same purpose as [`strip_all_reasoning`], for the durable message list the
+/// agent keeps between turns: a rewrite of the conversation prefix there
+/// invalidates every replayed reasoning block after the edit. Structured
+/// history stores reasoning in two shapes — the dedicated tool-call entry's
+/// field, and an assistant chat message whose content is the provider
+/// envelope — and both lose it. Everything else is untouched. Returns how
+/// many messages were touched.
+pub(crate) fn strip_all_reasoning_from_conversation(history: &mut [ConversationMessage]) -> usize {
+    let mut stripped = 0;
+    for message in history.iter_mut() {
+        match message {
+            ConversationMessage::AssistantToolCalls {
+                reasoning_content, ..
+            } => {
+                if reasoning_content.take().is_some() {
+                    stripped += 1;
+                }
+            }
+            ConversationMessage::Chat(chat) => {
+                if chat.role == "assistant"
+                    && strip_reasoning_from_assistant_content(&mut chat.content)
+                {
+                    stripped += 1;
+                }
+            }
+            ConversationMessage::ToolResults(_) => {}
+        }
+    }
+    stripped
+}
+
+/// Remove the stored reasoning envelope from one assistant message's JSON
+/// content. Returns true when the message carried reasoning and it is now
+/// gone. Malformed or non-object content is left untouched.
+fn strip_reasoning_from_assistant_content(content: &mut String) -> bool {
+    let Ok(mut envelope) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(object) = envelope.as_object_mut() else {
+        return false;
+    };
+    if object.remove("reasoning_content").is_none() {
+        return false;
+    }
+    *content = envelope.to_string();
+    true
+}
+
 /// Insert the trim breadcrumb after the leading system messages, unless one is
 /// already sitting there.
 pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) {
@@ -352,6 +478,23 @@ mod tests {
         }
     }
 
+    /// Pins the no-hysteresis identity: a low-water fraction of 1.0 must
+    /// reproduce the pre-hysteresis drop points exactly. All pre-existing
+    /// fixtures in this module run through this wrapper so the 1.0 case
+    /// stays exercised by every one of them.
+    fn trim_conversation_to_recent_turns_at_legacy_cap(
+        history: Vec<ConversationMessage>,
+        max_messages: usize,
+        has_leading_breadcrumb: bool,
+    ) -> MessageCountTrimResult {
+        trim_conversation_to_recent_turns(
+            history,
+            max_messages,
+            history_trim_target(max_messages, 1.0),
+            has_leading_breadcrumb,
+        )
+    }
+
     #[test]
     fn trim_conversation_to_recent_turns_keeps_single_tool_heavy_turn_over_cap() {
         let mut history = vec![conversation_user("run the workflow")];
@@ -361,7 +504,7 @@ mod tests {
         history.push(conversation_assistant("workflow complete"));
         assert_eq!(history.len(), 64);
 
-        let result = trim_conversation_to_recent_turns(history, 50, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 50, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -393,7 +536,7 @@ mod tests {
         }
         history.push(conversation_assistant("new answer"));
 
-        let result = trim_conversation_to_recent_turns(history, 50, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 50, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_turns, 1);
@@ -421,7 +564,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 0, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 0, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -446,7 +589,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -480,7 +623,7 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 3, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 3, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -502,7 +645,7 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -522,7 +665,7 @@ mod tests {
         history.push(conversation_assistant("done"));
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 1, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 1, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -546,7 +689,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -577,7 +720,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -608,7 +751,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 4, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -638,7 +781,7 @@ mod tests {
             conversation_assistant("middle answer"),
         ];
 
-        let first = trim_conversation_to_recent_turns(history, 4, true);
+        let first = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, true);
         assert!(
             !first.trimmed,
             "a synthetic breadcrumb must not push an exactly-at-cap body over the limit"
@@ -647,7 +790,7 @@ mod tests {
         history = first.history;
         history.push(conversation_user("new request"));
         history.push(conversation_assistant("new answer"));
-        let mut second = trim_conversation_to_recent_turns(history, 4, true);
+        let mut second = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, true);
 
         assert!(second.trimmed);
         assert_eq!(second.dropped_messages, 2);
@@ -678,6 +821,125 @@ mod tests {
             Some(ConversationMessage::Chat(message))
                 if message.role == "assistant" && message.content == "new answer"
         ));
+    }
+
+    #[test]
+    fn history_trim_target_semantics() {
+        // 1.0 keeps the no-hysteresis identity exactly.
+        assert_eq!(history_trim_target(10, 1.0), 10);
+        assert_eq!(history_trim_target(1, 1.0), 1);
+        assert_eq!(history_trim_target(0, 1.0), 0);
+        // Fractional values floor toward the cap.
+        assert_eq!(history_trim_target(10, 0.7), 7);
+        assert_eq!(history_trim_target(5, 0.7), 3);
+        assert_eq!(history_trim_target(4, 0.7), 2);
+        // The target never aims below a single message.
+        assert_eq!(history_trim_target(1, 0.7), 1);
+        assert_eq!(history_trim_target(0, 0.7), 1);
+        // Out-of-range fractions (rejected at config load) degrade to the
+        // legacy no-hysteresis target rather than something nonsensical.
+        assert_eq!(history_trim_target(10, 1.5), 10);
+        assert_eq!(history_trim_target(10, f32::NAN), 10);
+        assert_eq!(history_trim_target(10, 0.0), 10);
+    }
+
+    #[test]
+    fn trim_conversation_to_recent_turns_at_cap_does_not_trim_below_target() {
+        // The trigger stays on the cap: at or below max_messages the history
+        // is untouched even though the target is smaller.
+        let history = vec![
+            conversation_user("old request"),
+            conversation_assistant("old answer"),
+            conversation_user("new request"),
+            conversation_assistant("new answer"),
+        ];
+
+        let result =
+            trim_conversation_to_recent_turns(history, 4, history_trim_target(4, 0.7), false);
+
+        assert!(!result.trimmed);
+        assert_eq!(result.dropped_messages, 0);
+        assert_eq!(result.dropped_turns, 0);
+        assert_eq!(result.kept_turns, 2);
+        assert_eq!(result.history.len(), 4);
+    }
+
+    #[test]
+    fn trim_conversation_to_recent_turns_crossing_by_one_drops_to_target() {
+        let history = vec![
+            conversation_user("first request"),
+            conversation_user("second request"),
+            conversation_assistant("second answer"),
+            conversation_user("third request"),
+            conversation_assistant("third answer"),
+        ];
+        // 5 body messages over a cap of 4: the trim fires, but instead of
+        // refilling to the cap it drops to the low-water target (2), which
+        // here means two whole turns go instead of one.
+        let result = trim_conversation_to_recent_turns(history, 4, 2, false);
+
+        assert!(result.trimmed);
+        assert_eq!(result.dropped_turns, 2);
+        assert_eq!(result.dropped_messages, 3);
+        assert_eq!(result.kept_turns, 1);
+        assert_eq!(result.history.len(), 2);
+        assert!(matches!(
+            &result.history[..],
+            [
+                ConversationMessage::Chat(user),
+                ConversationMessage::Chat(assistant),
+            ] if user.role == "user" && user.content == "third request"
+                && assistant.role == "assistant" && assistant.content == "third answer"
+        ));
+
+        // The same fixture under a 1.0 low water mark keeps one more turn:
+        // hysteresis, not the cap change, is what drops the second turn.
+        let legacy = trim_conversation_to_recent_turns_at_legacy_cap(
+            vec![
+                conversation_user("first request"),
+                conversation_user("second request"),
+                conversation_assistant("second answer"),
+                conversation_user("third request"),
+                conversation_assistant("third answer"),
+            ],
+            4,
+            false,
+        );
+        assert_eq!(legacy.dropped_turns, 1);
+        assert_eq!(legacy.history.len(), 4);
+    }
+
+    #[test]
+    fn trim_conversation_to_recent_turns_newest_turn_alone_exceeds_target() {
+        let mut history = vec![
+            conversation_user("old request"),
+            conversation_assistant("old answer"),
+            conversation_user("new request"),
+        ];
+        for index in 0..25 {
+            push_tool_exchange(&mut history, index);
+        }
+        history.push(conversation_assistant("new answer"));
+
+        // Target 35 against a 52-message newest turn: the invariant wins,
+        // the newest complete turn is kept exactly.
+        let result = trim_conversation_to_recent_turns(history, 50, 35, false);
+
+        assert!(result.trimmed);
+        assert_eq!(result.dropped_turns, 1);
+        assert_eq!(result.dropped_messages, 2);
+        assert_eq!(result.kept_turns, 1);
+        assert!(matches!(
+            result.history.first(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "user" && message.content == "new request"
+        ));
+        assert!(matches!(
+            result.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "assistant" && message.content == "new answer"
+        ));
+        assert_structural_tool_pairs(&result.history);
     }
 
     #[test]
@@ -979,6 +1241,170 @@ mod tests {
         assert_eq!(h[1].role, "system");
         assert_eq!(h[2].role, breadcrumb().role);
         assert_eq!(h[2].content, breadcrumb().content);
+    }
+
+    fn reasoning_envelope(signature: &str, call_id: &str) -> String {
+        serde_json::json!({
+            "content": "working",
+            "tool_calls": [{"id": call_id, "name": "shell", "arguments": "{}"}],
+            "reasoning_content": serde_json::json!({
+                "thinking": "thought",
+                "signature": signature,
+            })
+            .to_string(),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn strip_all_reasoning_removes_reasoning_from_every_assistant_message() {
+        let mut history = vec![
+            sys("s1"),
+            user("first ask"),
+            asst(reasoning_envelope("sig_old", "call_1").as_str()),
+            tool(r#"{"tool_call_id":"call_1","content":"done"}"#),
+            user("second ask"),
+            asst(reasoning_envelope("sig_new", "call_2").as_str()),
+            tool(r#"{"tool_call_id":"call_2","content":"done"}"#),
+        ];
+
+        let stripped = strip_all_reasoning(&mut history);
+
+        assert_eq!(stripped, 2, "both assistant envelopes carried reasoning");
+        for msg in history.iter().filter(|m| m.role == "assistant") {
+            let parsed: serde_json::Value = serde_json::from_str(&msg.content)
+                .expect("an assistant envelope must survive the strip as valid JSON");
+            assert!(
+                parsed.get("reasoning_content").is_none(),
+                "no reasoning may remain: {parsed}"
+            );
+            let calls = parsed
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .expect("the tool calls must survive the strip");
+            assert_eq!(calls.len(), 1, "tool calls must survive: {parsed}");
+            assert_eq!(
+                parsed.get("content").and_then(serde_json::Value::as_str),
+                Some("working"),
+                "the assistant text must survive the strip: {parsed}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_all_reasoning_ignores_plain_text_and_non_assistant_messages() {
+        let mut history = vec![
+            sys("s1"),
+            user("a question"),
+            asst("a plain answer with reasoning_content in prose but no envelope"),
+            user(r#"{"reasoning_content":"not an assistant message"}"#),
+        ];
+
+        let stripped = strip_all_reasoning(&mut history);
+
+        assert_eq!(stripped, 0);
+        assert_eq!(
+            history
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "s1".to_string(),
+                "a question".to_string(),
+                "a plain answer with reasoning_content in prose but no envelope".to_string(),
+                r#"{"reasoning_content":"not an assistant message"}"#.to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn strip_all_reasoning_from_conversation_clears_both_reasoning_shapes() {
+        let mut history = vec![
+            conversation_system("s1"),
+            conversation_user("first ask"),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("calling".into()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: Some(r#"{"thinking":"t","signature":"sig_old"}"#.into()),
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                content: "done".into(),
+                tool_name: "shell".into(),
+            }]),
+            conversation_assistant(reasoning_envelope("sig_new", "call_2").as_str()),
+        ];
+
+        let stripped = strip_all_reasoning_from_conversation(&mut history);
+
+        assert_eq!(stripped, 2, "both reasoning shapes lose their payload");
+        assert!(
+            matches!(
+                &history[2],
+                ConversationMessage::AssistantToolCalls { reasoning_content: None, tool_calls, .. }
+                    if tool_calls.len() == 1 && tool_calls[0].id == "call_1"
+            ),
+            "the tool-call entry keeps its calls and loses its reasoning"
+        );
+        match &history[4] {
+            ConversationMessage::Chat(chat) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&chat.content).expect("envelope must stay valid JSON");
+                assert!(
+                    parsed.get("reasoning_content").is_none(),
+                    "the chat-envelope shape loses its reasoning: {parsed}"
+                );
+                assert!(
+                    parsed.get("tool_calls").is_some(),
+                    "the chat-envelope shape keeps its tool calls"
+                );
+            }
+            other => panic!("expected a chat message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_all_reasoning_from_conversation_counts_only_what_carried_reasoning() {
+        let mut history = vec![
+            conversation_user("ask"),
+            conversation_assistant("plain answer"),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                content: "done".into(),
+                tool_name: String::new(),
+            }]),
+        ];
+
+        assert_eq!(strip_all_reasoning_from_conversation(&mut history), 0);
+        assert_eq!(
+            serde_json::to_value(&history).unwrap(),
+            serde_json::to_value(vec![
+                conversation_user("ask"),
+                conversation_assistant("plain answer"),
+                ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: vec![],
+                    reasoning_content: None,
+                },
+                ConversationMessage::ToolResults(vec![ToolResultMessage {
+                    tool_call_id: "call_1".into(),
+                    content: "done".into(),
+                    tool_name: String::new(),
+                }]),
+            ])
+            .unwrap(),
+            "history without reasoning is untouched"
+        );
     }
 
     #[test]

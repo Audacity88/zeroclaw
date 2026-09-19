@@ -300,6 +300,9 @@ pub fn apply_compat_options(
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
+    if opts.reasoning_effort_passthrough {
+        b = b.with_reasoning_effort_passthrough();
+    }
     if !opts.extra_headers.is_empty() {
         b = b.extra_headers(opts.extra_headers.clone());
     }
@@ -317,8 +320,14 @@ pub fn apply_compat_options(
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
+    if opts.thinking_passthrough {
+        b = b.with_thinking_passthrough();
+    }
     if opts.cache_passthrough {
         b = b.with_cache_passthrough();
+    }
+    if let Some(cache_ttl) = opts.cache_ttl {
+        b = b.with_cache_ttl(cache_ttl);
     }
     // `provider_extra` alias is captured before `build()` because the WARN
     // path below reads it for logging. Only object-shaped JSON is threaded
@@ -1203,12 +1212,16 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
             .credential(key)
             .server_fallback_models(self.server_fallback_models.clone())
-            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()))
+            .thinking_display(self.thinking_display);
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
         }
         if let Some(ts) = opts.provider_timeout_secs {
             b = b.timeout_secs(ts);
+        }
+        if let Some(cache_ttl) = opts.cache_ttl {
+            b = b.cache_ttl(cache_ttl);
         }
         Ok(Box::new(b.build()))
     }

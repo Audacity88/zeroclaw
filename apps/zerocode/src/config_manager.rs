@@ -11,6 +11,7 @@ use crossterm::{
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
@@ -31,6 +32,12 @@ pub(crate) type Term = Terminal<WideCellCleanupBackend<Stdout>>;
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
+/// Ask terminals implementing XTSHIFTESCAPE to report Shift-modified mouse
+/// events to the application instead of reserving Shift for local selection.
+pub(crate) fn mouse_shift_capture_sequence(capture: bool) -> &'static str {
+    if capture { "\x1b[>1s" } else { "\x1b[>0s" }
 }
 
 fn type_template_label(template: &ConfigTemplateEntry) -> String {
@@ -59,6 +66,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
+        Print(mouse_shift_capture_sequence(true)),
         EnableBracketedPaste,
     )?;
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
@@ -82,6 +90,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     execute!(
         term.backend_mut(),
         DisableBracketedPaste,
+        Print(mouse_shift_capture_sequence(false)),
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -371,6 +380,75 @@ fn shorten_home(path: &Path) -> String {
 
 // ── App state ────────────────────────────────────────────────────
 
+#[derive(Default)]
+struct DescriptionPane {
+    path: String,
+    offset: u16,
+    max_offset: u16,
+    area: Rect,
+}
+
+impl DescriptionPane {
+    fn scroll(&mut self, down: bool, rows: u16) {
+        self.offset = if down {
+            self.offset.saturating_add(rows).min(self.max_offset)
+        } else {
+            self.offset.saturating_sub(rows)
+        };
+    }
+
+    fn draw(&mut self, frame: &mut Frame, main: &mut Rect, content: Option<(&str, &str)>) {
+        self.area = Rect::default();
+        let Some((path, description)) = content.filter(|(_, text)| !text.is_empty()) else {
+            *self = Self::default();
+            return;
+        };
+        if self.path != path {
+            self.path.clear();
+            self.path.push_str(path);
+            self.offset = 0;
+        }
+        let paragraph = Paragraph::new(description)
+            .style(theme::body_style())
+            .wrap(Wrap { trim: false });
+        let lines = paragraph.line_count(main.width.saturating_sub(2));
+        // Leave room for the list/editor even on short terminals.
+        let height = (lines.saturating_add(2)).min(usize::from(main.height / 2)) as u16;
+        if height < 3 || main.width < 3 {
+            return;
+        }
+        self.area = Rect::new(main.x, main.bottom() - height, main.width, height);
+        main.height -= height;
+        self.max_offset = lines
+            .saturating_sub(usize::from(height - 2))
+            .min(usize::from(u16::MAX)) as u16;
+        self.offset = self.offset.min(self.max_offset);
+        let title = if self.max_offset > 0 {
+            crate::i18n::t_args(
+                "zc-config-description-scroll",
+                &[
+                    (
+                        "up",
+                        &tab_key(crate::keymap::ConfigTabAction::DescriptionUp),
+                    ),
+                    (
+                        "down",
+                        &tab_key(crate::keymap::ConfigTabAction::DescriptionDown),
+                    ),
+                ],
+            )
+        } else {
+            crate::i18n::t("zc-config-description")
+        };
+        frame.render_widget(
+            paragraph
+                .scroll((self.offset, 0))
+                .block(theme::panel_block(&format!(" {title} "))),
+            self.area,
+        );
+    }
+}
+
 pub(crate) struct App {
     rpc: Arc<RpcClient>,
     /// Cached display string for the active config directory, computed once at
@@ -406,6 +484,7 @@ pub(crate) struct App {
     // Field list
     fields: Vec<ConfigFieldEntry>,
     field_cursor: usize,
+    description_pane: DescriptionPane,
     // Edit state
     edit_buf: String,
     edit_cursor: usize,
@@ -480,6 +559,7 @@ impl App {
             cost_cursor: 0,
             fields: Vec::new(),
             field_cursor: 0,
+            description_pane: DescriptionPane::default(),
             edit_buf: String::new(),
             edit_cursor: 0,
             select_cursor: 0,
@@ -531,9 +611,14 @@ impl App {
         Ok(())
     }
 
+    pub(crate) fn set_dock_summary(&mut self, side: crate::config::SidebarSide, width: u16) {
+        self.zerocode.set_dock_summary(side, width);
+    }
+
     /// Draw the current screen into the given area, beneath the Config
     /// section sub-tab bar (`zeroclaw` / `zerocode`).
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
+        self.description_pane.area = Rect::default();
         use ratatui::layout::{Constraint, Direction, Layout};
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -591,9 +676,14 @@ impl App {
                 let bc = breadcrumb.clone();
                 self.draw_alias_list(frame, right, si, &bc);
             }
-            Screen::AliasCreate { breadcrumb, .. } => {
+            Screen::AliasCreate {
+                section_idx,
+                breadcrumb,
+                ..
+            } => {
+                let si = *section_idx;
                 let bc = breadcrumb.clone();
-                self.draw_alias_create(frame, right, &bc);
+                self.draw_alias_create(frame, right, si, &bc);
             }
             Screen::FieldList {
                 section_idx,
@@ -605,13 +695,15 @@ impl App {
                 self.draw_field_list(frame, right, si, &bc);
             }
             Screen::FieldEdit {
+                section_idx,
                 breadcrumb,
                 field_idx,
                 ..
             } => {
+                let si = *section_idx;
                 let bc = breadcrumb.clone();
                 let fi = *field_idx;
-                self.draw_field_edit(frame, right, &bc, fi);
+                self.draw_field_edit(frame, right, si, &bc, fi);
             }
         }
     }
@@ -807,6 +899,10 @@ impl App {
             return self.handle_section_list(key).await;
         }
 
+        if self.handle_description_key(&key) {
+            return Ok(false);
+        }
+
         // At a section's top drill level, Left/Back returns focus to the section
         // list without tearing down the loaded screen, so its cursor is kept.
         // Deeper levels fall through to the drill handlers' one-level pop.
@@ -851,6 +947,24 @@ impl App {
         self.section = CONFIG_SECTIONS[(((i + delta) % n + n) % n) as usize];
     }
 
+    fn handle_description_key(&mut self, key: &KeyEvent) -> bool {
+        use crate::keymap::ConfigTabAction as A;
+        if self.description_pane.area.height == 0 {
+            return false;
+        }
+        let Some(action @ (A::DescriptionUp | A::DescriptionDown)) = A::from_chord(key) else {
+            return false;
+        };
+        if self.wants_text_input() && !crate::keymap::action_bypasses_text_input(action, key) {
+            return false;
+        }
+        self.description_pane.scroll(
+            action == A::DescriptionDown,
+            self.description_pane.area.height.saturating_sub(2).max(1),
+        );
+        true
+    }
+
     /// Handle a mouse event forwarded from the app event loop.
     pub(crate) async fn handle_mouse(
         &mut self,
@@ -875,6 +989,17 @@ impl App {
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_mouse(mouse);
             self.sync_zerocode_locales().await;
+            return Ok(());
+        }
+
+        if mouse::in_rect(mouse.column, mouse.row, self.description_pane.area)
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            self.description_pane
+                .scroll(mouse.kind == MouseEventKind::ScrollDown, 3);
             return Ok(());
         }
 
@@ -3658,20 +3783,36 @@ impl App {
         );
     }
 
+    fn draw_description(
+        &mut self,
+        frame: &mut Frame,
+        main: &mut Rect,
+        section_idx: usize,
+        field_idx: Option<usize>,
+    ) {
+        // Keep section and field identities distinct so changing the help source resets scrolling.
+        let section_path = format!("section:{section_idx}");
+        let content = field_idx
+            .and_then(|idx| self.fields.get(idx))
+            .filter(|field| !field.description.is_empty())
+            .map(|field| (field.path.as_str(), field.description.as_str()))
+            .or_else(|| {
+                self.sections
+                    .get(section_idx)
+                    .map(|section| (section_path.as_str(), section.help.as_str()))
+            });
+        self.description_pane.draw(frame, main, content);
+    }
+
     fn draw_type_list(&mut self, frame: &mut Frame, area: Rect, section_idx: usize) {
-        let r = regions(area);
+        let mut r = regions(area);
+        self.draw_description(frame, &mut r.main, section_idx, None);
         let section = &self.sections[section_idx];
 
         render_breadcrumb(frame, r.breadcrumb, std::slice::from_ref(&section.label));
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
-        } else {
-            frame.render_widget(
-                Paragraph::new(Span::styled(&section.help, theme::dim_style()))
-                    .wrap(Wrap { trim: false }),
-                r.help,
-            );
         }
 
         let type_names = self.type_list_labels(section_idx);
@@ -3731,7 +3872,7 @@ impl App {
         breadcrumb: &[String],
     ) {
         let mut r = regions(area);
-        let section = &self.sections[section_idx];
+        self.draw_description(frame, &mut r.main, section_idx, None);
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
@@ -3777,12 +3918,6 @@ impl App {
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
-        } else {
-            frame.render_widget(
-                Paragraph::new(Span::styled(&section.help, theme::dim_style()))
-                    .wrap(Wrap { trim: false }),
-                r.help,
-            );
         }
 
         let visible = self.filtered_indices(&self.aliases);
@@ -3881,8 +4016,15 @@ impl App {
         self.draw_status(frame, r);
     }
 
-    fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
-        let r = regions(area);
+    fn draw_alias_create(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        section_idx: usize,
+        breadcrumb: &[String],
+    ) {
+        let mut r = regions(area);
+        self.draw_description(frame, &mut r.main, section_idx, None);
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
@@ -3912,7 +4054,7 @@ impl App {
         &mut self,
         frame: &mut Frame,
         area: Rect,
-        _section_idx: usize,
+        section_idx: usize,
         breadcrumb: &[String],
     ) {
         let has_tabs = !self.tab_names.is_empty();
@@ -3981,12 +4123,6 @@ impl App {
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
-        } else if let Some(field) = self.fields.get(self.field_cursor) {
-            frame.render_widget(
-                Paragraph::new(Span::styled(&field.description, theme::dim_style()))
-                    .wrap(Wrap { trim: false }),
-                r.help,
-            );
         }
 
         let cursor = if self.filter.is_some() {
@@ -3998,6 +4134,7 @@ impl App {
                 .unwrap_or(0)
         };
         let selected_field = visible.get(cursor).copied();
+        self.draw_description(frame, &mut r.main, section_idx, selected_field);
 
         let items: Vec<ListItem> = visible
             .iter()
@@ -4248,10 +4385,12 @@ impl App {
         &mut self,
         frame: &mut Frame,
         area: Rect,
+        section_idx: usize,
         breadcrumb: &[String],
         field_idx: usize,
     ) {
-        let r = regions(area);
+        let mut r = regions(area);
+        self.draw_description(frame, &mut r.main, section_idx, Some(field_idx));
         let field = &self.fields[field_idx];
         let short_name = field.path.rsplit('.').next().unwrap_or(&field.path);
 
@@ -4264,12 +4403,6 @@ impl App {
             // Enum, Bool, or model select — with optional `/` filter.
             if let Some(buf) = &self.filter {
                 render_filter_bar(frame, r.help, buf);
-            } else {
-                frame.render_widget(
-                    Paragraph::new(Span::styled(&field.description, theme::dim_style()))
-                        .wrap(Wrap { trim: false }),
-                    r.help,
-                );
             }
 
             let visible = self.filtered_indices(&self.select_items);
@@ -4314,12 +4447,7 @@ impl App {
 
             self.draw_status(frame, r);
         } else {
-            // Text input (masked for secrets) — help text always visible.
-            frame.render_widget(
-                Paragraph::new(Span::styled(&field.description, theme::dim_style()))
-                    .wrap(Wrap { trim: false }),
-                r.help,
-            );
+            // Text input (masked for secrets).
             let type_prefix = crate::i18n::t("zc-config-field-type-prefix");
             let kind_hint = if field.is_secret {
                 let suffix = crate::i18n::t("zc-config-field-type-secret-suffix");
@@ -4475,6 +4603,15 @@ impl App {
                 )
             )
     }
+
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        if self.section == ConfigSection::Zerocode {
+            return self.zerocode.claims_session_shortcut(key);
+        }
+        self.wants_text_input()
+            || crate::keymap::ConfigTabAction::from_chord(key).is_some()
+            || crate::keymap::ConfigEditorAction::from_chord(key).is_some()
+    }
 }
 
 fn scalar_edit_display(text: &str, cursor: usize, secret: bool) -> String {
@@ -4512,6 +4649,12 @@ impl crate::widgets::HelpContext for App {
         }
         let mut node = self.zeroclaw_help_context();
         node.entries.insert(0, section_nav);
+        if self.description_pane.area.height > 0 {
+            node.entries.push(E::new(
+                [tab_keys(A::DescriptionUp), tab_keys(A::DescriptionDown)].concat(),
+                crate::i18n::t("zc-config-help-scroll-description"),
+            ));
+        }
         node
     }
 }
@@ -4886,6 +5029,7 @@ fn edit_in_external_editor(
     let _ = execute!(
         term.backend_mut(),
         PopKeyboardEnhancementFlags,
+        Print(mouse_shift_capture_sequence(false)),
         LeaveAlternateScreen
     );
     let _ = disable_raw_mode();
@@ -4899,7 +5043,11 @@ fn edit_in_external_editor(
 
     // Restore TUI.
     let _ = enable_raw_mode();
-    let _ = execute!(term.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(
+        term.backend_mut(),
+        EnterAlternateScreen,
+        Print(mouse_shift_capture_sequence(true))
+    );
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             term.backend_mut(),
@@ -4930,6 +5078,12 @@ fn edit_in_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_shift_capture_uses_xtshiftescape_sequences() {
+        assert_eq!(mouse_shift_capture_sequence(true), "\x1b[>1s");
+        assert_eq!(mouse_shift_capture_sequence(false), "\x1b[>0s");
+    }
 
     #[test]
     fn config_scalar_validation_rejects_invalid_integer() {
@@ -5077,6 +5231,203 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
         App::new(rpc, std::path::Path::new("/tmp"))
+    }
+
+    fn description_test_manager() -> App {
+        let mut manager = test_manager();
+        let mut first = field("example.first");
+        first.description = "First setting explanation".into();
+        let mut second = field("example.second");
+        second.description = format!("{}DESC_END", "Long setting explanation. ".repeat(80));
+        manager.fields = vec![first, second];
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+        };
+        manager
+    }
+
+    fn render_description_test(manager: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                match manager.screen {
+                    Screen::TypeList { section_idx } => {
+                        manager.draw_type_list(frame, area, section_idx);
+                    }
+                    Screen::AliasList { section_idx, .. } => {
+                        manager.draw_alias_list(frame, area, section_idx, &[]);
+                    }
+                    Screen::AliasCreate { section_idx, .. } => {
+                        manager.draw_alias_create(frame, area, section_idx, &[]);
+                    }
+                    Screen::FieldEdit { field_idx, .. } => {
+                        manager.draw_field_edit(frame, area, 0, &[], field_idx);
+                    }
+                    _ => manager.draw_field_list(frame, area, 0, &[]),
+                }
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn section_descriptions_share_the_lower_pane_with_field_help() {
+        let mut manager = description_test_manager();
+        let mut section = entry_with_cost("example", "models");
+        section.help = format!("{}SECTION_END", "Section explanation. ".repeat(80));
+        manager.sections = vec![section];
+        let screens = [
+            Screen::TypeList { section_idx: 0 },
+            Screen::AliasList {
+                section_idx: 0,
+                map_path: "example.provider".into(),
+                breadcrumb: vec!["example".into(), "provider".into()],
+            },
+            Screen::AliasCreate {
+                section_idx: 0,
+                map_path: "example.provider".into(),
+                breadcrumb: vec!["example".into(), "provider".into()],
+            },
+        ];
+        for screen in screens {
+            manager.screen = screen;
+            for (width, height) in [(36, 14), (80, 24)] {
+                for tab in [0, 1] {
+                    manager.alias_tab = tab;
+                    manager.description_pane.offset = 0;
+                    manager.filter = Some("missing".into());
+                    let rendered = render_description_test(&mut manager, width, height);
+                    assert!(rendered.contains("Section explanation."));
+                    let top: String = rendered
+                        .chars()
+                        .take(usize::from(manager.description_pane.area.y) * usize::from(width))
+                        .collect();
+                    assert!(!top.contains("Section explanation."));
+                    assert!(manager.handle_description_key(&KeyEvent::new(
+                        KeyCode::PageDown,
+                        KeyModifiers::NONE
+                    )));
+                    manager.description_pane.scroll(true, u16::MAX);
+                    assert!(
+                        render_description_test(&mut manager, width, height)
+                            .contains("SECTION_END")
+                    );
+                    assert_eq!(manager.filter.as_deref(), Some("missing"));
+                }
+            }
+        }
+        manager.filter = None;
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec![],
+        };
+        let rendered = render_description_test(&mut manager, 60, 20);
+        assert!(rendered.contains("First setting explanation"));
+        assert!(!rendered.contains("Section explanation."));
+        assert_eq!(manager.description_pane.offset, 0);
+        manager.filter = Some("no-matching-field".into());
+        assert!(render_description_test(&mut manager, 60, 20).contains("Section explanation."));
+        manager.filter = None;
+        manager.fields[0].description.clear();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec![],
+            field_idx: 0,
+        };
+        assert!(render_description_test(&mut manager, 60, 20).contains("Section explanation."));
+        manager.sections[0].help.clear();
+        render_description_test(&mut manager, 60, 20);
+        assert_eq!(manager.description_pane.area.height, 0);
+    }
+
+    #[tokio::test]
+    async fn description_pane_follows_filtered_selection_and_resets_scroll() {
+        let mut manager = description_test_manager();
+        manager.filter = Some("second".into());
+        let rendered = render_description_test(&mut manager, 60, 20);
+        assert!(rendered.contains("Long setting explanation."));
+        assert!(!rendered.contains("First setting explanation"));
+        assert_eq!(manager.field_cursor, 0);
+        assert_eq!(manager.description_pane.path, "example.second");
+        assert!(
+            manager.handle_description_key(&KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+        );
+        assert!(manager.description_pane.offset > 0);
+        manager.description_pane.scroll(true, u16::MAX);
+        assert!(render_description_test(&mut manager, 60, 20).contains("DESC_END"));
+        manager.filter = None;
+        assert!(
+            render_description_test(&mut manager, 60, 20).contains("First setting explanation")
+        );
+        assert_eq!(manager.description_pane.offset, 0);
+        manager.filter = Some("no-matching-field".into());
+        render_description_test(&mut manager, 60, 20);
+        assert_eq!(manager.description_pane.area.height, 0);
+    }
+
+    #[tokio::test]
+    async fn description_pane_edit_scrolling_preserves_value_and_selection() {
+        let mut manager = description_test_manager();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec![],
+            field_idx: 1,
+        };
+        manager.edit_buf = "unchanged".into();
+        manager.edit_cursor = 3;
+        for kind in [PropKind::String, PropKind::StringArray, PropKind::Bool] {
+            manager.fields[1].kind = kind;
+            manager.select_items = if kind == PropKind::Bool {
+                vec!["true".into(), "false".into()]
+            } else {
+                vec![]
+            };
+            render_description_test(&mut manager, 48, 16);
+            assert!(
+                manager
+                    .handle_description_key(&KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            );
+            assert_eq!(manager.edit_buf, "unchanged");
+            assert_eq!(manager.edit_cursor, 3);
+            assert_eq!(manager.select_cursor, 0);
+            assert!(
+                manager.handle_description_key(&KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            );
+            assert!(
+                !manager
+                    .handle_description_key(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn description_pane_resizes_without_losing_editor_space() {
+        let mut manager = description_test_manager();
+        manager.field_cursor = 1;
+        for (width, height) in [(36, 14), (80, 24), (120, 40)] {
+            render_description_test(&mut manager, width, height);
+            assert!(manager.description_pane.area.height >= 3);
+            assert!(manager.last_main_area.height >= manager.description_pane.area.height);
+            manager.description_pane.scroll(true, u16::MAX);
+            assert!(render_description_test(&mut manager, width, height).contains("DESC_END"));
+        }
+        for (width, height) in [(0, 0), (2, 4), (20, 5)] {
+            render_description_test(&mut manager, width, height);
+        }
     }
 
     fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {

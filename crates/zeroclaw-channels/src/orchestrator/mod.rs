@@ -7,6 +7,7 @@ pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod startup_warmup;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -2566,7 +2567,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 None
             }
         }
-        "/thinking" => {
+        "/effort" | "/thinking" | "/think" => {
             let arg = parts.next();
             if parts.next().is_some() {
                 Some(ChannelRuntimeCommand::InvalidThinking(
@@ -14091,6 +14092,38 @@ fn enabled_agent_aliases(config: &Config) -> Vec<String> {
     aliases
 }
 
+/// Select the agents that need a long-lived channel runtime context.
+///
+/// Explicit bindings are the ownership source of truth. Legacy configurations
+/// without any bindings retain one deterministic fallback agent, matching the
+/// owner-map fallback below.
+fn channel_runtime_agent_aliases(config: &Config, enabled_agents: &[String]) -> Vec<String> {
+    if config
+        .agents
+        .values()
+        .any(|agent| !agent.channels.is_empty())
+    {
+        return enabled_agents
+            .iter()
+            .filter(|alias| {
+                config
+                    .agents
+                    .get(alias.as_str())
+                    .is_some_and(|agent| !agent.channels.is_empty())
+            })
+            .cloned()
+            .collect();
+    }
+
+    config
+        .resolved_runtime_agent_alias()
+        .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
+        .map(ToString::to_string)
+        .or_else(|| enabled_agents.first().cloned())
+        .into_iter()
+        .collect()
+}
+
 /// Canonical explicit owner decision shared by channel construction and the
 /// inbound router. Sorted aliases preserve the router's established
 /// last-writer-wins behavior for duplicate bindings.
@@ -14398,6 +14431,16 @@ pub async fn start_channels_with_plugin_webhooks(
     if enabled_agents.is_empty() {
         anyhow::bail!("start_channels requires at least one enabled [agents.<alias>] entry");
     }
+    let runtime_agent_aliases = channel_runtime_agent_aliases(&config, &enabled_agents);
+    // An approval route may activate a channel even when every explicit agent
+    // owner is disabled. Preserve that registry/listener path by using one
+    // enabled agent to construct the shared channels, but do not retain its
+    // per-agent runtime context when it owns no channel.
+    let construction_agent_aliases = if runtime_agent_aliases.is_empty() {
+        enabled_agents.first().cloned().into_iter().collect()
+    } else {
+        runtime_agent_aliases.clone()
+    };
 
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -14459,7 +14502,8 @@ pub async fn start_channels_with_plugin_webhooks(
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
-    for agent_alias in &enabled_agents {
+    let mut startup_warmups = startup_warmup::StartupWarmups::new(cancel.clone());
+    for agent_alias in &construction_agent_aliases {
         let agent = config
             .resolved_agent_config(agent_alias)
             .with_context(|| format!("agents.{agent_alias} is not configured"))?;
@@ -14498,17 +14542,21 @@ pub async fn start_channels_with_plugin_webhooks(
             .await?,
         );
 
-        if let Err(e) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"error": format!("{}", e), "agent": agent_alias})
-                    ),
-                "ModelProvider warmup failed (non-fatal)"
-            );
-        }
+        let warmup_provider = Arc::clone(&model_provider);
+        let warmup_agent = agent_alias.clone();
+        startup_warmups.schedule(agent_alias.clone(), async move {
+            if let Err(e) = ProviderDispatch::from_ref(&*warmup_provider).warmup().await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "agent": warmup_agent})
+                        ),
+                    "ModelProvider warmup failed (non-fatal)"
+                );
+            }
+        });
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
         let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
@@ -15042,7 +15090,9 @@ pub async fn start_channels_with_plugin_webhooks(
             sop_audit: sop_audit.clone(),
         });
 
-        agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
+        if runtime_agent_aliases.contains(agent_alias) {
+            agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
+        }
     }
 
     let owner_by_channel_key =
@@ -18139,6 +18189,123 @@ temperature = 0.3
             Some("alpha")
         );
         assert_eq!(owners.get("mattermost").map(String::as_str), Some("alpha"));
+    }
+
+    #[test]
+    fn channel_runtime_agents_include_only_enabled_explicit_owners() {
+        let mut config = Config::default();
+        config.agents.clear();
+        for index in 0..20 {
+            config.agents.insert(
+                format!("idle_{index:02}"),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec![],
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "owner_z".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["matrix.ops".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "owner_a".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.default".into()],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        let runtime_agents = channel_runtime_agent_aliases(&config, &enabled_agents);
+
+        assert_eq!(runtime_agents, vec!["owner_a", "owner_z"]);
+    }
+
+    #[test]
+    fn channel_runtime_agents_use_one_deterministic_legacy_fallback() {
+        let mut config = Config::default();
+        config.agents.clear();
+        for alias in ["zeta", "default", "alpha"] {
+            config.agents.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec![],
+                    ..Default::default()
+                },
+            );
+        }
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        assert_eq!(
+            channel_runtime_agent_aliases(&config, &enabled_agents),
+            vec!["default"]
+        );
+
+        config
+            .agents
+            .get_mut("default")
+            .expect("default agent exists")
+            .enabled = false;
+        let enabled_agents = enabled_agent_aliases(&config);
+        assert_eq!(
+            channel_runtime_agent_aliases(&config, &enabled_agents),
+            vec!["alpha"]
+        );
+    }
+
+    #[test]
+    fn channel_runtime_agents_exclude_disabled_bound_agents() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "keeper".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.a".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "disabled_owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "idle".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        assert_eq!(
+            channel_runtime_agent_aliases(&config, &enabled_agents),
+            vec!["keeper"]
+        );
+
+        config
+            .agents
+            .get_mut("keeper")
+            .expect("keeper agent exists")
+            .enabled = false;
+        let enabled_agents = enabled_agent_aliases(&config);
+        assert!(
+            channel_runtime_agent_aliases(&config, &enabled_agents).is_empty(),
+            "an unbound enabled agent must not become a retained runtime fallback"
+        );
     }
 
     #[test]
@@ -35160,6 +35327,21 @@ BTC is currently around $65,000 based on latest tool output."#
                 ThinkingLevel::High
             )))
         );
+        // The shared command is named `effort`; both older spellings stay.
+        assert_eq!(
+            parse_runtime_command("telegram", "/effort xhigh"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(
+                ThinkingLevel::XHigh
+            )))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/think max"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(ThinkingLevel::Max)))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/effort@zeroclaw_bot reset"),
+            Some(ChannelRuntimeCommand::SetThinking(None))
+        );
     }
 
     #[test]
@@ -36963,7 +37145,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "sticker.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    data: tiny_png(),
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -37001,7 +37183,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
         assert!(turns[0].content.contains("[IMAGE:data:"));
-        assert!(turns[0].content.contains("AQIDBA"));
+        assert!(turns[0].content.contains("iVBORw0K"));
     }
 
     #[tokio::test]
@@ -40076,6 +40258,20 @@ This is an example JSON object for profile settings."#;
         assert!(cleaned.contains("look at") && cleaned.contains("please"));
     }
 
+    /// A structurally complete 1x1 PNG. Multimodal preparation validates the
+    /// decoded bytes of data-URI image markers, so an attachment that must
+    /// reach a provider as an image has to frame a real image rather than
+    /// arbitrary bytes.
+    fn tiny_png() -> Vec<u8> {
+        vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, b'I', b'D', b'A', b'T', 0x78,
+            0xda, 0x63, 0x64, 0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47,
+            0xba, 0x92, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ]
+    }
+
     #[tokio::test]
     async fn media_pipeline_preserves_image_bytes_when_vision_route_configured() {
         use wiremock::matchers::{body_string_contains, method, path};
@@ -40089,9 +40285,13 @@ This is an example JSON object for profile settings."#;
 
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         let vision_server = MockServer::start().await;
+        let png_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tiny_png());
         let _vision_mock = Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("data:image/png;base64,AQIDBA=="))
+            .and(body_string_contains(
+                format!("data:image/png;base64,{png_b64}").as_str(),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [
                     {
@@ -40146,7 +40346,7 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "route.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    data: tiny_png(),
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -40194,7 +40394,7 @@ This is an example JSON object for profile settings."#;
         assert!(
             vision_body
                 .to_string()
-                .contains("data:image/png;base64,AQIDBA=="),
+                .contains(format!("data:image/png;base64,{png_b64}").as_str()),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
         );
     }
@@ -40623,6 +40823,13 @@ This is an example JSON object for profile settings."#;
             sop_audit: None,
         });
 
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         // Simulate a photo attachment message with [IMAGE:] marker.
         process_channel_message(
             runtime_ctx,
@@ -40630,7 +40837,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -40740,13 +40947,20 @@ This is an example JSON object for profile settings."#;
             sop_audit: None,
         });
 
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         process_channel_message(
             Arc::clone(&runtime_ctx),
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,

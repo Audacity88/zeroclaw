@@ -16,17 +16,34 @@ zc-chrome-summary-loading = loading
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
-zc-app-help-toggle-sidebar = Toggle agent sidebar
+zc-app-help-toggle-sidebar = Toggle sessions sidebar
 zc-app-help-quit = Quit
 
-zc-sidebar-title = Agents
-zc-sidebar-empty = No active agents
+zc-sidebar-title = Open sessions
+zc-sidebar-count-hint = (N) = messages
+zc-sidebar-collapse = [x]
+zc-sidebar-empty = No active sessions
 zc-sidebar-picker-title = Add agent
 zc-sidebar-picker-loading = Loading agents…
 zc-sidebar-picker-empty = No configured agents
 zc-sidebar-picker-error = Failed to load agents ({ $error })
 zc-sidebar-picker-disconnected = agent lookup stopped before returning a result
 zc-sidebar-picker-open-suffix = (open)
+zc-dock-header = Dock { $side }
+zc-dock-side-left = left
+zc-dock-side-right = right
+zc-dock-switch-side = [↔]
+zc-dock-setting-sessions = Sessions visibility
+zc-dock-setting-side = Dock side
+zc-dock-setting-width = Dock width
+zc-dock-setting-split = Sessions/Plan split
+zc-dock-save-env-shadow = { $setting } changed, but an environment override will take effect after relaunch.
+zc-dock-save-failed = { $setting } changed for this run, but could not be saved: { $error }
+zc-dock-config-summary = Dock: { $side } / { $width } cols
+zc-dock-config-unavailable = Dock settings unavailable: { $error }
+zc-sidebar-date-placeholder = --/--
+zc-todo-plan-title = Plan ({ $total }) - { $done }/{ $total } done
+zc-todo-plan-empty = No active plan
 zc-app-keybindings-title = Keybindings
 zc-app-help-filter-label = Filter
 zc-app-help-filter-placeholder = type a key or action…
@@ -170,7 +187,6 @@ zc-queue-help-nav = Select queued
 zc-queue-help-delete = Delete queued
 zc-queue-help-clear = Clear queue ([N] = position)
 zc-queue-help-edit = Edit queued
-zc-queue-help-resize = Resize queue
 zc-queue-help-enqueue = Queue message
 zc-queue-help-inject = Send now (skip queue)
 zc-queue-edit-busy = Finish or clear the current message before editing a queued one.
@@ -459,6 +475,8 @@ zc-chat-resume-dropped = { $count } prior session(s) could not be re-attached an
 zc-chat-reconnect-interrupted = The connection was rebuilt and queued messages were preserved. Waiting for the prior turn to stop before reloading the durable transcript.
 zc-chat-resyncing = Some live updates were missed. Reloading this session before sending queued messages…
 zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
+zc-chat-resynced-turn-running = Live updates were missed. The in-progress turn is still running; output shown above was kept, and the durable transcript will be reloaded when the turn finishes.
+zc-chat-resynced-turn-finished = The in-progress turn finished, so the durable transcript was reloaded once more.
 zc-chat-resync-failed = Live updates were missed and the session could not be reloaded: { $error }
 zc-chat-session-restart-error = Failed to start a new session: { $error }
 zc-chat-code-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local Code session must start in that project, so it was not created.
@@ -468,9 +486,9 @@ zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
 
 # Model picker slash commands
-zc-model-picker-hint = Type a model name after /model, or Tab to autocomplete.
-zc-model-provider-picker-hint = Type a model_provider after /model-provider, then pick a model with /model.
 zc-model-picker-title = Select model
+zc-picker-search = Search
+zc-picker-no-results = No matching models
 zc-model-provider-picker-title = Select model_provider
 zc-model-switch-applying = Applying model change…
 zc-model-switch-model-ok = Model switched to { $model }.
@@ -480,6 +498,23 @@ zc-model-catalog-no-provider = Could not resolve this agent's model_provider fro
 zc-model-catalog-empty = No models available for the active model_provider.
 zc-model-catalog-loading = Loading models…
 zc-model-provider-catalog-failed = Could not load model_providers: { $error }
+
+# Session thinking controls: effort level and thinking display pickers
+zc-effort-picker-title = Select effort
+zc-display-picker-title = Select thinking display
+zc-thinking-switch-applying = Applying thinking change…
+zc-effort-ok = Effort set to { $level }.
+zc-effort-reset = Effort override cleared; now { $level }.
+zc-display-ok = Thinking display set to { $display }.
+zc-display-reset = Thinking display override cleared; now { $display }.
+zc-thinking-switch-failed = Thinking change failed: { $error }
+zc-effort-none-for-model = This model offers no effort levels.
+zc-display-none-for-model = This model offers no thinking display choices.
+zc-thinking-options-failed = Could not load thinking options: { $error }
+zc-thinking-remembered-skipped = Remembered thinking setting { $value } is not offered by this model; skipped.
+
+# Picker modals: dim suffix on the row whose value is currently in force
+zc-picker-current = current
 
 zc-chat-label-you = You:
 zc-chat-label-agent = Agent:
@@ -493,6 +528,7 @@ zc-chat-help-navigate = Navigate
 zc-chat-help-select-agent = Select agent
 zc-chat-help-quit = Quit
 zc-chat-help-switch-session = Switch session
+zc-chat-help-resume-session = Resume existing session
 zc-chat-help-close = Close
 zc-chat-help-cancel = Cancel
 zc-chat-help-approve = Approve
@@ -506,13 +542,14 @@ zc-chat-help-yank-selection = Yank selection
 zc-chat-help-return-to-input = Return to input
 zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
+zc-chat-help-open-link = Click a link to open it; drag from elsewhere to select text
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
 zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
 zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
 zc-chat-session-list-resume-note = Session history saved & resumable · Persistent memory isolated
 zc-chat-agent-picker-acp-memory-note = Session history saved & resumable · Persistent memory isolated
-zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
+zc-chat-session-list-switch-title = All sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice
 zc-elicit-help-cancel = Cancel
@@ -530,6 +567,11 @@ zc-chat-copied-clipboard = Copied to clipboard
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
 zc-chat-context-menu-copy = Copy
+zc-chat-context-menu-copy-selection = Copy selection
+zc-chat-context-menu-open-link = Open link
+zc-chat-context-menu-copy-link = Copy link
+zc-chat-open-link-failed = Could not open link: { $error }
+zc-chat-context-menu-add-to-chat = Add to Chat
 zc-chat-context-menu-send-now = Send now
 zc-chat-context-menu-edit = Edit
 zc-chat-context-menu-delete = Delete
@@ -634,6 +676,9 @@ zc-config-footer-action-new-line = new line
 zc-config-field-edit-hint = { $keys } → press to edit
 
 zc-doctor-log-path = log: { $path }
+zc-config-description = Description
+zc-config-description-scroll = Description · { $up }/{ $down } scroll
+zc-config-help-scroll-description = Scroll the description (or use the mouse wheel over it)
 
 ## Config registry metadata. Stable identifiers are used for lookup while the
 ## RPC-provided English display strings remain compatibility fallbacks.

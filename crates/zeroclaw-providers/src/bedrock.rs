@@ -610,10 +610,6 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-fn bedrock_model_supports_native_thinking(model: &str) -> bool {
-    !model.contains("claude-opus-4-7")
-}
-
 fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     if model.contains("claude") {
@@ -942,13 +938,100 @@ impl BedrockModelProvider {
 
     // ── Message conversion ──────────────────────────────────────
 
+    /// Resolve the reasoning request fields, the sampling temperature and the
+    /// output cap, which the model generation constrains together.
+    ///
+    /// Older generations name a token budget and must pin the temperature.
+    /// Newer ones think adaptively, take a depth setting instead, and reject
+    /// both a budget and any sampling parameter.
+    fn resolve_thinking(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        temperature: Option<f64>,
+        model: &str,
+    ) -> (Option<f64>, Option<serde_json::Value>, u32) {
+        use crate::claude_models::{
+            ClaudeProviderSlot, ClaudeThinkingShape, thinking_capabilities,
+        };
+
+        let capabilities = thinking_capabilities(ClaudeProviderSlot::Bedrock, model);
+        if capabilities.shape == ClaudeThinkingShape::FixedBudget {
+            let Some(budget) = thinking.and_then(|params| params.budget_tokens) else {
+                return (temperature, None, self.max_tokens);
+            };
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"budget_tokens": budget})),
+                "Bedrock native extended thinking enabled; forcing temperature=1.0"
+            );
+            let fields = serde_json::json!({
+                "thinking": { "type": "enabled", "budget_tokens": budget }
+            });
+            return (Some(1.0), Some(fields), self.max_tokens.max(budget + 1));
+        }
+
+        if let Some(temperature) = temperature {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "temperature": temperature,
+                    })),
+                "temperature dropped: this model generation rejects sampling parameters"
+            );
+        }
+        if self.max_tokens <= zeroclaw_api::model_provider::BASELINE_MAX_TOKENS {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "max_tokens": self.max_tokens,
+                    })),
+                "max_tokens is at the baseline; reasoning counts toward it on this model generation, so raise it on the provider entry"
+            );
+        }
+        let requested_effort = thinking.and_then(|params| params.effort);
+        let effort = requested_effort.and_then(|effort| capabilities.fit_effort(effort));
+        if requested_effort != effort {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "requested": requested_effort.map(|effort| effort.as_str()),
+                        "sent": effort.map(|effort| effort.as_str()),
+                    })),
+                "reasoning depth fitted to what this model generation accepts"
+            );
+        }
+        let fields = effort.map(|effort| {
+            serde_json::json!({
+                "thinking": { "type": "adaptive" },
+                "output_config": { "effort": effort.as_str() }
+            })
+        });
+        (None, fields, self.max_tokens)
+    }
+
     fn convert_messages(
         messages: &[ChatMessage],
+        model: &str,
     ) -> (Option<Vec<SystemBlock>>, Vec<ConverseMessage>) {
+        use crate::claude_models::claude_keeps_prior_thinking;
         let mut system_blocks = Vec::new();
         let mut converse_messages = Vec::new();
+        // Models whose API keeps old thinking in context must see every
+        // stored reasoning block again; the others only need the round still
+        // in flight. Same rule as the Anthropic adapter.
+        let keeps_prior_thinking = claude_keeps_prior_thinking(model);
+        let last_exchange_start = messages.iter().enumerate().rev().find_map(|(index, msg)| {
+            (!matches!(msg.role.as_str(), "system" | "assistant" | "tool")).then_some(index)
+        });
 
-        for msg in messages {
+        for (index, msg) in messages.iter().enumerate() {
             match msg.role.as_str() {
                 "system" => {
                     if system_blocks.is_empty() {
@@ -958,7 +1041,11 @@ impl BedrockModelProvider {
                     }
                 }
                 "assistant" => {
-                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                    let replay_thinking = keeps_prior_thinking
+                        || last_exchange_start.is_some_and(|start| index > start);
+                    if let Some(blocks) =
+                        Self::parse_assistant_tool_call_message(&msg.content, replay_thinking)
+                    {
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
                             content: blocks,
@@ -1233,7 +1320,18 @@ impl BedrockModelProvider {
     }
 
     /// Parse assistant message containing structured tool calls.
-    fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<ContentBlock>> {
+    /// Rebuild an assistant turn's blocks from the stored envelope.
+    /// `replay_thinking` gates the signed reasoning: on models whose API
+    /// keeps earlier turns' thinking in context, every assistant message
+    /// replays its blocks so the cached prefix survives the turn boundary;
+    /// on models that strip old thinking server-side, only the round still
+    /// in flight may resend it. The runtime drops reasoning it has itself
+    /// invalidated with a history rewrite, so replayed blocks are never
+    /// stale.
+    fn parse_assistant_tool_call_message(
+        content: &str,
+        replay_thinking: bool,
+    ) -> Option<Vec<ContentBlock>> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
         let tool_calls = value
             .get("tool_calls")
@@ -1245,10 +1343,11 @@ impl BedrockModelProvider {
         // with reasoning content blocks (including signatures) before any
         // tool_use blocks. The reasoning_content field stores JSON-encoded
         // thinking blocks from the original response.
-        if let Some(reasoning) = value
-            .get("reasoning_content")
-            .and_then(serde_json::Value::as_str)
-            .filter(|r| !r.is_empty())
+        if replay_thinking
+            && let Some(reasoning) = value
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str)
+                .filter(|r| !r.is_empty())
         {
             // reasoning_content may contain multiple JSON blocks joined by \n
             for part in reasoning.split('\n') {
@@ -1621,7 +1720,8 @@ impl ModelProvider for BedrockModelProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let auth = self.resolve_auth().await?;
 
-        let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
+        let (system_blocks, mut converse_messages) =
+            Self::convert_messages(request.messages, model);
 
         // Strip empty text ContentBlocks that would cause Bedrock 400 errors.
         Self::sanitize_empty_content_blocks(&mut converse_messages);
@@ -1664,40 +1764,8 @@ impl ModelProvider for BedrockModelProvider {
 
         let tool_config = Self::convert_tools_to_converse(request.tools);
 
-        // Native thinking forces temperature=1.0 (Anthropic API requirement).
-        // Otherwise the caller's Option<f64> flows through verbatim; None
-        // omits the field via skip_serializing_if.
-        let (effective_temperature, additional_fields, effective_max_tokens) = match request
-            .thinking
-        {
-            Some(params) if bedrock_model_supports_native_thinking(model) => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
-                    "Bedrock native extended thinking enabled; forcing temperature=1.0"
-                );
-                let fields = serde_json::json!({
-                    "thinking": {
-                        "type": "enabled",
-                        "budget_tokens": params.budget_tokens
-                    }
-                });
-                let min_required = params.budget_tokens + 1;
-                let max_tokens = self.max_tokens.max(min_required);
-                (Some(1.0), Some(fields), max_tokens)
-            }
-            Some(_) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"model": model})),
-                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
-                );
-                (temperature, None, self.max_tokens)
-            }
-            None => (temperature, None, self.max_tokens),
-        };
+        let (effective_temperature, additional_fields, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature, model);
 
         let converse_request = ConverseRequest {
             system,
@@ -2064,7 +2132,7 @@ mod tests {
             ChatMessage::system("You are helpful"),
             ChatMessage::user("Hello"),
         ];
-        let (system, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (system, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert!(system.is_some());
         let system_blocks = system.unwrap();
         assert_eq!(system_blocks.len(), 1);
@@ -2078,7 +2146,7 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there"),
         ];
-        let (system, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (system, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert!(system.is_none());
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
@@ -2089,7 +2157,7 @@ mod tests {
     fn convert_messages_tool_role_to_tool_result() {
         let tool_json = r#"{"tool_call_id": "call_123", "content": "Result data"}"#;
         let messages = vec![ChatMessage::tool(tool_json)];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert!(matches!(msgs[0].content[0], ContentBlock::ToolResult(_)));
@@ -2099,7 +2167,7 @@ mod tests {
     fn convert_messages_assistant_tool_calls_parsed() {
         let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
         let messages = vec![ChatMessage::assistant(tool_call_json)];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
         assert_eq!(msgs[0].content.len(), 2);
@@ -2114,7 +2182,7 @@ mod tests {
         // reject with "Expected toolResult blocks at messages.N.content".
         let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_ORPHAN", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
         let messages = vec![ChatMessage::assistant(tool_call_json)];
-        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         // Pre-condition: the converter produced an (orphaned) ToolUse block.
         assert!(
             msgs[0]
@@ -2145,7 +2213,7 @@ mod tests {
             ChatMessage::assistant(tool_call_json),
             ChatMessage::tool(tool_result_json),
         ];
-        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
         assert!(
             msgs[0]
@@ -2159,9 +2227,99 @@ mod tests {
     #[test]
     fn convert_messages_plain_assistant_text() {
         let messages = vec![ChatMessage::assistant("Just text")];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].content[0], ContentBlock::Text(_)));
+    }
+
+    /// Two finished tool rounds, each with a signed reasoning block, plus the
+    /// round still in flight. Shared by the replay-policy tests.
+    fn thinking_replay_messages() -> Vec<ChatMessage> {
+        let envelope = |thinking: &str, signature: &str, call_id: &str| {
+            serde_json::json!({
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "name": "shell",
+                    "arguments": "{}",
+                }],
+                "reasoning_content": serde_json::json!({
+                    "text": thinking,
+                    "signature": signature,
+                })
+                .to_string(),
+            })
+            .to_string()
+        };
+        vec![
+            ChatMessage::user("first ask"),
+            ChatMessage::assistant(envelope("earlier", "sig_old", "call_1")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+            ChatMessage::assistant("finished the first ask"),
+            ChatMessage::user("second ask"),
+            ChatMessage::assistant(envelope("current", "sig_new", "call_2")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_2", "content": "done"})
+                    .to_string(),
+            },
+        ]
+    }
+
+    fn replayed_signatures(msgs: &[ConverseMessage]) -> Vec<String> {
+        msgs.iter()
+            .flat_map(|msg| &msg.content)
+            .filter_map(|block| match block {
+                ContentBlock::ReasoningContent(wrapper) => {
+                    wrapper.reasoning_content.reasoning_text.signature.clone()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn thinking_replays_every_turn_on_models_that_keep_it() {
+        let messages = thinking_replay_messages();
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-opus-4-5");
+        assert_eq!(
+            replayed_signatures(&msgs),
+            vec!["sig_old", "sig_new"],
+            "a model that keeps prior turns' thinking replays every signed block"
+        );
+        for (position, msg) in msgs.iter().enumerate() {
+            if msg.role == "assistant" {
+                let has_reasoning = msg
+                    .content
+                    .first()
+                    .is_some_and(|block| matches!(block, ContentBlock::ReasoningContent(_)));
+                let carries_any_reasoning = msg
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ReasoningContent(_)));
+                if carries_any_reasoning {
+                    assert!(
+                        has_reasoning,
+                        "an assistant turn carrying reasoning must start with it (turn {position})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_replays_only_the_in_flight_round_on_models_that_strip_old_thinking() {
+        let messages = thinking_replay_messages();
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-haiku-4-5");
+        assert_eq!(
+            replayed_signatures(&msgs),
+            vec!["sig_new"],
+            "only the in-flight round replays its reasoning"
+        );
     }
 
     // ── Cache tests ─────────────────────────────────────────────
@@ -2255,28 +2413,133 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_model_supports_native_thinking_excludes_opus_4_7() {
-        // Per AWS Bedrock model card, Opus 4.7 only supports adaptive thinking;
-        // fixed-budget native thinking returns a 400.
-        assert!(!bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-opus-4-7"
-        ));
-        assert!(!bedrock_model_supports_native_thinking(
-            "anthropic.claude-opus-4-7-v1:0"
-        ));
+    fn bedrock_resolve_thinking_sends_adaptive_depth_without_a_budget() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test")
+            .max_tokens(32_000)
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: Some(10_000),
+            effort: Some(ThinkingEffort::High),
+            display: None,
+        };
+        let (temperature, fields, max_tokens) = provider.resolve_thinking(
+            Some(params),
+            Some(0.5_f64),
+            "us.anthropic.claude-opus-4-8-v1",
+        );
+        assert!(
+            temperature.is_none(),
+            "this generation rejects sampling parameters"
+        );
+        assert_eq!(
+            fields,
+            Some(serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
+            }))
+        );
+        assert_eq!(max_tokens, 32_000);
     }
 
     #[test]
-    fn bedrock_model_supports_native_thinking_allows_other_models() {
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-opus-4-6-v1"
-        ));
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-sonnet-4-6-v1"
-        ));
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-haiku-4-5-v1"
-        ));
+    fn bedrock_resolve_thinking_keeps_the_budget_shape_on_older_generations() {
+        use zeroclaw_api::model_provider::NativeThinkingParams;
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: Some(10_000),
+            effort: None,
+            display: None,
+        };
+        let (temperature, fields, max_tokens) = provider.resolve_thinking(
+            Some(params),
+            Some(0.5_f64),
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+        );
+        assert!((temperature.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        assert_eq!(
+            fields,
+            Some(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 10_000}
+            }))
+        );
+        assert_eq!(max_tokens, 10_001);
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_keeps_supported_depths_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+            display: None,
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_fits_xhigh_to_high_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::XHigh),
+            display: None,
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-sonnet-4-6-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("high")
+        );
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-opus-4-8-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_ignores_the_display() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "anthropic.claude-fable-5-1");
+        assert_eq!(
+            fields,
+            Some(serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
+            })),
+            "this adapter has no display field to carry the choice"
+        );
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_sends_nothing_without_a_chosen_depth() {
+        let provider = BedrockModelProvider::builder("test").build();
+        let (temperature, fields, _) =
+            provider.resolve_thinking(None, Some(0.5_f64), "anthropic.claude-fable-5-1");
+        assert!(temperature.is_none());
+        assert!(fields.is_none());
     }
 
     #[test]
@@ -2532,7 +2795,7 @@ mod tests {
                 content: "not valid json".to_string(),
             },
         ];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         let tool_msg = &msgs[2];
         assert_eq!(tool_msg.role, "user");
         assert!(
@@ -2554,7 +2817,7 @@ mod tests {
                 content: "raw output with no json".to_string(),
             },
         ];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         if let ContentBlock::ToolResult(ref wrapper) = msgs[2].content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "tool_abc");
             assert_eq!(wrapper.tool_result.status, "error");
@@ -2573,7 +2836,7 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
             ChatMessage::tool(r#"{"tool_call_id":"t2","content":"result 2"}"#),
         ];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         // Should be: user, assistant, user (merged tool results)
         assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
         assert_eq!(msgs[2].role, "user");
@@ -2694,7 +2957,7 @@ mod tests {
             },
             ChatMessage::user("Continue"),
         ];
-        let (_, converse) = BedrockModelProvider::convert_messages(&messages);
+        let (_, converse) = BedrockModelProvider::convert_messages(&messages, "claude-sonnet-4-5");
         let assistant_msg = &converse[1];
         assert_eq!(assistant_msg.role, "assistant");
         if let ContentBlock::Text(ref tb) = assistant_msg.content[0] {

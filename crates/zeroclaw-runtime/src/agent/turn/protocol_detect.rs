@@ -178,6 +178,31 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
     looks_like_tool_protocol_envelope(trimmed).then(|| message.into())
 }
 
+/// Whether a JSON-fenced block in `text` carries non-fence text after its
+/// closing fence. A candidate that begins with a `json` fence but is followed
+/// by ordinary text is quoted material inside a larger message, not a
+/// whole-message envelope. An unterminated fence is not trailing text: the
+/// stream may simply be cut, and the fence is all there is so far.
+pub(crate) fn json_fence_has_trailing_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return false;
+    };
+    let Some(first_newline) = rest.find('\n') else {
+        return false;
+    };
+    let language = rest[..first_newline].trim().trim_end_matches('\r');
+    if !language.eq_ignore_ascii_case("json") {
+        return false;
+    }
+
+    let body_with_close = &rest[first_newline + 1..];
+    let Some(close_start) = body_with_close.rfind("```") else {
+        return false;
+    };
+    !body_with_close[close_start + 3..].trim().is_empty()
+}
+
 pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
     let rest = trimmed.strip_prefix("```")?;
     let first_newline = rest.find('\n')?;
@@ -192,4 +217,54 @@ pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
         return None;
     }
     Some(body_with_close[..close_start].trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        find_embedded_protocol_candidate_start, find_incomplete_protocol_candidate_start,
+        json_fence_has_trailing_text,
+    };
+
+    #[test]
+    fn fence_with_text_after_close_has_trailing_text() {
+        assert!(json_fence_has_trailing_text(
+            "```json\n{\"a\": 1}\n``` and then prose"
+        ));
+    }
+
+    #[test]
+    fn fence_that_is_the_whole_text_has_no_trailing_text() {
+        assert!(!json_fence_has_trailing_text("```json\n{\"a\": 1}\n```"));
+        assert!(!json_fence_has_trailing_text(
+            "```json\n{\"a\": 1}\n```  \n"
+        ));
+    }
+
+    #[test]
+    fn unterminated_fence_has_no_trailing_text() {
+        // The body so far is all there is; the stream may simply be cut.
+        assert!(!json_fence_has_trailing_text("```json\n{\"a\":"));
+    }
+
+    #[test]
+    fn non_fence_text_has_no_trailing_text() {
+        assert!(!json_fence_has_trailing_text("plain prose"));
+        assert!(!json_fence_has_trailing_text("{\"a\": 1}"));
+        assert!(!json_fence_has_trailing_text(
+            "```tool_call\nx\n``` trailing"
+        ));
+    }
+
+    #[test]
+    fn incomplete_finder_selects_object_after_prose() {
+        let text = "see the shape {\"tool_call_id\": \"x\"} here";
+        assert_eq!(find_incomplete_protocol_candidate_start(text), Some(14));
+    }
+
+    #[test]
+    fn embedded_finder_selects_container_object_start() {
+        let text = "nope {\"tool_calls\": []}";
+        assert_eq!(find_embedded_protocol_candidate_start(text), Some(5));
+    }
 }

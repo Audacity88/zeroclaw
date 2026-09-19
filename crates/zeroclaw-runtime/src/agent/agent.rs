@@ -25,25 +25,31 @@ use zeroclaw_providers::{
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
-pub fn build_session_model_provider(
-    config: &Config,
-    model_provider_ref: &str,
-    model_override: Option<&str>,
-) -> Result<(Box<dyn ModelProvider>, String, String)> {
-    let (model_provider_name, model_provider_alias) = model_provider_ref
+/// Split a `<type>.<alias>` provider reference.
+fn split_model_provider_ref(model_provider_ref: &str) -> Result<(String, String)> {
+    model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
         .ok_or_else(|| {
             anyhow::Error::msg(format!(
                 "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
             ))
-        })?;
+        })
+}
 
+/// The model a session on `model_provider_ref` runs: the override when one
+/// was given, else the alias's configured `model`.
+fn resolve_session_model(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let (model_provider_name, model_provider_alias) = split_model_provider_ref(model_provider_ref)?;
     let entry = config
         .providers
         .models
         .find(&model_provider_name, &model_provider_alias);
-    let model_name = model_override
+    model_override
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(str::to_string)
@@ -59,7 +65,47 @@ pub fn build_session_model_provider(
                 "model_provider `{model_provider_ref}` has no `model` configured and no model \
                  override was supplied"
             ))
-        })?;
+        })
+}
+
+/// The provider reference and model a session resolves to from the agent's
+/// configuration and its overrides, without building a provider. It answers
+/// the same question `build_session_model_provider` answers on the way to a
+/// provider box, so a caller that only needs the identity, such as a check
+/// of what the model accepts, does not have to lock the agent.
+pub fn resolve_session_model_identity(
+    config: &Config,
+    agent_alias: &str,
+    model_provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<(String, String)> {
+    let model_provider_ref = match model_provider_override
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+    {
+        Some(reference) => reference.to_string(),
+        None => config
+            .agent(agent_alias)
+            .map(|agent| agent.model_provider.as_str().to_string())
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!("Agent `{agent_alias}` is not configured"))
+            })?,
+    };
+    let model = resolve_session_model(config, &model_provider_ref, model_override)?;
+    Ok((model_provider_ref, model))
+}
+
+pub fn build_session_model_provider(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    let (model_provider_name, model_provider_alias) = split_model_provider_ref(model_provider_ref)?;
+    let model_name = resolve_session_model(config, model_provider_ref, model_override)?;
+    let entry = config
+        .providers
+        .models
+        .find(&model_provider_name, &model_provider_alias);
 
     let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
         config,
@@ -298,6 +344,34 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestTurnEntryPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TestTurnEntryPause {
+    pub(crate) fn new() -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            entered,
+            release,
+        )
+    }
+
+    async fn wait(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
 #[derive(Debug)]
 struct HistoryTrimNotice {
     dropped_messages: usize,
@@ -416,6 +490,8 @@ pub struct Agent {
     channel_name: String,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    turn_entry_pause: Option<TestTurnEntryPause>,
     /// The `DelegateTool` this Agent's registry registered, in its concrete
     /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
     /// otherwise cannot drive the *constructed* delegate's nested-registry
@@ -566,6 +642,8 @@ pub struct AgentBuilder {
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
+    turn_entry_pause: Option<TestTurnEntryPause>,
+    #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -619,6 +697,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(test)]
             turn_datetime: None,
+            #[cfg(test)]
+            turn_entry_pause: None,
             #[cfg(test)]
             delegate_tool: None,
         }
@@ -878,6 +958,12 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_turn_entry_pause(mut self, pause: TestTurnEntryPause) -> Self {
+        self.turn_entry_pause = Some(pause);
+        self
+    }
+
     pub fn exclude_memory(mut self, exclude: bool) -> Self {
         self.exclude_memory = exclude;
         self
@@ -1026,6 +1112,8 @@ impl AgentBuilder {
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
             #[cfg(test)]
+            turn_entry_pause: self.turn_entry_pause,
+            #[cfg(test)]
             delegate_tool: self.delegate_tool,
         })
     }
@@ -1172,6 +1260,76 @@ impl Agent {
             return 0;
         };
         crate::agent::turn::media_degrade::degrade_media_in_messages(&mut self.history[start..])
+    }
+
+    /// Replace one completed turn only after confirming that the live history
+    /// still ends with the exact messages the turn committed. A mismatch is a
+    /// fail-closed signal: callers must discard this Agent rather than mixing
+    /// generations in its provider history.
+    pub fn replace_history_suffix(
+        &mut self,
+        expected_suffix: &[ConversationMessage],
+        replacement: Vec<ConversationMessage>,
+    ) -> bool {
+        if expected_suffix.is_empty() || self.history.len() < expected_suffix.len() {
+            return false;
+        }
+        let start = self.history.len() - expected_suffix.len();
+        if !self.history[start..]
+            .iter()
+            .zip(expected_suffix)
+            .all(|(live, expected)| Self::conversation_messages_equal(live, expected))
+        {
+            return false;
+        }
+        self.history.truncate(start);
+        self.history.extend(replacement);
+        true
+    }
+
+    fn conversation_messages_equal(
+        left: &ConversationMessage,
+        right: &ConversationMessage,
+    ) -> bool {
+        match (left, right) {
+            (ConversationMessage::Chat(left), ConversationMessage::Chat(right)) => {
+                left.role == right.role && left.content == right.content
+            }
+            (
+                ConversationMessage::AssistantToolCalls {
+                    text: left_text,
+                    tool_calls: left_calls,
+                    reasoning_content: left_reasoning,
+                },
+                ConversationMessage::AssistantToolCalls {
+                    text: right_text,
+                    tool_calls: right_calls,
+                    reasoning_content: right_reasoning,
+                },
+            ) => {
+                left_text == right_text
+                    && left_reasoning == right_reasoning
+                    && left_calls.len() == right_calls.len()
+                    && left_calls.iter().zip(right_calls).all(|(left, right)| {
+                        left.id == right.id
+                            && left.name == right.name
+                            && left.arguments == right.arguments
+                            && left.extra_content == right.extra_content
+                    })
+            }
+            (
+                ConversationMessage::ToolResults(left_results),
+                ConversationMessage::ToolResults(right_results),
+            ) => {
+                left_results.len() == right_results.len()
+                    && left_results.iter().zip(right_results).all(|(left, right)| {
+                        left.tool_call_id == right.tool_call_id
+                            && left.content == right.content
+                            && left.tool_name == right.tool_name
+                    })
+            }
+            _ => false,
+        }
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {
@@ -2094,14 +2252,41 @@ impl Agent {
         if self.history.len() <= max {
             return None;
         }
+        let target = crate::agent::history_trim::history_trim_target(
+            max,
+            self.config.resolved.history_trim_low_water,
+        );
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
             max,
+            target,
             self.history_has_trim_breadcrumb,
         );
         self.history = result.history;
         if !result.trimmed {
             return None;
+        }
+
+        // Models whose API keeps earlier turns' thinking in context replay
+        // every stored reasoning block on the next request. This trim just
+        // rewrote the conversation prefix, so every block it left behind is
+        // stale; the safe replay is none at all.
+        if zeroclaw_providers::claude_models::claude_keeps_prior_thinking(&self.model_name) {
+            let stripped = crate::agent::history_trim::strip_all_reasoning_from_conversation(
+                &mut self.history,
+            );
+            if stripped > 0 {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "model": self.model_name,
+                            "messages": stripped,
+                        })),
+                    "dropped replayed reasoning after a turn-boundary history trim"
+                );
+            }
         }
 
         crate::agent::history_trim::insert_conversation_breadcrumb(&mut self.history);
@@ -2133,6 +2318,7 @@ impl Agent {
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "max_history_messages": max,
+                        "trim_target": target,
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
@@ -3001,6 +3187,11 @@ impl Agent {
                 committed_response: String::new(),
                 new_messages: Vec::new(),
             });
+        }
+
+        #[cfg(test)]
+        if let Some(pause) = self.turn_entry_pause.clone() {
+            pause.wait().await;
         }
 
         // ── Preamble (identical to turn) ───────────────────────────────
@@ -7596,6 +7787,88 @@ mod tests {
     }
 
     #[test]
+    fn seed_conversation_history_skips_failed_turn_marker_from_provider_replay() {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // The durable shape a failed turn leaves behind: prompt, complete
+        // tool exchange, fixed system marker. The marker must be dropped
+        // from live history (the system prompt is rebuilt fresh) while the
+        // complete pair survives intact for the next provider request.
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("write the file")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "ok".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::system(
+                zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER,
+            )),
+        ];
+
+        agent.seed_conversation_history(messages);
+
+        let non_system: Vec<_> = agent
+            .history()
+            .iter()
+            .filter(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+            .collect();
+
+        assert_eq!(
+            non_system.len(),
+            3,
+            "prompt + tool call + tool result; the marker row must not \
+             become a provider-replay message"
+        );
+        assert!(matches!(
+            non_system[0],
+            ConversationMessage::Chat(c) if c.role == "user"
+        ));
+        assert!(
+            matches!(non_system[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1")
+        );
+        assert!(
+            matches!(non_system[2], ConversationMessage::ToolResults(r) if r[0].tool_call_id == "tc-1")
+        );
+    }
+
+    #[test]
     fn seed_history_trims_over_cap_restore_and_returns_transport_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
@@ -8670,6 +8943,35 @@ mod tests {
             .expect("agent builder should succeed with valid config")
     }
 
+    #[test]
+    fn replace_history_suffix_is_atomic_on_structural_mismatch() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_history_test_agent(32, observer);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("old")),
+            ConversationMessage::Chat(ChatMessage::assistant("finished")),
+        ];
+        let expected = agent.history[1..].to_vec();
+        let replacement = vec![ConversationMessage::Chat(ChatMessage::assistant("safe"))];
+
+        assert!(agent.replace_history_suffix(&expected, replacement.clone()));
+        assert!(matches!(
+            agent.history.last(),
+            Some(ConversationMessage::Chat(message)) if message.content == "safe"
+        ));
+
+        let before = agent.history.clone();
+        assert!(!agent.replace_history_suffix(
+            &[ConversationMessage::Chat(ChatMessage::assistant("wrong"))],
+            vec![ConversationMessage::Chat(ChatMessage::assistant("partial"))],
+        ));
+        assert_eq!(
+            serde_json::to_value(&agent.history).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "a mismatch must not partially mutate"
+        );
+    }
+
     fn seed_old_trim_test_turn(agent: &mut Agent) {
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
@@ -8766,6 +9068,122 @@ mod tests {
                 _ => panic!("tool exchange {} was split or reordered", index + 1),
             }
         }
+    }
+
+    fn seed_reasoned_history(agent: &mut Agent) {
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
+
+        let old_call = "reasoned-old-call";
+        let new_call = "reasoned-new-call";
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user("old ask")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("old round".into()),
+                tool_calls: vec![ToolCall {
+                    id: old_call.into(),
+                    name: "mock".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: Some(
+                    r#"{"thinking":"old thought","signature":"sig_old"}"#.into(),
+                ),
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: old_call.into(),
+                content: "old result".into(),
+                tool_name: "mock".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::user("recent ask")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("recent round".into()),
+                tool_calls: vec![ToolCall {
+                    id: new_call.into(),
+                    name: "mock".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: Some(
+                    r#"{"thinking":"new thought","signature":"sig_new"}"#.into(),
+                ),
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: new_call.into(),
+                content: "new result".into(),
+                tool_name: "mock".into(),
+            }]),
+        ];
+    }
+
+    #[test]
+    fn trim_history_strips_reasoning_from_survivors_on_models_that_keep_it() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_history_test_agent(2, observer);
+        agent.model_name = "claude-fable-5-1".to_string();
+        seed_reasoned_history(&mut agent);
+
+        let notice = agent
+            .trim_history(None)
+            .expect("a history over the message cap must trim");
+        assert!(notice.dropped_messages > 0, "old turns must be dropped");
+        assert!(
+            !agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content == "old ask"
+            )),
+            "the oldest turn must be gone"
+        );
+        for message in &agent.history {
+            match message {
+                ConversationMessage::AssistantToolCalls {
+                    reasoning_content,
+                    tool_calls,
+                    ..
+                } => {
+                    assert!(
+                        reasoning_content.is_none(),
+                        "the trim rewrote the prefix every replayed block was signed over, \
+                         so survivors lose their reasoning"
+                    );
+                    assert!(!tool_calls.is_empty(), "tool calls must survive the strip");
+                }
+                ConversationMessage::Chat(chat) if chat.role == "assistant" => {
+                    assert!(
+                        !chat.content.contains("sig_"),
+                        "no signed reasoning may survive: {}",
+                        chat.content
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                    if tool_calls.iter().any(|call| call.id == "reasoned-new-call")
+            )),
+            "the newest complete turn must survive with its tool calls"
+        );
+    }
+
+    #[test]
+    fn trim_history_keeps_reasoning_when_nothing_was_dropped() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_history_test_agent(50, observer);
+        agent.model_name = "claude-fable-5-1".to_string();
+        seed_reasoned_history(&mut agent);
+        let before = agent.history.clone();
+
+        let notice = agent.trim_history(None);
+
+        assert!(notice.is_none(), "a history under the cap must not trim");
+        assert_eq!(
+            serde_json::to_value(&agent.history).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "without a drop the prefix is untouched, so reasoning stays"
+        );
     }
 
     #[test]
@@ -9099,6 +9517,14 @@ mod tests {
         );
         assert_eq!(event.zeroclaw.get("channel"), None);
         assert_eq!(event.trace_id.as_deref(), Some("trim-test-turn"));
+        assert_eq!(
+            event
+                .attributes
+                .get("trim_target")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "cap 2 with the default 0.7 fraction floors to a target of 1"
+        );
         assert!(event.attributes.get("agent_alias").is_none());
         assert!(event.attributes.get("channel").is_none());
         assert!(event.attributes.get("turn_id").is_none());
@@ -10756,7 +11182,8 @@ mod tests {
         let answer_a = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 1_024,
+                    budget_tokens: Some(1_024),
+                    effort: None,
                     display: None,
                 }),
                 agent_a.turn("same request"),
@@ -10766,7 +11193,8 @@ mod tests {
         let answer_b = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 2_048,
+                    budget_tokens: Some(2_048),
+                    effort: None,
                     display: None,
                 }),
                 agent_b.turn("same request"),
