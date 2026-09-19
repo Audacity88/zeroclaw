@@ -92,7 +92,7 @@ function Remove-SmokeTask {
 if ($CleanupOnly) {
     Remove-SmokeTask
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
-    return
+    exit 0
 }
 
 $transcript = Join-Path $EvidenceDir 'windows-service-smoke-transcript.txt'
@@ -114,7 +114,8 @@ try {
     $task = Get-ScheduledTask -TaskName $taskName
     $action = $task.Actions | Select-Object -First 1
     $evidence.action = "$($action.Execute) $($action.Arguments)"
-    if ($action.Execute -ne $fixture) { throw "Task action executable mismatch: $($action.Execute)" }
+    $actionExecutable = $action.Execute.Trim('"')
+    if ($actionExecutable -ne $fixture) { throw "Task action executable mismatch: $($action.Execute)" }
     if ($action.Arguments -notlike "*service run-windows-daemon*") { throw 'Task action does not use the production Windows service runner' }
     if ($action.Arguments -notlike "*$ConfigDir*") { throw 'Task action omitted the isolated config directory' }
 
