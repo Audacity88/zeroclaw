@@ -575,6 +575,13 @@ fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
 /// An assistant message in native tool-call history is the JSON envelope
 /// built by the runtime (`{"content": …, "tool_calls": […],
 /// "reasoning_content"?: …}`) and parsed back by the provider adapters.
+/// It counts as an envelope only when its `tool_calls` value deserializes
+/// as `Vec<ToolCall>` — the same predicate every provider adapter uses to
+/// decide that an assistant message is a tool-call envelope — so a blob
+/// the adapters would replay as plain text (absent, null, non-array, or
+/// malformed call list) is sanitized as plain text, failing closed to the
+/// whole-string rewrite instead of being protected field-wise.
+///
 /// Only its `content` string is rewritten: `reasoning_content` carries
 /// signed thinking blocks that must replay byte-for-byte, and
 /// `tool_calls[].extra_content` carries provider signatures. The envelope
@@ -582,6 +589,15 @@ fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
 /// envelope stays byte-identical. Every other message is rewritten as a
 /// whole string, which keeps a marker inside a native tool-result blob
 /// cleaned in place (see [`MEDIA_PLACEHOLDER`]).
+///
+/// The protected shape is the intersection every adapter treats as an
+/// envelope. The compatible adapter alone also recognizes a
+/// reasoning-without-calls envelope, but the Anthropic and OpenAI-family
+/// adapters would replay that blob as plain text, so protecting it here
+/// would leak its markers exactly the way a malformed call list does; it
+/// stays under the whole-string rule — a shape the current runtime writer
+/// never produces, since it stores plain text and drops reasoning when
+/// there are no calls.
 fn rewrite_model_visible_text(
     message: &ChatMessage,
     rewrite: impl Fn(&str) -> (String, usize),
@@ -594,10 +610,10 @@ fn rewrite_model_visible_text(
     let Some(mut envelope) = parsed_envelope else {
         return rewrite(&message.content);
     };
-    if !envelope
-        .get("tool_calls")
-        .is_some_and(serde_json::Value::is_array)
-    {
+    if !envelope.get("tool_calls").is_some_and(|tool_calls| {
+        serde_json::from_value::<Vec<zeroclaw_api::model_provider::ToolCall>>(tool_calls.clone())
+            .is_ok()
+    }) {
         return rewrite(&message.content);
     }
     let Some(content) = envelope.get("content").and_then(serde_json::Value::as_str) else {
@@ -2360,29 +2376,79 @@ mod tests {
 
     // The envelope's only marker lives inside `reasoning_content`, so the
     // `content` rewrite counts zero and the envelope must come back
-    // byte-identical. A fix that always re-serializes would fail here if key
-    // order or escaping drifted; this pins the rewrite-only-on-change rule.
+    // byte-identical. The input is a hand-written non-canonical spelling —
+    // `tool_calls` before `content`, a space after a colon, and `\u002f`
+    // escapes inside the marker's path — which serde_json would never
+    // produce: a re-serialization spells the path with `/` and drops the
+    // spaces, so only the zero-rewrite early return can reproduce these
+    // exact bytes.
     #[test]
     fn sanitize_image_markers_leaves_assistant_envelope_byte_identical_when_only_reasoning_matches()
     {
-        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
-        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
-        let envelope = serde_json::json!({
-            "content": "running the tool",
-            "tool_calls": [{
-                "id": "toolu_1",
-                "name": "shell",
-                "arguments": "{}",
-                "extra_content": {"google": {"thought_signature": "sig_gemini"}},
-            }],
-            "reasoning_content": reasoning,
-        })
-        .to_string();
+        let marker = format!("[{}:{}]", "IMAGE", r"\u002ftmp\u002fshot.png");
+        let envelope = format!(
+            r#"{{"tool_calls": [{{"id": "toolu_1", "name": "shell", "arguments": "{{}}", "extra_content": {{"google": {{"thought_signature": "sig_gemini"}}}}}}], "content": "running the tool", "reasoning_content": "{{\"thinking\":\"look at {marker} first\",\"signature\":\"sig_abc\"}}"}}"#
+        );
         let messages = [ChatMessage::assistant(envelope)];
         let sanitized = sanitize_image_markers(&messages);
         assert_eq!(
             sanitized[0].content, messages[0].content,
             "an envelope whose content is untouched must not be re-serialized"
+        );
+    }
+
+    // A malformed call list (an element missing `name`/`arguments`) makes
+    // every adapter replay the whole blob as plain assistant text, so the
+    // seam must sanitize it as plain text too: fail-closed whole-string
+    // rewrite, not field-wise protection that would leave a marker inside
+    // `reasoning_content` untouched.
+    #[test]
+    fn sanitize_image_markers_rewrites_whole_string_when_tool_calls_do_not_deserialize() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
+        let envelope = serde_json::json!({
+            "content": "running",
+            "tool_calls": [{"id": "x"}],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = [ChatMessage::assistant(envelope)];
+        let sanitized = sanitize_image_markers(&messages);
+        assert!(
+            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
+            "a malformed call list must fall back to the whole-string rewrite: {}",
+            sanitized[0].content
+        );
+        assert!(
+            !sanitized[0].content.contains("/tmp/shot.png"),
+            "the marker inside the reasoning field must not survive as a raw path: {}",
+            sanitized[0].content
+        );
+    }
+
+    // `null` is not an envelope either: without a call list to deserialize,
+    // the adapters replay the blob as plain text, and the seam must match.
+    #[test]
+    fn sanitize_image_markers_rewrites_whole_string_when_tool_calls_is_not_an_array() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
+        let envelope = serde_json::json!({
+            "content": "running",
+            "tool_calls": null,
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = [ChatMessage::assistant(envelope)];
+        let sanitized = sanitize_image_markers(&messages);
+        assert!(
+            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
+            "a null call list must fall back to the whole-string rewrite: {}",
+            sanitized[0].content
+        );
+        assert!(
+            !sanitized[0].content.contains("/tmp/shot.png"),
+            "the marker inside the reasoning field must not survive as a raw path: {}",
+            sanitized[0].content
         );
     }
 
@@ -2440,6 +2506,36 @@ mod tests {
             tool_parsed["content"],
             format!("heard {MEDIA_PLACEHOLDER}"),
             "the tool message's audio marker is still replaced in place"
+        );
+    }
+
+    // Audio twin of the malformed-call-list case: the envelope's call list
+    // does not deserialize, so the adapters replay the blob as plain text
+    // and the seam rewrites it as plain text, marker inside
+    // `reasoning_content` included.
+    #[test]
+    fn sanitize_audio_markers_rewrites_whole_string_when_tool_calls_do_not_deserialize() {
+        let marker = format!("[{}:{}]", "AUDIO", "/tmp/clip.wav");
+        let reasoning = format!(
+            r#"{{"thinking":"listen to {marker} before answering","signature":"sig_abc"}}"#
+        );
+        let envelope = serde_json::json!({
+            "content": "running",
+            "tool_calls": [{"id": "x"}],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = [ChatMessage::assistant(envelope)];
+        let sanitized = sanitize_audio_markers(&messages);
+        assert!(
+            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
+            "a malformed call list must fall back to the whole-string rewrite: {}",
+            sanitized[0].content
+        );
+        assert!(
+            !sanitized[0].content.contains("/tmp/clip.wav"),
+            "the marker inside the reasoning field must not survive as a raw path: {}",
+            sanitized[0].content
         );
     }
 
