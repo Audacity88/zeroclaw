@@ -201,9 +201,7 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
-                // Heap-pinned: a full agent turn is one of the largest
-                // futures in the runtime, and holding it inline in this
-                // task overflows 2 MiB stacks (test threads, Windows).
+                // Keep the large turn future out of the nested cost-scope wrappers.
                 let turn = Box::pin(crate::agent::loop_::process_message(
                     cfg,
                     &recipient_alias,

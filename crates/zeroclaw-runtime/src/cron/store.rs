@@ -660,10 +660,19 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     Ok(jobs.into_iter().take(lim).collect())
 }
 
-/// Every overdue row, including rows with no single owner: startup
-/// catch-up must be able to retire or advance an unowned one-shot rather
-/// than leave it overdue until a claim appears and the stale occurrence
-/// fires. Execution paths refuse unowned rows themselves.
+/// Every overdue row, including rows with no single owner, because the two
+/// startup modes need the unfiltered view for different reasons.
+///
+/// With `catch_up_on_startup` disabled, startup skips or advances missed
+/// occurrences: an unowned one-shot has to be visible here to be retired or
+/// advanced, rather than staying overdue until a claim appears and the stale
+/// occurrence fires.
+///
+/// With catch-up enabled, the row is surfaced and then refused by the
+/// dispatch guard, which releases its lock; it stays overdue until ownership
+/// becomes resolvable. That is the intended behavior for enabled catch-up,
+/// and it cannot execute meanwhile: `due_jobs` excludes it from ordinary
+/// polling and every execution path refuses an unowned row.
 pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -4548,9 +4557,11 @@ mod tests {
 
     #[test]
     fn overdue_query_keeps_unowned_rows_for_startup_retirement() {
-        // due_jobs never offers an unowned row, but all_overdue_jobs must,
-        // so startup catch-up can retire or advance it instead of leaving
-        // it overdue until a claim appears and the stale occurrence fires.
+        // due_jobs never offers an unowned row, but all_overdue_jobs must:
+        // with catch-up disabled, startup skips or advances the missed
+        // occurrence, and an invisible row would instead fire stale once a
+        // claim appears. With catch-up enabled the row is refused at
+        // dispatch and simply stays overdue.
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
