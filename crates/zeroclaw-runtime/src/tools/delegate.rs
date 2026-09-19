@@ -152,6 +152,23 @@ fn delegate_cost_scope_per_agent_disabled_warn_once() {
     }
 }
 
+/// Inherited cost-scope subtree chain for a delegated sub-loop's own
+/// delegate tool, read from the cost-tracking scope installed around that
+/// sub-loop: the sub-loop's agent entry first, then its inherited ancestor
+/// entries (nearest first). Empty when the sub-loop is unscoped or runs on
+/// a non-agent-scoped tracker, matching the root tool's empty chain.
+fn current_delegate_subtree_chain() -> Vec<Arc<zeroclaw_config::cost::SubtreeSpend>> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(|ctx| {
+            ctx.as_ref()
+                .and_then(|context| context.tracker.as_ref())
+                .map(|tracker| tracker.subtree_chain_for_children())
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 /// Serializable result of a background delegate task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundDelegateResult {
@@ -338,6 +355,16 @@ pub struct DelegateTool {
     /// layer on its (stack-marginal) poll chain, so carrying the pre-built
     /// context is how the spawn-site context reaches the spawned sub-loop.
     prebuilt_cost_ctx: Option<(String, ToolLoopCostTrackingContext)>,
+    /// Inherited cost-scope subtree chain for the budget scopes this tool
+    /// builds in `delegate_cost_context`: the ancestor entries (nearest
+    /// first) a delegation target's per-agent scope carries, so a delegated
+    /// descendant's spend counts against every ancestor's per-hop ceiling.
+    /// Root tools carry an empty chain; target-bound nested tools carry the
+    /// dispatch target's own entry plus its inherited chain (read from the
+    /// cost scope installed around the dispatched sub-loop); the
+    /// background/parallel re-executor wrappers carry the spawning tool's
+    /// chain verbatim, like depth, because they re-run the SAME hop.
+    inherited_cost_chain: Vec<Arc<zeroclaw_config::cost::SubtreeSpend>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,6 +487,7 @@ impl DelegateTool {
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
             prebuilt_cost_ctx: None,
+            inherited_cost_chain: Vec::new(),
         }
     }
 
@@ -513,6 +541,7 @@ impl DelegateTool {
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
             prebuilt_cost_ctx: None,
+            inherited_cost_chain: Vec::new(),
         }
     }
 
@@ -886,9 +915,14 @@ impl DelegateTool {
                 // daily spend on the shared ledger; the global daily/monthly
                 // limits still apply to the shared totals on top, so the
                 // derived tracker is never looser than the global tracker.
-                ctx.tracker = Some(Arc::new(
-                    tracker.derived_for_agent(target_alias, ceiling_usd),
-                ));
+                // The target's scope also carries the ancestor subtree
+                // chain collected along the delegation path, so descendant
+                // spend counts against every ancestor's per-hop ceiling.
+                ctx.tracker = Some(Arc::new(tracker.derived_for_agent_in_chain(
+                    target_alias,
+                    ceiling_usd,
+                    self.inherited_cost_chain.clone(),
+                )));
             }
         }
 
@@ -2615,6 +2649,11 @@ impl DelegateTool {
         let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
         let nested_task_control_plane = Arc::clone(&self.task_control_plane);
+        // Same-hop re-executor: carry the spawning tool's inherited cost
+        // chain verbatim (like depth and the action ceiling), so the
+        // wrapper's own context fallbacks resolve the identical scopes the
+        // original call site would have built.
+        let inherited_cost_chain = self.inherited_cost_chain.clone();
         let terminal_store = Arc::clone(&task_control_plane.store);
         let terminal_owner_pid = std::process::id();
         let terminal_owner_boot_id = task_control_plane.boot_id.clone();
@@ -2666,6 +2705,7 @@ impl DelegateTool {
                     caller_alias,
                     task_control_plane: nested_task_control_plane,
                     prebuilt_cost_ctx,
+                    inherited_cost_chain,
                 };
 
                 let args_inner = json!({
@@ -2907,6 +2947,9 @@ impl DelegateTool {
             // that will construct its own nested registries.
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
+            // Same-hop re-executor (see the background spawn): the inherited
+            // cost chain is carried verbatim from the spawning tool.
+            let inherited_cost_chain = self.inherited_cost_chain.clone();
             let session_key = parent_session_key.clone();
             let thread_scope = parent_thread_id.clone();
             let memory = self.memory.clone();
@@ -2956,6 +2999,7 @@ impl DelegateTool {
                         caller_alias,
                         task_control_plane,
                         prebuilt_cost_ctx,
+                        inherited_cost_chain,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = TOOL_LOOP_THREAD_ID
@@ -3896,6 +3940,12 @@ impl DelegateTool {
                     && Self::delegate_admits_with_mcp(&tool_policy, Self::NAME))
                 .then(|| {
                     let nested_task_control_plane = Arc::clone(&self.task_control_plane);
+                    // Subtree chain for the target's own delegations: read
+                    // from the cost scope installed around THIS dispatched
+                    // sub-loop, so the target's entry (and every ancestor
+                    // entry it inherited) binds the target's descendants.
+                    // Empty when the sub-loop is unscoped, matching root.
+                    let inherited_cost_chain = current_delegate_subtree_chain();
                     Box::new(DelegateTool {
                         agents: Arc::clone(&self.agents),
                         security: Arc::clone(&target_policy),
@@ -3933,6 +3983,7 @@ impl DelegateTool {
                         // A second hop arrives through Required admission and
                         // resolves its own cost context for its own target.
                         prebuilt_cost_ctx: None,
+                        inherited_cost_chain,
                     }) as Box<dyn Tool>
                 });
 
@@ -14161,6 +14212,33 @@ command = "rm independent-delegate-marker"
         })
     }
 
+    /// Scripted tool-call completion carrying the same priced usage as
+    /// `usage_completion`, so the hop that emits the tool call lands its own
+    /// cost on the ledger ($0.006 at the fixture's rates) while keeping the
+    /// loop agentic. The nested-chain fixtures price every hop this way.
+    fn tool_call_completion_with_usage(
+        name: &str,
+        id: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string()
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 200}
+        })
+    }
+
     /// Raw-TCP chat server serving `total` identical text+usage completions,
     /// counting every accepted connection. The count doubles as the
     /// provider-was-never-reached probe for the ceiling tests.
@@ -14766,6 +14844,225 @@ command = "rm independent-delegate-marker"
             read_agent_cost(&fixture.data_dir, "target").is_none(),
             "no cost context may be scoped when tracking is disabled"
         );
+    }
+
+    /// Nested-chain cost fixture: `caller` (root, no per-hop cap) delegates
+    /// to `target` (per-hop ceiling `hop_ceiling_cents`), which delegates to
+    /// `target2` (no own cap, so the combined second-hop policy ceiling is
+    /// the first hop's numerically). Same priced mock provider and shared
+    /// risk profile as `delegate_cost_fixture_opts`; the risk profile
+    /// auto-approves `delegate` because the bounded second hop runs through
+    /// a fail-closed approval check, and each agent gets its own runtime
+    /// profile so the two hops' ceilings are pinned independently.
+    async fn nested_delegate_cost_fixture(
+        mock_uri: String,
+        daily_limit_usd: f64,
+        hop_ceiling_cents: u32,
+    ) -> DelegateCostFixture {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{CostConfig, OllamaModelProviderConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let workspace_dir = tmp.path().join("workspace");
+        let mut root_config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        root_config.cost = CostConfig {
+            enabled: true,
+            track_per_agent: true,
+            daily_limit_usd,
+            monthly_limit_usd: 10_000.0,
+            ..CostConfig::default()
+        };
+        root_config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("delegate-cost-model".to_string()),
+                    uri: Some(mock_uri),
+                    timeout_secs: Some(10),
+                    pricing: HashMap::from([
+                        ("delegate-cost-model.input".to_string(), 3.0),
+                        ("delegate-cost-model.output".to_string(), 15.0),
+                    ]),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        root_config.risk_profiles.insert(
+            "delegate_cost_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                auto_approve: vec!["delegate".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        for (profile, ceiling_cents) in [
+            ("delegate_cost_root_runtime", 0),
+            ("delegate_cost_hop_runtime", hop_ceiling_cents),
+            ("delegate_cost_leaf_runtime", 0),
+        ] {
+            root_config.runtime_profiles.insert(
+                profile.to_string(),
+                RuntimeProfileConfig {
+                    agentic: true,
+                    max_tool_iterations: 5,
+                    max_cost_per_day_cents: ceiling_cents,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+        }
+        let root = AliasedAgentConfig {
+            model_provider: "ollama.default".into(),
+            risk_profile: "delegate_cost_profile".into(),
+            runtime_profile: "delegate_cost_root_runtime".into(),
+            ..AliasedAgentConfig::default()
+        };
+        let hop = AliasedAgentConfig {
+            runtime_profile: "delegate_cost_hop_runtime".into(),
+            ..root.clone()
+        };
+        let leaf = AliasedAgentConfig {
+            runtime_profile: "delegate_cost_leaf_runtime".into(),
+            ..root.clone()
+        };
+        root_config.agents.insert("caller".to_string(), root);
+        root_config.agents.insert("target".to_string(), hop);
+        root_config.agents.insert("target2".to_string(), leaf);
+
+        let root_config = Arc::new(root_config);
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&root_config))
+            .with_workspace_dir(workspace_dir)
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(root_config.risk_profiles.clone())
+            .with_runtime_profiles(root_config.runtime_profiles.clone())
+            .with_caller_alias("caller");
+
+        DelegateCostFixture {
+            _tmp: tmp,
+            data_dir,
+            config: root_config,
+            tool,
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_delegate_inherited_ceiling_refuses_second_hop_provider() {
+        // The linked-issue acceptance shape: A (root, no per-hop cap) ->
+        // B (`target`, 1-cent ceiling) -> C (`target2`, no own cap, so the
+        // combined second-hop ceiling is B's 1 cent numerically). B's own
+        // ledger is seeded to the ceiling and B's first priced call pushes
+        // it over; the nested delegate to C must then be refused through
+        // B's inherited ceiling BEFORE C's provider is called. Without
+        // inherited-ceiling coverage C's own zero spend would admit C's
+        // call, so the wire count (exactly one request: B's own) is the
+        // acceptance signal.
+        let (server, captured) = start_scripted_chat_server(&[tool_call_completion_with_usage(
+            DelegateTool::NAME,
+            "call_target2",
+            json!({"agent": "target2", "prompt": "produce a status line"}),
+        )])
+        .await;
+        let fixture = nested_delegate_cost_fixture(server.uri.clone(), 1000.0, 1).await;
+        // Seed B's own alias to its $0.01 ceiling, NOT above it: B's own
+        // first call must still be admitted so the delegation happens.
+        record_agent_seed_spend(&fixture, "target", 0.01);
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "delegate onward to target2"
+            }))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "the second hop must fail on B's exhausted inherited ceiling: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`"),
+            "the refusal must name the ancestor whose ceiling binds: {error}"
+        );
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "only B's own provider call may reach the wire: C must be refused \
+             before its provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_delegate_descendant_spend_counts_toward_ancestor() {
+        // Same chain with headroom on B's ledger: B's own call costs $0.006,
+        // C's call costs another $0.006 under C's OWN alias, and B's ceiling
+        // is $0.01. B's next provider call must then be refused with the
+        // refusal's current equal to B's own ledger spend plus C's
+        // descendant spend ($0.0120), while B's ledger total stays at its
+        // own $0.006: attribution remains per alias, so descendant spend
+        // must reach the ancestor through the chain, not the ledger.
+        let (server, captured) = start_scripted_chat_server(&[
+            tool_call_completion_with_usage(
+                DelegateTool::NAME,
+                "call_target2",
+                json!({"agent": "target2", "prompt": "produce a status line"}),
+            ),
+            usage_completion("leaf finished"),
+        ])
+        .await;
+        let fixture = nested_delegate_cost_fixture(server.uri.clone(), 1000.0, 1).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "delegate onward to target2"
+            }))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "B's next call must be refused once the descendant spend counts: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`"),
+            "the refusal must name the ancestor: {error}"
+        );
+        assert!(
+            error.contains("$0.0120"),
+            "the refusal current must be B's own $0.006 ledger spend plus \
+             C's $0.006 descendant spend: {error}"
+        );
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            2,
+            "exactly B's and C's first calls may reach the wire: B's second \
+             call is refused before it is made"
+        );
+
+        // Attribution stays per alias: B's ledger total excludes C's spend.
+        let b_stats = poll_agent_cost(&fixture.data_dir, "target").await;
+        assert_eq!(
+            b_stats.request_count, 1,
+            "B's ledger holds only B's own call"
+        );
+        assert!((b_stats.cost_usd - 0.006).abs() < 1e-9);
+        let c_stats = poll_agent_cost(&fixture.data_dir, "target2").await;
+        assert_eq!(
+            c_stats.request_count, 1,
+            "C's spend lands under C's own alias"
+        );
+        assert!((c_stats.cost_usd - 0.006).abs() < 1e-9);
     }
 
     #[test]

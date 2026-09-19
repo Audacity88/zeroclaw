@@ -11,6 +11,37 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+/// Process-local subtree accounting for one hop of a delegation chain.
+///
+/// Single source of truth: the durable ledger remains the source of truth
+/// for every alias's own daily spend, which budget checks read per alias;
+/// `descendants_usd` holds only what THIS delegation chain's descendants
+/// recorded during this process lifetime. It exists because descendants
+/// attribute their ledger records to their own alias, not the ancestor's,
+/// so an ancestor's per-alias daily total alone cannot see them. A daemon
+/// restart therefore forgets descendant spend while every alias's own
+/// ledger total persists.
+///
+/// Shared by `Arc` into the budget scopes of the whole chain: the entry's
+/// owning scope checks it in `check_budget`, and every descendant tracker
+/// recording under an inherited chain adds its recorded cost to
+/// `descendants_usd`.
+pub struct SubtreeSpend {
+    alias: String,
+    daily_ceiling_usd: f64,
+    descendants_usd: Mutex<f64>,
+}
+
+impl SubtreeSpend {
+    fn new(alias: &str, daily_ceiling_usd: f64) -> Self {
+        Self {
+            alias: alias.to_string(),
+            daily_ceiling_usd,
+            descendants_usd: Mutex::new(0.0),
+        }
+    }
+}
+
 /// Budget scope a derived tracker enforces its substituted daily limit
 /// against. Private to the cost module: the shared ledger stays the source
 /// of truth either way; the scope only chooses which total the substituted
@@ -22,9 +53,13 @@ enum BudgetScope {
     /// Compare the named agent's OWN daily spend against this ceiling, so a
     /// per-profile cost ceiling means that agent's usage for the day. The
     /// shared daily/monthly limits still apply to the shared totals on top.
+    /// `own` is this hop's subtree entry; `inherited` is the delegation
+    /// chain's ancestor entries (nearest first), so a delegated descendant's
+    /// spend also counts against every ancestor's ceiling. Chains only
+    /// exist on per-agent scopes; the shared-cap degrade stays shared.
     Agent {
-        alias: String,
-        daily_ceiling_usd: f64,
+        own: Arc<SubtreeSpend>,
+        inherited: Vec<Arc<SubtreeSpend>>,
     },
 }
 
@@ -121,10 +156,46 @@ impl CostTracker {
     /// stricter than the base tracker, never looser. See
     /// `derived_with_config` for the lifetime guarantees.
     pub fn derived_for_agent(&self, agent_alias: &str, daily_ceiling_usd: f64) -> Self {
+        self.derived_for_agent_in_chain(agent_alias, daily_ceiling_usd, Vec::new())
+    }
+
+    /// `derived_for_agent` with an inherited delegation chain: `inherited`
+    /// carries the ancestor subtree entries (nearest first) collected with
+    /// [`Self::subtree_chain_for_children`] on the delegating parent's
+    /// tracker. Budget checks through the derived tracker then also count
+    /// this agent's spend against every ancestor's per-hop ceiling, and
+    /// usage recorded through it accumulates into each ancestor entry's
+    /// descendant total. Chains only apply to per-agent scopes.
+    /// See `derived_with_config` for the lifetime guarantees.
+    pub fn derived_for_agent_in_chain(
+        &self,
+        agent_alias: &str,
+        daily_ceiling_usd: f64,
+        inherited: Vec<Arc<SubtreeSpend>>,
+    ) -> Self {
         self.derived_with_scope(BudgetScope::Agent {
-            alias: agent_alias.to_string(),
-            daily_ceiling_usd,
+            own: Arc::new(SubtreeSpend::new(agent_alias, daily_ceiling_usd)),
+            inherited,
         })
+    }
+
+    /// The subtree entries a delegation FROM this tracker's agent passes to
+    /// the child's budget scope: this agent's own entry first, then the
+    /// inherited ancestor chain (nearest first). Empty when this tracker is
+    /// not agent-scoped, so unscoped and shared-cap delegations carry no
+    /// chain. Delegation plumbing calls this on the tracker of the loop a
+    /// delegated sub-agent runs under when building that sub-agent's own
+    /// delegate tool.
+    pub fn subtree_chain_for_children(&self) -> Vec<Arc<SubtreeSpend>> {
+        match &self.budget_scope {
+            BudgetScope::Agent { own, inherited } => {
+                let mut chain = Vec::with_capacity(inherited.len() + 1);
+                chain.push(Arc::clone(own));
+                chain.extend(inherited.iter().cloned());
+                chain
+            }
+            BudgetScope::Shared => Vec::new(),
+        }
     }
 
     fn derived_with_scope(&self, budget_scope: BudgetScope) -> Self {
@@ -188,23 +259,26 @@ impl CostTracker {
 
         // Per-agent daily ceiling: when this tracker was derived for a
         // specific agent, its ceiling means THAT agent's own spend for the
-        // day, not the shared total. Runs after the shared daily check, so
-        // the derived tracker can only be stricter than the base tracker,
-        // never looser.
-        if let BudgetScope::Agent {
-            alias: agent_alias,
-            daily_ceiling_usd,
-        } = &self.budget_scope
-        {
-            let agent_daily = storage.get_daily_cost_for_agent(agent_alias);
-            let projected_agent_daily = agent_daily + estimated_cost_usd;
-            if projected_agent_daily > *daily_ceiling_usd {
-                return Ok(BudgetCheck::Exceeded {
-                    current_usd: agent_daily,
-                    limit_usd: *daily_ceiling_usd,
-                    period: UsagePeriod::Day,
-                    agent_alias: Some(agent_alias.clone()),
-                });
+        // day, not the shared total, and the ceilings of every delegation
+        // ancestor bind on top: a delegated descendant's spend counts
+        // against each ancestor's ceiling through the chain's shared
+        // subtree entries. Runs after the shared daily check, so the
+        // derived tracker can only be stricter than the base tracker,
+        // never looser. Own entry first, then ancestors nearest first, so
+        // the nearest violated ceiling wins and names its agent.
+        if let BudgetScope::Agent { own, inherited } = &self.budget_scope {
+            for entry in std::iter::once(own).chain(inherited.iter()) {
+                let agent_daily = storage.get_daily_cost_for_agent(&entry.alias);
+                let descendants_usd = *entry.descendants_usd.lock();
+                let projected = agent_daily + descendants_usd + estimated_cost_usd;
+                if projected > entry.daily_ceiling_usd {
+                    return Ok(BudgetCheck::Exceeded {
+                        current_usd: agent_daily + descendants_usd,
+                        limit_usd: entry.daily_ceiling_usd,
+                        period: UsagePeriod::Day,
+                        agent_alias: Some(entry.alias.clone()),
+                    });
+                }
             }
         }
 
@@ -386,6 +460,21 @@ impl CostTracker {
         }
 
         drop(storage);
+
+        // Delegation-chain accounting: usage recorded through an
+        // agent-scoped tracker with an inherited chain lands on the ledger
+        // under this tracker's own alias, so the ancestors' per-alias daily
+        // totals never see it. Add it to each ancestor entry's
+        // process-local descendant accumulator so the ancestor's next
+        // `check_budget` counts it against the ancestor's ceiling. Gated on
+        // the same `track_per_agent` flag as the attribution above: chains
+        // only exist on per-agent scopes.
+        if track_per_agent && let BudgetScope::Agent { inherited, .. } = &self.budget_scope {
+            for entry in inherited {
+                *entry.descendants_usd.lock() += cost_usd;
+            }
+        }
+
         append_outcome.into_result()
     }
 
@@ -2429,6 +2518,111 @@ mod tests {
             ),
             "the per-agent ceiling must compare the agent's OWN daily spend, \
              not the shared process-wide total"
+        );
+    }
+
+    #[test]
+    fn derived_for_agent_in_chain_checks_ancestor_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        // The ancestor spent $6 of its own today under its own alias.
+        base.record_usage_with_agent(
+            TokenUsage::new("test/model", 6_000_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("parent"),
+        )
+        .unwrap();
+
+        // The parent's own scoped tracker, then the child's tracker derived
+        // with the parent's chain-for-children (own entry plus ancestors,
+        // exactly as delegation plumbing threads it).
+        let parent_scope = base.derived_for_agent("parent", 5.0);
+        let chain = parent_scope.subtree_chain_for_children();
+        let child = base.derived_for_agent_in_chain("child", 8.0, chain);
+
+        // The child's own $0 passes its own $8 ceiling, but the ancestor's
+        // own $6 already exceeds its $5 ceiling, so the child is refused
+        // with the ANCESTOR named and the ancestor's limit.
+        match child.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period,
+                agent_alias,
+            } => {
+                assert!((current_usd - 6.0).abs() < 1e-9);
+                assert!((limit_usd - 5.0).abs() < 1e-9);
+                assert_eq!(period, UsagePeriod::Day);
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded, got {other:?}"),
+        }
+
+        // A descendant's $1 recorded through the child accumulates into the
+        // ancestor entry while staying attributed to the child's own alias.
+        child
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("child"),
+            )
+            .unwrap();
+        match child.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded { current_usd, .. } => {
+                assert!(
+                    (current_usd - 7.0).abs() < 1e-9,
+                    "ancestor current must count its own $6 plus the \
+                     descendant's $1: {current_usd}"
+                );
+            }
+            other => panic!("expected ancestor-scoped Exceeded, got {other:?}"),
+        }
+
+        // Attribution stays per alias: the ancestor's own ledger total is
+        // still $6, and the child's own total is $1.
+        let parent_daily = base.get_summary_for_agent("parent").unwrap().daily_cost_usd;
+        assert!((parent_daily - 6.0).abs() < 1e-9);
+        let child_daily = base.get_summary_for_agent("child").unwrap().daily_cost_usd;
+        assert!((child_daily - 1.0).abs() < 1e-9);
+
+        // With headroom everywhere the chain admits: a fresh ancestor
+        // ledger at $1 against a $5 ceiling plus a $1 descendant is fine.
+        let tmp2 = TempDir::new().unwrap();
+        let base2 = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp2.path(),
+        )
+        .unwrap();
+        base2
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("parent"),
+            )
+            .unwrap();
+        let parent_scope2 = base2.derived_for_agent("parent", 5.0);
+        let child2 = base2.derived_for_agent_in_chain(
+            "child",
+            8.0,
+            parent_scope2.subtree_chain_for_children(),
+        );
+        assert!(
+            matches!(child2.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "headroom on every ceiling must admit the chained tracker"
         );
     }
 }
