@@ -127,12 +127,13 @@ try {
     $descendantPidFile = Join-Path $ConfigDir 'descendant.pid'
     Wait-Until -Description 'both bounded Unicode markers' -TimeoutSeconds 90 -Condition {
         if (-not (Test-Path -LiteralPath $stdoutLog) -or
-            -not (Test-Path -LiteralPath $stderrLog) -or
-            (Get-Item -LiteralPath $stdoutLog).Length -le 4MB -or
-            (Get-Item -LiteralPath $stderrLog).Length -le 4MB) {
+            -not (Test-Path -LiteralPath $stderrLog)) {
             return $false
         }
         try {
+            # Each marker is written only after its stream emits more than 8 MiB.
+            # The bounded pending queue may shed older burst data, so retained
+            # file size is not a valid lower bound for bytes captured.
             return ((Get-Content -LiteralPath $stdoutLog -Encoding UTF8 -Tail 4) -contains $stdoutMarker) -and
                 ((Get-Content -LiteralPath $stderrLog -Encoding UTF8 -Tail 4) -contains $stderrMarker)
         } catch {
