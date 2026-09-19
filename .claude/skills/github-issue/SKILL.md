@@ -132,12 +132,13 @@ For checkbox fields, render each option as:
 
 Show the final constructed issue (title + labels + full body) for one last confirmation. If the selected template has no labels, show `Labels: none` and omit `--label` from the create command.
 
-Create a private scratch directory outside the checkout, then save the final body to `$BODY_FILE`:
+With `ISSUE_BODY` containing the final body constructed in Step 5, create a private scratch directory outside the checkout and save it to `$BODY_FILE`. Treat the body as literal data, not shell code:
 
 ```bash
 umask 077
 BODY_DIR=$(mktemp -d /tmp/zeroclaw-issue.XXXXXX) || exit 1
 BODY_FILE="$BODY_DIR/body.md"
+printf '%s' "$ISSUE_BODY" > "$BODY_FILE" || exit 1
 ```
 
 Use the trusted system temporary directory on your platform if `/tmp` is unavailable; never substitute a checkout-controlled directory. Preview the saved file for confirmation and reread it immediately before submission. If its contents changed, obtain confirmation again. This avoids predictable checkout paths and other-user writes, not interference by a malicious process running as your user.
