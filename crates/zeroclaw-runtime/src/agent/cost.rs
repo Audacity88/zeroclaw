@@ -351,12 +351,29 @@ pub fn record_tool_loop_cost_usage(
 /// Compute cost_usd for a provider/model/usage triple using the task-local
 /// pricing context but WITHOUT updating any accumulators. For emitting
 /// Usage events for rejected attempts where the cost is already accounted
-/// via settle_provider_attempts.
+/// via settle_provider_attempts. Prices the usage exactly like the
+/// settlement path, including the cache-write band, so the projected
+/// rejected cost and the settled record agree.
 pub fn compute_cost_usd(
     model_provider_name: &str,
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
 ) -> Option<f64> {
+    price_usage(model_provider_name, model, usage, None).map(|(cost_usage, _)| cost_usage.cost_usd)
+}
+
+/// Resolve the effective rate sheet for one attempt from the task-local
+/// pricing context and price its usage, without touching any accumulator or
+/// tracker. Shared by the settlement path and the rejected-attempt projection
+/// so both derive the same cost from the same usage. Returns `None` when no
+/// cost-tracking context is scoped or the usage carries no input/output
+/// tokens.
+fn price_usage(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+    live_override: Option<ModelRates>,
+) -> Option<(CostTokenUsage, UnpricedUsage)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
@@ -376,9 +393,18 @@ pub fn compute_cost_usd(
             .unwrap_or_default(),
     );
 
-    let live = (!config_rates.is_complete())
-        .then(|| live_pricing_for(model_provider_name, model))
-        .flatten();
+    // Live-price FALLBACK fills only the dimensions config left unset; never
+    // fetches on this path (reads a cached snapshot, empty unless a provider
+    // opted into `live_pricing`). Cache writes are optional for completeness
+    // because they fall back to the ordinary input rate, but a cached live
+    // write rate must still be allowed to fill that absent dimension.
+    let live = if let Some(live) = live_override {
+        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none()).then_some(live)
+    } else {
+        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
+            .then(|| live_pricing_for(model_provider_name, model))
+            .flatten()
+    };
     let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
 
     // The catalog is the final per-dimension fallback, not an all-or-nothing
@@ -396,20 +422,29 @@ pub fn compute_cost_usd(
     }
 
     rates = normalized_rates(rates);
-    let input_rate = rates.input_per_mtok.unwrap_or(0.0);
-    let output_rate = rates.output_per_mtok.unwrap_or(0.0);
-    let cached_rate = rates.cached_input_per_mtok.unwrap_or(0.0);
-
-    let cost_usage = CostTokenUsage::new_with_cache(
+    let cache_creation_input_tokens = usage
+        .cache_creation_input_tokens
+        .unwrap_or(0)
+        .min(input_tokens.saturating_sub(cached_input_tokens));
+    let unpriced = unpriced_usage(
+        rates,
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+    );
+    let cost_usage = CostTokenUsage::new_with_cache_write(
         model,
         input_tokens,
         cached_input_tokens,
+        cache_creation_input_tokens,
         output_tokens,
-        input_rate,
-        cached_rate,
-        output_rate,
+        rates.input_per_mtok.unwrap_or(0.0),
+        rates.cached_input_per_mtok.unwrap_or(0.0),
+        rates.cache_write_per_mtok.unwrap_or(0.0),
+        rates.output_per_mtok.unwrap_or(0.0),
     );
-    Some(cost_usage.cost_usd)
+    Some((cost_usage, unpriced))
 }
 
 /// Settle the immutable physical-attempt report exactly once.  Only complete
@@ -487,79 +522,12 @@ fn record_tool_loop_cost_usage_inner_with_live(
 ) -> Option<(u64, f64)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
-    let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
-    let total_tokens = input_tokens.saturating_add(output_tokens);
-    if total_tokens == 0 {
-        return None;
-    }
-
+    let (mut cost_usage, unpriced) = price_usage(model_provider_name, model, usage, live_override)?;
     let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-    let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let config_rates = normalized_rates(
-        pricing
-            .map(|map| resolve_rates_opt(map, model))
-            .unwrap_or_default(),
-    );
 
-    // Live-price FALLBACK fills only the dimensions config left unset; never
-    // fetches on this path (reads a cached snapshot, empty unless a provider
-    // opted into `live_pricing`).
-    let live = if let Some(live) = live_override {
-        // Cache writes are optional for completeness because they fall back
-        // to the ordinary input rate, but a cached live write rate must still
-        // be allowed to fill that absent dimension.
-        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none()).then_some(live)
-    } else {
-        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
-            .then(|| live_pricing_for(model_provider_name, model))
-            .flatten()
-    };
-    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
-
-    // The catalog is the final per-dimension fallback, not an all-or-nothing
-    // replacement. Preserve every configured/live value (including an
-    // explicit free 0.0) and fill only the dimensions still absent.
-    if let Some((cat_in, cat_out, cat_cached)) =
-        crate::agent::pricing_catalog::global_pricing_rates(model)
-    {
-        rates = rates.or(ModelRates {
-            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
-            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
-            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
-            cache_write_per_mtok: None,
-        });
-    }
-
-    rates = normalized_rates(rates);
-    let cache_creation_input_tokens = usage
-        .cache_creation_input_tokens
-        .unwrap_or(0)
-        .min(input_tokens.saturating_sub(cached_input_tokens));
-    let unpriced = unpriced_usage(
-        rates,
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        output_tokens,
-    );
-    let input_rate = rates.input_per_mtok.unwrap_or(0.0);
-    let output_rate = rates.output_per_mtok.unwrap_or(0.0);
-    let cached_rate = rates.cached_input_per_mtok.unwrap_or(0.0);
-    let write_rate = rates.cache_write_per_mtok.unwrap_or(0.0);
-    let mut cost_usage = CostTokenUsage::new_with_cache_write(
-        model,
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        output_tokens,
-        input_rate,
-        cached_rate,
-        write_rate,
-        output_rate,
-    );
     cost_usage.unpriced_tokens = unpriced.tokens;
     cost_usage.pricing_available = unpriced.tokens == 0;
 
@@ -1788,6 +1756,73 @@ mod tests {
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cache_creation_input_tokens, 1_000);
+    }
+
+    #[test]
+    fn compute_cost_usd_matches_settlement_for_cache_writes() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "deepseek".to_string(),
+                pricing_with_cache_write("deepseek-chat", 0.27, 0.027, 0.54, 1.10),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(4_000),
+            cache_creation_input_tokens: Some(1_000),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let projected = runtime
+            .block_on(
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx.clone()), async {
+                    compute_cost_usd("deepseek", "deepseek-chat", &usage)
+                }),
+            )
+            .expect("projected cost");
+        let (_, settled_cost) = runtime
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+            }))
+            .expect("settled cost");
+
+        // The rejected-attempt projection must price the write band exactly
+        // like the settlement path: 1_000 writes at the write premium.
+        let expected = (1_000.0 * 0.54 / 1_000_000.0)
+            + (4_000.0 * 0.027 / 1_000_000.0)
+            + (200.0 * 1.10 / 1_000_000.0);
+        assert!(
+            (projected - expected).abs() < 1e-12,
+            "projection must match the settlement arithmetic"
+        );
+        assert!(
+            (settled_cost - expected).abs() < 1e-12,
+            "settlement must match the hand-computed cost"
+        );
+        assert!(
+            (projected - settled_cost).abs() < 1e-12,
+            "projection and settlement must agree on the same usage"
+        );
+
+        // The historical bug priced the 1_000 cache writes at the plain
+        // input rate; the projection must never reproduce that number.
+        let wrongly_at_input_rate = (1_000.0 * 0.27 / 1_000_000.0)
+            + (4_000.0 * 0.027 / 1_000_000.0)
+            + (200.0 * 1.10 / 1_000_000.0);
+        assert!(
+            (projected - wrongly_at_input_rate).abs() > 1e-12,
+            "projection must not price cache writes at the input rate"
+        );
     }
 
     #[test]

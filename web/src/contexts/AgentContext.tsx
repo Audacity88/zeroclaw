@@ -435,7 +435,7 @@ export function AgentProvider({
             },
           ]);
         }
-        // Extract context window info from "done" frame (sent by gateway). See #7311.
+        // Extract context window info from "done" frame (sent by gateway).
         if (msg.type === 'done') {
           // Prefer model_context_window (actual model capacity) for display,
           // fall back to max_context_tokens (trim budget) for backward compat.
@@ -570,6 +570,38 @@ export function AgentProvider({
           .replace('{reason}', reason)
           .replace('{dropped}', String(msg.dropped_messages ?? 0))
           .replace('{kept}', String(msg.kept_turns ?? 0));
+        localMessageMutationVersionRef.current += 1;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: generateUUID(),
+            role: 'agent' as const,
+            content,
+            timestamp: new Date(),
+            ephemeral: true,
+            notice: true,
+          },
+        ]);
+        break;
+      }
+
+      case 'safeguard_fallback': {
+        // Display-only safety-safeguard downgrade notice. Mirrors
+        // `history_trimmed`: rendered as an ephemeral warning bubble that is
+        // never persisted to localStorage or the backend transcript. Privacy:
+        // the gateway sends only model names and which layer switched — no
+        // classifier category or refusal explanation reaches the browser.
+        const served = msg.served_model ?? '';
+        const requested = msg.requested_model ?? '';
+        if (!served || !requested) break;
+        const key = msg.fallback_kind === 'server'
+          ? 'agent.safeguard_fallback_server'
+          : msg.fallback_kind === 'client_server'
+            ? 'agent.safeguard_fallback_client_server'
+            : 'agent.safeguard_fallback_client';
+        const content = t(key)
+          .replace('{requested}', requested)
+          .replace('{served}', served);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,

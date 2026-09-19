@@ -437,12 +437,20 @@ async fn safety_net_streaming_event_sequence_for_tool_turn() {
         pos_tool_call < pos_tool_result,
         "ToolCall must precede its ToolResult"
     );
-    let (call_id, result_id) = match (&events[pos_tool_call], &events[pos_tool_result]) {
-        (TurnEvent::ToolCall { id: c, .. }, TurnEvent::ToolResult { id: r, .. }) => {
-            (c.clone(), r.clone())
-        }
-        _ => unreachable!(),
-    };
+    let call_id = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a ToolCall event must carry an id");
+    let result_id = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a ToolResult event must carry an id");
     assert_eq!(call_id, "tc-1");
     assert_eq!(
         call_id, result_id,
@@ -570,33 +578,37 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
         parent_agent_alias: None,
         sop_reassembly: None,
-        exec: crate::agent::loop_::ResolvedAgentExecution {
-            model_access: crate::agent::loop_::ResolvedModelAccess {
+        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+            crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
                 temperature: None,
             },
-            tools_registry: &tools_registry,
-            observer: &observability::NoopObserver {},
-            silent: true,
-            approval: None,
-            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-            config: None,
-            max_tool_iterations: 5,
-            hooks: None,
-            excluded_tools: &[],
-            dedup_exempt_tools: &[],
-            activated_tools: None,
-            model_switch_callback: None,
-            pacing: &zeroclaw_config::schema::PacingConfig::default(),
-            strict_tool_parsing: false,
-            parallel_tools: false,
-            max_tool_result_chars: 30_000,
-            context_token_budget: 100_000,
-            receipt_generator: None,
-            knobs: &crate::agent::loop_::LoopKnobs::default(),
-        },
+            crate::agent::loop_::ResolvedIo {
+                tools_registry: &tools_registry,
+                observer: &observability::NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                hooks: None,
+                activated_tools: None,
+                model_switch_callback: None,
+                receipt_generator: None,
+            },
+            crate::agent::loop_::ResolvedRuntimeKnobs {
+                max_tool_iterations: 5,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_token_budget: 100_000,
+                knobs: &crate::agent::loop_::LoopKnobs::default(),
+            },
+        ),
         history: &mut history,
         channel_name: "cli",
         channel_reply_target: None,
@@ -967,33 +979,37 @@ async fn safety_net_task_locals_probe_per_entry_path() {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
-                exec: crate::agent::loop_::ResolvedAgentExecution {
-                    model_access: crate::agent::loop_::ResolvedModelAccess {
+                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                    crate::agent::loop_::ResolvedModelAccess {
                         model_provider: &provider,
                         provider_name: "mock",
                         model: "mock-model",
                         temperature: None,
                     },
-                    tools_registry: &tools_registry,
-                    observer: &observability::NoopObserver {},
-                    silent: true,
-                    approval: None,
-                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                    config: None,
-                    max_tool_iterations: 5,
-                    hooks: None,
-                    excluded_tools: &[],
-                    dedup_exempt_tools: &[],
-                    activated_tools: None,
-                    model_switch_callback: None,
-                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
-                    parallel_tools: false,
-                    max_tool_result_chars: 30_000,
-                    context_token_budget: 100_000,
-                    receipt_generator: None,
-                    knobs: &crate::agent::loop_::LoopKnobs::default(),
-                },
+                    crate::agent::loop_::ResolvedIo {
+                        tools_registry: &tools_registry,
+                        observer: &observability::NoopObserver {},
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        receipt_generator: None,
+                    },
+                    crate::agent::loop_::ResolvedRuntimeKnobs {
+                        max_tool_iterations: 5,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 30_000,
+                        context_token_budget: 100_000,
+                        knobs: &crate::agent::loop_::LoopKnobs::default(),
+                    },
+                ),
                 history: &mut history,
                 channel_name: "cli",
                 channel_reply_target: None,
@@ -3133,5 +3149,110 @@ async fn usage_identity_crosses_provider_boundary_without_usage() {
     assert_eq!(
         last_usage.1, "model-a",
         "last Usage model must reflect the most recent provider call"
+    );
+}
+
+// ── model_switch through a poisoned callback ────────────────────────────
+
+/// Regression: `ModelSwitchTool::handle_set` writes the pending switch through
+/// a poisoned guard, so the loop's per-iteration check must read through one
+/// too. Under the old `let Ok(guard) = callback.lock()` chain a poisoned
+/// callback short-circuited the check and the requested switch was dropped
+/// silently after the tool had already reported success.
+#[tokio::test]
+async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
+    use crate::agent::loop_::{
+        LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+        ToolLoop, is_model_switch_requested, run_tool_call_loop,
+    };
+
+    let callback: Arc<std::sync::Mutex<Option<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Poison the mutex the only way it can happen in production: a panic while
+    // the guard is held, after the pending switch has been written.
+    let poisoner = Arc::clone(&callback);
+    let poisoning_thread = std::thread::spawn(move || {
+        let mut guard = poisoner
+            .lock()
+            .expect("a fresh lock cannot be poisoned yet");
+        *guard = Some((
+            "switched-provider".to_string(),
+            "switched-model".to_string(),
+        ));
+        panic!("poison the model-switch callback on purpose");
+    })
+    .join();
+    assert!(poisoning_thread.is_err(), "the poisoning thread must panic");
+    assert!(
+        callback.is_poisoned(),
+        "the callback mutex must be poisoned"
+    );
+
+    let provider = ScriptedProvider::new(vec![text_response("never reached")]);
+    let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+    let mut history = vec![ChatMessage::user("hi")];
+    let (dtx, _drx) = mpsc::channel(256);
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let result = run_tool_call_loop(ToolLoop {
+        parent_agent_alias: None,
+        sop_reassembly: None,
+        exec: ResolvedAgentExecution::resolve(
+            ResolvedModelAccess {
+                model_provider: &provider,
+                provider_name: "mock",
+                model: "mock-model",
+                temperature: None,
+            },
+            ResolvedIo {
+                tools_registry: &tools_registry,
+                observer: &observability::NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                hooks: None,
+                activated_tools: None,
+                model_switch_callback: Some(Arc::clone(&callback)),
+                receipt_generator: None,
+            },
+            ResolvedRuntimeKnobs {
+                max_tool_iterations: 5,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_token_budget: 100_000,
+                knobs: &LoopKnobs::default(),
+            },
+        ),
+        history: &mut history,
+        channel_name: "cli",
+        channel_reply_target: None,
+        cancellation_token: None,
+        on_delta: Some(dtx),
+        shared_budget: None,
+        channel: None,
+        collected_receipts: None,
+        event_tx: None,
+        steering: None,
+        new_messages_out: None,
+        image_cache: None,
+        ingress: IngressContext::sub_turn(),
+        memory: None,
+        agent_alias: None,
+        turn_id: &turn_id,
+    })
+    .await;
+
+    let err = result.expect_err("a pending switch must surface as ModelSwitchRequested");
+    assert_eq!(
+        is_model_switch_requested(&err),
+        Some((
+            "switched-provider".to_string(),
+            "switched-model".to_string()
+        )),
+        "a switch written through the poisoned guard must be observed by the loop"
     );
 }
