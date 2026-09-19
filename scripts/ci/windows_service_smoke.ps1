@@ -109,7 +109,6 @@ try {
     $transcriptStarted = $true
     Remove-SmokeTask
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $evidence.administrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -196,8 +195,7 @@ try {
     }
 
     Invoke-Fixture service uninstall | Write-Host
-    Remove-Item -LiteralPath $ConfigDir -Recurse -Force
-    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    Remove-Item -LiteralPath (Join-Path $ConfigDir 'logs') -Recurse -Force
     Set-Content -LiteralPath (Join-Path $ConfigDir 'logs') -Value 'blocks log directory creation' -NoNewline
     Invoke-Fixture service install | Write-Host
     Remove-Item -LiteralPath (Join-Path $ConfigDir 'daemon-started.pid') -Force -ErrorAction SilentlyContinue
