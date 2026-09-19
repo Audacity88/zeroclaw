@@ -485,7 +485,7 @@ async fn forward_trim_event(
 ) {
     if let Some(event) = event
         && let Some(notification) =
-            super::dispatch::notification_for_turn_event(session_id, &event, None)
+            super::dispatch::notification_for_turn_event(session_id, &event, None, None)
     {
         let _ = rpc.send_raw(notification).await;
     }
