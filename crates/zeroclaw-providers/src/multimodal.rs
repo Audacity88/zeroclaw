@@ -631,6 +631,26 @@ fn rewrite_model_visible_text(
     (envelope.to_string(), n)
 }
 
+/// Strip every media marker from the model-visible text of one message,
+/// for the text-only degrade path: all marker kinds, all roles.
+///
+/// Same contract as [`sanitize_image_markers`] and
+/// [`sanitize_audio_markers`], applied to a single message: an assistant
+/// tool-call envelope is rewritten field-wise (only its `content` string,
+/// through `rewrite_model_visible_text`) so signed `reasoning_content` and
+/// `tool_calls[].extra_content` replay byte-for-byte, and every other
+/// message is rewritten as a whole string. [`strip_media_markers`] stays
+/// the plain-string form for callers that hold text rather than a history
+/// message.
+pub fn strip_media_markers_model_visible(message: &ChatMessage) -> String {
+    rewrite_model_visible_text(message, |text| {
+        let out = strip_media_markers(text);
+        let n = usize::from(out != text);
+        (out, n)
+    })
+    .0
+}
+
 /// Strip loadable audio markers (see `strip_unplayable_audio_markers`)
 /// across every message in `messages`, logging one degradation warning when
 /// any are removed. Returns the input borrowed when no candidate marker is
