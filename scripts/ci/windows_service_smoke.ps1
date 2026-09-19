@@ -109,6 +109,10 @@ try {
     $transcriptStarted = $true
     Remove-SmokeTask
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    $configAcl = Get-Acl -LiteralPath $ConfigDir
+    $configAcl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+    Set-Acl -LiteralPath $ConfigDir -AclObject $configAcl
 
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $evidence.administrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
