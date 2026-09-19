@@ -31,6 +31,8 @@ The request must remain active and unanswered. A review from the requested revie
 
 A head change requires a non-author Core approval and clean advisory review on the new current head before the lane can be used. A verified mechanical base integration that selects no behavior may preserve elapsed waiting time only: retain the previously recorded clock start instead of replacing it with the new approval timestamp. This does not waive the current-head approval, advisory evidence, or fresh required CI. Other head changes restart the clock under the later-of rule above. This lane does not carry approvals forward across production repairs.
 
+The report-only `second-core` queue may surface an older approval by a different reviewer for assessment under the ordinary two-Core path. That assessment does not replace the current-head approval required by this lane. A queue row never establishes eligibility for this exception.
+
 Every condition below must hold on the current head before proposing the exception:
 
 - The PR is non-draft, mergeable, and passing every required check.
