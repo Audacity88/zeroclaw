@@ -20,6 +20,7 @@ $fixture = if (Test-Path -LiteralPath $FixturePath) {
 } else {
     [IO.Path]::GetFullPath($FixturePath)
 }
+$ConfigDir = [IO.Path]::GetFullPath($ConfigDir)
 $evidence = [ordered]@{
     tested_sha = (git rev-parse HEAD).Trim()
     runner = $env:RUNNER_NAME
