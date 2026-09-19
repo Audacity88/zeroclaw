@@ -4636,19 +4636,21 @@ mod tests {
     }
 
     #[test]
-    fn help_context_omits_routine_editing_but_keeps_send_and_files() {
+    fn help_context_omits_routine_editing_and_unbound_actions_but_keeps_send() {
         use crate::keymap::InputBarAction as Ib;
         use crate::widgets::HelpContext;
         let bar = input_bar_with_shared_commands();
         let entries = bar.help_context().entries;
-        for action in [Ib::Submit, Ib::Inject, Ib::OpenFileBrowser, Ib::ClearInput] {
+        for action in [Ib::Submit, Ib::Inject, Ib::ClearInput] {
             assert!(
                 entries
                     .iter()
                     .any(|entry| entry.action == crate::help::action_help_text(action))
             );
         }
+        assert!(crate::keymap::action_key_labels(Ib::OpenFileBrowser).is_empty());
         for action in [
+            Ib::OpenFileBrowser,
             Ib::CursorLeft,
             Ib::CursorRight,
             Ib::Backspace,

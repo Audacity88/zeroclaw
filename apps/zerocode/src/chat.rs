@@ -18203,6 +18203,14 @@ mod tests {
                 &request,
                 serde_json::json!({"overrides": {"model": expected}}),
             );
+            let request =
+                next_rpc_request(&mut rx, "model selection refreshes thinking options").await;
+            assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+            respond_ok(
+                &outbound,
+                &request,
+                serde_json::json!({"thinking_options": {}}),
+            );
         };
         tokio::join!(
             Chat::handle_model_picker_mouse(&rpc, click, area, s),
