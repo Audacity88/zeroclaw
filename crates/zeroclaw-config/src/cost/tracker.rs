@@ -50,6 +50,14 @@ enum BudgetScope {
     /// Compare the substituted daily limit against the shared process-wide
     /// daily total (previous derived-tracker behavior).
     Shared,
+    /// Compare the shared process-wide daily total against the global daily
+    /// limit tightened by this per-hop ceiling
+    /// (`config.daily_limit_usd.min(daily_ceiling_usd)`, read live each
+    /// check). This is the `track_per_agent = false` degrade: per-alias
+    /// daily totals cannot exist, so the per-hop ceiling can only tighten
+    /// the shared check. No subtree chain rides on this scope: chains only
+    /// apply to per-agent scopes, and the shared cap stays shared.
+    SharedCapped { daily_ceiling_usd: f64 },
     /// Compare the named agent's OWN daily spend against this ceiling, so a
     /// per-profile cost ceiling means that agent's usage for the day. The
     /// shared daily/monthly limits still apply to the shared totals on top.
@@ -131,21 +139,17 @@ impl CostTracker {
         *self.config.write() = config;
     }
 
-    /// Derive an ephemeral tracker that shares this tracker's ledger storage,
-    /// session id, and per-session totals but enforces `config` instead of
-    /// this tracker's live config. Delegated sub-loops use this to enforce a
-    /// per-hop daily ceiling while their recorded spend lands on the same
-    /// durable ledger as every other path: budget checks through the derived
-    /// tracker read the same live aggregates, so concurrent traffic counts
-    /// against the delegate's ceiling, and usage recorded through it is
-    /// immediately visible to every other tracker over that ledger. The
-    /// derived tracker is never registered as the process-global one; it
-    /// lives only as long as the delegation that created it and never
-    /// receives config reloads.
-    pub fn derived_with_config(&self, config: CostConfig) -> Self {
-        let derived = self.derived_with_scope(BudgetScope::Shared);
-        *derived.config.write() = config;
-        derived
+    /// Derive an ephemeral tracker whose shared daily check uses the base
+    /// tracker's global daily limit tightened by `daily_ceiling_usd`
+    /// (`config.daily_limit_usd.min(daily_ceiling_usd)`, read live each
+    /// check). Delegated sub-loops use this when
+    /// `[cost].track_per_agent` is false: per-alias daily totals cannot
+    /// exist, so the per-hop ceiling can only tighten the shared check, and
+    /// their recorded spend lands on the same durable ledger as every other
+    /// path. The derived tracker is never registered as the process-global
+    /// one; it lives only as long as the delegation that created it.
+    pub fn derived_shared_capped(&self, daily_ceiling_usd: f64) -> Self {
+        self.derived_with_scope(BudgetScope::SharedCapped { daily_ceiling_usd })
     }
 
     /// Derive an ephemeral tracker whose `daily_ceiling_usd` is compared
@@ -153,8 +157,10 @@ impl CostTracker {
     /// per-profile cost ceiling means that agent's usage for the day. The
     /// tracker's own shared daily and monthly limits still apply to the
     /// shared totals on top, so the derived tracker can only ever be
-    /// stricter than the base tracker, never looser. See
-    /// `derived_with_config` for the lifetime guarantees.
+    /// stricter than the base tracker, never looser. The scope kind is
+    /// fixed for the derived tracker's lifetime; the limits themselves are
+    /// read live from the base tracker's shared config handle, so config
+    /// reloads apply at the next `check_budget`.
     pub fn derived_for_agent(&self, agent_alias: &str, daily_ceiling_usd: f64) -> Self {
         self.derived_for_agent_in_chain(agent_alias, daily_ceiling_usd, Vec::new())
     }
@@ -166,7 +172,9 @@ impl CostTracker {
     /// this agent's spend against every ancestor's per-hop ceiling, and
     /// usage recorded through it accumulates into each ancestor entry's
     /// descendant total. Chains only apply to per-agent scopes.
-    /// See `derived_with_config` for the lifetime guarantees.
+    /// The scope kind is fixed for the derived tracker's lifetime; the
+    /// limits themselves are read live from the base tracker's shared
+    /// config handle, so config reloads apply at the next `check_budget`.
     pub fn derived_for_agent_in_chain(
         &self,
         agent_alias: &str,
@@ -194,13 +202,20 @@ impl CostTracker {
                 chain.extend(inherited.iter().cloned());
                 chain
             }
-            BudgetScope::Shared => Vec::new(),
+            BudgetScope::Shared | BudgetScope::SharedCapped { .. } => Vec::new(),
         }
     }
 
     fn derived_with_scope(&self, budget_scope: BudgetScope) -> Self {
         Self {
-            config: Arc::new(RwLock::new(self.config_snapshot())),
+            // Shared handle, not a snapshot: a derived tracker sees every
+            // config reload the base tracker sees (`update_config` writes
+            // the one live `CostConfig`), so an operator lowering
+            // `daily_limit_usd` mid-delegation binds the delegate's next
+            // `check_budget`. The scope KIND stays fixed for the derived
+            // tracker's lifetime (which limit a delegation enforces is a
+            // decision taken at delegation start).
+            config: Arc::clone(&self.config),
             storage: Arc::clone(&self.storage),
             session_id: self.session_id.clone(),
             session_totals: Arc::clone(&self.session_totals),
@@ -246,12 +261,21 @@ impl CostTracker {
         let mut storage = self.lock_storage();
         let (daily_cost, monthly_cost) = storage.get_aggregated_costs()?;
 
-        // Check daily limit (shared)
+        // Check daily limit (shared). A shared-capped scope tightens the
+        // global daily limit by its per-hop ceiling; the global limit is
+        // read live from the shared config handle each call, so an operator
+        // reload applies to running delegates at their next check.
+        let shared_daily_limit = match &self.budget_scope {
+            BudgetScope::SharedCapped { daily_ceiling_usd } => {
+                config.daily_limit_usd.min(*daily_ceiling_usd)
+            }
+            BudgetScope::Shared | BudgetScope::Agent { .. } => config.daily_limit_usd,
+        };
         let projected_daily = daily_cost + estimated_cost_usd;
-        if projected_daily > config.daily_limit_usd {
+        if projected_daily > shared_daily_limit {
             return Ok(BudgetCheck::Exceeded {
                 current_usd: daily_cost,
-                limit_usd: config.daily_limit_usd,
+                limit_usd: shared_daily_limit,
                 period: UsagePeriod::Day,
                 agent_alias: None,
             });
@@ -2295,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_tracker_shares_ledger_and_enforces_its_own_limit() {
+    fn shared_capped_derived_tracker_enforces_cap_over_shared_ledger() {
         let tmp = TempDir::new().unwrap();
         let base = CostTracker::new(
             CostConfig {
@@ -2309,18 +2333,15 @@ mod tests {
         )
         .unwrap();
 
-        let mut capped = base.config();
-        capped.daily_limit_usd = 0.5;
-        let derived = base.derived_with_config(capped);
-        assert!(
-            (derived.config().daily_limit_usd - 0.5).abs() < f64::EPSILON,
-            "the derived tracker must enforce the substituted limit"
-        );
-        assert!(
-            (derived.config().monthly_limit_usd - 500.0).abs() < f64::EPSILON,
-            "the derived tracker must keep the base tracker's other limits"
-        );
+        // The derived tracker shares the base's live config (the global
+        // limits stay the base's) and tightens only the shared daily check
+        // to the $0.50 per-hop cap.
+        let derived = base.derived_shared_capped(0.5);
         assert_eq!(derived.session_id(), base.session_id());
+        assert!(
+            matches!(derived.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "an empty ledger must pass the capped shared check"
+        );
 
         // Spend recorded through the base tracker is immediately visible to
         // the derived tracker's budget check (shared storage, no stale fork).
@@ -2337,7 +2358,11 @@ mod tests {
         assert!(
             matches!(
                 derived.check_budget(0.0).unwrap(),
-                BudgetCheck::Exceeded { .. }
+                BudgetCheck::Exceeded {
+                    limit_usd,
+                    agent_alias: None,
+                    ..
+                } if (limit_usd - 0.5).abs() < 1e-9
             ),
             "the derived tracker must see shared-ledger spend against its cap"
         );
@@ -2361,6 +2386,107 @@ mod tests {
             (derived.get_daily_cost(day).unwrap() - daily).abs() < f64::EPSILON,
             "both trackers must read the same ledger file"
         );
+    }
+
+    #[test]
+    fn derived_tracker_sees_base_config_reload() {
+        // Base daily $10, derived for an agent with a $5 ceiling; $1 is
+        // recorded through the derived tracker, then the base's global
+        // daily limit is reloaded to $0.50. The derived tracker shares the
+        // base's live config handle, so its next check must refuse on the
+        // SHARED Day limit (agent_alias None), not the agent ceiling.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 10.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let derived = base.derived_for_agent("opus", 5.0);
+        derived
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("opus"),
+            )
+            .unwrap();
+        assert!(
+            matches!(derived.check_budget(0.1).unwrap(), BudgetCheck::Allowed),
+            "under the original $10 shared limit the $1 spend must pass"
+        );
+
+        let mut reloaded = base.config();
+        reloaded.daily_limit_usd = 0.5;
+        base.update_config(reloaded);
+        match derived.check_budget(0.1).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period,
+                agent_alias,
+            } => {
+                assert!((current_usd - 1.0).abs() < 1e-9);
+                assert!((limit_usd - 0.5).abs() < 1e-9);
+                assert_eq!(period, UsagePeriod::Day);
+                assert_eq!(
+                    agent_alias, None,
+                    "the reload must refuse through the shared limit, not the agent ceiling"
+                );
+            }
+            other => panic!("expected shared-limit Exceeded after reload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_capped_derived_tracker_reads_live_global_limit() {
+        // A $2 per-hop cap over a base global daily limit of $10: the
+        // effective shared limit is the cap. Reload the base's global limit
+        // down to $1 and the effective limit becomes the LIVE global $1,
+        // not the cap: the capped scope reads the global limit from the
+        // shared config handle on every check.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: false,
+                daily_limit_usd: 10.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        base.record_usage(TokenUsage::new("test/model", 800_000, 0, 0, 1.0, 1.0, 0.0))
+            .unwrap();
+        let derived = base.derived_shared_capped(2.0);
+        assert!(
+            matches!(derived.check_budget(0.5).unwrap(), BudgetCheck::Allowed),
+            "ledger $0.80 against the effective min(10, 2) = $2 cap must pass"
+        );
+
+        let mut reloaded = base.config();
+        reloaded.daily_limit_usd = 1.0;
+        base.update_config(reloaded);
+        match derived.check_budget(0.5).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!((current_usd - 0.8).abs() < 1e-9);
+                assert!(
+                    (limit_usd - 1.0).abs() < 1e-9,
+                    "the effective limit must be the live global $1, not the $2 cap"
+                );
+                assert_eq!(agent_alias, None);
+            }
+            other => panic!("expected Exceeded on the reloaded global limit, got {other:?}"),
+        }
     }
 
     /// Fold the day's per-alias spend straight from the ledger file - the

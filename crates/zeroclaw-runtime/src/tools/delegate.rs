@@ -875,6 +875,14 @@ impl DelegateTool {
     /// same context, and concurrent traffic counts against the delegate's
     /// ceiling.
     ///
+    /// Decisions taken here stay fixed for the run: which scope kind the
+    /// delegation enforces (per-agent vs shared-capped, decided from
+    /// `track_per_agent`) and whether the run is scoped at all
+    /// (`cost.enabled`). The limits themselves are live: derived trackers
+    /// share the global tracker's config handle, so an operator reload of
+    /// the global `[cost]` limits binds the running delegate at its next
+    /// budget check.
+    ///
     /// Returns `None` (leave the sub-loop unscoped, matching the previous
     /// behavior) when cost tracking is disabled for the resolved config or
     /// when neither `live_config` nor `root_config` is available - the
@@ -903,13 +911,12 @@ impl DelegateTool {
             if !config.cost.track_per_agent {
                 // Without per-agent attribution the alias is dropped before
                 // persistence, so no per-alias daily total exists to check
-                // against. Degrade to the shared check (previous behavior)
-                // and tell the operator once why the per-profile ceiling is
-                // looser than the field name suggests.
+                // against. Degrade to a shared-cap scope (the global daily
+                // limit tightened by this ceiling, both read live each
+                // check) and tell the operator once why the per-profile
+                // ceiling is looser than the field name suggests.
                 delegate_cost_scope_per_agent_disabled_warn_once();
-                let mut capped_config = tracker.config();
-                capped_config.daily_limit_usd = capped_config.daily_limit_usd.min(ceiling_usd);
-                ctx.tracker = Some(Arc::new(tracker.derived_with_config(capped_config)));
+                ctx.tracker = Some(Arc::new(tracker.derived_shared_capped(ceiling_usd)));
             } else {
                 // Per-agent scope: the ceiling applies to the TARGET's own
                 // daily spend on the shared ledger; the global daily/monthly
@@ -15063,6 +15070,217 @@ command = "rm independent-delegate-marker"
             "C's spend lands under C's own alias"
         );
         assert!((c_stats.cost_usd - 0.006).abs() < 1e-9);
+    }
+
+    /// Test tool that lowers a base tracker's global daily limit when
+    /// executed: a delegated loop calls it between its first and second
+    /// provider calls, so the next `check_budget` observes the reloaded
+    /// limit exactly the way a live operator reload through
+    /// `update_config` would.
+    struct ConfigLoweringTool {
+        tracker: Arc<crate::cost::CostTracker>,
+        lowered_daily_limit_usd: f64,
+        flipped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ConfigLoweringTool);
+
+    #[async_trait]
+    impl Tool for ConfigLoweringTool {
+        fn name(&self) -> &str {
+            "config_lowering_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Lowers the global daily cost limit when executed."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let mut reloaded = self.tracker.config();
+            reloaded.daily_limit_usd = self.lowered_daily_limit_usd;
+            self.tracker.update_config(reloaded);
+            self.flipped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "global daily limit lowered".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Two-step loop mock for the reload test: the first provider call
+    /// emits one `config_lowering_tool` call carrying priced usage ($0.006
+    /// at the fixture's rates); any later call (a tool result is already in
+    /// history) returns final text, which the test treats as failure
+    /// evidence.
+    struct ToolCallThenFinalModelProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolCallThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if request.messages.iter().any(|m| m.role == "tool") {
+                return Ok(ChatResponse {
+                    text: Some("second provider call was reached".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_lower".to_string(),
+                    name: "config_lowering_tool".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                }],
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(1_000),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    output_tokens: Some(200),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolCallThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ToolCallThenFinalModelProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn running_delegate_refuses_next_call_after_limit_lowered() {
+        use crate::agent::cost::ToolLoopCostTrackingContext;
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::CostConfig;
+
+        // A test-owned base tracker stands in for the process-global
+        // tracker a delegate derives from (owning it directly keeps this
+        // test independent of the process-global singleton other cost
+        // tests swap). The derived tracker is built the same way
+        // `delegate_cost_context` builds it, so it shares the base's live
+        // config handle while the scope kind stays fixed for the run.
+        let workspace = TempDir::new().unwrap();
+        let base = Arc::new(
+            CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    daily_limit_usd: 1000.0,
+                    monthly_limit_usd: 10_000.0,
+                    ..CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("base tracker"),
+        );
+        let derived = base.derived_for_agent("target", 5.0);
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::new(derived), pricing).with_agent_alias("target");
+
+        // First provider call: a priced `config_lowering_tool` call ($0.006
+        // lands on the ledger under `target`). The tool execution between
+        // the calls lowers the base's global daily limit to $0.005, the
+        // same write an operator reload performs through `update_config`.
+        let (server, _requests) = start_usage_chat_server(1).await;
+        let fixture = delegate_cost_fixture_opts(server.uri.clone(), 1000.0, true, 500, true).await;
+        let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lowering = ConfigLoweringTool {
+            tracker: Arc::clone(&base),
+            lowered_daily_limit_usd: 0.005,
+            flipped: Arc::clone(&flipped),
+        };
+        let tool = fixture
+            .tool
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(lowering)])));
+        let provider = ToolCallThenFinalModelProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let target_config = fixture
+            .config
+            .agents
+            .get("target")
+            .cloned()
+            .expect("target agent config");
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                tool.execute_agentic(
+                    "target",
+                    &target_config,
+                    "mock-provider",
+                    "test-model",
+                    &provider,
+                    "lower the limit, then try to continue",
+                    None,
+                )
+                .await
+            })
+            .await
+            .expect("agentic delegate run returns a result");
+
+        assert!(
+            flipped.load(std::sync::atomic::Ordering::SeqCst),
+            "the lowering tool must have run between the provider calls"
+        );
+        assert!(
+            !result.success,
+            "the next provider call must be refused after the reload: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded") && !error.contains("for agent"),
+            "the refusal must be the reloaded shared daily limit, not the \
+             per-agent ceiling: {error}"
+        );
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one provider call may be made; the second must be \
+             refused before it is sent"
+        );
     }
 
     #[test]
