@@ -5789,6 +5789,9 @@ mod tests {
         for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
             for image_only in [false, true] {
                 let provider = OpenAiCompatibleModelProvider::builder("test")
+                    .display_name("test")
+                    .base_url("http://127.0.0.1:1")
+                    .auth_style(AuthStyle::Bearer)
                     .with_cache_passthrough()
                     .with_cache_ttl(ttl)
                     .build();
