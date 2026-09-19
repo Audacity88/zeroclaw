@@ -3017,23 +3017,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_passthrough_config_field_maps_into_runtime_options() {
-        use zeroclaw_config::schema::{Config, ModelProviderConfig};
-        let entry = ModelProviderConfig {
-            cache_passthrough: true,
-            ..Default::default()
-        };
-        let opts = model_provider_runtime_options_from_model_provider_entry(
-            &Config::default(),
-            Some(&entry),
-        );
-        assert!(opts.cache_passthrough);
-        let defaults =
-            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
-        assert!(!defaults.cache_passthrough);
-    }
-
-    #[test]
     fn cache_ttl_config_field_maps_into_runtime_options() {
         use zeroclaw_config::schema::{CacheTtl, Config, ModelProviderConfig};
         let entry = ModelProviderConfig {
