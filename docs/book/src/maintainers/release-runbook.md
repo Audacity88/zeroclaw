@@ -124,7 +124,7 @@ If the PR also changes `[workspace.package] rust-version` or pinned Rust toolcha
 
 Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler adds. If the PR raises a toolchain floor, also apply `risk:high` and route it through lane D.
 
-Two independent Core Team approvals are the default. Toolchain-floor and release changes may be considered under the [expedited unanswered-review lane](./pr-workflow.md#expedited-unanswered-review-lane) only with its complete evidence and an explicit justification for this normally two-review category. A timeout never clears an unresolved compatibility or release-safety concern. Merge only when required CI is green.
+Two independent Core Team approvals are the default. Toolchain-floor and release changes may be considered under the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) only with its complete evidence and an explicit justification for this normally two-review category. A timeout never clears an unresolved compatibility or release-safety concern. Merge only when required CI is green.
 
 The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
 
