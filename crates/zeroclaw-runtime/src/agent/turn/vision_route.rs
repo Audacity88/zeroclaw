@@ -17,6 +17,7 @@ pub(crate) fn resolve_vision_provider(
     multimodal_config: &MultimodalConfig,
     provider_name: &str,
     model: &str,
+    dispatch_model: &str,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
@@ -28,7 +29,7 @@ pub(crate) fn resolve_vision_provider(
 
     let mut degrade_strip_images = false;
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
-        && !model_provider.capabilities_for_model(model).vision
+        && !model_provider.capabilities_for_model(dispatch_model).vision
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
             // Resolve the configured vision provider through the alias-aware
@@ -383,6 +384,7 @@ vision = false
             &multimodal,
             "primary",
             "primary-model",
+            "primary-model",
         )
         .err()
         .expect("a forced-off vision route must surface a capability error once its alias vision override is honored");
@@ -452,6 +454,7 @@ vision = false
             &multimodal,
             "primary",
             "primary-model",
+            "primary-model",
         )
         .err()
         .expect("a non-vision aggregate with no vision route must surface a capability error");
@@ -514,6 +517,7 @@ vision = false
             &multimodal,
             "primary",
             "primary-model",
+            "primary-model",
         )
         .err()
         .expect("a non-vision primary with no vision route must surface a capability error");
@@ -575,6 +579,7 @@ vision = false
             &multimodal,
             "primary",
             "primary-model",
+            "primary-model",
         )
         .expect("unresolvable markers must degrade instead of failing the turn");
         assert!(
@@ -633,6 +638,7 @@ vision = false
             &history,
             &multimodal,
             "primary",
+            "primary-model",
             "primary-model",
         )
         .err()
@@ -741,6 +747,7 @@ model = "vision-model"
             &multimodal,
             "primary",
             "primary-model",
+            "primary-model",
         )
         .expect("a configured vision-capable alias must build");
         let vision_provider =
@@ -787,6 +794,7 @@ model = "vision-model"
             &history,
             &explicit,
             "primary",
+            "primary-model",
             "primary-model",
         )
         .expect("an explicit vision model must resolve");
