@@ -15668,8 +15668,11 @@ command = "rm independent-delegate-marker"
             .expect("base tracker"),
         );
         let derived = base.derived_for_agent("target", 5.0);
+        // The agentic loop prices under the target agent's `model_provider`
+        // alias, so the map is keyed by the fixture's route rather than the
+        // provider_type handed to `execute_agentic`.
         let pricing = Arc::new(HashMap::from([(
-            "mock-provider".to_string(),
+            "ollama.default".to_string(),
             HashMap::from([
                 ("test-model.input".to_string(), 3.0),
                 ("test-model.output".to_string(), 15.0),
@@ -15770,8 +15773,10 @@ command = "rm independent-delegate-marker"
             .expect("base tracker"),
         );
         let derived = base.derived_for_agent("target", 0.01);
+        // Keyed by the target's `model_provider` alias: that is the route the
+        // agentic loop prices under, not the provider_type argument.
         let pricing = Arc::new(HashMap::from([(
-            "mock-provider".to_string(),
+            "ollama.default".to_string(),
             HashMap::from([
                 ("test-model.input".to_string(), 3.0),
                 ("test-model.output".to_string(), 15.0),
@@ -15881,8 +15886,10 @@ command = "rm independent-delegate-marker"
             .expect("base tracker"),
         );
         let derived = base.derived_for_agent("target", 0.02);
+        // Keyed by the target's `model_provider` alias: that is the route the
+        // agentic loop prices under, not the provider_type argument.
         let pricing = Arc::new(HashMap::from([(
-            "mock-provider".to_string(),
+            "ollama.default".to_string(),
             HashMap::from([
                 ("test-model.input".to_string(), 3.0),
                 ("test-model.output".to_string(), 15.0),
