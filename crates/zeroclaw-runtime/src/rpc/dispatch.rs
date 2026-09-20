@@ -10681,7 +10681,7 @@ mod tests {
 
         // (runtime_profile.max_context_tokens, provider.context_window, expected)
         let cases: &[(Option<usize>, Option<usize>, u64)] = &[
-            (Some(128_000), None, 128_000), // profile wins, no provider window
+            (Some(128_000), None, 32_000), // unknown capacity caps the profile budget
             (Some(128_000), Some(200_000), 128_000),
             (None, Some(200_000), 32_000), // meter reads profile budget (32k), not provider window
             (None, None, 32_000),          // hard stub
@@ -10836,7 +10836,7 @@ mod tests {
         use std::collections::HashMap;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        // Profile budget = 128_000; provider window explicitly UNSET.
+        // The 128k profile budget is capped at the unknown-capacity 32k fallback.
         let mut runtime_profiles = HashMap::new();
         runtime_profiles.insert(
             "coding".to_string(),
@@ -10905,8 +10905,8 @@ mod tests {
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
-            v["params"]["max_context_tokens"], 128_000,
-            "profile budget must be emitted"
+            v["params"]["max_context_tokens"], 32_000,
+            "effective budget must respect the unknown-capacity fallback"
         );
         assert!(
             v["params"].get("model_context_window").is_none(),
@@ -11124,7 +11124,8 @@ mod tests {
             "fallback model must not borrow the primary's capacity"
         );
 
-        // RPC projection: resolve per event exactly as dispatch does.
+        // The serving call resolves limits for model-b, not the primary model.
+        let limits = cfg.resolved_context_limits_for_route("coder", "openai.default", "model-b");
         let mut event = TurnEvent::Usage {
             context_token_budget: None,
             model_context_window: None,
@@ -11152,7 +11153,7 @@ mod tests {
             "RPC must omit window when served model differs from configured primary"
         );
 
-        let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let max_ctx = limits.context_token_budget as u64;
         if let TurnEvent::Usage {
             context_token_budget,
             model_context_window,
@@ -11165,7 +11166,7 @@ mod tests {
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(v["params"]["max_context_tokens"], 800_000);
+        assert_eq!(v["params"]["max_context_tokens"], 32_000);
         assert!(
             v["params"].get("model_context_window").is_none(),
             "RPC wire must omit model_context_window on same-profile fallback"
