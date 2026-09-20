@@ -251,7 +251,8 @@ jobs:
             plugin_cli_status=${PIPESTATUS[0]}
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
-              --test plugin_channel_runtime_e2e 2>&1 | tee "$plugin_root_log"
+              --test plugin_channel_runtime_e2e \
+              --test channel_egress_e2e 2>&1 | tee "$plugin_root_log"
             plugin_root_status=${PIPESTATUS[0]}
             set -e
             plugin_host_duration=$((SECONDS - plugin_started_at))
