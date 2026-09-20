@@ -2064,12 +2064,20 @@ impl Agent {
         // Keep deep Agent construction off the transport's default worker stack.
         // Carry the caller's exact snapshot; rereading live config here would
         // invalidate its construction witness and split the route generation.
+        let construction_admission = execution_capability
+            .as_ref()
+            .map(|capability| capability.admit(agent_alias))
+            .transpose()?;
         let config = Box::new(config.clone());
         let handle = tokio::runtime::Handle::current();
         let agent_alias = agent_alias.to_string();
         let session_cwd = session_cwd.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
-            handle.block_on(Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            // A cancelled caller cannot release the detached worker's lease.
+            if let Some(admission) = &construction_admission {
+                admission.revalidate()?;
+            }
+            let result = handle.block_on(Self::from_config_with_session_cwd_and_mcp_approval_mode(
                 &config,
                 &agent_alias,
                 session_cwd.as_deref(),
@@ -2085,7 +2093,9 @@ impl Agent {
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
                 execution_capability,
-            ))
+            ));
+            drop(construction_admission);
+            result
         })
         .await
         .map_err(|join| anyhow::Error::msg(format!("agent construction task failed: {join}")))?
@@ -14890,6 +14900,80 @@ model_provider = "custom.only"
             api_key: None,
         }];
         cfg
+    }
+
+    #[test]
+    fn cancelled_queued_construction_retains_lease_and_revalidates_before_work() {
+        use crate::live_config_authority::{AgentDeleteBlocker, LiveConfigAuthority};
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        // Bound shutdown even if a broken constructor queues filesystem work
+        // behind itself on the deliberately saturated blocking pool.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let config = direct_live_generation_config(temp.path(), "old", "model", 32_000, 10);
+                let workspace = config.agent_workspace_dir("direct");
+                assert!(!workspace.exists());
+                let authority = LiveConfigAuthority::new(config.clone());
+                let lifecycle = authority.agent_lifecycle();
+                let reservation = lifecycle.reserve_admission("direct").unwrap();
+                let capability = authority.execution_capability();
+                let live = authority.config();
+
+                let (release, blocked) = std::sync::mpsc::channel();
+                let (entered, ready) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    let _ = blocked.recv_timeout(Duration::from_secs(10));
+                });
+                tokio::time::timeout(Duration::from_secs(5), ready)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let caller = tokio::spawn(async move {
+                    let result = Agent::from_snapshot_with_tui_env_with_capability(
+                        &config, live, "direct", None, false, true, None, None, None,
+                        Some(capability), None,
+                    )
+                    .await;
+                    drop(reservation);
+                    result
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while lifecycle.active_turn_count("direct") == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("construction must acquire its worker lease before queuing");
+                caller.abort();
+                assert!(matches!(caller.await, Err(error) if error.is_cancelled()));
+                assert!(matches!(
+                    lifecycle.begin_delete("direct"),
+                    Err(AgentDeleteBlocker::ActiveTurns { count: 1, .. })
+                ));
+
+                authority.close_agent_lifecycle();
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                tokio::time::timeout(Duration::from_secs(5), authority.drain_agent_lifecycle())
+                    .await
+                    .expect("queued construction must reject the closed generation and release its lease");
+                assert_eq!(lifecycle.active_turn_count("direct"), 0);
+                assert!(!workspace.exists(), "closed construction must not create a workspace");
+            });
+        }));
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[tokio::test]

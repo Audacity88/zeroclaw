@@ -3091,7 +3091,7 @@ pub(crate) async fn process_message_shared_with_admission(
             admission.alias() == agent_alias,
             "agent execution admission alias changed during construction"
         );
-        config = Arc::clone(admission.config());
+        config = admission.config();
     }
     let execution_capability = execution_admission
         .as_ref()

@@ -6,7 +6,7 @@ use crate::agent::cost::{
     tool_loop_cost_tracking_context_for_agent,
 };
 use crate::cron::scheduler::deliver_announcement;
-use crate::live_config_authority::AgentExecutionCapability;
+use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 use crate::peers::resolve_peer_set;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -205,7 +205,7 @@ impl Tool for SendMessageToPeerTool {
                 .transpose()?;
             let cfg = admission
                 .as_ref()
-                .map(|admission| Arc::clone(admission.config()))
+                .map(AgentExecutionAdmission::config)
                 .unwrap_or_else(|| Arc::clone(&self.config));
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();

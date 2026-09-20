@@ -14253,12 +14253,7 @@ mod tests {
             dispatcher.handle_config_set(&json!({
                 "prop": "providers.models.openai.test-provider.model", "value": "committed-model"
             })).await.unwrap();
-            // Complete enumeration while the candidate is still unpublished.
-            RpcDispatcher::refresh_live_sessions_for_model_provider(
-                Arc::clone(&dispatcher.ctx),
-                "openai.test-provider",
-            )
-            .await;
+            // config/set completes its refresh while the candidate is unpublished.
             release.notify_one();
             let error = tokio::time::timeout(std::time::Duration::from_secs(5), candidate)
                 .await
@@ -14828,6 +14823,7 @@ mod tests {
             config_write_lock: authority.config_write_lock(),
             agent_lifecycle: authority.agent_lifecycle(),
             channel_generation_control: Some(control),
+            config_commit_pause: None,
             sessions,
             session_backend: None,
             memory: None,
