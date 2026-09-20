@@ -448,12 +448,15 @@ jobs:
         if: runner.os == 'Windows' && needs.path-changes.outputs.windows_recovery != 'false'
         shell: bash
         run: |
+          set -euo pipefail
           cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::authority::tests::windows_process_exit_is_detected -- --exact
+            control_plane::authority::tests::windows_process_exit_is_detected -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-exit.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-exit.log"
           cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact
+            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-recovery.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-recovery.log"
 
   check:
     name: Check (${{ matrix.name }})
