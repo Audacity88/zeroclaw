@@ -21,7 +21,6 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::thread::JoinHandle;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -49,7 +48,6 @@ const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
-#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2275,6 +2273,28 @@ fn windows_task_running(task_name: &str) -> Result<Option<bool>> {
     windows_task_state_from_exit_code(status.code())
 }
 
+fn stop_running_windows_task(task_name: &str) -> Result<()> {
+    if windows_task_running(task_name)? != Some(true) {
+        return Ok(());
+    }
+
+    run_checked(Command::new("schtasks").args(["/End", "/TN", task_name]))?;
+    let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
+    loop {
+        match windows_task_running(task_name)? {
+            Some(true) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Some(true) => {
+                bail!(
+                    "Timed out waiting for Windows scheduled task {task_name} to stop before reinstall"
+                );
+            }
+            Some(false) | None => return Ok(()),
+        }
+    }
+}
+
 fn service_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
     let candidates = [primary, secondary];
     let with_content: Vec<PathBuf> = candidates
@@ -3240,6 +3260,7 @@ fn install_windows(config: &Config) -> Result<()> {
     let logs_dir = base_dir.join("logs");
     let action = windows_task_action(&exe, &base_dir)?;
     let task_name = windows_task_name();
+    stop_running_windows_task(task_name)?;
     run_checked(Command::new("schtasks").args([
         "/Create", "/TN", task_name, "/SC", "ONLOGON", "/TR", &action, "/RL", "LIMITED", "/F",
     ]))?;

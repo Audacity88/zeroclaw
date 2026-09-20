@@ -31,6 +31,10 @@ $evidence = [ordered]@{
     runner_process_id = $null
     daemon_process_id = $null
     descendant_process_id = $null
+    legacy_wrapper_process_id = $null
+    legacy_daemon_process_id = $null
+    legacy_descendant_process_id = $null
+    legacy_process_tree_stopped_before_reinstall = $false
     stdout_bytes = $null
     stderr_bytes = $null
     capture_setup_failure_result = $null
@@ -129,7 +133,42 @@ try {
     $evidence.administrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $evidence.administrator) { throw 'Hosted Windows smoke requires an elevated runner' }
 
+    $legacyWrapper = Join-Path $ConfigDir 'zeroclaw-daemon.cmd'
+    $legacyStdout = Join-Path $ConfigDir 'legacy.stdout.log'
+    $legacyStderr = Join-Path $ConfigDir 'legacy.stderr.log'
+    @(
+        '@echo off'
+        ('"{0}" --config-dir "{1}" daemon >>"{2}" 2>>"{3}"' -f $fixture, $ConfigDir, $legacyStdout, $legacyStderr)
+    ) | Set-Content -LiteralPath $legacyWrapper -Encoding Ascii
+    $legacyAction = '"{0}"' -f $legacyWrapper
+    & schtasks /Create /TN $taskName /SC ONLOGON /TR $legacyAction /RL LIMITED /F | Write-Host
+    if ($LASTEXITCODE -ne 0) { throw "Failed to register legacy task: $LASTEXITCODE" }
+    & schtasks /Run /TN $taskName | Write-Host
+    if ($LASTEXITCODE -ne 0) { throw "Failed to start legacy task: $LASTEXITCODE" }
+    Wait-Until -Description 'legacy wrapper, daemon, and descendant startup' -TimeoutSeconds 90 -Condition {
+        $legacyWrapperProcess = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -like "*$legacyWrapper*" } |
+            Select-Object -First 1
+        (Test-Path -LiteralPath (Join-Path $ConfigDir 'daemon-started.pid')) -and
+            (Test-Path -LiteralPath $descendantPidFile) -and
+            ($null -ne $legacyWrapperProcess)
+    }
+    $legacyWrapperProcess = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -like "*$legacyWrapper*" } |
+        Select-Object -First 1
+    $legacyDaemonPid = [int](Get-Content -LiteralPath (Join-Path $ConfigDir 'daemon-started.pid') -Raw).Trim()
+    $legacyDescendantPid = [int](Get-Content -LiteralPath $descendantPidFile -Raw).Trim()
+    $evidence.legacy_wrapper_process_id = $legacyWrapperProcess.ProcessId
+    $evidence.legacy_daemon_process_id = $legacyDaemonPid
+    $evidence.legacy_descendant_process_id = $legacyDescendantPid
+
     Invoke-Fixture service install | Write-Host
+    $legacyProcessesStopped =
+        ($null -eq (Get-Process -Id $legacyWrapperProcess.ProcessId -ErrorAction SilentlyContinue)) -and
+        ($null -eq (Get-Process -Id $legacyDaemonPid -ErrorAction SilentlyContinue)) -and
+        ($null -eq (Get-Process -Id $legacyDescendantPid -ErrorAction SilentlyContinue))
+    if (-not $legacyProcessesStopped) { throw 'Legacy task process tree survived service reinstall' }
+    $evidence.legacy_process_tree_stopped_before_reinstall = $true
     $task = Get-ScheduledTask -TaskName $taskName
     $action = $task.Actions | Select-Object -First 1
     $evidence.action = "$($action.Execute) $($action.Arguments)"
