@@ -78,6 +78,9 @@ pub fn build_session_model_provider(
         &model_provider_runtime_options,
     )?;
 
+    // Return the full model_provider_ref (type.alias) so the agent's
+    // model_provider_name carries the complete reference for context-window
+    // resolution on the wire.
     Ok((model_provider, model_provider_ref.to_string(), model_name))
 }
 
@@ -367,7 +370,8 @@ pub struct Agent {
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
-    /// Autonomy level from config; controls safety prompt instructions.
+    /// Compatibility fallback for configless builders. When an
+    /// `ApprovalManager` exists, its autonomy level remains canonical.
     autonomy_level: crate::security::AutonomyLevel,
     /// False for isolated / ACP sessions built with `exclude_memory: true`.
     /// Drives `PromptContext::inject_memory` so `IdentitySection` cannot pull
@@ -793,6 +797,8 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the prompt autonomy fallback used only when no `ApprovalManager`
+    /// is attached. Retained for compatibility with existing builder users.
     pub fn autonomy_level(mut self, level: crate::security::AutonomyLevel) -> Self {
         self.autonomy_level = Some(level);
         self
@@ -1486,6 +1492,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1513,6 +1520,37 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+        config: &Config,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            acp_delivery,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            Some(acp_session_store),
             None,
         )
         .await
@@ -1544,6 +1582,38 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
+            Some(live_config),
+        )
+        .await
+    }
+
+    pub async fn from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        let config = live_config.read().clone();
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            &config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            acp_delivery,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            Some(acp_session_store),
             Some(live_config),
         )
         .await
@@ -1577,6 +1647,7 @@ impl Agent {
             sop_audit,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1607,6 +1678,41 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            None,
+            Some(live_config),
+        )
+        .await
+    }
+
+    /// Build a daemon-backed ACP TUI Agent with access to the shared durable
+    /// session store. The store is a read view for session tools; TUI turns do
+    /// not gain ACP file-delivery authority.
+    pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) -> Result<Self> {
+        let config = live_config.read().clone();
+        Self::from_config_with_session_cwd_and_mcp_approval_mode(
+            &config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            true,
+            exclude_memory,
+            // TUI turns never transport an ACP file attachment.
+            false,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+            Some(acp_session_store),
             Some(live_config),
         )
         .await
@@ -1625,6 +1731,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
         live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     ) -> Result<Self> {
         let agent_cfg = config
@@ -1739,7 +1846,9 @@ impl Agent {
             _ => (None, None),
         };
 
-        let all_tools_result = tools::all_tools_with_runtime(
+        let acp_sessions =
+            acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
+        let all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
             Arc::new(config.clone()),
             &security,
             risk_profile,
@@ -1767,6 +1876,7 @@ impl Agent {
             // startup state for the Agent's whole lifetime. One-shot callers
             // pass `None` and keep the documented snapshot fallback.
             live_config.clone(),
+            acp_sessions,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -1928,6 +2038,11 @@ impl Agent {
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
+            // Store the full "type.alias" ref so the live provider identity
+            // (attribution_fields().1) carries the same key the config
+            // provider registry is keyed by, and wire-emission paths can
+            // resolve model_context_window / cost pricing for the provider
+            // that actually served the call.
             .model_provider_name(provider_ref.clone())
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
@@ -2165,6 +2280,14 @@ impl Agent {
             &no_tools
         };
         let instructions = dispatcher.prompt_instructions(prompt_tools);
+        // Prompt policy facts come from the same ApprovalManager the
+        // execution gate consults (borrowed, render-time). A builder without
+        // a manager retains its legacy autonomy fallback but cannot name
+        // `always_ask` exceptions it does not own.
+        let (prompt_autonomy_level, prompt_always_ask) = match self.approval_manager.as_deref() {
+            Some(mgr) => (mgr.autonomy_level(), mgr.always_ask_tools()),
+            None => (self.autonomy_level, Vec::new()),
+        };
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
@@ -2178,11 +2301,13 @@ impl Agent {
             sends_native_tool_specs: dispatcher.should_send_tool_specs()
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
-            autonomy_level: self.autonomy_level,
+            autonomy_level: prompt_autonomy_level,
             inject_memory: self.inject_memory,
             shell_profile: self.shell_profile.clone(),
         };
-        let mut prompt = self.prompt_builder.build(&ctx)?;
+        let mut prompt = self
+            .prompt_builder
+            .build_with_approval_policy(&ctx, &prompt_always_ask)?;
         append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
@@ -6132,6 +6257,80 @@ mod tests {
         assert!(xml_prompt.contains("## Tool Use Protocol"));
     }
 
+    #[test]
+    fn approval_manager_policy_overrides_legacy_builder_autonomy() {
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            always_ask: vec!["shell".into()],
+            ..Default::default()
+        };
+        let manager = Arc::new(ApprovalManager::for_non_interactive(&risk_profile));
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::clone(&mem))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .prompt_builder(SystemPromptBuilder::with_defaults())
+            .workspace_dir(workspace.path().to_path_buf())
+            // Deliberately conflict with the manager to prove this restored
+            // public builder method is only a managerless fallback.
+            .autonomy_level(crate::security::AutonomyLevel::Supervised)
+            .approval_manager(Some(manager))
+            .build()
+            .expect("agent builder should succeed");
+
+        let prompt = agent.build_system_prompt().expect("prompt should render");
+        assert!(
+            prompt.contains("Full autonomy auto-approves tools")
+                && prompt.contains("shell")
+                && prompt.contains("still require operator approval"),
+            "manager-owned Full/always_ask policy must win: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Ask for approval when the runtime policy requires it"),
+            "legacy Supervised fallback must not override the manager: {prompt}"
+        );
+
+        let managerless = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .prompt_builder(SystemPromptBuilder::with_defaults())
+            .workspace_dir(workspace.path().to_path_buf())
+            .autonomy_level(crate::security::AutonomyLevel::Full)
+            .build()
+            .expect("managerless agent builder should succeed");
+        let prompt = managerless
+            .build_system_prompt()
+            .expect("managerless prompt should render");
+        assert!(
+            prompt.contains("Full autonomy auto-approves tools")
+                && prompt.contains("No tools are listed in `always_ask`"),
+            "legacy builder fallback must still render Full autonomy: {prompt}"
+        );
+    }
+
     mod surface2_tests {
         use super::*;
         use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
@@ -7024,6 +7223,105 @@ mod tests {
             "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
             result.err().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn acp_agent_session_tools_receive_the_owned_store_view() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig,
+        };
+        use zeroclaw_infra::acp_session_store::AcpSessionStore;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let mut config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let store = Arc::new(AcpSessionStore::new(tmp.path()).expect("ACP store"));
+        let current = "11111111-1111-4111-8111-111111111111";
+        let previous = "22222222-2222-4222-8222-222222222222";
+        store
+            .create_session(current, "test-agent", "/current")
+            .unwrap();
+        store
+            .create_session(previous, "test-agent", "/previous")
+            .unwrap();
+        store
+            .append_turn(
+                previous,
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "durable previous answer",
+                ))],
+            )
+            .unwrap();
+
+        let agent = Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+            &config,
+            "test-agent",
+            Some(&data_dir),
+            false,
+            true,
+            true,
+            None,
+            None,
+            None,
+            Arc::clone(&store),
+        )
+        .await
+        .expect("ACP agent construction");
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current.to_string()), async {
+                let listed = agent
+                    .execute_tool_for_test("sessions_list", serde_json::json!({}))
+                    .await
+                    .expect("sessions_list registered")
+                    .unwrap();
+                assert!(listed.success);
+                assert!(listed.output.contains(current));
+                assert!(listed.output.contains(previous));
+
+                let history = agent
+                    .execute_tool_for_test(
+                        "sessions_history",
+                        serde_json::json!({"session_id": previous}),
+                    )
+                    .await
+                    .expect("sessions_history registered")
+                    .unwrap();
+                assert!(history.success);
+                assert!(history.output.contains("durable previous answer"));
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -12868,6 +13166,62 @@ mod tests {
             agent.model_name, "llama3",
             "model_name must reflect the switched model after success"
         );
+    }
+
+    /// Regression: model_provider_context_window_opt follows the in-turn
+    /// provider switch, not the static agent alias.
+    #[test]
+    fn model_context_window_follows_in_turn_model_switch() {
+        let mut cfg = Config::default();
+        let provider_a = cfg
+            .providers
+            .models
+            .ensure("openai", "provider-a")
+            .expect("ensure provider A");
+        provider_a.context_window = Some(128_000);
+        provider_a.model = Some("gpt-4o-mini".into());
+        let provider_b = cfg
+            .providers
+            .models
+            .ensure("ollama", "provider-b")
+            .expect("ensure provider B");
+        provider_b.context_window = Some(1_000_000);
+        provider_b.model = Some("llama3".into());
+
+        let cfg_arc = std::sync::Arc::new(cfg);
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(cfg_arc.clone()),
+        };
+
+        let mut agent = build_test_agent("openai.provider-a", "gpt-4o-mini", Some(switch_cfg));
+
+        // Before switch: resolve with provider A's ref
+        let (_, live_provider_before, live_model_before) = agent.attribution_fields();
+        assert_eq!(live_provider_before, "openai.provider-a");
+        let window_before = cfg_arc
+            .model_provider_context_window_opt(&live_provider_before, &live_model_before)
+            .map(|v| v as u64);
+        assert_eq!(window_before, Some(128_000));
+
+        // Apply in-turn switch
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "ollama.provider-b".to_string(),
+            "llama3".to_string(),
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("llama3"),
+            "switch must return the new effective model (proves switch ran, not short-circuited)"
+        );
+
+        // After switch: B's ref and window
+        let (_, live_provider_after, live_model_after) = agent.attribution_fields();
+        assert_eq!(live_provider_after, "ollama.provider-b");
+        let window_after = cfg_arc
+            .model_provider_context_window_opt(&live_provider_after, &live_model_after)
+            .map(|v| v as u64);
+        assert_eq!(window_after, Some(1_000_000));
     }
 
     #[test]
