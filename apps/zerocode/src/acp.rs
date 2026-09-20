@@ -132,6 +132,10 @@ impl Acp {
         self.inner.plan_visible()
     }
 
+    pub(crate) fn current_session_id(&self) -> Option<&str> {
+        self.inner.current_session_id()
+    }
+
     pub(crate) fn set_plan_visible(&mut self, visible: bool) {
         self.inner.set_plan_visible(visible);
     }

@@ -572,10 +572,11 @@ fn handle_dock_mouse(
     mouse: &crossterm::event::MouseEvent,
 ) -> (bool, Option<DockAction>) {
     let pane_visible = match mode {
-        Mode::Chat => chat.plan_visible(),
-        Mode::Acp => acp.plan_visible(),
+        Mode::Chat => chat.current_session_id().is_none() || chat.plan_visible(),
+        Mode::Acp => acp.current_session_id().is_none() || acp.plan_visible(),
         _ => false,
     };
+    // Without an active pane, toggle the saved preference on its own.
     let plan_was_visible = dock.plan_visible && pane_visible;
     let result = dock.handle_mouse(mouse);
     if result.1 == Some(DockAction::TogglePlan) {
@@ -3633,6 +3634,45 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dock_plan_mouse_toggles_without_active_session() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut acp = acp::Acp::new(client);
+        let mut dock = test_dock();
+        dock.config_dir = dir.path().to_path_buf();
+        for mode in [Mode::Chat, Mode::Acp] {
+            for expected in [false, true] {
+                let target = dock.layout(Rect::new(0, 0, 120, 40), mode, false).toggles[2];
+                let (handled, action) = handle_dock_mouse(
+                    &mut dock,
+                    mode,
+                    &mut chat,
+                    &mut acp,
+                    &dock_mouse(MouseEventKind::Down(MouseButton::Left), target.x, target.y),
+                );
+                assert!(handled);
+                assert_eq!(action, Some(DockAction::TogglePlan));
+                assert_eq!(dock.plan_visible, expected);
+                persist_dock_action(&dock, action.unwrap()).unwrap();
+                assert_eq!(
+                    config::load_persisted(dir.path())
+                        .unwrap()
+                        .sidebar
+                        .plan_visible,
+                    expected
+                );
+                assert!(chat.current_session_id().is_none());
+                assert!(acp.current_session_id().is_none());
             }
         }
     }

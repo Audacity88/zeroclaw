@@ -1388,7 +1388,14 @@ impl ZerocodePane {
             self.set_tracker_load_error_status();
             return;
         }
-        let mut candidate = self.tracker.clone();
+        // Preserve legacy fields changed on disk since this pane was opened.
+        let mut candidate = match config::load_persisted_todotracker_strict(&self.config_dir) {
+            Ok(section) => section.unwrap_or_default(),
+            Err(error) => {
+                self.set_ui_save_error(&error);
+                return;
+            }
+        };
         match field {
             TrackerField::Enabled => candidate.enabled = !candidate.enabled,
             TrackerField::EnabledAtStart => {
@@ -1418,15 +1425,6 @@ impl ZerocodePane {
         self.status = Some(crate::i18n::t("zc-zerocode-tracker-edit-refused"));
     }
 
-    fn set_ui_validation_error(&mut self, error: config::UiSectionValidationError) {
-        let key = match error {
-            config::UiSectionValidationError::PositiveRequired => {
-                "zc-zerocode-config-positive-required"
-            }
-        };
-        self.status = Some(crate::i18n::t(key));
-    }
-
     fn set_ui_save_error(&mut self, error: &anyhow::Error) {
         self.status = Some(crate::i18n::t_args(
             "zc-zerocode-config-save-failed",
@@ -1435,10 +1433,6 @@ impl ZerocodePane {
     }
 
     fn persist_tracker_candidate(&mut self, candidate: TodoTrackerSection) {
-        if let Err(error) = candidate.validate() {
-            self.set_ui_validation_error(error);
-            return;
-        }
         // The persisted section is present but unparseable: the in-memory
         // `tracker` is a default stand-in, not the user's data. Writing it
         // would destroy the canonical text they need in order to repair it, so
@@ -1474,13 +1468,6 @@ impl ZerocodePane {
                 // so the ordinary "sessions will use this" is never shown when
                 // the effective outcome does not match the saved value.
                 let key = match config::ensure_and_load(&self.config_dir) {
-                    // An effective section that a session boundary would
-                    // reject (e.g. `ZEROCODE_todotracker__width=0`) must not
-                    // be reported as a mere shadowing override — the next
-                    // session keeps its current settings instead.
-                    Ok(effective) if effective.validate_todo_tracker().is_err() => {
-                        "zc-zerocode-tracker-saved-resolve-error"
-                    }
                     Ok(effective) if effective.resolve_todo_tracker() != persisted_resolved => {
                         "zc-zerocode-tracker-saved-env-override"
                     }
@@ -2135,9 +2122,8 @@ mod tests {
         );
     }
 
-    // Invalid candidate dimensions must not reach disk or report success.
     #[test]
-    fn tracker_invalid_candidate_does_not_persist_or_report_success() {
+    fn tracker_legacy_zero_candidate_persists_and_reports_success() {
         // Drives the pane's save path, which resolves the effective view
         // through `ensure_and_load`; `std::env` is process-global, so this
         // must serialize with every other env-reading test.
@@ -2152,17 +2138,18 @@ mod tests {
 
         let mut candidate = pane.tracker.clone();
         candidate.width = 0;
+        candidate.enabled = false;
         pane.persist_tracker_candidate(candidate);
 
-        // Persisted-only: the contract is that nothing was written to disk.
         let reloaded = config::load_persisted(dir.path()).unwrap();
-        assert_eq!(reloaded.todotracker, original);
-        assert_eq!(reloaded.todotracker.width, 40);
-        assert_eq!(
-            pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-config-positive-required").as_str())
+        assert_eq!(reloaded.todotracker.width, 0);
+        assert_eq!(reloaded.todotracker.max_height, original.max_height);
+        assert!(
+            !config::resolve_todo_tracker_checked(dir.path())
+                .unwrap()
+                .enabled
         );
-        assert_ne!(
+        assert_eq!(
             pane.status.as_deref(),
             Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
         );
@@ -2431,11 +2418,7 @@ mod tests {
         );
     }
 
-    // A zero dimension is *syntactically* valid TOML and parses cleanly as a
-    // `u16`, so a strict type re-read alone lets it through. It is still
-    // explicitly invalid configuration, and the preservation contract makes no
-    // distinction between "unparseable" and "parses but invalid": neither may
-    // be silently replaced, and neither may report a successful save.
+    // Legacy geometry remains on disk but cannot block the supported toggles.
     #[test]
     fn tracker_save_preserves_zero_width_written_after_pane_open() {
         assert_external_zero_section_survives_unrelated_save("width = 0\nmax_height = 5\n");
@@ -2446,9 +2429,6 @@ mod tests {
         assert_external_zero_section_survives_unrelated_save("width = 32\nmax_height = 0\n");
     }
 
-    /// Open the pane on valid data, let an external writer install
-    /// `[todotracker]` with `fields`, then perform an *unrelated* tracker
-    /// action and assert the file is byte-identical with no success status.
     fn assert_external_zero_section_survives_unrelated_save(fields: &str) {
         let _guard = crate::test_support::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -2462,22 +2442,33 @@ mod tests {
         let external = format!("[theme]\nname = \"nord\"\n\n[todotracker]\n{fields}");
         std::fs::write(config::config_path(dir.path()), &external).unwrap();
 
-        // Unrelated action: toggle a boolean, nothing to do with dimensions.
-        pane.tracker_cursor = TRACKER_FIELDS
-            .iter()
-            .position(|c| *c == TrackerField::Enabled)
-            .expect("tracker field is registered");
-        pane.activate_tracker();
+        let before = config::load_persisted(dir.path()).unwrap().todotracker;
+        for index in 0..TRACKER_FIELDS.len() {
+            pane.tracker_cursor = index;
+            pane.activate_tracker();
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            );
+        }
+        let after = config::load_persisted(dir.path()).unwrap();
+        assert_eq!(after.todotracker.width, before.width);
+        assert_eq!(after.todotracker.max_height, before.max_height);
+        assert_eq!(after.todotracker.enabled, !before.enabled);
+        assert_eq!(after.todotracker.enabled_at_start, !before.enabled_at_start);
+        assert_eq!(after.theme.name, "nord");
+        let effective = config::resolve_todo_tracker_checked(dir.path()).unwrap();
+        assert_eq!(effective.enabled, !before.enabled);
+        assert_eq!(effective.enabled_at_start, !before.enabled_at_start);
 
+        // Reopening on the same legacy section must also allow an edit.
+        let mut reopened = ZerocodePane::new(dir.path());
+        reopened.activate_tracker();
         assert_eq!(
-            std::fs::read_to_string(config::config_path(dir.path())).unwrap(),
-            external,
-            "an unrelated save must not replace an explicitly invalid current section"
-        );
-        assert_ne!(
-            pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
-            "a refused write must never report a successful save"
+            config::resolve_todo_tracker_checked(dir.path())
+                .unwrap()
+                .enabled,
+            before.enabled
         );
     }
 

@@ -402,31 +402,8 @@ fn default_sidebar_queue_percent() -> u16 {
 }
 
 impl TodoTrackerSection {
-    /// Reject values that must never reach the runtime.
-    ///
-    /// Run at **every** authoritative boundary: Config-pane saves call it
-    /// before persistence so a success message always describes the values
-    /// the next session will consume, and [`resolve_todo_tracker_checked`]
-    /// calls it on the effective (post-env-override) section so hand-edited
-    /// files and `ZEROCODE_todotracker__*` overrides fail visibly instead of
-    /// being normalized.
-    pub(crate) fn validate(&self) -> std::result::Result<(), UiSectionValidationError> {
-        if self.width == 0 || self.max_height == 0 {
-            return Err(UiSectionValidationError::PositiveRequired);
-        }
-        Ok(())
-    }
-
-    /// Infallible view used by non-authoritative callers (e.g. the Config
-    /// pane's persisted-vs-effective comparison), which must render something
-    /// rather than fail.
-    ///
-    /// The `.max(1)` here is a last-resort clamp so a zero can never collapse
-    /// the panel if some future caller bypasses validation — it is **not** the
-    /// authority on validity. An explicit zero from the file or the
-    /// environment must fail visibly rather than be silently normalized to
-    /// `1`, which is enforced by [`ZerocodeConfig::validate_todo_tracker`];
-    /// every session boundary runs it via [`resolve_todo_tracker_checked`].
+    /// Legacy dimensions remain readable for compatibility, but the shell's
+    /// sidebar settings now own geometry. They cannot invalidate Plan toggles.
     pub(crate) fn resolve(&self) -> TodoTrackerSettings {
         TodoTrackerSettings {
             enabled: self.enabled,
@@ -477,23 +454,6 @@ impl Default for TodoTrackerSettings {
         }
     }
 }
-
-/// Validation failures shared by the local UI config sections. User-facing
-/// wording is supplied by the Config pane's Fluent catalogue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UiSectionValidationError {
-    PositiveRequired,
-}
-
-impl std::fmt::Display for UiSectionValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PositiveRequired => f.write_str("numeric values must be greater than zero"),
-        }
-    }
-}
-
-impl std::error::Error for UiSectionValidationError {}
 
 // ── Default helpers ───────────────────────────────────────────────────────────
 
@@ -641,20 +601,8 @@ impl ZerocodeConfig {
 
     /// Convert the `[todotracker]` section into the runtime settings type
     /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
-    ///
-    /// This is the infallible view. Validity is enforced separately by
-    /// [`Self::validate_todo_tracker`] at the authoritative boundaries, so
-    /// an explicit zero surfaces an error instead of being normalized.
     pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
         self.todotracker.resolve()
-    }
-
-    /// Validate the effective `[todotracker]` section, whatever its origin
-    /// (file, defaults, or `ZEROCODE_todotracker__*` override).
-    pub(crate) fn validate_todo_tracker(
-        &self,
-    ) -> std::result::Result<(), UiSectionValidationError> {
-        self.todotracker.validate()
     }
 }
 
@@ -687,11 +635,8 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// *absent* section resolves exactly as `ensure_and_load` would, with
 /// `ZEROCODE_todotracker__*` overrides applied.
 ///
-/// The effective section is validated **after** env overrides are applied, so
-/// an explicit zero `width`/`max_height` fails visibly whether it came from
-/// the file or from the canonical environment surface, rather than being
-/// normalized to `1`. Callers keep their current settings on error, so an
-/// invalid value never resets a live tracker to defaults.
+/// Legacy numeric dimensions no longer control the dock and do not reject
+/// otherwise valid settings. Malformed fields and overrides still fail.
 pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrackerSettings> {
     let path = config_path(config_dir);
     if path.exists() {
@@ -705,9 +650,6 @@ pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrac
         }
     }
     let config = ensure_and_load(config_dir)?;
-    config
-        .validate_todo_tracker()
-        .map_err(|e| anyhow::Error::msg(format!("[todotracker] is invalid: {e}")))?;
     Ok(config.resolve_todo_tracker())
 }
 
@@ -1157,14 +1099,13 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 /// Other sections (theme, keybindings, connection, etc.) are preserved.
 ///
 /// This is the owning read-modify-write boundary. Refuse to replace a current
-/// section that is unparseable or invalid, even if the caller's older snapshot
+/// section that is unparseable, even if the caller's older snapshot
 /// and proposed section are valid.
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
-    section.validate()?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     if let Some(value) = doc.get("todotracker") {
-        let current = value
+        value
             .clone()
             .try_into::<TodoTrackerSection>()
             .with_context(|| {
@@ -1173,12 +1114,6 @@ pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSectio
                     path.display()
                 )
             })?;
-        current.validate().with_context(|| {
-            format!(
-                "refusing to overwrite the invalid [todotracker] section in {}",
-                path.display()
-            )
-        })?;
     }
     let serialized = toml::Value::try_from(section)
         .context("serializing todotracker section")?
@@ -2503,17 +2438,8 @@ mod tests {
         assert_eq!(c.todotracker.location, TodoTrackerLocation::Left);
     }
 
-    // ── Resolver validation / normalization (untrusted config boundary) ──────
-
-    // ── Zero-dimension rejection ────────────────────────────────────────────
-    //
-    // Explicit zero `width`/`max_height` must fail *visibly* at the session
-    // boundary rather than being silently normalized to 1 — for file values
-    // and for canonical environment overrides alike. The Config-pane edit
-    // path is covered separately by the pane's own save tests.
-
     #[test]
-    fn resolve_todo_tracker_checked_rejects_zero_width_from_file() {
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_width_from_file() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2522,17 +2448,12 @@ mod tests {
         )
         .unwrap();
 
-        let err = resolve_todo_tracker_checked(dir.path())
-            .expect_err("an explicit width = 0 in the file must fail, not normalize to 1");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("todotracker"),
-            "error must name the offending section, got: {msg}"
-        );
+        assert!(resolve_todo_tracker_checked(dir.path()).is_ok());
+        assert_eq!(load_persisted(dir.path()).unwrap().todotracker.width, 0);
     }
 
     #[test]
-    fn resolve_todo_tracker_checked_rejects_zero_max_height_from_file() {
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_max_height_from_file() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2542,17 +2463,15 @@ mod tests {
         .unwrap();
 
         assert!(
-            resolve_todo_tracker_checked(dir.path()).is_err(),
-            "an explicit max_height = 0 in the file must fail, not normalize to 1"
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy height must not reject settings for the shell-owned dock"
         );
     }
 
     #[test]
-    fn resolve_todo_tracker_checked_rejects_zero_width_from_env() {
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_width_from_env() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
-        // File is valid; only the canonical env override carries the zero, so
-        // this pins that validation happens *after* overrides are applied.
         std::fs::write(
             config_path(dir.path()),
             "[todotracker]\nwidth = 32\nmax_height = 5\n",
@@ -2561,20 +2480,20 @@ mod tests {
         let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
 
         assert!(
-            resolve_todo_tracker_checked(dir.path()).is_err(),
-            "ZEROCODE_todotracker__width=0 must fail visibly, not normalize to 1"
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy width override must not reject settings for the shell-owned dock"
         );
     }
 
     #[test]
-    fn resolve_todo_tracker_checked_rejects_zero_max_height_from_env() {
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_max_height_from_env() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let _v = EnvVarGuard::set("ZEROCODE_todotracker__max_height", "0");
 
         assert!(
-            resolve_todo_tracker_checked(dir.path()).is_err(),
-            "ZEROCODE_todotracker__max_height=0 must fail visibly, not normalize to 1"
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy height override must not reject settings for the shell-owned dock"
         );
     }
 
