@@ -3041,14 +3041,15 @@ mod tests {
             tmp.path(),
         )
         .unwrap();
+        assert_eq!(
+            cmd.as_std().get_program(),
+            shim.canonicalize().unwrap().as_os_str()
+        );
         let output = cmd.output().await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(output.status.success());
-        assert_eq!(
-            stdout.trim(),
-            format!("CUSTOM_SHELL:{}", shim.canonicalize().unwrap().display())
-        );
+        assert_eq!(stdout.trim(), format!("CUSTOM_SHELL:{}", shim.display()));
     }
 
     #[test]
