@@ -712,7 +712,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         turn_state.canonical.as_deref_mut(),
                         config,
                         multimodal_config,
-                        ctx.hooks,
+                        hooks,
                         image_cache.as_deref_mut(),
                     )
                     .await;
@@ -1761,7 +1761,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_state.canonical.as_deref_mut(),
         config,
         multimodal_config,
-        ctx.hooks,
+        hooks,
         image_cache,
     )
     .await
