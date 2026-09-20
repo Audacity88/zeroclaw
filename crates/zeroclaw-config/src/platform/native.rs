@@ -282,6 +282,14 @@ impl RuntimeAdapter for NativeRuntime {
                 process.arg("-c").arg(command);
                 process
             };
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+
+                // Canonicalize the executable, not the identity that selects a
+                // multicall applet or the shell's sh compatibility mode.
+                process.as_std_mut().arg0(configured_shell);
+            }
             process.current_dir(workspace_dir);
             Ok(process)
         }
@@ -501,6 +509,30 @@ mod tests {
     fn native_storage_path_contains_zeroclaw() {
         let path = NativeRuntime::new().storage_path();
         assert!(path.to_string_lossy().contains("zeroclaw"));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn native_canonical_shell_preserves_requested_argv0() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("sh");
+        let canonical_shell = std::fs::canonicalize("/bin/sh").unwrap();
+        std::os::unix::fs::symlink(&canonical_shell, &launcher).unwrap();
+
+        for requested in ["sh".to_owned(), launcher.to_str().unwrap().to_owned()] {
+            let runtime = NativeRuntime::with_shell(requested.clone());
+            let mut command = runtime
+                .build_shell_command_with_effective_path(
+                    "printf '%s' \"$0\"",
+                    dir.path(),
+                    Some(dir.path().as_os_str()),
+                )
+                .unwrap();
+            assert_eq!(command.as_std().get_program(), canonical_shell.as_os_str());
+            let output = command.output().await.unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, requested.as_bytes());
+        }
     }
 
     #[test]
