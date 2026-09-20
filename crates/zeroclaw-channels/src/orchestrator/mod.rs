@@ -24075,6 +24075,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -24275,6 +24276,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(LeakingNarratingToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -24458,6 +24460,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -24650,6 +24653,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -25216,6 +25220,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
