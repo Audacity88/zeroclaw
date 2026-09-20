@@ -618,6 +618,9 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
             },
         ),
         history: &mut history,
+        // Test transcripts start fresh: no prior trim, no crumb.
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,
@@ -1029,6 +1032,9 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                     },
                 ),
                 history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -3254,6 +3260,8 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
             },
         ),
         history: &mut history,
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,
