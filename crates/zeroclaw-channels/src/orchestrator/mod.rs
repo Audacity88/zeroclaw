@@ -6298,6 +6298,9 @@ fn spawn_supervised_listener_with_health_interval(
             let max_backoff = max_backoff_secs.max(backoff);
 
             loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
                 mark_listener_health(&*ch, &component);
                 // First tick one interval out, not immediately: the observation
                 // above already covers this instant.
@@ -6312,6 +6315,7 @@ fn spawn_supervised_listener_with_health_interval(
 
                     loop {
                         tokio::select! {
+                            biased;
                             () = cancel.cancelled() => return,
                             _ = health.tick() => {
                                 mark_listener_health(&*ch, &component);
@@ -14702,6 +14706,19 @@ pub async fn start_channels_with_plugin_webhooks(
     .await
 }
 
+#[cfg(test)]
+struct ChannelStartupProbe {
+    channel: Arc<dyn Channel>,
+    prepared: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    publishing: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CHANNEL_STARTUP_PROBE: Arc<ChannelStartupProbe>;
+}
+
 /// Start supervised channels with the shared live-config authority and the
 /// daemon generation's plugin-webhook route registry.
 #[allow(clippy::too_many_lines)]
@@ -14794,16 +14811,16 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         };
 
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
-    let mut cron_channel_registry_lease: Option<CronChannelRegistryLease> = None;
+    let mut prepared_channels = Vec::new();
     let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
-    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
-        None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
     for agent_alias in &enabled_agents {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let agent = config
             .resolved_agent_config(agent_alias)
             .with_context(|| format!("agents.{agent_alias} is not configured"))?;
@@ -15185,9 +15202,15 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 )
                 .await;
             append_configured_plugin_channels(&mut configured_channels, plugin_channels);
-            let (channels_by_name, registry_lease) =
-                publish_cron_channel_registry(&configured_channels);
-            cron_channel_registry_lease = Some(registry_lease);
+            #[cfg(test)]
+            if let Ok(probe) = CHANNEL_STARTUP_PROBE.try_with(Arc::clone) {
+                configured_channels.push(ConfiguredChannel {
+                    display_name: "Startup probe",
+                    alias: Some("startup-probe".to_string()),
+                    channel: Arc::clone(&probe.channel),
+                });
+            }
+            let channels_by_name = Arc::new(configured_channel_map(&configured_channels));
             if configured_channels.is_empty() {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -15215,41 +15238,13 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             println!("  📡 Channels: {}", channel_labels.join(", "));
             println!("  🤖 Agents:   {}", enabled_agents.join(", "));
             println!();
-            println!("  Listening for messages... (Ctrl+C to stop)");
-            println!();
-
-            zeroclaw_runtime::health::mark_component_ok("channels");
-
-            let initial_backoff_secs = config
-                .reliability
-                .channel_initial_backoff_secs
-                .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
-            let max_backoff_secs = config
-                .reliability
-                .channel_max_backoff_secs
-                .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
-
-            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
-
-            for cc in &configured_channels {
-                listener_handles.push(spawn_supervised_listener(
-                    cc.channel.clone(),
-                    cc.alias.clone(),
-                    tx.clone(),
-                    initial_backoff_secs,
-                    max_backoff_secs,
-                    cancel.clone(),
-                ));
-            }
-            drop(tx);
-
             let in_flight =
                 max_in_flight_messages_for_config(configured_channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
             channels_by_name_shared = Some(channels_by_name);
-            rx_holder = Some(rx);
+            prepared_channels = configured_channels;
         }
 
         let channels_by_name = Arc::clone(
@@ -15390,6 +15385,13 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
+        #[cfg(test)]
+        if agent_ctxs.len() == 1
+            && let Ok(probe) = CHANNEL_STARTUP_PROBE.try_with(Arc::clone)
+        {
+            probe.prepared.notify_one();
+            probe.release.notified().await;
+        }
     }
 
     let owner_by_channel_key =
@@ -15484,7 +15486,45 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         .with_agent_lifecycle(authority.agent_lifecycle())
         .with_execution_capability(authority.execution_capability());
 
-    let rx = rx_holder.expect("rx initialized by first agent's channel setup");
+    // Retirement holds this same lock while clearing the registry and draining
+    // startup. Cancellation must release this wait to avoid a lock/drain cycle.
+    let config_write_lock = authority.config_write_lock();
+    #[cfg(test)]
+    let _ = CHANNEL_STARTUP_PROBE.try_with(|probe| probe.publishing.notify_one());
+    let publication_guard = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Ok(()),
+        guard = config_write_lock.lock() => guard,
+    };
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    let (_, cron_channel_registry_lease) = publish_cron_channel_registry(&prepared_channels);
+    let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+    let listener_handles: Vec<_> = prepared_channels
+        .iter()
+        .map(|cc| {
+            spawn_supervised_listener(
+                Arc::clone(&cc.channel),
+                cc.alias.clone(),
+                tx.clone(),
+                config
+                    .reliability
+                    .channel_initial_backoff_secs
+                    .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS),
+                config
+                    .reliability
+                    .channel_max_backoff_secs
+                    .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS),
+                cancel.clone(),
+            )
+        })
+        .collect();
+    drop(tx);
+    drop(publication_guard);
+    zeroclaw_runtime::health::mark_component_ok("channels");
+    println!("  Listening for messages... (Ctrl+C to stop)");
+    println!();
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
     // Declared before the dispatch loop so it drops after it: on any
@@ -17643,6 +17683,8 @@ temperature = 0.3
 
     struct CronChannelRegistryRestore(Option<CronChannelRegistry>);
 
+    static STARTUP_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     impl Drop for CronChannelRegistryRestore {
         fn drop(&mut self) {
             *CRON_CHANNEL_REGISTRY
@@ -17653,6 +17695,7 @@ temperature = 0.3
 
     #[tokio::test]
     async fn ending_channel_task_clears_stale_delivery_handles() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
         let previous = CRON_CHANNEL_REGISTRY
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -17706,6 +17749,161 @@ temperature = 0.3
                 .contains("[channels.wecom_ws.removed] not configured"),
             "delivery must fall back to the current empty config: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_retired_publication_and_starts_no_listeners_on_setup_failure() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, CustomModelProviderConfig, ModelProviderConfig,
+        };
+        use zeroclaw_runtime::LiveConfigAuthority;
+
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY.read().unwrap().clone();
+        let _restore = CronChannelRegistryRestore(previous);
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        config.memory.backend = "none".into();
+        config.channels.session_persistence = false;
+        config.providers.models.custom.insert(
+            "startup".into(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1/v1".into()),
+                    model: Some("startup-model".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".into(), Default::default());
+        config
+            .runtime_profiles
+            .insert("default".into(), Default::default());
+        config.agents.insert(
+            "first".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.startup".into(),
+                risk_profile: "default".into(),
+                runtime_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+
+        // Exercise preparation cancellation, cancellation at the writer wait,
+        // a later agent's failure, and a clean retry through the same entrypoint.
+        for scenario in ["preparing", "writer-wait", "later-agent-failure", "retry"] {
+            prepare_live_channel_registry(true);
+            let mut attempt_config = config.clone();
+            if scenario == "later-agent-failure" {
+                let mut invalid = attempt_config.agents["first"].clone();
+                invalid.model_provider = "custom.missing".into();
+                attempt_config.agents.insert("second".into(), invalid);
+            }
+            let authority = LiveConfigAuthority::new(attempt_config);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let probe = Arc::new(ChannelStartupProbe {
+                channel: Arc::new(BlockUntilClosedChannel {
+                    name: "startup-probe".into(),
+                    calls: Arc::clone(&calls),
+                }),
+                prepared: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                publishing: tokio::sync::Notify::new(),
+            });
+            let scoped_probe = Arc::clone(&probe);
+            let startup_authority = authority.clone();
+            let startup_cancel = cancel.clone();
+            let mut task = zeroclaw_spawn::spawn!(async move {
+                CHANNEL_STARTUP_PROBE
+                    .scope(
+                        scoped_probe,
+                        Box::pin(start_channels_with_authority(
+                            startup_authority,
+                            None,
+                            startup_cancel,
+                            None,
+                            None,
+                        )),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::select! {
+                    () = probe.prepared.notified() => {}
+                    result = &mut task => panic!("{scenario}: startup ended before preparation: {result:?}"),
+                }
+            })
+                .await
+                .unwrap();
+            assert!(
+                live_channel_map().is_empty(),
+                "{scenario}: registry visible during preparation"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{scenario}: listener started during preparation"
+            );
+            if scenario == "preparing" || scenario == "writer-wait" {
+                let lock = authority.config_write_lock();
+                let guard = lock.lock().await;
+                if scenario == "writer-wait" {
+                    probe.release.notify_one();
+                    tokio::time::timeout(Duration::from_secs(5), probe.publishing.notified())
+                        .await
+                        .unwrap();
+                }
+                // The production retire path clears then cancels while holding
+                // the writer; drain must complete before that guard is released.
+                prepare_live_channel_registry(true);
+                cancel.cancel();
+                probe.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(live_channel_map().is_empty());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                drop(guard);
+            } else if scenario == "later-agent-failure" {
+                probe.release.notify_one();
+                let error = tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(format!("{error:#}").contains("second"));
+                assert!(live_channel_map().is_empty());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else {
+                probe.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while calls.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(live_channel_map().contains_key("startup-probe.startup-probe"));
+                cancel.cancel();
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(live_channel_map().is_empty());
+            }
+        }
     }
 
     #[test]
@@ -38717,7 +38915,7 @@ This is an example JSON object for profile settings."#;
                 "plugin" => source_segment_between(
                     async_assembly,
                     "zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(",
-                    "publish_cron_channel_registry(&configured_channels)",
+                    "publish_cron_channel_registry(&prepared_channels)",
                 )
                 .is_some_and(|block| {
                     block.contains("append_configured_plugin_channels(")
