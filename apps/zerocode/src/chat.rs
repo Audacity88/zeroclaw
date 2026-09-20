@@ -7666,12 +7666,8 @@ fn render_conversation(
         state.rebuild_lines(inner_width);
     }
 
-    let has_stream_text = !state.streaming_text.is_empty();
     let has_stream_thought = state.show_thoughts && !state.streaming_thought.is_empty();
     let has_approval = state.pending_approval().is_some();
-    if (has_stream_text || has_stream_thought) && state.transcript_selection.is_some() {
-        state.clear_transcript_selection();
-    }
     if has_stream_thought {
         state.ensure_streaming_thought_layout(inner_width);
     }
@@ -7833,6 +7829,11 @@ fn render_conversation(
     capture_transcript_snapshot(f, state, body_area, total_rows, scroll, row_breaks);
     state.streaming_selection_prefix =
         has_stream_thought.then_some((state.streaming_thought.len(), thought_start, inner_width));
+    if state.transcript_selection.is_some() {
+        // Snapshot refresh replaces wrap separators; restore them before
+        // selection copy actions capture the newly rendered text.
+        state.materialize_streaming_selection();
+    }
     state.url_hit_regions =
         project_cached_url_hit_regions(&state.cached_url_regions, scroll, body_area);
     state.url_hit_regions.extend(project_url_hit_regions(
@@ -7991,6 +7992,7 @@ fn capture_transcript_snapshot(
     if state.transcript_selection.is_some()
         && let Some(snapshot) = state.transcript_snapshot.as_mut()
         && snapshot.area.width == body.width
+        && snapshot.area.height == body.height
         && snapshot.content_height() == total_rows
     {
         snapshot.merge(captured);
@@ -9855,6 +9857,8 @@ pub struct ChatState {
     transcript_snapshot: Option<TranscriptSnapshot>,
     /// Copy metadata is materialized only on demand, for this displayed prefix.
     streaming_selection_prefix: Option<(usize, u16, u16)>,
+    /// Derived on selection, reused across unchanged redraws, dropped on invalidation.
+    streaming_selection_breaks: Option<(usize, u16, Vec<TranscriptRowBreak>)>,
     /// Normal-mode character selection within `transcript_snapshot`.
     transcript_selection: Option<TranscriptSelection>,
     /// Whether the left-button transcript selection gesture is still active.
@@ -10038,6 +10042,7 @@ impl ChatState {
             mouse_down_entry: None,
             transcript_snapshot: None,
             streaming_selection_prefix: None,
+            streaming_selection_breaks: None,
             transcript_selection: None,
             transcript_drag_active: false,
             transcript_drag_edge: None,
@@ -10171,6 +10176,7 @@ impl ChatState {
     }
 
     fn clear_transcript_selection(&mut self) {
+        self.streaming_selection_breaks = None;
         self.transcript_selection = None;
         self.pending_url_activation = None;
         self.transcript_drag_active = false;
@@ -11215,12 +11221,27 @@ impl ChatState {
         let Some(text) = self.streaming_thought.get(..len) else {
             return;
         };
-        // Use exactly the text that produced these cells, even if a newer
-        // notification appended text between drawing and the mouse event.
-        let breaks = row_breaks_for_line(
-            &Line::from(vec![Span::raw("(thinking) "), Span::raw(text.to_owned())]),
-            width,
-        );
+        // Use the displayed prefix, and avoid rewrapping it on every selected
+        // redraw. Content changes invalidate the selection and this cache.
+        if self
+            .streaming_selection_breaks
+            .as_ref()
+            .is_some_and(|(cached_len, cached_width, _)| {
+                *cached_len != len || *cached_width != width
+            })
+        {
+            self.streaming_selection_breaks = None;
+        }
+        let (_, _, breaks) = self.streaming_selection_breaks.get_or_insert_with(|| {
+            (
+                len,
+                width,
+                row_breaks_for_line(
+                    &Line::from(vec![Span::raw("(thinking) "), Span::raw(text.to_owned())]),
+                    width,
+                ),
+            )
+        });
         for (row, separator) in &mut snapshot.row_breaks {
             if let Some(index) = row.checked_sub(start)
                 && let Some(value) = breaks.get(usize::from(index))
@@ -11725,6 +11746,7 @@ impl ChatState {
     /// first response text chunk arrives after a thinking phase.
     fn flush_streaming_thought(&mut self) {
         self.materialize_streaming_selection();
+        self.streaming_selection_breaks = None;
         self.streaming_thought_layout = None;
         let thought = std::mem::take(&mut self.streaming_thought);
         if !thought.is_empty() {
@@ -11800,6 +11822,9 @@ impl ChatState {
 
         match update {
             SessionUpdate::AgentMessageChunk { text, .. } => {
+                if !text.is_empty() {
+                    self.clear_transcript_selection();
+                }
                 self.invalidate_url_interactions();
                 if !self.turn_in_flight && self.append_to_prompt_settled_stream(&text) {
                     return;
@@ -11819,6 +11844,9 @@ impl ChatState {
                 }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
+                if !text.is_empty() {
+                    self.clear_transcript_selection();
+                }
                 self.invalidate_url_interactions();
                 self.freeze_prompt_settled_stream();
                 self.streaming_thought.push_str(&text);
@@ -12629,6 +12657,7 @@ impl ChatState {
         self.pending_elicitation = None;
         self.streaming_text.clear();
         self.streaming_thought.clear();
+        self.streaming_selection_breaks = None;
         self.streaming_thought_layout = None;
         self.streaming_selection_prefix = None;
         self.transcript_snapshot = None;
@@ -12890,6 +12919,7 @@ impl ChatState {
         self.mouse_down_entry = None;
         self.transcript_snapshot = None;
         self.streaming_selection_prefix = None;
+        self.streaming_selection_breaks = None;
         self.transcript_selection = None;
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
@@ -14295,6 +14325,92 @@ mod tests {
         s.reset_turn_for_resync_reload();
         assert!(s.streaming_thought_layout.is_none());
         assert!(s.transcript_snapshot.is_none());
+    }
+
+    #[test]
+    fn streaming_thought_copy_survives_selection_redraw() {
+        for text in [
+            "alpha beta gamma delta epsilon zeta eta theta",
+            "https://example.com/a/long/path/without/spaces",
+        ] {
+            let mut s = state();
+            s.show_thoughts = true;
+            s.turn_in_flight = true;
+            s.apply_update(SessionUpdate::AgentThoughtChunk {
+                session_id: "sess-1".into(),
+                text: text.into(),
+            });
+            draw_long_thought(&mut s, 24);
+            assert!(s.streaming_selection_prefix.is_some());
+            let snapshot = s.transcript_snapshot.as_ref().unwrap();
+            let area = snapshot.area;
+            let last_row = snapshot.content_height() - 1;
+            assert_eq!(snapshot.scroll, 0);
+            assert!(last_row < area.height);
+            let last_column = snapshot.row_text_bounds(last_row).unwrap().1;
+            assert!(s.begin_transcript_drag(area.x, area.y));
+            assert!(s.update_transcript_drag(area.x + last_column, area.y + last_row));
+            let cached_breaks = s.streaming_selection_breaks.as_ref().unwrap().2.as_ptr();
+            let expected = format!("(thinking) {text}");
+            assert_eq!(s.current_selection_text(), expected);
+            draw_long_thought(&mut s, 24);
+            assert_eq!(s.current_selection_text(), expected);
+            s.finish_transcript_drag();
+            for _ in 0..2 {
+                draw_long_thought(&mut s, 24);
+                assert_eq!(s.current_selection_text(), expected);
+                assert_eq!(
+                    s.streaming_selection_breaks.as_ref().unwrap().2.as_ptr(),
+                    cached_breaks
+                );
+                let copy = s
+                    .copy_hit_regions
+                    .iter()
+                    .find(|region| {
+                        region.kind == CopyHitKind::Transcript
+                            && region.action == CopyHitAction::Copy
+                    })
+                    .expect("selection copy action");
+                assert_eq!(copy.text.as_ref(), expected);
+            }
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(26, 11)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_conversation(frame, &mut s, frame.area());
+                })
+                .unwrap();
+            assert!(
+                s.transcript_selection.is_none(),
+                "height resize invalidates endpoints"
+            );
+            draw_long_thought(&mut s, 24);
+            assert!(s.begin_transcript_drag(area.x, area.y));
+            draw_long_thought(&mut s, 25);
+            assert!(
+                s.transcript_selection.is_none(),
+                "resize invalidates endpoints"
+            );
+            assert!(s.begin_transcript_drag(area.x, area.y));
+            s.apply_update(SessionUpdate::AgentThoughtChunk {
+                session_id: "sess-1".into(),
+                text: " more".into(),
+            });
+            assert!(
+                s.transcript_selection.is_none(),
+                "new thought invalidates endpoints"
+            );
+            draw_long_thought(&mut s, 25);
+            assert!(s.begin_transcript_drag(area.x, area.y));
+            s.apply_update(SessionUpdate::AgentMessageChunk {
+                session_id: "sess-1".into(),
+                text: "answer".into(),
+            });
+            assert!(
+                s.transcript_selection.is_none(),
+                "new response invalidates endpoints"
+            );
+        }
     }
 
     #[test]
