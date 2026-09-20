@@ -205,13 +205,13 @@ impl Tool for SendMessageToPeerTool {
                 .transpose()?;
             let cfg = admission
                 .as_ref()
-                .map(|admission| admission.config().as_ref().clone())
-                .unwrap_or_else(|| (*self.config).clone());
+                .map(|admission| Arc::clone(admission.config()))
+                .unwrap_or_else(|| Arc::clone(&self.config));
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
             let body = message.clone();
             // Build the recipient's cost-tracking context from `&cfg` before
-            // `cfg` moves into `process_message` below — a detached
+            // `cfg` moves into `process_message_shared` below — a detached
             // `zeroclaw_spawn::spawn!` task does not inherit the caller's
             // task-locals, so the recipient's turn would otherwise run with
             // no cost context and its spend would go unrecorded.
@@ -223,7 +223,7 @@ impl Tool for SendMessageToPeerTool {
                 // The admitted recipient turn contains a complete agent loop;
                 // allocate it before adding the cost scopes so this detached
                 // worker does not construct the combined future on its stack.
-                let turn = Box::pin(crate::agent::loop_::process_message_with_admission(
+                let turn = Box::pin(crate::agent::loop_::process_message_shared_with_admission(
                     cfg,
                     &recipient_alias,
                     &body,

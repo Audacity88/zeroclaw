@@ -262,6 +262,12 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+fn interactive_context_recovery_budget(
+    context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> usize {
+    context_limits.model_context_window.saturating_mul(9) / 10
+}
+
 /// The single autosave decision for a turn's user-side text, shared by both
 /// store sites in this file so the gates cannot drift apart.
 ///
@@ -643,7 +649,7 @@ pub fn native_tool_specs_present_for_turn(
     Ok(activated.tool_names().iter().any(|name| !is_excluded(name)))
 }
 
-static IMAGE_DATA_URI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static IMAGE_DATA_URI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[IMAGE:data:[^\]]*\]").expect("static image data URI regex must compile")
 });
 
@@ -1011,6 +1017,23 @@ async fn agent_turn_with_sop_reassembly(
         agent_alias.map(str::to_string),
         Some(turn_id.clone()),
     );
+    let resolved_capacity = config.map_or(
+        zeroclaw_config::schema::ResolvedModelContextWindow {
+            tokens: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            source: zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        },
+        |config| config.resolved_model_context_window_for_route(provider_name, model),
+    );
+    let context_token_budget = if context_token_budget == 0 {
+        0
+    } else {
+        context_token_budget.min(resolved_capacity.tokens)
+    };
+    let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
+        model_context_window: resolved_capacity.tokens,
+        context_token_budget,
+        model_context_window_source: resolved_capacity.source,
+    };
     let result = run_tool_call_loop(ToolLoop {
         sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
@@ -1018,6 +1041,7 @@ async fn agent_turn_with_sop_reassembly(
                 model_provider,
                 provider_name,
                 model,
+                dispatch_model: model,
                 temperature,
             },
             ResolvedIo {
@@ -1040,7 +1064,8 @@ async fn agent_turn_with_sop_reassembly(
                 strict_tool_parsing,
                 parallel_tools,
                 max_tool_result_chars,
-                context_token_budget,
+                context_limits,
+                context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },
         ),
@@ -1063,6 +1088,7 @@ async fn agent_turn_with_sop_reassembly(
         ingress: IngressContext::from_origin(origin),
         agent_alias,
         parent_agent_alias: None,
+        served_route_sink: None,
         turn_id: &turn_id,
     })
     .await;
@@ -1097,20 +1123,20 @@ async fn agent_turn_with_sop_reassembly(
 // file per step (run sheet in agent/turn/mod.rs). `crate::agent::loop_`
 // stays the canonical public path via these re-exports.
 pub(crate) use super::turn::StreamCancelledAfterOutput;
+pub use super::turn::{
+    ContextLimitsResolver, DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior,
+    ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent,
+    REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink, SopStepReassembly, StreamDelta,
+    THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
+    is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,
+    scrub_credentials, thinking_status_label_round, thinking_status_round, thinking_status_text,
+};
 #[cfg(test)]
 pub(crate) use super::turn::{
     DEFAULT_MAX_TOOL_ITERATIONS, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
     build_native_assistant_history, consume_provider_streaming_response,
     maybe_inject_channel_delivery_defaults, resolve_display_text,
-};
-pub use super::turn::{
-    DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback,
-    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX,
-    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    SopStepReassembly, StreamDelta, THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled,
-    drain_steering_messages, is_model_switch_requested, is_thinking_status_text,
-    is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials, thinking_status_label_round,
-    thinking_status_round, thinking_status_text,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1379,7 +1405,6 @@ pub async fn run(
         let eff_max_history_messages = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
-        let eff_model_context_window = agent.resolved.model_context_window;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -1505,7 +1530,7 @@ pub async fn run(
                 .as_ref()
                 .map(AgentExecutionCapability::config_handle),
             execution_capability.clone(),
-        );
+        )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
@@ -1608,6 +1633,8 @@ pub async fn run(
              [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
             ),
         };
+        let mut context_limits =
+            config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
 
         {
             let span = zeroclaw_log::Span::current();
@@ -2083,6 +2110,7 @@ pub async fn run(
                                         model_provider: model_provider.as_ref(),
                                         provider_name: &provider_name,
                                         model: &model_name,
+                                        dispatch_model: &model_name,
                                         temperature: effective_temperature,
                                     },
                                     ResolvedIo {
@@ -2105,9 +2133,8 @@ pub async fn run(
                                         strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_token_budget: agent
-                                            .resolved
-                                            .effective_context_budget(),
+                                        context_limits,
+                                        context_limits_resolver: None,
                                         knobs: &LoopKnobs::default(),
                                     },
                                 ),
@@ -2140,6 +2167,7 @@ pub async fn run(
                                 agent_alias: Some(agent_alias),
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
+                                served_route_sink: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
                                 }),
@@ -2194,6 +2222,11 @@ pub async fn run(
 
                             provider_name = new_model_provider;
                             model_name = new_model;
+                            context_limits = config.resolved_context_limits_for_route(
+                                agent_alias,
+                                &provider_name,
+                                &model_name,
+                            );
 
                             turn_guard.set_model_route(provider_name.clone(), model_name.clone());
 
@@ -2305,7 +2338,7 @@ pub async fn run(
                             &config.multimodal,
                             &config.pacing,
                             agent.resolved.max_tool_result_chars,
-                            agent.resolved.max_context_tokens,
+                            agent.resolved.effective_context_budget(),
                             None, // cancellation_token — no parent token in single-shot run
                             Some(agent_alias),
                         ),
@@ -2639,6 +2672,7 @@ pub async fn run(
                                             model_provider: model_provider.as_ref(),
                                             provider_name: &provider_name,
                                             model: &model_name,
+                                            dispatch_model: &model_name,
                                             temperature: turn_temperature,
                                         },
                                         ResolvedIo {
@@ -2665,9 +2699,8 @@ pub async fn run(
                                             max_tool_result_chars: agent
                                                 .resolved
                                                 .max_tool_result_chars,
-                                            context_token_budget: agent
-                                                .resolved
-                                                .effective_context_budget(),
+                                            context_limits,
+                                            context_limits_resolver: None,
                                             knobs: &LoopKnobs::default(),
                                         },
                                     ),
@@ -2700,6 +2733,7 @@ pub async fn run(
                                     agent_alias: Some(agent_alias),
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
+                                    served_route_sink: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
                                     }),
@@ -2756,6 +2790,11 @@ pub async fn run(
 
                                 provider_name = new_model_provider;
                                 model_name = new_model;
+                                context_limits = config.resolved_context_limits_for_route(
+                                    agent_alias,
+                                    &provider_name,
+                                    &model_name,
+                                );
 
                                 turn_guard
                                     .set_model_route(provider_name.clone(), model_name.clone());
@@ -2775,7 +2814,8 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
-                                let recovery_budget = eff_model_context_window * 9 / 10;
+                                let recovery_budget =
+                                    interactive_context_recovery_budget(context_limits);
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
                                     recovery_budget,
@@ -2818,9 +2858,7 @@ pub async fn run(
                                 history = result.history;
                                 let system_floor =
                                     crate::agent::history::estimate_system_floor_tokens(&history);
-                                let context_token_budget =
-                                    agent.resolved.effective_context_budget();
-                                let floor_exceeds_budget = system_floor >= context_token_budget;
+                                let floor_exceeds_budget = system_floor >= recovery_budget;
                                 {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                                         target: "zeroclaw_log_internal_scope",
@@ -2840,12 +2878,12 @@ pub async fn run(
                                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                             .with_attrs(::serde_json::json!({
                                                 "system_floor": system_floor,
-                                                "budget": context_token_budget,
+                                                "budget": recovery_budget,
                                                 "error_key": "context_floor_exceeds_budget",
                                             })),
                                             crate::agent::history::context_floor_remediation(
                                                 system_floor,
-                                                context_token_budget,
+                                                recovery_budget,
                                             )
                                         );
                                     } else {
@@ -2867,7 +2905,7 @@ pub async fn run(
                                         "\nError: {e}\n{}\n",
                                         crate::agent::history::context_floor_remediation(
                                             system_floor,
-                                            context_token_budget,
+                                            recovery_budget,
                                         )
                                     );
                                     break String::new();
@@ -2904,7 +2942,7 @@ pub async fn run(
                     let usage = ctx.snapshot_turn_usage();
                     let effective_input_tokens = usage.last_input_tokens;
                     if effective_input_tokens > 0 || usage.output_tokens > 0 {
-                        let max_ctx = eff_model_context_window as u64;
+                        let max_ctx = context_limits.model_context_window as u64;
                         let pct = if max_ctx > 0 {
                             (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
                         } else {
@@ -3018,7 +3056,28 @@ pub async fn process_message_with_capability(
 /// use this form so the original admission remains owned through delivery and
 /// any caller-side persistence instead of being reacquired from a stale input.
 pub async fn process_message_with_admission(
-    mut config: Config,
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    execution_admission: Option<AgentExecutionAdmission>,
+) -> Result<String> {
+    process_message_shared_with_admission(
+        Arc::new(config),
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        execution_admission,
+    )
+    .await
+}
+
+/// Keep the admitted snapshot shared through detached work instead of cloning
+/// the large config onto each caller's stack.
+pub(crate) async fn process_message_shared_with_admission(
+    mut config: Arc<Config>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3032,7 +3091,7 @@ pub async fn process_message_with_admission(
             admission.alias() == agent_alias,
             "agent execution admission alias changed during construction"
         );
-        config = admission.config().as_ref().clone();
+        config = Arc::clone(admission.config());
     }
     let execution_capability = execution_admission
         .as_ref()
@@ -3151,7 +3210,7 @@ pub async fn process_message_with_admission(
         };
 
         let all_tools_result_pm = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::new(config.clone()),
+            Arc::clone(&config),
             &security,
             &risk_profile,
             agent_alias,
@@ -3177,7 +3236,7 @@ pub async fn process_message_with_admission(
                 .as_ref()
                 .map(AgentExecutionCapability::config_handle),
             execution_capability.clone(),
-        );
+        )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -3259,10 +3318,11 @@ pub async fn process_message_with_admission(
             provider_name,
             provider_alias.as_str(),
         );
+        let model_provider_ref = format!("{provider_name}.{provider_alias}");
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 &config,
-                &format!("{provider_name}.{provider_alias}"),
+                &model_provider_ref,
                 agent_model_provider
                     .as_ref()
                     .and_then(|e| e.api_key.as_deref()),
@@ -3562,7 +3622,7 @@ pub async fn process_message_with_admission(
                     &mut history,
                     &tools_registry,
                     observer.as_ref(),
-                    provider_name,
+                    &model_provider_ref,
                     &model_name,
                     effective_temperature,
                     true,
@@ -3578,7 +3638,13 @@ pub async fn process_message_with_admission(
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
-                    agent.resolved.max_context_tokens,
+                    config
+                        .resolved_context_limits_for_route(
+                            agent_alias,
+                            &model_provider_ref,
+                            &model_name,
+                        )
+                        .context_token_budget,
                     // Cross-channel HITL: a route-only approval bridge when the
                     // profile sets `approval_route` and channels are live, else
                     // `None` (today's channel-less auto-deny). See above.
@@ -3684,6 +3750,17 @@ mod tests {
     };
     use zeroclaw_providers::{ChatMessage, ToolCall};
     use zeroclaw_tool_call_parser::parse_tool_calls;
+
+    fn test_context_limits(
+        context_token_budget: usize,
+    ) -> zeroclaw_config::schema::ResolvedContextLimits {
+        zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            context_token_budget,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        }
+    }
 
     fn extract_sop_started_run_id(content: &str) -> Option<String> {
         content
@@ -5390,12 +5467,14 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5414,7 +5493,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5798,12 +5878,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5822,7 +5904,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5876,12 +5959,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5900,7 +5985,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -5982,6 +6068,7 @@ mod tests {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6000,7 +6087,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6013,6 +6101,7 @@ mod tests {
             channel: None,
             collected_receipts: None,
             event_tx: None,
+            served_route_sink: None,
             steering: None,
             new_messages_out: None,
             image_cache: None,
@@ -6049,12 +6138,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6073,7 +6164,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6139,12 +6231,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6163,7 +6257,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6214,12 +6309,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6238,7 +6335,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6292,12 +6390,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6316,7 +6416,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6371,12 +6472,14 @@ mod tests {
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "scripted",
                     model: "scripted-model",
+                    dispatch_model: "scripted-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6395,7 +6498,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6437,12 +6541,14 @@ mod tests {
 
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
                         provider_name: "scripted",
                         model: "scripted-model",
+                        dispatch_model: "scripted-model",
                         temperature: Some(0.0),
                     },
                     tools_registry: &tools_registry,
@@ -6461,7 +6567,8 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
-                    context_token_budget: 0,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
                 },
@@ -6624,12 +6731,14 @@ mod tests {
 
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
                         provider_name: "scripted",
                         model: "scripted-model",
+                        dispatch_model: "scripted-model",
                         temperature: Some(0.0),
                     },
                     tools_registry: &tools_registry,
@@ -6648,7 +6757,8 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
-                    context_token_budget: 0,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
                 },
@@ -6750,12 +6860,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6774,7 +6886,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6828,12 +6941,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "scripted",
                     model: "scripted-model",
+                    dispatch_model: "scripted-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6852,7 +6967,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -6905,12 +7021,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6929,7 +7047,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7067,12 +7186,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7091,7 +7212,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7209,12 +7331,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7233,7 +7357,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7370,12 +7495,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7394,7 +7521,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7488,12 +7616,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7512,7 +7642,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7661,12 +7792,14 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7685,7 +7818,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7770,12 +7904,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7794,7 +7930,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7863,12 +8000,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7887,7 +8026,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -7948,12 +8088,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7972,7 +8114,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8041,12 +8184,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8065,7 +8210,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8137,12 +8283,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8161,7 +8309,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8239,12 +8388,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8263,7 +8414,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8333,12 +8485,14 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8357,7 +8511,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8453,12 +8608,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8477,7 +8634,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &knobs,
             },
@@ -8551,12 +8709,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8575,7 +8735,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8654,12 +8815,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8678,7 +8841,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8747,12 +8911,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8771,7 +8937,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8844,12 +9011,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8868,7 +9037,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -8943,12 +9113,14 @@ mod tests {
 
         let _result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8967,7 +9139,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9028,12 +9201,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9052,7 +9227,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9117,12 +9293,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9141,7 +9319,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9201,12 +9380,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9225,7 +9406,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9283,12 +9465,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9307,7 +9491,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9368,12 +9553,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9392,7 +9579,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9451,12 +9639,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9475,7 +9665,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9545,6 +9736,7 @@ mod tests {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9563,7 +9755,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9576,6 +9769,7 @@ mod tests {
             channel: None,
             collected_receipts: None,
             event_tx: Some(event_tx),
+            served_route_sink: None,
             steering: None,
             new_messages_out: Some(&mut new_messages_out),
             image_cache: None,
@@ -9630,12 +9824,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9654,7 +9850,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9704,12 +9901,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9728,7 +9927,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9779,12 +9979,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9803,7 +10005,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9854,12 +10057,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9878,7 +10083,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9931,12 +10137,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9955,7 +10163,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10012,12 +10221,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10036,7 +10247,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10105,12 +10317,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10129,7 +10343,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10182,12 +10397,14 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10206,7 +10423,8 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10262,12 +10480,14 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10286,7 +10506,8 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10340,12 +10561,14 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10364,7 +10587,8 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10419,12 +10643,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10443,7 +10669,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10555,12 +10782,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10579,7 +10808,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10642,12 +10872,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10666,7 +10898,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10732,12 +10965,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10756,7 +10991,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10845,12 +11081,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10869,7 +11107,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -10970,12 +11209,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10994,7 +11235,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -11064,12 +11306,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -11088,7 +11332,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -11169,12 +11414,14 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -11193,7 +11440,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -12063,12 +12311,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -12087,7 +12337,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -12170,12 +12421,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -12194,7 +12447,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -12274,12 +12528,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -12298,7 +12554,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -12378,12 +12635,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -12402,7 +12661,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -12539,12 +12799,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &router,
                     provider_name: "router",
                     model: "hint:fast",
+                    dispatch_model: "hint:fast",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -12563,7 +12825,8 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -15142,11 +15405,21 @@ Let me check the result."#;
     }
 
     #[test]
-    fn cli_outer_recovery_trims_below_model_window_with_headroom() {
+    fn cli_outer_recovery_uses_capacity_headroom_not_proactive_budget() {
         use crate::agent::history_trim::trim_to_recent_turns;
 
-        let model_context_window: usize = 32_000;
-        let recovery_budget = model_context_window * 9 / 10; // 28_800
+        let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 32_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            context_token_budget: 7_200,
+        };
+        let recovery_budget = interactive_context_recovery_budget(context_limits);
+        assert_eq!(recovery_budget, 28_800);
+        assert_ne!(
+            recovery_budget, context_limits.context_token_budget,
+            "reactive recovery must not reuse the positive proactive trim budget"
+        );
 
         let big = "x".repeat(4000);
         let mut history = vec![ChatMessage::system("sys")];
@@ -15156,7 +15429,7 @@ Let me check the result."#;
         }
         let tokens_before = super::estimate_history_tokens(&history);
         assert!(
-            tokens_before > model_context_window,
+            tokens_before > context_limits.model_context_window,
             "fixture must overflow the window: got {tokens_before}"
         );
 
@@ -15174,7 +15447,7 @@ Let me check the result."#;
         // Headroom must leave us strictly below the model's true window,
         // so the retried request has room for the reply + next user turn.
         assert!(
-            result.tokens_after < model_context_window,
+            result.tokens_after < context_limits.model_context_window,
             "headroom must leave us strictly below the model window: got {}",
             result.tokens_after
         );
@@ -15208,12 +15481,14 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -15232,7 +15507,8 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -15392,12 +15668,14 @@ Let me check the result."#;
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
+                    served_route_sink: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
                             provider_name: "mock-provider",
                             model: "mock-model",
+                            dispatch_model: "mock-model",
                             temperature: Some(0.0),
                         },
                         tools_registry:
@@ -15417,7 +15695,8 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 0,
+                        context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
@@ -15514,11 +15793,13 @@ Let me check the result."#;
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
                     sop_reassembly: None,
+                    served_route_sink: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &provider,
                             provider_name: "reliable-test",
                             model: "test-model",
+                            dispatch_model: "test-model",
                             temperature: Some(0.0),
                         },
                         tools_registry: &tools_registry,
@@ -15537,7 +15818,9 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 100,
+                        context_limits:
+                            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(100),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
@@ -15722,6 +16005,7 @@ Let me check the result."#;
                             model_provider: &provider,
                             provider_name: "reliable-test",
                             model: "test-model",
+                            dispatch_model: "test-model",
                             temperature: Some(0.0),
                         },
                         tools_registry: &tools_registry,
@@ -15740,7 +16024,13 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 100,
+                        context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                            model_context_window: 100,
+                            context_token_budget: 100,
+                            model_context_window_source:
+                                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                        },
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
@@ -15760,6 +16050,7 @@ Let me check the result."#;
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
                     turn_id: "malformed-usage-test",
+                    served_route_sink: None,
                 }),
             )
             .await
@@ -15811,12 +16102,14 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "recording-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -15837,7 +16130,8 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -15932,12 +16226,14 @@ Let me check the result."#;
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
+                    served_route_sink: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
                             provider_name: "mock-provider",
                             model: "mock-model",
+                            dispatch_model: "mock-model",
                             temperature: Some(0.0),
                         },
                         tools_registry:
@@ -15957,7 +16253,8 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 0,
+                        context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
@@ -16026,12 +16323,14 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -16052,7 +16351,8 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -16117,12 +16417,14 @@ Let me check the result."#;
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "anthropic.personal",
                     model: "claude-opus-4-8",
+                    dispatch_model: "claude-opus-4-8",
                     temperature: Some(0.0),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -16143,7 +16445,8 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 50,
+                context_limits: test_context_limits(50),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -17400,7 +17703,8 @@ Let me check the result."#;
             None,
             false,
             None,
-        );
+        )
+        .expect("tool registry builds");
 
         let before = tool_names(&built.tools);
         assert!(
@@ -17601,12 +17905,14 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -17625,7 +17931,8 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },

@@ -985,6 +985,8 @@ pub async fn run_with_authority(
             RpcContext::config_handles_for_authority(&live_config_authority);
 
         Some(std::sync::Arc::new(RpcContext {
+            #[cfg(test)]
+            config_commit_pause: None,
             config: rpc_config,
             config_write_lock: rpc_config_write_lock,
             agent_lifecycle: live_config_authority.agent_lifecycle(),
