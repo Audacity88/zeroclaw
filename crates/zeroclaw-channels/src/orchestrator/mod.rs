@@ -7014,7 +7014,9 @@ impl Channel for ApprovalTypingChannel {
             .request_approval_attributed(recipient, request)
             .await;
         if response.as_ref().is_ok_and(|response| {
-            response.as_ref().is_some_and(|response| {
+            // Unsupported approval is not a denial: the runtime may continue
+            // under ordinary shell policy without granting approval.
+            response.as_ref().is_none_or(|response| {
                 matches!(
                     response.response,
                     zeroclaw_api::channel::ChannelApprovalResponse::Approve
@@ -30649,7 +30651,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn approval_wait_pauses_typing_and_only_approval_resumes_it() {
+    async fn approval_wait_resumes_typing_for_approval_or_unsupported_response() {
         use zeroclaw_api::channel::{
             ApprovalSource, AttributedApprovalResponse, ChannelApprovalRequest,
             ChannelApprovalResponse,
@@ -30685,7 +30687,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 false,
                 false,
             ),
-            (PendingApprovalOutcome::Response(None), false, false),
+            (PendingApprovalOutcome::Response(None), true, false),
             (PendingApprovalOutcome::Error, false, true),
         ];
 
@@ -30752,7 +30754,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     }
                 })
                 .await
-                .expect("approved work should resume typing");
+                .expect("continuing work should resume typing");
             } else {
                 tokio::task::yield_now().await;
                 assert_eq!(
@@ -30764,6 +30766,148 @@ BTC is currently around $65,000 based on latest tool output."#
 
             typing.pause().await;
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_approval_resumes_typing_through_shell_gate() {
+        struct ShellProvider(Arc<PendingApprovalChannel>);
+
+        impl zeroclaw_api::attribution::Attributable for ShellProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                ToolCallingModelProvider.role()
+            }
+            fn alias(&self) -> &str {
+                "shell-typing-test"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for ShellProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while self.0.start_typing_calls.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("initial typing must start before the approval request");
+                Ok(
+                    r#"<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>"#
+                        .into(),
+                )
+            }
+
+            async fn chat_with_history(
+                &self,
+                messages: &[ChatMessage],
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                if messages
+                    .iter()
+                    .any(|message| message.content.contains("[Tool results]"))
+                {
+                    Ok("done".into())
+                } else {
+                    self.chat_with_system(None, "", model, temperature).await
+                }
+            }
+        }
+
+        struct ShellProbe {
+            channel: Arc<PendingApprovalChannel>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for ShellProbe {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                NamedMockTool("shell").role()
+            }
+            fn alias(&self) -> &str {
+                "shell"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for ShellProbe {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Observe approval and typing at execution"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}})
+            }
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                assert_eq!(
+                    args["approved"], false,
+                    "unsupported must not grant approval"
+                );
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while self.channel.start_typing_calls.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("typing must resume for the continuing shell call");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                NamedMockTool("shell").execute(args).await
+            }
+        }
+
+        let channel = Arc::new(PendingApprovalChannel::new(
+            PendingApprovalOutcome::Response(None),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut ctx = test_runtime_ctx_with_observer_and_tools(
+            channel.clone(),
+            Arc::new(ShellProvider(channel.clone())),
+            Default::default(),
+            Default::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(ShellProbe {
+                channel: channel.clone(),
+                calls: calls.clone(),
+            })],
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("unshared test context")
+            .approval_manager = Arc::new(channel_approval_manager(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ));
+        let turn = process_channel_message(
+            ctx,
+            ChannelMessage {
+                id: "typing-fallback".into(),
+                sender: "test-user".into(),
+                reply_target: "test-room".into(),
+                content: "show the working directory".into(),
+                channel: "approval-test".into(),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        );
+        let release = async {
+            channel.approval_started.notified().await;
+            assert_eq!(channel.stop_typing_calls.load(Ordering::SeqCst), 1);
+            channel.approval_release.notify_one();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(turn, release);
+        })
+        .await
+        .expect("channel turn should complete");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
