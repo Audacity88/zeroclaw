@@ -6285,7 +6285,7 @@ fn validate_thinking_overrides(
     patch: &SessionOverrides,
 ) -> Result<(), JsonRpcError> {
     use super::thinking_options::{
-        accepted_levels, capabilities_for, capabilities_for_with_config, join_displays, join_levels,
+        accepted_levels, capabilities_for_with_config, join_displays, join_levels,
     };
 
     let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
@@ -6390,8 +6390,7 @@ fn resolve_turn_thinking(
     inline_level: Option<zeroclaw_config::scattered_types::ThinkingLevel>,
 ) -> Result<Option<zeroclaw_api::model_provider::NativeThinkingParams>, JsonRpcError> {
     use super::thinking_options::{
-        accepted_levels, capabilities_for, capabilities_for_with_config, join_levels,
-        resolve_session_thinking,
+        accepted_levels, capabilities_for_with_config, join_levels, resolve_session_thinking,
     };
 
     let profile = session_thinking_profile(config, agent_alias);

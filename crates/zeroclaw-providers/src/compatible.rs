@@ -4433,7 +4433,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
             let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = tools_count > 0;
-            let reasoning_effort = provider.reasoning_effort_for_model(&model);
+            let reasoning_effort = provider.wire_reasoning_effort(&model, thinking_owned);
             let reasoning_effort_omitted =
                 provider.reasoning_effort.is_some() && reasoning_effort.is_none();
             let reasoning_effort_omission_reason =
@@ -5502,6 +5502,61 @@ mod tests {
         let provider = builder.build();
 
         (provider, captured, server)
+    }
+
+    #[tokio::test]
+    async fn effort_dialect_stream_chat_forwards_selected_effort_on_wire() {
+        use futures_util::StreamExt as _;
+
+        for with_tools in [false, true] {
+            for passthrough in [false, true] {
+                let (mut provider, captured, server) = mock_streaming_cache_capture(false).await;
+                provider.reasoning_effort = Some("low".into());
+                provider.reasoning_effort_passthrough = passthrough;
+                let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+                    "lookup",
+                    "Look up a value",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                )];
+                let messages = [ChatMessage::user("hello")];
+                let mut stream = provider.stream_chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: with_tools.then_some(tools.as_slice()),
+                        thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                            budget_tokens: None,
+                            effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
+                            display: None,
+                        }),
+                    },
+                    "custom-model",
+                    None,
+                    StreamOptions {
+                        enabled: true,
+                        count_tokens: false,
+                    },
+                );
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while let Some(event) = stream.next().await {
+                        event.expect("stream event");
+                    }
+                })
+                .await;
+                server.abort();
+                result.expect("stream finished");
+                let requests = captured.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                let body = &requests[0];
+                assert_eq!(body["stream"], true);
+                assert_eq!(body.get("tools").is_some(), with_tools);
+                if passthrough {
+                    assert_eq!(body["reasoning_effort"], "high");
+                    assert!(body.get("thinking").is_none());
+                } else {
+                    assert!(body.get("reasoning_effort").is_none());
+                }
+            }
+        }
     }
 
     /// D3 wire shape: behind the flag, the system prompt converts from
