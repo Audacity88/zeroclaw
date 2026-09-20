@@ -6284,7 +6284,9 @@ fn validate_thinking_overrides(
     merged: &SessionOverrides,
     patch: &SessionOverrides,
 ) -> Result<(), JsonRpcError> {
-    use super::thinking_options::{accepted_levels, capabilities_for, join_displays, join_levels};
+    use super::thinking_options::{
+        accepted_levels, capabilities_for, capabilities_for_with_config, join_displays, join_levels,
+    };
 
     let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
         config,
@@ -6293,7 +6295,7 @@ fn validate_thinking_overrides(
         merged.model.as_deref(),
     )
     .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-    let capabilities = capabilities_for(&model_provider, &model);
+    let capabilities = capabilities_for_with_config(config, &model_provider, &model);
     if let Some(level) = patch.thinking_level {
         let accepted = accepted_levels(
             &capabilities,
@@ -6336,7 +6338,9 @@ fn session_thinking_options(
     agent_alias: &str,
     overrides: &SessionOverrides,
 ) -> Result<ThinkingOptions, JsonRpcError> {
-    use super::thinking_options::{ThinkingContext, thinking_options};
+    use super::thinking_options::{
+        ThinkingContext, capabilities_for_with_config, thinking_options,
+    };
 
     let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
         config,
@@ -6351,6 +6355,7 @@ fn session_thinking_options(
         model: &model,
         profile: &profile,
         alias_display: alias_thinking_display(config, &model_provider),
+        capabilities: capabilities_for_with_config(config, &model_provider, &model),
         session_level: overrides.thinking_level,
         session_display: overrides.thinking_display,
     }))
@@ -6385,7 +6390,8 @@ fn resolve_turn_thinking(
     inline_level: Option<zeroclaw_config::scattered_types::ThinkingLevel>,
 ) -> Result<Option<zeroclaw_api::model_provider::NativeThinkingParams>, JsonRpcError> {
     use super::thinking_options::{
-        accepted_levels, capabilities_for, join_levels, resolve_session_thinking,
+        accepted_levels, capabilities_for, capabilities_for_with_config, join_levels,
+        resolve_session_thinking,
     };
 
     let profile = session_thinking_profile(config, agent_alias);
@@ -6397,7 +6403,10 @@ fn resolve_turn_thinking(
             overrides.model.as_deref(),
         )
         .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-        let accepted = accepted_levels(&capabilities_for(&model_provider, &model), &profile);
+        let accepted = accepted_levels(
+            &capabilities_for_with_config(config, &model_provider, &model),
+            &profile,
+        );
         if !accepted.contains(&level) {
             return Err(rpc_err(
                 INVALID_PARAMS,

@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
+use zeroclaw_config::schema::Config;
 use zeroclaw_providers::claude_models::{
     ClaudeProviderSlot, ClaudeThinkingShape, ThinkingCapabilities, thinking_capabilities,
 };
@@ -44,6 +45,39 @@ pub fn capabilities_for(model_provider: &str, model: &str) -> ThinkingCapabiliti
         .map_or(ThinkingCapabilities::NONE, |slot| {
             thinking_capabilities(slot, model)
         })
+}
+
+/// Depth levels advertised for effort-dialect backends: the values the
+/// operator verified against the live gateway when enabling the passthrough
+/// flag. `xhigh`/`max` stay excluded until verified on a real backend.
+const EFFORT_DIALECT_EFFORTS: &[ThinkingEffort] = &[ThinkingEffort::Low, ThinkingEffort::High];
+
+/// Capabilities for a `<type>.<alias>` reference, including the opt-in
+/// effort-dialect path: a `custom` alias with `reasoning_effort` configured
+/// with `reasoning_effort_passthrough` set declares an operator-verified
+/// backend that honors the param, so it
+/// advertises depth controls instead of the Claude-slot table. Displays stay
+/// unadvertised: no wire display control has been verified on these
+/// backends. Everything else falls back to `capabilities_for`.
+#[must_use]
+pub fn capabilities_for_with_config(
+    config: &Config,
+    model_provider: &str,
+    model: &str,
+) -> ThinkingCapabilities {
+    if let Some((provider_type, alias)) = model_provider.split_once('.')
+        && provider_type == "custom"
+        && let Some(slot) = config.providers.models.custom.get(alias).map(|c| &c.base)
+        && slot.reasoning_effort_passthrough
+    {
+        return ThinkingCapabilities {
+            shape: ClaudeThinkingShape::Adaptive,
+            accepts_budget: false,
+            efforts: EFFORT_DIALECT_EFFORTS,
+            displays: &[],
+        };
+    }
+    capabilities_for(model_provider, model)
 }
 
 /// The levels a session may choose, given what the model accepts and whether
@@ -124,6 +158,8 @@ pub struct ThinkingContext<'a> {
     pub profile: &'a ThinkingConfig,
     /// The display the provider alias configured, when the slot has one.
     pub alias_display: Option<ThinkingDisplay>,
+    /// Precomputed capabilities for this session's provider reference.
+    pub capabilities: ThinkingCapabilities,
     pub session_level: Option<ThinkingLevel>,
     pub session_display: Option<ThinkingDisplay>,
 }
@@ -134,7 +170,7 @@ pub struct ThinkingContext<'a> {
 /// caller can still offer to clear it.
 #[must_use]
 pub fn thinking_options(context: &ThinkingContext<'_>) -> ThinkingOptions {
-    let capabilities = capabilities_for(context.model_provider, context.model);
+    let capabilities = context.capabilities;
     let levels = accepted_levels(&capabilities, context.profile);
     let displays = capabilities.displays.to_vec();
 
@@ -268,7 +304,10 @@ pub fn join_displays(displays: &[ThinkingDisplay]) -> String {
 mod tests {
     use super::*;
     use ThinkingDisplay::{Omitted, Summarized, Updates};
+    use ThinkingEffort::{High as EffortHigh, Low as EffortLow};
     use ThinkingLevel::{High, Low, Max, Medium, XHigh};
+    use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+    use zeroclaw_providers::claude_models::ClaudeThinkingShape;
 
     fn profile(default_level: ThinkingLevel, native_thinking: bool) -> ThinkingConfig {
         ThinkingConfig {
@@ -290,6 +329,7 @@ mod tests {
             alias_display: None,
             session_level: None,
             session_display: None,
+            capabilities: capabilities_for(model_provider, model),
         }
     }
 
@@ -546,5 +586,51 @@ mod tests {
         assert_eq!(join_levels(&[Low, Medium, High]), "low, medium, high");
         assert_eq!(join_displays(&[Omitted, Updates]), "omitted, updates");
         assert_eq!(join_levels(&[]), "");
+    }
+    #[test]
+    fn effort_dialect_custom_alias_advertises_verified_levels_only() {
+        let mut config = Config::default();
+        config.providers.models.custom.insert(
+            "truefoundry".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    reasoning_effort_passthrough: true,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let caps = capabilities_for_with_config(
+            &config,
+            "custom.truefoundry",
+            "fireworks-primary/glm-5p3",
+        );
+        assert!(matches!(caps.shape, ClaudeThinkingShape::Adaptive));
+        assert_eq!(
+            caps.efforts,
+            [EffortLow, EffortHigh],
+            "only the live-verified effort ladder is advertised; got {:?}",
+            caps.efforts
+        );
+        assert!(
+            caps.displays.is_empty(),
+            "no wire display control is verified on effort-dialect backends"
+        );
+    }
+
+    #[test]
+    fn unflagged_custom_alias_stays_fail_closed() {
+        let mut config = Config::default();
+        config.providers.models.custom.insert(
+            "truefoundry".to_string(),
+            CustomModelProviderConfig::default(),
+        );
+
+        let caps = capabilities_for_with_config(
+            &config,
+            "custom.truefoundry",
+            "fireworks-primary/glm-5p3",
+        );
+        assert_eq!(caps, ThinkingCapabilities::NONE);
     }
 }

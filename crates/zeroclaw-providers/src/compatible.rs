@@ -1521,7 +1521,7 @@ impl OpenAiCompatibleModelProvider {
             temperature,
             stream: Some(false),
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, thinking),
             tool_stream: None,
             tools: None,
             tool_choice: None,
@@ -1613,11 +1613,35 @@ impl OpenAiCompatibleModelProvider {
     /// object (when any) merged under the configured `extra_body`, whose
     /// explicit keys always win. With the flag off or no params supplied,
     /// this is exactly the configured `extra_body` (byte-identical default).
+    /// The reasoning effort that travels on the wire for this request: the
+    /// turn's explicit effort when the passthrough flag makes this an
+    /// effort-dialect backend, otherwise the provider's static configured
+    /// effort (still name-filtered).
+    fn wire_reasoning_effort(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<String> {
+        if self.reasoning_effort_passthrough
+            && let Some(params) = thinking
+            && let Some(effort) = params.effort
+        {
+            return Some(effort.as_str().to_string());
+        }
+        self.reasoning_effort_for_model(model)
+    }
+
     fn request_extra_body(
         &self,
         model: &str,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> Option<serde_json::Value> {
+        if self.reasoning_effort_passthrough {
+            // Effort-dialect backend: the turn's effort rides
+            // `reasoning_effort` (see `wire_reasoning_effort`); the
+            // Anthropic-shaped thinking object is an unknown param here.
+            return self.extra_body.clone();
+        }
         let Some(mut merged) = self.thinking_request_object(model, thinking) else {
             return self.extra_body.clone();
         };
@@ -3043,7 +3067,7 @@ impl OpenAiCompatibleModelProvider {
             // Non-streaming path; `usage` is on the final response body, not
             // gated on `stream_options.include_usage`.
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, thinking),
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice,
@@ -3073,7 +3097,7 @@ impl OpenAiCompatibleModelProvider {
             temperature,
             stream: Some(false),
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, thinking),
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice: has_tool_entries.then(|| "auto".to_string()),
@@ -3141,7 +3165,7 @@ impl OpenAiCompatibleModelProvider {
                 messages
             },
             temperature,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, thinking),
             tool_stream: if options_enabled {
                 self.tool_stream_for_tools(true)
             } else {
@@ -3993,6 +4017,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             temperature,
             stream: Some(false),
             stream_options: None,
+            // Text-only helper: no turn context exists, so there are no runtime
+            // thinking params to forward. Static configured effort is the
+            // ceiling here (name filter still applies).
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: None,
             tools: None,
@@ -6280,6 +6307,106 @@ mod tests {
     }
 
     #[test]
+    fn effort_dialect_streaming_request_carries_turn_effort() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("low".to_string()))
+            .with_reasoning_effort_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
+            display: None,
+        };
+
+        let value = serde_json::to_value(p.build_streaming_native_tool_request(
+            "fireworks-primary/glm-5p3",
+            &messages,
+            None,
+            None,
+            true,
+            false,
+            Some(params),
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            value["reasoning_effort"],
+            serde_json::json!("high"),
+            "streaming requests must carry the session-selected effort under passthrough; got: {value}"
+        );
+    }
+
+    #[test]
+    fn streaming_without_flag_stays_name_filtered() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("low".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
+            display: None,
+        };
+
+        let value = serde_json::to_value(p.build_streaming_native_tool_request(
+            "fireworks-primary/glm-5p3",
+            &messages,
+            None,
+            None,
+            true,
+            false,
+            Some(params),
+            false,
+        ))
+        .unwrap();
+
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "flag-off streaming must keep the name filter for glm-style models; got: {value}"
+        );
+    }
+
+    #[test]
+    fn raw_builder_with_none_thinking_resolves_static_effort() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .with_reasoning_effort_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let value = serde_json::to_value(p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            None,
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            value["reasoning_effort"],
+            serde_json::json!("high"),
+            "raw builder with no turn params falls back to the configured effort; got: {value}"
+        );
+    }
+
+    #[test]
     fn streaming_native_tool_request_serializes_tools_and_guards_tool_choice() {
         let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
         let messages = vec![ChatMessage::user("hello")];
@@ -6577,6 +6704,104 @@ mod tests {
         assert!(
             resolved["thinking"].get("budget_tokens").is_none(),
             "adaptive shape must not carry a budget_tokens key"
+        );
+    }
+
+    #[test]
+    fn effort_dialect_passthrough_sends_turn_effort_as_reasoning_effort() {
+        // On an effort-dialect backend the turn's effort rides
+        // reasoning_effort and beats the provider's static configured value.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("low".to_string()))
+            .with_reasoning_effort_passthrough()
+            .build();
+
+        let req = p.build_native_tool_chat_request(
+            &[ChatMessage::user("hello")],
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            Some(params),
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "turn effort must beat the static configured value on effort-dialect backends; got: {value}"
+        );
+    }
+
+    #[test]
+    fn effort_dialect_passthrough_suppresses_anthropic_thinking_object() {
+        // The Anthropic-shaped thinking object is an unknown param on
+        // effort-dialect backends; the flag selects the dialect, so the
+        // object must not be injected.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_reasoning_effort_passthrough()
+            .build();
+
+        let resolved = p.request_extra_body("fireworks-primary/glm-5p3", Some(params));
+        match &resolved {
+            None => {} // no extra_body configured: nothing injected at all
+            Some(v) => assert!(
+                v.get("thinking").is_none(),
+                "effort-dialect backends must not receive the anthropic thinking object; got: {v}"
+            ),
+        }
+    }
+
+    #[test]
+    fn without_passthrough_turn_effort_never_reaches_non_openai_models() {
+        // Fail-closed default: no flag, non-OpenAI model name — the turn's
+        // effort is not forwarded, and the name filter keeps deciding.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("low".to_string()))
+            .build();
+
+        let req = p.build_native_tool_chat_request(
+            &[ChatMessage::user("hello")],
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            Some(params),
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "flag-off must preserve the name filter for glm-style models; got: {value}"
         );
     }
 
