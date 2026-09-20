@@ -573,10 +573,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
-    // Text withheld by the streaming text guard on a previous attempt. An
-    // identical repeat means the model produced the same protocol-shaped
-    // prose again; another retry would suppress it again, so the turn ends
-    // with a notice instead of spending more provider calls.
+    // Text withheld by the streaming text guard on a previous attempt,
+    // stored with its trailing whitespace trimmed. A repeat that is
+    // identical up to trailing whitespace means the model produced the same
+    // protocol-shaped prose again; another retry would suppress it again,
+    // so the turn ends with a notice instead of spending more provider
+    // calls.
     let mut last_guard_suppressed_text: Option<String> = None;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -1143,7 +1145,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             );
 
             if protocol_suppressed {
-                if last_guard_suppressed_text.as_deref() == Some(response_text.as_str()) {
+                // Trailing whitespace is not a semantic difference: the same
+                // suppressed envelope with or without a final newline is
+                // still the same reply, so compare trimmed ends and store
+                // the trimmed form. The delivered text is not rewritten.
+                let suppressed_text = response_text.trim_end().to_string();
+                if last_guard_suppressed_text.as_deref() == Some(suppressed_text.as_str()) {
                     // The guard withheld the same text twice: retrying cannot
                     // recover prose the guard keeps suppressing, so end the
                     // turn with a notice instead of another provider call.
@@ -1158,7 +1165,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     turn_state.push_dual(msg);
                     return Ok(accumulated_display_text);
                 }
-                last_guard_suppressed_text = Some(response_text.clone());
+                last_guard_suppressed_text = Some(suppressed_text);
             }
 
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
@@ -1283,8 +1290,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
-            // `protocol_suppressed` withholds the whole turn; the empty-remainder
-            // skip below handles the guard-passed case where the live stream already forwarded every byte.
+            // `protocol_suppressed` withholds from the suppressed candidate onward; the prose
+            // ahead of it is already delivered, and the empty-remainder skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
                 && let Some(ref tx) = on_delta

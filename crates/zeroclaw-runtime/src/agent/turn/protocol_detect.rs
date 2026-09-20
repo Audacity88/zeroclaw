@@ -15,6 +15,24 @@ pub(crate) fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize
         .unwrap_or(0)
 }
 
+/// Fence-opener patterns a candidate finder recognizes. A match anywhere
+/// inside a longer backtick run still identifies that run's fence, so a
+/// found index is walked back to the run's first backtick.
+const FENCE_PATTERNS: [&str; 3] = ["```tool", "```invoke", "```json"];
+
+/// Walk a fence-pattern match at `idx` back to the first backtick of the
+/// run it sits in. A candidate seeded at a fence opener must begin at the
+/// start of the opening run: a finder that matched only the last three
+/// backticks of a four-backtick opener hands the guard a shortened fence
+/// that a three-backtick line can then close.
+fn fence_pattern_run_start(text: &str, idx: usize) -> usize {
+    let mut start = idx;
+    while start > 0 && text.as_bytes()[start - 1] == b'`' {
+        start -= 1;
+    }
+    start
+}
+
 pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
     let mut earliest: Option<usize> = None;
@@ -25,12 +43,16 @@ pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize
         "<tool-call",
         "<invoke",
         "<function",
-        "```tool",
-        "```invoke",
-        "```json",
     ] {
         if let Some(idx) = lower.find(pattern) {
             earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
+        }
+    }
+
+    for pattern in FENCE_PATTERNS {
+        if let Some(idx) = lower.find(pattern) {
+            let start = fence_pattern_run_start(text, idx);
+            earliest = Some(earliest.map_or(start, |current| current.min(start)));
         }
     }
 
@@ -49,16 +71,16 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
     let lower = text.to_ascii_lowercase();
     let mut earliest: Option<usize> = None;
 
-    for pattern in [
-        "<tool",
-        "<invoke",
-        "<function",
-        "```tool",
-        "```invoke",
-        "```json",
-    ] {
+    for pattern in ["<tool", "<invoke", "<function"] {
         if let Some(idx) = lower.rfind(pattern) {
             earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
+        }
+    }
+
+    for pattern in FENCE_PATTERNS {
+        if let Some(idx) = lower.rfind(pattern) {
+            let start = fence_pattern_run_start(text, idx);
+            earliest = Some(earliest.map_or(start, |current| current.min(start)));
         }
     }
 
@@ -78,6 +100,22 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
     earliest
 }
 
+/// Whether lowercased, trimmed text begins with a fence opener: a run of
+/// three or more backticks followed by the `json`, `tool`, or `invoke`
+/// language label. An opening run of any length from three up is a fence,
+/// so prefix routing must not recognize only the exact three-backtick
+/// spelling and let a longer opener pass as ordinary text.
+fn starts_with_suspicious_fence_opener(lower: &str) -> bool {
+    let run = lower.chars().take_while(|&ch| ch == '`').count();
+    if run < 3 {
+        return false;
+    }
+    let after_run = &lower[run..];
+    after_run.starts_with("json")
+        || after_run.starts_with("tool")
+        || after_run.starts_with("invoke")
+}
+
 pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
     let trimmed = text.trim_start();
     if trimmed.is_empty() {
@@ -89,9 +127,7 @@ pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
         || lower.starts_with("<tool")
         || lower.starts_with("<invoke")
         || lower.starts_with("<function")
-        || lower.starts_with("```tool")
-        || lower.starts_with("```invoke")
-        || lower.starts_with("```json")
+        || starts_with_suspicious_fence_opener(&lower)
 }
 
 pub(crate) fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
@@ -99,9 +135,7 @@ pub(crate) fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
     lower.starts_with("<tool")
         || lower.starts_with("<invoke")
         || lower.starts_with("<function")
-        || lower.starts_with("```tool")
-        || lower.starts_with("```invoke")
-        || lower.starts_with("```json")
+        || starts_with_suspicious_fence_opener(&lower)
         || lower.starts_with("[tool_call]")
 }
 
@@ -178,45 +212,93 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
     looks_like_tool_protocol_envelope(trimmed).then(|| message.into())
 }
 
-/// Whether a JSON-fenced block in `text` carries non-fence text after its
-/// closing fence. A candidate that begins with a `json` fence but is followed
-/// by ordinary text is quoted material inside a larger message, not a
-/// whole-message envelope. An unterminated fence is not trailing text: the
-/// stream may simply be cut, and the fence is all there is so far.
-pub(crate) fn json_fence_has_trailing_text(text: &str) -> bool {
-    let trimmed = text.trim();
-    let Some(rest) = trimmed.strip_prefix("```") else {
-        return false;
-    };
-    let Some(first_newline) = rest.find('\n') else {
-        return false;
-    };
-    let language = rest[..first_newline].trim().trim_end_matches('\r');
-    if !language.eq_ignore_ascii_case("json") {
-        return false;
+/// The start of the body of the `json` fence that leads `text` (just past
+/// its opening line) and the length of the opener's backtick run. `None`
+/// when `text` does not begin with a fence opener of three or more
+/// backticks labeled `json`.
+fn json_fence_opener(text: &str) -> Option<(usize, usize)> {
+    let leading_whitespace = text.len() - text.trim_start().len();
+    let rest = &text[leading_whitespace..];
+    let opener_run = rest.chars().take_while(|&ch| ch == '`').count();
+    if opener_run < 3 {
+        return None;
     }
-
-    let body_with_close = &rest[first_newline + 1..];
-    let Some(close_start) = body_with_close.rfind("```") else {
-        return false;
-    };
-    !body_with_close[close_start + 3..].trim().is_empty()
+    let after_run = &rest[opener_run..];
+    let opener_line_end = after_run.find('\n')?;
+    let language = after_run[..opener_line_end].trim().trim_end_matches('\r');
+    if !language.eq_ignore_ascii_case("json") {
+        return None;
+    }
+    Some((
+        leading_whitespace + opener_run + opener_line_end + 1,
+        opener_run,
+    ))
 }
 
-pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
-    let rest = trimmed.strip_prefix("```")?;
-    let first_newline = rest.find('\n')?;
-    let language = rest[..first_newline].trim().trim_end_matches('\r');
-    if !language.eq_ignore_ascii_case("json") {
-        return None;
+/// Byte offset just past the real closing fence line of a `json` fence that
+/// leads `text`. The close is a line whose entire content is a backtick run
+/// at least as long as the opener's run, so a run of backticks inside a
+/// JSON string is string content, never a close. `None` when the fence is
+/// unterminated: no such line has arrived, and the stream may simply be cut.
+pub(crate) fn json_fence_close_end(text: &str) -> Option<usize> {
+    let (body_start, opener_run) = json_fence_opener(text)?;
+    let mut line_start = body_start;
+    for line in text[body_start..].split_inclusive('\n') {
+        let content = line.trim();
+        if !content.is_empty() && content.chars().all(|ch| ch == '`') && content.len() >= opener_run
+        {
+            let run_start = line_start + (line.len() - line.trim_start().len());
+            return Some(run_start + content.len());
+        }
+        line_start += line.len();
     }
+    None
+}
 
-    let body_with_close = &rest[first_newline + 1..];
-    let close_start = body_with_close.rfind("```")?;
-    if !body_with_close[close_start + 3..].trim().is_empty() {
+/// Whether a JSON-fenced block in `text` carries non-fence text after its
+/// real closing fence line. A candidate that begins with a `json` fence but
+/// is followed by ordinary text is quoted material inside a larger message,
+/// not a whole-message envelope. The close is a line of backticks at least
+/// as long as the opener; an unterminated fence is not trailing text, since
+/// the stream may simply be cut and the fence is all there is so far.
+pub(crate) fn json_fence_has_trailing_text(text: &str) -> bool {
+    json_fence_close_end(text).is_some_and(|close_end| !text[close_end..].trim().is_empty())
+}
+
+/// The body of a `json` fence that leads `text` and is closed by a real
+/// closing fence line with nothing but whitespace after it. The close is
+/// the line rule `json_fence_close_end` applies, a backtick run at least
+/// as long as the opener alone on its line, so a longer opener cannot be
+/// closed by a shorter run and a run inside a JSON string is string
+/// content, never the close.
+pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
+    let (body_start, _) = json_fence_opener(trimmed)?;
+    let close_end = json_fence_close_end(trimmed)?;
+    if !trimmed[close_end..].trim().is_empty() {
         return None;
     }
-    Some(body_with_close[..close_start].trim())
+    let close_line_start = trimmed[..close_end]
+        .rfind('\n')
+        .map_or(body_start, |newline| newline + 1);
+    Some(trimmed[body_start..close_line_start].trim())
+}
+
+/// The body of the `json` fence that leads a candidate, for the guard's
+/// detectors to judge: the text after the opening line through the real
+/// closing fence line when it has arrived, or to the end of the candidate
+/// while the fence is still open. Unlike [`json_fence_body`] this neither
+/// requires a close nor rejects a tail: an unterminated fence still has a
+/// body, and text past an arrived close belongs to the re-scanned
+/// remainder, not to the body.
+pub(crate) fn json_fence_candidate_body(candidate: &str) -> Option<&str> {
+    let (body_start, _) = json_fence_opener(candidate)?;
+    let body_end = match json_fence_close_end(candidate) {
+        Some(close_end) => candidate[..close_end]
+            .rfind('\n')
+            .map_or(body_start, |newline| newline + 1),
+        None => candidate.len(),
+    };
+    Some(candidate[body_start..body_end].trim())
 }
 
 #[cfg(test)]
@@ -229,7 +311,7 @@ mod tests {
     #[test]
     fn fence_with_text_after_close_has_trailing_text() {
         assert!(json_fence_has_trailing_text(
-            "```json\n{\"a\": 1}\n``` and then prose"
+            "```json\n{\"a\": 1}\n```\nand then prose"
         ));
     }
 
@@ -245,6 +327,39 @@ mod tests {
     fn unterminated_fence_has_no_trailing_text() {
         // The body so far is all there is; the stream may simply be cut.
         assert!(!json_fence_has_trailing_text("```json\n{\"a\":"));
+        // A backtick run inside a JSON string is string content, not a close.
+        assert!(!json_fence_has_trailing_text(
+            "```json\n{\"name\": \"shell\", \"arguments\": {\"command\": \"echo ```done\"}}"
+        ));
+        // Backticks sharing their line with other text do not close either.
+        assert!(!json_fence_has_trailing_text(
+            "```json\n{\"a\": 1}\n``` and then prose"
+        ));
+    }
+
+    #[test]
+    fn inner_backtick_run_with_real_close_and_text_after_has_trailing_text() {
+        // The string's inner run is skipped; the real closing fence line is
+        // the close, and the text after it is trailing.
+        assert!(json_fence_has_trailing_text(
+            "```json\n{\"command\": \"echo ```done\"}\n```\nand then prose"
+        ));
+    }
+
+    #[test]
+    fn four_backtick_opener_ignores_shorter_close_run() {
+        // A three-backtick line is too short to close a four-backtick fence.
+        assert!(!json_fence_has_trailing_text(
+            "````json\n{\"a\": 1}\n```\nstill inside the fence\ntrailing"
+        ));
+    }
+
+    #[test]
+    fn four_backtick_opener_closes_with_matching_run() {
+        assert!(json_fence_has_trailing_text(
+            "````json\n{\"a\": 1}\n````\nand then prose"
+        ));
+        assert!(!json_fence_has_trailing_text("````json\n{\"a\": 1}\n````"));
     }
 
     #[test]
@@ -266,5 +381,44 @@ mod tests {
     fn embedded_finder_selects_container_object_start() {
         let text = "nope {\"tool_calls\": []}";
         assert_eq!(find_embedded_protocol_candidate_start(text), Some(5));
+    }
+
+    #[test]
+    fn finders_seed_four_backtick_opener_at_its_run_start() {
+        // The pattern match lands on the last three backticks of the
+        // four-backtick run; the candidate must begin at the first one so
+        // a three-backtick line can never close this fence.
+        assert_eq!(
+            find_embedded_protocol_candidate_start("````json\n{\"a\": 1}\n```\nstill inside"),
+            Some(0)
+        );
+        assert_eq!(
+            find_embedded_protocol_candidate_start("prose\n````json\n{\"a\": 1}"),
+            Some(6)
+        );
+        assert_eq!(
+            find_incomplete_protocol_candidate_start("````json\n{\"a\""),
+            Some(0)
+        );
+        assert_eq!(
+            find_incomplete_protocol_candidate_start("prose ````json\n{\"a\""),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn finders_keep_exact_three_backtick_opener_start() {
+        assert_eq!(
+            find_embedded_protocol_candidate_start("```json\n{\"a\": 1}"),
+            Some(0)
+        );
+        assert_eq!(
+            find_embedded_protocol_candidate_start("prose\n```json\n{\"a\": 1}"),
+            Some(6)
+        );
+        assert_eq!(
+            find_incomplete_protocol_candidate_start("```json\n{\"a\""),
+            Some(0)
+        );
     }
 }

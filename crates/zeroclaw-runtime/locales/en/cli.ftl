@@ -997,10 +997,14 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
-# Safe reply delivered when the streaming protocol guard withholds the same
-# response text twice: retrying cannot recover prose the guard keeps
-# suppressing, so the turn ends instead of spending another model call.
-cli-agent-error-protocol-guard-withheld = I withheld this reply because its text matched the internal tool-protocol guard, and a retry produced the same text. Nothing from the reply was delivered.
+# Safe reply delivered when the streaming protocol guard withheld the same
+# response text on two attempts that were both rejected as tool-protocol
+# parse issues (a recovered valid tool call is not stopped this way):
+# retrying cannot recover the withheld envelope, so the turn ends instead of
+# spending another model call. Prose released ahead of the envelope may
+# already have reached the user, so the text claims nothing about the rest
+# of the reply.
+cli-agent-error-protocol-guard-withheld = I withheld the tool-protocol-shaped part of this reply, and a retry produced the same text.
 channel-runtime-progress-received = Received
 channel-runtime-progress-planning = Planning
 channel-runtime-progress-waiting-on-model = Waiting on model
