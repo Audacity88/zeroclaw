@@ -14854,6 +14854,7 @@ model_provider = "custom.only"
     ) -> zeroclaw_config::schema::Config {
         let provider_ref = format!("custom.{provider_alias}");
         let mut cfg = zeroclaw_config::schema::Config {
+            config_path: data_dir.join("config.toml"),
             data_dir: data_dir.to_path_buf(),
             memory: zeroclaw_config::schema::MemoryConfig {
                 backend: "none".into(),
@@ -14931,13 +14932,13 @@ model_provider = "custom.only"
                 let (entered, ready) = tokio::sync::oneshot::channel();
                 let blocker = tokio::task::spawn_blocking(move || {
                     entered.send(()).unwrap();
-                    let _ = blocked.recv_timeout(Duration::from_secs(10));
+                    let _ = blocked.recv();
                 });
                 tokio::time::timeout(Duration::from_secs(5), ready)
                     .await
                     .unwrap()
                     .unwrap();
-                let caller = tokio::spawn(async move {
+                let caller = zeroclaw_spawn::spawn!(async move {
                     let result = Agent::from_snapshot_with_tui_env_with_capability(
                         &config, live, "direct", None, false, true, None, None, None,
                         Some(capability), None,
