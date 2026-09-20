@@ -35,8 +35,6 @@ use ratatui::text::{Line, Span, StyledGrapheme};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::text_selection::{TextRowBreak, row_breaks_for_line};
-
 const PREFIX: &str = "(thinking) ";
 
 #[derive(Clone, Debug)]
@@ -85,18 +83,24 @@ pub(crate) struct WrappedRangeRun {
 
 impl WrappedLineLayout {
     pub(crate) fn new(line: &Line<'_>, width: u16) -> Self {
-        let (pieces, symbol_ends, symbol_widths, row_ends, row_widths) =
-            wrap_symbols(symbols(line), width);
+        let mut layout = Self::empty(width, line.alignment.unwrap_or(Alignment::Left));
+        let mut wrapper = WrapState::default();
+        wrapper.feed(symbols(line), &mut layout);
+        wrapper.finish(&mut layout);
+        layout
+    }
+
+    fn empty(width: u16, alignment: Alignment) -> Self {
         #[cfg(test)]
         static GENERATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         Self {
             width,
-            pieces,
-            symbol_ends,
-            symbol_widths,
-            row_ends,
-            row_widths,
-            alignment: line.alignment.unwrap_or(Alignment::Left),
+            pieces: Vec::new(),
+            symbol_ends: Vec::new(),
+            symbol_widths: Vec::new(),
+            row_ends: Vec::new(),
+            row_widths: Vec::new(),
+            alignment,
             #[cfg(test)]
             generation: GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
@@ -155,16 +159,19 @@ impl WrappedLineLayout {
         }
     }
 
-    pub(crate) fn range_runs(
+    pub(crate) fn range_runs(&self, ranges: &[(usize, usize, String)]) -> Vec<WrappedRangeRun> {
+        self.range_runs_rows(ranges, 0..self.row_count())
+    }
+
+    fn range_runs_rows(
         &self,
-        line: &Line<'_>,
         ranges: &[(usize, usize, String)],
+        rows: Range<u16>,
     ) -> Vec<WrappedRangeRun> {
         let mut runs: Vec<WrappedRangeRun> = Vec::new();
-        let mut range_index = 0;
         // Transcript coordinates are `u16`; never wrap unreachable rows back
         // into the visible range when one pathological line exceeds the cap.
-        for row in 0..usize::from(self.row_count()) {
+        for row in usize::from(rows.start)..usize::from(rows.end.min(self.row_count())) {
             let start = if row == 0 { 0 } else { self.row_ends[row - 1] };
             let mut column = match self.alignment {
                 Alignment::Center => (self.width / 2).saturating_sub(self.row_widths[row] / 2),
@@ -172,22 +179,20 @@ impl WrappedLineLayout {
                 Alignment::Left => 0,
             };
             for piece in &self.pieces[start..self.row_ends[row]] {
-                let Some(span) = line.spans.get(piece.span) else {
-                    continue;
-                };
-                let text = &span.content[piece.span_range.clone()];
-                for (relative, symbol) in text.grapheme_indices(true) {
-                    let symbol_width = symbol.width() as u16;
+                let mut source = piece.virtual_range.start;
+                let mut span_start = piece.span_range.start;
+                for symbol in piece.symbols.clone() {
+                    let symbol_width = self.symbol_widths[symbol];
+                    let symbol_start = source;
+                    source += self.symbol_ends[symbol] - span_start;
+                    span_start = self.symbol_ends[symbol];
                     if symbol_width == 0 || column >= self.width {
                         continue;
                     }
-                    let source = piece.virtual_range.start + relative;
-                    while range_index < ranges.len() && ranges[range_index].1 <= source {
-                        range_index += 1;
-                    }
+                    let range_index = ranges.partition_point(|range| range.1 <= symbol_start);
                     if let Some((lo, hi, _)) = ranges.get(range_index)
-                        && source >= *lo
-                        && source < *hi
+                        && symbol_start >= *lo
+                        && symbol_start < *hi
                     {
                         let width = symbol_width.min(self.width - column);
                         if let Some(previous) = runs.last_mut()
@@ -222,9 +227,21 @@ impl WrappedLineLayout {
 pub(crate) struct ThoughtLayout {
     text: Arc<str>,
     layout: WrappedLineLayout,
-    row_breaks: Vec<TextRowBreak>,
     urls: Vec<(usize, usize, String)>,
     url_runs: Vec<WrappedRangeRun>,
+    streaming: Option<StreamingThought>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StreamingThought {
+    wrapper: WrapState,
+    /// State before the provisional EOF tail was painted.
+    settled: (usize, usize, usize),
+    next_byte: usize,
+    text_len: usize,
+    url_frontier: usize,
+    #[cfg(test)]
+    scanned_bytes: usize,
 }
 
 impl ThoughtLayout {
@@ -237,22 +254,130 @@ impl ThoughtLayout {
         let (layout, url_runs) = {
             let line = Line::from(vec![Span::raw(PREFIX), Span::raw(text.as_ref())]);
             let layout = WrappedLineLayout::new(&line, width);
-            let url_runs = layout.range_runs(&line, &urls);
+            let url_runs = layout.range_runs(&urls);
             (layout, url_runs)
         };
-        // Keep the existing selection/copy separator contract; layout changes
-        // must not turn soft wrapping into newlines in copied text.
-        let row_breaks = row_breaks_for_line(
-            &Line::from(vec![Span::raw(PREFIX), Span::raw(text.to_string())]),
-            width,
-        );
         Self {
             text,
             layout,
-            row_breaks,
             urls,
             url_runs,
+            streaming: None,
         }
+    }
+
+    pub(crate) fn streaming(width: u16) -> Self {
+        let mut layout = WrappedLineLayout::empty(width, Alignment::Left);
+        let mut stream = StreamingThought::default();
+        stream
+            .wrapper
+            .feed(symbols(&Line::from(PREFIX)), &mut layout);
+        stream.settled = (
+            layout.pieces.len(),
+            layout.symbol_ends.len(),
+            layout.row_ends.len(),
+        );
+        Self {
+            text: Arc::from(""),
+            layout,
+            urls: Vec::new(),
+            url_runs: Vec::new(),
+            streaming: Some(stream),
+        }
+    }
+
+    pub(crate) fn append_streaming(
+        &mut self,
+        text: &str,
+        recognize: fn(&str) -> Vec<(usize, usize, String)>,
+    ) {
+        let stream = self.streaming.as_mut().expect("streaming layout");
+        if stream.text_len == text.len() && !self.layout.row_ends.is_empty() {
+            return;
+        }
+        debug_assert!(text.len() >= stream.text_len);
+        let (pieces, symbols_len, rows) = stream.settled;
+        self.layout.pieces.truncate(pieces);
+        self.layout.symbol_ends.truncate(symbols_len);
+        self.layout.symbol_widths.truncate(symbols_len);
+        self.layout.row_ends.truncate(rows);
+        self.layout.row_widths.truncate(rows);
+
+        // Appending can extend the last grapheme (combining marks, ZWJ, RI).
+        // Keep that grapheme outside the committed wrapper state.
+        let mut graphemes = text[stream.next_byte..].grapheme_indices(true).peekable();
+        let offset = stream.next_byte;
+        let mut tail = None;
+        while let Some((start, grapheme)) = graphemes.next() {
+            #[cfg(test)]
+            {
+                stream.scanned_bytes += grapheme.len();
+            }
+            let start = offset + start;
+            let symbol = thought_symbol(start, grapheme);
+            if graphemes.peek().is_none() {
+                stream.next_byte = start;
+                tail = symbol;
+            } else {
+                stream.wrapper.feed(symbol, &mut self.layout);
+            }
+        }
+        stream.settled = (
+            self.layout.pieces.len(),
+            self.layout.symbol_ends.len(),
+            self.layout.row_ends.len(),
+        );
+        let mut preview = stream.wrapper.clone();
+        #[cfg(test)]
+        {
+            stream.scanned_bytes += preview
+                .pending_line
+                .iter()
+                .chain(&preview.pending_word)
+                .chain(&preview.pending_whitespace)
+                .map(|symbol| symbol.span_range.len())
+                .sum::<usize>();
+        }
+        preview.feed(tail, &mut self.layout);
+        preview.finish(&mut self.layout);
+
+        let frontier = stream.url_frontier;
+        #[cfg(test)]
+        {
+            stream.scanned_bytes += text[frontier..].len();
+        }
+        self.urls.truncate(
+            self.urls
+                .partition_point(|url| url.0 < PREFIX.len() + frontier),
+        );
+        self.urls.extend(
+            recognize(&text[frontier..])
+                .into_iter()
+                .map(|(lo, hi, url)| {
+                    (
+                        PREFIX.len() + frontier + lo,
+                        PREFIX.len() + frontier + hi,
+                        url,
+                    )
+                }),
+        );
+        stream.url_frontier = text[frontier..]
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map_or(frontier, |(i, ch)| frontier + i + ch.len_utf8());
+        stream.text_len = text.len();
+    }
+
+    pub(crate) fn streaming_url_runs(&self, rows: Range<u16>) -> Vec<(u16, u16, u16, usize, &str)> {
+        self.layout
+            .range_runs_rows(&self.urls, rows)
+            .into_iter()
+            .map(|run| {
+                let (start, _, url) = &self.urls[run.range_index];
+                (run.row, run.column, run.width, *start, url.as_str())
+            })
+            .collect()
     }
 
     pub(crate) fn url_runs(
@@ -281,13 +406,16 @@ impl ThoughtLayout {
         self.layout.width
     }
 
-    pub(crate) fn row_breaks(&self) -> &[TextRowBreak] {
-        &self.row_breaks
-    }
-
     #[cfg(test)]
     pub(crate) fn generation(&self) -> usize {
         self.layout.generation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scanned_bytes(&self) -> usize {
+        self.streaming
+            .as_ref()
+            .map_or(0, |stream| stream.scanned_bytes)
     }
 
     pub(crate) fn render(
@@ -298,13 +426,42 @@ impl ThoughtLayout {
         area: Rect,
         buffer: &mut Buffer,
     ) {
+        self.render_text(&self.text, rows, prefix_style, body_style, area, buffer);
+    }
+
+    pub(crate) fn render_text(
+        &self,
+        text: &str,
+        rows: Range<usize>,
+        prefix_style: Style,
+        body_style: Style,
+        area: Rect,
+        buffer: &mut Buffer,
+    ) {
         let line = Line::from(vec![
             Span::styled(PREFIX, prefix_style),
-            Span::styled(self.text.as_ref(), body_style),
+            Span::styled(text, body_style),
         ]);
         self.layout
             .render(&line, rows, Style::default(), area, buffer);
     }
+}
+
+fn thought_symbol(start: usize, grapheme: &str) -> Option<Symbol> {
+    if grapheme.contains(char::is_control) {
+        return None;
+    }
+    Some(Symbol {
+        virtual_range: PREFIX.len() + start..PREFIX.len() + start + grapheme.len(),
+        span: 1,
+        span_range: start..start + grapheme.len(),
+        width: grapheme.width() as u16,
+        whitespace: StyledGrapheme {
+            symbol: grapheme,
+            style: Style::default(),
+        }
+        .is_whitespace(),
+    })
 }
 
 fn symbols(line: &Line<'_>) -> Vec<Symbol> {
@@ -337,108 +494,113 @@ fn symbols(line: &Line<'_>) -> Vec<Symbol> {
         .collect()
 }
 
-fn wrap_symbols(
-    symbols: Vec<Symbol>,
-    width: u16,
-) -> (Vec<SourcePiece>, Vec<usize>, Vec<u16>, Vec<usize>, Vec<u16>) {
-    if width == 0 {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    }
+#[derive(Clone, Debug, Default)]
+struct WrapState {
+    pending_line: Vec<Symbol>,
+    pending_word: Vec<Symbol>,
+    pending_whitespace: VecDeque<Symbol>,
+    line_width: u16,
+    word_width: u16,
+    whitespace_width: u16,
+    non_whitespace_previous: bool,
+}
 
-    let mut pieces = Vec::new();
-    let mut symbol_ends = Vec::new();
-    let mut symbol_widths = Vec::new();
-    let mut row_ends = Vec::new();
-    let mut row_widths = Vec::new();
-    let mut pending_line: Vec<Symbol> = Vec::new();
-    let mut pending_word: Vec<Symbol> = Vec::new();
-    let mut pending_whitespace: VecDeque<Symbol> = VecDeque::new();
-    let mut line_width = 0u16;
-    let mut word_width = 0u16;
-    let mut whitespace_width = 0u16;
-    let mut non_whitespace_previous = false;
-
-    for symbol in symbols {
-        if symbol.width > width {
-            continue;
-        }
-        let word_found = non_whitespace_previous && symbol.whitespace;
-        let untrimmed_overflow = pending_line.is_empty()
-            && word_width
-                .saturating_add(whitespace_width)
-                .saturating_add(symbol.width)
-                > width;
-        if word_found || untrimmed_overflow {
-            pending_line.extend(pending_whitespace.drain(..));
-            line_width = line_width.saturating_add(whitespace_width);
-            pending_line.append(&mut pending_word);
-            line_width = line_width.saturating_add(word_width);
-            whitespace_width = 0;
-            word_width = 0;
+impl WrapState {
+    fn feed(&mut self, symbols: impl IntoIterator<Item = Symbol>, layout: &mut WrappedLineLayout) {
+        let width = layout.width;
+        if width == 0 {
+            return;
         }
 
-        let line_full = line_width >= width;
-        let pending_word_overflow = symbol.width > 0
-            && line_width
-                .saturating_add(whitespace_width)
-                .saturating_add(word_width)
-                >= width;
-        if line_full || pending_word_overflow {
-            let mut remaining_width = width.saturating_sub(line_width);
-            append_row(
-                mem::take(&mut pending_line),
-                line_width,
-                &mut pieces,
-                &mut symbol_ends,
-                &mut symbol_widths,
-                &mut row_ends,
-                &mut row_widths,
-            );
-            line_width = 0;
-            while let Some(candidate) = pending_whitespace.front() {
-                if candidate.width > remaining_width {
-                    break;
-                }
-                whitespace_width = whitespace_width.saturating_sub(candidate.width);
-                remaining_width = remaining_width.saturating_sub(candidate.width);
-                pending_whitespace.pop_front();
-            }
-            if symbol.whitespace && pending_whitespace.is_empty() {
+        for symbol in symbols {
+            if symbol.width > width {
                 continue;
             }
-        }
+            let word_found = self.non_whitespace_previous && symbol.whitespace;
+            let untrimmed_overflow = self.pending_line.is_empty()
+                && self
+                    .word_width
+                    .saturating_add(self.whitespace_width)
+                    .saturating_add(symbol.width)
+                    > width;
+            if word_found || untrimmed_overflow {
+                self.pending_line.extend(self.pending_whitespace.drain(..));
+                self.line_width = self.line_width.saturating_add(self.whitespace_width);
+                self.pending_line.append(&mut self.pending_word);
+                self.line_width = self.line_width.saturating_add(self.word_width);
+                self.whitespace_width = 0;
+                self.word_width = 0;
+            }
 
-        non_whitespace_previous = !symbol.whitespace;
-        if symbol.whitespace {
-            whitespace_width = whitespace_width.saturating_add(symbol.width);
-            pending_whitespace.push_back(symbol);
-        } else {
-            word_width = word_width.saturating_add(symbol.width);
-            pending_word.push(symbol);
+            let line_full = self.line_width >= width;
+            let pending_word_overflow = symbol.width > 0
+                && self
+                    .line_width
+                    .saturating_add(self.whitespace_width)
+                    .saturating_add(self.word_width)
+                    >= width;
+            if line_full || pending_word_overflow {
+                let mut remaining_width = width.saturating_sub(self.line_width);
+                append_row(
+                    mem::take(&mut self.pending_line),
+                    self.line_width,
+                    &mut layout.pieces,
+                    &mut layout.symbol_ends,
+                    &mut layout.symbol_widths,
+                    &mut layout.row_ends,
+                    &mut layout.row_widths,
+                );
+                self.line_width = 0;
+                while let Some(candidate) = self.pending_whitespace.front() {
+                    if candidate.width > remaining_width {
+                        break;
+                    }
+                    self.whitespace_width = self.whitespace_width.saturating_sub(candidate.width);
+                    remaining_width = remaining_width.saturating_sub(candidate.width);
+                    self.pending_whitespace.pop_front();
+                }
+                if symbol.whitespace && self.pending_whitespace.is_empty() {
+                    continue;
+                }
+            }
+
+            self.non_whitespace_previous = !symbol.whitespace;
+            if symbol.whitespace {
+                self.whitespace_width = self.whitespace_width.saturating_add(symbol.width);
+                self.pending_whitespace.push_back(symbol);
+            } else {
+                self.word_width = self.word_width.saturating_add(symbol.width);
+                self.pending_word.push(symbol);
+            }
         }
     }
 
-    pending_line.extend(pending_whitespace);
-    pending_line.append(&mut pending_word);
-    if !pending_line.is_empty() {
-        let final_width = line_width
-            .saturating_add(whitespace_width)
-            .saturating_add(word_width);
-        append_row(
-            pending_line,
-            final_width,
-            &mut pieces,
-            &mut symbol_ends,
-            &mut symbol_widths,
-            &mut row_ends,
-            &mut row_widths,
-        );
+    fn finish(mut self, layout: &mut WrappedLineLayout) {
+        if layout.width == 0 {
+            return;
+        }
+        self.pending_line.extend(self.pending_whitespace);
+        self.pending_line.append(&mut self.pending_word);
+        if !self.pending_line.is_empty() {
+            let final_width = self
+                .line_width
+                .saturating_add(self.whitespace_width)
+                .saturating_add(self.word_width);
+            append_row(
+                self.pending_line,
+                final_width,
+                &mut layout.pieces,
+                &mut layout.symbol_ends,
+                &mut layout.symbol_widths,
+                &mut layout.row_ends,
+                &mut layout.row_widths,
+            );
+        }
+        if layout.row_ends.is_empty() {
+            layout.row_ends.push(0);
+            layout.row_widths.push(0);
+        }
     }
-    if row_ends.is_empty() {
-        row_ends.push(0);
-        row_widths.push(0);
-    }
-    (pieces, symbol_ends, symbol_widths, row_ends, row_widths)
 }
 
 fn append_row(
@@ -678,7 +840,7 @@ mod tests {
             (0, 1, "first".to_owned()),
             (69_999, 70_000, "unreachable".to_owned()),
         ];
-        let runs = layout.range_runs(&line, &ranges);
+        let runs = layout.range_runs(&ranges);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].range_index, 0);
         assert_eq!(runs[0].row, 0);

@@ -7263,6 +7263,36 @@ fn project_thought_url_hits(
         .collect()
 }
 
+fn project_streaming_thought_url_hits(
+    layout: &ThoughtLayout,
+    origin: u16,
+    scroll: u16,
+    body: Rect,
+) -> Vec<UrlHitRegion> {
+    let first = scroll.saturating_sub(origin);
+    let end = (u32::from(scroll) + u32::from(body.height))
+        .saturating_sub(u32::from(origin))
+        .min(u32::from(layout.row_count())) as u16;
+    layout
+        .streaming_url_runs(first..end)
+        .into_iter()
+        .map(|(row, column, width, byte_start, url)| UrlHitRegion {
+            rect: Rect::new(
+                body.x.saturating_add(column),
+                body.y
+                    .saturating_add(origin.saturating_add(row).saturating_sub(scroll)),
+                width,
+                1,
+            ),
+            url: url.to_owned(),
+            occurrence: UrlOccurrenceId {
+                row: origin,
+                byte_start,
+            },
+        })
+        .collect()
+}
+
 fn project_url_hit_regions(
     regions: &[UrlLineRegion],
     scroll: u16,
@@ -7716,7 +7746,6 @@ fn render_conversation(
         .cached_row_breaks
         .iter()
         .chain(&message_row_breaks)
-        .chain(thought_layout.map_or(&[][..], ThoughtLayout::row_breaks))
         .copied()
         .skip(usize::from(scroll))
         .take(usize::from(body_area.height))
@@ -7785,15 +7814,15 @@ fn render_conversation(
         {
             thought_rows_painted += usize::from(rect.height);
         }
-        paint_thought_rows(
-            f,
-            layout,
-            rect,
-            local_scroll,
+        layout.render_text(
+            &state.streaming_thought,
+            usize::from(local_scroll)..usize::from(local_scroll) + usize::from(rect.height),
             theme::thought_style(),
             theme::dim_style(),
+            rect,
+            f.buffer_mut(),
         );
-        thought_url_hits.extend(project_thought_url_hits(
+        thought_url_hits.extend(project_streaming_thought_url_hits(
             layout,
             thought_start,
             scroll,
@@ -7801,6 +7830,8 @@ fn render_conversation(
         ));
     }
     capture_transcript_snapshot(f, state, body_area, total_rows, scroll, row_breaks);
+    state.streaming_selection_prefix =
+        has_stream_thought.then_some((state.streaming_thought.len(), thought_start, inner_width));
     state.url_hit_regions =
         project_cached_url_hit_regions(&state.cached_url_regions, scroll, body_area);
     state.url_hit_regions.extend(project_url_hit_regions(
@@ -9821,6 +9852,8 @@ pub struct ChatState {
     /// Visible transcript cells from the last draw. Character-level selection
     /// uses this exact rendered grid so Markdown wrapping has one source of truth.
     transcript_snapshot: Option<TranscriptSnapshot>,
+    /// Copy metadata is materialized only on demand, for this displayed prefix.
+    streaming_selection_prefix: Option<(usize, u16, u16)>,
     /// Normal-mode character selection within `transcript_snapshot`.
     transcript_selection: Option<TranscriptSelection>,
     /// Whether the left-button transcript selection gesture is still active.
@@ -10003,6 +10036,7 @@ impl ChatState {
             browse_multi: std::collections::BTreeSet::new(),
             mouse_down_entry: None,
             transcript_snapshot: None,
+            streaming_selection_prefix: None,
             transcript_selection: None,
             transcript_drag_active: false,
             transcript_drag_edge: None,
@@ -10159,6 +10193,7 @@ impl ChatState {
     }
 
     fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
+        self.materialize_streaming_selection();
         let Some(snapshot) = &self.transcript_snapshot else {
             return false;
         };
@@ -10295,6 +10330,7 @@ impl ChatState {
     }
 
     fn select_transcript_word(&mut self, column: u16, row: u16) -> bool {
+        self.materialize_streaming_selection();
         let Some(snapshot) = &self.transcript_snapshot else {
             return false;
         };
@@ -10329,6 +10365,7 @@ impl ChatState {
     }
 
     fn set_transcript_snapshot(&mut self, snapshot: TranscriptSnapshot) {
+        self.streaming_selection_prefix = None;
         if self
             .transcript_snapshot
             .as_ref()
@@ -11157,10 +11194,38 @@ impl ChatState {
             .as_ref()
             .is_none_or(|layout| layout.width() != width)
         {
-            self.streaming_thought_layout = Some(new_thought_layout(
-                Arc::<str>::from(self.streaming_thought.as_str()),
-                width,
-            ));
+            self.streaming_thought_layout = Some(ThoughtLayout::streaming(width));
+        }
+        if let Some(layout) = &mut self.streaming_thought_layout {
+            layout.append_streaming(&self.streaming_thought, recognized_url_ranges);
+        }
+    }
+
+    fn materialize_streaming_selection(&mut self) {
+        let Some((len, start, width)) = self.streaming_selection_prefix.take() else {
+            return;
+        };
+        let Some(snapshot) = &mut self.transcript_snapshot else {
+            return;
+        };
+        if !snapshot.row_breaks.keys().any(|row| *row >= start) {
+            return;
+        }
+        let Some(text) = self.streaming_thought.get(..len) else {
+            return;
+        };
+        // Use exactly the text that produced these cells, even if a newer
+        // notification appended text between drawing and the mouse event.
+        let breaks = row_breaks_for_line(
+            &Line::from(vec![Span::raw("(thinking) "), Span::raw(text.to_owned())]),
+            width,
+        );
+        for (row, separator) in &mut snapshot.row_breaks {
+            if let Some(index) = row.checked_sub(start)
+                && let Some(value) = breaks.get(usize::from(index))
+            {
+                *separator = *value;
+            }
         }
     }
 
@@ -11283,7 +11348,7 @@ impl ChatState {
                     self.cached_url_regions.push(CachedUrlLineRegion {
                         row: line_start,
                         rows,
-                        runs: layout.range_runs(line, &urls),
+                        runs: layout.range_runs(&urls),
                         urls,
                     });
                 }
@@ -11658,6 +11723,7 @@ impl ChatState {
     /// natural flush points: when a tool call interrupts thinking, and when the
     /// first response text chunk arrives after a thinking phase.
     fn flush_streaming_thought(&mut self) {
+        self.materialize_streaming_selection();
         self.streaming_thought_layout = None;
         let thought = std::mem::take(&mut self.streaming_thought);
         if !thought.is_empty() {
@@ -11753,7 +11819,6 @@ impl ChatState {
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
                 self.invalidate_url_interactions();
-                self.streaming_thought_layout = None;
                 self.freeze_prompt_settled_stream();
                 self.streaming_thought.push_str(&text);
                 if self.turn_in_flight {
@@ -12563,6 +12628,10 @@ impl ChatState {
         self.pending_elicitation = None;
         self.streaming_text.clear();
         self.streaming_thought.clear();
+        self.streaming_thought_layout = None;
+        self.streaming_selection_prefix = None;
+        self.transcript_snapshot = None;
+        self.clear_transcript_selection();
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
         self.turn_had_streaming_text = false;
@@ -12819,6 +12888,7 @@ impl ChatState {
         self.browse_anchor = None;
         self.mouse_down_entry = None;
         self.transcript_snapshot = None;
+        self.streaming_selection_prefix = None;
         self.transcript_selection = None;
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
@@ -14036,7 +14106,7 @@ mod tests {
             session_id: "sess-1".into(),
             text: " suffix".into(),
         });
-        assert!(s.streaming_thought_layout.is_none());
+        assert!(s.streaming_thought_layout.is_some());
         assert!(s.context_menu.is_none());
         assert!(s.take_url_activation(hit.rect.x, hit.rect.y).is_none());
         draw_long_thought(&mut s, 19);
@@ -14081,7 +14151,8 @@ mod tests {
     }
 
     #[track_caller]
-    fn assert_thought_snapshot_matches_paragraph(state: &ChatState, text: &str) {
+    fn assert_thought_snapshot_matches_paragraph(state: &mut ChatState, text: &str) {
+        state.materialize_streaming_selection();
         let original = Line::from(vec![
             Span::styled("(thinking) ", theme::thought_style()),
             Span::styled(text.to_owned(), theme::dim_style()),
@@ -14144,6 +14215,163 @@ mod tests {
     }
 
     #[test]
+    fn streaming_thought_chunk_prefixes_preserve_cells_copy_and_links() {
+        for width in [1, 2, 5, 8, 19, 32] {
+            for text in [
+                "alpha beta  gamma averylongunbrokenword trailing ",
+                "  \t\n\r\nspaces\u{200b}and\u{a0}nonbreaking space   ",
+                "e\u{301} \u{1f469}\u{200d}\u{1f4bb} \u{1f1fa}\u{1f1f8}\u{1f1e8}\u{1f1e6} \u{754c}",
+                "see (https://example.com/a(b)). then https://example.org?q=1! next",
+                "abcd efgh\nijkl mnop \u{301} end",
+            ] {
+                let mut s = state();
+                s.show_thoughts = true;
+                s.turn_in_flight = true;
+                let mut prefix = String::new();
+                for ch in text.chars() {
+                    prefix.push(ch);
+                    s.apply_update(SessionUpdate::AgentThoughtChunk {
+                        session_id: "sess-1".into(),
+                        text: ch.to_string(),
+                    });
+                    draw_long_thought(&mut s, width);
+                    let snapshot = s.transcript_snapshot.as_ref().unwrap();
+                    let reference = new_thought_layout(Arc::from(prefix.as_str()), width);
+                    assert_eq!(
+                        s.streaming_thought_layout.as_ref().unwrap().row_count(),
+                        reference.row_count()
+                    );
+                    assert_eq!(
+                        s.url_hit_regions,
+                        project_thought_url_hits(&reference, 0, s.scroll_offset, snapshot.area),
+                        "URLs at width {width}, prefix {prefix:?}"
+                    );
+                    assert_thought_snapshot_matches_paragraph(&mut s, &prefix);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_thought_copy_uses_displayed_prefix_after_append_and_flush() {
+        let mut s = state();
+        s.show_thoughts = true;
+        s.turn_in_flight = true;
+        s.apply_update(SessionUpdate::AgentThoughtChunk {
+            session_id: "sess-1".into(),
+            text: "alpha beta gamma".into(),
+        });
+        draw_long_thought(&mut s, 8);
+        let pending = s.streaming_selection_prefix;
+        s.materialize_streaming_selection();
+        let expected = s.transcript_snapshot.clone().unwrap();
+        s.streaming_selection_prefix = pending;
+        for value in s
+            .transcript_snapshot
+            .as_mut()
+            .unwrap()
+            .row_breaks
+            .values_mut()
+        {
+            *value = TranscriptRowBreak::Hard;
+        }
+        s.apply_update(SessionUpdate::AgentThoughtChunk {
+            session_id: "sess-1".into(),
+            text: "\nchanged next rows".into(),
+        });
+        assert!(s.begin_transcript_drag(expected.area.x, expected.area.y));
+        assert_eq!(
+            s.transcript_snapshot.as_ref().unwrap().row_breaks,
+            expected.row_breaks
+        );
+        s.streaming_selection_prefix = pending;
+        s.flush_streaming_thought();
+        assert_eq!(
+            s.transcript_snapshot.as_ref().unwrap().row_breaks,
+            expected.row_breaks
+        );
+        assert!(s.streaming_selection_prefix.is_none());
+        s.reset_turn_for_resync_reload();
+        assert!(s.streaming_thought_layout.is_none());
+        assert!(s.transcript_snapshot.is_none());
+    }
+
+    #[test]
+    fn streaming_thought_append_work_does_not_revisit_settled_prefix() {
+        for repeats in [100, 10_000] {
+            let mut s = state();
+            s.show_thoughts = true;
+            s.turn_in_flight = true;
+            s.apply_update(SessionUpdate::AgentThoughtChunk {
+                session_id: "sess-1".into(),
+                text: "alpha beta https://example.com/path \u{754c} ".repeat(repeats),
+            });
+            draw_long_thought(&mut s, 80);
+            let before = s.streaming_thought_layout.as_ref().unwrap().scanned_bytes();
+            let suffix = "next words ";
+            s.apply_update(SessionUpdate::AgentThoughtChunk {
+                session_id: "sess-1".into(),
+                text: suffix.into(),
+            });
+            draw_long_thought(&mut s, 80);
+            let layout = s.streaming_thought_layout.as_ref().unwrap();
+            assert!(layout.scanned_bytes() - before <= 2 * suffix.len() + 8 * 80);
+            assert!(
+                s.streaming_selection_prefix.is_some(),
+                "copy wrapping stays off the draw path"
+            );
+            let unchanged = layout.scanned_bytes();
+            draw_long_thought(&mut s, 80);
+            assert_eq!(
+                s.streaming_thought_layout.as_ref().unwrap().scanned_bytes(),
+                unchanged
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual timing comparison, not a CI latency threshold"]
+    fn benchmark_streaming_thought_append() {
+        use std::time::Instant;
+        let text = "alpha beta \u{754c} e\u{301} trailing words ".repeat(3_000);
+        let mut s = state();
+        s.show_thoughts = true;
+        s.turn_in_flight = true;
+        s.streaming_thought = text;
+        draw_long_thought(&mut s, 80);
+        let mut incremental = Vec::new();
+        let mut full = Vec::new();
+        for _ in 0..9 {
+            s.apply_update(SessionUpdate::AgentThoughtChunk {
+                session_id: "sess-1".into(),
+                text: " next words".into(),
+            });
+            let start = Instant::now();
+            draw_long_thought(&mut s, 80);
+            incremental.push(start.elapsed());
+            let start = Instant::now();
+            let reference = new_thought_layout(Arc::from(s.streaming_thought.as_str()), 80);
+            let separators = row_breaks_for_line(
+                &Line::from(vec![
+                    Span::raw("(thinking) "),
+                    Span::raw(s.streaming_thought.clone()),
+                ]),
+                80,
+            );
+            std::hint::black_box((reference, separators));
+            full.push(start.elapsed());
+        }
+        incremental.sort();
+        full.sort();
+        eprintln!(
+            "{} bytes: full layout/copy rebuild median {:?}; incremental complete draw median {:?}",
+            s.streaming_thought.len(),
+            full[4],
+            incremental[4]
+        );
+    }
+
+    #[test]
     fn long_thought_rows_reuse_layout_during_scroll_append_and_finalization() {
         let mut s = state();
         s.show_thoughts = true;
@@ -14164,7 +14392,7 @@ mod tests {
                 s.streaming_thought_layout.as_ref().unwrap().generation(),
                 generation
             );
-            assert_thought_snapshot_matches_paragraph(&s, &text);
+            assert_thought_snapshot_matches_paragraph(&mut s, &text);
         }
 
         let suffix = " appended suffix";
@@ -14173,16 +14401,16 @@ mod tests {
             session_id: "sess-1".into(),
             text: suffix.into(),
         });
-        assert!(s.streaming_thought_layout.is_none());
+        assert!(s.streaming_thought_layout.is_some());
         draw_long_thought(&mut s, 32);
-        assert_ne!(
+        assert_eq!(
             s.streaming_thought_layout.as_ref().unwrap().generation(),
             generation
         );
-        assert_thought_snapshot_matches_paragraph(&s, &text);
+        assert_thought_snapshot_matches_paragraph(&mut s, &text);
         draw_long_thought(&mut s, 19);
         assert_eq!(s.streaming_thought_layout.as_ref().unwrap().width(), 19);
-        assert_thought_snapshot_matches_paragraph(&s, &text);
+        assert_thought_snapshot_matches_paragraph(&mut s, &text);
 
         s.commit_turn(String::new(), false);
         assert!(s.streaming_thought_layout.is_none());
@@ -14193,12 +14421,12 @@ mod tests {
             let work = draw_long_thought(&mut s, 19);
             assert!(work.thought_rows_painted <= 8);
             assert_eq!(s.cached_thought_layouts[&0].generation(), generation);
-            assert_thought_snapshot_matches_paragraph(&s, &text);
+            assert_thought_snapshot_matches_paragraph(&mut s, &text);
         }
         assert_eq!(clipboard_text(&s.entries[0]), format!("(thinking) {text}"));
         draw_long_thought(&mut s, 40);
         assert_ne!(s.cached_thought_layouts[&0].generation(), generation);
-        assert_thought_snapshot_matches_paragraph(&s, &text);
+        assert_thought_snapshot_matches_paragraph(&mut s, &text);
     }
 
     #[test]
@@ -14231,6 +14459,7 @@ mod tests {
                 s.scroll_offset = scroll;
                 let work = draw_long_thought(&mut s, width);
                 assert!(work.thought_rows_painted <= 8);
+                s.materialize_streaming_selection();
                 assert_snapshot_matches_paragraph(&s, reference.clone());
             }
         }
