@@ -291,6 +291,11 @@ class RiskClassifierTest(unittest.TestCase):
                 "@@ -7,1 +7,1 @@\n-  contents: read\n+  contents: write\n",
             ),
             (
+                "workflow permission expansion",
+                ".github/workflows/other.yml",
+                "@@ -1,1 +1,1 @@\n-name: old\n+permissions: {contents: write}\n",
+            ),
+            (
                 "secret access",
                 ".github/workflows/docs-check.yml",
                 "@@ -12,1 +12,1 @@\n-          TOKEN: ${{ github.token }}\n+          TOKEN: ${{ secrets.RELEASE_TOKEN }}\n",
@@ -299,6 +304,11 @@ class RiskClassifierTest(unittest.TestCase):
                 "OIDC token access",
                 ".github/workflows/docs-check.yml",
                 "@@ -8,1 +8,1 @@\n-  id-token: none\n+  id-token: write\n",
+            ),
+            (
+                "OIDC token access",
+                ".github/workflows/other.yml",
+                "@@ -1,1 +1,1 @@\n-name: old\n+permissions: {id-token: write}\n",
             ),
             (
                 "artifact publication",
@@ -314,6 +324,11 @@ class RiskClassifierTest(unittest.TestCase):
                 "elevated pull_request_target",
                 ".github/workflows/docs-check.yml",
                 "@@ -2,1 +2,1 @@\n-  pull_request:\n+  pull_request_target:\n",
+            ),
+            (
+                "elevated pull_request_target",
+                ".github/workflows/other.yml",
+                "@@ -1,1 +1,1 @@\n-on: [pull_request]\n+on: [pull_request_target]\n",
             ),
             (
                 "toolchain install or container baseline",
@@ -354,6 +369,22 @@ class RiskClassifierTest(unittest.TestCase):
         self.assertEqual(workflow_report["proposed_risk"], "risk:medium")
         self.assertEqual(workflow_report["matching_evidence"], [])
 
+        workflow_name_report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        ".github/workflows/docs-check.yml",
+                        1,
+                        1,
+                        "@@ -7,1 +7,1 @@\n-name: read\n+name: write\n",
+                    )
+                ],
+            )
+        )
+        self.assertEqual(workflow_name_report["proposed_risk"], "risk:medium")
+        self.assertEqual(workflow_name_report["matching_evidence"], [])
+
         docs_report = evaluate(
             FakeAPI(
                 pull(),
@@ -369,6 +400,38 @@ class RiskClassifierTest(unittest.TestCase):
         )
         self.assertEqual(docs_report["proposed_risk"], "risk:low")
         self.assertEqual(docs_report["matching_evidence"], [])
+
+        workflow_docs_report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        ".github/workflows/master-branch-flow.md",
+                        1,
+                        1,
+                        "@@ -51,1 +51,1 @@\n-old\n+| Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |\n",
+                    )
+                ],
+            )
+        )
+        self.assertEqual(workflow_docs_report["proposed_risk"], "risk:low")
+        self.assertEqual(workflow_docs_report["matching_evidence"], [])
+
+        fixture_report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        "scripts/github/pr_risk_label_test.py",
+                        1,
+                        1,
+                        "@@ -1,1 +1,1 @@\n-old\n+case = '${{ secrets.RELEASE_TOKEN }} && FROM ubuntu:24.04'\n",
+                    )
+                ],
+            )
+        )
+        self.assertEqual(fixture_report["proposed_risk"], "risk:medium")
+        self.assertEqual(fixture_report["matching_evidence"], [])
 
     def test_changed_line_policy_fails_closed_when_content_sensitive_patch_is_missing(self) -> None:
         report = evaluate(FakeAPI(pull(), [changed_file(".github/workflows/docs-check.yml", patch=None)]))
@@ -450,6 +513,7 @@ class RiskClassifierTest(unittest.TestCase):
             summary,
         )
         self.assertEqual(classifier.summary_text("risk:`manual`\n"), r"risk:\`manual\`\\n")
+        self.assertEqual(classifier.summary_text("~~untrusted~~"), r"\~\~untrusted\~\~")
 
     def test_summary_json_is_indented_without_markdown_fences(self) -> None:
         report = evaluate(FakeAPI(pull(["risk:high"]), [changed_file("wit/```escape.wit")]))

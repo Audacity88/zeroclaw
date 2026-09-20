@@ -50,6 +50,30 @@ CHAR_LITERAL_RE = re.compile(
     r"'(?:\\(?:[nrt0\\'\"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]{1,6}\})|[^\\'\n])'"
 )
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+WORKFLOW_YAML_RE = re.compile(r"^\.github/workflows/[^/]+\.ya?ml$")
+TEST_FIXTURE_RE = re.compile(r"(?:^|/)(?:test_|.*_test\.py$|tests?/|fixtures?/|__fixtures__/)")
+WORKFLOW_SEMANTIC_RULES = {
+    "workflow permission expansion",
+    "OIDC token access",
+    "elevated pull_request_target",
+}
+WORKFLOW_PERMISSION_KEYS = (
+    "actions",
+    "attestations",
+    "checks",
+    "contents",
+    "deployments",
+    "discussions",
+    "id-token",
+    "issues",
+    "models",
+    "packages",
+    "pages",
+    "pull-requests",
+    "security-events",
+    "statuses",
+)
+WORKFLOW_PERMISSION_KEY_RE = "(?:" + "|".join(re.escape(key) for key in WORKFLOW_PERMISSION_KEYS) + ")"
 
 
 class ContentRule(NamedTuple):
@@ -211,6 +235,67 @@ def is_low_path(path: str) -> bool:
 
 def matching_content_rules(path: str, content_rules: Iterable[ContentRule]) -> list[ContentRule]:
     return [rule for rule in content_rules if any(glob_matches(path, pattern) for pattern in rule.paths)]
+
+
+def is_workflow_yaml(path: str) -> bool:
+    return WORKFLOW_YAML_RE.fullmatch(path) is not None
+
+
+def is_test_fixture_path(path: str) -> bool:
+    return TEST_FIXTURE_RE.search(path) is not None
+
+
+def active_content_rules(path: str, content_rules: Iterable[ContentRule]) -> list[ContentRule]:
+    if is_test_fixture_path(path):
+        return []
+    rules = matching_content_rules(path, content_rules)
+    if path.startswith(".github/workflows/") and not is_workflow_yaml(path):
+        return [rule for rule in rules if rule.name not in WORKFLOW_SEMANTIC_RULES and rule.name != "release behavior"]
+    return rules
+
+
+def workflow_permission_write(line: str) -> bool:
+    scalar = r"write(?:-all)?"
+    return any(
+        re.search(pattern, line)
+        for pattern in (
+            rf"^\s*permissions\s*:\s*{scalar}\s*(?:#.*)?$",
+            rf"^\s*{WORKFLOW_PERMISSION_KEY_RE}\s*:\s*{scalar}\s*(?:#.*)?$",
+            rf"^\s*permissions\s*:\s*\{{[^}}]*{WORKFLOW_PERMISSION_KEY_RE}\s*:\s*{scalar}\b",
+        )
+    )
+
+
+def workflow_oidc_write(line: str) -> bool:
+    return any(
+        re.search(pattern, line)
+        for pattern in (
+            r"^\s*id-token\s*:\s*write\s*(?:#.*)?$",
+            r"^\s*permissions\s*:\s*\{[^}]*id-token\s*:\s*write\b",
+        )
+    )
+
+
+def workflow_pull_request_target(line: str) -> bool:
+    return any(
+        re.search(pattern, line)
+        for pattern in (
+            r"^\s*pull_request_target\s*:\s*(?:#.*)?$",
+            r"^\s*-\s*pull_request_target\s*(?:#.*)?$",
+            r"^\s*on\s*:\s*\[[^\]]*\bpull_request_target\b[^\]]*\]\s*(?:#.*)?$",
+        )
+    )
+
+
+def content_rule_matches(path: str, rule: ContentRule, line: str) -> bool:
+    if is_workflow_yaml(path):
+        if rule.name == "workflow permission expansion":
+            return workflow_permission_write(line)
+        if rule.name == "OIDC token access":
+            return workflow_oidc_write(line)
+        if rule.name == "elevated pull_request_target":
+            return workflow_pull_request_target(line)
+    return rule.pattern.search(line) is not None
 
 
 def labels_from_pr(pr: dict[str, Any]) -> set[str]:
@@ -593,7 +678,7 @@ def strict_test_only_proof(
 
 def content_evidence_for_file(item: dict[str, Any], content_rules: tuple[ContentRule, ...]) -> dict[str, Any] | None:
     path = normalize_path(item.get("filename"))
-    rules = matching_content_rules(path, content_rules)
+    rules = active_content_rules(path, content_rules)
     if not rules:
         return None
 
@@ -615,7 +700,7 @@ def content_evidence_for_file(item: dict[str, Any], content_rules: tuple[Content
     line_numbers: list[int] = []
     for line_number, line in new_changed:
         for rule in rules:
-            if rule.pattern.search(line):
+            if content_rule_matches(path, rule, line):
                 matches.append(rule.name)
                 line_numbers.append(line_number)
     if not matches:
@@ -835,7 +920,7 @@ def evaluate(api: Any, pr_number: int, policy_path: Path) -> dict[str, Any]:
 def summary_text(value: Any) -> str:
     text = str(value).replace("\r", r"\r").replace("\n", r"\n")
     text = html_escape(text, quote=False)
-    return re.sub(r"([\\`*_{}\[\]()#+\-.!|>])", r"\\\1", text)
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", text)
 
 
 def evidence_summary(item: dict[str, Any]) -> str:
