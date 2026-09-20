@@ -1236,17 +1236,62 @@ mod tests {
 
     #[test]
     fn binary_lookup_ignores_relative_path_entries() {
+        const CHILD_ENV: &str = "ZEROCLAW_TEST_GROK_PATH_SHADOW";
+        if let Some(trusted) = std::env::var_os(CHILD_ENV) {
+            let trusted = PathBuf::from(trusted);
+            for relative in ["", ".", "bin"] {
+                let decoy = Path::new(relative).join(DEFAULT_GROK_CLI_BINARY);
+                assert!(
+                    GrokCliModelProvider::first_executable_candidate(&decoy, None).is_some(),
+                    "workspace decoy must be executable: {decoy:?}"
+                );
+                let path = std::env::join_paths([PathBuf::from(relative), trusted.clone()])
+                    .expect("test PATH");
+                let resolved = GrokCliModelProvider::resolve_binary_path(None, Some(&path), None)
+                    .expect("trusted executable");
+                assert_eq!(
+                    resolved,
+                    std::fs::canonicalize(trusted.join(DEFAULT_GROK_CLI_BINARY))
+                        .expect("canonical trusted executable")
+                );
+
+                let unsafe_path =
+                    std::env::join_paths([PathBuf::from(relative)]).expect("relative-only PATH");
+                let error =
+                    GrokCliModelProvider::resolve_binary_path(None, Some(&unsafe_path), None)
+                        .expect_err("workspace decoy must not be selected");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("no absolute executable directories")
+                );
+            }
+            return;
+        }
+
         let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        copy_test_executable(&workspace, DEFAULT_GROK_CLI_BINARY);
+        copy_test_executable(&workspace.join("bin"), DEFAULT_GROK_CLI_BINARY);
         let trusted = temp.path().join("trusted");
-        let trusted_binary = copy_test_executable(&trusted, DEFAULT_GROK_CLI_BINARY);
-        let path = std::env::join_paths([PathBuf::from("."), trusted]).expect("test PATH");
+        copy_test_executable(&trusted, DEFAULT_GROK_CLI_BINARY);
 
-        let resolved = GrokCliModelProvider::resolve_binary_path(None, Some(&path), None)
-            .expect("trusted executable");
-
-        assert_eq!(
-            resolved,
-            std::fs::canonicalize(trusted_binary).expect("canonical trusted executable")
+        // Isolate workspace-relative lookup from other tests' process-wide cwd.
+        let output = std::process::Command::new(test_executable_path())
+            .args([
+                "--exact",
+                "grok_cli::tests::binary_lookup_ignores_relative_path_entries",
+                "--nocapture",
+            ])
+            .current_dir(workspace)
+            .env(CHILD_ENV, trusted)
+            .output()
+            .expect("run isolated PATH lookup test");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated PATH lookup failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
