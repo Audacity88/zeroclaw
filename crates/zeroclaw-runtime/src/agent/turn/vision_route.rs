@@ -129,7 +129,11 @@ pub(crate) async fn resolve_vision_provider(
             // vision fallback never probes the filesystem for this decision,
             // and the probe count is bounded by the policy-allowed
             // absolute-path markers of the latest user message (one message,
-            // never the whole history).
+            // never the whole history) and capped at
+            // `multimodal::MAX_RESOLVABILITY_PROBES` (16) metadata calls per
+            // gate evaluation; policy-accepted markers beyond the cap count
+            // as resolvable without probing, so an oversized message fails
+            // toward this error rather than a silent degrade.
             let path_allowed = |path: &std::path::Path| -> bool {
                 security.is_some_and(|policy| {
                     let path_str = path.to_string_lossy();

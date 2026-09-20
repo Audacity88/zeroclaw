@@ -525,9 +525,19 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
 /// reference, a data URI, or a remote URL: the predicate is pure caller-side
 /// policy work and runs first, so no filesystem call is made for a path the
 /// policy rejects. It does no network I/O and no decoding.
+///
+/// Probing is capped at [`MAX_RESOLVABILITY_PROBES`] metadata calls: after
+/// the budget is spent, every further policy-accepted absolute marker counts
+/// as resolvable WITHOUT probing. The cap exists because no upstream limit
+/// bounds the marker count of a single inbound user message (transport frame
+/// caps operate at megabytes, not markers). Over budget the count can only
+/// grow, so an oversized message fails toward the caller's loud capability
+/// error, never toward silently degrading away a real attachment.
 /// `parse_image_markers` remains the single source of truth for what a
 /// marker reference is, and `split_base64_image_data_uri` for what a valid
 /// inline data URI is.
+pub const MAX_RESOLVABILITY_PROBES: usize = 16;
+
 pub async fn count_latest_user_resolvable_image_markers(
     messages: &[ChatMessage],
     remote_allowed: bool,
@@ -541,8 +551,11 @@ pub async fn count_latest_user_resolvable_image_markers(
         return 0;
     };
     let mut resolvable = 0;
+    let mut probe_budget = MAX_RESOLVABILITY_PROBES;
     for reference in parse_image_markers(&message.content).1 {
-        if image_reference_resolves(&reference, remote_allowed, path_allowed).await {
+        if image_reference_resolves(&reference, remote_allowed, path_allowed, &mut probe_budget)
+            .await
+        {
             resolvable += 1;
         }
     }
@@ -554,11 +567,14 @@ pub async fn count_latest_user_resolvable_image_markers(
 /// count, impossible to verify without a fetch), and local files the caller's
 /// path policy allows. The predicate runs before any filesystem access, so a
 /// rejected path is never probed; the existence check for an accepted
-/// absolute path is one async metadata call.
+/// absolute path is one async metadata call, drawn from `probe_budget`.
+/// When the budget is spent, an accepted absolute path counts as resolvable
+/// without a probe (see [`MAX_RESOLVABILITY_PROBES`]).
 async fn image_reference_resolves(
     reference: &str,
     remote_allowed: bool,
     path_allowed: &(dyn Fn(&Path) -> bool + Sync),
+    probe_budget: &mut usize,
 ) -> bool {
     if reference.starts_with("data:") {
         return split_base64_image_data_uri(reference, MAX_ENCODED_IMAGE_PAYLOAD_BYTES).is_ok();
@@ -575,6 +591,13 @@ async fn image_reference_resolves(
     if !path_allowed(path) {
         return false;
     }
+    if *probe_budget == 0 {
+        // Over budget: count as resolvable without probing, so the caller
+        // fails toward the capability error, never toward silently
+        // stripping an attachment that may be real.
+        return true;
+    }
+    *probe_budget -= 1;
     tokio::fs::metadata(path)
         .await
         .map(|metadata| metadata.is_file())
@@ -3167,6 +3190,69 @@ mod tests {
             probed.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "only the local markers consulted the predicate; the data URI did not"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_stops_probing_after_budget() {
+        let probed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probed_for_predicate = std::sync::Arc::clone(&probed);
+        let path_allowed = move |_: &Path| -> bool {
+            probed_for_predicate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        };
+        let temp = tempfile::tempdir().unwrap();
+        // 20 accepted absolute markers, all naming missing files. The first
+        // MAX_RESOLVABILITY_PROBES are probed (and find nothing); the rest
+        // count as resolvable without probing. The returned count is exactly
+        // the unprobed remainder, which pins the budget at 16: a budget of
+        // 15 would return 5, a budget of 17 would return 3.
+        let markers: Vec<String> = (0..20)
+            .map(|i| {
+                format!(
+                    "[IMAGE: {}]",
+                    temp.path().join(format!("missing-{i}.png")).display()
+                )
+            })
+            .collect();
+        let messages = vec![ChatMessage::user(format!(
+            "look at these {}",
+            markers.join(" ")
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, &path_allowed).await,
+            20 - MAX_RESOLVABILITY_PROBES,
+            "markers beyond the probe budget count as resolvable without probing"
+        );
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            20,
+            "policy classification still runs for every marker; only the probe is capped"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_probes_all_markers_at_or_below_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        // 16 accepted absolute markers, all missing: every one is probed, so
+        // none counts as resolvable. If the last marker had been
+        // short-circuited by the budget, the count would be 1.
+        let markers: Vec<String> = (0..MAX_RESOLVABILITY_PROBES)
+            .map(|i| {
+                format!(
+                    "[IMAGE: {}]",
+                    temp.path().join(format!("missing-{i}.png")).display()
+                )
+            })
+            .collect();
+        let messages = vec![ChatMessage::user(format!(
+            "look at these {}",
+            markers.join(" ")
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
+            0,
+            "at or below the budget every accepted marker is probed, so missing files count 0"
         );
     }
 
