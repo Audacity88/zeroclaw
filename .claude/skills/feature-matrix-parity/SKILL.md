@@ -62,8 +62,7 @@ downgrade patterns below.
   **defined-but-dead** (a module with no non-test callers) or a
   **degraded/orphan path** (it starts but produces no end-to-end behavior). A
   directory name or alias is not a match; the implementing, *called* module is.
-- Leave a walked ZeroClaw row with no TOML entry to render `unknown`; fill it in
-  as parity is confirmed rather than guessing.
+- Use `unknown` when support has not been assessed or the available evidence is inconclusive. A missing TOML entry also renders `unknown`; record an explicit value and source notes when a bounded walk cannot establish a verdict.
 
 The loose-alias downgrades in Step 3 are the same rule applied to naming: a
 speech- or image-only module is not LLM-chat `supported`, and a similarly named
