@@ -7306,6 +7306,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_agentic_configless_full_always_ask_overrides_auto_approval() {
+        // The configless path must preserve normalized always_ask precedence,
+        // including when Full autonomy would otherwise approve the tool.
+        let (result, executions, messages) = bounded_approval_probe(
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                auto_approve: vec!["echo_tool".to_string()],
+                always_ask: vec![" echo_tool ".to_string()],
+                ..RiskProfileConfig::default()
+            },
+            false,
+        )
+        .await;
+        assert!(
+            result.success,
+            "denial should be returned to the child model: {result:?}"
+        );
+        assert_eq!(executions, 0, "always_ask tool must not execute");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("requires approval"))
+        );
+    }
+
+    #[tokio::test]
     async fn execute_agentic_rebinds_memory_tools_to_target_agent_scope() {
         // Memory tools are stateful even when they come from the parent registry.
         // Agentic delegation must rebind them to the target alias so a child
