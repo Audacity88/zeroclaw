@@ -43,6 +43,17 @@ EXPECTED_HIGH_GLOBS = (
     "scripts/github/pr_risk_label.py",
     "scripts/release/**",
 )
+EXPECTED_CONTENT_RULES = (
+    "workflow permission expansion",
+    "secret access",
+    "OIDC token access",
+    "artifact publication",
+    "release behavior",
+    "elevated pull_request_target",
+    "toolchain install or container baseline",
+    "release floor",
+    "WIT contract",
+)
 
 
 def pull(labels: list[str] | None = None, **extra: object) -> dict[str, object]:
@@ -158,8 +169,9 @@ TEST_PATCH = """@@ -9,1 +9,1 @@
 
 class RiskClassifierTest(unittest.TestCase):
     def test_policy_uses_high_risk_globs(self) -> None:
-        globs = classifier.load_policy(POLICY_PATH)
-        self.assertEqual(globs, EXPECTED_HIGH_GLOBS)
+        policy = classifier.load_policy(POLICY_PATH)
+        self.assertEqual(policy.high_globs, EXPECTED_HIGH_GLOBS)
+        self.assertEqual(tuple(rule.name for rule in policy.content_rules), EXPECTED_CONTENT_RULES)
         self.assertTrue(
             classifier.glob_matches(
                 ".github/workflows/release-stable.yml",
@@ -271,6 +283,101 @@ class RiskClassifierTest(unittest.TestCase):
         self.assertEqual(report["proposed_risk"], "risk:high")
         self.assertEqual(report["matching_evidence"][0]["path"], "wit/plugin.wit")
 
+    def test_changed_line_policy_escalates_high_risk_workflow_content(self) -> None:
+        cases = [
+            (
+                "workflow permission expansion",
+                ".github/workflows/docs-check.yml",
+                "@@ -7,1 +7,1 @@\n-  contents: read\n+  contents: write\n",
+            ),
+            (
+                "secret access",
+                ".github/workflows/docs-check.yml",
+                "@@ -12,1 +12,1 @@\n-          TOKEN: ${{ github.token }}\n+          TOKEN: ${{ secrets.RELEASE_TOKEN }}\n",
+            ),
+            (
+                "OIDC token access",
+                ".github/workflows/docs-check.yml",
+                "@@ -8,1 +8,1 @@\n-  id-token: none\n+  id-token: write\n",
+            ),
+            (
+                "artifact publication",
+                ".github/workflows/docs-check.yml",
+                "@@ -20,1 +20,1 @@\n-      - run: echo ok\n+      - uses: actions/upload-artifact@0123456789abcdef0123456789abcdef01234567\n",
+            ),
+            (
+                "release behavior",
+                ".github/workflows/docs-check.yml",
+                "@@ -20,1 +20,1 @@\n-      - run: echo ok\n+      - run: gh release create \"$TAG\"\n",
+            ),
+            (
+                "elevated pull_request_target",
+                ".github/workflows/docs-check.yml",
+                "@@ -2,1 +2,1 @@\n-  pull_request:\n+  pull_request_target:\n",
+            ),
+            (
+                "toolchain install or container baseline",
+                "dev/Containerfile",
+                "@@ -1,1 +1,1 @@\n-FROM ubuntu:22.04\n+FROM ubuntu:24.04\n",
+            ),
+            (
+                "release floor",
+                "crates/zeroclaw-runtime/Cargo.toml",
+                '@@ -5,1 +5,1 @@\n-rust-version = "1.86"\n+rust-version = "1.90"\n',
+            ),
+            (
+                "WIT contract",
+                "crates/plugin-contracts/component.wit",
+                "@@ -1,1 +1,1 @@\n-package zeroclaw:old;\n+interface plugin { export run: func(); }\n",
+            ),
+        ]
+        for rule_name, path, patch in cases:
+            with self.subTest(rule_name=rule_name):
+                report = evaluate(FakeAPI(pull(), [changed_file(path, 1, 1, patch)]))
+                self.assertEqual(report["proposed_risk"], "risk:high")
+                self.assertIn(rule_name, report["matching_evidence"][0]["content_rules"])
+
+    def test_changed_line_policy_does_not_escalate_read_only_workflow_or_docs_mentions(self) -> None:
+        workflow_report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        ".github/workflows/docs-check.yml",
+                        1,
+                        1,
+                        "@@ -7,1 +7,1 @@\n-  contents: none\n+  contents: read\n",
+                    )
+                ],
+            )
+        )
+        self.assertEqual(workflow_report["proposed_risk"], "risk:medium")
+        self.assertEqual(workflow_report["matching_evidence"], [])
+
+        docs_report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        "docs/book/src/guide.md",
+                        1,
+                        1,
+                        "@@ -1,1 +1,1 @@\n-old\n+Mention ${{ secrets.EXAMPLE }} in prose.\n",
+                    )
+                ],
+            )
+        )
+        self.assertEqual(docs_report["proposed_risk"], "risk:low")
+        self.assertEqual(docs_report["matching_evidence"], [])
+
+    def test_changed_line_policy_fails_closed_when_content_sensitive_patch_is_missing(self) -> None:
+        report = evaluate(FakeAPI(pull(), [changed_file(".github/workflows/docs-check.yml", patch=None)]))
+        self.assertEqual(report["proposed_risk"], "risk:high")
+        self.assertEqual(
+            report["matching_evidence"][0]["content_rules"],
+            ["content-sensitive diff unavailable"],
+        )
+
     def test_file_evidence_must_match_captured_head(self) -> None:
         with self.assertRaisesRegex(classifier.RiskReportError, "captured head SHA"):
             evaluate(
@@ -327,10 +434,33 @@ class RiskClassifierTest(unittest.TestCase):
         self.assertIn("risk:manual freezes future automatic risk replacement", report["mismatches"])
 
     def test_summary_escapes_untrusted_markdown_text(self) -> None:
-        report = evaluate(FakeAPI(pull(["risk:`manual`"]), [changed_file("wit/```escape.wit")]))
+        report = evaluate(
+            FakeAPI(
+                pull(["risk:`manual`"]),
+                [
+                    changed_file(
+                        "wit/![x](https:attacker.invalid_pixel.png)```escape.wit",
+                    )
+                ],
+            )
+        )
         summary = classifier.human_summary(report)
-        self.assertIn(r"wit/\`\`\`escape.wit", summary)
-        self.assertEqual(classifier.summary_text("risk:`manual`\n"), r"risk:\`manual\`\n")
+        self.assertIn(
+            r"wit/\!\[x\]\(https:attacker\.invalid\_pixel\.png\)\`\`\`escape\.wit",
+            summary,
+        )
+        self.assertEqual(classifier.summary_text("risk:`manual`\n"), r"risk:\`manual\`\\n")
+
+    def test_summary_json_is_indented_without_markdown_fences(self) -> None:
+        report = evaluate(FakeAPI(pull(["risk:high"]), [changed_file("wit/```escape.wit")]))
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary.md"
+            classifier.write_summary(summary, report)
+            text = summary.read_text(encoding="utf-8")
+            self.assertNotIn("\n```", text)
+            self.assertNotIn("```json", text)
+            self.assertIn("JSON report:\n\n    {", text)
+            self.assertIn('"path": "wit/```escape.wit"', text)
 
     def test_9530_positive_test_only_rust_high_path_proposes_medium(self) -> None:
         path = "crates/zeroclaw-runtime/src/security/policy.rs"

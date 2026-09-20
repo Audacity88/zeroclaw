@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 
@@ -52,6 +52,17 @@ CHAR_LITERAL_RE = re.compile(
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
+class ContentRule(NamedTuple):
+    name: str
+    paths: tuple[str, ...]
+    pattern: re.Pattern[str]
+
+
+class RiskPolicy(NamedTuple):
+    high_globs: tuple[str, ...]
+    content_rules: tuple[ContentRule, ...]
+
+
 class RiskReportError(RuntimeError):
     """A trusted policy or GitHub input cannot support a trustworthy report."""
 
@@ -83,34 +94,76 @@ def parse_json_file(path: Path, description: str) -> Any:
         raise RiskReportError(f"{description} is invalid") from exc
 
 
-def load_policy(path: Path) -> tuple[str, ...]:
+def parse_content_rule(value: Any, seen_names: set[str]) -> ContentRule:
+    require(isinstance(value, dict), "risk policy content rule is invalid")
+    require(set(value) == {"name", "paths", "pattern"}, "risk policy content rule is invalid")
+    name = value["name"]
+    paths = value["paths"]
+    pattern = value["pattern"]
+    require(isinstance(name, str) and name and name not in seen_names, "risk policy content rule name is invalid")
+    require(isinstance(paths, list) and paths, "risk policy content rule paths are invalid")
+    normalized_paths: list[str] = []
+    for rule_path in paths:
+        require(
+            isinstance(rule_path, str)
+            and rule_path
+            and "\x00" not in rule_path
+            and not rule_path.startswith("/")
+            and ".." not in rule_path.split("/"),
+            "risk policy content rule path is invalid",
+        )
+        normalized_paths.append(rule_path)
+    require(isinstance(pattern, str) and pattern, "risk policy content rule pattern is invalid")
+    try:
+        compiled = re.compile(pattern)
+    except re.error as exc:
+        raise RiskReportError("risk policy content rule pattern is invalid") from exc
+    seen_names.add(name)
+    return ContentRule(name, tuple(normalized_paths), compiled)
+
+
+def load_policy(path: Path) -> RiskPolicy:
     payload = parse_json_file(path, "risk policy")
     require(isinstance(payload, dict) and set(payload) == {HIGH_LABEL}, "risk policy shape is invalid")
     rules = payload[HIGH_LABEL]
     require(isinstance(rules, list) and rules, "risk policy has no high-risk rules")
 
     globs: list[str] = []
+    content_rules: list[ContentRule] = []
+    seen_names: set[str] = set()
     for rule in rules:
-        require(isinstance(rule, dict) and set(rule) == {"changed-files"}, "risk policy rule is invalid")
-        changed_files = rule["changed-files"]
-        require(
-            isinstance(changed_files, dict) and set(changed_files) == {"any-glob-to-any-file"},
-            "risk policy changed-files rule is invalid",
-        )
-        values = changed_files["any-glob-to-any-file"]
-        require(isinstance(values, list) and values, "risk policy glob list is empty")
-        for value in values:
+        require(isinstance(rule, dict) and len(rule) == 1, "risk policy rule is invalid")
+        if "changed-files" in rule:
+            changed_files = rule["changed-files"]
             require(
-                isinstance(value, str)
-                and value
-                and "\x00" not in value
-                and not value.startswith("/")
-                and ".." not in value.split("/"),
-                "risk policy glob is invalid",
+                isinstance(changed_files, dict) and set(changed_files) == {"any-glob-to-any-file"},
+                "risk policy changed-files rule is invalid",
             )
-            globs.append(value)
+            values = changed_files["any-glob-to-any-file"]
+            require(isinstance(values, list) and values, "risk policy glob list is empty")
+            for value in values:
+                require(
+                    isinstance(value, str)
+                    and value
+                    and "\x00" not in value
+                    and not value.startswith("/")
+                    and ".." not in value.split("/"),
+                    "risk policy glob is invalid",
+                )
+                globs.append(value)
+        elif "changed-lines" in rule:
+            changed_lines = rule["changed-lines"]
+            require(
+                isinstance(changed_lines, dict) and set(changed_lines) == {"any-rule-to-any-added-line"},
+                "risk policy changed-lines rule is invalid",
+            )
+            values = changed_lines["any-rule-to-any-added-line"]
+            require(isinstance(values, list) and values, "risk policy content rule list is empty")
+            content_rules.extend(parse_content_rule(value, seen_names) for value in values)
+        else:
+            raise RiskReportError("risk policy rule is invalid")
     require(len(globs) == len(set(globs)), "risk policy contains duplicate globs")
-    return tuple(globs)
+    return RiskPolicy(tuple(globs), tuple(content_rules))
 
 
 @lru_cache(maxsize=None)
@@ -154,6 +207,10 @@ def is_high_path(path: str, high_globs: Iterable[str]) -> list[str]:
 
 def is_low_path(path: str) -> bool:
     return any(glob_matches(path, pattern) for pattern in LOW_PATH_GLOBS)
+
+
+def matching_content_rules(path: str, content_rules: Iterable[ContentRule]) -> list[ContentRule]:
+    return [rule for rule in content_rules if any(glob_matches(path, pattern) for pattern in rule.paths)]
 
 
 def labels_from_pr(pr: dict[str, Any]) -> set[str]:
@@ -534,9 +591,45 @@ def strict_test_only_proof(
     return True, "complete diff is confined to existing cfg(test) items"
 
 
+def content_evidence_for_file(item: dict[str, Any], content_rules: tuple[ContentRule, ...]) -> dict[str, Any] | None:
+    path = normalize_path(item.get("filename"))
+    rules = matching_content_rules(path, content_rules)
+    if not rules:
+        return None
+
+    patch = item.get("patch")
+    if not isinstance(patch, str):
+        return {
+            "path": path,
+            "content_rules": ["content-sensitive diff unavailable"],
+        }
+    try:
+        _, new_changed, _ = changed_line_content(patch)
+    except RiskReportError:
+        return {
+            "path": path,
+            "content_rules": ["content-sensitive diff unavailable"],
+        }
+
+    matches: list[str] = []
+    line_numbers: list[int] = []
+    for line_number, line in new_changed:
+        for rule in rules:
+            if rule.pattern.search(line):
+                matches.append(rule.name)
+                line_numbers.append(line_number)
+    if not matches:
+        return None
+    return {
+        "path": path,
+        "content_rules": sorted(set(matches)),
+        "line_numbers": sorted(set(line_numbers)),
+    }
+
+
 def classify(
     files: list[dict[str, Any]],
-    high_globs: tuple[str, ...],
+    policy: RiskPolicy,
     api: Any,
     base_sha: str,
     head_sha: str,
@@ -545,15 +638,19 @@ def classify(
     high_match = False
     for item in files:
         for path in item_paths(item):
-            patterns = is_high_path(path, high_globs)
+            patterns = is_high_path(path, policy.high_globs)
             if patterns:
                 high_match = True
                 evidence.append({"path": path, "high_globs": patterns})
+        content_evidence = content_evidence_for_file(item, policy.content_rules)
+        if content_evidence is not None:
+            high_match = True
+            evidence.append(content_evidence)
 
     exception = False
     detail = "not applicable"
     if high_match:
-        exception, detail = strict_test_only_proof(files, high_globs, api, base_sha, head_sha)
+        exception, detail = strict_test_only_proof(files, policy.high_globs, api, base_sha, head_sha)
         proposed = "risk:medium" if exception else HIGH_LABEL
     elif all(all(is_low_path(path) for path in item_paths(item)) for item in files):
         proposed = "risk:low"
@@ -712,7 +809,7 @@ class GitHubAPI:
 
 
 def evaluate(api: Any, pr_number: int, policy_path: Path) -> dict[str, Any]:
-    high_globs = load_policy(policy_path)
+    policy = load_policy(policy_path)
     pr = api.get_pull(pr_number)
     head_sha, base_sha, live_labels, changed_file_count = parse_pr_metadata(pr)
     require(0 < changed_file_count <= MAX_PR_FILES, "PR file count is incomplete or exceeds the safe API boundary")
@@ -721,7 +818,7 @@ def evaluate(api: Any, pr_number: int, policy_path: Path) -> dict[str, Any]:
         changed_file_count,
         head_sha,
     )
-    classification = classify(files, high_globs, api, base_sha, head_sha)
+    classification = classify(files, policy, api, base_sha, head_sha)
 
     latest_pr = api.get_pull(pr_number)
     latest_head, latest_base, latest_labels, latest_file_count = parse_pr_metadata(latest_pr)
@@ -736,14 +833,27 @@ def evaluate(api: Any, pr_number: int, policy_path: Path) -> dict[str, Any]:
 
 
 def summary_text(value: Any) -> str:
-    return html_escape(str(value), quote=False).replace("`", r"\`").replace("\r", r"\r").replace("\n", r"\n")
+    text = str(value).replace("\r", r"\r").replace("\n", r"\n")
+    text = html_escape(text, quote=False)
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|>])", r"\\\1", text)
+
+
+def evidence_summary(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if item.get("high_globs"):
+        parts.append("path: " + ", ".join(summary_text(pattern) for pattern in item["high_globs"]))
+    if item.get("content_rules"):
+        parts.append("content: " + ", ".join(summary_text(rule) for rule in item["content_rules"]))
+    if item.get("line_numbers"):
+        parts.append("lines: " + ", ".join(str(line) for line in item["line_numbers"]))
+    return f"{summary_text(item['path'])} ({'; '.join(parts)})"
 
 
 def human_summary(report: dict[str, Any]) -> str:
     evidence = report["matching_evidence"]
     evidence_text = (
         ", ".join(
-            f"{summary_text(item['path'])} ({', '.join(summary_text(pattern) for pattern in item['high_globs'])})"
+            evidence_summary(item)
             for item in evidence
         )
         if evidence
@@ -770,12 +880,13 @@ def human_summary(report: dict[str, Any]) -> str:
 
 
 def write_summary(path: Path, report: dict[str, Any]) -> None:
+    json_lines = json.dumps(report, indent=2, sort_keys=True, ensure_ascii=True).splitlines()
     path.write_text(
         "## PR risk report\n\n"
         + human_summary(report)
-        + "\n\n```json\n"
-        + json.dumps(report, indent=2, sort_keys=True, ensure_ascii=True)
-        + "\n```\n",
+        + "\n\nJSON report:\n\n"
+        + "\n".join(f"    {line}" for line in json_lines)
+        + "\n",
         encoding="utf-8",
     )
 
@@ -806,12 +917,13 @@ def main(argv: list[str] | None = None, api: Any | None = None) -> int:
         }
         if args.summary:
             try:
+                json_lines = json.dumps(error, indent=2, sort_keys=True).splitlines()
                 args.summary.write_text(
                     "## PR risk report\n\n"
-                    + f"Risk report failed closed: {exc}\n\n"
-                    + "```json\n"
-                    + json.dumps(error, indent=2, sort_keys=True)
-                    + "\n```\n",
+                    + f"Risk report failed closed: {summary_text(exc)}\n\n"
+                    + "JSON report:\n\n"
+                    + "\n".join(f"    {line}" for line in json_lines)
+                    + "\n",
                     encoding="utf-8",
                 )
             except OSError:
