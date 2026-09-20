@@ -10659,7 +10659,7 @@ mod tests {
             let mut config = config_with_always_ask_delegate(DelegateExecutionMode::Bounded);
             if padded_profile {
                 let target = Arc::make_mut(&mut config).agents.get_mut("target").unwrap();
-                target.runtime_profile = format!(" {} ", target.runtime_profile);
+                target.runtime_profile = format!(" {} ", target.runtime_profile).into();
             }
             let tool = delegate_tool_for_config(config);
 
