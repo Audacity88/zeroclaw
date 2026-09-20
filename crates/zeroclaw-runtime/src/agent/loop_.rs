@@ -2469,6 +2469,11 @@ pub async fn run(
                                 print!("{text}");
                                 let _ = std::io::stdout().flush();
                             }
+                            StreamDelta::FlushBarrier(ack) => {
+                                // CLI prints deltas immediately; nothing is
+                                // buffered, so release the barrier right away.
+                                StreamDelta::ack_flush_barrier(&ack);
+                            }
                             StreamDelta::Reasoning(_) => {}
                             tool_event @ (StreamDelta::ToolStart { .. }
                             | StreamDelta::ToolComplete { .. }) => {
@@ -10960,6 +10965,7 @@ This is an example, not an invocation."#;
                 StreamDelta::ToolStart { .. }
                 | StreamDelta::ToolComplete { .. }
                 | StreamDelta::Lifecycle(_) => true,
+                StreamDelta::FlushBarrier(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -11058,7 +11064,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11155,7 +11163,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -12160,7 +12170,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -12648,7 +12660,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -15342,6 +15356,7 @@ Let me check the result."#;
                     d.legacy_status().unwrap_or_default()
                 }
                 StreamDelta::Lifecycle(_) => String::new(),
+                StreamDelta::FlushBarrier(_) => String::new(),
             })
             .collect();
 
