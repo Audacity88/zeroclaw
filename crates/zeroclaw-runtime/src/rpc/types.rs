@@ -1150,6 +1150,9 @@ rpc_type! {
         /// Display group for the dashboard sidebar.
         #[serde(default)]
         pub group: String,
+        /// Stable locale-independent group identifier.
+        #[serde(default)]
+        pub group_key: String,
         /// `true` when this section is part of the canonical Quickstart list.
         #[serde(default)]
         pub is_quickstart: bool,
@@ -1241,6 +1244,9 @@ rpc_type! {
         pub data_b64: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub filename: Option<String>,
+        /// Advisory only, retained for wire compatibility. The image/document
+        /// marker decision is made from the filename and payload bytes via the
+        /// canonical provider-loadable contract, never from this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub mime_type: Option<String>,
         #[serde(default)]
@@ -1413,15 +1419,20 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the runtime-profile context
-    /// budget (`[runtime_profiles.<name>] max_context_tokens`). Both may be
-    /// absent when the provider doesn't report usage.
+    /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
+    /// resolved `effective_context_budget`), preserving its original meaning as
+    /// the value the meter fills toward. `model_context_window` is the model's
+    /// full context window (provider `context_window`), exposed distinctly so a
+    /// client can render capacity and budget separately. Any may be absent when
+    /// the provider doesn't report usage or the value can't be resolved.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_context_window: Option<u64>,
     },
     /// Emitted when the TodoWrite tool produces a plan. The `entries` array
     /// carries the normalized `PlanEntry` values (content, status, priority,
@@ -1851,6 +1862,37 @@ mod tests {
         // to `1` so the handshake succeeds without an explicit version.
         let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn config_section_group_key_is_additive_on_the_wire() {
+        let legacy: ConfigSectionEntry = serde_json::from_value(json!({
+            "key": "cron",
+            "label": "Cron",
+            "help": "Scheduled tasks",
+            "has_picker": true,
+            "completed": false,
+            "group": "Agent"
+        }))
+        .unwrap();
+        assert!(legacy.group_key.is_empty());
+
+        let current = ConfigSectionEntry {
+            key: "cron".into(),
+            label: "Cron".into(),
+            help: "Scheduled tasks".into(),
+            has_picker: true,
+            completed: false,
+            ready: false,
+            group: "Agent".into(),
+            group_key: "agent".into(),
+            is_quickstart: true,
+            shape: None,
+            cost_category: String::new(),
+        };
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["group"], json!("Agent"));
+        assert_eq!(value["group_key"], json!("agent"));
     }
 
     #[test]

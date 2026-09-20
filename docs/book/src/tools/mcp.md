@@ -62,6 +62,7 @@ key. Free access is rate limited. Its Streamable HTTP endpoint uses ZeroClaw's
 name = "parallel"
 transport = "http"
 url = "https://search.parallel.ai/mcp"
+headers = { "User-Agent" = "ZeroClaw" }
 
 [mcp_bundles.web]
 servers = ["parallel"]
@@ -69,6 +70,12 @@ servers = ["parallel"]
 [agents.assistant]
 mcp_bundles = ["web"]
 ```
+
+The `User-Agent` identifies ZeroClaw project-wide so Parallel can measure
+aggregate integration usage to understand adoption and support it. Keep this
+header on HTTP requests if the transport changes. Preserve existing headers;
+if you already set a `User-Agent`, append `ZeroClaw` to its existing project and
+HTTP client tokens instead of replacing them.
 
 Merge these entries into your existing `config.toml`, using the alias of the
 agent you want to grant access. Add `"web"` to that agent's existing
@@ -132,9 +139,9 @@ default trust store. Stdio servers ignore it.
 
 MCP tool calls go through the same approval gate as every other tool, governed by the agent's risk profile (`risk_profiles.<alias>`). The `tool_search` discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:
 
-- At autonomy `level = full`, no tool call prompts (MCP tools included).
+- At autonomy `level = full`, uncovered tool calls do not prompt (MCP tools included). A name (or `"*"`) in `always_ask` still prompts, including under Full.
 - Otherwise, an MCP tool call prompts for approval unless its **prefixed** name (`<server>__<tool>`) is in the profile's `auto_approve` list. `auto_approve = ["*"]` approves everything; an exact entry like `auto_approve = ["filesystem__read_file"]` approves just that tool.
-- `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve`.
+- `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve` and Full autonomy.
 
 ### Authorization: `allowed_tools` / `excluded_tools`
 
@@ -150,7 +157,7 @@ Keep the three MCP tool controls on their own axes:
 
 For runtime-discovered MCP tools the capability contract has an MCP-specific exception:
 
-- If the risk profile's `allowed_tools` is empty or omitted, no authorization constraint applies; every discovered tool (MCP or built-in) is reachable. The TOML config does not distinguish an omitted field from `allowed_tools = []`; both deserialize to the same "no authorization constraint" state at the risk-profile level. If you need an explicit deny-all gate, do it on the caller-supplied per-run `allowed_tools` (cron jobs and other narrowers pass that list in directly) or via `excluded_tools` covering the specific tools you want blocked.
+- If the risk profile's `allowed_tools` is omitted or empty, no authorization constraint applies; every discovered tool (MCP or built-in) is reachable; an empty list is the legacy unrestricted state, not deny-all. For an explicit deny-all gate, set the sibling `deny_all_tools = true`: it denies MCP tools too (there is no `__` auto-admit under deny-all) and cannot be combined with a nonempty `allowed_tools`.
 - If `allowed_tools` is non-empty, any MCP tool whose name contains `__` (the `<server>__<tool>` convention) is auto-admitted into the effective allow-list without being listed there individually. Non-MCP built-ins still need an exact entry.
 - `excluded_tools` always subtracts, including from the auto-admitted MCP set. To block a single MCP tool like `filesystem__write_file` while keeping the rest of the `filesystem` server reachable, put it in `excluded_tools`.
 
