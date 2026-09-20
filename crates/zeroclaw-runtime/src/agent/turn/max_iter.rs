@@ -47,6 +47,8 @@ async fn emit_summary_attempt_usage(
                     cached_input_tokens: summary.cached_input_tokens,
                     output_tokens: summary.output_tokens,
                     cost_usd: summary.cost_usd,
+                    context_token_budget: None,
+                    model_context_window: None,
                     provider_ref: summary.provider_ref.clone(),
                     model: summary.model.clone(),
                     accepted: summary.accepted,
@@ -62,6 +64,7 @@ pub(crate) async fn finish_after_max_iterations(
     history: &mut Vec<ChatMessage>,
     provider_name: &str,
     model: &str,
+    dispatch_model: &str,
     temperature: Option<f64>,
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
@@ -131,14 +134,16 @@ pub(crate) async fn finish_after_max_iterations(
         multimodal_config,
         provider_name,
         model,
+        dispatch_model,
     )?;
-    let (model_provider, provider_name, model) = match vision_provider.as_ref() {
+    let (model_provider, provider_name, model, dispatch_model) = match vision_provider.as_ref() {
         Some(route) => (
             route.provider.as_ref(),
             route.provider_name.as_str(),
             route.model.as_str(),
+            route.model.as_str(),
         ),
-        None => (model_provider, provider_name, model),
+        None => (model_provider, provider_name, model, dispatch_model),
     };
     let summary_prompt = ChatMessage::user(format!(
         "{exhaustion}. Please provide your best answer based on the work completed so far. \
@@ -194,6 +199,11 @@ pub(crate) async fn finish_after_max_iterations(
                 model_provider,
                 provider_name,
                 model: &selected_model,
+                dispatch_model: if selected_model == model {
+                    dispatch_model
+                } else {
+                    &selected_model
+                },
                 temperature,
             };
             // Route the graceful-summary call through the metered provider seam. This
@@ -423,6 +433,7 @@ mod graceful_summary_metering_tests {
             provider,
             &mut history,
             "custom",
+            "test-model",
             "test-model",
             None,
             &pacing,
@@ -714,6 +725,7 @@ mod graceful_summary_metering_tests {
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
             &pacing,
             None,
@@ -782,6 +794,7 @@ mod graceful_summary_metering_tests {
             &provider,
             &mut history,
             "custom",
+            "test-model",
             "test-model",
             None,
             &pacing,
@@ -855,6 +868,7 @@ mod graceful_summary_metering_tests {
             &provider,
             &mut history,
             "custom",
+            "test-model",
             "test-model",
             None,
             &pacing,
