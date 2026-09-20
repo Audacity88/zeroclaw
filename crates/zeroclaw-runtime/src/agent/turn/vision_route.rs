@@ -26,12 +26,17 @@ pub(crate) struct ResolvedVisionProvider {
 /// latest user message count as "resolvable" for the no-vision, no-fallback
 /// refusal. A local reference counts only when it is absolute, the policy's
 /// string-level check admits it, the same symlink-aware read ledger the
-/// `file_read` tool applies admits the resolved target, and the file exists
-/// (one async `tokio::fs::metadata` probe per policy-allowed marker of that
-/// one message; a path the policy rejects, a relative reference, a data URI,
-/// or a remote URL is never probed). `None` fails closed: no local path
-/// resolves, so a configless caller degrades to a text-only turn instead of
-/// erroring, and data-URI and remote references are unaffected by `None`.
+/// `file_read` tool applies admits the resolved target, and the file exists.
+/// The resolvable count (and its probes) is computed only on that
+/// no-vision, no-fallback branch: a vision-capable primary or a configured
+/// vision fallback never touches the filesystem for this decision, and the
+/// probe count is bounded by the policy-allowed absolute-path markers of
+/// the latest user message, one message, never the whole history (one async
+/// `tokio::fs::metadata` probe per policy-allowed marker; a path the policy
+/// rejects, a relative reference, a data URI, or a remote URL is never
+/// probed). `None` fails closed: no local path resolves, so a configless
+/// caller degrades to a text-only turn instead of erroring, and data-URI
+/// and remote references are unaffected by `None`.
 pub(crate) async fn resolve_vision_provider(
     config: Option<&Config>,
     model_provider: &dyn ModelProvider,
@@ -44,28 +49,6 @@ pub(crate) async fn resolve_vision_provider(
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
-    // A local marker reference counts as resolvable only when the agent's
-    // filesystem policy would let its file tools read it: the pure
-    // string-level `is_path_allowed` check runs first (no filesystem access
-    // at all for a path it rejects), and a surviving reference is then held
-    // to the same symlink-aware read ledger `file_read` applies
-    // (`resolve_tool_path` + `is_resolved_path_readable`) before the gate's
-    // one async metadata probe. Without a policy (`None`) no local path
-    // resolves: fail closed to the degrade branch.
-    let path_allowed = |path: &std::path::Path| -> bool {
-        security.is_some_and(|policy| {
-            let path_str = path.to_string_lossy();
-            policy.is_path_allowed(&path_str)
-                && policy.is_resolved_path_readable(&policy.resolve_tool_path(&path_str))
-        })
-    };
-    let latest_user_resolvable_marker_count =
-        multimodal::count_latest_user_resolvable_image_markers(
-            history,
-            multimodal_config.allow_remote_fetch,
-            &path_allowed,
-        )
-        .await;
 
     let mut degrade_strip_images = false;
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
@@ -130,59 +113,91 @@ pub(crate) async fn resolve_vision_provider(
                 provider_name: vp.clone(),
                 model: vision_model,
             })
-        } else if latest_user_resolvable_marker_count > 0 {
-            // Marker syntax alone must not fail the turn: prose that
-            // discusses marker syntax parses into markers whose references
-            // resolve to nothing (a missing file, a malformed data URI, a
-            // remote URL while remote fetch is off). Only references that
-            // would actually be sent reach this hard error, so the count in
-            // the refusal is the count of loadable attachments; the rest
-            // fall through to the degrade branch and the turn proceeds as
-            // text.
-            //
-            // `vision_limited_by` already excludes the primary entry (it
-            // returns `None` when the primary itself is the non-vision
-            // entry), so any `Some` here names a genuine fallback and is
-            // safe to surface without re-deriving primary-vs-fallback from
-            // `provider_name`, whose format is not guaranteed to line up
-            // with the dotted entry name.
-            let marker_count = latest_user_resolvable_marker_count.to_string();
-            let message = match model_provider.vision_limited_by(model) {
-                Some(fallback_name) => crate::i18n::get_required_cli_string_with_args(
-                    "cli-agent-vision-unsupported-by-fallback",
-                    &[
-                        ("marker_count", marker_count.as_str()),
-                        ("fallback_name", fallback_name.as_str()),
-                    ],
-                ),
-                None => crate::i18n::get_required_cli_string_with_args(
-                    "cli-agent-vision-unsupported-by-provider",
-                    &[("marker_count", marker_count.as_str())],
-                ),
-            };
-            return Err(ProviderCapabilityError {
-                model_provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message,
-            }
-            .into());
         } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Provider)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "model_provider": provider_name,
-                        "image_marker_count": image_marker_count,
-                        "latest_user_image_marker_count": latest_user_image_marker_count,
-                        "latest_user_resolvable_marker_count":
-                            latest_user_resolvable_marker_count,
-                    })),
-                "no vision route for image marker(s) that are carried over, tool results, or unresolvable; degrading to text-only (markers stripped)"
-            );
-            degrade_strip_images = true;
-            None
+            // A local marker reference counts as resolvable only when the
+            // agent's filesystem policy would let its file tools read it:
+            // the pure string-level `is_path_allowed` check runs first (no
+            // filesystem access at all for a path it rejects), and a
+            // surviving reference is then held to the same symlink-aware
+            // read ledger `file_read` applies (`resolve_tool_path` +
+            // `is_resolved_path_readable`) before the gate's one async
+            // metadata probe. Without a policy (`None`) no local path
+            // resolves: fail closed to the degrade branch.
+            //
+            // This is the ONLY place the resolvable count (and its metadata
+            // probes) is computed: a vision-capable primary or a configured
+            // vision fallback never probes the filesystem for this decision,
+            // and the probe count is bounded by the policy-allowed
+            // absolute-path markers of the latest user message (one message,
+            // never the whole history).
+            let path_allowed = |path: &std::path::Path| -> bool {
+                security.is_some_and(|policy| {
+                    let path_str = path.to_string_lossy();
+                    policy.is_path_allowed(&path_str)
+                        && policy.is_resolved_path_readable(&policy.resolve_tool_path(&path_str))
+                })
+            };
+            let latest_user_resolvable_marker_count =
+                multimodal::count_latest_user_resolvable_image_markers(
+                    history,
+                    multimodal_config.allow_remote_fetch,
+                    &path_allowed,
+                )
+                .await;
+            if latest_user_resolvable_marker_count > 0 {
+                // Marker syntax alone must not fail the turn: prose that
+                // discusses marker syntax parses into markers whose references
+                // resolve to nothing (a missing file, a malformed data URI, a
+                // remote URL while remote fetch is off). Only references that
+                // would actually be sent reach this hard error, so the count in
+                // the refusal is the count of loadable attachments; the rest
+                // fall through to the degrade branch and the turn proceeds as
+                // text.
+                //
+                // `vision_limited_by` already excludes the primary entry (it
+                // returns `None` when the primary itself is the non-vision
+                // entry), so any `Some` here names a genuine fallback and is
+                // safe to surface without re-deriving primary-vs-fallback from
+                // `provider_name`, whose format is not guaranteed to line up
+                // with the dotted entry name.
+                let marker_count = latest_user_resolvable_marker_count.to_string();
+                let message = match model_provider.vision_limited_by(model) {
+                    Some(fallback_name) => crate::i18n::get_required_cli_string_with_args(
+                        "cli-agent-vision-unsupported-by-fallback",
+                        &[
+                            ("marker_count", marker_count.as_str()),
+                            ("fallback_name", fallback_name.as_str()),
+                        ],
+                    ),
+                    None => crate::i18n::get_required_cli_string_with_args(
+                        "cli-agent-vision-unsupported-by-provider",
+                        &[("marker_count", marker_count.as_str())],
+                    ),
+                };
+                return Err(ProviderCapabilityError {
+                    model_provider: provider_name.to_string(),
+                    capability: "vision".to_string(),
+                    message,
+                }
+                .into());
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": provider_name,
+                            "image_marker_count": image_marker_count,
+                            "latest_user_image_marker_count": latest_user_image_marker_count,
+                            "latest_user_resolvable_marker_count":
+                                latest_user_resolvable_marker_count,
+                        })),
+                    "no vision route for image marker(s) that are carried over, tool results, or unresolvable; degrading to text-only (markers stripped)"
+                );
+                degrade_strip_images = true;
+                None
+            }
         }
     } else {
         None
@@ -935,6 +950,168 @@ vision = false
         assert!(
             degrade_strip_images,
             "without a policy no local marker may count as resolvable"
+        );
+    }
+
+    /// A vision-capable primary never reaches the resolvability branch:
+    /// the turn routes to the primary unchanged, even with a policy-readable
+    /// marker file in place. Pins the branch outcome (`(None, false)`, no
+    /// degrade); the no-probe property is structural: the resolvable count
+    /// exists only inside the no-vision, no-fallback `else`.
+    #[tokio::test]
+    async fn vision_capable_primary_takes_no_resolvability_branch() {
+        struct VisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for VisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            fn capabilities_for_model(
+                &self,
+                _model: &str,
+            ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    vision: true,
+                    ..Default::default()
+                }
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for VisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "VisionPrimary"
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let image_path = workspace.path().join("shot.png");
+        std::fs::write(&image_path, b"a readable file that must not matter").unwrap();
+        let security = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            None,
+            &VisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            Some(&security),
+        )
+        .await
+        .expect("a vision-capable primary serves image turns itself");
+        assert!(
+            vision_provider.is_none(),
+            "the primary is the route; no fallback provider is built"
+        );
+        assert!(
+            !degrade_strip_images,
+            "a vision-capable primary must not degrade/strip images"
+        );
+    }
+
+    /// A configured vision fallback never reaches the resolvability branch
+    /// either: the route builds the configured provider and returns it, and
+    /// a policy-readable marker file is irrelevant to the decision. Same
+    /// pinning caveat as above: the outcome proves the branch, the code
+    /// placement proves the absence of probes.
+    #[tokio::test]
+    async fn configured_fallback_takes_no_resolvability_branch() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let image_path = workspace.path().join("shot.png");
+        std::fs::write(&image_path, b"a readable file that must not matter").unwrap();
+        let security = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.custom.visionroute]
+uri = "http://127.0.0.1:9/v1"
+model = "vision-model"
+"#,
+        )
+        .expect("config parses");
+        let multimodal = MultimodalConfig {
+            vision_model_provider: Some("custom.visionroute".to_string()),
+            ..Default::default()
+        };
+        let history = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            Some(&config),
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            Some(&security),
+        )
+        .await
+        .expect("the configured vision fallback must build");
+        let resolved =
+            vision_provider.expect("the configured vision_model_provider must be returned");
+        assert!(
+            resolved
+                .provider
+                .capabilities_for_model(&resolved.model)
+                .vision,
+            "the configured fallback must be vision-capable"
+        );
+        assert!(
+            !degrade_strip_images,
+            "a live vision route must not degrade/strip images"
         );
     }
 
