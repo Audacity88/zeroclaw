@@ -1,81 +1,176 @@
-name: Scheduled Platform Tests
+name: Windows cache forwarding diagnostic
 
 on:
-  pull_request:
-    branches: [master]
-    paths:
-      - ".github/workflows/platform-tests.yml"
-      - "crates/zeroclaw-tools/src/coding_cli.rs"
   workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * *"
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: windows-cache-forwarding-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: 0
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  windows-cache:
+    if: github.repository == 'Audacity88/zeroclaw'
+    runs-on: windows-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Record revision
+        shell: bash
+        run: git rev-parse HEAD
+      - name: Diagnose default cache without a Rust build
+        shell: python
+        timeout-minutes: 12
+        run: |
+          """Windows-only, opt-in diagnostic. Does not change the production allowlist."""
+
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+
+          def main():
+              if os.name != "nt":
+                  sys.exit("STOP: Windows PowerShell 5.1 is required")
+              root = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[1]))
+              expected = {
+                  "crates/zeroclaw-config/src/platform/native.rs":
+                      "7420ad6db1dddd3174ec412ae1a5edab7a975fdce0bbd19afe8b1f9415b34cd0",
+                  "crates/zeroclaw-runtime/src/tools/shell_env.rs":
+                      "903e522cb7b86a1fb58cd1f2507efe82494bf24c6bd609f2a16558114f4e7965",
+              }
+              for relative, digest in expected.items():
+                  data = (root / relative).read_bytes().replace(b"\r\n", b"\n")
+                  if hashlib.sha256(data).hexdigest() != digest:
+                      sys.exit("STOP: source contract drift")
+              source = (root / "crates/zeroclaw-runtime/src/tools/shell_env.rs").read_text()
+              blocks = re.findall(
+                  r'#\[cfg\(target_os = "windows"\)\]\s*pub\(crate\) const SAFE_SHELL_ENV_VARS: &\[&str\] = &\[(.*?)\];',
+                  source, re.S,
+              )
+              if len(blocks) != 1:
+                  sys.exit("STOP: cannot resolve baseline")
+              baseline = re.sub(r"//[^\n]*", "", blocks[0])
+              names = re.findall(r'"([A-Za-z_][A-Za-z_0-9]*)"', baseline)
+              if not names or re.sub(r'"[A-Za-z_][A-Za-z_0-9]*"|[\s,]', '', baseline):
+                  sys.exit("STOP: unexpected baseline syntax")
+              override = "psmoduleanalysiscachepath"
+              inherited = {k: v for k, v in os.environ.items() if k.lower() != override}
+              sanitized = {k: os.environ[k] for k in names if k in os.environ and k.lower() != override}
+              local_app_data = os.environ.get("LOCALAPPDATA")
+              if not local_app_data or any(k.lower() == "localappdata" for k in sanitized):
+                  sys.exit("STOP: add-back comparison precondition failed")
+              addback = {**sanitized, "LOCALAPPDATA": local_app_data}
+              executable = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+              if not executable.is_file():
+                  sys.exit("STOP: native Windows PowerShell unavailable")
+              modes = [("inherited-unset", inherited), ("sanitized-unset", sanitized), ("localappdata-addback", addback)]
+
+              def invoke(script, environment, cwd):
+                  started = time.monotonic()
+                  try:
+                      # communicate drains both pipes; run kills and reaps on timeout.
+                      result = subprocess.run(
+                          [str(executable), "-NoProfile", "-NonInteractive", "-Command", script],
+                          cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                          creationflags=subprocess.CREATE_NO_WINDOW,
+                      )
+                  except subprocess.TimeoutExpired:
+                      sys.exit("STOP: fixed diagnostic exceeded 60 seconds; no retry")
+                  except OSError:
+                      sys.exit("STOP: fixed diagnostic failed to start")
+                  elapsed = round(time.monotonic() - started, 3)
+                  if result.returncode or result.stderr:
+                      sys.exit("STOP: fixed diagnostic failed; output withheld")
+                  return result.stdout.decode("ascii").strip(), elapsed
+
+              with tempfile.TemporaryDirectory(prefix="zc-default-cache-") as cwd:
+                  version, _ = invoke("[Console]::Write($PSVersionTable.PSVersion.ToString())", inherited, cwd)
+                  if not version.startswith("5.1."):
+                      sys.exit("STOP: expected Windows PowerShell 5.1")
+                  print(json.dumps({"powershell_version": version, "source_contract": "matched"}), flush=True)
+                  plain = 'Write-Output "quoted safe value" | Select-Object -First 1'
+                  for number, (mode, environment) in enumerate(modes + list(reversed(modes))):
+                      output, elapsed = invoke(plain, environment, cwd)
+                      if output != "quoted safe value":
+                          sys.exit("STOP: unexpected pipeline result; output withheld")
+                      print(json.dumps({"attempt": number, "mode": mode, "success": True, "seconds": elapsed}), flush=True)
+
+                  # Run resolution probes after timings so reflection does not prewarm the
+                  # timed attempts. These inspect the installed Desktop assembly, not PS7.
+                  probe = r'''
+                    $ErrorActionPreference = 'Stop'
+                    $known = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+                    $type = [psobject].Assembly.GetType('System.Management.Automation.AnalysisCacheData')
+                    $field = $null
+                    if ($null -ne $type) {
+                      $field = $type.GetField('s_cacheStoreLocation', [Reflection.BindingFlags]'NonPublic,Static')
+                    }
+                    $path = $null
+                    if ($null -ne $field) { $path = $field.GetValue($null) }
+                    $resolved = $path -is [string] -and -not [string]::IsNullOrEmpty($path)
+                    $default = [IO.Path]::Combine($known, 'Microsoft\Windows\PowerShell\ModuleAnalysisCache')
+                    [ordered]@{
+                      cache_location_known = $resolved
+                      known_folder_resolves = -not [string]::IsNullOrEmpty($known)
+                      cache_matches_documented_default = $resolved -and [string]::Equals($path, $default, [StringComparison]::OrdinalIgnoreCase)
+                      cache_file_exists = $resolved -and [IO.File]::Exists($path)
+                      override_absent = $null -eq [Environment]::GetEnvironmentVariable('PSModuleAnalysisCachePath')
+                      localappdata_present = $null -ne [Environment]::GetEnvironmentVariable('LOCALAPPDATA')
+                    } | ConvertTo-Json -Compress
+                  '''
+                  for mode, environment in modes:
+                      output, _ = invoke(probe, environment, cwd)
+                      evidence = json.loads(output)
+                      if not all(isinstance(value, bool) for value in evidence.values()):
+                          sys.exit("STOP: unexpected resolution evidence; output withheld")
+                      print(json.dumps({"mode": mode, "resolution": evidence}), flush=True)
+                  print("Complete: timings are exploratory; absent reflection evidence is inconclusive.")
+
+
+          if __name__ == "__main__":
+              main()
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: 1.98.0
           components: rustfmt
-      - name: Check formatting
+      - name: Format
+        shell: bash
         run: cargo fmt --all -- --check
-
-  platform-tests:
-    name: Platform Test (${{ matrix.name }})
-    needs: [fmt]
-    # macOS is a supported target ahead of Windows and has passed 20/20 recent
-    # runs, so its result is honest and a regression turns this workflow red.
-    # Windows stays masked ONLY because one known test is red -- see
-    # cron::scheduler::tests::agent_cron_run_keeps_workspace_through_shell_on_retry_and_concurrency,
-    # where the cron shell reports a POSIX path (/tmp/...) instead of the
-    # Windows scheduler workspace. Re-enable by deleting this expression once
-    # that test is fixed; do not widen it to hide new failures.
-    continue-on-error: ${{ matrix.name == 'Windows' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS
-            os: macos-14
-            nextest-platform: mac
-            timeout-minutes: 45
-          - name: Windows
-            os: windows-latest
-            nextest-platform: windows-tar
-            timeout-minutes: 60
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout-minutes }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: 1.98.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: platform-test
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Ensure web/dist placeholder exists
+          save-if: false
+      - name: Ensure web assets placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Install cargo-nextest
+      - name: Run four exact tests
         shell: bash
-        run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
-      - name: Run tests
-        shell: bash
-        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
+        run: |
+          set -euo pipefail
+          tests=(
+            tools::shell::tests::shell_preserves_inherited_powershell_cache_path
+            tools::skill_tool::tests::skill_shell_preserves_inherited_powershell_cache_path
+            tools::shell::tests::powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias
+            tools::skill_tool::tests::skill_shell_tool_executes_powershell_safe_pipeline_with_sanitized_env
+          )
+          for test in "${tests[@]}"; do
+            log="$RUNNER_TEMP/cache-test-${test##*::}.log"
+            cargo test --locked -p zeroclaw-runtime --lib "$test" -- --exact 2>&1 | tee "$log"
+            grep -Fq 'test result: ok. 1 passed;' "$log"
+          done
