@@ -4,13 +4,35 @@ use anyhow::Result;
 use zeroclaw_config::schema::{Config, MultimodalConfig};
 use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderCapabilityError, multimodal};
 
+use crate::security::SecurityPolicy;
+
 pub(crate) struct ResolvedVisionProvider {
     pub(crate) provider: Box<dyn ModelProvider>,
     pub(crate) provider_name: String,
     pub(crate) model: String,
 }
 
-pub(crate) fn resolve_vision_provider(
+/// Decide this turn's image-input route.
+///
+/// No image markers in the history, or a primary provider that already
+/// accepts images (`capabilities_for_model(dispatch_model)`): the primary
+/// serves the turn unchanged, `(None, false)`. A non-vision primary with a
+/// configured `[multimodal] vision_model_provider`: the configured provider
+/// is built through the alias-aware factory and returned, `(Some(_), false)`;
+/// a configured provider that itself lacks vision is an operator
+/// misconfiguration and surfaces as a `ProviderCapabilityError`.
+///
+/// `security` governs one thing: which local image-marker references in the
+/// latest user message count as "resolvable" for the no-vision, no-fallback
+/// refusal. A local reference counts only when it is absolute, the policy's
+/// string-level check admits it, the same symlink-aware read ledger the
+/// `file_read` tool applies admits the resolved target, and the file exists
+/// (one async `tokio::fs::metadata` probe per policy-allowed marker of that
+/// one message; a path the policy rejects, a relative reference, a data URI,
+/// or a remote URL is never probed). `None` fails closed: no local path
+/// resolves, so a configless caller degrades to a text-only turn instead of
+/// erroring, and data-URI and remote references are unaffected by `None`.
+pub(crate) async fn resolve_vision_provider(
     config: Option<&Config>,
     model_provider: &dyn ModelProvider,
     history: &[ChatMessage],
@@ -18,14 +40,32 @@ pub(crate) fn resolve_vision_provider(
     provider_name: &str,
     model: &str,
     dispatch_model: &str,
+    security: Option<&SecurityPolicy>,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
+    // A local marker reference counts as resolvable only when the agent's
+    // filesystem policy would let its file tools read it: the pure
+    // string-level `is_path_allowed` check runs first (no filesystem access
+    // at all for a path it rejects), and a surviving reference is then held
+    // to the same symlink-aware read ledger `file_read` applies
+    // (`resolve_tool_path` + `is_resolved_path_readable`) before the gate's
+    // one async metadata probe. Without a policy (`None`) no local path
+    // resolves: fail closed to the degrade branch.
+    let path_allowed = |path: &std::path::Path| -> bool {
+        security.is_some_and(|policy| {
+            let path_str = path.to_string_lossy();
+            policy.is_path_allowed(&path_str)
+                && policy.is_resolved_path_readable(&policy.resolve_tool_path(&path_str))
+        })
+    };
     let latest_user_resolvable_marker_count =
         multimodal::count_latest_user_resolvable_image_markers(
             history,
             multimodal_config.allow_remote_fetch,
-        );
+            &path_allowed,
+        )
+        .await;
 
     let mut degrade_strip_images = false;
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
@@ -330,8 +370,8 @@ mod tests {
     /// provider is honored as non-vision and the capability error surfaces -
     /// proving the alias flag is read (the legacy `create_model_provider(vp,
     /// None)` path ignored it entirely).
-    #[test]
-    fn resolve_vision_provider_honors_configured_alias_vision_override() {
+    #[tokio::test]
+    async fn resolve_vision_provider_honors_configured_alias_vision_override() {
         use zeroclaw_config::schema::{Config, MultimodalConfig};
 
         struct NonVisionPrimary;
@@ -385,7 +425,9 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
         )
+        .await
         .err()
         .expect("a forced-off vision route must surface a capability error once its alias vision override is honored");
         assert!(
@@ -398,8 +440,8 @@ vision = false
     /// model_provider) whose non-vision entry is a configured fallback, the
     /// capability error must name that fallback rather than blaming the
     /// primary, since the primary itself may well support vision.
-    #[test]
-    fn resolve_vision_provider_names_fallback_in_capability_error() {
+    #[tokio::test]
+    async fn resolve_vision_provider_names_fallback_in_capability_error() {
         struct NonVisionWithNamedFallback;
         #[async_trait::async_trait]
         impl ModelProvider for NonVisionWithNamedFallback {
@@ -441,6 +483,11 @@ vision = false
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
         std::fs::write(&image_path, b"existence is all the gate checks").unwrap();
+        let security = SecurityPolicy {
+            workspace_dir: temp.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
         let multimodal = MultimodalConfig::default();
         let history = vec![ChatMessage::user(format!(
             "look [IMAGE:{}]",
@@ -455,7 +502,9 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            Some(&security),
         )
+        .await
         .err()
         .expect("a non-vision aggregate with no vision route must surface a capability error");
 
@@ -473,8 +522,8 @@ vision = false
     /// Companion to the fallback-naming test above: a lone non-vision
     /// provider (no aggregate, so nothing names a fallback) must keep the
     /// original wording rather than being mislabeled as a fallback problem.
-    #[test]
-    fn resolve_vision_provider_keeps_primary_wording_without_a_named_fallback() {
+    #[tokio::test]
+    async fn resolve_vision_provider_keeps_primary_wording_without_a_named_fallback() {
         struct PlainNonVisionPrimary;
         #[async_trait::async_trait]
         impl ModelProvider for PlainNonVisionPrimary {
@@ -504,6 +553,11 @@ vision = false
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
         std::fs::write(&image_path, b"existence is all the gate checks").unwrap();
+        let security = SecurityPolicy {
+            workspace_dir: temp.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
         let multimodal = MultimodalConfig::default();
         let history = vec![ChatMessage::user(format!(
             "look [IMAGE:{}]",
@@ -518,7 +572,9 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            Some(&security),
         )
+        .await
         .err()
         .expect("a non-vision primary with no vision route must surface a capability error");
 
@@ -537,8 +593,8 @@ vision = false
     /// file, a malformed data URI) must not fail the turn on a non-vision
     /// provider: it takes the same degrade branch as carried-over markers,
     /// so the turn proceeds with the markers stripped.
-    #[test]
-    fn no_vision_provider_with_unresolvable_marker_degrades_instead_of_failing() {
+    #[tokio::test]
+    async fn no_vision_provider_with_unresolvable_marker_degrades_instead_of_failing() {
         struct PlainNonVisionPrimary;
         #[async_trait::async_trait]
         impl ModelProvider for PlainNonVisionPrimary {
@@ -580,7 +636,9 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
         )
+        .await
         .expect("unresolvable markers must degrade instead of failing the turn");
         assert!(
             vision_provider.is_none(),
@@ -595,8 +653,8 @@ vision = false
     /// A marker whose reference resolves (an existing file) still fails the
     /// turn on a non-vision provider, and the refusal counts the loadable
     /// marker(s) rather than every marker-shaped span in the text.
-    #[test]
-    fn no_vision_provider_with_resolvable_marker_still_fails() {
+    #[tokio::test]
+    async fn no_vision_provider_with_resolvable_marker_still_fails() {
         struct PlainNonVisionPrimary;
         #[async_trait::async_trait]
         impl ModelProvider for PlainNonVisionPrimary {
@@ -626,6 +684,11 @@ vision = false
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
         std::fs::write(&image_path, b"existence is all the gate checks").unwrap();
+        let security = SecurityPolicy {
+            workspace_dir: temp.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
         let multimodal = MultimodalConfig::default();
         let history = vec![ChatMessage::user(format!(
             "look at this [IMAGE:{}]",
@@ -640,7 +703,9 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            Some(&security),
         )
+        .await
         .err()
         .expect("a resolvable image marker on a non-vision provider must fail");
 
@@ -652,6 +717,224 @@ vision = false
         assert!(
             capability_error.message.contains("1 image marker(s)"),
             "the refusal must count the loadable marker: {capability_error}"
+        );
+    }
+
+    /// The existence-oracle regression the policy gate exists for: a marker
+    /// whose file exists OUTSIDE the agent's read boundary must take the
+    /// exact same branch as when no file exists anywhere, so a message author
+    /// cannot learn host-file existence from the error-vs-degrade outcome on
+    /// a model that will never read the file.
+    #[tokio::test]
+    async fn unresolvable_outside_workspace_marker_degrades_without_probe() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().join("host-secret.png");
+        std::fs::write(&outside_path, b"an existing file outside the read boundary").unwrap();
+        let inside_missing = workspace.path().join("attachment.png");
+        let security = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user(format!(
+            "see [IMAGE: {}] and [IMAGE: {}]",
+            outside_path.display(),
+            inside_missing.display()
+        ))];
+
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            Some(&security),
+        )
+        .await
+        .expect("markers outside the read boundary must degrade, never fail the turn");
+        assert!(
+            vision_provider.is_none(),
+            "no vision route exists, so the degrade branch must return None"
+        );
+        assert!(
+            degrade_strip_images,
+            "an unreadable marker must be stripped so the turn proceeds as text"
+        );
+
+        // The same message with both files missing takes the identical
+        // branch. Before the policy gate, the existing outside file flipped
+        // the first call to the capability error: that flip is the oracle.
+        std::fs::remove_file(&outside_path).unwrap();
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            Some(&security),
+        )
+        .await
+        .expect("missing files must degrade, never fail the turn");
+        assert!(vision_provider.is_none());
+        assert!(degrade_strip_images);
+    }
+
+    /// A marker whose file the policy DOES allow to be read (inside the
+    /// workspace) still refuses on a non-vision provider with no fallback.
+    #[tokio::test]
+    async fn inside_workspace_marker_still_refuses() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let image_path = workspace.path().join("shot.png");
+        std::fs::write(&image_path, b"existence is all the gate checks").unwrap();
+        let security = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+
+        let err = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            Some(&security),
+        )
+        .await
+        .err()
+        .expect("a policy-readable image marker on a non-vision provider must fail");
+
+        let capability_error = err
+            .downcast_ref::<ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.model_provider, "primary");
+        assert_eq!(capability_error.capability, "vision");
+        assert!(
+            capability_error.message.contains("1 image marker(s)"),
+            "the refusal must count the loadable marker: {capability_error}"
+        );
+    }
+
+    /// `security: None` fails closed: even an existing file never counts, so
+    /// a configless caller degrades instead of erroring.
+    #[tokio::test]
+    async fn no_policy_fails_closed_to_degrade() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"an existing file nobody vouches for").unwrap();
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            None,
+        )
+        .await
+        .expect("no policy means fail closed: degrade, never fail the turn");
+        assert!(
+            vision_provider.is_none(),
+            "no vision route exists, so the degrade branch must return None"
+        );
+        assert!(
+            degrade_strip_images,
+            "without a policy no local marker may count as resolvable"
         );
     }
 
@@ -748,7 +1031,9 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
         )
+        .await
         .expect("a configured vision-capable alias must build");
         let vision_provider =
             vision_provider.expect("the configured vision_model_provider must be returned");
@@ -796,7 +1081,9 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
         )
+        .await
         .expect("an explicit vision model must resolve");
         assert_eq!(
             vision_provider

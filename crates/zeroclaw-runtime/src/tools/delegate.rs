@@ -3847,6 +3847,7 @@ impl DelegateTool {
                         activated_tools: sub_activated.as_ref(),
                         model_switch_callback: None,
                         receipt_generator,
+                        security: None,
                     },
                     ResolvedRuntimeKnobs {
                         max_tool_iterations: loop_runtime.max_tool_iterations,

@@ -503,44 +503,82 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
 /// Count image markers in the latest user message whose references would
 /// actually resolve to an attachment: an inline `data:` URI that passes the
 /// shared structural check, a remote `http(s)` URL when `remote_allowed` is
-/// set (counted without any network access), or a local path that exists as
-/// a file. Marker syntax alone does not count, so prose that merely looks
+/// set (counted without any network access), or a local path that the
+/// caller's `path_allowed` predicate accepts and that exists as a file.
+/// Marker syntax alone does not count, so prose that merely looks
 /// like a marker cannot fail a turn on a text-only model.
 ///
-/// This touches at most the markers of the latest user message and performs
-/// only synchronous filesystem metadata checks (`Path::is_file`); it does no
-/// network I/O and no decoding. `parse_image_markers` remains the single
-/// source of truth for what a marker reference is, and
-/// `split_base64_image_data_uri` for what a valid inline data URI is.
-pub fn count_latest_user_resolvable_image_markers(
+/// A local reference counts only when it is absolute AND `path_allowed`
+/// accepts it. Relative references never count: this module has no agent
+/// workspace of its own, and a bare existence check would resolve a relative
+/// reference against the process working directory instead, which is not
+/// where the runtime's file tools resolve relative paths, so there is no
+/// answer this module could give that matches the loader. The predicate
+/// exists because the ledger of who may read a path is the agent's
+/// filesystem policy in the runtime, which this crate cannot depend on;
+/// callers pass the same check their file tools apply, so "resolvable" means
+/// exactly "the agent could read this file".
+///
+/// This touches at most the markers of the latest user message. The probe is
+/// one async `tokio::fs::metadata` call per policy-allowed marker of that
+/// message, and nothing at all for a path the predicate rejects, a relative
+/// reference, a data URI, or a remote URL: the predicate is pure caller-side
+/// policy work and runs first, so no filesystem call is made for a path the
+/// policy rejects. It does no network I/O and no decoding.
+/// `parse_image_markers` remains the single source of truth for what a
+/// marker reference is, and `split_base64_image_data_uri` for what a valid
+/// inline data URI is.
+pub async fn count_latest_user_resolvable_image_markers(
     messages: &[ChatMessage],
     remote_allowed: bool,
+    path_allowed: &(dyn Fn(&Path) -> bool + Sync),
 ) -> usize {
-    messages
+    let Some(message) = messages
         .iter()
         .rev()
         .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
-        .map(|message| {
-            parse_image_markers(&message.content)
-                .1
-                .into_iter()
-                .filter(|reference| image_reference_resolves(reference, remote_allowed))
-                .count()
-        })
-        .unwrap_or(0)
+    else {
+        return 0;
+    };
+    let mut resolvable = 0;
+    for reference in parse_image_markers(&message.content).1 {
+        if image_reference_resolves(&reference, remote_allowed, path_allowed).await {
+            resolvable += 1;
+        }
+    }
+    resolvable
 }
 
 /// True when a parsed marker reference would resolve to a loadable image:
 /// structurally valid inline data URIs, remote URLs when allowed (cheap to
-/// count, impossible to verify without a fetch), and existing local files.
-fn image_reference_resolves(reference: &str, remote_allowed: bool) -> bool {
+/// count, impossible to verify without a fetch), and local files the caller's
+/// path policy allows. The predicate runs before any filesystem access, so a
+/// rejected path is never probed; the existence check for an accepted
+/// absolute path is one async metadata call.
+async fn image_reference_resolves(
+    reference: &str,
+    remote_allowed: bool,
+    path_allowed: &(dyn Fn(&Path) -> bool + Sync),
+) -> bool {
     if reference.starts_with("data:") {
         return split_base64_image_data_uri(reference, MAX_ENCODED_IMAGE_PAYLOAD_BYTES).is_ok();
     }
     if reference.starts_with("http://") || reference.starts_with("https://") {
         return remote_allowed;
     }
-    Path::new(reference).is_file()
+    let path = Path::new(reference);
+    if !path.is_absolute() {
+        // Relative references never count: see the doc comment on
+        // `count_latest_user_resolvable_image_markers`.
+        return false;
+    }
+    if !path_allowed(path) {
+        return false;
+    }
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
 }
 
 /// Media-marker kinds this module recognizes. `IMAGE` is the only kind
@@ -2964,20 +3002,20 @@ mod tests {
         assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
     }
 
-    #[test]
-    fn resolvable_count_ignores_missing_path() {
+    #[tokio::test]
+    async fn resolvable_count_ignores_missing_path() {
         let messages = vec![ChatMessage::user(format!(
             "look at this [IMAGE:{}]",
             "/definitely/not/a/real/screenshot.png"
         ))];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false),
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
             0
         );
     }
 
-    #[test]
-    fn resolvable_count_accepts_existing_file() {
+    #[tokio::test]
+    async fn resolvable_count_accepts_existing_file() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
         std::fs::write(&image_path, b"not a real png; existence is all that counts").unwrap();
@@ -2986,47 +3024,47 @@ mod tests {
             image_path.display()
         ))];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false),
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
             1
         );
     }
 
-    #[test]
-    fn resolvable_count_accepts_structurally_valid_data_uri() {
+    #[tokio::test]
+    async fn resolvable_count_accepts_structurally_valid_data_uri() {
         let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
         let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false),
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
             1
         );
     }
 
-    #[test]
-    fn resolvable_count_rejects_malformed_data_uri() {
+    #[tokio::test]
+    async fn resolvable_count_rejects_malformed_data_uri() {
         let uri = "data:image/png;base64,%%%";
         let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false),
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
             0
         );
     }
 
-    #[test]
-    fn resolvable_count_remote_follows_flag() {
+    #[tokio::test]
+    async fn resolvable_count_remote_follows_flag() {
         let reference = "https://example.com/cat.png";
         let messages = vec![ChatMessage::user(format!("see [IMAGE:{reference}]"))];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false),
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
             0
         );
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, true),
+            count_latest_user_resolvable_image_markers(&messages, true, &|_| true).await,
             1
         );
     }
 
-    #[test]
-    fn resolvable_count_looks_only_at_latest_user_message() {
+    #[tokio::test]
+    async fn resolvable_count_looks_only_at_latest_user_message() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("older.png");
         std::fs::write(&image_path, b"an older turn's real image").unwrap();
@@ -3035,8 +3073,100 @@ mod tests {
             ChatMessage::user("what is WAL?".to_string()),
         ];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false),
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_skips_local_paths_the_policy_rejects() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"not a real png; existence is all that counts").unwrap();
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| false).await,
+            0,
+            "a local path the policy rejects must never count, file or no file"
+        );
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
+            1,
+            "the same message with an accepting policy counts the existing file"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_never_counts_relative_local_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("rel.png");
+        std::fs::write(
+            &image_path,
+            b"relative references must not resolve against the process cwd",
+        )
+        .unwrap();
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            "rel.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, &|_| true).await,
+            0,
+            "a relative reference never counts, even when the predicate accepts everything"
+        );
+        // Contrast: the same file reached by its absolute path does count, so
+        // the zero above comes from relativity, not from a missing file.
+        let absolute = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&absolute, false, &|_| true).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_does_not_probe_rejected_paths() {
+        let probed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probed_for_predicate = std::sync::Arc::clone(&probed);
+        let path_allowed = move |_: &Path| -> bool {
+            probed_for_predicate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        };
+        // Both local markers name files that do not exist anywhere: a
+        // rejected path must count 0 without the file ever needing to exist.
+        let messages = vec![ChatMessage::user(format!(
+            "compare [IMAGE: {}] with [IMAGE: {}]",
+            "/definitely/not/a/real/left.png", "/definitely/not/a/real/right.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, &path_allowed).await,
+            0
+        );
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the predicate runs exactly once per local marker"
+        );
+        // A structurally valid data URI in the same message resolves without
+        // the predicate being consulted for it.
+        let data_uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        let with_data_uri = vec![ChatMessage::user(format!(
+            "compare [IMAGE: {}] with [IMAGE: {}]",
+            data_uri, "/definitely/not/a/real/right.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&with_data_uri, false, &path_allowed).await,
+            1
+        );
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "only the local markers consulted the predicate; the data URI did not"
         );
     }
 
