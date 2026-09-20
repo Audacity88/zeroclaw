@@ -1485,6 +1485,8 @@ pub async fn run(
     initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
+    let timing = crate::ui_timing::TimingTrace::from_env()?;
+    use crate::ui_timing::Phase;
     let max_tracked_sessions_per_pane =
         crate::config::resolve_max_tracked_sessions_per_pane_checked(config_dir)?;
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
@@ -1775,6 +1777,7 @@ pub async fn run(
 
     loop {
         // Draw
+        timing.mark(Phase::Tick);
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
             dock.clear_capture();
@@ -1841,9 +1844,12 @@ pub async fn run(
                 .iter()
                 .map(|(status, agent)| (Some(status), Some(agent.as_str()))),
         );
+        timing.mark(Phase::StatusWrite);
         crate::osc_status::sync(terminal_status, terminal_agent);
 
+        timing.mark(Phase::TerminalOutput);
         term.draw(|frame| {
+            timing.mark(Phase::Render);
             // Theme backdrop: paint the whole screen with the active
             // theme's background first so every pane inherits it. The
             // `terminal` theme returns None and the user's own shell
@@ -1942,7 +1948,10 @@ pub async fn run(
             if let Some(msg) = &reload_status {
                 draw_reload_status_toast(frame, frame.area(), msg);
             }
+            timing.mark(Phase::TerminalOutput);
         })?;
+        timing.frame_completed();
+        timing.mark(Phase::Reconnect);
 
         // Restore the base palette so the override never leaks into the next
         // frame, a different pane, or live theme changes from the Config pane.
@@ -2113,12 +2122,21 @@ pub async fn run(
         // assembly and drag coalescing finish, or after a genuine timeout.
         let (input_event, dispatch_state) = poll_input_event_and_snapshot(
             &mut input_decoder,
-            |timeout| Ok(event::poll(timeout)?),
-            || Ok(event::read()?),
+            |timeout| {
+                timing.mark(Phase::Poll);
+                Ok(event::poll(timeout)?)
+            },
+            || {
+                timing.mark(Phase::Read);
+                let event = event::read()?;
+                timing.input_received();
+                Ok(event)
+            },
             || rpc.connection_state(),
         )?;
 
         let Some(input_event) = input_event else {
+            timing.mark(Phase::IdleTick);
             dispatch_state
                 .run_rpc_dispatch(|| async {
                     if mode == Mode::Dashboard {
@@ -2146,6 +2164,7 @@ pub async fn run(
             continue;
         };
 
+        timing.mark(Phase::Dispatch);
         if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
             // The visible confirmation modal is the authoritative input
             // owner; discard paste instead of forwarding it underneath.

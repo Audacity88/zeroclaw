@@ -54,6 +54,7 @@ mod theme;
 mod thought_layout;
 mod todo_tracker;
 mod turn_status;
+mod ui_timing;
 mod url_open;
 mod widgets;
 mod wire;
