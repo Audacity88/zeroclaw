@@ -30866,11 +30866,13 @@ BTC is currently around $65,000 based on latest tool output."#
             PendingApprovalOutcome::Response(None),
         ));
         let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent_cfg.precheck.enabled = false;
         let mut ctx = test_runtime_ctx_with_observer_and_tools(
             channel.clone(),
             Arc::new(ShellProvider(channel.clone())),
             Default::default(),
-            Default::default(),
+            agent_cfg,
             "test-provider",
             None,
             Arc::new(NoopObserver),
