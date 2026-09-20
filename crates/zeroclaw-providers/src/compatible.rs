@@ -4708,11 +4708,12 @@ mod tests {
         );
     }
 
-    /// Capture mock for the TTL path: passthrough always on, provider
-    /// built with the requested `cache_ttl`. Same wire as
+    /// Capture mock for the TTL path: passthrough on or off, provider
+    /// built with the requested `cache_ttl` when set. Same wire as
     /// [`Self::mock_streaming_cache_capture`] so tests pin both paths
     /// against one shape.
     async fn mock_cache_capture_with_ttl(
+        cache_passthrough: bool,
         cache_ttl: Option<CacheTtl>,
     ) -> (
         OpenAiCompatibleModelProvider,
@@ -4759,8 +4760,10 @@ mod tests {
         let mut builder = OpenAiCompatibleModelProvider::builder("test")
             .display_name("custom")
             .base_url(&format!("http://{addr}"))
-            .auth_style(AuthStyle::Bearer)
-            .with_cache_passthrough();
+            .auth_style(AuthStyle::Bearer);
+        if cache_passthrough {
+            builder = builder.with_cache_passthrough();
+        }
         if let Some(cache_ttl) = cache_ttl {
             builder = builder.with_cache_ttl(cache_ttl);
         }
@@ -4776,7 +4779,7 @@ mod tests {
     #[tokio::test]
     async fn cache_ttl_one_hour_marks_every_compat_breakpoint() {
         let (provider, captured, server) =
-            mock_cache_capture_with_ttl(Some(CacheTtl::OneHour)).await;
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::OneHour)).await;
         let messages = vec![
             ChatMessage::system("be brief"),
             ChatMessage::user("first question"),
@@ -4827,7 +4830,7 @@ mod tests {
         }
 
         // Default-lifetime control run: same placement, no ttl anywhere.
-        let (provider, captured, server) = mock_cache_capture_with_ttl(None).await;
+        let (provider, captured, server) = mock_cache_capture_with_ttl(true, None).await;
         let messages = vec![
             ChatMessage::system("be brief"),
             ChatMessage::user("first question"),
@@ -4858,47 +4861,35 @@ mod tests {
         assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
     }
 
-    /// D3: `cache_ttl` without `cache_passthrough` is inert — the body is
-    /// byte-identical to the flag-off pin, so a staged value waiting for a
-    /// passthrough flip changes nothing on the wire.
+    /// D3: `cache_ttl` without `cache_passthrough` is inert — the structured
+    /// `chat` path hits the `!cache_passthrough` early return in
+    /// `apply_cache_breakpoints`, so the body is byte-identical to the
+    /// flag-off structured wire and a staged value waiting for a passthrough
+    /// flip changes nothing on the wire. Removing that early return fails
+    /// this test (breakpoints would appear in the body).
     #[tokio::test]
     async fn cache_ttl_one_hour_without_passthrough_is_inert() {
-        use axum::{Json, Router, routing::post};
-        use tokio::net::TcpListener;
-
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured_for_route = std::sync::Arc::clone(&captured);
-        let app = Router::new().route(
-            "/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
-                let captured = std::sync::Arc::clone(&captured_for_route);
-                async move {
-                    captured.lock().unwrap().push(body);
-                    Json(serde_json::json!({
-                        "choices": [{"message": {"content": "ok"}}]
-                    }))
-                }
-            }),
-        );
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = ::zeroclaw_spawn::spawn!(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let provider = OpenAiCompatibleModelProvider::builder("test")
-            .display_name("custom")
-            .base_url(&format!("http://{addr}"))
-            .auth_style(AuthStyle::Bearer)
-            .with_cache_ttl(CacheTtl::OneHour)
-            .build();
-
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(false, Some(CacheTtl::OneHour)).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
         let result = provider
-            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
             .await;
         server.abort();
-        let result = result.unwrap_or_else(|error| panic!("inert request failed: {error}"));
-        assert_eq!(result, "ok");
+        result.unwrap_or_else(|error| panic!("inert request failed: {error}"));
 
         let requests = captured.lock().unwrap();
         assert_eq!(
@@ -4907,11 +4898,13 @@ mod tests {
                 "model": "test-model",
                 "messages": [
                     {"role": "system", "content": "be brief"},
-                    {"role": "user", "content": "hello"},
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second question"},
                 ],
                 "stream": false,
             }),
-            "cache_ttl without passthrough must leave the body identical to flag-off"
+            "cache_ttl without passthrough must leave the structured body identical to flag-off"
         );
     }
 
