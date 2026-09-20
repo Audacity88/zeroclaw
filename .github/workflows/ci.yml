@@ -28,7 +28,8 @@ env:
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
 # check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
-# directly, so they start as soon as the run does.
+# directly, so runner selection does not wait for fmt. The build matrix still
+# waits for path-changes to select its Windows task-owner recovery tests.
 # `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
 # labels or their cache-provider inputs drift apart, so moving the fleet stays
 # one reviewed edit even though the constant is written more than once.
@@ -356,6 +357,7 @@ jobs:
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
+    # All build legs wait for this detector; only the Windows recovery step is filtered.
     needs: [path-changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -441,6 +443,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Recovery-filter invariant and retirement condition: README.md bespoke CI gate registry.
       - name: Test Windows task-owner recovery
         if: runner.os == 'Windows' && needs.path-changes.outputs.windows_recovery != 'false'
         shell: bash
