@@ -71,6 +71,29 @@ enum BudgetScope {
     },
 }
 
+/// Where a tracker reads the two mutable mode flags that decide whether
+/// it enforces and records at all (`enabled`) and whether its recorded
+/// rows carry an agent alias (`track_per_agent`). Split from the limits
+/// on purpose: the limits (`daily_limit_usd`, `monthly_limit_usd`,
+/// `warn_at_percent`) always come from the live config handle, while the
+/// mode is decided once for a derived tracker so a running delegation's
+/// checks and records cannot be desynchronized by a mid-run reload.
+enum EnforcementMode {
+    /// Read both flags from the live config on every use. The
+    /// process-global tracker is live: an operator reload applies to its
+    /// next check and its next record.
+    Live,
+    /// Both flags captured from the base tracker's config at derivation
+    /// time. Every derived tracker is frozen: a delegation that started
+    /// scoped keeps checking and recording under the mode it started
+    /// with, and one that started dropping aliases keeps dropping them,
+    /// for the delegation's whole lifetime.
+    Frozen {
+        enabled: bool,
+        track_per_agent: bool,
+    },
+}
+
 pub struct CostTracker {
     /// Live cost policy. This is hot-swapped on config reload so budget checks
     /// see new global limits without rebuilding the tracker.
@@ -87,6 +110,15 @@ pub struct CostTracker {
     /// tracker always enforces `Shared`; only derived trackers can carry an
     /// agent-scoped ceiling.
     budget_scope: BudgetScope,
+    /// Where the enforcement mode comes from. The mode flags (`enabled`,
+    /// `track_per_agent`) decide whether this tracker enforces and records
+    /// at all and whether recorded rows carry an agent alias; the limits
+    /// (`daily_limit_usd`, `monthly_limit_usd`, `warn_at_percent`) always
+    /// come from the live config handle. The global tracker reads the mode
+    /// live as well; every derived tracker freezes it at derivation so a
+    /// delegation's checks and records keep agreeing for its whole
+    /// lifetime.
+    enforcement_mode: EnforcementMode,
 }
 
 /// Cheap process-local totals for one optional agent attribution bucket.
@@ -119,6 +151,7 @@ impl CostTracker {
             session_id: uuid::Uuid::new_v4().to_string(),
             session_totals: Arc::new(Mutex::new(HashMap::new())),
             budget_scope: BudgetScope::Shared,
+            enforcement_mode: EnforcementMode::Live,
         })
     }
 
@@ -130,8 +163,13 @@ impl CostTracker {
         self.config_snapshot()
     }
 
+    /// Whether this tracker enforces and records spend. The
+    /// process-global tracker reads the live config, so a reload applies
+    /// at its next check; a derived tracker reports the mode frozen at
+    /// derivation time, matching what its checks and records actually
+    /// honor for the delegation's whole lifetime.
     pub fn is_enabled(&self) -> bool {
-        self.config.read().enabled
+        self.mode().0
     }
 
     /// Hot-swap config so reloaded budget limits apply without a restart.
@@ -146,8 +184,12 @@ impl CostTracker {
     /// `[cost].track_per_agent` is false: per-alias daily totals cannot
     /// exist, so the per-hop ceiling can only tighten the shared check, and
     /// their recorded spend lands on the same durable ledger as every other
-    /// path. The derived tracker is never registered as the process-global
-    /// one; it lives only as long as the delegation that created it.
+    /// path. The captured `track_per_agent = false` is frozen for the
+    /// derived tracker's lifetime, so a mid-run reload enabling per-agent
+    /// attribution does not start attributing this delegation's rows
+    /// halfway through a run. The derived tracker is never registered as
+    /// the process-global one; it lives only as long as the delegation
+    /// that created it.
     pub fn derived_shared_capped(&self, daily_ceiling_usd: f64) -> Self {
         self.derived_with_scope(BudgetScope::SharedCapped { daily_ceiling_usd })
     }
@@ -157,10 +199,11 @@ impl CostTracker {
     /// per-profile cost ceiling means that agent's usage for the day. The
     /// tracker's own shared daily and monthly limits still apply to the
     /// shared totals on top, so the derived tracker can only ever be
-    /// stricter than the base tracker, never looser. The scope kind is
-    /// fixed for the derived tracker's lifetime; the limits themselves are
-    /// read live from the base tracker's shared config handle, so config
-    /// reloads apply at the next `check_budget`.
+    /// stricter than the base tracker, never looser. The scope kind and
+    /// the enforcement mode (`enabled`, `track_per_agent`, captured at
+    /// derivation) are fixed for the derived tracker's lifetime; the
+    /// limits themselves are read live from the base tracker's shared
+    /// config handle, so config reloads apply at the next `check_budget`.
     pub fn derived_for_agent(&self, agent_alias: &str, daily_ceiling_usd: f64) -> Self {
         self.derived_for_agent_in_chain(agent_alias, daily_ceiling_usd, Vec::new())
     }
@@ -172,9 +215,11 @@ impl CostTracker {
     /// this agent's spend against every ancestor's per-hop ceiling, and
     /// usage recorded through it accumulates into each ancestor entry's
     /// descendant total. Chains only apply to per-agent scopes.
-    /// The scope kind is fixed for the derived tracker's lifetime; the
-    /// limits themselves are read live from the base tracker's shared
-    /// config handle, so config reloads apply at the next `check_budget`.
+    /// The scope kind and the enforcement mode (`enabled`,
+    /// `track_per_agent`, captured at derivation) are fixed for the
+    /// derived tracker's lifetime; the limits themselves are read live
+    /// from the base tracker's shared config handle, so config reloads
+    /// apply at the next `check_budget`.
     pub fn derived_for_agent_in_chain(
         &self,
         agent_alias: &str,
@@ -207,19 +252,53 @@ impl CostTracker {
     }
 
     fn derived_with_scope(&self, budget_scope: BudgetScope) -> Self {
+        // Two sources of truth, split on purpose. The config handle is
+        // shared, not snapshotted: a derived tracker sees every config
+        // reload the base tracker sees (`update_config` writes the one
+        // live `CostConfig`), so an operator lowering `daily_limit_usd`
+        // mid-delegation binds the delegate's next `check_budget`. The
+        // enforcement MODE is frozen instead: `enabled` and
+        // `track_per_agent` are captured from the base's config here,
+        // because whether a delegation enforces at all and how its rows
+        // are attributed are decisions taken at delegation start, same
+        // as the scope kind fixed by `budget_scope`. A mid-run reload of
+        // either flag must not untrack a scoped run, whose spend would
+        // then escape every ceiling if tracking were re-enabled, nor
+        // start reattributing an unattributed one halfway through a run.
+        let (enabled, track_per_agent) = {
+            let config = self.config.read();
+            (config.enabled, config.track_per_agent)
+        };
         Self {
-            // Shared handle, not a snapshot: a derived tracker sees every
-            // config reload the base tracker sees (`update_config` writes
-            // the one live `CostConfig`), so an operator lowering
-            // `daily_limit_usd` mid-delegation binds the delegate's next
-            // `check_budget`. The scope KIND stays fixed for the derived
-            // tracker's lifetime (which limit a delegation enforces is a
-            // decision taken at delegation start).
             config: Arc::clone(&self.config),
             storage: Arc::clone(&self.storage),
             session_id: self.session_id.clone(),
             session_totals: Arc::clone(&self.session_totals),
             budget_scope,
+            enforcement_mode: EnforcementMode::Frozen {
+                enabled,
+                track_per_agent,
+            },
+        }
+    }
+
+    /// The `(enabled, track_per_agent)` pair every enforcement and
+    /// attribution decision on this tracker reads: the early return in
+    /// `check_budget`, the record path's enabled gate, the alias
+    /// stamping, and the ancestor-accumulator gate. A live tracker reads
+    /// the pair from the config; a frozen one returns the pair captured
+    /// at derivation, so a derived tracker keeps honoring the mode its
+    /// delegation started under across later reloads.
+    fn mode(&self) -> (bool, bool) {
+        match &self.enforcement_mode {
+            EnforcementMode::Live => {
+                let config = self.config.read();
+                (config.enabled, config.track_per_agent)
+            }
+            EnforcementMode::Frozen {
+                enabled,
+                track_per_agent,
+            } => (*enabled, *track_per_agent),
         }
     }
 
@@ -243,7 +322,8 @@ impl CostTracker {
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
         let config = self.config_snapshot();
-        if !config.enabled {
+        let (enabled, _) = self.mode();
+        if !enabled {
             return Ok(BudgetCheck::Allowed);
         }
 
@@ -442,10 +522,7 @@ impl CostTracker {
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<()> {
-        let (enabled, track_per_agent) = {
-            let config = self.config.read();
-            (config.enabled, config.track_per_agent)
-        };
+        let (enabled, track_per_agent) = self.mode();
         if honor_enabled && !enabled {
             return Ok(());
         }
@@ -2487,6 +2564,205 @@ mod tests {
             }
             other => panic!("expected Exceeded on the reloaded global limit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn derived_tracker_keeps_enforcing_after_global_disable() {
+        // A delegation that started scoped stays scoped: the derived
+        // tracker froze `enabled` at derivation, so an operator disabling
+        // cost tracking mid-run stops the GLOBAL tracker's checks but
+        // not the running delegate's, and the delegate's records keep
+        // landing on the ledger instead of vanishing from every ceiling.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let derived = base.derived_for_agent("target", 5.0);
+        derived
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 6_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("target"),
+            )
+            .unwrap();
+
+        let mut disabled = base.config();
+        disabled.enabled = false;
+        base.update_config(disabled);
+
+        match derived.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!((current_usd - 6.0).abs() < 1e-9);
+                assert!((limit_usd - 5.0).abs() < 1e-9);
+                assert_eq!(
+                    agent_alias.as_deref(),
+                    Some("target"),
+                    "the frozen mode must keep the agent ceiling enforcing"
+                );
+            }
+            other => panic!("expected agent-scoped Exceeded after disable, got {other:?}"),
+        }
+        assert!(
+            matches!(base.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "the global tracker honors the live disabled flag"
+        );
+
+        // Recording through the derived tracker is gated on the frozen
+        // mode too, so the delegation's later spend still lands under
+        // its alias instead of disappearing.
+        derived
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("target"),
+            )
+            .unwrap();
+        let daily = base.get_summary_for_agent("target").unwrap().daily_cost_usd;
+        assert!(
+            (daily - 7.0).abs() < 1e-9,
+            "post-disable records must keep landing under the alias: {daily}"
+        );
+    }
+
+    #[test]
+    fn derived_agent_scope_keeps_attribution_after_track_per_agent_disabled() {
+        // Flipping `track_per_agent` off mid-run must not reattribute a
+        // per-agent-scoped delegation: the child's rows keep their own
+        // alias and keep counting into the ancestor's descendant total,
+        // so the ancestor's ceiling still refuses once the subtree is
+        // over it.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        base.record_usage_with_agent(
+            TokenUsage::new("test/model", 6_000_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("parent"),
+        )
+        .unwrap();
+        let parent_scope = base.derived_for_agent("parent", 5.0);
+        let child = base.derived_for_agent_in_chain(
+            "child",
+            8.0,
+            parent_scope.subtree_chain_for_children(),
+        );
+
+        let mut reloaded = base.config();
+        reloaded.track_per_agent = false;
+        base.update_config(reloaded);
+
+        child
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("child"),
+            )
+            .unwrap();
+        let child_daily = base.get_summary_for_agent("child").unwrap().daily_cost_usd;
+        assert!(
+            (child_daily - 1.0).abs() < 1e-9,
+            "the frozen mode must keep attributing the child's rows: {child_daily}"
+        );
+        let parent_daily = base.get_summary_for_agent("parent").unwrap().daily_cost_usd;
+        assert!(
+            (parent_daily - 6.0).abs() < 1e-9,
+            "the child's row must stay attributed to the child, not the parent: {parent_daily}"
+        );
+
+        // The ancestor entry counted the post-flip record: the parent's
+        // own $6 plus the descendant's $1 exceeds the $5 ceiling, and
+        // both the parent's scoped tracker and the child's (through the
+        // inherited chain) refuse naming the ancestor.
+        match parent_scope.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 7.0).abs() < 1e-9,
+                    "the ancestor's check must count the descendant's post-flip $1: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded after flip, got {other:?}"),
+        }
+        match child.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 7.0).abs() < 1e-9,
+                    "the child's check must see the ancestor subtree total: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded through the child, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_capped_scope_stays_unattributed_after_track_per_agent_enabled() {
+        // The SharedCapped degrade froze `track_per_agent = false` at
+        // derivation: enabling per-agent attribution mid-run must not
+        // start attributing this delegation's rows halfway through, so
+        // the spend stays in the unattributed bucket of the shared
+        // ledger.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: false,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let derived = base.derived_shared_capped(2.0);
+
+        let mut reloaded = base.config();
+        reloaded.track_per_agent = true;
+        base.update_config(reloaded);
+
+        derived
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("x"),
+            )
+            .unwrap();
+        let attributed = base.get_summary_for_agent("x").unwrap().daily_cost_usd;
+        assert!(
+            attributed.abs() < 1e-9,
+            "the frozen SharedCapped mode must keep dropping the alias: {attributed}"
+        );
+        let day = Utc::now().date_naive();
+        let daily = base.get_daily_cost(day).unwrap();
+        assert!(
+            (daily - 1.0).abs() < 1e-9,
+            "the row must still land on the shared ledger, unattributed: {daily}"
+        );
     }
 
     /// Fold the day's per-alias spend straight from the ledger file - the

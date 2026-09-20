@@ -877,11 +877,16 @@ impl DelegateTool {
     ///
     /// Decisions taken here stay fixed for the run: which scope kind the
     /// delegation enforces (per-agent vs shared-capped, decided from
-    /// `track_per_agent`) and whether the run is scoped at all
-    /// (`cost.enabled`). The limits themselves are live: derived trackers
-    /// share the global tracker's config handle, so an operator reload of
-    /// the global `[cost]` limits binds the running delegate at its next
-    /// budget check.
+    /// `track_per_agent`), whether the run is scoped at all
+    /// (`cost.enabled`), and the enforcement mode itself - the derived
+    /// tracker captures `enabled` and `track_per_agent` at derivation, so
+    /// a mid-run reload can neither untrack a scoped run nor start
+    /// attributing an unattributed one halfway through; checks and
+    /// recording keep honoring the mode the delegation started under.
+    /// The limits themselves are live: derived trackers share the global
+    /// tracker's config handle, so an operator reload of the global
+    /// `[cost]` limits binds the running delegate at its next budget
+    /// check.
     ///
     /// Returns `None` (leave the sub-loop unscoped, matching the previous
     /// behavior) when cost tracking is disabled for the resolved config or
@@ -15496,6 +15501,125 @@ command = "rm independent-delegate-marker"
         }
     }
 
+    /// Test tool that flips the cost-tracking MODE flags on the shared
+    /// base tracker between provider calls of one delegated loop, the
+    /// same write a live operator reload performs through
+    /// `update_config`. Idempotent: later executions re-apply the same
+    /// flag values, so a loop that calls it more than once keeps the
+    /// flipped mode.
+    struct ConfigModeFlipTool {
+        tracker: Arc<crate::cost::CostTracker>,
+        disable_enabled: bool,
+        disable_track_per_agent: bool,
+        flipped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ConfigModeFlipTool);
+
+    #[async_trait]
+    impl Tool for ConfigModeFlipTool {
+        fn name(&self) -> &str {
+            "config_mode_flip_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Flips cost-tracking mode flags on the base tracker when executed."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let mut reloaded = self.tracker.config();
+            if self.disable_enabled {
+                reloaded.enabled = false;
+            }
+            if self.disable_track_per_agent {
+                reloaded.track_per_agent = false;
+            }
+            self.tracker.update_config(reloaded);
+            self.flipped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "cost mode flags flipped".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// N-step loop mock for the mode-freeze tests: the first
+    /// `tool_calls` provider responses each emit one
+    /// `config_mode_flip_tool` call carrying priced usage ($0.015 at
+    /// the fixture's rates: 4k input and 200 output tokens); any later
+    /// call returns final text, which the tests treat as failure
+    /// evidence.
+    struct ToolCallsThenFinalModelProvider {
+        tool_calls: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolCallsThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call > self.tool_calls {
+                return Ok(ChatResponse {
+                    text: Some("later provider call was reached".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("call_flip_{call}"),
+                    name: "config_mode_flip_tool".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                }],
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(4_000),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    output_tokens: Some(200),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolCallsThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ToolCallsThenFinalModelProvider"
+        }
+    }
+
     #[tokio::test]
     async fn running_delegate_refuses_next_call_after_limit_lowered() {
         use crate::agent::cost::ToolLoopCostTrackingContext;
@@ -15594,6 +15718,228 @@ command = "rm independent-delegate-marker"
             1,
             "exactly one provider call may be made; the second must be \
              refused before it is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_delegate_stays_enforced_after_cost_tracking_disabled() {
+        use crate::agent::cost::ToolLoopCostTrackingContext;
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::CostConfig;
+
+        // Same shape as the limit-lowered reload test, but the mid-run
+        // write disables cost tracking entirely. The derived tracker
+        // froze `enabled` at derivation, so the delegated loop stays
+        // enforced: the $0.015 first call against the one-cent per-hop
+        // ceiling refuses the second call even though the live config
+        // now says tracking is off, and the first call's row stays on
+        // the ledger under the target alias.
+        let workspace = TempDir::new().unwrap();
+        let base = Arc::new(
+            CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    daily_limit_usd: 1000.0,
+                    monthly_limit_usd: 10_000.0,
+                    ..CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("base tracker"),
+        );
+        let derived = base.derived_for_agent("target", 0.01);
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::new(derived), pricing).with_agent_alias("target");
+
+        // First provider call: a priced `config_mode_flip_tool` call
+        // ($0.015 lands on the ledger under `target`). The tool
+        // execution between the calls disables tracking on the base
+        // tracker, the same write an operator reload performs through
+        // `update_config`.
+        let (server, _requests) = start_usage_chat_server(1).await;
+        let fixture = delegate_cost_fixture_opts(server.uri.clone(), 1000.0, true, 1, true).await;
+        let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disabling = ConfigModeFlipTool {
+            tracker: Arc::clone(&base),
+            disable_enabled: true,
+            disable_track_per_agent: false,
+            flipped: Arc::clone(&flipped),
+        };
+        let tool = fixture
+            .tool
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(disabling)])));
+        let provider = ToolCallsThenFinalModelProvider {
+            tool_calls: 1,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let target_config = fixture
+            .config
+            .agents
+            .get("target")
+            .cloned()
+            .expect("target agent config");
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                tool.execute_agentic(
+                    "target",
+                    &target_config,
+                    "mock-provider",
+                    "test-model",
+                    &provider,
+                    "disable tracking, then try to continue",
+                    None,
+                )
+                .await
+            })
+            .await
+            .expect("agentic delegate run returns a result");
+
+        assert!(
+            flipped.load(std::sync::atomic::Ordering::SeqCst),
+            "the flip tool must have run between the provider calls"
+        );
+        assert!(
+            !result.success,
+            "the next provider call must stay refused after the disable: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`"),
+            "the refusal must be the frozen per-agent ceiling, not the shared limit: {error}"
+        );
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one provider call may be made; the second must be \
+             refused before it is sent"
+        );
+        let daily = base
+            .get_summary_for_agent("target")
+            .expect("ledger readable")
+            .daily_cost_usd;
+        assert!(
+            (daily - 0.015).abs() < 1e-9,
+            "the first call's row must sit on the ledger under the target alias: {daily}"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_delegate_keeps_attribution_after_track_per_agent_disabled() {
+        use crate::agent::cost::ToolLoopCostTrackingContext;
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::CostConfig;
+
+        // The mid-run write flips `track_per_agent` off between the
+        // first and second provider calls. The derived tracker froze the
+        // flag at derivation, so the second call's row keeps the target
+        // alias and both rows count toward the two-cent per-hop ceiling,
+        // which refuses the third call; the shared $1000 limit alone
+        // would have let the run continue.
+        let workspace = TempDir::new().unwrap();
+        let base = Arc::new(
+            CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    daily_limit_usd: 1000.0,
+                    monthly_limit_usd: 10_000.0,
+                    ..CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("base tracker"),
+        );
+        let derived = base.derived_for_agent("target", 0.02);
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::new(derived), pricing).with_agent_alias("target");
+
+        // First provider call records $0.015 under `target`, the flip
+        // tool disables per-agent attribution, the second call records
+        // another $0.015 (frozen mode keeps the alias), and the third
+        // call is refused: $0.03 against the $0.02 ceiling.
+        let (server, _requests) = start_usage_chat_server(2).await;
+        let fixture = delegate_cost_fixture_opts(server.uri.clone(), 1000.0, true, 2, true).await;
+        let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let untracking = ConfigModeFlipTool {
+            tracker: Arc::clone(&base),
+            disable_enabled: false,
+            disable_track_per_agent: true,
+            flipped: Arc::clone(&flipped),
+        };
+        let tool = fixture
+            .tool
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(untracking)])));
+        let provider = ToolCallsThenFinalModelProvider {
+            tool_calls: 2,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let target_config = fixture
+            .config
+            .agents
+            .get("target")
+            .cloned()
+            .expect("target agent config");
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                tool.execute_agentic(
+                    "target",
+                    &target_config,
+                    "mock-provider",
+                    "test-model",
+                    &provider,
+                    "stop attributing, then try to continue",
+                    None,
+                )
+                .await
+            })
+            .await
+            .expect("agentic delegate run returns a result");
+
+        assert!(
+            flipped.load(std::sync::atomic::Ordering::SeqCst),
+            "the flip tool must have run between the provider calls"
+        );
+        assert!(
+            !result.success,
+            "the run must be refused once both rows count against the ceiling: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`"),
+            "the refusal must be the per-agent ceiling, which the shared limit would not trip: {error}"
+        );
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly two provider calls may be made; the third must be \
+             refused before it is sent"
+        );
+        let daily = base
+            .get_summary_for_agent("target")
+            .expect("ledger readable")
+            .daily_cost_usd;
+        assert!(
+            (daily - 0.03).abs() < 1e-9,
+            "both rows must carry the target alias after the flip: {daily}"
         );
     }
 
