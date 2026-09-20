@@ -838,7 +838,10 @@ pub enum AuthMode {
 /// where Anthropic-shaped `cache_control` markers reach the API: the
 /// native Anthropic provider always places them, compatible providers
 /// only behind `cache_passthrough` (with passthrough off the setting is
-/// inert). One TTL applies to every marker in a request.
+/// inert). One TTL applies to every marker this implementation places;
+/// operator-supplied `cache_control` (via `provider_extra` or raw tool
+/// JSON) sits outside that guarantee and must order 1h before 5m when
+/// mixing lifetimes in one request.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]

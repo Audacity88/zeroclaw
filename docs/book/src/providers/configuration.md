@@ -318,30 +318,40 @@ longer lifetime would have kept alive.
 
 The break-even arithmetic, with P the base input price of the prefix: a
 5m cache write costs 1.25P and a 1h write costs 2P, so choosing the 1h
-lifetime costs 0.75P more up front. Each expiry the longer lifetime
-avoids saves 1.25P minus the 0.1P read, about 1.15P. For a 140k-token
-prefix at a $10/M input rate, that is about $1.05 of extra write premium
-up front per hour, about $1.61 saved per avoided expiry, so the first
-avoided pause in an hour nets roughly $0.56 and every pause after that
-nets the full $1.61. On top of the write premium, the 1h lifetime adds a
-small cost on every appended tail: a few thousand tokens times 0.75
-times the input rate, roughly one cent per turn at the same rate.
-Conversations that pause longer than five minutes between turns favor
-`"1h"`; conversations that stay active or end quickly favor the default.
+lifetime costs 0.75P more per cache write (a hit refreshes the entry, so
+the premium is paid on each write, not per hour). Each expiry the longer
+lifetime avoids saves 1.25P minus the 0.1P read, about 1.15P. For a
+140k-token prefix at a $10/M input rate, P is $1.40: about $1.05 of
+extra write premium per 1h write, about $1.61 saved per avoided expiry,
+so the first avoided pause nets roughly $0.56 and every pause after that
+nets the full $1.61. The saving is bounded: it exists for a prefix reused
+after a gap longer than five minutes and shorter than one hour, and a
+gap past the hour pays the 2x write again with no saving. On top of the
+write premium, the 1h lifetime adds a small cost on every appended tail:
+a few thousand tokens times 0.75 times the input rate, two to three
+cents per turn for a few-thousand-token tail at that rate. (The 0.1x
+read rate is the common figure; some models differ, so check Anthropic's
+prompt-caching pricing table for the model in question.) Conversations
+that pause between five minutes and an hour favor `"1h"`; conversations
+that stay active, end quickly, or pause past the hour favor the default.
 
 Plan against Anthropic's nominal 2x cache-write price. A gateway in front
-of the API may bill 1h writes at its own rate, and internal cost tracking
-records cache writes at the input rate either way, so the premium shows up
-on the vendor bill rather than in the ledger.
+of the API may bill 1h writes at its own rate. The ledger prices cache
+writes at the configured or live `cache_write_per_mtok` rate when one is
+present, and at the plain input rate when only the catalog fallback
+applies (the catalog carries no write rate). `cache_ttl` does not select
+a write rate: an operator who moves an entry to `"1h"` should set the
+provider's write rate to match what the route actually charges.
 
 Two caveats from live route qualification: survival past five minutes was
 demonstrated twice, at six and forty-nine minutes; a full one-hour
-lifetime was not measured. And one TTL applies to every marker in a
-request by design: the
-native Anthropic provider marks its system prompt, the last tool
-definition, and the rolling last message with the same lifetime, and the
-passthrough breakpoints carry it likewise. Per-marker mixed lifetimes are
-not supported.
+lifetime was not measured. And one TTL applies to every marker this
+implementation generates: the native Anthropic provider's system, tool,
+and rolling-message markers and the compatible passthrough breakpoints
+all carry the configured lifetime. Operator-supplied `cache_control`
+(through `provider_extra` body fields or raw tool JSON) sits outside
+that guarantee, and any mixed lifetimes in one request must satisfy
+Anthropic's ordering rule (a 1h marker before a 5m one).
 
 ```toml
 [providers.models.custom.claude-via-gateway]
