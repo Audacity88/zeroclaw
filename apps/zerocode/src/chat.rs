@@ -33,10 +33,11 @@ use crate::input_bar::{InputBarAction, InputBarState};
 use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
 #[cfg(test)]
-use crate::text_selection::{CellPoint, TextCell as TranscriptCell, row_breaks_for_line};
+use crate::text_selection::{CellPoint, TextCell as TranscriptCell};
 use crate::text_selection::{
     TextRowBreak as TranscriptRowBreak, TextSelection as TranscriptSelection,
-    TextSnapshot as TranscriptSnapshot, borrow_line, row_breaks_for_lines, wrapped_rows,
+    TextSnapshot as TranscriptSnapshot, borrow_line, row_breaks_for_line, row_breaks_for_lines,
+    wrapped_rows,
 };
 use crate::theme;
 use crate::thought_layout::{ThoughtLayout, WrappedLineLayout, WrappedRangeRun};
