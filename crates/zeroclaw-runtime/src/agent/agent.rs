@@ -862,8 +862,8 @@ impl AgentBuilder {
     /// Set the agent's filesystem policy. Config-backed construction passes
     /// the same `Arc<SecurityPolicy>` the agent's file tools were built
     /// with, so the no-vision image-marker gate applies the identical read
-    /// ledger. Unset builders get `SecurityPolicy::default()` (see
-    /// [`Agent::security`]).
+    /// ledger. Unset builders get `SecurityPolicy::default()`, whose
+    /// `workspace_dir` is `.` (the process cwd).
     pub fn security(mut self, security: Arc<crate::security::SecurityPolicy>) -> Self {
         self.security = Some(security);
         self

@@ -197,8 +197,8 @@ pub struct ResolvedAgentExecution<'a> {
     /// The agent's filesystem policy, applied by the no-vision image-marker
     /// gate so a local marker counts as resolvable only when the agent's own
     /// file tools could read it. `None` on configless (test) paths, where the
-    /// gate fails closed to a degrade. See
-    /// [`crate::agent::turn::vision_route::resolve_vision_provider`].
+    /// gate fails closed to a degrade. The gate lives in
+    /// `crate::agent::turn::vision_route::resolve_vision_provider`.
     pub security: Option<&'a SecurityPolicy>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
