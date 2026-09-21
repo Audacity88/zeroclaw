@@ -2,7 +2,7 @@
 //! Firejail is a SUID sandbox program that Linux applications use to sandbox themselves.
 
 use crate::security::traits::Sandbox;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use zeroclaw_config::platform::resolve_executable;
@@ -144,12 +144,17 @@ impl FirejailSandbox {
         support: FirejailHardeningSupport,
         launcher: &Path,
     ) -> std::io::Result<()> {
-        // Prepend firejail to the command
-        let program = cmd.get_program().to_string_lossy().to_string();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let invocation = super::shell_identity::invocation(cmd, None)?;
+        self.wrap_invocation(cmd, support, launcher, &invocation)
+    }
+
+    fn wrap_invocation(
+        &self,
+        cmd: &mut Command,
+        support: FirejailHardeningSupport,
+        launcher: &Path,
+        invocation: &[OsString],
+    ) -> std::io::Result<()> {
         let current_dir = cmd.get_current_dir().map(std::path::Path::to_path_buf);
 
         // Build firejail wrapper with security flags
@@ -168,8 +173,7 @@ impl FirejailSandbox {
         Self::append_hardening_flags(&mut firejail_cmd, support);
 
         // Add the original command
-        firejail_cmd.arg(&program);
-        firejail_cmd.args(&args);
+        firejail_cmd.args(invocation);
         if let Some(current_dir) = current_dir {
             firejail_cmd.current_dir(current_dir);
         }
@@ -181,6 +185,17 @@ impl FirejailSandbox {
 }
 
 impl Sandbox for FirejailSandbox {
+    fn wrap_shell_command(
+        &self,
+        cmd: &mut Command,
+        shell_program: Option<&OsStr>,
+    ) -> std::io::Result<()> {
+        let invocation = super::shell_identity::invocation(cmd, shell_program)?;
+        let launcher = Self::resolve_launcher()?;
+        let support = Self::detect_hardening_support(&launcher);
+        self.wrap_invocation(cmd, support, &launcher, &invocation)
+    }
+
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
         let launcher = Self::resolve_launcher()?;
         let support = Self::detect_hardening_support(&launcher);
@@ -203,6 +218,35 @@ impl Sandbox for FirejailSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firejail_shell_identity_survives_replacing_wrapper() {
+        let mut cmd = Command::new("/usr/bin/busybox");
+        cmd.args(["-c", "printf '%s' \"$0\""]).current_dir("/tmp");
+        let invocation =
+            crate::security::shell_identity::invocation_with(&cmd, Some(OsStr::new("sh")), || {
+                Ok(PathBuf::from("/usr/bin/env"))
+            })
+            .unwrap();
+        FirejailSandbox
+            .wrap_invocation(
+                &mut cmd,
+                FirejailHardeningSupport::default(),
+                Path::new("/usr/bin/firejail"),
+                &invocation,
+            )
+            .unwrap();
+        assert_eq!(cmd.get_program(), "/usr/bin/firejail");
+        assert!(
+            cmd.get_args().collect::<Vec<_>>().ends_with(
+                &invocation
+                    .iter()
+                    .map(OsString::as_os_str)
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/tmp")));
+    }
 
     fn args(cmd: &Command) -> Vec<String> {
         cmd.get_args()

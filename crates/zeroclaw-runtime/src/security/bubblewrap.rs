@@ -1,7 +1,7 @@
 //! Bubblewrap sandbox (user namespaces for Linux/macOS)
 
 use crate::security::traits::Sandbox;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use zeroclaw_config::platform::resolve_executable;
@@ -136,12 +136,17 @@ impl BubblewrapSandbox {
         support: BubblewrapHardeningSupport,
         launcher: &Path,
     ) -> std::io::Result<()> {
-        let program = cmd.get_program().to_string_lossy().to_string();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let invocation = super::shell_identity::invocation(cmd, None)?;
+        self.wrap_invocation(cmd, support, launcher, &invocation)
+    }
 
+    fn wrap_invocation(
+        &self,
+        cmd: &mut Command,
+        support: BubblewrapHardeningSupport,
+        launcher: &Path,
+        invocation: &[OsString],
+    ) -> std::io::Result<()> {
         let mut bwrap_cmd = Command::new(launcher);
         bwrap_cmd.args([
             "--ro-bind",
@@ -172,8 +177,7 @@ impl BubblewrapSandbox {
                 bwrap_cmd.args(["--ro-bind", lib_dir, lib_dir]);
             }
         }
-        bwrap_cmd.arg(&program);
-        bwrap_cmd.args(&args);
+        bwrap_cmd.args(invocation);
 
         *cmd = bwrap_cmd;
         Ok(())
@@ -181,6 +185,17 @@ impl BubblewrapSandbox {
 }
 
 impl Sandbox for BubblewrapSandbox {
+    fn wrap_shell_command(
+        &self,
+        cmd: &mut Command,
+        shell_program: Option<&OsStr>,
+    ) -> std::io::Result<()> {
+        let invocation = super::shell_identity::invocation(cmd, shell_program)?;
+        let launcher = Self::resolve_launcher()?;
+        let support = Self::detect_hardening_support(&launcher);
+        self.wrap_invocation(cmd, support, &launcher, &invocation)
+    }
+
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
         let launcher = Self::resolve_launcher()?;
         let support = Self::detect_hardening_support(&launcher);
@@ -209,6 +224,34 @@ impl Sandbox for BubblewrapSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bubblewrap_shell_identity_survives_replacing_wrapper() {
+        let mut cmd = Command::new("/usr/bin/busybox");
+        cmd.args(["-c", "printf '%s' \"$0\""]);
+        let invocation =
+            crate::security::shell_identity::invocation_with(&cmd, Some(OsStr::new("sh")), || {
+                Ok(PathBuf::from("/usr/bin/env"))
+            })
+            .unwrap();
+        BubblewrapSandbox
+            .wrap_invocation(
+                &mut cmd,
+                BubblewrapHardeningSupport::default(),
+                Path::new("/usr/bin/bwrap"),
+                &invocation,
+            )
+            .unwrap();
+        assert_eq!(cmd.get_program(), "/usr/bin/bwrap");
+        assert!(
+            cmd.get_args().collect::<Vec<_>>().ends_with(
+                &invocation
+                    .iter()
+                    .map(OsString::as_os_str)
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
 
     fn args(cmd: &Command) -> Vec<String> {
         cmd.get_args()
