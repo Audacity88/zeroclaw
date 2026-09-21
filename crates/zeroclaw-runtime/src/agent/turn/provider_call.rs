@@ -32,15 +32,19 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) streamed_visible_text: String,
 }
 
-/// Fingerprints of a request's cacheable prompt prefix: the leading system
-/// message and the tool list. Hashes are the first 16 hex chars of SHA-256,
-/// enough to compare two `llm_request` trace rows without capturing request
-/// bodies.
+/// Fingerprints of a request's cacheable prompt prefix: the contiguous
+/// leading system messages and the tool list. Hashes are the first 16 hex
+/// chars of SHA-256, enough to compare two `llm_request` trace rows without
+/// capturing request bodies.
 struct PrefixFingerprint {
-    /// Char count of the leading system message content, 0 when absent.
+    /// Char count of the contiguous leading system message contents, summed
+    /// over the whole run, 0 when there are none.
     system_chars: usize,
-    /// Hash of the leading system message content, absent when there is no
-    /// system message.
+    /// Hash of the leading system message contents serialized as a JSON
+    /// array, absent when there are no leading system messages. The whole
+    /// run is hashed, not just the first message: a before-call hook may
+    /// insert or edit a later leading system message, and provider adapters
+    /// then keep, merge, or drop it, which is outside the hashed bytes.
     system_sha256: Option<String>,
     /// Number of tool specs, 0 when the request carries no tools.
     tools_count: usize,
@@ -54,12 +58,23 @@ fn prefix_fingerprint(
     request_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
 ) -> PrefixFingerprint {
-    let system = request_messages
-        .first()
-        .filter(|message| message.role == "system");
+    let leading_system: Vec<&str> = request_messages
+        .iter()
+        .take_while(|message| message.role == "system")
+        .map(|message| message.content.as_str())
+        .collect();
     PrefixFingerprint {
-        system_chars: system.map_or(0, |message| message.content.chars().count()),
-        system_sha256: system.map(|message| short_sha256_prefix(message.content.as_bytes())),
+        system_chars: leading_system
+            .iter()
+            .map(|content| content.chars().count())
+            .sum(),
+        system_sha256: if leading_system.is_empty() {
+            None
+        } else {
+            Some(short_sha256_prefix(
+                &::serde_json::to_vec(&leading_system).unwrap_or_default(),
+            ))
+        },
         tools_count: request_tools.map_or(0, <[ToolSpec]>::len),
         tools_sha256: request_tools
             .map(|tools| short_sha256_prefix(&::serde_json::to_vec(tools).unwrap_or_default())),
@@ -474,6 +489,7 @@ mod payload_capture_tests {
     use super::super::context::TurnCtx;
     use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
     use super::{announce_llm_request, prefix_fingerprint};
+    use crate::hooks::{HookHandler, HookResult, HookRunner};
     use crate::observability::NoopObserver;
     use crate::tools::ToolSpec;
     use async_trait::async_trait;
@@ -768,6 +784,114 @@ mod payload_capture_tests {
         let no_tools = prefix_fingerprint(&messages, None);
         assert_eq!(no_tools.tools_count, 0);
         assert!(no_tools.tools_sha256.is_none());
+    }
+
+    #[test]
+    fn prefix_fingerprint_covers_every_leading_system_message() {
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+        let single = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let base = prefix_fingerprint(&single, Some(&tools));
+
+        // Two leading system messages: the char count is the sum over the
+        // whole run, and the hash differs from the single-message case.
+        let doubled = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::system("Always cite your sources."),
+            ChatMessage::user("hello"),
+        ];
+        let two_leading = prefix_fingerprint(&doubled, Some(&tools));
+        assert_eq!(
+            two_leading.system_chars,
+            "You are a helpful assistant.".chars().count()
+                + "Always cite your sources.".chars().count()
+        );
+        assert_ne!(two_leading.system_sha256, base.system_sha256);
+
+        // Editing the SECOND leading system message moves the system hash
+        // and leaves the tools hash unchanged.
+        let mut edited_second = doubled.clone();
+        edited_second[1].content.push('!');
+        let second_changed = prefix_fingerprint(&edited_second, Some(&tools));
+        assert_ne!(second_changed.system_sha256, two_leading.system_sha256);
+        assert_eq!(second_changed.tools_sha256, two_leading.tools_sha256);
+
+        // A system message placed after the first user message is not part
+        // of the prefix: neither hash moves relative to the base.
+        let trailing = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+            ChatMessage::system("mid-conversation reminder"),
+        ];
+        let non_leading = prefix_fingerprint(&trailing, Some(&tools));
+        assert_eq!(non_leading.system_chars, base.system_chars);
+        assert_eq!(non_leading.system_sha256, base.system_sha256);
+        assert_eq!(non_leading.tools_sha256, base.tools_sha256);
+
+        // The JSON-array serialization keeps one message "a\n\nb" distinct
+        // from two messages "a", "b": merging with a separator would not.
+        let joined = vec![ChatMessage::system("a\n\nb"), ChatMessage::user("hello")];
+        let split = vec![
+            ChatMessage::system("a"),
+            ChatMessage::system("b"),
+            ChatMessage::user("hello"),
+        ];
+        assert_ne!(
+            prefix_fingerprint(&joined, Some(&tools)).system_sha256,
+            prefix_fingerprint(&split, Some(&tools)).system_sha256
+        );
+    }
+
+    /// Inserts a second leading system message at index 1, the way a
+    /// before-call hook may mutate the request messages.
+    struct SystemInjectingHook;
+
+    #[async_trait]
+    impl HookHandler for SystemInjectingHook {
+        fn name(&self) -> &str {
+            "inject-second-system"
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            messages.insert(1, ChatMessage::system("injected guidance"));
+            HookResult::Continue(())
+        }
+    }
+
+    #[tokio::test]
+    async fn before_llm_call_hook_inserting_system_message_moves_system_fingerprint() {
+        let tools = vec![test_tool_spec("alpha")];
+        let mut messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let before = prefix_fingerprint(&messages, Some(&tools));
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(SystemInjectingHook));
+        let mut model = String::from("stub-model");
+        let result = runner.run_before_llm_call(&mut messages, &mut model).await;
+        assert!(matches!(result, HookResult::Continue(())));
+
+        // The hook inserted a second leading system message, so the runtime
+        // prefix the provider sees changed: the system fingerprint must move
+        // with it while the tools fingerprint stays put.
+        assert_eq!(messages.len(), 3);
+        let after = prefix_fingerprint(&messages, Some(&tools));
+        assert_ne!(after.system_sha256, before.system_sha256);
+        assert_eq!(
+            after.system_chars,
+            before.system_chars + "injected guidance".chars().count()
+        );
+        assert_eq!(after.tools_sha256, before.tools_sha256);
     }
 
     #[allow(clippy::await_holding_lock)]
