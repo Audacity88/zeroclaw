@@ -21,6 +21,10 @@ $fixture = if (Test-Path -LiteralPath $FixturePath) {
     [IO.Path]::GetFullPath($FixturePath)
 }
 $ConfigDir = [IO.Path]::GetFullPath($ConfigDir)
+$legacyConfigDir = Join-Path $env:RUNNER_TEMP 'zeroclaw-legacy-service-smoke'
+$legacyWrapper = Join-Path $legacyConfigDir 'zeroclaw-daemon.cmd'
+$legacyStdout = Join-Path $legacyConfigDir 'daemon.stdout.log'
+$legacyStderr = Join-Path $legacyConfigDir 'daemon.stderr.log'
 $evidence = [ordered]@{
     tested_sha = (git rev-parse HEAD).Trim()
     runner = $env:RUNNER_NAME
@@ -75,10 +79,14 @@ function Set-CurrentUserOwner {
 }
 
 function Remove-SmokeTask {
-    $descendantPid = if (Test-Path -LiteralPath (Join-Path $ConfigDir 'descendant.pid')) {
-        [int](Get-Content -LiteralPath (Join-Path $ConfigDir 'descendant.pid') -Raw).Trim()
-    } else {
-        $null
+    $descendantPids = @()
+    foreach ($pidFile in @(
+        (Join-Path $ConfigDir 'descendant.pid'),
+        (Join-Path $legacyConfigDir 'descendant.pid')
+    )) {
+        if (Test-Path -LiteralPath $pidFile) {
+            $descendantPids += [int](Get-Content -LiteralPath $pidFile -Raw).Trim()
+        }
     }
     if (Test-Path -LiteralPath $fixture) {
         & $fixture --config-dir $ConfigDir service stop *> $null
@@ -86,9 +94,12 @@ function Remove-SmokeTask {
     }
     schtasks /Delete /TN $taskName /F *> $null
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ExecutablePath -eq $fixture -and $_.CommandLine -like "*$ConfigDir*" } |
+        Where-Object {
+            $_.ExecutablePath -eq $fixture -and
+            ($_.CommandLine -like "*$ConfigDir*" -or $_.CommandLine -like "*$legacyConfigDir*")
+        } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    if ($null -ne $descendantPid) {
+    foreach ($descendantPid in $descendantPids) {
         $descendant = Get-CimInstance Win32_Process -Filter "ProcessId = $descendantPid" -ErrorAction SilentlyContinue
         if ($null -ne $descendant -and
             $descendant.Name -eq 'powershell.exe' -and
@@ -104,6 +115,7 @@ function Remove-SmokeTask {
 if ($CleanupOnly) {
     Remove-SmokeTask
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $legacyConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     exit 0
 }
 
@@ -120,7 +132,9 @@ try {
     $transcriptStarted = $true
     Remove-SmokeTask
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $legacyConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $legacyConfigDir | Out-Null
     Set-CurrentUserOwner -Path $ConfigDir
     New-Item -ItemType Directory -Force -Path (Join-Path $ConfigDir 'logs') | Out-Null
     Set-CurrentUserOwner -Path (Join-Path $ConfigDir 'logs')
@@ -133,15 +147,11 @@ try {
     $evidence.administrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $evidence.administrator) { throw 'Hosted Windows smoke requires an elevated runner' }
 
-    $legacyWrapper = Join-Path $ConfigDir 'zeroclaw-daemon.cmd'
-    $legacyStdout = Join-Path $ConfigDir 'legacy.stdout.log'
-    $legacyStderr = Join-Path $ConfigDir 'legacy.stderr.log'
     @(
         '@echo off'
-        ('"{0}" --config-dir "{1}" daemon >>"{2}" 2>>"{3}"' -f $fixture, $ConfigDir, $legacyStdout, $legacyStderr)
+        ('"{0}" --config-dir "{1}" daemon >>"{2}" 2>>"{3}"' -f $fixture, $legacyConfigDir, $legacyStdout, $legacyStderr)
     ) | Set-Content -LiteralPath $legacyWrapper -Encoding Ascii
-    $legacyAction = '"{0}"' -f $legacyWrapper
-    & schtasks /Create /TN $taskName /SC ONLOGON /TR $legacyAction /RL LIMITED /F | Write-Host
+    & schtasks /Create /TN $taskName /SC ONLOGON /TR $legacyWrapper /RL LIMITED /F | Write-Host
     if ($LASTEXITCODE -ne 0) { throw "Failed to register legacy task: $LASTEXITCODE" }
     & schtasks /Run /TN $taskName | Write-Host
     if ($LASTEXITCODE -ne 0) { throw "Failed to start legacy task: $LASTEXITCODE" }
@@ -149,15 +159,15 @@ try {
         $legacyWrapperProcess = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -like "*$legacyWrapper*" } |
             Select-Object -First 1
-        (Test-Path -LiteralPath (Join-Path $ConfigDir 'daemon-started.pid')) -and
-            (Test-Path -LiteralPath $descendantPidFile) -and
+        (Test-Path -LiteralPath (Join-Path $legacyConfigDir 'daemon-started.pid')) -and
+            (Test-Path -LiteralPath (Join-Path $legacyConfigDir 'descendant.pid')) -and
             ($null -ne $legacyWrapperProcess)
     }
     $legacyWrapperProcess = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -eq 'cmd.exe' -and $_.CommandLine -like "*$legacyWrapper*" } |
         Select-Object -First 1
-    $legacyDaemonPid = [int](Get-Content -LiteralPath (Join-Path $ConfigDir 'daemon-started.pid') -Raw).Trim()
-    $legacyDescendantPid = [int](Get-Content -LiteralPath $descendantPidFile -Raw).Trim()
+    $legacyDaemonPid = [int](Get-Content -LiteralPath (Join-Path $legacyConfigDir 'daemon-started.pid') -Raw).Trim()
+    $legacyDescendantPid = [int](Get-Content -LiteralPath (Join-Path $legacyConfigDir 'descendant.pid') -Raw).Trim()
     $evidence.legacy_wrapper_process_id = $legacyWrapperProcess.ProcessId
     $evidence.legacy_daemon_process_id = $legacyDaemonPid
     $evidence.legacy_descendant_process_id = $legacyDescendantPid
@@ -298,6 +308,7 @@ finally {
     }
     try { Remove-SmokeTask } catch { Write-Warning "Cleanup failed: $_" }
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $legacyConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($transcriptStarted) { Stop-Transcript | Out-Null }
 }
 
