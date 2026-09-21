@@ -5382,7 +5382,10 @@ mod tests {
 
         history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| {
+                crate::agent::history::is_prompt_tool_results_message(msg)
+                    && msg.content.starts_with("[Tool results]")
+            })
             .expect("tool results message should be present")
             .content
             .clone()
@@ -8469,7 +8472,10 @@ mod tests {
 
         let tool_results = history
             .iter()
-            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .find(|msg| {
+                crate::agent::history::is_prompt_tool_results_message(msg)
+                    && msg.content.starts_with("[Tool results]")
+            })
             .expect("tool results message should be present");
         assert!(
             !tool_results.content.contains("Denied by user."),

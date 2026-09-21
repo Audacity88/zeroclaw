@@ -13074,15 +13074,26 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("new answer")),
         ];
 
+        // The limit counts complete turns: keeping one turn retains the
+        // newest exchange and drops the older tool-bearing turn whole.
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
-            2,
+            1,
             false,
         );
         assert!(active.trimmed);
         assert!(!active.history.iter().any(|message| matches!(
             message,
             ConversationMessage::Chat(chat) if chat.content == "old question"
+        )));
+        assert!(!active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::ToolResults(results)
+                if results.iter().any(|result| result.tool_call_id == "old-call")
+        )));
+        assert!(active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "new question"
         )));
 
         let transcript = conversation_message_entries(&durable);
