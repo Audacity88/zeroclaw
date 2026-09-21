@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use image::ImageDecoder;
 use reqwest::Client;
 use sha2::{Digest as _, Sha256};
 use std::borrow::Cow;
@@ -972,6 +973,7 @@ async fn normalize_native_tool_result_json(
     remote_client: &Client,
     ctx: &ImageNormalizeCtx<'_>,
     cache: Option<&mut LocalImageCache>,
+    budget: &mut DecodeBudget,
 ) -> Option<(String, bool)> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
     else {
@@ -988,7 +990,8 @@ async fn normalize_native_tool_result_json(
     }
 
     let normalized =
-        normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache).await;
+        normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache, budget)
+            .await;
     let new_inner = compose_multimodal_content(
         &cleaned_text,
         &normalized.data_uris,
@@ -1071,9 +1074,19 @@ async fn prepare_messages_inner(
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
     let current_turn_tool_indices = current_turn_tool_result_indices(messages);
 
+    // Per-request decode budget for data-URI validation; local-file and
+    // remote references do not decode and never touch it.
+    let mut decode_budget = DecodeBudget::new(max_images);
+
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
-    for (index, message) in messages.iter().enumerate() {
+    // Normalize newest-first so an exhausted decode budget demotes the
+    // OLDEST candidates, matching the keep-newest rule the image cap below
+    // applies; walking oldest-first would spend decode attempts on images
+    // the cap is about to evict. Each message normalizes independently (the
+    // local-image cache is path-keyed), so collecting in reverse and then
+    // restoring the input order is order-preserving in output.
+    for (index, message) in messages.iter().enumerate().rev() {
         if !should_normalize_message_images(index, message, &current_turn_tool_indices) {
             normalized_messages.push(replay_message_without_stale_tool_images(
                 index,
@@ -1094,6 +1107,7 @@ async fn prepare_messages_inner(
                     role: &message.role,
                 },
                 cache.as_deref_mut(),
+                &mut decode_budget,
             )
             .await
         {
@@ -1121,6 +1135,7 @@ async fn prepare_messages_inner(
                 role: &message.role,
             },
             cache.as_deref_mut(),
+            &mut decode_budget,
         )
         .await;
         let content = compose_multimodal_content(
@@ -1135,6 +1150,7 @@ async fn prepare_messages_inner(
             content,
         });
     }
+    normalized_messages.reverse();
 
     // Apply age-based trimming when configured: strip images from user
     // messages older than `max_image_turns` real user turns back from the end
@@ -1379,6 +1395,7 @@ async fn normalize_image_references(
     remote_client: &Client,
     ctx: &ImageNormalizeCtx<'_>,
     mut cache: Option<&mut LocalImageCache>,
+    budget: &mut DecodeBudget,
 ) -> NormalizedImageReferences {
     let mut data_uris = Vec::with_capacity(refs.len());
     let mut skipped_count = 0usize;
@@ -1390,6 +1407,7 @@ async fn normalize_image_references(
             max_bytes,
             remote_client,
             cache.as_deref_mut(),
+            budget,
         )
         .await
         {
@@ -1533,11 +1551,14 @@ async fn normalize_image_reference(
     max_bytes: usize,
     remote_client: &Client,
     cache: Option<&mut LocalImageCache>,
+    budget: &mut DecodeBudget,
 ) -> anyhow::Result<String> {
     if source.starts_with("data:") {
-        return normalize_data_uri(source, max_bytes);
+        return normalize_data_uri(source, max_bytes, budget).await;
     }
 
+    // Local-file and remote references do not decode and do not touch the
+    // decode budget; they are validated by prefix sniffing only.
     if source.starts_with("http://") || source.starts_with("https://") {
         if !config.allow_remote_fetch {
             return Err(MultimodalError::RemoteFetchDisabled {
@@ -1555,7 +1576,11 @@ async fn normalize_image_reference(
     }
 }
 
-fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> {
+async fn normalize_data_uri(
+    source: &str,
+    max_bytes: usize,
+    budget: &mut DecodeBudget,
+) -> anyhow::Result<String> {
     let Some(comma_idx) = source.find(',') else {
         return Err(MultimodalError::InvalidMarker {
             input: source.to_string(),
@@ -1594,7 +1619,10 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
 
     validate_size(source, decoded.len(), max_bytes)?;
 
-    match complete_image_mime_from_magic(&decoded) {
+    // Cheap rejects first: sniff the leading signature bytes and compare
+    // with the declaration before any decoder is constructed, so a
+    // mismatched payload never pays for a decode.
+    let sniffed = match image_mime_from_magic(&decoded) {
         None => {
             return Err(MultimodalError::InvalidMarker {
                 input: source.to_string(),
@@ -1611,55 +1639,373 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
             }
             .into());
         }
-        Some(_) => {}
-    }
+        Some(sniffed) => sniffed,
+    };
 
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
-}
-
-/// Sniff decoded data-URI bytes and require the payload to decode as a
-/// complete image of the sniffed type.
-///
-/// [`image_mime_from_magic`] matches leading signature bytes only, so a
-/// truncated fragment — a JPEG SOI plus the APP0 header of a segment it does
-/// not carry, a bare PNG signature — still sniffs as the declared type.
-/// Promoting marker-shaped text out of a tool result needs more than a
-/// prefix: the bytes must decode as an image the provider accepts, otherwise
-/// the marker keeps flowing as text.
-fn complete_image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
-    let mime = image_mime_from_magic(bytes)?;
-    let format = match mime {
+    // The sniffed type now equals the declaration, so only now is a decode
+    // worth its budget.
+    let format = match sniffed {
         "image/png" => image::ImageFormat::Png,
         "image/jpeg" => image::ImageFormat::Jpeg,
         "image/gif" => image::ImageFormat::Gif,
         "image/webp" => image::ImageFormat::WebP,
-        // BMP is recognized but never accepted by `PROVIDER_IMAGE_MIME_TYPES`,
-        // so callers reject it as a declared-type mismatch before a decode
-        // could matter.
-        _ => return Some(mime),
+        // Unreachable in practice: `validate_mime` already restricted the
+        // declaration to the provider-supported set and the sniff matched
+        // it. Kept as a reject rather than a panic so a future allowlist
+        // change cannot turn into a crash.
+        _ => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!("decoded payload is not a recognized image (declared {mime})"),
+            }
+            .into());
+        }
     };
-    // A decompression-bomb cap for untrusted bytes, not a content policy.
+
+    let validated = match decode_check(decoded, format, budget).await {
+        Ok(bytes) => bytes,
+        Err(DecodeReject::NotDecodable) => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!("decoded payload is not a recognized image (declared {mime})"),
+            }
+            .into());
+        }
+        Err(DecodeReject::BudgetExhausted) => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: "decode budget exhausted for this request".to_string(),
+            }
+            .into());
+        }
+        Err(DecodeReject::OverBudget { needed, limit }) => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!(
+                    "decoded image would need {needed} bytes, over the {limit} byte ceiling"
+                ),
+            }
+            .into());
+        }
+    };
+
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(validated)))
+}
+
+/// Why [`decode_check`] refused a data-URI payload.
+#[derive(Debug)]
+enum DecodeReject {
+    /// The payload is not a decodable image of the sniffed type: the header
+    /// did not parse, the decode failed, or a prior validation memo entry
+    /// already recorded a rejection for these exact bytes.
+    NotDecodable,
+    /// The per-request decode attempt budget is exhausted.
+    BudgetExhausted,
+    /// The decoded output would need `needed` bytes, over the `limit` byte
+    /// ceiling. `limit` is whichever bound applied: the per-image ceiling or
+    /// the request's remaining projected-output budget.
+    OverBudget { needed: u64, limit: u64 },
+}
+
+/// Decoded-output ceiling for one candidate. 96 MiB holds a 6K RGBA
+/// screenshot (6016x3384x4 = 81 MB) and a 24 MP RGB photo (72 MB); every
+/// supported provider downscales to ~1.2-1.6 MP and Anthropic rejects
+/// anything over 8000 px a side, so larger decodes buy nothing.
+const MAX_DECODED_BYTES_PER_IMAGE: u64 = 96 * 1024 * 1024;
+const MAX_IMAGE_SIDE: u32 = 8_192;
+
+/// Payloads at or below this size are hashed on the calling thread; larger
+/// ones are hashed inside a blocking task (a 20 MiB SHA-256 is ~40 ms).
+const HASH_INLINE_LIMIT: usize = 1024 * 1024;
+
+/// Per-request budget for data-URI decode validation. Local-file and remote
+/// references do not decode and never touch this budget; only data-URI
+/// candidates spend it.
+struct DecodeBudget {
+    /// Configured `max_images` for the request being prepared (logging).
+    max_images: usize,
+    /// Remaining full decode attempts (max_images * 4, min 4).
+    attempts_left: usize,
+    /// Remaining projected decoded output in bytes
+    /// (max_images * MAX_DECODED_BYTES_PER_IMAGE, min one image's worth).
+    projected_bytes_left: u64,
+    /// Full decodes actually run (for tests and logging).
+    attempts: usize,
+    /// Set with the first budget rejection so only one WARN is logged per
+    /// request.
+    warned: bool,
+    /// Test hook: called inside the blocking decode closure before the
+    /// decode it gates. Consumed by the first decode that runs with it set.
+    #[cfg(test)]
+    on_decode: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl DecodeBudget {
+    /// Budget for one preparation pass: `max_images * 4` decode attempts and
+    /// `max_images` images' worth of projected decoded output, each floored
+    /// so even a `max_images == 1` request keeps a working minimum.
+    fn new(max_images: usize) -> Self {
+        Self {
+            max_images,
+            attempts_left: max_images.saturating_mul(4).max(4),
+            projected_bytes_left: max_images.max(1) as u64 * MAX_DECODED_BYTES_PER_IMAGE,
+            attempts: 0,
+            warned: false,
+            #[cfg(test)]
+            on_decode: None,
+        }
+    }
+
+    /// Log the first budget rejection of this request.
+    fn warn_once(&mut self) {
+        if self.warned {
+            return;
+        }
+        self.warned = true;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "max_images": self.max_images,
+                    "attempts_left": self.attempts_left,
+                    "projected_bytes_left": self.projected_bytes_left,
+                })),
+            "multimodal: data-URI decode budget rejection; the candidate stays as text"
+        );
+    }
+}
+
+#[cfg(test)]
+impl DecodeBudget {
+    /// Fresh budget sized like a `max_images = 4` request.
+    fn for_tests() -> Self {
+        Self::new(4)
+    }
+}
+
+/// Process-wide memo of data-URI validation verdicts, keyed by SHA-256 of
+/// the base64-decoded payload.
+///
+/// This is a memo of verdicts, not a cache of decoded output: the runtime
+/// validates messages for iteration and the provider adapter validates them
+/// again for dispatch, so the second pass (and every later turn carrying
+/// the same marker) hits the memo instead of re-decoding. Plumbing a
+/// validated result through `PreparedMessages` is the alternative if
+/// maintainers would rather not keep process-wide state.
+#[derive(Default)]
+struct ValidationMemo {
+    verdicts: HashMap<[u8; 32], bool>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl ValidationMemo {
+    /// Bounded so a flood of unique payloads cannot grow it without limit.
+    const CAPACITY: usize = 256;
+
+    fn get(&self, key: &[u8; 32]) -> Option<bool> {
+        self.verdicts.get(key).copied()
+    }
+
+    fn record(&mut self, key: [u8; 32], verdict: bool) {
+        if self.verdicts.contains_key(&key) {
+            return;
+        }
+        self.verdicts.insert(key, verdict);
+        self.order.push_back(key);
+        while self.order.len() > Self::CAPACITY {
+            match self.order.pop_front() {
+                Some(evicted) => {
+                    self.verdicts.remove(&evicted);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+static VALIDATED: std::sync::LazyLock<parking_lot::Mutex<ValidationMemo>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(ValidationMemo::default()));
+
+/// Validate that `bytes` decode as an image of `format` without letting one
+/// candidate dominate the request, and hand the payload back on success:
+/// parse the header only, project the decoded-output size from it, charge
+/// the projection against the budget, and only then run the full decode on
+/// a blocking thread. The decoded image is dropped inside that closure;
+/// this is validation, not caching, and the original bytes are what travel
+/// to the provider.
+///
+/// Verdicts are memoized process-wide by payload hash, so repeated
+/// validation of the same history (the adapter pass after the runtime pass,
+/// and every later turn) costs no decode.
+async fn decode_check(
+    mut bytes: Vec<u8>,
+    format: image::ImageFormat,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<u8>, DecodeReject> {
+    // a. Memo lookup first: a hit spends nothing and works even when the
+    // attempt budget is exhausted.
+    let key: [u8; 32] = if bytes.len() <= HASH_INLINE_LIMIT {
+        Sha256::digest(&bytes).into()
+    } else {
+        // A 20 MiB SHA-256 is ~40 ms of CPU; keep it off the async worker.
+        // The payload moves into the task and back out with its hash, so no
+        // clone is needed.
+        match tokio::task::spawn_blocking(move || {
+            let key: [u8; 32] = Sha256::digest(&bytes).into();
+            (bytes, key)
+        })
+        .await
+        {
+            Ok((payload, key)) => {
+                bytes = payload;
+                key
+            }
+            Err(join_error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": join_error.to_string(),
+                        })),
+                    "multimodal: data-URI payload hash task failed"
+                );
+                return Err(DecodeReject::NotDecodable);
+            }
+        }
+    };
+    let memo_verdict = VALIDATED.lock().get(&key);
+    if let Some(verdict) = memo_verdict {
+        return if verdict {
+            Ok(bytes)
+        } else {
+            Err(DecodeReject::NotDecodable)
+        };
+    }
+
+    // b. Attempt budget: every memo miss pays one attempt.
+    if budget.attempts_left == 0 {
+        budget.warn_once();
+        return Err(DecodeReject::BudgetExhausted);
+    }
+
+    // c. Header parse only: `into_decoder` reads through the container
+    // header (for PNG, through IHDR to the first IDAT) and applies the
+    // dimension limits without decoding any pixel data.
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(256 * 1024 * 1024);
-    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
-    reader.limits(limits);
-    match reader.decode() {
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(MAX_DECODED_BYTES_PER_IMAGE);
+    let total_bytes = {
+        let mut reader =
+            image::ImageReader::with_format(std::io::Cursor::new(bytes.as_slice()), format);
+        reader.limits(limits.clone());
+        match reader.into_decoder() {
+            Ok(decoder) => decoder.total_bytes(),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "format": format!("{format:?}"),
+                            "error": error.to_string(),
+                        })),
+                    "multimodal: data-URI payload failed to decode as the sniffed image type"
+                );
+                VALIDATED.lock().record(key, false);
+                return Err(DecodeReject::NotDecodable);
+            }
+        }
+    };
+
+    // d. Projection check from the header, before any pixel decode. The
+    // per-image ceiling is a property of the bytes and is memoized; the
+    // request's remaining budget is not, so a later request retries the
+    // same payload against a fresh budget.
+    if total_bytes > MAX_DECODED_BYTES_PER_IMAGE {
+        budget.warn_once();
+        VALIDATED.lock().record(key, false);
+        return Err(DecodeReject::OverBudget {
+            needed: total_bytes,
+            limit: MAX_DECODED_BYTES_PER_IMAGE,
+        });
+    }
+    if total_bytes > budget.projected_bytes_left {
+        budget.warn_once();
+        return Err(DecodeReject::OverBudget {
+            needed: total_bytes,
+            limit: budget.projected_bytes_left,
+        });
+    }
+
+    // e. Spend, then decode off the async worker. `into_decoder` returns a
+    // decoder that borrows the reader, so the blocking closure rebuilds it
+    // from the moved bytes instead of receiving it across the boundary, and
+    // hands the payload back with its verdict.
+    budget.attempts_left -= 1;
+    budget.attempts += 1;
+    budget.projected_bytes_left -= total_bytes;
+    #[cfg(test)]
+    let on_decode = budget.on_decode.take();
+    let joined = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(hook) = on_decode.as_ref() {
+            hook();
+        }
+        let mut reader =
+            image::ImageReader::with_format(std::io::Cursor::new(bytes.as_slice()), format);
+        reader.limits(limits);
         // Decodability is the whole question: the decoded image is dropped
         // here, and the original bytes are what travel to the provider.
-        Ok(_) => Some(mime),
-        Err(error) => {
+        let verdict = match reader
+            .into_decoder()
+            .and_then(image::DynamicImage::from_decoder)
+        {
+            Ok(_image) => true,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "format": format!("{format:?}"),
+                            "error": error.to_string(),
+                        })),
+                    "multimodal: data-URI payload failed to decode as the sniffed image type"
+                );
+                false
+            }
+        };
+        (bytes, verdict)
+    })
+    .await;
+
+    // f. Memoize the verdict. The key is `Copy`, so it is still available
+    // even when the blocking task failed and took the payload with it.
+    match joined {
+        Ok((payload, verdict)) => {
+            VALIDATED.lock().record(key, verdict);
+            if verdict {
+                Ok(payload)
+            } else {
+                Err(DecodeReject::NotDecodable)
+            }
+        }
+        Err(join_error) => {
+            // The blocking task did not run to completion (panic or
+            // cancellation); treat the payload as not decodable instead of
+            // re-attempting it on every later turn.
             ::zeroclaw_log::record!(
-                DEBUG,
+                WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
-                        "mime": mime,
-                        "error": error.to_string(),
+                        "error": join_error.to_string(),
                     })),
-                "multimodal: data-URI payload failed to decode as the sniffed image type"
+                "multimodal: data-URI decode task failed"
             );
-            None
+            VALIDATED.lock().record(key, false);
+            Err(DecodeReject::NotDecodable)
         }
     }
 }
@@ -2284,13 +2630,15 @@ mod tests {
     /// decoded-byte check.
     const MINIMAL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
-    #[test]
-    fn normalize_data_uri_rejects_truncated_jpeg_fragment() {
+    #[tokio::test]
+    async fn normalize_data_uri_rejects_truncated_jpeg_fragment() {
         // The regression payload: canonical base64 that decodes to six bytes —
         // a JPEG SOI plus the APP0 header of a segment it does not carry.
         // Prefix sniffing alone would accept it; framing must not.
         let source = format!("data:image/jpeg;base64,{}", "/9j/4AAQ");
-        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let error = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
+            .unwrap_err();
         let reason = match error.downcast_ref::<MultimodalError>() {
             Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
             _ => panic!("truncated JPEG fragment must fail as InvalidMarker"),
@@ -2305,8 +2653,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_data_uri_rejects_jpeg_header_without_frame() {
+    #[tokio::test]
+    async fn normalize_data_uri_rejects_jpeg_header_without_frame() {
         // The maintainer's named false positive: SOI plus a complete 16-byte
         // APP0 JFIF segment plus EOI. Every byte of container framing is
         // here, but there is no SOF, no SOS and no entropy data, so the
@@ -2316,7 +2664,9 @@ mod tests {
             0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
         ];
         let source = format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg));
-        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let error = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
+            .unwrap_err();
         let reason = match error.downcast_ref::<MultimodalError>() {
             Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
             _ => panic!("header-only JPEG must fail as InvalidMarker"),
@@ -2331,8 +2681,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_data_uri_rejects_png_without_idat() {
+    #[tokio::test]
+    async fn normalize_data_uri_rejects_png_without_idat() {
         // Signature + IHDR (with a valid CRC) + IEND: the chunk walk of the
         // old framing check ended exactly at IEND and accepted it. A decoder
         // gets past the header and fails: there is no IDAT, so no image data.
@@ -2347,7 +2697,9 @@ mod tests {
         png.extend_from_slice(b"IEND");
         png.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]);
         let source = format!("data:image/png;base64,{}", STANDARD.encode(&png));
-        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let error = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
+            .unwrap_err();
         let reason = match error.downcast_ref::<MultimodalError>() {
             Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
             _ => panic!("PNG without IDAT must fail as InvalidMarker"),
@@ -2362,8 +2714,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_data_uri_rejects_gif_without_image_descriptor() {
+    #[tokio::test]
+    async fn normalize_data_uri_rejects_gif_without_image_descriptor() {
         // `GIF89a` + a 7-byte logical screen descriptor + the 0x3B trailer:
         // header, descriptor and trailer are the whole file, which is all the
         // old framing check asked for. No image descriptor, no image data.
@@ -2371,7 +2723,9 @@ mod tests {
             b'G', b'I', b'F', b'8', b'9', b'a', 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x3B,
         ];
         let source = format!("data:image/gif;base64,{}", STANDARD.encode(gif));
-        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let error = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
+            .unwrap_err();
         let reason = match error.downcast_ref::<MultimodalError>() {
             Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
             _ => panic!("GIF without an image descriptor must fail as InvalidMarker"),
@@ -2386,8 +2740,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_data_uri_rejects_webp_without_bitstream() {
+    #[tokio::test]
+    async fn normalize_data_uri_rejects_webp_without_bitstream() {
         // `RIFF` + size + `WEBP` + four zero bytes, with the RIFF size
         // accounting for every remaining byte: the container declares its
         // own extent, which is all the old framing check verified. There is
@@ -2398,7 +2752,9 @@ mod tests {
         webp.extend_from_slice(b"WEBP");
         webp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         let source = format!("data:image/webp;base64,{}", STANDARD.encode(&webp));
-        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let error = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
+            .unwrap_err();
         let reason = match error.downcast_ref::<MultimodalError>() {
             Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
             _ => panic!("WebP without a bitstream must fail as InvalidMarker"),
@@ -2429,57 +2785,63 @@ mod tests {
         cursor.into_inner()
     }
 
-    #[test]
-    fn normalize_data_uri_accepts_decodable_png() {
+    #[tokio::test]
+    async fn normalize_data_uri_accepts_decodable_png() {
         let source = format!(
             "data:image/png;base64,{}",
             STANDARD.encode(encoded_1x1(image::ImageFormat::Png))
         );
-        let normalized = normalize_data_uri(&source, TEN_MB)
+        let normalized = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
             .unwrap_or_else(|error| panic!("decodable PNG must pass: {error}"));
         assert_eq!(normalized, source);
     }
 
-    #[test]
-    fn normalize_data_uri_accepts_decodable_jpeg() {
+    #[tokio::test]
+    async fn normalize_data_uri_accepts_decodable_jpeg() {
         let source = format!(
             "data:image/jpeg;base64,{}",
             STANDARD.encode(encoded_1x1(image::ImageFormat::Jpeg))
         );
-        let normalized = normalize_data_uri(&source, TEN_MB)
+        let normalized = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
             .unwrap_or_else(|error| panic!("decodable JPEG must pass: {error}"));
         assert_eq!(normalized, source);
     }
 
-    #[test]
-    fn normalize_data_uri_accepts_decodable_gif() {
+    #[tokio::test]
+    async fn normalize_data_uri_accepts_decodable_gif() {
         let source = format!(
             "data:image/gif;base64,{}",
             STANDARD.encode(encoded_1x1(image::ImageFormat::Gif))
         );
-        let normalized = normalize_data_uri(&source, TEN_MB)
+        let normalized = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
             .unwrap_or_else(|error| panic!("decodable GIF must pass: {error}"));
         assert_eq!(normalized, source);
     }
 
-    #[test]
-    fn normalize_data_uri_accepts_decodable_webp() {
+    #[tokio::test]
+    async fn normalize_data_uri_accepts_decodable_webp() {
         let source = format!(
             "data:image/webp;base64,{}",
             STANDARD.encode(encoded_1x1(image::ImageFormat::WebP))
         );
-        let normalized = normalize_data_uri(&source, TEN_MB)
+        let normalized = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
             .unwrap_or_else(|error| panic!("decodable WebP must pass: {error}"));
         assert_eq!(normalized, source);
     }
 
-    #[test]
-    fn normalize_data_uri_rejects_signature_that_disagrees_with_declaration() {
+    #[tokio::test]
+    async fn normalize_data_uri_rejects_signature_that_disagrees_with_declaration() {
         // A framed PNG declared as JPEG is rejected, not re-labelled: a marker
         // lifted out of arbitrary tool text has no provenance, so the bytes
         // and the declaration must agree.
         let source = format!("data:image/jpeg;base64,{MINIMAL_PNG_B64}");
-        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let error = normalize_data_uri(&source, TEN_MB, &mut DecodeBudget::for_tests())
+            .await
+            .unwrap_err();
         let reason = match error.downcast_ref::<MultimodalError>() {
             Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
             _ => panic!("sniffed/declared mismatch must fail as InvalidMarker"),
@@ -2487,6 +2849,298 @@ mod tests {
         assert!(
             reason.contains("image/png") && reason.contains("image/jpeg"),
             "reason should name both types: {reason}"
+        );
+    }
+
+    /// Encode a solid 1x1 RGBA PNG with a per-test pixel colour. Each test
+    /// uses its own colour so every fixture's payload hash is distinct and
+    /// the process-wide validation memo cannot cross-contaminate tests.
+    fn unique_png(red: u8, green: u8, blue: u8) -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([red, green, blue, 255]),
+        ));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("1x1 test image should encode");
+        cursor.into_inner()
+    }
+
+    fn unique_png_data_uri(red: u8, green: u8, blue: u8) -> String {
+        format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(unique_png(red, green, blue))
+        )
+    }
+
+    #[tokio::test]
+    async fn normalize_data_uri_rejects_mime_mismatch_without_decoding() {
+        // A valid encoder-produced PNG declared as JPEG is rejected by the
+        // prefix sniff alone; no decode attempt is spent on a mismatch.
+        let source = format!(
+            "data:image/jpeg;base64,{}",
+            STANDARD.encode(unique_png(81, 1, 1))
+        );
+        let mut budget = DecodeBudget::for_tests();
+        let error = normalize_data_uri(&source, TEN_MB, &mut budget)
+            .await
+            .unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("sniffed/declared mismatch must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("image/png") && reason.contains("image/jpeg"),
+            "reason should name both types: {reason}"
+        );
+        assert_eq!(
+            budget.attempts, 0,
+            "a mime mismatch must be rejected before any decode attempt"
+        );
+    }
+
+    /// Header-only oversized PNG: signature + IHDR + one tiny IDAT + IEND,
+    /// with valid CRCs. `into_decoder` reads through IHDR to the first IDAT
+    /// and never inflates the IDAT, so `total_bytes` comes straight from the
+    /// header.
+    fn oversized_header_png(dims: u32) -> Vec<u8> {
+        let ihdr_crc = match dims {
+            16_000 => 0x417E_DFDEu32,
+            8_192 => 0x72AA_CA59,
+            _ => panic!("no precomputed IHDR CRC for dims {dims}"),
+        };
+        let idat: &[u8] = &[0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01];
+        let mut png: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&dims.to_be_bytes());
+        png.extend_from_slice(&dims.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png.extend_from_slice(&ihdr_crc.to_be_bytes());
+        png.extend_from_slice(&(idat.len() as u32).to_be_bytes());
+        png.extend_from_slice(b"IDAT");
+        png.extend_from_slice(idat);
+        png.extend_from_slice(&0x0D0A_2DB4u32.to_be_bytes());
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]);
+        png
+    }
+
+    #[tokio::test]
+    async fn normalize_data_uri_rejects_projected_output_over_ceiling_before_decode() {
+        // The header parses (8192 is exactly MAX_IMAGE_SIDE, so the strict
+        // dimension check passes), the projection from IHDR is
+        // 8192*8192*4 = 268435456 bytes, over the 96 MiB per-image ceiling,
+        // so the candidate is rejected before any pixel decode runs. (A
+        // 16000x16000 fixture was tried first and `into_decoder` refuses it
+        // outright: PngDecoder checks the dimension limits while parsing
+        // the header, so it never reaches the projection.)
+        let dims: u32 = 8_192;
+        let source = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(oversized_header_png(dims))
+        );
+        let mut budget = DecodeBudget::for_tests();
+        let error = normalize_data_uri(&source, TEN_MB, &mut budget)
+            .await
+            .unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("over-ceiling projection must fail as InvalidMarker"),
+        };
+        let projected = u64::from(dims) * u64::from(dims) * 4;
+        assert_eq!(
+            reason,
+            format!(
+                "decoded image would need {projected} bytes, over the {} byte ceiling",
+                MAX_DECODED_BYTES_PER_IMAGE
+            ),
+            "the projection reason must carry the plain byte counts"
+        );
+        assert_eq!(
+            budget.attempts, 0,
+            "the projection must reject before any decode attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalize_data_uri_keeps_candidate_as_text_when_attempts_are_spent() {
+        // Two distinct valid PNGs against a budget with one attempt left:
+        // the first decodes, the second is rejected for the budget alone.
+        let first = unique_png_data_uri(83, 3, 1);
+        let second = unique_png_data_uri(83, 3, 2);
+        let mut budget = DecodeBudget {
+            attempts_left: 1,
+            ..DecodeBudget::for_tests()
+        };
+        let normalized = normalize_data_uri(&first, TEN_MB, &mut budget).await;
+        assert!(
+            normalized.is_ok(),
+            "the first candidate should decode: {normalized:?}"
+        );
+        let error = normalize_data_uri(&second, TEN_MB, &mut budget)
+            .await
+            .unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("a budget rejection must fail as InvalidMarker"),
+        };
+        assert_eq!(
+            reason, "decode budget exhausted for this request",
+            "the budget reason must say exactly this"
+        );
+        assert_eq!(
+            budget.attempts, 1,
+            "only the first candidate may spend an attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalize_data_uri_reuses_memoized_verdict_for_repeated_payload() {
+        // The same valid PNG twice against a one-attempt budget: the first
+        // pass decodes, the second hits the process-wide memo and is
+        // accepted without spending anything.
+        let source = unique_png_data_uri(84, 4, 4);
+        let mut budget = DecodeBudget {
+            attempts_left: 1,
+            ..DecodeBudget::for_tests()
+        };
+        let first = normalize_data_uri(&source, TEN_MB, &mut budget).await;
+        assert!(first.is_ok(), "the first pass should decode: {first:?}");
+        let second = normalize_data_uri(&source, TEN_MB, &mut budget).await;
+        assert!(
+            second.is_ok(),
+            "the memoized verdict must accept the repeat: {second:?}"
+        );
+        assert_eq!(
+            budget.attempts, 1,
+            "the repeat must be a memo hit, not a second decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_spends_decode_budget_newest_first() {
+        // Five user messages, one unique data-URI PNG each, max_images = 1
+        // so the request budget is four decode attempts. The newest four
+        // decode; the OLDEST is the one that stays textual, matching the
+        // keep-newest rule the image cap applies.
+        let mut messages = Vec::new();
+        for index in 0..5u8 {
+            let data_uri = unique_png_data_uri(85, 5, index);
+            let marker = format!("[{}:{}]", "IMAGE", data_uri);
+            messages.push(ChatMessage::user(format!("shot {index}\n{marker}")));
+        }
+
+        let config = MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0, // disable age trimming to isolate the cap
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("five decodable candidates must prepare");
+
+        // The oldest message is the budget casualty: its caption and the
+        // skipped-image note remain, and nothing image-shaped survives.
+        let oldest = &prepared.messages[0];
+        assert!(
+            oldest.content.contains("shot 0"),
+            "the caption must survive: {}",
+            oldest.content
+        );
+        assert!(
+            oldest
+                .content
+                .contains("1 attached image(s) could not be loaded"),
+            "the skipped-image note is the textual representation: {}",
+            oldest.content
+        );
+        assert!(
+            !oldest.content.contains("data:image"),
+            "the over-budget candidate must not be promoted: {}",
+            oldest.content
+        );
+        assert!(
+            !oldest.content.contains(IMAGE_MARKER_PREFIX),
+            "no marker may survive a rejected reference: {}",
+            oldest.content
+        );
+
+        // Exactly one image survives the max_images trim, and it is the
+        // newest one.
+        assert_eq!(
+            count_image_markers(&prepared.messages),
+            1,
+            "the final output keeps exactly one image"
+        );
+        for (index, message) in prepared.messages.iter().enumerate() {
+            if index == 4 {
+                assert!(
+                    message.content.contains("data:image/png;base64,"),
+                    "the newest candidate must survive as the image: {}",
+                    message.content
+                );
+            } else {
+                assert!(
+                    !message.content.contains("data:image"),
+                    "message {index} must not carry a promoted image: {}",
+                    message.content
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decode_runs_off_the_async_worker() {
+        use std::sync::mpsc;
+
+        // The blocking decode closure signals entry, then parks on the gate.
+        // On this single-threaded runtime, an inline decode would park the
+        // only runtime thread inside `go_rx.recv()` and this test body could
+        // never resume.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        // std mpsc receivers are not `Sync` and the test hook type demands
+        // `Send + Sync`, so the gate receiver rides behind a mutex.
+        let go_rx = std::sync::Mutex::new(go_rx);
+        let mut budget = DecodeBudget {
+            on_decode: Some(Box::new(move || {
+                let _ = entered_tx.send(());
+                let _ = go_rx.lock().expect("gate receiver").recv();
+            })),
+            ..DecodeBudget::for_tests()
+        };
+
+        let source = unique_png_data_uri(86, 6, 6);
+        let task = zeroclaw_spawn::spawn!(async move {
+            normalize_data_uri(&source, TEN_MB, &mut budget)
+                .await
+                .map(|normalized| normalized == source)
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || entered_rx.recv()),
+        )
+        .await
+        .expect("test timed out: the decode never ran, or it parked the runtime thread")
+        .expect("entered channel closed unexpectedly")
+        .expect("entered signal lost");
+
+        go_tx
+            .send(())
+            .expect("the decode closure is parked on the gate");
+
+        let outcome = task.await.expect("the decode task must not panic");
+        assert!(
+            outcome.unwrap(),
+            "the gated payload should validate as a decodable PNG"
         );
     }
 
