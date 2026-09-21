@@ -176,7 +176,8 @@ Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both e
 
 - Trigger: at logon (`/SC ONLOGON`)
 - Run level: `LIMITED` (runs as the current user, not elevated)
-- Action: runs `zeroclaw.exe --config-dir <config-dir> service run-windows-daemon` directly; the hidden runner owns the daemon child and its output capture
+- Action: runs `zeroclaw.exe --config-dir <config-dir> service run-windows-daemon` directly; the internal runner owns the daemon child and its output capture
+- Window: Windows currently attaches an empty console window to this interactive scheduled task. Leave it open while the service runs; closing it may stop the runner and daemon. Background launch without that window is tracked in [#10991](https://github.com/zeroclaw-labs/zeroclaw/issues/10991).
 
 Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw Daemon.
 
