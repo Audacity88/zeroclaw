@@ -253,7 +253,7 @@ mod tests {
         });
         let mut crumb = false;
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let error = anyhow::anyhow!("maximum context length exceeded");
+        let error = anyhow::Error::msg("maximum context length exceeded");
         assert!(
             try_recover_context_overflow(
                 &mut injected,

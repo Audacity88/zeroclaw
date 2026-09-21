@@ -13484,8 +13484,12 @@ mod tests {
             .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
             .unwrap();
         acp_store
-            .append_turn(
+            .begin_turn_checkpoint(sid, "interrupted-seed", &[])
+            .unwrap();
+        acp_store
+            .finalize_turn_checkpoint_with_context(
                 sid,
+                "interrupted-seed",
                 &[
                     zeroclaw_api::model_provider::ConversationMessage::Chat(
                         ChatMessage::assistant("ACP history"),
@@ -13494,6 +13498,10 @@ mod tests {
                         "transcript-only interruption",
                     )),
                 ],
+                &[zeroclaw_api::model_provider::ConversationMessage::Chat(
+                    ChatMessage::assistant("ACP history"),
+                )],
+                false,
             )
             .unwrap();
         let plan = vec![zeroclaw_api::plan::PlanEntry {
@@ -14707,14 +14715,17 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel(64);
             dispatcher.rpc = Arc::new(RpcOutbound::new(tx));
             let handle = dispatcher.spawn_handle();
-            let prompt = zeroclaw_spawn::spawn!(async move {
+            let mut prompt = zeroclaw_spawn::spawn!(async move {
                 handle
                     .handle_session_prompt(&json!({"session_id": sid, "prompt": "current request"}))
                     .await
             });
             let mut trims = 0;
             loop {
-                let raw = rx.recv().await.expect("prompt notifications");
+                let raw = tokio::select! {
+                    result = &mut prompt => panic!("prompt ended before the expected trims and prefix: {result:?}"),
+                    raw = rx.recv() => raw.expect("prompt notifications"),
+                };
                 let notification: Value = serde_json::from_str(&raw).unwrap();
                 if notification["params"]["dropped_messages"]
                     .as_u64()
@@ -21373,6 +21384,19 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            // One overflow attempt includes streaming and its non-streaming
+            // fallback; both must fail before the loop can trim and retry.
+            if self
+                .overflows_left
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(anyhow::Error::msg("maximum context length exceeded"));
+            }
             Ok(zeroclaw_providers::ChatResponse {
                 text: Some("fallback".to_string()),
                 tool_calls: vec![],
@@ -21397,15 +21421,7 @@ mod tests {
         > {
             use futures_util::StreamExt as _;
 
-            if self
-                .overflows_left
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |left| left.checked_sub(1),
-                )
-                .is_ok()
-            {
+            if self.overflows_left.load(std::sync::atomic::Ordering::SeqCst) > 0 {
                 return futures_util::stream::iter(vec![Err(
                     zeroclaw_providers::traits::StreamError::ModelProvider(
                         "maximum context length exceeded".into(),
@@ -21977,6 +21993,12 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-acp-gap:pid=1".into());
 
+        let state_result = dispatcher
+            .handle_session_state(&json!({ "session_id": sid }))
+            .await
+            .expect("live ACP state must come from the runtime actor");
+        assert_eq!(state_result["state"], "idle");
+
         let result = dispatcher
             .handle_session_prompt(&json!({
                 "session_id": sid,
@@ -21996,11 +22018,10 @@ mod tests {
             );
         }
 
-        let state_result = dispatcher
-            .handle_session_state(&json!({ "session_id": sid }))
-            .await
-            .expect("live ACP state must come from the runtime actor");
-        assert_eq!(state_result["state"], "idle");
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "a failed ACP turn evicts its live owner for checkpoint recovery"
+        );
     }
 
     /// Session IDs are caller-supplied and the Chat and ACP persistence modes
@@ -22656,9 +22677,8 @@ mod tests {
         acp_store.set_plan(sid, &plan).unwrap();
         assert!(sessions.get_agent(sid).await.is_none());
 
-        // The first prompt on the reaped session rehydrates it; the turn
-        // itself fails against the mock, which is irrelevant to the plan
-        // restoration that happens during rehydration.
+        // The first prompt rehydrates and replays the plan, then the provider
+        // failure evicts the live owner. Restore again to inspect durable state.
         let prompt_result = dispatcher
             .handle_session_prompt(&json!({
                 "session_id": sid,
@@ -22669,16 +22689,7 @@ mod tests {
             prompt_result.is_err(),
             "the mock intentionally returns a provider error"
         );
-
-        let restored = sessions.get_plan(sid).await;
-        assert_eq!(
-            restored.as_deref(),
-            Some(plan.as_slice()),
-            "the rehydrated session must carry the persisted TodoWrite plan"
-        );
-
-        // The replay notification must have been emitted so a connected
-        // client's tracker repopulates without a model round-trip.
+        // Check the first prompt's replay before a second restore can emit one.
         let mut saw_plan_replay = false;
         while let Ok(raw) = rx.try_recv() {
             if raw.contains("Analyze codebase") && raw.contains("session/update") {
@@ -22688,6 +22699,18 @@ mod tests {
         assert!(
             saw_plan_replay,
             "rehydration must emit the plan replay notification"
+        );
+        assert!(sessions.get_agent(sid).await.is_none());
+        dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("failed-turn recovery must restore the ACP session");
+
+        let restored = sessions.get_plan(sid).await;
+        assert_eq!(
+            restored.as_deref(),
+            Some(plan.as_slice()),
+            "the rehydrated session must carry the persisted TodoWrite plan"
         );
     }
 
