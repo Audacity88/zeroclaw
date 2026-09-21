@@ -2273,12 +2273,39 @@ fn windows_task_running(task_name: &str) -> Result<Option<bool>> {
     windows_task_state_from_exit_code(status.code())
 }
 
+fn windows_task_tree_stop_command(task_name: &str) -> String {
+    let quoted = task_name.replace('\'', "''");
+    format!(
+        "$task = Get-ScheduledTask -TaskName '{quoted}' -ErrorAction SilentlyContinue; \
+         if ($null -eq $task) {{ exit 0 }}; \
+         $action = $task.Actions | Select-Object -First 1; \
+         $execute = $action.Execute.Trim('\"'); \
+         $isLegacyWrapper = $execute.EndsWith('.cmd', [System.StringComparison]::OrdinalIgnoreCase); \
+         $roots = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{ \
+             ($isLegacyWrapper -and $_.Name -ieq 'cmd.exe' -and $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($execute, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or \
+             (-not $isLegacyWrapper -and $_.ExecutablePath -ieq $execute -and $null -ne $_.CommandLine -and $_.CommandLine -like '*service run-windows-daemon*') \
+         }} | Select-Object -ExpandProperty ProcessId); \
+         $failed = $false; \
+         foreach ($rootProcessId in $roots) {{ \
+             & taskkill.exe /PID $rootProcessId /T /F *> $null; \
+             if ($LASTEXITCODE -ne 0 -and $null -ne (Get-Process -Id $rootProcessId -ErrorAction SilentlyContinue)) {{ $failed = $true }} \
+         }}; \
+         Stop-ScheduledTask -TaskName '{quoted}' -ErrorAction SilentlyContinue; \
+         if ($failed) {{ exit 3 }}"
+    )
+}
+
 fn stop_running_windows_task(task_name: &str) -> Result<()> {
     if windows_task_running(task_name)? != Some(true) {
         return Ok(());
     }
 
-    run_checked(Command::new("schtasks").args(["/End", "/TN", task_name]))?;
+    run_checked(Command::new("powershell").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &windows_task_tree_stop_command(task_name),
+    ]))?;
     let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
     loop {
         match windows_task_running(task_name)? {
