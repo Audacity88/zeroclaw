@@ -134,6 +134,8 @@ Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 
 ### ACP durable lifecycle
 
+Native RPC keeps the original visible transcript separate from the retained provider context. Automatic trimming does not delete or renumber original transcript rows. A trim notification is sent only after its retained-context snapshot and covered checkpoint boundary have committed together; a failed write suppresses that notification. The snapshot excludes runtime system prompts, recalled-memory injection, and hidden reasoning. On interruption, recovery appends visible checkpoint progress once while restoring the model from the latest retained snapshot plus later checkpoint events. An explicitly empty retained snapshot remains authoritative. Sessions without a snapshot keep the legacy provider-safe replay path.
+
 ACP sessions can retain durable history before reaching a terminal state. When the in-memory owner is reaped, RPC prompt recovery considers only durable rows whose persisted `interaction_surface` is supported; an unsupported surface is left untouched so a later direct recovery can inspect the original checkpoint.
 
 Recovery adds a client-visible interruption marker for an unfinished turn. Provider replay excludes that synthetic marker, and persisted tool output remains subject to the existing transcript bounds.
