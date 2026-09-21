@@ -126,7 +126,7 @@ turn.
 
 | Value | What is captured |
 | --- | --- |
-| `off` (default) | No message content is recorded. The event still carries `messages_count` plus the always-on prefix fingerprints described below (`system_chars`, `tools_count`, and when present `system_sha256`, `tools_sha256`). |
+| `off` (default) | No message content is recorded. The event still carries `messages_count` plus the always-on prefix fingerprints described below (`system_chars`, `tools_count`, and when present `system_sha256`, `tools_sha256`); they are digests, not content, but a trace reader can still test them for equality. |
 | `redacted` | Full message history (role + content), credential-scanned with the same `scrub_credentials` pass used for `raw_response` and tool I/O, then truncated at `log_tool_io_truncate_bytes`. Truncation is flagged with `request_messages_truncated` and `request_messages_original_bytes`. |
 | `full` | Same credential scrubbing as `redacted`, but untruncated (replay fidelity, mirroring `raw_response`). |
 
@@ -154,7 +154,10 @@ the tool instructions live inside the system text, so `tools_count` is 0 and
 `system_sha256`. Confirm an actual cache hit or miss from the provider's
 reported cache usage. The fingerprints are counts and unsalted truncated
 hashes, not content: they reveal whether an input changed and let a known
-candidate text be tested for equality, but persist no message text.
+candidate text be tested for equality, but persist no message text. Anyone
+who can read the trace can test a known candidate prompt or tool set for
+equality, so treat trace files with the same access controls as the opt-in
+payload capture that sits beside them.
 
 Both `redacted` and `full` always run credential scrubbing; the only difference
 between them is truncation. The capture reuses the existing
