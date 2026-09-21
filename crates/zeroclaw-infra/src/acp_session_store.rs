@@ -529,7 +529,8 @@ impl AcpSessionStore {
             .optional()?
             .ok_or_else(|| anyhow::Error::msg(format!("unknown ACP session: {session_uuid}")))?;
         let snapshot_max: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM acp_messages WHERE session_id = ?1",
+            "SELECT COALESCE(MAX(id), 0) FROM acp_messages
+             WHERE session_id = ?1 AND role != 'system'",
             params![session_id],
             |row| row.get(0),
         )?;
@@ -579,7 +580,7 @@ impl AcpSessionStore {
                 .query_row(
                     "SELECT id, role, content, reasoning_content
                      FROM acp_messages
-                     WHERE session_id = ?1 AND id <= ?2 AND id <= ?3
+                     WHERE session_id = ?1 AND role != 'system' AND id <= ?2 AND id <= ?3
                      ORDER BY id DESC LIMIT 1",
                     params![session_id, state.max_message_id, current_id],
                     |row| {
@@ -626,7 +627,7 @@ impl AcpSessionStore {
                 let previous: Option<i64> = conn
                     .query_row(
                         "SELECT id FROM acp_messages
-                         WHERE session_id = ?1 AND id < ?2 AND id <= ?3
+                         WHERE session_id = ?1 AND role != 'system' AND id < ?2 AND id <= ?3
                          ORDER BY id DESC LIMIT 1",
                         params![session_id, message_id, state.max_message_id],
                         |row| row.get(0),
@@ -2526,6 +2527,71 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM acp_messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "no orphan rows after failed append_turn");
+    }
+
+    #[test]
+    fn cursor_excludes_legacy_system_rows_and_terminates() {
+        let (_tmp, store) = open_store();
+        for (session, rows, expected) in [
+            (
+                "mixed",
+                vec![
+                    ("system", "legacy leading prompt"),
+                    ("user", "old"),
+                    ("system", "legacy middle prompt"),
+                    ("assistant", "new"),
+                    ("system", "legacy trailing prompt"),
+                ],
+                vec!["new", "old"],
+            ),
+            (
+                "system-only",
+                vec![("system", "legacy only prompt")],
+                vec![],
+            ),
+        ] {
+            store.create_session(session, "alpha", "/tmp").unwrap();
+            {
+                // Bypass today's write filter to represent an existing database.
+                let conn = store.conn.lock();
+                let session_id: i64 = conn
+                    .query_row(
+                        "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                        params![session],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                for (role, content) in rows {
+                    conn.execute(
+                        "INSERT INTO acp_messages (session_id, role, content, created_at)
+                         VALUES (?1, ?2, ?3, '2020-01-01T00:00:00Z')",
+                        params![session_id, role, content],
+                    )
+                    .unwrap();
+                }
+            }
+
+            let mut cursor = None;
+            let mut contents = Vec::new();
+            for page_index in 0..expected.len().max(1) {
+                let page = store
+                    .load_message_page(session, 1, cursor.as_deref())
+                    .unwrap();
+                assert_eq!(page.messages.len(), usize::from(!expected.is_empty()));
+                for message in page.messages {
+                    let ConversationMessage::Chat(chat) = message else {
+                        panic!("expected a plain transcript message");
+                    };
+                    assert_ne!(chat.role, "system");
+                    contents.push(chat.content);
+                }
+                let has_older = page_index + 1 < expected.len();
+                assert_eq!(page.has_older, has_older);
+                assert_eq!(page.next_cursor.is_some(), has_older);
+                cursor = page.next_cursor;
+            }
+            assert_eq!(contents, expected);
+        }
     }
 
     #[test]
