@@ -2450,6 +2450,14 @@ impl DelegateTool {
         let terminal_owner_boot_id = task_control_plane.boot_id.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        // Receipt continuity for detached work: capture the launching turn's
+        // generator so the background sub-loop signs with the same key. The
+        // wrapper below pairs it with a fresh collector, never the parent's
+        // per-turn one.
+        let parent_receipt_generator = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+            .try_with(|scope| scope.as_ref().map(|scope| scope.generator.clone()))
+            .ok()
+            .flatten();
         // Sender-bucket continuity (same rationale as the parallel spawn):
         // capture the originating sender scope so every admission inside the
         // detached task charges the caller's bucket, not the fallback
@@ -2458,10 +2466,18 @@ impl DelegateTool {
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            TOOL_LOOP_THREAD_ID.scope(
-                parent_thread_id,
-                scope_delegate_session_key(parent_session_key, async move {
-                let inner = DelegateTool {
+            TOOL_LOOP_THREAD_ID
+                .scope(
+                    parent_thread_id,
+                    scope_delegate_session_key(parent_session_key, async move {
+                        // Detached receipt scope: the launching turn's generator with a
+                        // fresh per-task collector; nothing appends to the launching
+                        // turn's receipts block (consumer: check_result progress,
+                        // tracked separately).
+                        crate::agent::tool_receipts::scope_receipts(
+                    crate::agent::tool_receipts::detached_scope(parent_receipt_generator),
+                    async move {
+                    let inner = DelegateTool {
                     agents,
                     security,
                     global_credential,
@@ -2559,11 +2575,14 @@ impl DelegateTool {
                     terminal_owner_boot_id,
                 )
                 .await;
-                }),
-            )
-            .instrument(::zeroclaw_log::attribution_span!(
-                &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
-            ))
+                    },
+                )
+                .await
+                    }),
+                )
+                .instrument(::zeroclaw_log::attribution_span!(
+                    &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
+                ))
         );
 
         Ok(ToolResult {
@@ -8081,6 +8100,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_background_signs_sub_loop_tool_results_with_the_parent_generator() {
+        use crate::agent::tool_receipts::{
+            ReceiptGenerator, ReceiptScope, TOOL_LOOP_RECEIPT_CONTEXT,
+        };
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        // The background target routes through the scripted chat server (the
+        // provider routing `execute_background` supports), so the signed tool
+        // result is asserted on the captured request body that carries the
+        // tool message back to the model.
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                "echo_tool",
+                "call_echo_bg",
+                serde_json::json!({"value": "background receipt"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "background done"}}]}),
+        ])
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("receipt-test-model".to_string()),
+            api_key: Some("receipt-test-key".to_string()),
+            timeout_secs: Some(5),
+            // The scripted server answers with a native `tool_calls` block; the
+            // text-tool request mode ignores it and retries the same prompt.
+            native_tools: Some(true),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(workspace_dir)
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let collector: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Retained so the child's token can be verified against the launching
+        // turn's key, not merely spotted.
+        let parent_generator = ReceiptGenerator::new();
+        let scope = ReceiptScope {
+            generator: parent_generator.clone(),
+            collector: Arc::clone(&collector),
+        };
+
+        let result = TOOL_LOOP_RECEIPT_CONTEXT
+            .scope(Some(scope), async {
+                tool.execute(json!({
+                    "agent": "target",
+                    "prompt": "run in background",
+                    "background": true
+                }))
+                .await
+            })
+            .await
+            .unwrap();
+
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
+        assert_eq!(
+            bg_result.status,
+            BackgroundTaskStatus::Completed,
+            "{bg_result:?}"
+        );
+        assert!(
+            bg_result
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("background done"),
+            "{bg_result:?}"
+        );
+
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "the background sub-loop makes exactly two provider requests: {bodies:?}"
+        );
+        // The second request carries the tool result back to the model as
+        // `echo:<value>\n\n[receipt: <token>]`. Verify the token with the
+        // launching turn's generator against the exact tool name, arguments
+        // and output the sub-loop signed, so a wrapper that minted its own
+        // key would fail here, not just a wrapper that signed nothing.
+        let signed_body = bodies
+            .iter()
+            .find(|body| body.contains("[receipt: zc-receipt-"))
+            .expect("one provider request must carry the signed tool result");
+        let token_start = signed_body
+            .find("[receipt: ")
+            .map(|at| at + "[receipt: ".len())
+            .unwrap();
+        let token_end = token_start + signed_body[token_start..].find(']').unwrap();
+        let token = &signed_body[token_start..token_end];
+        let echo_output = "echo:background receipt";
+        assert!(
+            parent_generator.verify(
+                token,
+                "echo_tool",
+                &serde_json::json!({"value": "background receipt"}),
+                echo_output,
+            ),
+            "the child's receipt must verify against the launching turn's key: {token}"
+        );
+        assert!(
+            !ReceiptGenerator::new().verify(
+                token,
+                "echo_tool",
+                &serde_json::json!({"value": "background receipt"}),
+                echo_output,
+            ),
+            "a receipt that verifies under an unrelated key proves nothing"
+        );
+        let receipts = collector.lock().unwrap();
+        assert!(
+            receipts.is_empty(),
+            "detached receipts must not append to the launching turn's collector: {receipts:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn delegate_spawn_helper_forwards_session_key() {
         let seen = TOOL_LOOP_SESSION_KEY
             .scope(Some("channel_session".to_string()), async {
@@ -8102,7 +8316,7 @@ mod tests {
     #[tokio::test]
     async fn execute_agentic_emits_no_receipts_when_scope_absent() {
         // Backward-compat for callers without a scoped receipt context (CLI,
-        // background spawn that does not forward scope, tests). The sub-loop
+        // a background spawn whose launching turn had receipts off, tests). The sub-loop
         // must run unsigned and the agent output must not carry a
         // `[receipt: ` trailer.
         let config = agentic_agent_config();
