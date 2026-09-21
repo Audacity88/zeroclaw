@@ -1221,7 +1221,7 @@ impl AcpSessionStore {
         let tx = conn
             .transaction()
             .context("Failed to begin append_turn transaction")?;
-        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+        Self::append_messages(&tx, session_uuid, session_id, messages, &now)?;
 
         tx.commit().context("Failed to commit append_turn")?;
         Ok(())
@@ -2384,7 +2384,7 @@ mod tests {
             reasoning_content: None,
         };
         store
-            .append_turn_checkpoint(sid, "turn", &[call.clone()])
+            .append_turn_checkpoint(sid, "turn", std::slice::from_ref(&call))
             .unwrap();
         // A later real trim deliberately drops earlier active progress. The
         // retained call is still incomplete at the snapshot boundary.

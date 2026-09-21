@@ -7196,7 +7196,7 @@ mod tool_lifecycle_abandonment_tests {
         context_token_budget: usize,
     ) -> anyhow::Result<String> {
         let mut crumb_present = false;
-        let mut injected_preamble: Option<String> = None;
+        let mut injected_preamble = None;
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
