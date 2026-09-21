@@ -21421,7 +21421,11 @@ mod tests {
         > {
             use futures_util::StreamExt as _;
 
-            if self.overflows_left.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            if self
+                .overflows_left
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
                 return futures_util::stream::iter(vec![Err(
                     zeroclaw_providers::traits::StreamError::ModelProvider(
                         "maximum context length exceeded".into(),
