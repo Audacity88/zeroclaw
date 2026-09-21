@@ -18899,7 +18899,7 @@ Let me check the result."#;
         }
         assert_eq!(
             hook_calls.load(Ordering::SeqCst),
-            if summary { 1 } else { 2 },
+            2,
             "one hook per preparation"
         );
         let captured = requests.lock().unwrap();
@@ -18947,7 +18947,7 @@ Let me check the result."#;
                         .last()
                         .unwrap()
                         .content
-                        .starts_with("You have reached")
+                        .starts_with("Agent exceeded maximum tool iterations")
                 );
                 assert!(
                     next.messages
@@ -18972,9 +18972,9 @@ Let me check the result."#;
                     .any(|m| m.content.contains(&"r".repeat(4000)))
             );
             assert!(
-                !history
-                    .iter()
-                    .any(|m| m.content.starts_with("You have reached")),
+                !history.iter().any(|m| m
+                    .content
+                    .starts_with("Agent exceeded maximum tool iterations")),
                 "failed summary must not append a synthetic user turn"
             );
         }
