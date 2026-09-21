@@ -6903,8 +6903,9 @@ mod tests {
         // `dropped_messages` from the crumb-aware restore trim counts only
         // real messages, but the persisted leading breadcrumb is still a row
         // of the seed vector. The replay offset must skip that crumb row too:
-        // with [crumb, old turn, new turn] and one old turn dropped, replay
-        // must begin at the new turn, not at the old turn's assistant reply.
+        // with [crumb, old turn, new turn], a one-turn cap drops the old
+        // turn whole, and replay must begin at the new turn, not at the old
+        // turn's assistant reply.
         let cwd = tempfile::tempdir().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
@@ -6943,7 +6944,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
@@ -7431,12 +7432,14 @@ mod tests {
         store
             .replace_messages_and_breadcrumb(session_id, &before, true)
             .unwrap();
+        // A one-turn cap: the new prompt's turn displaces the old turn whole,
+        // leaving the breadcrumb and the new exchange.
         let mut config = make_test_config(cwd.path());
         config
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let server = Arc::new(AcpServer::new_with_store(
             config,
             AcpServerConfig::default(),
@@ -8804,13 +8807,13 @@ mod tests {
 
         // The cap retains only the newer turn: after repair the seed body is
         // [older user, older failure sentinel, newer user, newer assistant],
-        // and trimming drops the first two rows.
+        // two complete turns, and a one-turn cap drops the older one whole.
         let mut config = make_test_config(cwd.path());
         config
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
