@@ -2959,6 +2959,13 @@ impl Chat {
         key: KeyEvent,
         term: &mut crate::config_manager::Term,
     ) -> bool {
+        if !matches!(self.phase, ChatPhase::Active(_))
+            && crate::keymap::ChatTabAction::from_chord(&key)
+                == Some(crate::keymap::ChatTabAction::TodoToggle)
+        {
+            self.plan_toggle_requested = true;
+            return false;
+        }
         // Determine which phase we're in without holding a borrow on self.
         // For the picker, extract what we need; for active, delegate below.
         match &mut self.phase {
