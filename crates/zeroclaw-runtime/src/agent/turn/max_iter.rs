@@ -77,7 +77,11 @@ pub(crate) async fn finish_after_max_iterations(
     config: Option<&Config>,
     multimodal_config: &MultimodalConfig,
     hooks: Option<&crate::hooks::HookRunner>,
-    image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    context_token_budget_for_route: impl Fn(&str, &str) -> usize + Send + Sync,
+    crumb_present: &mut bool,
+    reported_usage: Option<super::ReportedRequestUsage>,
+    observer: &dyn crate::observability::Observer,
 ) -> Result<String> {
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
@@ -151,9 +155,6 @@ pub(crate) async fn finish_after_max_iterations(
     ));
     let summary_prompt_mirror = summary_prompt.clone();
 
-    let summary_history_len = history.len();
-    history.push(summary_prompt);
-
     enum SummaryCall {
         Cancelled,
         TimedOut(u64),
@@ -166,19 +167,20 @@ pub(crate) async fn finish_after_max_iterations(
     let mut summary_attempts = Vec::new();
     let summary_call = {
         // Preparation and hooks belong to the same timeout/cancellation scope
-        // as dispatch; every unsuccessful outcome below removes the prompt.
+        // as dispatch; only a successful summary persists the prompt.
         let summary_future = async {
             // Exclude the synthetic prompt so trailing tool-result images
             // remain in the latest run and receive normal image validation.
             let mut messages = super::vision_route::prepare_messages_for_iteration(
-                &history[..summary_history_len],
+                history,
                 multimodal_config,
                 degrade_strip_images,
-                image_cache,
+                image_cache.as_deref_mut(),
             )
             .await?
             .messages;
             messages.push(summary_prompt_mirror.clone());
+            let pre_hook_messages = messages.clone();
             let mut selected_model = model.to_string();
             if let Some(hooks) = hooks.filter(|hooks| !hooks.is_empty())
                 && let crate::hooks::HookResult::Cancel(reason) = hooks
@@ -186,6 +188,111 @@ pub(crate) async fn finish_after_max_iterations(
                     .await
             {
                 anyhow::bail!("LLM call cancelled by hook: {reason}");
+            }
+            let context_token_budget =
+                context_token_budget_for_route(provider_name, &selected_model);
+            let token_counter = super::DispatchTokenCounter::for_route(
+                reported_usage,
+                provider_name,
+                &selected_model,
+            );
+            let suffix_only = messages.len() >= pre_hook_messages.len()
+                && messages
+                    .iter()
+                    .zip(&pre_hook_messages)
+                    .all(|(a, b)| a.role == b.role && a.content == b.content);
+            let hook_suffix = if suffix_only {
+                messages[pre_hook_messages.len()..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let tokens_before =
+                token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+            let mut dropped_messages = 0;
+            let mut dropped_turns = 0;
+            loop {
+                let tokens =
+                    token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+                let mut trim = super::surface_oversized_dispatch_if_needed(
+                    history,
+                    crumb_present,
+                    tokens,
+                    context_token_budget,
+                );
+                dropped_messages += trim.dropped_messages;
+                if trim.outcome == super::PreDispatchOutcome::Trimmed {
+                    // Rebuild only an unchanged prefix plus a transient suffix.
+                    // Arbitrary hook rewrites cannot be replayed without invoking the hook twice.
+                    if !suffix_only {
+                        anyhow::bail!(crate::i18n::get_required_cli_string(
+                            "turn-context-hook-mutation-unsafe-error",
+                        ));
+                    }
+                    dropped_turns += 1;
+                    messages = super::vision_route::prepare_messages_for_iteration(
+                        history,
+                        multimodal_config,
+                        degrade_strip_images,
+                        image_cache.as_deref_mut(),
+                    )
+                    .await?
+                    .messages;
+                    messages.push(summary_prompt_mirror.clone());
+                    messages.extend(hook_suffix.iter().cloned());
+                    continue;
+                }
+                trim.dropped_messages = dropped_messages;
+                super::record_dispatch_trim(
+                    (provider_name, &selected_model),
+                    &trim,
+                    dropped_turns,
+                    context_token_budget,
+                    tokens_before,
+                    tokens,
+                    token_counter.source(),
+                );
+                let floor = trim.outcome == super::PreDispatchOutcome::Floor;
+                if dropped_messages > 0 || floor {
+                    let source = token_counter.source();
+                    let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
+                    if let Some(tx) = event_tx {
+                        let _ = tx
+                            .send(TurnEvent::HistoryTrimmed {
+                                dropped_messages,
+                                kept_turns: trim.kept_turns,
+                                reason: reason.clone(),
+                                token_budget: Some(context_token_budget as u64),
+                                tokens_before: Some(tokens_before),
+                                tokens_after: Some(tokens),
+                                tokens_before_source: Some(source),
+                                tokens_after_source: Some(source),
+                                unsatisfiable_floor: floor.then_some(true),
+                            })
+                            .await;
+                    }
+                    observer.record_event(
+                        &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                            dropped_messages,
+                            kept_turns: trim.kept_turns,
+                            reason,
+                            channel: None,
+                            agent_alias: None,
+                            turn_id: None,
+                            token_budget: Some(context_token_budget as u64),
+                            tokens_before: Some(tokens_before),
+                            tokens_after: Some(tokens),
+                            tokens_before_source: Some(source),
+                            tokens_after_source: Some(source),
+                            unsatisfiable_floor: floor.then_some(true),
+                        },
+                    );
+                }
+                if floor {
+                    anyhow::bail!(crate::i18n::get_required_cli_string(
+                        "turn-context-budget-floor-error"
+                    ));
+                }
+                break;
             }
             let summary_request = zeroclaw_providers::ChatRequest {
                 messages: &messages,
@@ -248,11 +355,9 @@ pub(crate) async fn finish_after_max_iterations(
 
     let resp = match summary_call {
         SummaryCall::Cancelled => {
-            history.pop();
             return Err(ToolLoopCancelled.into());
         }
         SummaryCall::TimedOut(step_secs) => {
-            history.pop();
             anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
         }
         SummaryCall::Done(Err(e)) => {
@@ -271,7 +376,6 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
-            history.pop();
             return Err(e).context(exhaustion);
         }
         SummaryCall::Done(Ok(resp)) => {
@@ -282,7 +386,6 @@ pub(crate) async fn finish_after_max_iterations(
 
     let raw_text = resp.text.unwrap_or_default();
     if raw_text.is_empty() {
-        history.pop();
         anyhow::bail!("{exhaustion}")
     }
     // The summary is raw provider text, and emitting it as a chunk makes this
@@ -317,11 +420,11 @@ pub(crate) async fn finish_after_max_iterations(
         display_text
     };
     if display_text.trim().is_empty() {
-        history.pop();
         anyhow::bail!("{exhaustion}")
     }
     // History and result payloads keep the unmodified provider text; only the
     // display path is normalized, matching the final-response contract.
+    history.push(summary_prompt);
     let summary_msg = ChatMessage::assistant(raw_text.clone());
     if let Some(out) = &mut new_messages_out {
         out.push(summary_prompt_mirror);
@@ -448,6 +551,10 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            |_, _| 0,
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
         )
         .await
     }
@@ -636,9 +743,11 @@ mod graceful_summary_metering_tests {
     /// test can assert on what actually reached the provider. `vision` lets a
     /// test decide whether the provider can see images, which the summary
     /// path consults exactly like the in-loop path.
+    #[derive(Default)]
     struct CapturingProvider {
         seen: Arc<std::sync::Mutex<Vec<String>>>,
         vision: bool,
+        expected_request: Option<(&'static str, usize)>,
     }
 
     #[async_trait]
@@ -663,9 +772,17 @@ mod graceful_summary_metering_tests {
         async fn chat(
             &self,
             request: ChatRequest<'_>,
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            if let Some((expected_model, token_budget)) = self.expected_request {
+                assert_eq!(model, expected_model);
+                assert!(request.tools.is_none());
+                assert!(
+                    crate::agent::history::estimate_history_tokens(request.messages)
+                        <= token_budget
+                );
+            }
             let joined = request
                 .messages
                 .iter()
@@ -691,6 +808,169 @@ mod graceful_summary_metering_tests {
         }
     }
 
+    #[tokio::test]
+    async fn graceful_summary_counts_hook_selected_request_without_repeating_hook() {
+        struct SummaryHook(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::hooks::HookHandler for SummaryHook {
+            fn name(&self) -> &str {
+                "summary-context-hook"
+            }
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> crate::hooks::HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                *model = "summary-model".into();
+                messages.push(ChatMessage::user("hook context ".repeat(80)));
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+
+        for budget in [512, 1] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CapturingProvider {
+                seen: Arc::clone(&seen),
+                expected_request: Some(("summary-model", budget)),
+                ..Default::default()
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SummaryHook(Arc::clone(&calls))));
+            let mut history = vec![
+                ChatMessage::user("obsolete context ".repeat(800)),
+                ChatMessage::assistant("obsolete answer"),
+                ChatMessage::user("latest real question"),
+                ChatMessage::assistant("latest completed work"),
+            ];
+            let mut crumb_present = false;
+            let result = finish_after_max_iterations(
+                &provider,
+                &mut history,
+                "custom",
+                "original-model",
+                "hint:original-model",
+                None,
+                &PacingConfig::default(),
+                None,
+                CompletionLimit::ExecutionTree,
+                String::new(),
+                "summary-hook-context",
+                &LoopKnobs::default(),
+                None,
+                None,
+                None,
+                &MultimodalConfig::default(),
+                Some(&hooks),
+                None,
+                |provider, model| {
+                    assert_eq!(provider, "custom");
+                    assert_eq!(model, "summary-model");
+                    budget
+                },
+                &mut crumb_present,
+                None,
+                &crate::observability::NoopObserver,
+            )
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(crumb_present);
+            assert!(history.iter().any(|m| m.content == "latest real question"));
+            assert!(history.iter().any(|m| m.content == "latest completed work"));
+            assert!(!history.iter().any(|m| m.content.contains("obsolete")));
+            assert!(!history.iter().any(|m| m.content.contains("hook context")));
+            let captured = seen.lock().unwrap();
+            if budget == 512 {
+                assert!(result.unwrap().contains("execution-tree iteration budget"));
+                assert_eq!(captured.len(), 1);
+                assert!(captured[0].contains("latest real question"));
+                assert!(captured[0].contains("hook context"));
+                assert!(!captured[0].contains("obsolete"));
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(&crate::i18n::get_required_cli_string(
+                        "turn-context-budget-floor-error",
+                    ))
+                );
+                assert!(captured.is_empty());
+                assert!(
+                    !history
+                        .iter()
+                        .any(|m| m.content.contains("execution-tree iteration budget"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_prompt_can_make_the_latest_turn_unsatisfiable() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+            ..Default::default()
+        };
+        let mut history = vec![
+            ChatMessage::user("current question"),
+            ChatMessage::assistant("work completed"),
+        ];
+        // The real turn fits exactly; only the synthetic prompt can exceed it.
+        let budget = crate::agent::history::estimate_history_tokens(&history);
+        let mut crumb_present = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let error = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &PacingConfig::default(),
+            None,
+            CompletionLimit::LocalIterations(1),
+            String::new(),
+            "summary-prompt-floor",
+            &LoopKnobs::default(),
+            Some(&tx),
+            None,
+            None,
+            &MultimodalConfig::default(),
+            None,
+            None,
+            |_, _| budget,
+            &mut crumb_present,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect_err("summary prompt must be included in the floor decision");
+        assert!(
+            format!("{error:#}").contains(&crate::i18n::get_required_cli_string(
+                "turn-context-budget-floor-error",
+            ))
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no oversized summary dispatch"
+        );
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "current question");
+        assert_eq!(history[1].content, "work completed");
+        assert!(!crumb_present);
+        let TurnEvent::HistoryTrimmed {
+            tokens_after,
+            unsatisfiable_floor,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected summary floor event");
+        };
+        assert_eq!(unsatisfiable_floor, Some(true));
+        assert!(tokens_after.unwrap() > budget as u64);
+    }
+
     // The graceful-summary path now prepares the accumulated history through
     // the full multimodal normalizer before dispatch, and the dispatch seam
     // still strips loadable audio markers as a fail-closed backstop. A
@@ -703,6 +983,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: false,
+            ..Default::default()
         };
         // A properly paired assistant tool_call + native tool-result JSON blob,
         // so the orphaned-tool-message sweep in finish_after_max_iterations keeps
@@ -739,6 +1020,10 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            |_, _| 0,
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");
@@ -771,6 +1056,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: true,
+            ..Default::default()
         };
         // A properly paired assistant tool_call + native tool-result JSON
         // blob, so the orphan sweep keeps the exchange intact and the marker
@@ -809,6 +1095,10 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            |_, _| 0,
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");
@@ -848,6 +1138,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: true,
+            ..Default::default()
         };
         let mut history = vec![
             ChatMessage::user("call the tool and describe both screenshots"),
@@ -883,6 +1174,10 @@ mod graceful_summary_metering_tests {
             &multimodal_config,
             None,
             None,
+            |_, _| 0,
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");
@@ -915,6 +1210,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: false,
+            ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
 
