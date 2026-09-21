@@ -74,6 +74,7 @@ WORKFLOW_PERMISSION_KEYS = (
     "statuses",
 )
 WORKFLOW_PERMISSION_KEY_RE = "(?:" + "|".join(re.escape(key) for key in WORKFLOW_PERMISSION_KEYS) + ")"
+WORKFLOW_METADATA_KEY_RE = re.compile(r"^\s*(?:-\s*)?(?:name|run-name)\s*:")
 
 
 class ContentRule(NamedTuple):
@@ -254,14 +255,45 @@ def active_content_rules(path: str, content_rules: Iterable[ContentRule]) -> lis
     return rules
 
 
+def strip_yaml_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(line):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if quote == "'":
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character == "#":
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def workflow_semantic_line(line: str) -> str | None:
+    stripped = strip_yaml_comment(line)
+    if not stripped.strip() or WORKFLOW_METADATA_KEY_RE.match(stripped):
+        return None
+    return stripped
+
+
 def workflow_permission_write(line: str) -> bool:
-    scalar = r"write(?:-all)?"
+    scalar = r"""["']?write(?:-all)?["']?"""
+    key = rf"""["']?{WORKFLOW_PERMISSION_KEY_RE}["']?"""
     return any(
         re.search(pattern, line)
         for pattern in (
             rf"^\s*permissions\s*:\s*{scalar}\s*(?:#.*)?$",
-            rf"^\s*{WORKFLOW_PERMISSION_KEY_RE}\s*:\s*{scalar}\s*(?:#.*)?$",
-            rf"^\s*permissions\s*:\s*\{{[^}}]*{WORKFLOW_PERMISSION_KEY_RE}\s*:\s*{scalar}\b",
+            rf"^\s*{key}\s*:\s*{scalar}\s*(?:#.*)?$",
+            rf"^\s*permissions\s*:\s*\{{[^}}]*{key}\s*:\s*{scalar}(?=\s*(?:[,}}#]|$))",
         )
     )
 
@@ -270,8 +302,8 @@ def workflow_oidc_write(line: str) -> bool:
     return any(
         re.search(pattern, line)
         for pattern in (
-            r"^\s*id-token\s*:\s*write\s*(?:#.*)?$",
-            r"^\s*permissions\s*:\s*\{[^}]*id-token\s*:\s*write\b",
+            r"""^\s*["']?id-token["']?\s*:\s*["']?write["']?\s*(?:#.*)?$""",
+            r"""^\s*permissions\s*:\s*\{[^}]*["']?id-token["']?\s*:\s*["']?write["']?(?=\s*(?:[,}#]|$))""",
         )
     )
 
@@ -289,12 +321,16 @@ def workflow_pull_request_target(line: str) -> bool:
 
 def content_rule_matches(path: str, rule: ContentRule, line: str) -> bool:
     if is_workflow_yaml(path):
+        semantic_line = workflow_semantic_line(line)
+        if semantic_line is None:
+            return False
         if rule.name == "workflow permission expansion":
-            return workflow_permission_write(line)
+            return workflow_permission_write(semantic_line)
         if rule.name == "OIDC token access":
-            return workflow_oidc_write(line)
+            return workflow_oidc_write(semantic_line)
         if rule.name == "elevated pull_request_target":
-            return workflow_pull_request_target(line)
+            return workflow_pull_request_target(semantic_line)
+        return rule.pattern.search(semantic_line) is not None
     return rule.pattern.search(line) is not None
 
 
@@ -437,6 +473,16 @@ def changed_line_content(patch: str) -> tuple[list[tuple[int, str]], list[tuple[
 
     require(saw_hunk and old_remaining == 0 and new_remaining == 0, "patch has incomplete hunks")
     return old_changed, new_changed, True
+
+
+def parsed_patch_counts_match(
+    item: dict[str, Any],
+    old_changed: list[tuple[int, str]],
+    new_changed: list[tuple[int, str]],
+) -> bool:
+    additions = len(new_changed)
+    deletions = len(old_changed)
+    return additions == item["additions"] and deletions == item["deletions"] and item["changes"] == additions + deletions
 
 
 def source_text(payload: Any) -> str:
@@ -689,8 +735,13 @@ def content_evidence_for_file(item: dict[str, Any], content_rules: tuple[Content
             "content_rules": ["content-sensitive diff unavailable"],
         }
     try:
-        _, new_changed, _ = changed_line_content(patch)
+        old_changed, new_changed, _ = changed_line_content(patch)
     except RiskReportError:
+        return {
+            "path": path,
+            "content_rules": ["content-sensitive diff unavailable"],
+        }
+    if not parsed_patch_counts_match(item, old_changed, new_changed):
         return {
             "path": path,
             "content_rules": ["content-sensitive diff unavailable"],

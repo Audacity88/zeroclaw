@@ -296,6 +296,11 @@ class RiskClassifierTest(unittest.TestCase):
                 "@@ -1,1 +1,1 @@\n-name: old\n+permissions: {contents: write}\n",
             ),
             (
+                "workflow permission expansion",
+                ".github/workflows/other.yml",
+                '@@ -1,1 +1,1 @@\n-name: old\n+permissions: {"contents": "write"}\n',
+            ),
+            (
                 "secret access",
                 ".github/workflows/docs-check.yml",
                 "@@ -12,1 +12,1 @@\n-          TOKEN: ${{ github.token }}\n+          TOKEN: ${{ secrets.RELEASE_TOKEN }}\n",
@@ -309,6 +314,11 @@ class RiskClassifierTest(unittest.TestCase):
                 "OIDC token access",
                 ".github/workflows/other.yml",
                 "@@ -1,1 +1,1 @@\n-name: old\n+permissions: {id-token: write}\n",
+            ),
+            (
+                "OIDC token access",
+                ".github/workflows/other.yml",
+                "@@ -1,1 +1,1 @@\n-name: old\n+permissions: {'id-token': 'write'}\n",
             ),
             (
                 "artifact publication",
@@ -385,6 +395,38 @@ class RiskClassifierTest(unittest.TestCase):
         self.assertEqual(workflow_name_report["proposed_risk"], "risk:medium")
         self.assertEqual(workflow_name_report["matching_evidence"], [])
 
+        workflow_release_name_report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        ".github/workflows/docs-check.yml",
+                        1,
+                        1,
+                        "@@ -7,1 +7,1 @@\n-name: docs\n+name: release docs\n",
+                    )
+                ],
+            )
+        )
+        self.assertEqual(workflow_release_name_report["proposed_risk"], "risk:medium")
+        self.assertEqual(workflow_release_name_report["matching_evidence"], [])
+
+        workflow_comment_report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        ".github/workflows/docs-check.yml",
+                        1,
+                        1,
+                        "@@ -7,1 +7,1 @@\n-name: docs\n+# secrets: none\n",
+                    )
+                ],
+            )
+        )
+        self.assertEqual(workflow_comment_report["proposed_risk"], "risk:medium")
+        self.assertEqual(workflow_comment_report["matching_evidence"], [])
+
         docs_report = evaluate(
             FakeAPI(
                 pull(),
@@ -435,6 +477,26 @@ class RiskClassifierTest(unittest.TestCase):
 
     def test_changed_line_policy_fails_closed_when_content_sensitive_patch_is_missing(self) -> None:
         report = evaluate(FakeAPI(pull(), [changed_file(".github/workflows/docs-check.yml", patch=None)]))
+        self.assertEqual(report["proposed_risk"], "risk:high")
+        self.assertEqual(
+            report["matching_evidence"][0]["content_rules"],
+            ["content-sensitive diff unavailable"],
+        )
+
+    def test_changed_line_policy_fails_closed_when_content_sensitive_patch_is_truncated(self) -> None:
+        report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        ".github/workflows/docs-check.yml",
+                        2,
+                        1,
+                        "@@ -7,1 +7,1 @@\n-  contents: read\n+  contents: write\n",
+                    )
+                ],
+            )
+        )
         self.assertEqual(report["proposed_risk"], "risk:high")
         self.assertEqual(
             report["matching_evidence"][0]["content_rules"],
