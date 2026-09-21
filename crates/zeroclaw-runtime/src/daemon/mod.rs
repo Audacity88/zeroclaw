@@ -791,6 +791,8 @@ pub async fn run(
         };
 
         Some(std::sync::Arc::new(RpcContext {
+            #[cfg(test)]
+            config_commit_pause: None,
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sessions,
@@ -3384,9 +3386,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3438,6 +3442,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 approval_timeout_secs: 300,
+                purpose_as_instructions: false,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -3687,9 +3692,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -3717,9 +3724,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
                 per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,

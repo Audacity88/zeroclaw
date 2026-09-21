@@ -3690,11 +3690,21 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
-    /// Token budget for preemptive context/history trimming (from runtime profile).
+    /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
+    /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
+    /// With a ratio, `Some(n)` clamps the model-relative threshold down to `n`.
+    /// Every positive result is also capped by the selected model capacity.
+    /// `Some(0)` disables proactive token-budget trimming.
     /// NOT the provider `max_tokens` output limit.
-    pub max_context_tokens: usize,
+    pub max_context_tokens: Option<usize>,
     /// Model's context window (max input tokens) — from provider config.
     pub model_context_window: usize,
+    /// Whether `model_context_window` came from the selected provider profile
+    /// or from the compatibility fallback for unknown/unconfigured capacity.
+    pub model_context_window_source: ModelContextWindowSource,
+    /// Opt-in fraction of `model_context_window` at which proactive trimming
+    /// triggers. `None` preserves the legacy absolute-budget behavior.
+    pub context_compact_ratio: Option<f64>,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
     pub strict_tool_parsing: bool,
@@ -3712,17 +3722,133 @@ pub struct ResolvedRuntime {
     pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
-impl ResolvedRuntime {
-    /// Effective token budget for preemptive whole-turn history trimming.
-    /// When `history_pruning.enabled` is set, an explicit `max_tokens` floor
-    /// trims earlier than the hard context ceiling; otherwise the ceiling is
-    /// the only trigger. Reuses the existing `history_pruning.*` idents.
-    pub fn effective_context_budget(&self) -> usize {
-        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
-            self.max_context_tokens.min(self.history_pruning.max_tokens)
-        } else {
-            self.max_context_tokens
+/// Historical proactive context budget used when an operator sets neither an
+/// absolute budget nor the opt-in model-relative ratio.
+///
+/// Shares its value with [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`] — the legacy
+/// default budget was exactly the unconfigured-window stub — but is a distinct
+/// concept: this is a proactive-trim budget default, not a model-capacity
+/// fallback. Kept as a named alias so the two never drift and each call site
+/// reads as the concept it means.
+pub const LEGACY_DEFAULT_CONTEXT_BUDGET: usize = UNCONFIGURED_CONTEXT_WINDOW_FALLBACK;
+
+/// Provenance of the model capacity used for one route. The compatibility
+/// fallback remains usable for internal safety calculations, but callers can
+/// avoid presenting it as configured model truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelContextWindowSource {
+    Configured,
+    #[default]
+    CompatibilityFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedModelContextWindow {
+    pub tokens: usize,
+    pub source: ModelContextWindowSource,
+}
+
+/// Capacity and proactive-trim budget resolved together for one selected
+/// provider alias and model. This is a per-route materialized view, not a new
+/// configuration source: model capacity remains owned by provider config and
+/// budget policy remains owned by the agent's runtime profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedContextLimits {
+    pub model_context_window: usize,
+    pub model_context_window_source: ModelContextWindowSource,
+    pub context_token_budget: usize,
+}
+
+impl ResolvedContextLimits {
+    /// Compatibility-fallback limits for paths that cannot resolve a route
+    /// (missing config or an empty agent alias): the unconfigured-window
+    /// fallback with the caller's budget preserved — `0` stays `0` (proactive
+    /// trimming disabled), any positive value is clamped to that window.
+    #[must_use]
+    pub fn legacy_fallback(budget: usize) -> Self {
+        Self {
+            model_context_window: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
+            context_token_budget: if budget == 0 {
+                0
+            } else {
+                budget.min(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+            },
         }
+    }
+
+    /// Return capacity only when it is configured for the selected route.
+    /// Wire/UI consumers use absence to distinguish the 32k compatibility
+    /// fallback from known model capacity.
+    #[must_use]
+    pub fn configured_model_context_window(self) -> Option<usize> {
+        (self.model_context_window_source == ModelContextWindowSource::Configured)
+            .then_some(self.model_context_window)
+    }
+}
+
+impl ResolvedRuntime {
+    /// Resolve capacity and proactive budget for this runtime snapshot.
+    #[must_use]
+    pub fn context_limits(&self) -> ResolvedContextLimits {
+        self.context_limits_for_model_window(self.model_context_window)
+    }
+
+    /// Apply this runtime policy to a route-selected model capacity.
+    #[must_use]
+    pub fn context_limits_for_model_window(
+        &self,
+        model_context_window: usize,
+    ) -> ResolvedContextLimits {
+        let model_context_window = if model_context_window > 0 {
+            model_context_window
+        } else {
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        };
+
+        // Preserve the established disable sentinel before applying any
+        // ratio, pruning floor, or positive-value normalization.
+        if self.max_context_tokens == Some(0) {
+            return ResolvedContextLimits {
+                model_context_window,
+                model_context_window_source: self.model_context_window_source,
+                context_token_budget: 0,
+            };
+        }
+
+        let ratio = self
+            .context_compact_ratio
+            .filter(|ratio| *ratio > 0.0 && *ratio <= 1.0);
+        let mut context_token_budget = ratio.map_or_else(
+            || {
+                self.max_context_tokens
+                    .unwrap_or(LEGACY_DEFAULT_CONTEXT_BUDGET)
+            },
+            |ratio| ((model_context_window as f64 * ratio) as usize).max(1),
+        );
+
+        // In ratio mode an explicit absolute budget remains an operator cap.
+        if ratio.is_some()
+            && let Some(ceiling) = self.max_context_tokens
+        {
+            context_token_budget = context_token_budget.min(ceiling);
+        }
+        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
+            context_token_budget = context_token_budget.min(self.history_pruning.max_tokens);
+        }
+        // Capacity is a hard invariant for every positive effective budget.
+        // Preserve zero as the explicit proactive-trimming disable sentinel.
+        context_token_budget = context_token_budget.min(model_context_window);
+        ResolvedContextLimits {
+            model_context_window,
+            model_context_window_source: self.model_context_window_source,
+            context_token_budget,
+        }
+    }
+
+    /// Effective token budget for preemptive whole-turn history trimming.
+    pub fn effective_context_budget(&self) -> usize {
+        self.context_limits().context_token_budget
     }
 }
 
@@ -3732,8 +3858,10 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_history_messages: 50,
-            max_context_tokens: 32_000,
+            max_context_tokens: None,
             model_context_window: 32_000,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
+            context_compact_ratio: None,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             strict_tool_parsing: false,
@@ -4370,12 +4498,21 @@ impl Config {
     }
 
     #[must_use]
-    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
-        // Token budget for preemptive context/history trimming (runtime profile override).
-        // This is NOT the provider max_tokens output limit and NOT the model's context window.
+    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> Option<usize> {
+        // Optional operator budget from the runtime profile. `None` retains the
+        // legacy 32k default unless the model-relative ratio is explicitly set.
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
-            .unwrap_or(32_000)
+    }
+
+    /// Optional fraction of the selected model's context window at which
+    /// proactive trimming fires. Invalid values are treated as unset so they
+    /// cannot silently opt an existing profile into model-relative budgeting.
+    #[must_use]
+    pub fn effective_context_compact_ratio(&self, agent_alias: &str) -> Option<f64> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.context_compact_ratio)
+            .filter(|r| *r > 0.0 && *r <= 1.0)
     }
 
     /// The model's context window exactly as configured, or `None` when no
@@ -4399,8 +4536,141 @@ impl Config {
     /// Does NOT check runtime profile (that's for output budget).
     #[must_use]
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
-        self.configured_model_context_window(agent_alias)
-            .unwrap_or(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+        self.resolved_model_context_window(agent_alias).tokens
+    }
+
+    /// Resolve model capacity and its provenance for an agent's configured
+    /// route. Unknown agents and unconfigured capacities retain the numeric
+    /// compatibility fallback while remaining explicitly identifiable.
+    #[must_use]
+    pub fn resolved_model_context_window(&self, agent_alias: &str) -> ResolvedModelContextWindow {
+        let Some(agent) = self.agents.get(agent_alias) else {
+            return ResolvedModelContextWindow {
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                source: ModelContextWindowSource::CompatibilityFallback,
+            };
+        };
+        let model = self
+            .model_provider_for_agent(agent_alias)
+            .and_then(|provider| provider.model.as_deref())
+            .unwrap_or_default();
+        self.resolved_model_context_window_for_route(agent.model_provider.as_str(), model)
+    }
+
+    /// Resolve model capacity for the provider alias and model selected for a
+    /// turn. `context_window` describes the model configured on that alias; a
+    /// different per-session model override therefore falls back to the legacy
+    /// unknown-capacity value instead of borrowing metadata for another model.
+    #[must_use]
+    pub fn effective_model_context_window_for_route(
+        &self,
+        model_provider_ref: &str,
+        selected_model: &str,
+    ) -> usize {
+        self.resolved_model_context_window_for_route(model_provider_ref, selected_model)
+            .tokens
+    }
+
+    /// Resolve capacity for exactly the selected provider profile and model.
+    /// A model mismatch or missing positive `context_window` is an explicit
+    /// compatibility fallback, never borrowed metadata from another model.
+    #[must_use]
+    pub fn resolved_model_context_window_for_route(
+        &self,
+        model_provider_ref: &str,
+        selected_model: &str,
+    ) -> ResolvedModelContextWindow {
+        let configured =
+            model_provider_ref
+                .split_once('.')
+                .and_then(|(provider_type, provider_alias)| {
+                    self.providers.models.find(provider_type, provider_alias)
+                });
+        let selected_model = selected_model.trim();
+        let configured_model = configured
+            .and_then(|provider| provider.model.as_deref())
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+
+        let configured_window = configured
+            .filter(|_| {
+                selected_model.is_empty()
+                    || configured_model.is_none()
+                    || configured_model == Some(selected_model)
+            })
+            .and_then(|provider| provider.context_window)
+            .filter(|window| *window > 0);
+
+        configured_window.map_or(
+            ResolvedModelContextWindow {
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                source: ModelContextWindowSource::CompatibilityFallback,
+            },
+            |tokens| ResolvedModelContextWindow {
+                tokens,
+                source: ModelContextWindowSource::Configured,
+            },
+        )
+    }
+
+    /// Resolve one route's capacity and proactive budget from their canonical
+    /// owners: the selected provider alias/model and the agent runtime profile.
+    #[must_use]
+    pub fn resolved_context_limits_for_route(
+        &self,
+        agent_alias: &str,
+        model_provider_ref: &str,
+        selected_model: &str,
+    ) -> ResolvedContextLimits {
+        let model_context_window =
+            self.resolved_model_context_window_for_route(model_provider_ref, selected_model);
+        let mut runtime = ResolvedRuntime {
+            max_context_tokens: self.effective_max_context_tokens(agent_alias),
+            model_context_window: model_context_window.tokens,
+            model_context_window_source: model_context_window.source,
+            context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
+            ..ResolvedRuntime::default()
+        };
+        if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
+            runtime.history_pruning = profile.history_pruning.clone();
+        }
+        runtime.context_limits()
+    }
+
+    /// Provider's explicit `context_window` for the served model, or `None`.
+    /// Use on wire boundaries: emitting the 32k stub from
+    /// `effective_model_context_window()` would freeze the client
+    /// meter at 32k instead of the profile budget. Use this instead
+    /// of the agent-alias variant when the live provider identity is
+    /// known (e.g., from `Agent.attribution_fields().1` or
+    /// `SessionOverrides.model_provider`). Returns `None` when the
+    /// ref is unparseable, the entry has no `context_window`, or the
+    /// served model does not match the entry's configured primary
+    /// `model`, so the wire omission path preserves absence (no 32k
+    /// stub leak) and fallback/vision/override models never borrow
+    /// another model's capacity.
+    #[must_use]
+    pub fn model_provider_context_window_opt(
+        &self,
+        provider_ref: &str,
+        model: &str,
+    ) -> Option<usize> {
+        let (type_key, alias_key) = provider_ref.split_once('.')?;
+        let (_, _, cfg) = self
+            .providers
+            .models
+            .iter_entries()
+            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)?;
+        let configured = cfg
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let served = model.trim();
+        if served.is_empty() || configured != served {
+            return None;
+        }
+        cfg.context_window
     }
 
     #[must_use]
@@ -4478,13 +4748,17 @@ impl Config {
     #[must_use]
     pub fn resolved_agent_config(&self, agent_alias: &str) -> Option<AliasedAgentConfig> {
         let mut out = self.agents.get(agent_alias)?.clone();
+        let model_context_window = self.resolved_model_context_window(agent_alias);
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
-            // Token budget for context/history trimming — from runtime profile
+            // Absolute operator budget. In opt-in ratio mode it also caps the
+            // model-derived threshold (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             // Model's context window (max input tokens) — from provider config
-            model_context_window: self.effective_model_context_window(agent_alias),
+            model_context_window: model_context_window.tokens,
+            model_context_window_source: model_context_window.source,
+            context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
@@ -8077,20 +8351,33 @@ impl Default for BrowserComputerUseConfig {
 
 /// Browser automation configuration (`[browser]` section).
 ///
-/// Controls the `browser_open` tool and browser automation backends.
+/// Gates two distinct tools on two independent flags: `enabled` (default
+/// `true`) registers `browser_open`, and `automation_enabled` (default
+/// `false`) registers the full `browser` automation tool. The remaining
+/// fields configure the automation backends and are shared by both.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "browser"]
 #[integration(
     category = "ToolsAutomation",
     display_name = "Browser",
-    description = "Chrome/Chromium control",
-    status_field = "enabled"
+    description = "Open URLs and control Chrome/Chromium",
+    status_method = "integration_active"
 )]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Enable the full `browser` automation tool (Chrome/Chromium control:
+    /// navigate, click, type, read page content). Opt-in and independent of
+    /// `enabled`, which gates only `browser_open`.
+    /// Automation acts inside browser sessions that may already be logged in,
+    /// so on an always-on agent a prompt-injected message could drive them;
+    /// leave this off unless the agent needs it. It is also absent from
+    /// [`default_auto_approve`], so `browser` calls hit the approval gate
+    /// unless a risk profile lists it explicitly.
+    #[serde(default)]
+    pub automation_enabled: bool,
     /// Allowed domains for `browser_open` (exact or subdomain match)
     #[serde(default = "default_browser_allowed_domains")]
     pub allowed_domains: Vec<String>,
@@ -8140,10 +8427,25 @@ fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
 
+impl BrowserConfig {
+    /// Status source for the `#[integration(status_method = ...)]`
+    /// descriptor: the "Browser" integration is Active when the runtime
+    /// registers *either* of the tools this section gates — `browser_open`
+    /// (`enabled`) or the full `browser` automation tool
+    /// (`automation_enabled`). Reading only one flag would misreport half
+    /// the combinations: a default config would claim Chrome/Chromium
+    /// control that is not registered, and an automation-only config would
+    /// report Available while automation is live.
+    pub fn integration_active(&self) -> bool {
+        self.enabled || self.automation_enabled
+    }
+}
+
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            automation_enabled: false,
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
@@ -13140,7 +13442,11 @@ pub fn default_auto_approve() -> Vec<String> {
         "image_info".into(),
         "weather".into(),
         "tool_search".into(),
-        "browser".into(),
+        // `browser_open` only hands a URL to the system browser — no
+        // scraping, no page interaction — so it stays auto-approved. The
+        // full `browser` automation tool is deliberately absent: it drives a
+        // possibly logged-in Chrome/Chromium session, which is not a
+        // decision to make on the operator's behalf.
         "browser_open".into(),
     ]
 }
@@ -13252,26 +13558,41 @@ fn is_valid_auth_section_name(name: &str) -> bool {
     name.len() <= 64 && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
-/// One OIDC trust relationship (`[oidc.<alias>]`) — the identity-mapping
-/// half consumed by the shared principal resolver.
+/// One OIDC trust relationship (`[oidc.<alias>]`): the identity-mapping
+/// half consumed by the shared principal resolver, plus the
+/// token-verification settings the `oidc.<alias>` auth provider enforces.
 ///
 /// The alias is an operator-chosen handle (it appears in logs and audit
 /// attribution as `oidc.<alias>` and selects the provider during the
 /// handshake), never part of principal identity: canonical identity is
 /// keyed by the validated issuer plus token subject, so renaming an alias
 /// cannot re-key principals or link accounts across issuers.
-///
-/// Token-verification settings (validation mode, audience, client secrets,
-/// lifetimes) ship with the OIDC provider slice; this entry carries what
-/// the resolver needs to map verified claims to permission profiles.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "oidc"]
 #[serde(default)]
 pub struct OidcConfig {
     /// Issuer URL exactly as it appears in validated token `iss` claims
-    /// (e.g. `https://sso.example.com/realms/main`).
+    /// (e.g. `https://sso.example.com/realms/main`). Discovery is fetched
+    /// from `<issuer>/.well-known/openid-configuration` and its `issuer`
+    /// field must match this value exactly.
     pub issuer: String,
+    /// Audience the token must carry in its `aud` claim for this daemon
+    /// (typically the client ID or resource identifier registered at the
+    /// IdP). Required for token verification.
+    pub audience: String,
+    /// Client ID this daemon authenticates AS for confidential flows
+    /// (token introspection; enrollment in a later slice). Defaults to
+    /// `audience` when empty.
+    pub client_id: String,
+    /// Client secret for confidential-client flows (token introspection).
+    /// Not required for JWKS validation. Encrypted at rest.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub client_secret: Option<String>,
+    /// How presented tokens are validated.
+    pub validation: OidcValidation,
     /// Dotted path to the verified claim holding this deployment's
     /// role/group values (e.g. `realm_access.roles`, `groups`). Must be
     /// set explicitly: the daemon refuses to guess where grants live in a
@@ -13289,6 +13610,172 @@ pub struct OidcConfig {
     /// (fail closed).
     #[serde(default)]
     pub service_profile_map: HashMap<String, String>,
+    /// Require the token to attest MFA through the IdP aggregate `mfa`
+    /// marker or an accepted configured ACR before authentication succeeds.
+    pub require_mfa: bool,
+    /// Acceptable `acr` (authentication context class) values. Empty = no
+    /// requirement; non-empty = the token's `acr` claim must be one of
+    /// these values or authentication fails closed.
+    pub required_acr: Vec<String>,
+    /// Allowed `azp` (authorized party) values — the client the token was
+    /// issued TO. Empty = no restriction; non-empty = the token must carry
+    /// an `azp` claim listed here or authentication fails closed.
+    pub allowed_authorized_parties: Vec<String>,
+    /// Client identities whose tokens are ALWAYS service principals
+    /// (`client_credentials` callers), matched against the token's
+    /// verified `client_id` claim. Service principals are keyed by
+    /// issuer + client identity and never inherit human-user assumptions,
+    /// whatever provider-specific shape their `sub` takes (`<client>@clients`,
+    /// a service-account user id, or the client id itself).
+    ///
+    /// Actor classification is declarative, never inferred from the
+    /// `sub`/`client_id` relationship: a token is a service because its
+    /// client is listed here, a human because its client is listed in
+    /// `interactive_clients`, or classified by `actor_claim`. A token whose
+    /// client is declared nowhere and carries no configured actor claim
+    /// evidence is denied. A client may appear in only one of the two lists.
+    pub service_clients: Vec<String>,
+    /// Client identities whose tokens are ALWAYS human principals
+    /// (authorization-code / device-code clients), matched against the
+    /// verified `client_id` claim. Their tokens must carry a nonblank `sub`
+    /// and resolve through `profile_map`. A client may appear in only one of
+    /// `service_clients` and `interactive_clients`.
+    pub interactive_clients: Vec<String>,
+    /// Dotted path to a claim the issuer stamps on exactly ONE actor kind's
+    /// tokens (present, non-null), e.g. Auth0's `gty` on client-credentials
+    /// tokens or Okta's `uid` on user tokens. `actor_claim_marks` names the
+    /// kind its presence proves; absence proves the other kind. Required
+    /// for a client that issues both human and machine tokens (declared in
+    /// neither client list); also checked against declared clients, where
+    /// contradicting evidence denies. Empty = no claim-based classification,
+    /// so every accepted client must be declared.
+    pub actor_claim: String,
+    /// Which actor kind the presence of `actor_claim` proves.
+    pub actor_claim_marks: OidcActorKind,
+    /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
+    /// tokens remain valid only through configured introspection.
+    pub require_at_jwt: bool,
+    /// Maximum authentication lifetime (seconds) for offline-validated
+    /// (JWKS) tokens. Offline validation cannot see revocation, so the
+    /// identity expires at the EARLIER of the token `exp` and `iat` + this
+    /// cap. Must be > 0.
+    pub max_auth_lifetime_secs: u64,
+    /// Revalidation interval (seconds) for introspection mode: the
+    /// deadline stamped on each identity after which the next privileged
+    /// operation must re-introspect or fail closed. `0` = revalidate at
+    /// every privileged operation.
+    pub revalidation_secs: u64,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("validation", &self.validation)
+            .field("claim_path", &self.claim_path)
+            .field("profile_map", &self.profile_map)
+            .field("service_profile_map", &self.service_profile_map)
+            .field("require_mfa", &self.require_mfa)
+            .field("required_acr", &self.required_acr)
+            .field(
+                "allowed_authorized_parties",
+                &self.allowed_authorized_parties,
+            )
+            .field("service_clients", &self.service_clients)
+            .field("interactive_clients", &self.interactive_clients)
+            .field("actor_claim", &self.actor_claim)
+            .field("actor_claim_marks", &self.actor_claim_marks)
+            .field("require_at_jwt", &self.require_at_jwt)
+            .field("max_auth_lifetime_secs", &self.max_auth_lifetime_secs)
+            .field("revalidation_secs", &self.revalidation_secs)
+            .finish()
+    }
+}
+
+fn default_oidc_max_auth_lifetime_secs() -> u64 {
+    86_400
+}
+
+fn default_oidc_revalidation_secs() -> u64 {
+    60
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            audience: String::new(),
+            client_id: String::new(),
+            client_secret: None,
+            validation: OidcValidation::default(),
+            claim_path: String::new(),
+            profile_map: HashMap::new(),
+            service_profile_map: HashMap::new(),
+            require_mfa: false,
+            required_acr: Vec::new(),
+            allowed_authorized_parties: Vec::new(),
+            service_clients: Vec::new(),
+            interactive_clients: Vec::new(),
+            actor_claim: String::new(),
+            actor_claim_marks: OidcActorKind::default(),
+            require_at_jwt: true,
+            max_auth_lifetime_secs: default_oidc_max_auth_lifetime_secs(),
+            revalidation_secs: default_oidc_revalidation_secs(),
+        }
+    }
+}
+
+/// Token validation strategy for an OIDC trust relationship.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OidcValidation {
+    /// Validate token signatures offline against the issuer's published
+    /// JWKS (fetched via discovery, refreshed on key rotation with a
+    /// bounded cooldown). No per-request IdP round-trip; revocation is
+    /// bounded by `max_auth_lifetime_secs` and token expiry.
+    #[default]
+    Jwks,
+    /// Validate every token online via the issuer's RFC 7662 introspection
+    /// endpoint. Live revocation within `revalidation_secs`; requires
+    /// `client_secret`.
+    ///
+    /// Endpoint contract (the daemon fails closed on anything less): an
+    /// `active: true` response authenticates only when it also reports
+    /// `token_type: Bearer`, an `aud` containing `audience`, and a nonblank
+    /// `client_id`. The endpoint MUST NOT report refresh tokens, ID tokens,
+    /// or any other non-access credential as an active `Bearer` token for
+    /// this audience: RFC 7662 lets an endpoint introspect refresh tokens
+    /// and treats the daemon's `token_type_hint=access_token` as advisory,
+    /// so this is the issuer's obligation. Where the issuer stamps an
+    /// explicit purpose marker (`typ`, e.g. Keycloak's `Refresh`/`ID`, or
+    /// `token_use`, e.g. Cognito's `id`), any value other than an access
+    /// token is denied.
+    Introspection,
+}
+
+/// The actor kind an OIDC `actor_claim`'s presence proves.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OidcActorKind {
+    /// The claim is present only on `client_credentials` (machine) tokens;
+    /// a token without it is a human's.
+    #[default]
+    Service,
+    /// The claim is present only on interactive (human) tokens; a token
+    /// without it is a machine's.
+    Human,
 }
 
 impl OidcConfig {
@@ -13349,6 +13836,12 @@ impl OidcConfig {
                 ),
             }
         }
+        if self.audience.trim().is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.audience is required: tokens must be minted for this \
+                 daemon's audience, or any token from the issuer would be accepted"
+            );
+        }
         if self.profile_map.is_empty() && self.service_profile_map.is_empty() {
             anyhow::bail!(
                 "oidc.{alias} requires profile_map or service_profile_map: map at least one \
@@ -13362,7 +13855,57 @@ impl OidcConfig {
                  claim carrying role/group values (e.g. `realm_access.roles` or `groups`)"
             );
         }
+        if self.validation == OidcValidation::Introspection && self.client_secret.is_none() {
+            anyhow::bail!(
+                "oidc.{alias}.client_secret is required when validation is `introspection`"
+            );
+        }
+        if self.max_auth_lifetime_secs == 0 {
+            anyhow::bail!(
+                "oidc.{alias}.max_auth_lifetime_secs must be > 0: offline-validated \
+                 tokens need a bounded authentication lifetime"
+            );
+        }
+        if self.validation == OidcValidation::Jwks && !self.require_at_jwt {
+            anyhow::bail!(
+                "oidc.{alias}.require_at_jwt must be true: bearer authentication accepts only \
+                 RFC 9068 typed access tokens"
+            );
+        }
+        for (field, clients) in [
+            ("service_clients", &self.service_clients),
+            ("interactive_clients", &self.interactive_clients),
+        ] {
+            if clients.iter().any(|client| client.trim().is_empty()) {
+                anyhow::bail!("oidc.{alias}.{field} must not contain a blank client id");
+            }
+        }
+        if let Some(shared) = self
+            .service_clients
+            .iter()
+            .find(|client| self.interactive_clients.contains(client))
+        {
+            anyhow::bail!(
+                "oidc.{alias}: client {shared:?} is declared in both service_clients and \
+                 interactive_clients; a client that issues both kinds of token must be listed \
+                 in neither and classified by actor_claim"
+            );
+        }
+        if self.actor_claim != self.actor_claim.trim() {
+            anyhow::bail!("oidc.{alias}.actor_claim must not have surrounding whitespace");
+        }
         Ok(())
+    }
+
+    /// The client ID used for confidential-client calls (introspection);
+    /// falls back to `audience` when unset.
+    #[must_use]
+    pub fn effective_client_id(&self) -> &str {
+        if self.client_id.trim().is_empty() {
+            &self.audience
+        } else {
+            &self.client_id
+        }
     }
 }
 
@@ -13685,8 +14228,17 @@ pub struct RuntimeProfileConfig {
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.
     pub max_history_messages: Option<usize>,
-    /// Maximum estimated tokens for context before compaction. `None` inherits.
+    /// Maximum estimated tokens before proactive history trimming. `None`
+    /// preserves the legacy 32,000-token default when `context_compact_ratio`
+    /// is unset. In ratio mode this remains an optional downward cap. Every
+    /// positive effective value is capped by the selected model capacity. `0`
+    /// disables proactive token-budget trimming.
     pub max_context_tokens: Option<usize>,
+    /// Opt-in fraction of the selected model's context window at which
+    /// proactive history trimming triggers (e.g. `0.9` = trim at 90%). `None`
+    /// preserves the legacy absolute-budget behavior. Values outside `(0, 1]`
+    /// are treated as unset.
+    pub context_compact_ratio: Option<f64>,
     /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
@@ -13741,6 +14293,7 @@ impl Default for RuntimeProfileConfig {
             agentic_timeout_secs: None,
             max_history_messages: None,
             max_context_tokens: None,
+            context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
             tool_dispatcher: None,
@@ -15474,7 +16027,14 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
-    /// Send the response as multiple separate messages at paragraph boundaries.
+    /// Send the response as multiple separate messages. The boundary between
+    /// messages is channel-specific (for example, Telegram splits at completed
+    /// agent turns).
+    ///
+    /// On Telegram, narration streamed for a text-default peer is delivered as
+    /// separate, permanent text messages. A per-turn voice route
+    /// (`send_via(modality = "voice")`) therefore applies to the final reply
+    /// only — it does not convert or retract narration already sent this turn.
     #[serde(rename = "multi_message")]
     MultiMessage,
 }
@@ -15582,8 +16142,12 @@ fn default_draft_update_interval_ms() -> u64 {
     1000
 }
 
+/// Default pacing between consecutive messages in MultiMessage stream mode.
+/// Channel constructors must reference this instead of duplicating the value.
+pub const DEFAULT_MULTI_MESSAGE_DELAY_MS: u64 = 800;
+
 fn default_multi_message_delay_ms() -> u64 {
-    800
+    DEFAULT_MULTI_MESSAGE_DELAY_MS
 }
 
 fn default_telegram_approval_timeout_secs() -> u64 {
@@ -15655,6 +16219,13 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Minimum delay (ms) between successive multi_message narration messages
+    /// (and before the approval prompt) for one recipient. Does not apply to the
+    /// fixed pacing between physical fragments of a single over-4096-character
+    /// message. Only used when `stream_mode = "multi_message"`.
+    #[tab(Behavior)]
+    #[serde(default = "default_multi_message_delay_ms")]
+    pub multi_message_delay_ms: u64,
     /// Inbound message debounce window in milliseconds for this Telegram alias.
     /// When set, overrides the global `[channels].debounce_ms` for this channel
     /// only. `0` or unset falls back to the global value.
@@ -15686,6 +16257,28 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub per_user_session: bool,
+    /// When true in Telegram group chats, unaddressed messages that pass
+    /// sender/chat authorization are recorded as passive conversation context
+    /// without starting an agent turn. Lets the bot follow the discussion and
+    /// answer with full context when later @-mentioned. Default: `false`.
+    ///
+    /// Recording passive messages requires `mention_only = true`: with the
+    /// default `mention_only = false` the bot already answers every
+    /// authorized group message, so no unaddressed message is left to record.
+    ///
+    /// Shared history is not gated that way. Enabling this flag puts every
+    /// group/topic message on one shared session, the way
+    /// `per_user_session = false` does, whatever `mention_only` says and
+    /// whatever `per_user_session` says, because an observation filed in the
+    /// observed member's own session could never answer the participant who
+    /// later @-mentions the bot. Members therefore share conversation
+    /// context and the session-scoped controls that come with it, so any
+    /// member's `/new` resets the history for the whole group/topic.
+    /// Scheduling stays personal: message debouncing, `/stop` and
+    /// interruption still key on the sender.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub passive_group_context: bool,
     /// Override for the top-level `ack_reactions` setting. When `None`, the
     /// channel falls back to `[channels].ack_reactions`. When set
     /// explicitly, it takes precedence.
@@ -15729,9 +16322,11 @@ impl Default for TelegramConfig {
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
+            multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
             per_user_session: true,
+            passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -16303,6 +16898,23 @@ pub struct MattermostConfig {
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Inject each room's Mattermost channel purpose into the system prompt as
+    /// channel-supplied context, letting one room specialise the agent.
+    ///
+    /// Off by default, because enabling it is a trust decision: the purpose is
+    /// editable by anyone holding `manage_*_channel_properties`, which on
+    /// default permission schemes is every channel member, and the text reaches
+    /// the system prompt. Those editors can therefore steer the agent in that
+    /// room, including with text that reads as an instruction, and they need
+    /// not be authorized ZeroClaw peers.
+    ///
+    /// What that steering cannot do is exceed the agent's existing permissions:
+    /// prompt text grants no tool, widens no peer group, and changes no
+    /// autonomy level. Enable this only where the room's editors are trusted
+    /// with the agent's configured capabilities.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub purpose_as_instructions: bool,
 }
 
 impl Default for MattermostConfig {
@@ -16325,6 +16937,7 @@ impl Default for MattermostConfig {
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             approval_timeout_secs: default_channel_approval_timeout_secs(),
+            purpose_as_instructions: false,
         }
     }
 }
@@ -26259,6 +26872,150 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn effective_context_budget_preserves_legacy_default_and_zero_sentinel() {
+        use super::{ModelContextWindowSource, ResolvedRuntime};
+
+        // Ratio is opt-in: a large model keeps the established 32k default.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 32_000);
+
+        // Opting in to a ratio scales against the selected model window.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            context_compact_ratio: Some(0.8),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 160_000);
+
+        // An explicit ceiling clamps ratio mode down.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            max_context_tokens: Some(50_000),
+            context_compact_ratio: Some(0.8),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 50_000);
+
+        // Invalid ratio behaves as unset and therefore preserves 32k.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            context_compact_ratio: Some(0.0),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 32_000);
+
+        // Explicit zero remains the proactive-trimming disable sentinel.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            max_context_tokens: Some(0),
+            context_compact_ratio: Some(0.9),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 0);
+
+        // The historical 32k input budget is clamped to the selected model's
+        // smaller capacity.
+        let r = ResolvedRuntime {
+            model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 8_000);
+
+        // An explicit absolute budget is also bounded by capacity when ratio
+        // mode is off.
+        let r = ResolvedRuntime {
+            model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            max_context_tokens: Some(128_000),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 8_000);
+
+        // A pruning threshold remains a downward cap and can never raise the
+        // effective budget above model capacity.
+        let r = ResolvedRuntime {
+            model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            history_pruning: crate::scattered_types::HistoryPrunerConfig {
+                enabled: true,
+                max_tokens: 12_000,
+                ..crate::scattered_types::HistoryPrunerConfig::default()
+            },
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 8_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn context_limits_follow_selected_provider_alias_and_model() {
+        use std::collections::HashMap;
+
+        use super::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RuntimeProfileConfig,
+        };
+
+        let mut providers = HashMap::new();
+        for (alias, model, context_window) in [
+            ("large", "large-model", 200_000),
+            ("small", "small-model", 8_000),
+        ] {
+            providers.insert(
+                alias.to_string(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        context_window: Some(context_window),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            );
+        }
+
+        let mut cfg = Config::default();
+        cfg.providers.models.custom = providers;
+        cfg.runtime_profiles.insert(
+            "ratio".to_string(),
+            RuntimeProfileConfig {
+                context_compact_ratio: Some(0.9),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "ratio".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let large = cfg.resolved_context_limits_for_route("coder", "custom.large", "large-model");
+        assert_eq!(large.model_context_window, 200_000);
+        assert_eq!(
+            large.model_context_window_source,
+            super::ModelContextWindowSource::Configured
+        );
+        assert_eq!(large.context_token_budget, 180_000);
+
+        let small = cfg.resolved_context_limits_for_route("coder", "custom.small", "small-model");
+        assert_eq!(small.model_context_window, 8_000);
+        assert_eq!(small.context_token_budget, 7_200);
+
+        let unknown_override =
+            cfg.resolved_context_limits_for_route("coder", "custom.large", "different-model");
+        assert_eq!(unknown_override.model_context_window, 32_000);
+        assert_eq!(
+            unknown_override.model_context_window_source,
+            super::ModelContextWindowSource::CompatibilityFallback
+        );
+        assert_eq!(unknown_override.context_token_budget, 28_800);
+    }
+
     /// The whole point of splitting the accessor: an operator-facing caller
     /// must be able to tell "unconfigured" from a real 32,000, which a bare
     /// `usize` cannot express.
@@ -26697,6 +27454,7 @@ mod tests {
             "corp".to_string(),
             OidcConfig {
                 issuer: "https://sso.example.com/realms/main".to_string(),
+                audience: "zeroclaw".to_string(),
                 claim_path: "realm_access.roles".to_string(),
                 profile_map: HashMap::from([(
                     "zeroclaw-operators".to_string(),
@@ -26789,11 +27547,12 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn oidc_requires_issuer_claim_path_and_profile_map() {
-        for strip in ["issuer", "claim_path", "profile_map"] {
+        for strip in ["issuer", "audience", "claim_path", "profile_map"] {
             let mut config = auth_config();
             let oidc = config.oidc.get_mut("corp").unwrap();
             match strip {
                 "issuer" => oidc.issuer.clear(),
+                "audience" => oidc.audience.clear(),
                 "claim_path" => oidc.claim_path.clear(),
                 _ => oidc.profile_map.clear(),
             }
@@ -27028,6 +27787,7 @@ permission_profiles = ["operator"]
 
 [oidc.corp]
 issuer = "https://sso.example.com/realms/main"
+audience = "zeroclaw"
 claim_path = "realm_access.roles"
 
 [oidc.corp.profile_map]
@@ -27045,6 +27805,134 @@ zeroclaw-operators = "operator"
             "operator"
         );
         assert_eq!(config.users["alice"].uid, Some(1000));
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_introspection_requires_client_secret() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().validation = OidcValidation::Introspection;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("client_secret"), "got: {err}");
+
+        config.oidc.get_mut("corp").unwrap().client_secret = Some("s3cret".to_string());
+        config
+            .validate()
+            .expect("introspection with secret is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_max_auth_lifetime_must_be_positive() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().max_auth_lifetime_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_auth_lifetime_secs"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_verification_defaults_are_bounded() {
+        let defaults = OidcConfig::default();
+        assert_eq!(defaults.validation, OidcValidation::Jwks);
+        assert_eq!(defaults.max_auth_lifetime_secs, 86_400);
+        assert_eq!(defaults.revalidation_secs, 60);
+        assert!(defaults.require_at_jwt);
+        assert!(defaults.required_acr.is_empty());
+        assert!(defaults.service_clients.is_empty());
+        assert!(defaults.interactive_clients.is_empty());
+        assert!(
+            defaults.actor_claim.is_empty(),
+            "no claim-based classification unless the operator declares the claim"
+        );
+        assert_eq!(defaults.actor_claim_marks, OidcActorKind::Service);
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_actor_declarations_are_disjoint_and_nonblank() {
+        let mut config = auth_config();
+        {
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            oidc.service_clients = vec!["portal".to_string()];
+            oidc.interactive_clients = vec!["portal".to_string()];
+        }
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("\"portal\"") && err.contains("actor_claim"),
+            "got: {err}"
+        );
+
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().interactive_clients = vec![" ".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("interactive_clients"), "got: {err}");
+
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().actor_claim = " gty".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("actor_claim"), "got: {err}");
+
+        let mut config = auth_config();
+        {
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            oidc.service_clients = vec!["reporting-batch".to_string()];
+            oidc.interactive_clients = vec!["zerocode-cli".to_string()];
+            oidc.actor_claim = "gty".to_string();
+            oidc.actor_claim_marks = OidcActorKind::Service;
+        }
+        config
+            .validate()
+            .expect("disjoint declarations with a trimmed actor claim validate");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_actor_claim_settings_roundtrip_from_toml() {
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.corp]
+issuer = "https://sso.example.com/realms/main"
+audience = "zeroclaw"
+claim_path = "realm_access.roles"
+interactive_clients = ["zerocode-cli"]
+actor_claim = "uid"
+actor_claim_marks = "human"
+
+[oidc.corp.profile_map]
+zeroclaw-operators = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("actor settings parse");
+        config.validate().expect("actor settings validate");
+        let oidc = &config.oidc["corp"];
+        assert_eq!(oidc.interactive_clients, vec!["zerocode-cli".to_string()]);
+        assert_eq!(oidc.actor_claim, "uid");
+        assert_eq!(oidc.actor_claim_marks, OidcActorKind::Human);
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_bearer_profile_requires_typed_access_tokens() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("require_at_jwt"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_debug_redacts_client_secret() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().client_secret = Some("super-secret-value".to_string());
+        let dbg = format!("{:?}", config.oidc["corp"]);
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("super-secret-value"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_effective_client_id_falls_back_to_audience() {
+        let mut entry = OidcConfig {
+            audience: "zeroclaw".to_string(),
+            ..OidcConfig::default()
+        };
+        assert_eq!(entry.effective_client_id(), "zeroclaw");
+        entry.client_id = "zeroclaw-daemon".to_string();
+        assert_eq!(entry.effective_client_id(), "zeroclaw-daemon");
     }
 
     #[test]
@@ -29913,10 +30801,12 @@ auto_save = true
                         api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
+                        multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
                         per_user_session: true,
+                        passive_group_context: false,
                         ack_reactions: None,
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -30191,6 +31081,47 @@ auto_approve = ["my_custom_tool", "another_tool"]
     async fn default_auto_approve_includes_tool_search() {
         let defaults = default_auto_approve();
         assert!(defaults.contains(&"tool_search".to_string()));
+    }
+
+    /// Security guard: the full `browser` automation tool drives a real
+    /// Chrome/Chromium session that may already be logged in, so it must
+    /// never be silently auto-approved — a prompt-injected message would
+    /// otherwise act as the operator with no approval prompt.
+    /// `browser_open` (hand a URL to the system browser, no scraping or
+    /// interaction) stays on the list.
+    #[test]
+    async fn default_auto_approve_excludes_browser_automation() {
+        let defaults = default_auto_approve();
+        assert!(
+            !defaults.contains(&"browser".to_string()),
+            "full browser automation must not be auto-approved by default"
+        );
+        assert!(
+            defaults.contains(&"browser_open".to_string()),
+            "browser_open must stay auto-approved"
+        );
+    }
+
+    /// The forced merge in `ensure_default_auto_approve` must not put
+    /// `browser` back on an operator's list at load time.
+    #[test]
+    async fn ensure_default_auto_approve_does_not_add_browser_automation() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+auto_approve = []
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(
+            !profile.auto_approve.contains(&"browser".to_string()),
+            "loading a config must not merge `browser` into auto_approve"
+        );
+        assert!(
+            profile.auto_approve.contains(&"browser_open".to_string()),
+            "browser_open must still be merged in"
+        );
     }
 
     /// Regression test: empty auto_approve still gets defaults merged.
@@ -31602,9 +32533,11 @@ default_temperature = 0.7
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
             per_user_session: true,
+            passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
@@ -31642,6 +32575,19 @@ stream_mode = "single_message"
         .unwrap_err();
 
         assert!(err.to_string().contains("single_message"));
+    }
+
+    #[test]
+    async fn telegram_config_passive_group_context_defaults_off() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_passive_group_context_deserializes_true() {
+        let parsed: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","passive_group_context":true}"#).unwrap();
+        assert!(parsed.passive_group_context);
     }
 
     #[test]
@@ -32858,6 +33804,10 @@ default_temperature = 0.7
     async fn browser_config_default_enabled() {
         let b = BrowserConfig::default();
         assert!(b.enabled);
+        assert!(
+            !b.automation_enabled,
+            "full browser automation must be opt-in"
+        );
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
         assert_eq!(b.headed, None);
@@ -32876,6 +33826,7 @@ default_temperature = 0.7
     async fn browser_config_serde_roundtrip() {
         let b = BrowserConfig {
             enabled: true,
+            automation_enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
@@ -32897,6 +33848,7 @@ default_temperature = 0.7
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.enabled);
+        assert!(parsed.automation_enabled);
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
@@ -32943,7 +33895,99 @@ default_temperature = 0.7
 "#;
         let parsed = parse_test_config(minimal);
         assert!(parsed.browser.enabled);
+        assert!(!parsed.browser.automation_enabled);
         assert_eq!(parsed.browser.allowed_domains, vec!["*".to_string()]);
+    }
+
+    /// Migration guard: a pre-split config that opted into `[browser]` gets
+    /// `browser_open` but NOT full automation. Operators must add
+    /// `automation_enabled = true` themselves.
+    #[test]
+    async fn browser_automation_stays_off_for_pre_split_configs() {
+        let raw = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[browser]
+enabled = true
+allowed_domains = ["example.com"]
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.browser.enabled);
+        assert!(
+            !parsed.browser.automation_enabled,
+            "`enabled = true` alone must not re-grant full browser automation"
+        );
+    }
+
+    /// The two flags are independent: automation can be turned on without
+    /// `browser_open`, and vice versa.
+    #[test]
+    async fn browser_automation_enabled_parses_independently() {
+        let raw = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[browser]
+enabled = false
+automation_enabled = true
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(!parsed.browser.enabled);
+        assert!(parsed.browser.automation_enabled);
+    }
+
+    /// The operator-visible integration status must follow both gates. One
+    /// flag alone misreports two of the four combinations: a default config
+    /// would advertise Chrome/Chromium control that is not registered, and
+    /// an automation-only config would read as inactive while automation is
+    /// live.
+    #[test]
+    async fn browser_integration_descriptor_tracks_both_flags() {
+        for (enabled, automation_enabled, expected_active) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let b = BrowserConfig {
+                enabled,
+                automation_enabled,
+                ..BrowserConfig::default()
+            };
+            assert_eq!(
+                b.integration_active(),
+                expected_active,
+                "integration_active wrong for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+            assert_eq!(
+                b.integration_descriptor().active,
+                expected_active,
+                "descriptor.active wrong for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+        }
+    }
+
+    /// The descriptor copy names both surfaces this section gates, so an
+    /// Active "Browser" row is not read as automation-only.
+    #[test]
+    async fn browser_integration_descriptor_description_covers_both_tools() {
+        let descriptor = BrowserConfig::default().integration_descriptor();
+        assert_eq!(descriptor.display_name, "Browser");
+        assert!(
+            descriptor.description.contains("Open URLs"),
+            "description must mention opening URLs: {:?}",
+            descriptor.description
+        );
+        assert!(
+            descriptor.description.contains("Chrome/Chromium"),
+            "description must mention browser control: {:?}",
+            descriptor.description
+        );
     }
 
     async fn env_override_lock() -> MutexGuard<'static, ()> {
@@ -37253,9 +38297,11 @@ high_entropy_tokens = false
                 api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
+                multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
                 per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
