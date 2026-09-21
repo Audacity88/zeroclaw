@@ -2928,6 +2928,98 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervised_channel_retry_reads_latest_published_config() {
+        let _broadcast_guard = hold_log_broadcast();
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.port = 41_001;
+        config.reliability.channel_initial_backoff_secs = 1;
+        config.reliability.channel_max_backoff_secs = 1;
+        config.channels.webhook.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let authority = crate::LiveConfigAuthority::new_owned(config).unwrap();
+        let publisher = authority.clone();
+        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_channels = attempts.clone();
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let published_rx = std::sync::Arc::new(parking_lot::Mutex::new(Some(published_rx)));
+        let (reload_tx, reload_rx) = tokio::sync::oneshot::channel();
+        let reload_rx = std::sync::Arc::new(parking_lot::Mutex::new(Some(reload_rx)));
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_channels(Box::new(move |authority, cancel| {
+            let attempt_tx = attempt_tx.clone();
+            let attempt = attempts_for_channels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let published_rx = (attempt == 0).then(|| published_rx.lock().take().unwrap());
+            Box::pin(async move {
+                attempt_tx
+                    .send(authority.snapshot_config().gateway.port)
+                    .unwrap();
+                if let Some(published_rx) = published_rx {
+                    published_rx.await.unwrap();
+                    return Err(anyhow::Error::msg("force channel retry"));
+                }
+                cancel.cancelled().await;
+                Ok(())
+            })
+        }));
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _authority, _events, controls, _tui, _ready| {
+                let reload_rx = reload_rx.lock().take().unwrap();
+                Box::pin(async move {
+                    reload_rx.await.unwrap();
+                    controls.unwrap().reload_tx.send(true).unwrap();
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let daemon = zeroclaw_spawn::spawn!(run_with_authority(
+            authority,
+            "127.0.0.1".to_string(),
+            0,
+            registry,
+            false,
+            false,
+        ));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(41_001)
+        );
+        let mut updated = publisher.snapshot_config();
+        updated.gateway.port = 41_002;
+        publisher.publish_for_test(updated);
+        published_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(41_002),
+            "the retry must resolve the config published after the failed attempt"
+        );
+
+        reload_tx.send(()).unwrap();
+        let (exit, ownership) = tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit, DaemonExit::Reload);
+        drop(ownership);
+    }
+
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
             data_dir: tmp.path().join("data"),
