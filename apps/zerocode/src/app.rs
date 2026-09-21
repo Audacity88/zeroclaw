@@ -3644,77 +3644,89 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn dock_plan_mouse_and_keyboard_toggle_without_active_session() {
+    #[test]
+    fn dock_plan_mouse_and_keyboard_toggle_without_active_session() {
         let _guard = crate::test_support::env_test_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
-        let client = Arc::new(RpcClient::with_rpc(Arc::new(
-            crate::jsonrpc::RpcOutbound::new(tx),
-        )));
-        let mut chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
-        let mut acp = acp::Acp::new(client);
-        let mut dock = test_dock();
-        dock.config_dir = dir.path().to_path_buf();
-        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
-            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
-            },
-        )
-        .unwrap();
-        let key = KeyEvent::new(
-            KeyCode::Char('p'),
-            crate::keymap::Chord::primary('p').effective_modifiers(),
-        );
-        for mode in [Mode::Chat, Mode::Acp] {
-            for expected in [false, true] {
-                let target = dock.layout(Rect::new(0, 0, 120, 40), mode, false).toggles[2];
-                let (handled, action) = handle_dock_mouse(
-                    &mut dock,
-                    mode,
-                    &mut chat,
-                    &mut acp,
-                    &dock_mouse(MouseEventKind::Down(MouseButton::Left), target.x, target.y),
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+                let client = Arc::new(RpcClient::with_rpc(Arc::new(
+                    crate::jsonrpc::RpcOutbound::new(tx),
+                )));
+                let mut chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+                let mut acp = acp::Acp::new(client);
+                let mut dock = test_dock();
+                dock.config_dir = dir.path().to_path_buf();
+                let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                    crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+                    },
+                )
+                .unwrap();
+                let key = KeyEvent::new(
+                    KeyCode::Char('p'),
+                    crate::keymap::Chord::primary('p').effective_modifiers(),
                 );
-                assert!(handled);
-                assert_eq!(action, Some(DockAction::TogglePlan));
-                assert_eq!(dock.plan_visible, expected);
-                persist_dock_action(&dock, action.unwrap()).unwrap();
-                assert_eq!(
-                    config::load_persisted(dir.path())
-                        .unwrap()
-                        .sidebar
-                        .plan_visible,
-                    expected
-                );
-                assert!(chat.current_session_id().is_none());
-                assert!(acp.current_session_id().is_none());
-            }
-            for expected in [false, true] {
-                match mode {
-                    Mode::Chat => assert!(!chat.handle_key(key, &mut term).await),
-                    Mode::Acp => assert!(!acp.handle_key(key, &mut term).await),
-                    _ => unreachable!(),
+                for mode in [Mode::Chat, Mode::Acp] {
+                    for expected in [false, true] {
+                        let target = dock.layout(Rect::new(0, 0, 120, 40), mode, false).toggles[2];
+                        let (handled, action) = handle_dock_mouse(
+                            &mut dock,
+                            mode,
+                            &mut chat,
+                            &mut acp,
+                            &dock_mouse(
+                                MouseEventKind::Down(MouseButton::Left),
+                                target.x,
+                                target.y,
+                            ),
+                        );
+                        assert!(handled);
+                        assert_eq!(action, Some(DockAction::TogglePlan));
+                        assert_eq!(dock.plan_visible, expected);
+                        persist_dock_action(&dock, action.unwrap()).unwrap();
+                        assert_eq!(
+                            config::load_persisted(dir.path())
+                                .unwrap()
+                                .sidebar
+                                .plan_visible,
+                            expected
+                        );
+                        assert!(chat.current_session_id().is_none());
+                        assert!(acp.current_session_id().is_none());
+                    }
+                    for expected in [false, true] {
+                        match mode {
+                            Mode::Chat => assert!(!chat.handle_key(key, &mut term).await),
+                            Mode::Acp => assert!(!acp.handle_key(key, &mut term).await),
+                            _ => unreachable!(),
+                        }
+                        let action =
+                            apply_dock_plan_key_request(&mut dock, mode, &mut chat, &mut acp);
+                        assert_eq!(action, Some(DockAction::TogglePlan));
+                        assert_eq!(dock.plan_visible, expected);
+                        persist_dock_action(&dock, action.unwrap()).unwrap();
+                        assert_eq!(
+                            config::load_persisted(dir.path())
+                                .unwrap()
+                                .sidebar
+                                .plan_visible,
+                            expected
+                        );
+                        assert!(chat.current_session_id().is_none());
+                        assert!(acp.current_session_id().is_none());
+                        assert!(
+                            apply_dock_plan_key_request(&mut dock, mode, &mut chat, &mut acp)
+                                .is_none()
+                        );
+                    }
                 }
-                let action = apply_dock_plan_key_request(&mut dock, mode, &mut chat, &mut acp);
-                assert_eq!(action, Some(DockAction::TogglePlan));
-                assert_eq!(dock.plan_visible, expected);
-                persist_dock_action(&dock, action.unwrap()).unwrap();
-                assert_eq!(
-                    config::load_persisted(dir.path())
-                        .unwrap()
-                        .sidebar
-                        .plan_visible,
-                    expected
-                );
-                assert!(chat.current_session_id().is_none());
-                assert!(acp.current_session_id().is_none());
-                assert!(
-                    apply_dock_plan_key_request(&mut dock, mode, &mut chat, &mut acp).is_none()
-                );
-            }
-        }
+            });
     }
 
     #[tokio::test]
