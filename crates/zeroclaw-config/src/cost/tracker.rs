@@ -78,16 +78,21 @@ enum BudgetScope {
 /// `warn_at_percent`) always come from the live config handle, while the
 /// mode is decided once for a derived tracker so a running delegation's
 /// checks and records cannot be desynchronized by a mid-run reload.
+#[derive(Clone, Copy)]
 enum EnforcementMode {
     /// Read both flags from the live config on every use. The
     /// process-global tracker is live: an operator reload applies to its
     /// next check and its next record.
     Live,
-    /// Both flags captured from the base tracker's config at derivation
-    /// time. Every derived tracker is frozen: a delegation that started
-    /// scoped keeps checking and recording under the mode it started
-    /// with, and one that started dropping aliases keeps dropping them,
-    /// for the delegation's whole lifetime.
+    /// Both flags frozen for the derived tracker's whole lifetime:
+    /// captured from the live config when deriving from a live base (the
+    /// process-global tracker), and inherited verbatim from an
+    /// already-frozen base, so the mode is fixed at the ROOT delegation
+    /// of a tree and every nested hop of that tree derives with the same
+    /// pair. A delegation that started scoped keeps checking and
+    /// recording under the mode it started with, and one that started
+    /// dropping aliases keeps dropping them, for the delegation's whole
+    /// lifetime.
     Frozen {
         enabled: bool,
         track_per_agent: bool,
@@ -170,6 +175,17 @@ impl CostTracker {
     /// honor for the delegation's whole lifetime.
     pub fn is_enabled(&self) -> bool {
         self.mode().0
+    }
+
+    /// The effective `(enabled, track_per_agent)` pair for this tracker,
+    /// as the runtime reads it when deciding how a delegated sub-loop is
+    /// scoped: the process-global tracker reports the live pair, and a
+    /// derived tracker the pair frozen at derivation (for a nested hop,
+    /// inherited from its delegating parent). Exposed as a plain pair
+    /// rather than the mode itself so the public surface stays two
+    /// booleans.
+    pub fn enforcement_flags(&self) -> (bool, bool) {
+        self.mode()
     }
 
     /// Hot-swap config so reloaded budget limits apply without a restart.
@@ -257,17 +273,31 @@ impl CostTracker {
         // reload the base tracker sees (`update_config` writes the one
         // live `CostConfig`), so an operator lowering `daily_limit_usd`
         // mid-delegation binds the delegate's next `check_budget`. The
-        // enforcement MODE is frozen instead: `enabled` and
-        // `track_per_agent` are captured from the base's config here,
+        // enforcement MODE is frozen instead, and where the frozen pair
+        // comes from depends on the base: deriving from a LIVE base (the
+        // process-global tracker, the root of a delegation tree)
+        // captures `enabled` and `track_per_agent` from the config here,
         // because whether a delegation enforces at all and how its rows
         // are attributed are decisions taken at delegation start, same
-        // as the scope kind fixed by `budget_scope`. A mid-run reload of
-        // either flag must not untrack a scoped run, whose spend would
-        // then escape every ceiling if tracking were re-enabled, nor
-        // start reattributing an unattributed one halfway through a run.
-        let (enabled, track_per_agent) = {
-            let config = self.config.read();
-            (config.enabled, config.track_per_agent)
+        // as the scope kind fixed by `budget_scope`; deriving from a
+        // FROZEN base (any nested hop inside a running delegation)
+        // inherits the base's captured pair verbatim, so the mode is
+        // fixed at the root of the tree and a mid-run reload of either
+        // flag can neither untrack a scoped run, whose spend would then
+        // escape every ceiling if tracking were re-enabled, nor start
+        // reattributing an unattributed one halfway through a run.
+        let enforcement_mode = match self.enforcement_mode {
+            EnforcementMode::Live => {
+                let (enabled, track_per_agent) = {
+                    let config = self.config.read();
+                    (config.enabled, config.track_per_agent)
+                };
+                EnforcementMode::Frozen {
+                    enabled,
+                    track_per_agent,
+                }
+            }
+            frozen @ EnforcementMode::Frozen { .. } => frozen,
         };
         Self {
             config: Arc::clone(&self.config),
@@ -275,10 +305,7 @@ impl CostTracker {
             session_id: self.session_id.clone(),
             session_totals: Arc::clone(&self.session_totals),
             budget_scope,
-            enforcement_mode: EnforcementMode::Frozen {
-                enabled,
-                track_per_agent,
-            },
+            enforcement_mode,
         }
     }
 
@@ -2632,6 +2659,53 @@ mod tests {
         assert!(
             (daily - 7.0).abs() < 1e-9,
             "post-disable records must keep landing under the alias: {daily}"
+        );
+    }
+
+    #[test]
+    fn derived_from_frozen_base_inherits_frozen_mode() {
+        // The mode a nested delegation runs under is fixed at the ROOT of
+        // its tree: deriving from an already-frozen tracker propagates the
+        // frozen pair instead of re-reading the live config, so an
+        // operator reload between a parent's provider calls cannot flip
+        // the mode the parent's descendants derive with. A derivation
+        // from the still-live base keeps capturing the live pair, so
+        // root behaviour is unchanged.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let derived_a = base.derived_for_agent("parent", 5.0);
+        assert_eq!(derived_a.enforcement_flags(), (true, true));
+
+        let mut reloaded = base.config();
+        reloaded.enabled = false;
+        reloaded.track_per_agent = false;
+        base.update_config(reloaded);
+
+        // The nested hop derives from the frozen parent, not from the
+        // live config the parent's base still shares.
+        let derived_b = derived_a.derived_for_agent("child", 8.0);
+        assert_eq!(
+            derived_b.enforcement_flags(),
+            (true, true),
+            "a frozen base must propagate its own pair to further derivations"
+        );
+        // A derivation straight from the live base still captures the
+        // reloaded pair.
+        let derived_c = base.derived_for_agent("other", 8.0);
+        assert_eq!(
+            derived_c.enforcement_flags(),
+            (false, false),
+            "a live base keeps capturing the live pair"
         );
     }
 

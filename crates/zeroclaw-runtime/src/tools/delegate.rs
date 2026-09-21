@@ -1,6 +1,6 @@
 use crate::agent::cost::{
     TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext, TurnUsage,
-    tool_loop_cost_tracking_context_for_agent,
+    tool_loop_cost_tracking_context_from_tracker,
 };
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
@@ -152,21 +152,17 @@ fn delegate_cost_scope_per_agent_disabled_warn_once() {
     }
 }
 
-/// Inherited cost-scope subtree chain for a delegated sub-loop's own
-/// delegate tool, read from the cost-tracking scope installed around that
-/// sub-loop: the sub-loop's agent entry first, then its inherited ancestor
-/// entries (nearest first). Empty when the sub-loop is unscoped or runs on
-/// a non-agent-scoped tracker, matching the root tool's empty chain.
-fn current_delegate_subtree_chain() -> Vec<Arc<zeroclaw_config::cost::SubtreeSpend>> {
+/// Cost tracker a delegated sub-loop's own delegate tool derives from,
+/// read from the cost-tracking scope installed around that sub-loop.
+/// `None` when the sub-loop is unscoped (no scope installed, or a
+/// usage-only context without a tracker), matching the root tool's
+/// `None`: an unscoped parent's nested hops then resolve the live global
+/// config exactly as the root did, which is the intended root behaviour.
+fn current_delegate_cost_tracker() -> Option<Arc<crate::cost::CostTracker>> {
     TOOL_LOOP_COST_TRACKING_CONTEXT
-        .try_with(|ctx| {
-            ctx.as_ref()
-                .and_then(|context| context.tracker.as_ref())
-                .map(|tracker| tracker.subtree_chain_for_children())
-        })
+        .try_with(|ctx| ctx.as_ref().and_then(|context| context.tracker.clone()))
         .ok()
         .flatten()
-        .unwrap_or_default()
 }
 
 /// Serializable result of a background delegate task.
@@ -355,16 +351,18 @@ pub struct DelegateTool {
     /// layer on its (stack-marginal) poll chain, so carrying the pre-built
     /// context is how the spawn-site context reaches the spawned sub-loop.
     prebuilt_cost_ctx: Option<(String, ToolLoopCostTrackingContext)>,
-    /// Inherited cost-scope subtree chain for the budget scopes this tool
-    /// builds in `delegate_cost_context`: the ancestor entries (nearest
-    /// first) a delegation target's per-agent scope carries, so a delegated
-    /// descendant's spend counts against every ancestor's per-hop ceiling.
-    /// Root tools carry an empty chain; target-bound nested tools carry the
-    /// dispatch target's own entry plus its inherited chain (read from the
-    /// cost scope installed around the dispatched sub-loop); the
-    /// background/parallel re-executor wrappers carry the spawning tool's
-    /// chain verbatim, like depth, because they re-run the SAME hop.
-    inherited_cost_chain: Vec<Arc<zeroclaw_config::cost::SubtreeSpend>>,
+    /// Cost tracker a nested delegation derives from: the delegating
+    /// parent's tracker, read from the cost scope installed around the
+    /// dispatched sub-loop this tool was built for. `None` on root tools
+    /// and the plain constructors. `delegate_cost_context` uses it as the
+    /// base for BOTH the enforcement mode (the parent's frozen pair, so
+    /// an operator reload between the parent's provider calls can neither
+    /// unscope the next hop of a scoped tree nor strip its attribution)
+    /// and the inherited subtree chain (`subtree_chain_for_children`, so
+    /// the child's scope carries the ancestor entries); the
+    /// background/parallel re-executor wrappers carry it verbatim, like
+    /// depth, because they re-run the SAME hop.
+    inherited_cost_tracker: Option<Arc<crate::cost::CostTracker>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,7 +485,7 @@ impl DelegateTool {
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
             prebuilt_cost_ctx: None,
-            inherited_cost_chain: Vec::new(),
+            inherited_cost_tracker: None,
         }
     }
 
@@ -541,7 +539,7 @@ impl DelegateTool {
             caller_alias: String::new(),
             task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
             prebuilt_cost_ctx: None,
-            inherited_cost_chain: Vec::new(),
+            inherited_cost_tracker: None,
         }
     }
 
@@ -866,32 +864,41 @@ impl DelegateTool {
         )
     }
 
-    /// Build the cost-tracking context a delegated sub-loop runs under: the
-    /// process-global tracker scoped to the TARGET agent alias, with the
-    /// target's effective per-hop daily ceiling
+    /// Build the cost-tracking context a delegated sub-loop runs under:
+    /// usage recorded with the target's attribution on the shared ledger,
+    /// budget checks against the target's effective per-hop daily ceiling
     /// (`SecurityPolicy.max_cost_per_day_cents`, `0` = inherit the global
-    /// limit) enforced through a derived tracker that shares the global
-    /// ledger. Recorded spend and budget enforcement therefore agree on the
-    /// same context, and concurrent traffic counts against the delegate's
-    /// ceiling.
+    /// limit), and, for a nested hop, the ancestor subtree chain so
+    /// descendant spend counts against every ancestor's ceiling. Recorded
+    /// spend and budget enforcement therefore agree on the same context,
+    /// and concurrent traffic counts against the delegate's ceiling.
     ///
-    /// Decisions taken here stay fixed for the run: which scope kind the
-    /// delegation enforces (per-agent vs shared-capped, decided from
-    /// `track_per_agent`), whether the run is scoped at all
-    /// (`cost.enabled`), and the enforcement mode itself - the derived
-    /// tracker captures `enabled` and `track_per_agent` at derivation, so
-    /// a mid-run reload can neither untrack a scoped run nor start
-    /// attributing an unattributed one halfway through; checks and
-    /// recording keep honoring the mode the delegation started under.
-    /// The limits themselves are live: derived trackers share the global
-    /// tracker's config handle, so an operator reload of the global
-    /// `[cost]` limits binds the running delegate at its next budget
-    /// check.
+    /// The base the target's tracker derives from is the delegating
+    /// parent's tracker when this tool was built inside a running scoped
+    /// sub-loop (carried from the scope installed around that sub-loop),
+    /// else the process-global tracker. The enforcement MODE pair
+    /// (`enabled`, `track_per_agent`) comes from that base, never from
+    /// the resolved config: a frozen parent supplies the pair its
+    /// delegation started under, so the mode is fixed at the ROOT
+    /// delegation of a tree and inherited down every hop, and an operator
+    /// reload between a parent's provider call and its next delegation
+    /// can neither unscope the second hop of a scoped tree nor strip its
+    /// ancestor chain. The global base supplies the live pair, so root
+    /// behaviour is unchanged, and a parent that started unscoped leaves
+    /// no scope installed, so its nested hops carry no tracker and read
+    /// the live config exactly as the root did. The numeric limits and
+    /// the pricing map stay live for every hop: the derived tracker
+    /// shares the base's config handle, and the pricing map is rebuilt
+    /// from the resolved config snapshot, so an operator reload of the
+    /// global `[cost]` limits binds the running delegate at its next
+    /// budget check.
     ///
     /// Returns `None` (leave the sub-loop unscoped, matching the previous
-    /// behavior) when cost tracking is disabled for the resolved config or
-    /// when neither `live_config` nor `root_config` is available - the
-    /// configless fallback warns once per process.
+    /// behavior) when the base's mode is off - for a root hop the live
+    /// global's `enabled`, checked before resolving the global tracker
+    /// (whose reuse path would hot-swap a disabled config over the shared
+    /// singleton) - or when neither `live_config` nor `root_config` is
+    /// available - the configless fallback warns once per process.
     fn delegate_cost_context(
         &self,
         target_alias: &str,
@@ -899,21 +906,49 @@ impl DelegateTool {
     ) -> Option<ToolLoopCostTrackingContext> {
         let config = self.cost_scope_config_snapshot()?;
 
-        if !config.cost.enabled {
-            // Cost tracking is off for this config: leave the sub-loop
-            // unscoped (no ledger, no budget checks) instead of resolving the
-            // global tracker, whose reuse path would hot-swap a disabled
-            // config over the shared singleton.
+        // Base the target's tracker derives from, and where its
+        // enforcement mode comes from. A nested hop (this tool was built
+        // inside a running scoped sub-loop) derives from the delegating
+        // parent's frozen tracker, whose captured pair decides both the
+        // scoped-at-all question and the scope kind; a root hop derives
+        // from the process-global tracker, whose live pair equals the
+        // snapshot's flags. Checking the snapshot's `enabled` BEFORE
+        // resolving the global keeps the disabled-config reuse path from
+        // hot-swapping a disabled config over the shared singleton.
+        let (base, (enabled, track_per_agent)) = match self.inherited_cost_tracker.as_ref() {
+            Some(parent) => (Arc::clone(parent), parent.enforcement_flags()),
+            None => {
+                if !config.cost.enabled {
+                    // Cost tracking is off for this config: leave the
+                    // sub-loop unscoped (no ledger, no budget checks).
+                    return None;
+                }
+                let tracker = crate::cost::CostTracker::get_or_init_global(
+                    config.cost.clone(),
+                    &config.data_dir,
+                )?;
+                let flags = tracker.enforcement_flags();
+                (tracker, flags)
+            }
+        };
+
+        if !enabled {
+            // The base's own mode is off (a live global that flipped off,
+            // or a frozen base that started disabled): leave the sub-loop
+            // unscoped. A scoped parent's frozen pair keeps every nested
+            // hop of its tree scoped, so this is not reachable from a
+            // scoped parent unless the tracker itself is missing.
             return None;
         }
 
-        let mut ctx = tool_loop_cost_tracking_context_for_agent(&config, target_alias)?;
-
-        if ceiling_cents > 0
-            && let Some(tracker) = ctx.tracker.as_ref()
-        {
+        // The child's own tracker: derived from the base for its own alias
+        // and ceiling, so the derivation inherits the base's frozen mode.
+        // With no per-hop ceiling (`0` = inherit the global limit) no
+        // derivation happens and the base records the child's usage under
+        // the stamped alias, same as before.
+        let scope_tracker = if ceiling_cents > 0 {
             let ceiling_usd = f64::from(ceiling_cents) / 100.0;
-            if !config.cost.track_per_agent {
+            if !track_per_agent {
                 // Without per-agent attribution the alias is dropped before
                 // persistence, so no per-alias daily total exists to check
                 // against. Degrade to a shared-cap scope (the global daily
@@ -921,24 +956,33 @@ impl DelegateTool {
                 // check) and tell the operator once why the per-profile
                 // ceiling is looser than the field name suggests.
                 delegate_cost_scope_per_agent_disabled_warn_once();
-                ctx.tracker = Some(Arc::new(tracker.derived_shared_capped(ceiling_usd)));
+                Arc::new(base.derived_shared_capped(ceiling_usd))
             } else {
                 // Per-agent scope: the ceiling applies to the TARGET's own
                 // daily spend on the shared ledger; the global daily/monthly
                 // limits still apply to the shared totals on top, so the
                 // derived tracker is never looser than the global tracker.
                 // The target's scope also carries the ancestor subtree
-                // chain collected along the delegation path, so descendant
-                // spend counts against every ancestor's per-hop ceiling.
-                ctx.tracker = Some(Arc::new(tracker.derived_for_agent_in_chain(
+                // chain, derived from the same base the mode came from, so
+                // descendant spend counts against every ancestor's per-hop
+                // ceiling.
+                Arc::new(base.derived_for_agent_in_chain(
                     target_alias,
                     ceiling_usd,
-                    self.inherited_cost_chain.clone(),
-                )));
+                    base.subtree_chain_for_children(),
+                ))
             }
-        }
+        } else {
+            base
+        };
 
-        Some(ctx)
+        // Pricing stays live from the resolved config: the map is rebuilt
+        // from the snapshot at every hop.
+        Some(tool_loop_cost_tracking_context_from_tracker(
+            &config,
+            target_alias,
+            scope_tracker,
+        ))
     }
 
     /// Snapshot the config a delegate's cost context resolves from: the live
@@ -2685,10 +2729,10 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let nested_task_control_plane = Arc::clone(&self.task_control_plane);
         // Same-hop re-executor: carry the spawning tool's inherited cost
-        // chain verbatim (like depth and the action ceiling), so the
+        // base verbatim (like depth and the action ceiling), so the
         // wrapper's own context fallbacks resolve the identical scopes the
         // original call site would have built.
-        let inherited_cost_chain = self.inherited_cost_chain.clone();
+        let inherited_cost_tracker = self.inherited_cost_tracker.clone();
         let terminal_store = Arc::clone(&task_control_plane.store);
         let terminal_owner_pid = std::process::id();
         let terminal_owner_boot_id = task_control_plane.boot_id.clone();
@@ -2740,7 +2784,7 @@ impl DelegateTool {
                     caller_alias,
                     task_control_plane: nested_task_control_plane,
                     prebuilt_cost_ctx,
-                    inherited_cost_chain,
+                    inherited_cost_tracker,
                 };
 
                 let args_inner = json!({
@@ -2983,8 +3027,8 @@ impl DelegateTool {
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             // Same-hop re-executor (see the background spawn): the inherited
-            // cost chain is carried verbatim from the spawning tool.
-            let inherited_cost_chain = self.inherited_cost_chain.clone();
+            // cost base is carried verbatim from the spawning tool.
+            let inherited_cost_tracker = self.inherited_cost_tracker.clone();
             let session_key = parent_session_key.clone();
             let thread_scope = parent_thread_id.clone();
             let memory = self.memory.clone();
@@ -3034,7 +3078,7 @@ impl DelegateTool {
                         caller_alias,
                         task_control_plane,
                         prebuilt_cost_ctx,
-                        inherited_cost_chain,
+                        inherited_cost_tracker,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = TOOL_LOOP_THREAD_ID
@@ -3987,12 +4031,14 @@ impl DelegateTool {
                     && Self::delegate_admits_with_mcp(&tool_policy, Self::NAME))
                 .then(|| {
                     let nested_task_control_plane = Arc::clone(&self.task_control_plane);
-                    // Subtree chain for the target's own delegations: read
-                    // from the cost scope installed around THIS dispatched
-                    // sub-loop, so the target's entry (and every ancestor
-                    // entry it inherited) binds the target's descendants.
-                    // Empty when the sub-loop is unscoped, matching root.
-                    let inherited_cost_chain = current_delegate_subtree_chain();
+                    // Cost base for the target's own delegations: the
+                    // tracker read from the cost scope installed around
+                    // THIS dispatched sub-loop, so the target's hops
+                    // inherit this sub-loop's frozen mode, and its subtree
+                    // chain (the target's entry plus every ancestor entry
+                    // it inherited) binds the target's descendants. None
+                    // when the sub-loop is unscoped, matching root.
+                    let inherited_cost_tracker = current_delegate_cost_tracker();
                     Box::new(DelegateTool {
                         agents: Arc::clone(&self.agents),
                         security: Arc::clone(&target_policy),
@@ -4030,7 +4076,7 @@ impl DelegateTool {
                         // A second hop arrives through Required admission and
                         // resolves its own cost context for its own target.
                         prebuilt_cost_ctx: None,
-                        inherited_cost_chain,
+                        inherited_cost_tracker,
                     }) as Box<dyn Tool>
                 });
 
@@ -15409,6 +15455,540 @@ command = "rm independent-delegate-marker"
             "C's spend lands under C's own alias"
         );
         assert!((c_stats.cost_usd - 0.006).abs() < 1e-9);
+    }
+
+    /// Scripted tool-call completion carrying triple the priced usage of
+    /// `tool_call_completion_with_usage` (4k input and 200 output tokens,
+    /// $0.015 at the fixture's rates), so the reload-escape tests can land
+    /// exactly $0.030 of hop spend before the nested hop and reach a
+    /// four-cent per-hop ceiling with one child call to spare.
+    fn heavy_tool_call_completion(
+        name: &str,
+        id: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string()
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 4000, "completion_tokens": 200}
+        })
+    }
+
+    /// Final-text completion carrying the same $0.015 usage as
+    /// `heavy_tool_call_completion`, so a refused boundary check sees the
+    /// same projected spend whether the loop's last served response was a
+    /// tool call or final text.
+    fn heavy_usage_completion(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {"content": content}
+            }],
+            "usage": {"prompt_tokens": 4000, "completion_tokens": 200}
+        })
+    }
+
+    /// Two-hop cost fixture whose root tool carries a LIVE config handle
+    /// (the reload-visible handle `cost_scope_config_snapshot` prefers),
+    /// so a tool running inside the first hop's loop can rewrite the
+    /// handle mid-run the same way an operator reload does. The leaf
+    /// target gets its own provider entry pointing at `leaf_mock_uri`, so
+    /// the two hops' provider traffic hits separate scripted servers and
+    /// is counted separately. The tool also carries an isolated in-memory
+    /// task store: the detached second hop spawned from INSIDE the first
+    /// hop's loop is owned by that loop's caller identity, so the root
+    /// tool cannot read it back through its own task actions and the
+    /// store is the shared authority to await it through. The shared
+    /// daily limit stays ample; the per-hop ceiling on the first hop's
+    /// profile does the refusing.
+    async fn nested_delegate_cost_fixture_with_live_config(
+        hop_mock_uri: String,
+        leaf_mock_uri: String,
+        hop_ceiling_cents: u32,
+    ) -> (
+        DelegateCostFixture,
+        Arc<RwLock<Config>>,
+        Arc<dyn TaskRegistry>,
+    ) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{CostConfig, OllamaModelProviderConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let workspace_dir = tmp.path().join("workspace");
+        let mut root_config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        root_config.cost = CostConfig {
+            enabled: true,
+            track_per_agent: true,
+            daily_limit_usd: 1000.0,
+            monthly_limit_usd: 10_000.0,
+            ..CostConfig::default()
+        };
+        for (alias, uri) in [("default", hop_mock_uri), ("leaf", leaf_mock_uri)] {
+            root_config.providers.models.ollama.insert(
+                alias.to_string(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("delegate-cost-model".to_string()),
+                        uri: Some(uri),
+                        timeout_secs: Some(10),
+                        pricing: HashMap::from([
+                            ("delegate-cost-model.input".to_string(), 3.0),
+                            ("delegate-cost-model.output".to_string(), 15.0),
+                        ]),
+                        ..ModelProviderConfig::default()
+                    },
+                    ..OllamaModelProviderConfig::default()
+                },
+            );
+        }
+        root_config.risk_profiles.insert(
+            "delegate_cost_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                auto_approve: vec!["delegate".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        for (profile, ceiling_cents) in [
+            ("delegate_cost_root_runtime", 0),
+            ("delegate_cost_hop_runtime", hop_ceiling_cents),
+            ("delegate_cost_leaf_runtime", 0),
+        ] {
+            root_config.runtime_profiles.insert(
+                profile.to_string(),
+                RuntimeProfileConfig {
+                    agentic: true,
+                    max_tool_iterations: 5,
+                    max_cost_per_day_cents: ceiling_cents,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+        }
+        let root = AliasedAgentConfig {
+            model_provider: "ollama.default".into(),
+            risk_profile: "delegate_cost_profile".into(),
+            runtime_profile: "delegate_cost_root_runtime".into(),
+            ..AliasedAgentConfig::default()
+        };
+        let hop = AliasedAgentConfig {
+            runtime_profile: "delegate_cost_hop_runtime".into(),
+            ..root.clone()
+        };
+        let leaf = AliasedAgentConfig {
+            model_provider: "ollama.leaf".into(),
+            runtime_profile: "delegate_cost_leaf_runtime".into(),
+            ..root.clone()
+        };
+        root_config.agents.insert("caller".to_string(), root);
+        root_config.agents.insert("target".to_string(), hop);
+        root_config.agents.insert("target2".to_string(), leaf);
+
+        let root_config = Arc::new(root_config);
+        let live_config = Arc::new(RwLock::new((*root_config).clone()));
+        let task_store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&root_config))
+            .with_live_config(Some(Arc::clone(&live_config)))
+            .with_task_control_plane(task_control_plane(Arc::clone(&task_store)))
+            .with_workspace_dir(workspace_dir)
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(root_config.risk_profiles.clone())
+            .with_runtime_profiles(root_config.runtime_profiles.clone())
+            .with_caller_alias("caller");
+
+        (
+            DelegateCostFixture {
+                _tmp: tmp,
+                data_dir,
+                config: root_config,
+                tool,
+            },
+            live_config,
+            task_store,
+        )
+    }
+
+    /// Test tool that rewrites the cost-tracking MODE flags on the LIVE
+    /// config handle between provider calls of a delegated loop: the same
+    /// config-side write an operator reload performs, visible to every
+    /// later `cost_scope_config_snapshot` read. Idempotent, so loops that
+    /// call it more than once (the leaf hops inherit it) keep the flipped
+    /// mode.
+    struct LiveConfigModeFlipTool {
+        live_config: Arc<RwLock<Config>>,
+        disable_enabled: bool,
+        disable_track_per_agent: bool,
+        flipped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(LiveConfigModeFlipTool);
+
+    #[async_trait]
+    impl Tool for LiveConfigModeFlipTool {
+        fn name(&self) -> &str {
+            "live_config_flip_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Flips cost-tracking mode flags on the live config when executed."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let mut reloaded = self.live_config.read().clone();
+            if self.disable_enabled {
+                reloaded.cost.enabled = false;
+            }
+            if self.disable_track_per_agent {
+                reloaded.cost.track_per_agent = false;
+            }
+            *self.live_config.write() = reloaded;
+            self.flipped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "live config mode flags flipped".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Poll the fixture's in-memory task store until the detached delegate
+    /// task for `agent` reaches a terminal state, then return its record
+    /// and stored error. For tests where the spawning delegate call lives
+    /// INSIDE a delegated loop: that task is owned by the loop's caller
+    /// identity, so the root tool (a different caller) cannot read it
+    /// back through its own task actions, and the store both sides share
+    /// is the await point.
+    async fn poll_detached_delegate_outcome(
+        store: &Arc<dyn TaskRegistry>,
+        agent: &str,
+    ) -> (TaskRecord, Option<String>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let records = store.list_by_agent(agent).await.unwrap_or_default();
+            if let Some(record) = records
+                .iter()
+                .find(|record| record.kind == TaskKind::Delegate)
+                && record.status.is_terminal()
+            {
+                let snapshot = store
+                    .get_snapshot(&record.id)
+                    .await
+                    .expect("terminal delegate task snapshot readable")
+                    .expect("terminal delegate task snapshot present");
+                return (snapshot.task, snapshot.error);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detached delegate task for {agent} did not finish before timeout"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_delegate_stays_scoped_after_cost_tracking_disabled_between_hops() {
+        // Reload escape a single running scope's freeze could not cover:
+        // the operator flips [cost] enabled off between the first hop's
+        // provider calls and its nested delegate call. The nested hop
+        // inherits the delegating parent's frozen mode instead of
+        // re-deriving it from the live config, so the child stays scoped:
+        // its first provider call still lands on the ledger under the
+        // CHILD alias, and once the parent's four-cent ceiling is
+        // exhausted (the parent's own $0.030 plus the child's $0.015
+        // descendant spend) the child's next provider call is refused
+        // before it is sent, the same boundary shape as the single-hop
+        // refusal test.
+        let (hop_server, hop_wire) = start_scripted_chat_server(&[
+            heavy_tool_call_completion("live_config_flip_tool", "call_flip", json!({})),
+            heavy_tool_call_completion(
+                DelegateTool::NAME,
+                "call_target2",
+                json!({"agent": "target2", "prompt": "produce a status line"}),
+            ),
+            heavy_usage_completion("unscoped escape would end here"),
+        ])
+        .await;
+        let (leaf_server, leaf_wire) = start_scripted_chat_server(&[
+            heavy_tool_call_completion("live_config_flip_tool", "leaf_flip", json!({})),
+            heavy_usage_completion("leaf finished"),
+        ])
+        .await;
+        let (fixture, live_config, _task_store) = nested_delegate_cost_fixture_with_live_config(
+            hop_server.uri.clone(),
+            leaf_server.uri.clone(),
+            4,
+        )
+        .await;
+        let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disabling = LiveConfigModeFlipTool {
+            live_config: Arc::clone(&live_config),
+            disable_enabled: true,
+            disable_track_per_agent: false,
+            flipped: Arc::clone(&flipped),
+        };
+        let tool = fixture
+            .tool
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(disabling)])));
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "flip tracking off, then delegate onward to target2"
+            }))
+            .await
+            .expect("delegate execute returns a result");
+
+        assert!(
+            flipped.load(std::sync::atomic::Ordering::SeqCst),
+            "the flip tool must have run between the hop's provider calls"
+        );
+        // The child's admitted call must still be recorded under the CHILD
+        // alias: an unscoped second hop would leave no ledger row at all.
+        let c_stats = poll_agent_cost(&fixture.data_dir, "target2").await;
+        assert_eq!(
+            c_stats.request_count, 1,
+            "the child's provider call must land on the ledger under its own alias"
+        );
+        assert!((c_stats.cost_usd - 0.015).abs() < 1e-9);
+        assert!(
+            !result.success,
+            "the exhausted ancestor ceiling must refuse the hop's next call: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`"),
+            "the refusal must name the ancestor whose ceiling binds: {error}"
+        );
+        assert!(
+            error.contains("$0.0450"),
+            "the refusal current must be the parent's own $0.030 plus the child's \
+             $0.015 descendant spend: {error}"
+        );
+        assert_eq!(
+            leaf_wire.lock().unwrap().len(),
+            1,
+            "exactly the child's first call may reach the child server; its second \
+             must be refused before it is sent"
+        );
+        assert_eq!(
+            hop_wire.lock().unwrap().len(),
+            2,
+            "exactly the hop's two scripted calls may reach the hop server"
+        );
+        let b_stats = poll_agent_cost(&fixture.data_dir, "target").await;
+        assert_eq!(
+            b_stats.request_count, 2,
+            "the hop's own two calls land under its own alias"
+        );
+        assert!((b_stats.cost_usd - 0.030).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn nested_delegate_keeps_ancestor_chain_after_track_per_agent_disabled_between_hops() {
+        // Reload escape for the second flag: the operator flips
+        // [cost] track_per_agent off between the hop's provider calls and
+        // its nested delegate call. The nested hop inherits the parent's
+        // frozen per-agent mode instead of degrading to the shared cap,
+        // so the child's spend still counts toward the parent's subtree
+        // total and its rows still carry the child alias, and the
+        // parent's next provider call is refused once the ancestor
+        // ceiling is exhausted by the combination.
+        let (hop_server, hop_wire) = start_scripted_chat_server(&[
+            heavy_tool_call_completion("live_config_flip_tool", "call_flip", json!({})),
+            heavy_tool_call_completion(
+                DelegateTool::NAME,
+                "call_target2",
+                json!({"agent": "target2", "prompt": "produce a status line"}),
+            ),
+            heavy_usage_completion("shared-cap degrade would end here"),
+        ])
+        .await;
+        let (leaf_server, leaf_wire) =
+            start_scripted_chat_server(&[heavy_usage_completion("leaf finished")]).await;
+        let (fixture, live_config, _task_store) = nested_delegate_cost_fixture_with_live_config(
+            hop_server.uri.clone(),
+            leaf_server.uri.clone(),
+            4,
+        )
+        .await;
+        let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let untracking = LiveConfigModeFlipTool {
+            live_config: Arc::clone(&live_config),
+            disable_enabled: false,
+            disable_track_per_agent: true,
+            flipped: Arc::clone(&flipped),
+        };
+        let tool = fixture
+            .tool
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(untracking)])));
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "stop attributing, then delegate onward to target2"
+            }))
+            .await
+            .expect("delegate execute returns a result");
+
+        assert!(
+            flipped.load(std::sync::atomic::Ordering::SeqCst),
+            "the flip tool must have run between the hop's provider calls"
+        );
+        // The child's spend must still land under the CHILD alias: the
+        // shared-cap degrade would drop the alias before persistence.
+        let c_stats = poll_agent_cost(&fixture.data_dir, "target2").await;
+        assert_eq!(
+            c_stats.request_count, 1,
+            "the child's row must keep the child alias after the flip"
+        );
+        assert!((c_stats.cost_usd - 0.015).abs() < 1e-9);
+        assert!(
+            !result.success,
+            "the ancestor ceiling must refuse the hop's next call once descendant \
+             spend counts: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`"),
+            "the refusal must name the ancestor: {error}"
+        );
+        assert!(
+            error.contains("$0.0450"),
+            "the refusal current must be the parent's own $0.030 plus the child's \
+             $0.015 descendant spend: {error}"
+        );
+        assert_eq!(
+            leaf_wire.lock().unwrap().len(),
+            1,
+            "exactly the child's one call may reach the child server"
+        );
+        assert_eq!(
+            hop_wire.lock().unwrap().len(),
+            2,
+            "exactly the hop's two scripted calls may reach the hop server; its third \
+             must be refused before it is sent"
+        );
+        let b_stats = poll_agent_cost(&fixture.data_dir, "target").await;
+        assert_eq!(b_stats.request_count, 2);
+        assert!((b_stats.cost_usd - 0.030).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn nested_delegate_background_stays_scoped_after_cost_tracking_disabled_between_hops() {
+        // Detached variant of the enabled-flip escape: the hop delegates
+        // its second hop with background = true, so the child loop runs
+        // in a spawned task whose cost context is built BEFORE the spawn
+        // from the spawning tool. That pre-spawn build inherits the
+        // parent's frozen mode, so the detached child stays scoped after
+        // the flip: its admitted call lands on the ledger under the CHILD
+        // alias and its next call is refused at the exhausted ancestor
+        // ceiling, never unscoped. The hop's own post-delegate provider
+        // call races the detached child's landings (admitted or refused
+        // depending on whether the child's spend has landed yet), so this
+        // test pins the child-side evidence and leaves the hop's third
+        // call unasserted.
+        let (hop_server, _hop_wire) = start_scripted_chat_server(&[
+            heavy_tool_call_completion("live_config_flip_tool", "call_flip", json!({})),
+            heavy_tool_call_completion(
+                DelegateTool::NAME,
+                "call_target2_background",
+                json!({
+                    "agent": "target2",
+                    "prompt": "produce a status line",
+                    "background": true
+                }),
+            ),
+            heavy_usage_completion("hop loop ends here"),
+        ])
+        .await;
+        let (leaf_server, leaf_wire) = start_scripted_chat_server(&[
+            heavy_tool_call_completion("live_config_flip_tool", "leaf_flip", json!({})),
+            heavy_usage_completion("leaf finished"),
+        ])
+        .await;
+        let (fixture, live_config, task_store) = nested_delegate_cost_fixture_with_live_config(
+            hop_server.uri.clone(),
+            leaf_server.uri.clone(),
+            4,
+        )
+        .await;
+        let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disabling = LiveConfigModeFlipTool {
+            live_config: Arc::clone(&live_config),
+            disable_enabled: true,
+            disable_track_per_agent: false,
+            flipped: Arc::clone(&flipped),
+        };
+        let tool = fixture
+            .tool
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(disabling)])));
+
+        tool.execute(json!({
+            "agent": "target",
+            "prompt": "flip tracking off, then delegate onward to target2 in the background"
+        }))
+        .await
+        .expect("delegate execute returns a result");
+        assert!(
+            flipped.load(std::sync::atomic::Ordering::SeqCst),
+            "the flip tool must have run between the hop's provider calls"
+        );
+        // The detached child is scoped: its admitted call lands under the
+        // CHILD alias (an unscoped detached child would record nothing).
+        let c_stats = poll_agent_cost(&fixture.data_dir, "target2").await;
+        assert_eq!(
+            c_stats.request_count, 1,
+            "the detached child's admitted call must land under its own alias"
+        );
+        assert!((c_stats.cost_usd - 0.015).abs() < 1e-9);
+
+        // ... and it is refused at the boundary instead of running to
+        // completion unscoped. Await it through the shared task store: the
+        // spawning delegate call lives inside the hop's loop, so the task
+        // is owned by that loop's caller identity and the root tool's own
+        // task actions cannot read it back.
+        let (task, task_error) = poll_detached_delegate_outcome(&task_store, "target2").await;
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "the detached child must be refused at the exhausted ancestor ceiling: {task:?}"
+        );
+        assert!(
+            task_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Budget exceeded for agent `target`"),
+            "the detached refusal must name the ancestor: {task_error:?}"
+        );
+        assert_eq!(
+            leaf_wire.lock().unwrap().len(),
+            1,
+            "exactly the detached child's first call may reach the child server; its \
+             second must be refused before it is sent"
+        );
     }
 
     /// Test tool that lowers a base tracker's global daily limit when
