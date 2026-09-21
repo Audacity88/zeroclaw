@@ -6835,6 +6835,8 @@ mod sop_step_reassembly_tests {
             None,
             None,
             None,
+            None,
+            None,
             &mut exec_cache,
         )
         .await;
