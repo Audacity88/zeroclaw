@@ -2,13 +2,44 @@
 //! LLM for a tools-free final summary (with step timeout + cancel select)
 //! and return it appended to the accumulated display text, or bail.
 
+use super::execution::SettledAttemptSummary;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
+use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_config::schema::PacingConfig;
+use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
+use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
+
+/// Project a finished summary call's settled attempts as `TurnEvent::Usage`
+/// so the gateway ledger includes the final-summary billed work. Mirrors
+/// `emit_rejected_attempt_usage`, but carries each summary's own `accepted`
+/// flag (the accepted leaf is `true`).
+async fn emit_summary_attempt_usage(
+    event_tx: Option<&Sender<TurnEvent>>,
+    summaries: &[SettledAttemptSummary],
+) {
+    if let Some(tx) = event_tx {
+        for summary in summaries {
+            let _ = tx
+                .send(TurnEvent::Usage {
+                    input_tokens: summary.input_tokens,
+                    cached_input_tokens: summary.cached_input_tokens,
+                    output_tokens: summary.output_tokens,
+                    cost_usd: summary.cost_usd,
+                    context_token_budget: None,
+                    model_context_window: None,
+                    provider_ref: summary.provider_ref.clone(),
+                    model: summary.model.clone(),
+                    accepted: summary.accepted,
+                })
+                .await;
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
@@ -16,14 +47,21 @@ pub(crate) async fn finish_after_max_iterations(
     history: &mut Vec<ChatMessage>,
     provider_name: &str,
     model: &str,
+    dispatch_model: &str,
     temperature: Option<f64>,
+    multimodal_config: &MultimodalConfig,
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
     max_iterations: usize,
     mut accumulated_display_text: String,
     turn_id: &str,
     knobs: &LoopKnobs,
+    event_tx: Option<&Sender<TurnEvent>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    context_token_budget: usize,
+    crumb_present: &mut bool,
+    token_counter: super::DispatchTokenCounter,
+    observer: &dyn crate::observability::Observer,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
         WARN,
@@ -77,6 +115,100 @@ pub(crate) async fn finish_after_max_iterations(
             .to_string(),
     );
     let summary_prompt_mirror = summary_prompt.clone();
+
+    // The summary may see the turn's images, so the accumulated history goes
+    // through the same multimodal normalizer an in-loop request does (size,
+    // MIME and image-cap limits all apply) instead of being sent verbatim.
+    // Preparing before the summary prompt is appended keeps the trailing
+    // tool results the latest tool-result run, so their markers normalize
+    // exactly as an in-loop dispatch would. A provider that cannot see
+    // images degrades to text-only exactly like the in-loop rule, minus the
+    // vision-fallback resolution: handing validated inline images to a
+    // provider that rejects them would turn the graceful exit into a hard
+    // request failure.
+    let degrade_strip_images = !model_provider.capabilities_for_model(model).vision
+        && zeroclaw_providers::multimodal::count_image_markers(history) > 0;
+    let mut tokens_before = None;
+    let mut dropped_messages = 0;
+    let mut dropped_turns = 0;
+    let request_messages = loop {
+        let mut messages = super::prepare_messages_for_iteration(
+            history,
+            multimodal_config,
+            degrade_strip_images,
+            None,
+        )
+        .await?
+        .messages;
+        // Count the summary prompt, but keep it out of durable history until
+        // the request fits: it must not make the newest real turn droppable.
+        messages.push(summary_prompt_mirror.clone());
+        let tokens = token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+        let before = *tokens_before.get_or_insert(tokens);
+        let mut trim = super::surface_oversized_dispatch_if_needed(
+            history,
+            crumb_present,
+            tokens,
+            context_token_budget,
+        );
+        dropped_messages += trim.dropped_messages;
+        if trim.outcome == super::PreDispatchOutcome::Trimmed {
+            dropped_turns += 1;
+            continue;
+        }
+        trim.dropped_messages = dropped_messages;
+        super::record_dispatch_trim(
+            (provider_name, model),
+            &trim,
+            dropped_turns,
+            context_token_budget,
+            before,
+            tokens,
+            token_counter.source(),
+        );
+        let floor = trim.outcome == super::PreDispatchOutcome::Floor;
+        if dropped_messages > 0 || floor {
+            let source = token_counter.source();
+            if let Some(tx) = event_tx {
+                let _ = tx
+                    .send(TurnEvent::HistoryTrimmed {
+                        dropped_messages,
+                        dropped_turns,
+                        kept_turns: trim.kept_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        token_budget: Some(context_token_budget as u64),
+                        tokens_before: Some(before),
+                        tokens_after: Some(tokens),
+                        tokens_before_source: Some(source),
+                        tokens_after_source: Some(source),
+                        unsatisfiable_floor: floor.then_some(true),
+                    })
+                    .await;
+            }
+            observer.record_event(
+                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                    dropped_messages,
+                    kept_turns: trim.kept_turns,
+                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
+                    token_budget: Some(context_token_budget as u64),
+                    tokens_before: Some(before),
+                    tokens_after: Some(tokens),
+                    tokens_before_source: Some(source),
+                    tokens_after_source: Some(source),
+                    unsatisfiable_floor: floor.then_some(true),
+                },
+            );
+        }
+        if floor {
+            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                "turn-context-budget-floor-error",
+            )));
+        }
+        break messages;
+    };
     history.push(summary_prompt);
 
     enum SummaryCall {
@@ -84,9 +216,14 @@ pub(crate) async fn finish_after_max_iterations(
         TimedOut(u64),
         Done(Result<zeroclaw_providers::ChatResponse>),
     }
+    // Collect the summary call's settled attempts so they can be projected
+    // as Usage events below: without this the gateway ledger omits the
+    // final-summary billed work. Declared outside the call block so the
+    // match arms below can read it after the future completes.
+    let mut summary_attempts = Vec::new();
     let summary_call = {
         let summary_request = zeroclaw_providers::ChatRequest {
-            messages: history,
+            messages: &request_messages,
             tools: None, // No tools — force a text response
             thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .try_with(Clone::clone)
@@ -97,6 +234,7 @@ pub(crate) async fn finish_after_max_iterations(
             model_provider,
             provider_name,
             model,
+            dispatch_model,
             temperature,
         };
         // Route the graceful-summary call through the metered provider seam. This
@@ -104,7 +242,7 @@ pub(crate) async fn finish_after_max_iterations(
         // recorded no cost; through the seam it now fails closed when the turn's
         // budget is exhausted and its token usage is charged like any in-loop
         // call. Metering is a no-op when the turn is unscoped.
-        let summary_future = access.run_model_query(summary_request);
+        let summary_future = access.run_model_query(summary_request, &mut summary_attempts);
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
                 let step_timeout = Duration::from_secs(step_secs);
@@ -160,31 +298,82 @@ pub(crate) async fn finish_after_max_iterations(
                     })),
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
+            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
             history.pop();
-            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+            return Err(e).context(format!(
+                "Agent exceeded maximum tool iterations ({max_iterations})"
+            ));
         }
-        SummaryCall::Done(Ok(resp)) => resp,
+        SummaryCall::Done(Ok(resp)) => {
+            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
+            resp
+        }
     };
 
-    let text = resp.text.unwrap_or_default();
-    if text.is_empty() {
+    let raw_text = resp.text.unwrap_or_default();
+    if raw_text.is_empty() {
         history.pop();
         anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
     }
-    let summary_msg = ChatMessage::assistant(text.clone());
+    // The summary is raw provider text, and emitting it as a chunk makes this
+    // a new automatic display sink: ACP renders `agent_message_chunk` live,
+    // while gateway and RPC forward the same chunk without another
+    // normalization step. Apply the display hygiene the ordinary final
+    // response already gets before anything is emitted -- strip hidden think
+    // content and trailing terminal markers, then withhold text that looks
+    // like an internal tool-protocol envelope. The summary call passes
+    // `tools: None`, so the tools-free detector is the matching contract.
+    let display_text = strip_trailing_terminal_markers(&strip_think_tags(&raw_text));
+    let protocol_suppressed =
+        super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
+    if protocol_suppressed {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model": model,
+                    "max_iterations": max_iterations,
+                    "trace_id": turn_id,
+                    "error": "malformed internal tool protocol omitted from max-iteration summary",
+                })),
+            "max_iteration_summary_protocol_suppressed"
+        );
+    }
+    let display_text = if protocol_suppressed {
+        crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output").to_string()
+    } else {
+        display_text
+    };
+    if display_text.trim().is_empty() {
+        history.pop();
+        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+    }
+    // History and result payloads keep the unmodified provider text; only the
+    // display path is normalized, matching the final-response contract.
+    let summary_msg = ChatMessage::assistant(raw_text.clone());
     if let Some(out) = &mut new_messages_out {
         out.push(summary_prompt_mirror);
         out.push(summary_msg.clone());
     }
     history.push(summary_msg);
-    accumulated_display_text.push_str(&text);
     // Graceful shutdown with a visible reason so the user knows why the
     // agent stopped making progress.
-    accumulated_display_text.push_str("\n\n");
-    accumulated_display_text.push_str(&crate::i18n::get_required_cli_string_with_args(
+    let stop_reason = crate::i18n::get_required_cli_string_with_args(
         "turn-max-iterations-reached",
         &[("max_iterations", &max_iterations.to_string())],
-    ));
+    );
+    let segment = format!("{display_text}\n\n{stop_reason}");
+    // This summary is the turn's only visible output on the max-iteration
+    // exit path, and it comes from a fresh non-streaming call — there is no
+    // live delta a client could have already received, so unlike the normal
+    // final-response path this emit needs no live-vs-post-hoc guard. Only the
+    // newly-produced segment goes out; `accumulated_display_text` holds
+    // narration earlier iterations already streamed, and resending it here
+    // would duplicate it in the client.
+    super::events::emit_posthoc_turn_chunk(event_tx, &segment).await;
+    accumulated_display_text.push_str(&segment);
     Ok(accumulated_display_text)
 }
 
@@ -198,10 +387,14 @@ mod graceful_summary_metering_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
-    use zeroclaw_config::schema::{CostConfig, PacingConfig};
+    use zeroclaw_api::model_provider::{
+        ChatRequest, ChatResponse, ProviderCapabilities, SemanticEmptyTerminalCompletion,
+    };
+    use zeroclaw_config::schema::{CostConfig, MultimodalConfig, PacingConfig};
     use zeroclaw_providers::traits::TokenUsage;
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    use super::{Sender, TurnEvent};
 
     /// Provider stub that counts calls and returns a summary WITH token usage.
     struct CountingUsageProvider {
@@ -234,6 +427,7 @@ mod graceful_summary_metering_tests {
                     input_tokens: Some(100),
                     output_tokens: Some(20),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -249,25 +443,41 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    async fn run_summary(provider: &CountingUsageProvider) -> anyhow::Result<String> {
+    async fn run_summary_with_events(
+        provider: &dyn ModelProvider,
+        accumulated_display_text: String,
+        event_tx: Option<&Sender<TurnEvent>>,
+    ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default(); // GracefulSummary
+        let multimodal_config = MultimodalConfig::default();
         finish_after_max_iterations(
             provider,
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
+            &multimodal_config,
             &pacing,
             None,
             2,
-            String::new(),
+            accumulated_display_text,
             "trace-req-test",
             &knobs,
+            event_tx,
             None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
         )
         .await
+    }
+
+    async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
+        run_summary_with_events(provider, String::new(), None).await
     }
 
     // The graceful summary now routes through the metered provider seam: under a
@@ -302,6 +512,43 @@ mod graceful_summary_metering_tests {
         assert_eq!(recorded.output_tokens, 20);
     }
 
+    // The final-summary call's billed work must reach the event ledger, not
+    // just the accumulator: the gateway derives done.cost_usd from emitted
+    // Usage events, so an unprojected summary silently under-reports the turn.
+    #[tokio::test]
+    async fn graceful_summary_projects_usage_event_for_gateway_ledger() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&calls),
+        };
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let out = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_summary_with_events(&provider, String::new(), Some(&event_tx)),
+            )
+            .await
+            .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let mut usage_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                accepted,
+                ..
+            } = event
+            {
+                usage_events.push((input_tokens, output_tokens, accepted));
+            }
+        }
+        // Exactly the summary call's accepted attempt — no more, no less.
+        assert_eq!(usage_events, vec![(Some(100), Some(20), true)]);
+    }
+
     // The graceful summary now fails closed on budget exhaustion: it was the one
     // tool-loop provider call that skipped the budget check. A tripped budget
     // (negative limit) makes the seam bail BEFORE spending, so the provider is
@@ -334,14 +581,99 @@ mod graceful_summary_metering_tests {
         );
     }
 
+    struct SemanticEmptySummaryProvider;
+
+    #[async_trait]
+    impl ModelProvider for SemanticEmptySummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("<think>internal reasoning</think>".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: Some("internal reasoning".to_string()),
+            })
+        }
+    }
+
+    impl Attributable for SemanticEmptySummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "semantic-empty-summary-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_rejects_think_only_text_with_rejected_usage_and_typed_cause() {
+        let provider = SemanticEmptySummaryProvider;
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                run_summary(&provider)
+                    .await
+                    .expect_err("think-only summary cannot be a successful terminal answer")
+            })
+            .await;
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Agent exceeded maximum tool iterations (2)"),
+            "the iteration cap remains the caller-visible summary failure: {error}"
+        );
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 100);
+        assert_eq!(recorded.output_tokens, 20);
+        assert_eq!(recorded.last_input_tokens, 0);
+    }
+
     /// Provider stub that records the exact messages it was dispatched, so a
-    /// test can assert on what actually reached the provider.
+    /// test can assert on what actually reached the provider. `vision` lets a
+    /// test decide whether the provider can see images, which the summary
+    /// path consults exactly like the in-loop path.
     struct CapturingProvider {
         seen: Arc<std::sync::Mutex<Vec<String>>>,
+        vision: bool,
     }
 
     #[async_trait]
     impl ModelProvider for CapturingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: self.vision,
+                ..Default::default()
+            }
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -383,16 +715,83 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    // The graceful-summary path dispatches the accumulated history directly
-    // through `run_model_query`, which does NOT run
-    // `prepare_messages_for_provider`. A tool-result `[AUDIO:/path]` in that
-    // history must be stripped before it reaches the provider, or the raw
-    // filesystem path leaks and is hallucinated over on the max-iteration exit.
+    #[tokio::test]
+    async fn graceful_summary_prompt_can_make_the_latest_turn_unsatisfiable() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+        };
+        let mut history = vec![
+            ChatMessage::user("current question"),
+            ChatMessage::assistant("work completed"),
+        ];
+        // The real turn fits exactly; only the synthetic prompt can exceed it.
+        let budget = crate::agent::history::estimate_history_tokens(&history);
+        let mut crumb_present = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let error = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &MultimodalConfig::default(),
+            &PacingConfig::default(),
+            None,
+            1,
+            String::new(),
+            "summary-prompt-floor",
+            &LoopKnobs::default(),
+            Some(&tx),
+            None,
+            budget,
+            &mut crumb_present,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect_err("summary prompt must be included in the floor decision");
+        assert!(
+            error
+                .to_string()
+                .contains(&crate::i18n::get_required_cli_string(
+                    "turn-context-budget-floor-error",
+                ))
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no oversized summary dispatch"
+        );
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "current question");
+        assert_eq!(history[1].content, "work completed");
+        assert!(!crumb_present);
+        let TurnEvent::HistoryTrimmed {
+            tokens_after,
+            unsatisfiable_floor,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected summary floor event");
+        };
+        assert_eq!(unsatisfiable_floor, Some(true));
+        assert!(tokens_after.unwrap() > budget as u64);
+    }
+
+    // The graceful-summary path now prepares the accumulated history through
+    // the full multimodal normalizer before dispatch, and the dispatch seam
+    // still strips loadable audio markers as a fail-closed backstop. A
+    // tool-result audio marker in the history must never reach the provider
+    // as a raw filesystem path the model would hallucinate over; this pins
+    // the combined contract on the max-iteration exit.
     #[tokio::test]
     async fn graceful_summary_strips_tool_audio_marker_before_dispatch() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
+            vision: false,
         };
         // A properly paired assistant tool_call + native tool-result JSON blob,
         // so the orphaned-tool-message sweep in finish_after_max_iterations keeps
@@ -408,13 +807,16 @@ mod graceful_summary_metering_tests {
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
             &provider,
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
+            &multimodal_config,
             &pacing,
             None,
             2,
@@ -422,6 +824,11 @@ mod graceful_summary_metering_tests {
             "trace-req-audio",
             &knobs,
             None,
+            None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");
@@ -433,8 +840,333 @@ mod graceful_summary_metering_tests {
             "raw audio path reached the provider on the max-iteration path: {captured}"
         );
         assert!(
-            captured.contains("[media attachment]"),
+            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
             "audio marker should be replaced with a placeholder: {captured}"
+        );
+    }
+
+    // The summary request is prepared like an in-loop request, so a
+    // tool-result image marker whose file is not an interpretable image is
+    // dropped by the normalizer with a model-facing note: the raw path never
+    // reaches the provider, and the model is told the image could not be
+    // loaded rather than being handed a path to hallucinate over.
+    #[tokio::test]
+    async fn graceful_summary_drops_unloadable_tool_image_marker() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bogus_image = temp.path().join("shot.txt");
+        std::fs::write(&bogus_image, b"not an image").expect("write text bytes");
+        let marker = format!("[{}:{}]", "IMAGE", bogus_image.display());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+        };
+        // A properly paired assistant tool_call + native tool-result JSON
+        // blob, so the orphan sweep keeps the exchange intact and the marker
+        // reaches the summary preparation as a latest-run tool result.
+        let mut history = vec![
+            ChatMessage::user("call the tool and describe the screenshot"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_img"}]}"#),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": format!("{marker} shot"),
+                    "tool_call_id": "toolu_img",
+                })
+                .to_string(),
+            ),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-img-drop",
+            &knobs,
+            None,
+            None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            !captured.contains(&bogus_image.display().to_string()),
+            "raw image path reached the provider on the max-iteration path: {captured}"
+        );
+        assert!(
+            !captured.contains(&marker),
+            "the unloadable image marker must be dropped, not forwarded: {captured}"
+        );
+        assert!(
+            captured.contains("could not be loaded"),
+            "the normalizer's skipped-image note must reach the model: {captured}"
+        );
+    }
+
+    // A loadable local image and an already-inline data URI both reach the
+    // summary request as validated inline markers: the file is read,
+    // MIME-checked and inlined by the normalizer, and the inline marker
+    // passes through byte-identical. This pins the normalize decision for
+    // the summary path: the summary may see the turn's images.
+    #[tokio::test]
+    async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let png_path = temp.path().join("shot.png");
+        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+            .expect("write png signature");
+        let inline_uri = "data:image/png;base64,iVBORw0KGgo=";
+        let inline_marker = format!("[{}:{}]", "IMAGE", inline_uri);
+        let local_marker = format!("[{}:{}]", "IMAGE", png_path.display());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+        };
+        let mut history = vec![
+            ChatMessage::user("call the tool and describe both screenshots"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_two"}]}"#),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": format!("{local_marker} and {inline_marker}"),
+                    "tool_call_id": "toolu_two",
+                })
+                .to_string(),
+            ),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-img-inline",
+            &knobs,
+            None,
+            None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            !captured.contains(&png_path.display().to_string()),
+            "the local path must be inlined, not forwarded: {captured}"
+        );
+        assert!(
+            !captured.contains(&local_marker),
+            "the path-form marker must be replaced by its inline form: {captured}"
+        );
+        assert_eq!(
+            captured.matches(&inline_marker).count(),
+            2,
+            "both images must arrive as the same byte-identical inline marker: {captured}"
+        );
+    }
+
+    // ACP and other event-driven clients render message content exclusively
+    // from `TurnEvent::Chunk`. The max-iteration exit must emit one, and it
+    // must carry only the newly-produced segment — narration from earlier
+    // iterations already reached the client through prior chunks, so
+    // re-sending `accumulated_display_text` here would duplicate it.
+    #[tokio::test]
+    async fn graceful_summary_emits_a_turn_event_chunk_with_only_the_new_segment() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+
+        let out = run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
+            .await
+            .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+
+        let mut chunk_delta = None;
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                chunk_delta = Some(delta);
+            }
+        }
+        let delta = chunk_delta.expect("max-iteration exit must emit a TurnEvent::Chunk");
+        assert!(
+            delta.contains("wrap-up summary"),
+            "chunk must carry the summary text: {delta}"
+        );
+        assert!(
+            delta.contains("Turn stopped: reached maximum tool iterations (2)"),
+            "chunk must carry the max-iterations stop reason: {delta}"
+        );
+        assert!(
+            !delta.contains("earlier narration"),
+            "chunk must not re-send narration already streamed in earlier iterations: {delta}"
+        );
+    }
+
+    /// Provider stub returning caller-supplied raw summary text, so a test can
+    /// drive the display-hygiene path with think content, terminal markers, or
+    /// an internal tool-protocol envelope.
+    struct RawTextProvider {
+        text: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for RawTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.text.clone())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(self.text.clone()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for RawTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "raw-text-provider"
+        }
+    }
+
+    async fn emitted_chunk_for_raw_summary(raw: &str) -> String {
+        let provider = RawTextProvider {
+            text: raw.to_string(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
+            .await
+            .expect("graceful summary should succeed");
+        let mut chunk_delta = None;
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                chunk_delta = Some(delta);
+            }
+        }
+        chunk_delta.expect("max-iteration exit must emit a TurnEvent::Chunk")
+    }
+
+    // The emitted chunk is a live display sink (ACP renders it directly;
+    // gateway and RPC forward it unchanged), so the summary must go through
+    // the same display-safe contract as the ordinary final response: hidden
+    // think content stripped, trailing terminal markers stripped, and an
+    // internal tool-protocol envelope suppressed rather than rendered.
+    #[tokio::test]
+    async fn graceful_summary_chunk_strips_hidden_think_content() {
+        let delta =
+            emitted_chunk_for_raw_summary("<think>secret chain of thought</think>wrap-up summary")
+                .await;
+        assert!(
+            !delta.contains("secret chain of thought"),
+            "hidden think content must not reach the display chunk: {delta}"
+        );
+        assert!(
+            delta.contains("wrap-up summary"),
+            "visible summary text must survive: {delta}"
+        );
+        assert!(
+            delta.contains("Turn stopped: reached maximum tool iterations (2)"),
+            "chunk must still carry the stop reason: {delta}"
+        );
+        assert!(
+            !delta.contains("earlier narration"),
+            "chunk must not re-send earlier narration: {delta}"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_chunk_strips_trailing_terminal_marker() {
+        let delta = emitted_chunk_for_raw_summary("wrap-up summary<|eom|>").await;
+        assert!(
+            !delta.contains("eom"),
+            "trailing terminal marker must not reach the display chunk: {delta}"
+        );
+        assert!(
+            delta.contains("wrap-up summary"),
+            "visible summary text must survive: {delta}"
+        );
+        assert!(
+            delta.contains("Turn stopped: reached maximum tool iterations (2)"),
+            "chunk must still carry the stop reason: {delta}"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_chunk_suppresses_internal_tool_protocol_envelope() {
+        let delta = emitted_chunk_for_raw_summary(
+            "<tool_call>{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}</tool_call>",
+        )
+        .await;
+        assert!(
+            !delta.contains("tool_call"),
+            "internal tool-protocol envelope must not be rendered: {delta}"
+        );
+        assert!(
+            !delta.contains("shell"),
+            "internal tool-protocol payload must not be rendered: {delta}"
+        );
+        assert!(
+            delta.contains("internal tool-call format error"),
+            "suppressed protocol output must fall back to the safe notice: {delta}"
+        );
+        assert!(
+            delta.contains("Turn stopped: reached maximum tool iterations (2)"),
+            "chunk must still carry the stop reason: {delta}"
+        );
+        assert!(
+            !delta.contains("earlier narration"),
+            "chunk must not re-send earlier narration: {delta}"
         );
     }
 }

@@ -184,8 +184,14 @@ impl HasPropKind for crate::multi_agent::MemoryBackendKind {
 impl HasPropKind for crate::multi_agent::OutputModality {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
+impl HasPropKind for crate::multi_agent::MemoryGrant {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
 impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
     const PROP_KIND: PropKind = PropKind::StringArray;
+}
+impl HasPropKind for Vec<crate::multi_agent::MemoryGrant> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::multi_agent::PeerUsername> {
     const PROP_KIND: PropKind = PropKind::StringArray;
@@ -244,6 +250,9 @@ impl HasPropKind for Vec<crate::schema::PeripheralBoardConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::schema::ToolFilterGroup> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for Vec<crate::schema::StreamToolArgumentEntry> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 
@@ -923,11 +932,14 @@ pub struct IntegrationDescriptor {
 /// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
-    /// Canonical kebab-case identifier used in config TOML
-    /// (`[channels.<kind>]`). Matches the field name on
-    /// `ChannelsConfig` so Quickstart and other surfaces can
-    /// reuse the schema's own labeling without a parallel map.
+    /// Canonical runtime/API identifier for the channel type. This can differ
+    /// from the config map key when multiple runtime backends share one
+    /// `ChannelsConfig` field, such as `whatsapp-web` and `whatsapp`.
     pub kind: &'static str,
+    /// Canonical `ChannelsConfig` map key used by config APIs and TOML paths.
+    /// Keep this separate from `kind`: runtime channel identifiers can use
+    /// kebab-case or distinguish backends that share one config map.
+    pub config_key: &'static str,
     pub name: &'static str,
     pub desc: &'static str,
     pub configured: bool,
@@ -1145,7 +1157,7 @@ mod secret_field_tests {
 #[cfg(test)]
 mod resource_key_tests {
     // Pins `MapKeySection::resource_key`, the discriminator that
-    // `ensure_map_key_for_prop_path` (in the `zeroclawlabs` binary crate)
+    // `ensure_map_key_for_prop_path` (in the `zeroclaw` binary crate)
     // filters on: `true` for sections keyed by a value drawn from another
     // domain (a model id, tool name, …) that may itself contain dots;
     // `false` for sections keyed by a short operator-chosen alias.

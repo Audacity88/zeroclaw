@@ -148,7 +148,25 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
+tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
+tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
+tool-sessions-current-channel = Channel: { $channel }
+
 tool-screenshot = Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data.
+tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
+tool-browser-screenshot-error-parent-not-exist = Screenshot path '{ $path }' parent directory '{ $parent }' does not exist
+tool-browser-screenshot-error-path-outside-workspace = Screenshot path '{ $path }' resolves to '{ $canonical }' which is outside the workspace
+tool-browser-screenshot-error-missing-filename = Screenshot path '{ $path }' is missing a filename component
+tool-browser-screenshot-error-runtime-config-target = Cannot write screenshot to runtime config path '{ $target }'
+tool-browser-screenshot-error-symlink-target = Cannot write screenshot to symlink target '{ $target }'
+tool-browser-screenshot-error-path-not-utf8 = Screenshot path '{ $path }' resolves to a non-UTF-8 pathname; refusing to write through a lossy conversion
+tool-browser-screenshot-error-computeruse-non-string-path = Screenshot 'path' parameter must be a string, got { $path }
+tool-browser-screenshot-error-non-string-path = Screenshot 'path' must be a string or absent
+tool-browser-screenshot-error-args-not-object = Screenshot arguments must be a JSON object
+tool-browser-screenshot-error-sidecar-no-png-data = computer-use sidecar did not return PNG data
+tool-browser-screenshot-error-sidecar-empty-png = computer-use sidecar returned an empty screenshot payload
+tool-browser-screenshot-error-sidecar-not-png = computer-use sidecar returned a non-PNG screenshot payload
+tool-browser-screenshot-error-sidecar-non-json-success = computer-use sidecar returned a non-JSON success response for a path-bearing screenshot; the requested file was not written
 
 tool-security-ops = Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics).
 
@@ -169,7 +187,29 @@ tool-tool-search = Fetch full schema definitions for deferred MCP tools so they 
 tool-web-fetch = Fetch a web page and return its content as clean plain text. HTML pages are automatically converted to readable text. JSON and plain text responses are returned as-is. Only GET requests; follows redirects. Security: allowlist-only domains, no local/private hosts.
 
 tool-web-search-tool = Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics.
+tool-web-search-tool-error-duckduckgo-blocked = DuckDuckGo is rate-limiting this machine. Do not retry or rephrase the search; wait a few minutes, fetch known URLs directly with web_fetch, or configure SearXNG, Brave, or Tavily as the web_search provider.
+tool-web-search-tool-error-searxng-not-configured = SearXNG instance URL not configured. Set [web_search] searxng_instance_url in config.toml, or override it with the ZEROCLAW_web_search__searxng_instance_url environment variable.
+tool-web-search-tool-note-truncated-results = (further results omitted)
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
+
+tool-a2a-discover = List available remote A2A peer agents and their advertised capabilities. Call with no peer to list all configured peers, or a specific peer to fetch its Agent Card (name, description, skills). Use before a2a_send to find the right peer and agent for a task.
+tool-a2a-discover-desc-peer = Peer name to fetch the Agent Card for. Omit to list all configured peers.
+tool-a2a-discover-desc-filter-tags = Optional tags to filter peers by (e.g. ["production"]).
+tool-a2a-send = Delegate a task to a remote A2A peer agent and wait for the result. Returns a Task with a task_id, state, and artifacts (the peer's reply, fenced as untrusted-external). If the state is non-terminal (working/input-required), poll with a2a_get_task or cancel with a2a_cancel. The message is sent as-is. This is an Act operation that requires approval by default (not in auto_approve) unless the operator explicitly opts in via risk_profiles.<name>.auto_approve.
+tool-a2a-send-desc-peer = Configured peer name to send the task to.
+tool-a2a-send-desc-agent = Target route identity on the peer: the agent alias ({"{"}alias{"}"} in /a2a/{"{"}alias{"}"}) or, when the card shares a URL across tenants, the tenant of the interface to reach.
+tool-a2a-send-desc-message = The task prompt to send to the peer agent.
+tool-a2a-send-desc-return-immediately = Default false (block for a terminal state). Set true to return immediately with a non-terminal (working/input-required) task for polling.
+tool-a2a-send-desc-context-id = Optional context ID for multi-turn continuation (from a prior send's response).
+tool-a2a-send-desc-task-id = Optional task ID for continuing an existing task (e.g. after INPUT_REQUIRED).
+tool-a2a-get-task = Retrieve the current state and artifacts of an in-flight A2A task on a peer. Use to poll a task that a2a_send returned in a non-terminal state (working/input-required).
+tool-a2a-get-task-desc-peer = Configured peer name hosting the task.
+tool-a2a-get-task-desc-task-id = The task id returned by a2a_send.
+tool-a2a-get-task-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the poll to the correct interface when discovery is re-run (the cached route is used first).
+tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Task (typically state=canceled, though the spec does not guarantee it).
+tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
+tool-a2a-cancel-desc-task-id = The task id to cancel.
+tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).

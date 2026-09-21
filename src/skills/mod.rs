@@ -52,7 +52,6 @@ pub mod skill_http {
 }
 
 // The lib target sees this as dead; only the bin target calls it from main.rs.
-#[allow(dead_code)]
 pub async fn handle_command(
     command: crate::SkillCommands,
     config: &crate::config::Config,
@@ -768,6 +767,8 @@ fn handle_add(
         tags: Vec::new(),
         // Slash options are authored in the dashboard editor, not at scaffold time.
         slash_options: Vec::new(),
+        // Scaffolded skills load on demand; always-inject is opt-in via the editor.
+        always: false,
     };
 
     let skill_dir = service.scaffold_skill(

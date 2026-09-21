@@ -22,8 +22,8 @@ Last verified against the `v0.8.2` release cycle.
 6. [Verify the release exists and assets are downloadable](#step-6-verify-the-release)
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
-That is the entire process. Everything else (Docker, website redeploy, Scoop,
-AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
+That is the entire process. Everything else (crates.io, Docker, website
+redeploy, Scoop, AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
 detects the stable GitHub release through its own autobump service. You do not
 need to do anything for those unless a job explicitly fails or Homebrew's
 external bump remains stale.
@@ -42,6 +42,23 @@ PR (step 2), or open it as a separate preceding PR if the diff is large.
 
 If `CHANGELOG-next.md` already exists from a previous aborted release cycle,
 review it for accuracy before reusing it.
+
+The file must carry an `## In brief` section directly after the preamble: two
+short paragraphs, at most 255 characters together, that say what the release
+is. The X and Discord announcement workflows publish that section, followed by
+the commit and contributor counts from the preamble and a link to the website's
+release post (or the GitHub release when no post exists yet). Without it they
+fall back to the first Highlights bullets, and without those to the raw commit
+list. The skill's `SKILL.md` has the style rules and a reference example.
+
+Preview the announcement text for any published tag without posting:
+
+```bash
+gh workflow run tweet-release.yml -f release_tag=vX.Y.Z -f dry_run=true
+gh workflow run discord-release.yml -f release_tag=vX.Y.Z -f dry_run=true
+```
+
+The composed text appears in the run's job summary.
 
 ---
 
@@ -62,7 +79,7 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 This updates README badges, the Tauri config, and workflow description
 examples, then regenerates every spec-driven install surface via
 `cargo generate installers`: install.sh, setup.bat, `dist/aur/PKGBUILD`,
-`dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
+`dist/aur/.SRCINFO`, `dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
 sets, `dev/ci/docker-tags.toml`, `docs/book/src/_snippets/install.md`, the Unix
 fast-path blocks in README/platform docs, and the Windows prebuilt block in
 `docs/book/src/setup/windows.md`.
@@ -122,15 +139,11 @@ chore: bump version to vX.Y.Z
 
 If the PR also changes `[workspace.package] rust-version` or pinned Rust toolchains, treat it as a compatibility change, not just release plumbing. The PR should name the new MSRV, explain the source-build upgrade path, and show that CI, Docker, installer, and generated surfaces agree on the new floor before merge.
 
-Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler
-adds. If the PR raises a toolchain floor, also apply `risk:high` and route it
-through lane D. Get one maintainer review. Merge when CI is green. The **Installer Drift**
-gate in CI fails the PR if a generated surface is out of sync with the spec, so
-a missed regeneration cannot land. The
-**Validate Translations Pin** gate resolves the submodule at the pinned commit
-and validates catalogue format and msgid parity, so a bad pin cannot land
-either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext)
-for translation pipeline details.
+Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler adds. If the PR raises a toolchain floor, also apply `risk:high` and route it through lane D.
+
+Two independent Core Team approvals are the default. Toolchain-floor and release changes may be considered under the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) only with its complete evidence and an explicit justification for this normally two-review category. A timeout never clears an unresolved compatibility or release-safety concern. Merge only when required CI is green.
+
+The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
 
 **Confirm the merge landed correctly:**
 
@@ -319,6 +332,7 @@ Everything else is skipped with a logged reason:
 ```
 ==> skip release-stable-manual:publish (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:docker (not on dry-run-safe allowlist)
+==> skip release-stable-manual:crates (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
 ==> skip docs-deploy:deploy (not on dry-run-safe allowlist)
 ==> skip daily-audit:advisories (not on dry-run-safe allowlist)
@@ -351,7 +365,7 @@ not real defects:
 
 - Jobs that depend on a real release tag (`publish` creating a GitHub
   Release).
-- Environment-gated jobs (`publish`, `docker`): the
+- Environment-gated jobs (`publish`, `docker`, and the crates publisher): the
   approval UI doesn't exist locally.
 - OIDC-based federated identity tokens.
 
@@ -385,15 +399,17 @@ re-trigger. Do not try to work around it.
 
 ## Step 5: Approve the environment gates
 
-Two jobs are gated by GitHub environment protection rules. When each becomes
+Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve both when they appear:
+Approve all three when they appear. Approve `crates-io` only after its tokenless
+package preflight is green:
 
 | Environment | Job | What it does |
 |---|---|---|
 | `github-releases` | `publish` | Creates the GitHub Release and uploads assets |
 | `docker` | `docker` | Pushes images to GHCR |
+| `crates-io` | `crates / Publish to crates.io` | Publishes the verified 23-crate workspace in dependency order |
 
 If you miss the approval window and a job times out, re-run only the failed
 job from the workflow run page; you do not need to restart from scratch.
@@ -424,7 +440,7 @@ inside the stable release workflow. You do not need a separate Docker check if
 all release jobs are green. If a maintainer instead starts the release by
 pushing a `vX.Y.Z` tag, Docker Publish starts as a separate tag-triggered run;
 confirm that sibling run is green before treating container publication as
-complete. Scoop and AUR need separate attention only when their jobs show red.
+complete. crates.io, Scoop, and AUR need separate attention only when their jobs show red.
 Homebrew Core is external to this workflow; its
 [autobump service](https://docs.brew.sh/Autobump) checks eligible formulae on
 its own schedule.
@@ -526,11 +542,83 @@ restart the workflow.
 **A Scoop or AUR distribution job failed:** Each has a corresponding
 manually-triggerable sub-workflow. Re-run the specific one with `dry_run: true`
 first to confirm the fix, then `dry_run: false`. These are nice-to-have: a
-failed distribution job does not invalidate the release itself.
+failed distribution job does not invalidate the release itself. For Scoop
+credential failures, use Scoop Bucket Canary instead of treating a generic dry
+run as credential proof; the canary enables the fail-closed
+`credential_canary` path.
+
+**The crates.io publisher stopped after uploading some crates:** Do not bump the
+version or start a second release. crates.io versions cannot be replaced or
+deleted. Fix the failing crate at the same release commit, then re-run
+`Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
+every `<crate>@<version>` first and skips versions that already landed. Read the
+Publish step for the last successful crate. If preflight failed, no upload was
+attempted and the problem is still reversible.
+
+**The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
+A permissions problem, not a manifest problem: the bucket token is dead or
+under-scoped. Rotate the token per
+[Rotating `SCOOP_BUCKET_TOKEN`](./ci-and-actions.md#rotating-scoop_bucket_token),
+then dispatch Scoop Bucket Canary to confirm the fix without writing to the
+bucket. Rerun the Scoop publisher with `dry_run: false` and confirm the bucket
+landed the new version. Bucket-side Excavator recovery remains pending on
+`zeroclaw-labs/scoop-zeroclaw#1`, repository workflow write permission, and a
+maintainer smoke test; do not wait for it to repair a release until those steps
+are complete.
+
+**Weekly `Scoop Bucket Canary` went red:** The token has expired or lost write.
+Same rotation path. Fix it before the next release.
 
 **Homebrew Core is stale:** Homebrew is not a release-workflow job. Check the
 [Homebrew autobump status and documented manual bump
 path](https://docs.brew.sh/Autobump) instead of adding a repository fork token.
+
+**The AUR job failed with `The AUR is down due to maintenance`:** An upstream
+outage, not a credential problem. `AUR_SSH_KEY` is fine if the log shows a key
+fingerprint under `SSH key diagnostics` and the failure came from the server
+rather than from SSH. The publisher retries five times over roughly seven
+minutes, with a hard job timeout. Each attempt reclones the current package and
+stops instead of downgrading it if another run has already published a newer
+version. Reaching the maintenance error means the window outlasted the retry
+budget. Wait for `aur.archlinux.org` to come back, then re-dispatch Pub AUR Package at the
+release tag with `dry_run: true`, then `dry_run: false`. Confirm the result with
+`curl -fsS 'https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=zeroclawlabs'`, or
+just dispatch AUR Freshness Check. Skipping this leaves the AUR silently behind
+until the weekly check catches it.
+
+**The AUR is newer than a deliberately rolled-back stable release:** Verify the
+rollback tag and package contents. If the published package has a nonzero
+`epoch` that the rollback tag does not contain, do not re-dispatch the old tag:
+release metadata comes from the immutable tag, so default-branch edits cannot
+change that run. Instead, prepare a forward-numbered stable release containing
+the reverted code, add the matching `epoch=` assignment to
+`dist/aur/PKGBUILD`, run `cargo generate installers` to regenerate
+`dist/aur/.SRCINFO`, review both files, merge, and cut a new release tag. The
+freshness check remains red until that tag is published. Never use
+`allow_downgrade` to cross an epoch boundary. For a rollback within the same
+epoch, run the manual Pub AUR
+Package workflow once with `dry_run: true` to validate metadata generation and
+the target side of the version guard, then run it with `dry_run: false` and
+`allow_downgrade: true`. The non-dry-run guard additionally compares the fresh
+AUR clone. That override exists only on manual dispatch; the reusable interface
+does not declare the input and therefore cannot request it. Never use it to
+bypass malformed AUR metadata or an unexplained version mismatch.
+
+**Publishing stopped because package files differ at the same version:** The
+publisher intentionally refuses to replace different files at an existing
+`epoch:pkgver-pkgrel` tuple. Inspect the diff. An authorized AUR maintainer must
+either restore the canonical PKGBUILD and `.SRCINFO` generated from that release
+tag, or merge a corrected source change and ship it under a new stable release
+tag. Editing the default branch and re-dispatching the old tag cannot work,
+because the publisher reads metadata from the immutable tag.
+
+**Publishing reports a non-numeric or otherwise malformed current AUR
+version:** The automated publisher intentionally fails closed, and
+`allow_downgrade` cannot bypass malformed metadata. An authorized AUR maintainer
+must repair the package with a manual AUR push to a well-formed
+`epoch:pkgver-pkgrel`, verify it through the AUR RPC, and then re-dispatch the
+normal publisher. Do not weaken the guard to make malformed published state
+comparable.
 
 ---
 

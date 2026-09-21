@@ -616,7 +616,13 @@ fn bedrock_model_supports_native_thinking(model: &str) -> bool {
 
 fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    model.contains("claude") || model.contains("nova")
+    if model.contains("claude") {
+        return true;
+    }
+    // The Nova 2 generation rejects `cachePoint` with a 400 despite matching the
+    // Nova family. Caching is an optimization, so unconfirmed generations skip
+    // it rather than risk the error; Nova 1 (Micro/Lite/Pro/Premier) keeps it.
+    model.contains("nova") && !model.contains("nova-2")
 }
 
 #[derive(Debug, Serialize)]
@@ -654,9 +660,6 @@ struct ConverseResponse {
     #[serde(default)]
     output: Option<ConverseOutput>,
     #[serde(default)]
-    #[allow(dead_code)]
-    stop_reason: Option<String>,
-    #[serde(default)]
     usage: Option<BedrockUsage>,
 }
 
@@ -677,8 +680,6 @@ struct ConverseOutput {
 
 #[derive(Debug, Deserialize)]
 struct ConverseOutputMessage {
-    #[allow(dead_code)]
-    role: String,
     content: Vec<ResponseContentBlock>,
 }
 
@@ -688,7 +689,7 @@ enum ResponseContentBlock {
     ToolUse(ResponseToolUseWrapper),
     ReasoningContent(ReasoningContentWrapper),
     Text(TextBlock),
-    Other(#[allow(dead_code)] serde_json::Value),
+    Other(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1362,6 +1363,7 @@ impl BedrockModelProvider {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
 
         if let Some(output) = response.output
@@ -1395,7 +1397,7 @@ impl BedrockModelProvider {
                             });
                         }
                     }
-                    ResponseContentBlock::Other(_) => {}
+                    ResponseContentBlock::Other(value) => drop(value),
                 }
             }
         }
@@ -2306,6 +2308,35 @@ mod tests {
             assert!(
                 !bedrock_model_supports_prompt_caching(model),
                 "expected NO prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_unsupported_for_nova2() {
+        // Nova 2 models match the "nova" family but reject cachePoint with a
+        // 400 "extraneous key [cachePoint] is not permitted".
+        for model in [
+            "us.amazon.nova-2-lite-v1:0",
+            "amazon.nova-2-lite-v1:0",
+            "US.AMAZON.NOVA-2-LITE-V1:0",
+        ] {
+            assert!(
+                !bedrock_model_supports_prompt_caching(model),
+                "expected NO prompt caching support for {model}"
+            );
+        }
+        // First-generation Nova models keep caching (whose IDs must not be
+        // caught by the Nova 2 exclusion).
+        for model in [
+            "us.amazon.nova-lite-v1:0",
+            "amazon.nova-micro-v1:0",
+            "amazon.nova-pro-v1:0",
+            "amazon.nova-premier-v1:0",
+        ] {
+            assert!(
+                bedrock_model_supports_prompt_caching(model),
+                "expected prompt caching support for {model}"
             );
         }
     }

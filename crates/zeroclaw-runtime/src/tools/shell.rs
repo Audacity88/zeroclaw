@@ -1,6 +1,7 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
+use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -48,39 +49,14 @@ impl Drop for ChildGroupGuard {
                 .with_attrs(::serde_json::json!({ "pgid": pgid, "signal": "SIGKILL" })),
             "shell tool reaping child process group"
         );
+        // SAFETY: `pgid` was published only after the spawned child created
+        // its own process group; a negative PID targets that group, and this
+        // best-effort signal call passes no pointers.
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
     }
 }
-
-/// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
-#[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-/// Environment variables safe to pass to shell commands on Windows.
-/// Includes Windows-specific variables needed for cmd.exe and program resolution.
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "TEMP",
-    "TMP",
-    "TERM",
-    "LANG",
-    "USERNAME",
-];
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -145,54 +121,12 @@ impl ShellTool {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn decode_output(bytes: &[u8]) -> String {
-    use windows::Win32::Globalization::GetACP;
-    use windows::Win32::System::Console::GetConsoleOutputCP;
-
-    let cp = unsafe { GetConsoleOutputCP() };
-    let cp = if cp == 0 { unsafe { GetACP() } } else { cp };
-
-    decode_output_with_code_page(bytes, cp)
+    super::shell_output::decode_shell_output(bytes)
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn decode_output_with_code_page(bytes: &[u8], cp: u32) -> String {
-    let encoding = windows_code_page_to_encoding(cp);
-    if std::ptr::eq(encoding, encoding_rs::UTF_8) {
-        String::from_utf8_lossy(bytes).into_owned()
-    } else {
-        let (cow, _enc_used, _had_errors) = encoding.decode(bytes);
-        cow.into_owned()
-    }
-}
-
-/// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
-/// Falls back to UTF-8 (lossy) for unknown code pages.
-#[cfg(any(target_os = "windows", test))]
-fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
-    match cp {
-        932 => encoding_rs::SHIFT_JIS,
-        936 | 54936 => encoding_rs::GBK,
-        949 => encoding_rs::EUC_KR,
-        950 => encoding_rs::BIG5,
-        1250 => encoding_rs::WINDOWS_1250,
-        1251 => encoding_rs::WINDOWS_1251,
-        1252 => encoding_rs::WINDOWS_1252,
-        1253 => encoding_rs::WINDOWS_1253,
-        1254 => encoding_rs::WINDOWS_1254,
-        1255 => encoding_rs::WINDOWS_1255,
-        1256 => encoding_rs::WINDOWS_1256,
-        1257 => encoding_rs::WINDOWS_1257,
-        1258 => encoding_rs::WINDOWS_1258,
-        20127 | 65001 => encoding_rs::UTF_8,
-        _ => encoding_rs::UTF_8,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn decode_output(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+fn decode_truncated_output(bytes: &[u8]) -> String {
+    super::shell_output::decode_truncated_shell_output(bytes)
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -207,7 +141,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
 fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for key in SAFE_ENV_VARS
+    for key in SAFE_SHELL_ENV_VARS
         .iter()
         .copied()
         .chain(security.shell_env_passthrough.iter().map(|s| s.as_str()))
@@ -283,7 +217,11 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution(command, approved) {
+        match self.security.validate_command_execution_for_shell(
+            command,
+            approved,
+            self.runtime.shell_dialect(),
+        ) {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -292,6 +230,21 @@ impl Tool for ShellTool {
                     error: Some(reason),
                 });
             }
+        }
+
+        // Own the workspace-resolving forbidden-path scan here, dialect-aware,
+        // rather than relying on an outer generic path guard that defaults to
+        // POSIX. This keeps symlink-escape hardening while allowing cmd.exe's
+        // null device only on the native Windows execution path.
+        if let Some(path) = self
+            .security
+            .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Path blocked by security policy: {path}")),
+            });
         }
 
         // Execute with timeout to prevent hanging commands.
@@ -306,7 +259,9 @@ impl Tool for ShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to build runtime command: {e}")),
+                    error: Some(super::runtime_command_error::format_runtime_command_error(
+                        &e,
+                    )),
                 });
             }
         };
@@ -400,8 +355,8 @@ impl Tool for ShellTool {
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = decode_output(&stdout_capture.bytes);
-                    let mut stderr = decode_output(&stderr_capture.bytes);
+                    let mut stdout = decode_capture(&stdout_capture);
+                    let mut stderr = decode_capture(&stderr_capture);
 
                     if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
                         append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
@@ -465,6 +420,15 @@ struct DrainHandle {
 struct DrainOutput {
     bytes: Vec<u8>,
     truncated: bool,
+    complete: bool,
+}
+
+fn decode_capture(capture: &DrainOutput) -> String {
+    if capture.truncated || !capture.complete {
+        decode_truncated_output(&capture.bytes)
+    } else {
+        decode_output(&capture.bytes)
+    }
 }
 
 fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
@@ -509,12 +473,20 @@ async fn drain_capped_into<R>(
 {
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
+        if let Ok(mut capture) = output.lock() {
+            capture.complete = true;
+        }
         return;
     };
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                if let Ok(mut capture) = output.lock() {
+                    capture.complete = true;
+                }
+                break;
+            }
             Ok(n) => {
                 let Ok(mut capture) = output.lock() else {
                     break;
@@ -557,6 +529,51 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct ErrorAfterBytes {
+        bytes: Option<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for ErrorAfterBytes {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(bytes) = self.bytes.take() {
+                buf.put_slice(&bytes);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_drain_preserves_utf8_prefix_below_capture_limit() {
+        let mut bytes = "€".repeat(12).into_bytes();
+        bytes.push(0xe2);
+        let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+
+        drain_capped_into(
+            Some(ErrorAfterBytes { bytes: Some(bytes) }),
+            MAX_OUTPUT_BYTES,
+            Arc::clone(&output),
+        )
+        .await;
+
+        let capture = output.lock().unwrap().clone();
+        assert!(!capture.complete);
+        assert!(!capture.truncated);
+        let decoded = decode_capture(&capture);
+        assert!(
+            decoded.starts_with(&"€".repeat(12)),
+            "decoded text: {decoded:?}"
+        );
+        assert!(decoded.ends_with('\u{fffd}'), "decoded text: {decoded:?}");
+    }
 
     #[test]
     fn android_child_path_prefixes_platform_dirs_with_tui_path_winning() {
@@ -579,9 +596,10 @@ mod tests {
         let _ = zeroclaw_api::platform::is_android();
     }
     use super::*;
-    use crate::platform::{NativeRuntime, RuntimeAdapter};
+    use crate::platform::{DockerRuntime, NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+    use zeroclaw_config::schema::DockerRuntimeConfig;
+    use zeroclaw_tools::wrappers::RateLimitedTool;
 
     #[tokio::test]
     async fn get_session_id_returns_scoped_session_key() {
@@ -609,6 +627,21 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_with_allowed_commands(
+        autonomy: AutonomyLevel,
+        commands: &[&str],
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: commands
+                .iter()
+                .map(|command| (*command).to_string())
+                .collect(),
             ..SecurityPolicy::default()
         })
     }
@@ -650,7 +683,7 @@ mod tests {
 
     #[cfg(windows)]
     fn medium_risk_write_command() -> &'static str {
-        "copy /Y NUL zeroclaw_shell_approval_test"
+        "copy NUL zeroclaw_shell_approval_test"
     }
 
     #[cfg(not(windows))]
@@ -665,17 +698,33 @@ mod tests {
             .expect("medium-risk test command should have a base command")
     }
 
-    /// Returns the fully-wrapped shell tool as it is composed in production:
-    /// RateLimited(PathGuarded(ShellTool)).  Tests that verify path-blocking or
-    /// rate-limiting behaviour must use this helper so they exercise the wrappers.
-    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
-        RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new(security.clone(), test_runtime()),
-                security.clone(),
-            ),
-            security,
-        )
+    /// The shell tool as assembled in production: `RateLimitedTool<ShellTool>`.
+    /// ShellTool owns its own dialect-aware command + forbidden-path validation,
+    /// so (like `SkillShellTool`) it is not wrapped in the generic POSIX
+    /// `PathGuardedTool`. Tests exercise this exact shape.
+    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<ShellTool> {
+        RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
+    }
+
+    /// A forbidden path argument is refused by whichever guard sees it first,
+    /// and the two guards word it differently. On a Windows shell dialect the
+    /// policy's own scan inside `validate_command_execution_for_shell` runs
+    /// before the tool body and reports `Command blocked: forbidden path
+    /// argument`; on POSIX dialects that scan is skipped (an operator may
+    /// legitimately allow absolute arguments there) and the refusal comes from
+    /// the shell tool's workspace scan as `Path blocked by security policy`.
+    /// Both are the same verdict, so assert the refusal rather than one
+    /// platform's phrasing.
+    fn assert_path_argument_blocked(result: &ToolResult, context: &str) {
+        assert!(
+            !result.success,
+            "{context}: the forbidden path argument must be refused, got: {result:?}"
+        );
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("Path blocked") || error.contains("forbidden path argument"),
+            "{context}: expected a path-guard refusal, got: {error:?}"
+        );
     }
 
     #[test]
@@ -702,6 +751,88 @@ mod tests {
                 .contains(&json!("command"))
         );
         assert!(schema["properties"]["approved"].is_object());
+    }
+
+    #[cfg(all(any(unix, windows), not(target_os = "android")))]
+    #[tokio::test]
+    async fn rebuilt_shell_tool_adopts_reloaded_runtime_shell_dialect() {
+        use crate::platform::{ShellDialect, create_runtime};
+        use zeroclaw_config::schema::Config;
+
+        let mut config = Config::default();
+        #[cfg(target_os = "windows")]
+        {
+            config.runtime.shell = Some("cmd".into());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            config.runtime.shell = Some("sh".into());
+        }
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let build_shell_tool = |config: &Config| {
+            let runtime: Arc<dyn RuntimeAdapter> =
+                Arc::from(create_runtime(&config.runtime).expect("runtime should rebuild"));
+            ShellTool::new(security.clone(), runtime)
+        };
+
+        let before_reload = build_shell_tool(&config);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            before_reload.runtime.shell_dialect(),
+            ShellDialect::WindowsCmd
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(before_reload.runtime.shell_dialect(), ShellDialect::Posix);
+        let before_result = before_reload
+            .execute(json!({"command": "echo Env:NAME"}))
+            .await
+            .expect("pre-reload shell should return a tool result");
+        assert!(
+            before_result.success,
+            "the pre-reload non-PowerShell policy should accept the probe: {before_result:?}"
+        );
+
+        // A daemon reload re-reads Config and rebuilds the subsystem graph.
+        // Use an executable shim named `pwsh` on Unix so the real runtime
+        // factory validates the reloaded value without requiring PowerShell to
+        // be installed; policy rejection occurs before the shim can spawn.
+        #[cfg(unix)]
+        let powershell_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let powershell = powershell_dir.path().join("pwsh");
+            std::fs::write(&powershell, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(&powershell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            config.runtime.shell = Some(powershell.to_string_lossy().into_owned());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            config.runtime.shell = Some("powershell".into());
+        }
+
+        let after_reload = build_shell_tool(&config);
+        assert_eq!(
+            after_reload.runtime.shell_dialect(),
+            ShellDialect::PowerShell
+        );
+        let after_result = after_reload
+            .execute(json!({"command": "echo Env:NAME", "approved": true}))
+            .await
+            .expect("reloaded shell should return a policy result");
+        assert!(!after_result.success);
+        assert!(
+            after_result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed")),
+            "the rebuilt PowerShell path must apply provider-aware validation: {after_result:?}"
+        );
     }
 
     #[tokio::test]
@@ -738,6 +869,97 @@ mod tests {
         assert!(result.error.is_none());
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_executes_windows_nul_redirect_through_cmd_exe() {
+        // Native-Windows runtime boundary through the FULLY WRAPPED production
+        // shape (`RateLimitedTool<ShellTool>`). `test_runtime()` is
+        // `NativeRuntime`, which reports `WindowsCmd`, so ShellTool's own
+        // dialect-aware validation accepts a redirect to the `nul` null device
+        // and cmd.exe then resolves `nul` to the discard-only device. Because the
+        // shell tool now owns its forbidden-path scan (no outer POSIX
+        // `PathGuardedTool`), the `\\.\nul` device form is no longer rejected
+        // ahead of the tool. Proves the allow decision AND real execution.
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+
+        // Bare `2>nul`: stderr is discarded, stdout is preserved, command succeeds.
+        let result = tool
+            .execute(json!({"command": "echo zeroclaw_nul_stdout 2>nul"}))
+            .await
+            .expect("`2>nul` command should return a result");
+        assert!(
+            result.success,
+            "`2>nul` must be allowed and execute on Windows: {:?}",
+            result.error
+        );
+        assert!(result.output.trim().contains("zeroclaw_nul_stdout"));
+        assert!(result.error.is_none());
+
+        // Full `\\.\nul` device form redirecting stdout: nothing is written to a
+        // real workspace file, and the command still succeeds.
+        let result = tool
+            .execute(json!({"command": r"echo zeroclaw_dev >\\.\nul"}))
+            .await
+            .expect(r"`>\\.\nul` command should return a result");
+        assert!(
+            result.success,
+            r"`>\\.\nul` must be allowed and execute on Windows: {:?}",
+            result.error
+        );
+        assert!(result.error.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn shell_rejects_nul_redirect_through_posix_production_shape() {
+        // The POSIX counterpart, through the same production shape. On a POSIX
+        // sink (Unix native, Docker `sh -c`, cron `sh -c`) `nul` is an ordinary
+        // relative filename, so a redirect to it — bare `nul` or the `\\.\nul`
+        // device form — must stay blocked as an unsafe file redirect. This is the
+        // boundary the fix protects: dropping the outer `PathGuardedTool` must not
+        // weaken POSIX rejection, because ShellTool's own dialect-aware scan runs.
+        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        for cmd in ["echo zeroclaw x >nul", r"echo zeroclaw x >\\.\nul"] {
+            let result = tool
+                .execute(json!({ "command": cmd }))
+                .await
+                .expect("command should return a result");
+            assert!(
+                !result.success,
+                "POSIX must reject a redirect to `nul` as an unsafe file target: {cmd}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_reports_invalid_docker_workspace_root() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
+        let missing_root = workspace.path().join("missing-root");
+        let missing_root_text = missing_root.to_string_lossy().into_owned();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime = Arc::new(DockerRuntime::new(DockerRuntimeConfig {
+            allowed_workspace_roots: vec![missing_root_text.clone()],
+            ..DockerRuntimeConfig::default()
+        }));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .expect("invalid Docker root should return a tool result");
+
+        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("Failed to canonicalize Docker workspace root"));
+        assert!(error.contains(missing_root_text.as_str()));
+    }
+
     #[tokio::test]
     async fn shell_blocks_disallowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -747,7 +969,207 @@ mod tests {
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        // Which guard refuses first is dialect-dependent: on POSIX hosts the
+        // allowlist/high-risk checks fire, while under the Windows shell
+        // dialect the forbidden-path scan sees `/` (current-drive root) first
+        // and refuses with its own message. All three are the required
+        // refusal; none may be weakened into a pass.
+        assert!(
+            error.contains("not allowed")
+                || error.contains("high-risk")
+                || error.contains("forbidden path argument"),
+            "expected a refusal reason, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_policy_blocks_powershell_native_high_risk_command() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({"command": "Remove-Item important.txt"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "PowerShell-native operation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_windows_relative_path_for_powershell() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "cat ..\\secret.txt"}))
+            .await
+            .expect("path rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("forbidden path argument")),
+            "Windows-relative path must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_powershell_stop_parsing_native_mutation() {
+        // `git --% push` would reach native Git as `push` on PowerShell while
+        // policy sees only `--%` as the first argument. The dialect-aware
+        // validator must reject it before the process is ever built, so the
+        // guard holds on this Unix host too.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["git".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "git --% push origin main"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "stop-parsing native mutation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_powershell_mixed_quoted_provider_path() {
+        // `cat E'nv:'PATH` binds as the `Env:PATH` provider read on PowerShell,
+        // but the interior quote hides the `Env:` prefix from policy's raw-token
+        // provider check. The bounded grammar rejects the mixed quoted/unquoted
+        // token so it is blocked before the process is ever built.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "cat E'nv:'PATH"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "mixed-quoted provider path must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let safe = tool
+            .execute(json!({
+                    "command": "Write-Output \"quoted safe value\" | Select-Object -First 1"
+            }))
+            .await
+            .expect("safe PowerShell pipeline should return a tool result");
+        assert!(safe.success, "{:?}", safe.error);
+        assert!(safe.output.contains("quoted safe value"), "{}", safe.output);
+
+        let dangerous = tool
+            .execute(json!({"command": "ac .\\blocked.txt value", "approved": true}))
+            .await
+            .expect("dangerous PowerShell alias should return a policy result");
+        assert!(!dangerous.success);
+        assert!(
+            dangerous
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            dangerous.error
+        );
+        assert!(!workspace.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn shell_uses_runtime_dialect_to_reject_powershell_expression_bypass() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["echo".into()],
+            ..SecurityPolicy::default()
+        });
+        // Policy rejection happens before spawn, so this test does not require
+        // pwsh to be installed on the host.
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({
+                "command": "echo ([System.IO.File]::Delete('important.txt'))"
+            }))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed")),
+            "PowerShell expression must be rejected before spawn: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
@@ -824,8 +1246,13 @@ mod tests {
     async fn shell_warns_on_ephemeral_workspace_failure_path() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
             .with_persistent_writes(false);
+        // Use a bare (non-path-looking) name so the command fails on a missing
+        // directory rather than being stopped by the shell tool's own forbidden-
+        // path guard. An absolute `/nonexistent...` would be rejected before it
+        // ever runs, and this test is about the ephemeral banner on a *runtime*
+        // failure, not about path gating.
         let result = tool
-            .execute(json!({"command": "ls /nonexistent_dir_xyz_4627"}))
+            .execute(json!({"command": "ls nonexistent_dir_xyz_4627"}))
             .await
             .expect("command should return a result");
         assert!(!result.success);
@@ -882,70 +1309,109 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_absolute_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["cat"],
+        ));
         let result = tool
             .execute(json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
             .expect("absolute path argument should be blocked");
-        assert!(!result.success);
+        assert_path_argument_blocked(&result, "absolute path argument");
+    }
+
+    /// End-to-end regression for the shell workspace-boundary bypass: driving
+    /// the REAL wrapped shell tool, a write through an in-workspace symlink
+    /// pointing outside must be refused before the command runs, and nothing may
+    /// be created at the target. This covers only the direct path-shaped
+    /// redirect form the static scan can see; dynamic forms (scripts,
+    /// expansion, races) are outside this layer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_blocks_symlink_escape_end_to_end() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_shell_e2e_symlink_escape_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // `link` inside the workspace points at the outside directory.
+        symlink(&outside, workspace.join("link")).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = wrapped_shell(security);
+
+        let result = tool
+            .execute(json!({"command": "echo pwned > link/escape.txt", "approved": true}))
+            .await
+            .expect("shell tool must return a result");
+
+        assert!(!result.success, "the escaping write must be refused");
         assert!(
             result
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("Path blocked")
+                .contains("Path blocked"),
+            "expected a path-block error, got: {:?}",
+            result.error
         );
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "no file may be written outside the workspace through the symlink"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn shell_blocks_option_assignment_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["grep"],
+        ));
         let result = tool
             .execute(json!({"command": format!("grep --file={} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("option-assigned forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "option-assigned forbidden path");
     }
 
     #[tokio::test]
     async fn shell_blocks_short_option_attached_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["grep"],
+        ));
         let result = tool
             .execute(json!({"command": format!("grep -f{} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("short option attached forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "short option attached forbidden path");
     }
 
     #[tokio::test]
     async fn shell_blocks_tilde_user_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["cat"],
+        ));
         let result = tool
             .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
             .await
             .expect("tilde-user path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "tilde-user path");
     }
 
     #[tokio::test]
@@ -1165,10 +1631,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
+        let workspace = tempfile::TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec![medium_risk_write_base().into()],
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir: workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
 
@@ -1193,10 +1660,7 @@ mod tests {
             }))
             .await
             .expect("approved command execution should succeed");
-        assert!(allowed.success);
-
-        let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+        assert!(allowed.success, "{:?}", allowed.error);
     }
 
     // ── shell timeout enforcement tests ─────────────────
@@ -1321,11 +1785,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_invalid_utf8_uses_replacement_chars() {
-        // 0xFF is not valid UTF-8
+    fn decode_output_invalid_utf8_is_safe() {
+        // 0xFF is not valid UTF-8. Detection may select a legacy encoding,
+        // but the output must remain usable and must never panic.
         let input = b"hello\xFF world";
         let result = super::decode_output(input);
-        // Must not panic; non-UTF-8 bytes become replacement characters on non-Windows
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
     }
@@ -1333,64 +1797,6 @@ mod tests {
     #[test]
     fn decode_output_empty_bytes_returns_empty_string() {
         assert_eq!(super::decode_output(b""), "");
-    }
-
-    #[test]
-    fn windows_code_page_mapping_covers_cjk() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(936), encoding_rs::GBK);
-        assert_eq!(windows_code_page_to_encoding(932), encoding_rs::SHIFT_JIS);
-        assert_eq!(windows_code_page_to_encoding(949), encoding_rs::EUC_KR);
-        assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_utf8_variants() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(65001), encoding_rs::UTF_8);
-        assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn decode_output_with_cp936_gbk_bytes_transcodes_to_utf8() {
-        // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
-        let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
-        let decoded = super::decode_output_with_code_page(gbk_bytes, 936);
-        assert_eq!(decoded, "你好");
-        assert!(!decoded.contains('\u{FFFD}'));
-    }
-
-    #[test]
-    fn shell_safe_env_vars_excludes_secrets() {
-        for var in SAFE_ENV_VARS {
-            let lower = var.to_lowercase();
-            assert!(
-                !lower.contains("key") && !lower.contains("secret") && !lower.contains("token"),
-                "SAFE_ENV_VARS must not include sensitive variable: {var}"
-            );
-        }
-    }
-
-    #[test]
-    fn shell_safe_env_vars_includes_essentials() {
-        assert!(
-            SAFE_ENV_VARS.contains(&"PATH"),
-            "PATH must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"HOME") || SAFE_ENV_VARS.contains(&"USERPROFILE"),
-            "HOME or USERPROFILE must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"TERM"),
-            "TERM must be in safe env vars"
-        );
     }
 
     #[tokio::test]
@@ -1521,7 +1927,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_is_passed_to_subprocess() {
-        // A var that is NOT in SAFE_ENV_VARS and NOT in passthrough —
+        // A var that is NOT in SAFE_SHELL_ENV_VARS and NOT in passthrough —
         // it should only appear if tui_env injects it.
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
@@ -1562,7 +1968,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_overrides_safe_var() {
-        // tui_env wins over the process-level value for a var that is also in SAFE_ENV_VARS.
+        // tui_env wins over the process-level value for a var that is also in SAFE_SHELL_ENV_VARS.
         // This lets the TUI's PATH (e.g. with nix/brew) win over the daemon's PATH.
         let home_key = home_env_key();
         let _guard = EnvGuard::set(home_key, "daemon-home");
@@ -1599,7 +2005,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_none_behaves_like_existing() {
         // with_tui_env(None) must be identical to no tui_env at all —
-        // only SAFE_ENV_VARS + passthrough reach the subprocess.
+        // only SAFE_SHELL_ENV_VARS + passthrough reach the subprocess.
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
 
         let result = tool
@@ -1618,7 +2024,7 @@ mod tests {
     async fn shell_tui_env_secrets_reach_subprocess_but_not_safe_list() {
         // The whole point: secrets from the TUI env (e.g. SSH_AUTH_SOCK)
         // DO reach the subprocess via tui_env even though they are not
-        // in SAFE_ENV_VARS.
+        // in SAFE_SHELL_ENV_VARS.
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
                 let mut m = std::collections::HashMap::new();
@@ -1628,8 +2034,8 @@ mod tests {
 
         // Confirm SSH_AUTH_SOCK is not in the safe list (would be a bug if it were)
         assert!(
-            !SAFE_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
-            "SSH_AUTH_SOCK must not be in SAFE_ENV_VARS"
+            !SAFE_SHELL_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
+            "SSH_AUTH_SOCK must not be in SAFE_SHELL_ENV_VARS"
         );
 
         let result = tool

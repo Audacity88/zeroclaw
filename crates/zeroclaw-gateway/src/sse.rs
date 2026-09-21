@@ -33,7 +33,10 @@ impl EventBuffer {
 
     /// Push an event into the buffer, evicting the oldest if at capacity.
     pub fn push(&self, event: serde_json::Value) {
-        let mut buf = self.inner.lock().unwrap();
+        let mut buf = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if buf.len() == self.capacity {
             buf.pop_front();
         }
@@ -42,7 +45,11 @@ impl EventBuffer {
 
     /// Return a snapshot of all buffered events (oldest first).
     pub fn snapshot(&self) -> Vec<serde_json::Value> {
-        self.inner.lock().unwrap().iter().cloned().collect()
+        let buf = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        buf.iter().cloned().collect()
     }
 }
 
@@ -332,6 +339,12 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 channel,
                 agent_alias,
                 turn_id,
+                token_budget,
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
+                unsatisfiable_floor,
             } => {
                 let mut json = serde_json::json!({
                     "type": "history_trimmed",
@@ -341,6 +354,24 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                     "reason": reason,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
+                if let Some(token_budget) = token_budget {
+                    json["token_budget"] = (*token_budget).into();
+                }
+                if let Some(tokens_before) = tokens_before {
+                    json["tokens_before"] = (*tokens_before).into();
+                }
+                if let Some(tokens_after) = tokens_after {
+                    json["tokens_after"] = (*tokens_after).into();
+                }
+                if let Some(tokens_before_source) = tokens_before_source {
+                    json["tokens_before_source"] = tokens_before_source.as_str().into();
+                }
+                if let Some(tokens_after_source) = tokens_after_source {
+                    json["tokens_after_source"] = tokens_after_source.as_str().into();
+                }
+                if let Some(unsatisfiable_floor) = unsatisfiable_floor {
+                    json["unsatisfiable_floor"] = (*unsatisfiable_floor).into();
+                }
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
                 add_optional_string(&mut json, "turn_id", turn_id);
@@ -374,6 +405,25 @@ mod tests {
     // The broadcast hook is process-wide; serialize hook-touching tests
     // within this test binary so they don't observe each other's state.
     static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn event_buffer_recovers_after_a_poisoned_writer() {
+        let buffer = Arc::new(EventBuffer::new(4));
+        let poisoned = buffer.clone();
+        let result = std::thread::spawn(move || {
+            let mut guard = poisoned.inner.lock().expect("fresh buffer must lock");
+            guard.push_back(serde_json::json!({"sequence": 1}));
+            panic!("poison event buffer");
+        })
+        .join();
+        assert!(result.is_err());
+
+        buffer.push(serde_json::json!({"sequence": 2}));
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0]["sequence"], 1);
+        assert_eq!(snapshot[1]["sequence"], 2);
+    }
 
     fn make_broadcast() -> (
         Arc<BroadcastObserver>,
@@ -443,6 +493,12 @@ mod tests {
             channel: Some("wss".into()),
             agent_alias: Some("trimtest".into()),
             turn_id: Some("turn-1".into()),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            unsatisfiable_floor: None,
         });
 
         let value = rx.try_recv().expect("history_trimmed must broadcast");
@@ -451,10 +507,45 @@ mod tests {
         assert_eq!(value["dropped_messages"], 12);
         assert_eq!(value["kept_turns"], 1);
         assert_eq!(value["reason"], "context token budget exceeded");
+        assert_eq!(value["token_budget"], 500_000);
+        assert_eq!(value["tokens_before"], 612_000);
+        assert_eq!(value["tokens_after"], 117_000);
+        assert_eq!(value["tokens_before_source"], "provider");
+        assert_eq!(value["tokens_after_source"], "calibrated");
         assert_eq!(value["channel"], "wss");
         assert_eq!(value["agent_alias"], "trimtest");
         assert_eq!(value["turn_id"], "turn-1");
         assert!(is_public_sse_event(&value));
+    }
+
+    #[test]
+    fn history_trimmed_without_token_accounting_omits_token_fields() {
+        // Message-limit trims carry no token data; the broadcast must not emit
+        // null placeholder keys, so older clients keep parsing the frame.
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "history message limit exceeded".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        let value = rx.try_recv().expect("history_trimmed must broadcast");
+        assert_eq!(value["type"], "history_trimmed");
+        assert!(value.get("token_budget").is_none());
+        assert!(value.get("tokens_before").is_none());
+        assert!(value.get("tokens_after").is_none());
+        assert!(value.get("tokens_before_source").is_none());
+        assert!(value.get("tokens_after_source").is_none());
     }
 
     #[test]
@@ -876,7 +967,9 @@ mod tests {
     ) -> Arc<zeroclaw_runtime::security::pairing::PairingGuard> {
         let owned: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
         Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
-            require, &owned,
+            require,
+            &owned,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
         ))
     }
 
