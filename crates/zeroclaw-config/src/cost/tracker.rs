@@ -40,10 +40,15 @@ pub struct SubtreeSpend {
 /// One UTC day's worth of descendant spend in a [`SubtreeSpend`] entry.
 /// The stored total counts toward `day`'s ceiling check only: reads for
 /// any other day see zero, so a stale day's spend never leaks into
-/// another day's check.
+/// another day's check. `day` is `None` until the first record opens the
+/// slot: the entry is created when its tracker is derived, not when its
+/// first descendant spend arrives, so an unopened slot must not behave
+/// as if the derivation day had already accumulated spend (a record
+/// stamped before the derivation would otherwise be dropped as older
+/// than a day that never opened).
 #[derive(Clone, Copy)]
 struct DescendantSpend {
-    day: NaiveDate,
+    day: Option<NaiveDate>,
     usd: f64,
 }
 
@@ -53,7 +58,7 @@ impl SubtreeSpend {
             alias: alias.to_string(),
             daily_ceiling_usd,
             descendant_spend: Mutex::new(DescendantSpend {
-                day: Utc::now().date_naive(),
+                day: None,
                 usd: 0.0,
             }),
         }
@@ -65,19 +70,37 @@ impl SubtreeSpend {
     /// the stored slot.
     fn descendants_usd_for(&self, day: NaiveDate) -> f64 {
         let spend = *self.descendant_spend.lock();
-        if spend.day == day { spend.usd } else { 0.0 }
+        if spend.day == Some(day) {
+            spend.usd
+        } else {
+            0.0
+        }
     }
 
-    /// Add `cost_usd` of descendant spend to `day`'s total, resetting the
-    /// stored slot to `day` at zero first when it holds another day, so
-    /// each UTC day starts from zero exactly like the ledger's daily
-    /// aggregates.
+    /// Add `cost_usd` of descendant spend to `day`'s total. The first
+    /// record opens the slot on its own day. After a day is open, a
+    /// record for a NEWER day (the UTC rollover) resets the stored slot
+    /// to `day` at zero first, so each UTC day starts from zero exactly
+    /// like the ledger's daily aggregates; a record for the SAME day
+    /// adds into that day's total; and a record for an OLDER day is
+    /// dropped: the slot was already opened by a newer record (a usage
+    /// stamped just before UTC midnight can be persisted just after
+    /// another record already opened the new day), and resetting the
+    /// slot back to the older day would lose the new day's accumulated
+    /// spend at the next add. The older day's ceiling checks are over,
+    /// and its ledger row still lands on its own day either way, so
+    /// nothing else needs the stale amount.
     fn add_descendant_spend(&self, day: NaiveDate, cost_usd: f64) {
         let mut spend = self.descendant_spend.lock();
-        if spend.day != day {
-            *spend = DescendantSpend { day, usd: 0.0 };
+        if spend.day.is_none_or(|stored| stored < day) {
+            *spend = DescendantSpend {
+                day: Some(day),
+                usd: 0.0,
+            };
         }
-        spend.usd += cost_usd;
+        if spend.day == Some(day) {
+            spend.usd += cost_usd;
+        }
     }
 }
 
@@ -3349,5 +3372,93 @@ mod tests {
             }
             other => panic!("expected ancestor-scoped Exceeded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn subtree_descendant_spend_ignores_record_from_earlier_day() {
+        // A record stamped on an EARLIER day than the accumulator's
+        // stored slot (a usage recorded just before UTC midnight,
+        // persisted just after another record already opened the new day)
+        // must not reset the slot back to the older day: the new day's
+        // accumulated spend survives, and the older day reads zero
+        // because its record was dropped from the accumulator (its
+        // ledger row still lands on its own day).
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        let day_d = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let day_d1 = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let period = |day: NaiveDate| ReportingPeriod {
+            day,
+            year: day.year(),
+            month: day.month(),
+        };
+        let usage_on = |cost_usd: f64, day: NaiveDate| {
+            usage_costing_at(
+                cost_usd,
+                Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap()),
+            )
+        };
+
+        let parent_scope = base.derived_for_agent("parent", 1.0);
+        let child = base.derived_for_agent_in_chain(
+            "child",
+            10.0,
+            parent_scope.subtree_chain_for_children(),
+        );
+
+        // Day D+1's slot opens with $0.50 of descendant spend, then a
+        // day-D record arrives late (out-of-order persistence around UTC
+        // midnight) with $0.80.
+        child
+            .record_usage_with_agent(usage_on(0.50, day_d1), Some("child"))
+            .unwrap();
+        child
+            .record_usage_with_agent(usage_on(0.80, day_d), Some("child"))
+            .unwrap();
+
+        // Day D+1's total is unchanged: the ancestor's day-D+1 check
+        // still counts exactly the $0.50 that landed on day D+1, so the
+        // $0.60 estimate is refused with the $0.50 current.
+        match parent_scope
+            .check_budget_at_period(0.60, period(day_d1))
+            .unwrap()
+        {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 0.50).abs() < 1e-9,
+                    "day D+1 must keep its own $0.50 total: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded on day D+1, got {other:?}"),
+        }
+
+        // Day D reads zero: the late day-D record was dropped from the
+        // accumulator, so the same estimate passes the ancestor's day-D
+        // check instead of seeing the stale $0.80.
+        assert!(
+            matches!(
+                parent_scope
+                    .check_budget_at_period(0.60, period(day_d))
+                    .unwrap(),
+                BudgetCheck::Allowed
+            ),
+            "day D must read zero descendant spend: the older record was dropped"
+        );
     }
 }
