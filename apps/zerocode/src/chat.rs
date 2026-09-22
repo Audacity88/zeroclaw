@@ -1153,12 +1153,19 @@ impl Chat {
             if retained_was_focused {
                 self.resume_focused = None;
             }
-            // Closed the focused session: promote the next tracked one (sidebar
-            // order), else fall back to the agent picker.
+            // Closed the focused session: prefer the previously focused
+            // session (last_focused_sid) so focus returns where the user last
+            // was, else promote the next tracked one (sidebar order), else fall
+            // back to the agent picker.
             let next_idx = self
-                .session_order
-                .iter()
-                .find_map(|sid| self.background.iter().position(|s| &s.session_id == sid))
+                .last_focused_sid
+                .as_ref()
+                .and_then(|sid| self.background.iter().position(|s| &s.session_id == sid))
+                .or_else(|| {
+                    self.session_order
+                        .iter()
+                        .find_map(|sid| self.background.iter().position(|s| &s.session_id == sid))
+                })
                 .or_else(|| (!self.background.is_empty()).then_some(0));
             match next_idx {
                 Some(idx) => {
@@ -21377,10 +21384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_n_keeps_its_turn_in_flight_guard() {
-        // The chord keeps the guard it had before it became additive: the
-        // conversation is not swapped out from under a running turn. `[+]`
-        // stays the surface for that case.
+    async fn ctrl_n_opens_the_add_session_picker_during_a_running_turn() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -21398,8 +21402,8 @@ mod tests {
         .await;
 
         assert!(
-            !chat.take_add_session_request(),
-            "a running turn still refuses the new-session chord"
+            chat.take_add_session_request(),
+            "a running turn must allow the additive new-session chord"
         );
     }
 

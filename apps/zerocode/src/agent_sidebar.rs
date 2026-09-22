@@ -161,6 +161,7 @@ pub(crate) struct AgentSidebar {
     minus_target: Option<(PaneKind, String)>,
     plus_rect: Rect,
     row_rects: Vec<(PaneKind, String, Rect)>,
+    row_close_rects: Vec<(PaneKind, String, Rect)>,
     picker: Option<SidebarPicker>,
     /// Last successful display list, valid only for this RPC connection.
     cached_aliases: Vec<String>,
@@ -177,6 +178,7 @@ impl AgentSidebar {
             minus_target: None,
             plus_rect: Rect::default(),
             row_rects: Vec::new(),
+            row_close_rects: Vec::new(),
             picker: None,
             cached_aliases: Vec::new(),
             cache_rpc: Weak::new(),
@@ -204,6 +206,7 @@ impl AgentSidebar {
         self.minus_target = None;
         self.plus_rect = Rect::default();
         self.row_rects.clear();
+        self.row_close_rects.clear();
     }
 
     /// Render the Sessions section into the shell-computed rectangle.
@@ -380,9 +383,14 @@ impl AgentSidebar {
             // (the daemon's turn-end count) plus an optimistic in-flight user
             // message; the switch picker's counts come from the daemon's
             // durable store. The two measure different things and can differ.
+            let close_width = u16::from(row_rect.width >= 6) * 2;
+            let content_rect = Rect {
+                width: row_rect.width.saturating_sub(close_width),
+                ..row_rect
+            };
             let count_label = format!(" ({count})");
             let count_width = crate::display_width::display_width(&count_label);
-            let available = (row_rect.width as usize).saturating_sub(2 + count_width);
+            let available = (content_rect.width as usize).saturating_sub(2 + count_width);
             // Keep the name before optional date metadata.
             let show_date = available >= date_width + 5;
             let name_width = available.saturating_sub(if show_date { date_width + 1 } else { 0 });
@@ -406,9 +414,34 @@ impl AgentSidebar {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(date, theme::dim_style()));
             }
-            frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), row_rect);
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(row_style),
+                content_rect,
+            );
             self.row_rects
                 .push((summary.pane_kind, summary.session_id.clone(), row_rect));
+            if close_width > 0 {
+                let close_rect = Rect {
+                    x: content_rect.right(),
+                    y: row_rect.y,
+                    width: close_width,
+                    height: 1,
+                };
+                let close_style = if focused_here {
+                    theme::selection_highlight(true, true)
+                } else {
+                    theme::dim_style()
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled("\u{2715}", close_style)),
+                    close_rect,
+                );
+                self.row_close_rects.push((
+                    summary.pane_kind,
+                    summary.session_id.clone(),
+                    close_rect,
+                ));
+            }
         }
     }
 
@@ -566,6 +599,14 @@ impl AgentSidebar {
                 {
                     return Some(SidebarEvent::CloseSession { pane, session_id });
                 }
+                for (pane, sid, rect) in &self.row_close_rects {
+                    if mouse::in_rect(col, row, *rect) {
+                        return Some(SidebarEvent::CloseSession {
+                            pane: *pane,
+                            session_id: sid.clone(),
+                        });
+                    }
+                }
                 for (pane, sid, rect) in &self.row_rects {
                     if mouse::in_rect(col, row, *rect) {
                         return Some(SidebarEvent::FocusSession {
@@ -674,6 +715,7 @@ mod tests {
             minus_target: None,
             plus_rect: Rect::default(),
             row_rects: Vec::new(),
+            row_close_rects: Vec::new(),
             picker: None,
             cached_aliases: Vec::new(),
             cache_rpc: Weak::new(),
@@ -746,6 +788,7 @@ mod tests {
         assert!(s.plus_rect.width > 0, "plus affordance recorded");
         let rect = s.minus_rect;
         assert_eq!(s.minus_target, Some((PaneKind::Chat, "s1".into())));
+        assert_eq!(s.row_close_rects.len(), 2);
         let first_row = rendered_row(term.backend().buffer(), s.row_rects[0].2);
         assert!(first_row.contains("alpha #1"));
         let expected_date = chrono::DateTime::parse_from_rfc3339("2026-01-02T12:00:00Z")
@@ -770,6 +813,14 @@ mod tests {
             Some(SidebarEvent::FocusSession {
                 pane: PaneKind::Chat,
                 session_id: sid,
+            })
+        );
+        let (_, _, row_close) = s.row_close_rects[1].clone();
+        assert_eq!(
+            s.handle_mouse(&click(row_close.x, row_close.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "s2".into(),
             })
         );
         assert_eq!(
@@ -816,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn running_row_keeps_count_and_header_close_target() {
+    fn running_row_keeps_count_and_both_close_targets() {
         let mut sidebar = sidebar();
         let area = Rect::new(0, 0, 40, 8);
         let mut row = summary("long-agent-name", "s1", true);
@@ -845,6 +896,14 @@ mod tests {
         let close = sidebar.minus_rect;
         assert_eq!(
             sidebar.handle_mouse(&click(close.x, close.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "s1".into(),
+            })
+        );
+        let (_, _, row_close) = sidebar.row_close_rects[0].clone();
+        assert_eq!(
+            sidebar.handle_mouse(&click(row_close.x, row_close.y)),
             Some(SidebarEvent::CloseSession {
                 pane: PaneKind::Chat,
                 session_id: "s1".into(),
@@ -960,10 +1019,10 @@ mod tests {
         assert!(chat_row.contains("same-agent #1"));
         assert!(chat_row.contains(&expected_date));
         assert!(!chat_row.contains(&t("zc-pane-chat")));
-        assert!(!chat_row.contains("\u{2715}"));
+        assert!(chat_row.contains("\u{2715}"));
         assert!(code_row.contains("same-agent #1"));
         assert!(!code_row.contains(&t("zc-pane-code")));
-        assert!(!code_row.contains("\u{2715}"));
+        assert!(code_row.contains("\u{2715}"));
     }
 
     #[test]
@@ -985,7 +1044,7 @@ mod tests {
         let row = rendered_row(term.backend().buffer(), s.row_rects[0].2);
         assert!(row.contains("agent #1"));
         assert!(row.contains(&t("zc-sidebar-date-placeholder")));
-        assert!(!row.contains("\u{2715}"));
+        assert!(row.contains("\u{2715}"));
     }
 
     #[test]
@@ -1036,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn session_controls_are_distinct_and_rows_only_focus() {
+    fn session_controls_are_distinct_and_rows_expose_close_targets() {
         for width in [crate::config::SIDEBAR_WIDTH_MIN, 40] {
             let mut s = sidebar();
             let area = Rect::new(0, 0, width, 8);
@@ -1068,11 +1127,23 @@ mod tests {
                     assert_eq!(s.handle_mouse(&click(x, rect.y)), Some(action.clone()));
                 }
             }
-            for (pane, session_id, rect) in s.row_rects.clone() {
-                for x in rect.x..rect.right() {
+            assert_eq!(s.row_close_rects.len(), s.row_rects.len());
+            for (idx, (pane, session_id, rect)) in s.row_rects.clone().into_iter().enumerate() {
+                let (close_pane, close_session_id, close_rect) = s.row_close_rects[idx].clone();
+                assert_eq!((close_pane, &close_session_id), (pane, &session_id));
+                for x in rect.x..close_rect.x {
                     assert_eq!(
                         s.handle_mouse(&click(x, rect.y)),
                         Some(SidebarEvent::FocusSession {
+                            pane,
+                            session_id: session_id.clone()
+                        })
+                    );
+                }
+                for x in close_rect.x..close_rect.right() {
+                    assert_eq!(
+                        s.handle_mouse(&click(x, close_rect.y)),
+                        Some(SidebarEvent::CloseSession {
                             pane,
                             session_id: session_id.clone()
                         })
