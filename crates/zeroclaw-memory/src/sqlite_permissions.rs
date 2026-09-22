@@ -63,6 +63,10 @@ fn validate_file_metadata(metadata: &std::fs::Metadata) -> anyhow::Result<()> {
         "SQLite storage file has multiple links"
     );
     anyhow::ensure!(
+        metadata.permissions().mode() & 0o600 == 0o600,
+        "SQLite storage file lacks owner read/write permissions; repair its permissions before reopening"
+    );
+    anyhow::ensure!(
         metadata.permissions().mode() & 0o077 == 0,
         "SQLite storage file has group or other permissions; repair its permissions before reopening"
     );
@@ -220,6 +224,31 @@ mod tests {
             assert!(prepare_sqlite_storage(root.path(), "response_cache.db").is_err());
             assert_eq!(mode(&entry), 0o666);
             assert_eq!(std::fs::read(entry).unwrap(), b"unchanged");
+        }
+    }
+
+    #[test]
+    fn sqlite_storage_constructors_reject_nonwritable_existing_files_without_chmod() {
+        for database in ["response_cache.db", "audit.db"] {
+            for rejected_mode in [0o400, 0o000] {
+                let root = TempDir::new().unwrap();
+                open_store(root.path(), database).unwrap();
+                let db = root.path().join("memory").join(database);
+                let original_bytes = std::fs::read(&db).unwrap();
+                std::fs::set_permissions(&db, std::fs::Permissions::from_mode(rejected_mode))
+                    .unwrap();
+
+                let error = open_store(root.path(), database).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("lacks owner read/write permissions"),
+                    "{database} {rejected_mode:o}: {error:#}"
+                );
+                assert_eq!(mode(&db), rejected_mode, "{database}");
+                std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(std::fs::read(&db).unwrap(), original_bytes, "{database}");
+            }
         }
     }
 
