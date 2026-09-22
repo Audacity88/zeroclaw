@@ -144,7 +144,9 @@ The lifecycle operations have distinct durable meanings:
 
 - `session/close` may retain durable resumable history.
 - `session/kill` retains the history but marks the row as tombstoned, so it is not eligible for runtime rehydration.
-- `session/delete` removes the ACP row and its recoverable checkpoint before unregistering and removing the live session when the target is a live ACP session, or when no live mode exists and an ACP durable row is selected. A live same-ID Chat session remains isolated from ACP storage. If the selected SQLite deletion fails, the RPC reports an internal error and preserves the live owner and channel registration.
+- `session/delete` removes the ACP row and its recoverable checkpoint before unregistering and removing the live session when the target is a live ACP session, or when no live mode exists and an ACP durable row is selected. A live same-ID Chat session remains isolated from ACP storage.
+
+Kill and delete signal cancellation before attempting their fallible SQLite operation. If that operation fails for an idle target, the RPC reports an internal error and preserves the live owner and channel registration. If hard cancellation has already removed an active owner, the RPC cannot restore that live generation; the durable row and recoverable checkpoint remain available once storage is working again.
 
 ## Ephemeral mode
 
