@@ -702,44 +702,33 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
-        // This channel historically accepted a surrounding-whitespace wildcard
-        // (`entry.trim() == "*"`), which is broader than the shared helper's
-        // exact `"*"` check, so keep that pre-check here.
-        if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
-            return true;
-        }
-        crate::allowlist::is_user_allowed_by(allowed_numbers, phone, |entry, phone| {
-            match (
-                Self::normalize_phone_token(entry),
-                Self::normalize_phone_token(phone),
-            ) {
-                (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
-                _ => false,
-            }
-        })
+        Self::are_numbers_allowed_for_list(allowed_numbers, &[phone])
     }
 
-    /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
-    /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
+    /// One sender reaches this channel under several numbers (its JID, the
+    /// alternate JID and the LID mapping), so they are evaluated as one
+    /// account: a deny naming any of them rejects the sender, whichever number
+    /// would otherwise have carried the grant.
+    #[cfg(feature = "whatsapp-web")]
+    fn are_numbers_allowed_for_list(allowed_numbers: &[String], phones: &[&str]) -> bool {
+        // The surrounding-whitespace wildcard this channel accepts is now what
+        // the shared helper accepts, so there is no broader local notion of the
+        // wildcard left to keep in step with the deny check.
+        crate::allowlist::is_identity_allowed_by(allowed_numbers, phones, Self::phone_matches)
+    }
+
+    /// Both WhatsApp surfaces admit the same accounts, so the raw / `+E.164` /
+    /// JID identity rule lives once in [`crate::whatsapp`] and both call it.
+    /// Keeping a second copy here let the two drift, and the Cloud webhook was
+    /// left comparing exactly while this path canonicalized.
+    #[cfg(feature = "whatsapp-web")]
+    fn phone_matches(entry: &str, phone: &str) -> bool {
+        crate::whatsapp::phone_matches(entry, phone)
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone_token(value: &str) -> Option<String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let user_part = trimmed
-            .split_once('@')
-            .map(|(user, _)| user)
-            .unwrap_or(trimmed)
-            .trim();
-
-        let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            None
-        } else {
-            Some(format!("+{digits}"))
-        }
+        crate::whatsapp::normalize_phone_token(value)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -817,10 +806,19 @@ impl WhatsAppWebChannel {
             None
         };
         let candidates = Self::sender_phone_candidates(sender, sender_alt, mapped_phone.as_deref());
-        let allowed_phone = candidates
-            .iter()
-            .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
-            .cloned();
+        // Authorize the sender as one account first, so a deny naming any of
+        // its numbers is not sidestepped by another number of the same sender.
+        // Only then pick the number to report downstream.
+        let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let allowed_phone = if Self::are_numbers_allowed_for_list(allowed_numbers, &candidate_refs)
+        {
+            candidates
+                .iter()
+                .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
+                .cloned()
+        } else {
+            None
+        };
 
         SenderAllowlistResolution {
             mapped_phone,
@@ -1808,6 +1806,7 @@ impl WhatsAppWebChannel {
                 explicitly_addressed: false,
                 conversation_scope,
                 references: Vec::new(),
+                voice_origin: false,
             })
             .await
         {
@@ -3127,6 +3126,7 @@ impl Channel for WhatsAppWebChannel {
                                                 "whatsapp",
                                                 alias.as_ref(),
                                                 &format!("+{digits}"),
+                                                Self::phone_matches,
                                             )
                                             .await
                                     {
@@ -3357,6 +3357,42 @@ impl Channel for WhatsAppWebChannel {
     async fn health_check(&self) -> bool {
         let bot_handle_guard = self.bot_handle.lock();
         bot_handle_guard.is_some()
+    }
+
+    fn supports_native_polls(&self) -> bool {
+        true
+    }
+
+    /// Post a native WhatsApp poll. Unlike `send`, a recipient outside the
+    /// allowlist is an error rather than a silent no-op: this is a tool call,
+    /// and the caller has to learn that nothing was posted.
+    async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
+        // Validated before the client is touched, so a caller that got the
+        // recipient wrong hears that instead of a connection error.
+        if !Self::is_jid(&poll.recipient) {
+            let normalized = self.normalize_phone(&poll.recipient);
+            anyhow::ensure!(
+                self.is_number_allowed(&normalized),
+                "recipient `{}` is not in this channel's allowlist",
+                poll.recipient
+            );
+        }
+        let deliverable_recipient = Self::resolve_outbound_recipient(&poll.recipient);
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
+
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        Box::pin(
+            client
+                .polls()
+                .create(to, &poll.question, &poll.options, poll.selectable_count),
+        )
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("WhatsApp poll creation failed: {e}")))?;
+        Ok(())
     }
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
@@ -4235,6 +4271,102 @@ mod tests {
         assert!(ch.is_number_allowed("+9999999999"));
     }
 
+    /// Resolve peers the way the daemon does, so these cover the
+    /// config-to-adapter boundary rather than a hand-built vector.
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("whatsapp", alias)
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_survives_the_whitespace_wildcard() {
+        // A wildcard written with surrounding whitespace, resolved from config.
+        // Gating deny emission on the exact string `"*"` emitted no deny here
+        // while this matcher still read the entry as a wildcard.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = [" * "]
+            ignore = ["+15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_an_equivalent_phone_spelling() {
+        // This matcher reads `+15551234567` and `15551234567` as one number.
+        // Resolving the deny by comparing raw strings kept the grant and
+        // dropped the `ignore`, and the sender was then admitted.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["+15551234567"]
+            ignore = ["15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_a_jid_spelling_of_the_granted_number() {
+        // A sender arrives as a JID, which normalizes to the same number.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["*"]
+            ignore = ["15551234567@s.whatsapp.net"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_on_one_sender_number_covers_the_others() {
+        // A sender arrives as several numbers (JID, alternate JID, LID
+        // mapping). Denying one of them must reject the sender rather than
+        // letting the next number pick up the wildcard.
+        let peers = vec!["*".to_string(), "!+15551234567".to_string()];
+        assert!(!WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15551234567"]
+        ));
+        assert!(WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15559999999"]
+        ));
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
@@ -4329,6 +4461,78 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::normalize_phone_token("+1 (555) 123-4567"),
             Some("+15551234567".to_string())
+        );
+    }
+
+    /// Config to writer to runtime, on the one identity WhatsApp spells three
+    /// ways. The writer runs on every reconnect, so a wrong answer here is the
+    /// operator's whole experience of pairing: told it worked, never able to
+    /// talk, and no conflict to act on.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_pairing_write_honors_a_deny_spelled_as_a_jid() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "whatsapp_admin".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp.admin".to_string()),
+                external_peers: vec![PeerUsername::new("+15551234567".to_string())],
+                ignore: vec![PeerUsername::new("15551234567@s.whatsapp.net".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let resolved = config.channel_external_peers("whatsapp", "admin");
+        assert!(
+            !WhatsAppWebChannel::are_numbers_allowed_for_list(&resolved, &["+15551234567"]),
+            "the runtime canonicalizes the JID deny and rejects the account"
+        );
+
+        let err = crate::identity_persist::merge_external_peer(
+            &mut config,
+            "whatsapp",
+            "admin",
+            "+15551234567",
+            WhatsAppWebChannel::phone_matches,
+        )
+        .expect_err("the deny names this account, whichever spelling it uses");
+        assert!(
+            err.to_string().contains("ignore"),
+            "the operator is told which field to edit: {err}"
+        );
+
+        config
+            .peer_groups
+            .get_mut("whatsapp_admin")
+            .expect("group exists")
+            .ignore
+            .clear();
+        assert!(
+            crate::identity_persist::merge_external_peer(
+                &mut config,
+                "whatsapp",
+                "admin",
+                "+15551234567",
+                WhatsAppWebChannel::phone_matches,
+            )
+            .expect("merge succeeds once the deny is gone")
+            .is_none(),
+            "the existing grant is now effective, so nothing needs writing"
+        );
+        let resolved = config.channel_external_peers("whatsapp", "admin");
+        assert!(
+            WhatsAppWebChannel::are_numbers_allowed_for_list(&resolved, &["+15551234567"]),
+            "a no-op write leaves the identity admissible: the recovery path ends"
         );
     }
 
@@ -7505,6 +7709,68 @@ mod tests {
         );
         let ch = WhatsAppWebChannel::new(&cfg, "alias", Arc::new(Vec::new), Arc::new(Vec::new));
         assert_eq!(ch.approval_timeout_secs, 300);
+    }
+
+    // ── Native polls ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_channel(allowed_numbers: &[&str]) -> WhatsAppWebChannel {
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp-polls.db".into()),
+            ..Default::default()
+        };
+        let peers: Vec<String> = allowed_numbers.iter().map(|n| (*n).to_string()).collect();
+        WhatsAppWebChannel::new(
+            &cfg,
+            "poll_alias",
+            Arc::new(move || peers.clone()),
+            Arc::new(Vec::new),
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_request(recipient: &str) -> zeroclaw_api::channel::PollRequest {
+        zeroclaw_api::channel::PollRequest::new(
+            recipient,
+            "Which tasting slot?",
+            vec!["Friday".into(), "Saturday".into()],
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_channel_advertises_native_polls() {
+        assert!(poll_channel(&["+15550001111"]).supports_native_polls());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_poll_without_a_client_reports_the_same_not_connected_error_as_send() {
+        let channel = poll_channel(&["+15550001111"]);
+        let error = channel
+            .send_poll(&poll_request("+15550001111"))
+            .await
+            .expect_err("no client is connected");
+        assert!(error.to_string().contains("not connected"), "{error}");
+    }
+
+    /// `send` drops a disallowed recipient with a warning and reports success.
+    /// A poll is a tool call, so it has to say that nothing was posted.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_poll_to_a_number_outside_the_allowlist_fails_loudly() {
+        let channel = poll_channel(&["+15550001111"]);
+        let error = channel
+            .send_poll(&poll_request("+15559999999"))
+            .await
+            .expect_err("the recipient is not allowed");
+        let message = error.to_string();
+        assert!(message.contains("allowlist"), "{message}");
+        assert!(
+            !message.contains("not connected"),
+            "the allowlist must be checked before the client, so the caller learns the real reason: {message}"
+        );
     }
 
     /// ...and a config built in Rust now agrees with one parsed from a file.
