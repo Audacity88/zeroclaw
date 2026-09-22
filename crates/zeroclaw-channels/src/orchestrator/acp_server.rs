@@ -8456,15 +8456,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_image_with_prompt_tool_results_degrades_media_on_both_paths() {
+    async fn failed_image_with_tool_result_carrier_degrades_media_on_both_paths() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
-        use zeroclaw_runtime::agent::dispatcher::{
-            ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
-        };
-
-        // Typed replay must keep the result carrier within its real user's
-        // turn, so failed attachments are degraded on both live and restore paths.
+        // A prompt-mode tool round appends its results as a user-role
+        // `[Tool results]` carrier, and typed replay preserves it as an
+        // ordinary user chat. A turn shaped `user(image) -> assistant(tool
+        // request) -> user([Tool results] ...) -> failure` therefore hides its
+        // opening prompt behind that carrier: a span selector that walks back
+        // to "the last user message" starts at the carrier, misses the image
+        // prompt, and leaves the rejected attachment in both the live history
+        // and the restored seed. This regression drives that exact shape
+        // through both repair paths with a vision-capable provider, which
+        // retains historical image markers, so a clean next request is only
+        // possible if the span reached the opening prompt.
 
         // ── Phase A: restore path ────────────────────────────────────
         let cwd = tempfile::tempdir().unwrap();
@@ -8485,12 +8490,10 @@ mod tests {
                 &AcpServer::failed_turn_transcript(vec![
                     ConversationMessage::Chat(ChatMessage::user(marker.clone())),
                     ConversationMessage::Chat(ChatMessage::assistant("let me read that file")),
-                    XmlToolDispatcher.format_results(&[ToolExecutionResult {
-                        name: "file_read".to_string(),
-                        output: String::from_utf8_lossy(&file_bytes).into_owned(),
-                        success: true,
-                        tool_call_id: None,
-                    }]),
+                    ConversationMessage::Chat(ChatMessage::user(format!(
+                        "[Tool results]\n{}",
+                        String::from_utf8_lossy(&file_bytes)
+                    ))),
                 ]),
             )
             .unwrap();
@@ -8706,8 +8709,7 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| matches!(m, ConversationMessage::Chat(chat)
-                    if !zeroclaw_runtime::agent::is_turn_opening_user_message(m)
-                        && chat.content.starts_with("[Tool results]"))),
+                    if chat.role == "user" && chat.content.starts_with("[Tool results]"))),
             "precondition: the failed turn must contain a prompt-mode tool-result carrier: {:?}",
             stored.messages
         );

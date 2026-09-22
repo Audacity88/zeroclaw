@@ -159,15 +159,13 @@ pub(super) async fn prepare_messages_with_source_rows(
     // Enforce the universal leading-turn-order invariant before any provider
     // sees the history: strict providers reject a first non-system turn that is
     // not `user`, which context trims and session restores can produce.
-    let mut sanitized =
-        crate::agent::history::normalize_prompt_tool_results_for_provider(history).into_owned();
+    let mut sanitized = history.to_vec();
     let system_end = sanitized
         .iter()
         .take_while(|message| message.is_system())
         .count();
     ChatMessage::sanitize_leading_turn_order(&mut sanitized);
     // Sanitization removes only the orphan span after leading system rows.
-    // Keep original row identity even when a result's wire role becomes user.
     let removed = history.len() - sanitized.len();
     let source_rows: Vec<usize> = (0..system_end)
         .chain(system_end + removed..history.len())
@@ -230,7 +228,7 @@ mod tests {
             ChatMessage::tool("orphan result"),
             ChatMessage::user("[Tool results] is literal user text"),
             ChatMessage::assistant("current call"),
-            crate::agent::history::prompt_tool_results_message("[Tool results]\nresult"),
+            ChatMessage::user("[Tool results]\nresult"),
             ChatMessage::user("new question [IMAGE:/unread.png]"),
         ];
         let (prepared, source_rows) =

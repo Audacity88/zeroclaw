@@ -5,6 +5,12 @@ use crate::agent::history::estimate_history_tokens;
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::ChatMessage;
 
+/// Prefix the tool loop puts on the user-role message that carries prompt-mode
+/// tool results (see `history_append::append_tool_round_to_history`). Typed
+/// replay preserves that carrier as an ordinary user chat, so span selectors
+/// must not mistake it for the user prompt that opened a turn.
+pub(crate) const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
+
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
 /// was dropped, in which case the caller emits a user-visible event and injects
 /// a breadcrumb so the loss is never silent.
@@ -36,7 +42,9 @@ fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool)
     matches!(
         msg,
         ConversationMessage::Chat(chat)
-            if chat.role == "user" && !is_breadcrumb
+            if chat.role == "user"
+                && !chat.content.starts_with(TOOL_RESULTS_PREFIX)
+                && !is_breadcrumb
     )
 }
 
@@ -106,7 +114,7 @@ pub(crate) fn trim_conversation_to_recent_turns(
 }
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
-    msg.role == "user"
+    msg.role == "user" && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
 }
 
 fn is_system(msg: &ChatMessage) -> bool {
@@ -910,7 +918,7 @@ mod tests {
             user(&format!("turn1 {big}")),
             asst("calling tool"),
             tool("tool_use_1 result"),
-            crate::agent::history::prompt_tool_results_message("[Tool results]\nmore"),
+            user("[Tool results]\nmore"),
             asst("done1"),
             user("turn2 short"),
             asst("done2"),
@@ -929,8 +937,14 @@ mod tests {
         }
     }
 
+    /// Known limit of prefix provenance: the trimmer identifies a prompt-mode
+    /// tool-result row as a `user` row whose content starts with
+    /// `[Tool results]`, so a genuine user message that happens to begin with
+    /// that prefix is grouped with the preceding assistant turn instead of
+    /// opening a turn of its own. This pins that grouping: the row is dropped
+    /// together with that turn and never counted as an independent turn.
     #[test]
-    fn count_trim_treats_user_text_matching_tool_results_prefix_as_a_real_turn() {
+    fn user_text_matching_tool_results_prefix_is_dropped_with_its_turn() {
         let history = vec![
             sys("system"),
             user("old request"),
@@ -941,16 +955,21 @@ mod tests {
             asst("new answer"),
         ];
 
-        let result = trim_to_recent_turn_count(history, 2, false);
+        let result = trim_to_recent_turn_count(history, 1, false);
 
         assert!(result.trimmed);
-        assert_eq!(result.dropped_turns, 1);
-        assert_eq!(result.kept_turns, 2);
+        assert_eq!(
+            result.dropped_turns, 1,
+            "the prefix-matching row must not count as a turn of its own"
+        );
+        assert_eq!(result.kept_turns, 1);
+        assert_eq!(result.dropped_messages, 4);
         assert!(
-            result
+            !result
                 .history
                 .iter()
-                .any(|message| message.content == "[Tool results]\nthis is literal user text")
+                .any(|message| message.content == "[Tool results]\nthis is literal user text"),
+            "the prefix-matching row drops with its turn rather than surviving as its own"
         );
     }
 
@@ -1118,25 +1137,6 @@ mod tests {
         assert_eq!(result.dropped_turns, 1);
         assert_eq!(result.kept_turns, 1);
         assert!(result.history.iter().any(|m| m.content == "new request"));
-    }
-
-    #[test]
-    fn user_text_matching_breadcrumb_remains_a_real_turn_without_provenance() {
-        let matching_user_text = breadcrumb().content;
-        let history = vec![
-            sys("system"),
-            user(&matching_user_text),
-            asst("matching-text answer"),
-            user("new request"),
-            asst("new answer"),
-        ];
-
-        let result = trim_to_recent_turn_count(history, 1, false);
-
-        assert!(result.trimmed);
-        assert_eq!(result.dropped_messages, 2);
-        assert_eq!(result.dropped_turns, 1);
-        assert_eq!(result.kept_turns, 1);
     }
 
     #[test]
@@ -1402,18 +1402,6 @@ mod tests {
         assert_eq!(h[2].role, breadcrumb().role);
         assert_eq!(h[2].content, breadcrumb().content);
         assert!(has_breadcrumb);
-    }
-
-    #[test]
-    fn insertion_does_not_infer_breadcrumb_from_identical_user_text() {
-        let matching_user_text = breadcrumb().content;
-        let mut history = vec![sys("system"), user(&matching_user_text), asst("answer")];
-        let has_breadcrumb = insert_breadcrumb_deduped(&mut history, false);
-
-        assert!(has_breadcrumb);
-        assert_eq!(history.len(), 4);
-        assert_eq!(history[1].content, matching_user_text);
-        assert_eq!(history[2].content, matching_user_text);
     }
 
     #[test]

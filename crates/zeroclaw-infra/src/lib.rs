@@ -5,7 +5,6 @@ pub mod acp_session_store;
 pub mod debounce;
 pub mod net_guard;
 pub mod session_backend;
-pub mod session_message_encoding;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;

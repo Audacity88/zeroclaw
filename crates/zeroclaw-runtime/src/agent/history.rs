@@ -2,7 +2,6 @@ use crate::agent::history_pruner::remove_orphaned_tool_messages;
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::path::Path;
 use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
@@ -15,46 +14,6 @@ use zeroclaw_providers::multimodal::image_marker_summary;
 /// value via `run_tool_call_loop`; this constant is only used when callers omit
 /// the parameter. The name is retained for config compatibility.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
-
-use zeroclaw_infra::session_message_encoding::{
-    PROMPT_TOOL_RESULTS_ROLE, restore_legacy_prompt_result,
-};
-
-pub(crate) fn prompt_tool_results_message(content: impl Into<String>) -> ChatMessage {
-    ChatMessage {
-        role: PROMPT_TOOL_RESULTS_ROLE.to_string(),
-        content: content.into(),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn is_prompt_tool_results_message(message: &ChatMessage) -> bool {
-    message.role == PROMPT_TOOL_RESULTS_ROLE
-}
-
-pub(crate) fn normalize_prompt_tool_results_for_provider(
-    messages: &[ChatMessage],
-) -> Cow<'_, [ChatMessage]> {
-    if !messages
-        .iter()
-        .any(|message| message.role == PROMPT_TOOL_RESULTS_ROLE)
-    {
-        return Cow::Borrowed(messages);
-    }
-
-    Cow::Owned(
-        messages
-            .iter()
-            .cloned()
-            .map(|mut message| {
-                if message.role == PROMPT_TOOL_RESULTS_ROLE {
-                    message.role = "user".to_string();
-                }
-                message
-            })
-            .collect(),
-    )
-}
 
 pub(crate) static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -539,7 +498,7 @@ pub struct InteractiveSessionState {
 impl InteractiveSessionState {
     pub fn from_history_with_crumb(history: &[ChatMessage], has_crumb: bool) -> Self {
         Self {
-            version: 3,
+            version: 2,
             history: history.to_vec(),
             history_has_trim_breadcrumb: has_crumb,
         }
@@ -586,11 +545,8 @@ pub fn is_history_trim_breadcrumb_text(text: &str) -> bool {
 /// stable historical value and any future translated variant. A v1 file whose
 /// first user turn genuinely equals the breadcrumb text cannot be
 /// distinguished from a synthetic marker on its one-time migration; after the
-/// next persist the file carries the (mis)classified flag, which is
+/// next persist the file becomes v2 with the (mis)classified flag, which is
 /// the documented one-time limitation for unmarked legacy state.
-/// Before v3, prompt tool results were user-role rows. Those snapshots retain
-/// the historical prefix heuristic on load; v3 preserves explicit roles even
-/// when a genuine user sends the same text.
 pub fn load_interactive_session_history_with_crumb(
     path: &Path,
     system_prompt: &str,
@@ -601,11 +557,6 @@ pub fn load_interactive_session_history_with_crumb(
 
     let raw = std::fs::read_to_string(path)?;
     let mut state: InteractiveSessionState = serde_json::from_str(&raw)?;
-    if state.version < 3 {
-        for message in &mut state.history {
-            restore_legacy_prompt_result(message);
-        }
-    }
     if state.history.is_empty() {
         state.history.push(ChatMessage::system(system_prompt));
     } else if state.history.first().map(|msg| msg.role.as_str()) != Some("system") {
@@ -665,42 +616,6 @@ pub fn save_interactive_session_history_with_crumb(
 mod tests {
     use super::*;
 
-    #[test]
-    fn legacy_session_restore_keeps_tool_results_with_the_real_turn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("history.json");
-        let legacy = InteractiveSessionState {
-            version: 2,
-            history_has_trim_breadcrumb: false,
-            history: vec![
-                ChatMessage::system("system"),
-                ChatMessage::user("old question"),
-                ChatMessage::assistant("old answer"),
-                ChatMessage::user("current question"),
-                ChatMessage::assistant("tool call"),
-                ChatMessage::user("[Tool results]\nfirst output"),
-                ChatMessage::assistant("another call"),
-                ChatMessage::user("[Tool results]\nsecond output"),
-            ],
-        };
-        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let (mut history, mut crumb) =
-            load_interactive_session_history_with_crumb(&path, "system").unwrap();
-        trim_history(&mut history, 1, &mut crumb);
-        assert_eq!(history[1].content, "current question");
-        assert_eq!(history.len(), 6);
-        assert!(is_prompt_tool_results_message(&history[3]));
-        assert!(is_prompt_tool_results_message(&history[5]));
-        history.push(ChatMessage::user("[Tool results]\na real new user"));
-        save_interactive_session_history_with_crumb(&path, &history, crumb).unwrap();
-        let (mut restored, mut crumb) =
-            load_interactive_session_history_with_crumb(&path, "system").unwrap();
-        assert_eq!(restored.last().unwrap().role, "user");
-        trim_history(&mut restored, 1, &mut crumb);
-        assert_eq!(restored.len(), 2);
-        assert_eq!(restored[1].content, "[Tool results]\na real new user");
-    }
-
     /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
     #[allow(deprecated)]
     #[test]
@@ -709,20 +624,6 @@ mod tests {
 
         assert_eq!(floor_char_boundary(text, 5), 3);
         assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
-    }
-
-    #[test]
-    fn history_trim_prompt_tool_results_normalize_only_at_provider_boundary() {
-        let internal = prompt_tool_results_message("[Tool results]\noutput");
-        let messages = vec![internal.clone(), ChatMessage::user("real user")];
-
-        let normalized = normalize_prompt_tool_results_for_provider(&messages);
-
-        assert!(is_prompt_tool_results_message(&internal));
-        assert_eq!(normalized[0].role, "user");
-        assert_eq!(normalized[0].content, internal.content);
-        assert_eq!(normalized[1].role, "user");
-        assert!(is_prompt_tool_results_message(&messages[0]));
     }
 
     #[test]

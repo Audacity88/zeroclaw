@@ -14,7 +14,8 @@ on different representations:
 Both limits retain turns atomically. A turn starts at a real user message and
 includes the assistant response and any tool calls and tool results before the
 next user message. Trimming therefore does not split a tool call from its
-result.
+result. A user message whose text happens to begin with `[Tool results]` is
+treated as part of the turn before it, not as a new turn.
 
 ## Whole-turn retention
 

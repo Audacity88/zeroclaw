@@ -52,13 +52,6 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// Durable role for prompt-mode tool results, stored in session history to
-/// keep tool-result provenance separate from genuine user turns. Converted
-/// to `user` only at the provider boundary; consumers that must agree with
-/// the provider-facing projection (image routing, token estimation) accept
-/// it alongside `user`.
-pub const PROMPT_TOOL_RESULTS_ROLE: &str = "zeroclaw_prompt_tool_results";
-
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX: &str = "results collapsed]";
 pub const PRUNED_CONTEXT_SEPARATOR: &str = "[context continues]";

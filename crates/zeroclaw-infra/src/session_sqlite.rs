@@ -3,9 +3,6 @@
 use crate::session_backend::{
     SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
 };
-use crate::session_message_encoding::{
-    CURRENT_ENCODING_VERSION, decode_json, decode_message, ensure_sqlite_encoding_column,
-};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -122,9 +119,6 @@ impl SqliteSessionBackend {
         )
         .context("Failed to initialize session schema")?;
 
-        ensure_sqlite_encoding_column(&conn, "sessions")
-            .context("Failed to migrate session message encoding")?;
-
         for (column, ddl) in [
             ("name", "ALTER TABLE session_metadata ADD COLUMN name TEXT"),
             (
@@ -216,9 +210,9 @@ impl SqliteSessionBackend {
         now: &str,
     ) -> rusqlite::Result<()> {
         conn.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at, history_encoding_version)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_key, message.role, message.content, now, CURRENT_ENCODING_VERSION],
+            "INSERT INTO sessions (session_key, role, content, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_key, message.role, message.content, now],
         )?;
         conn.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
@@ -678,8 +672,8 @@ impl SqliteSessionBackend {
                 {
                     let mut insert = tx
                         .prepare(
-                            "INSERT INTO sessions (session_key, role, content, created_at, history_encoding_version) \
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            "INSERT INTO sessions (session_key, role, content, created_at) \
+                             VALUES (?1, ?2, ?3, ?4)",
                         )
                         .with_context(|| format!("Failed to prepare JSONL import for {name}"))?;
                     for line in io::BufReader::new(file).split(b'\n') {
@@ -697,17 +691,11 @@ impl SqliteSessionBackend {
                             continue;
                         }
                         has_non_whitespace_source = true;
-                        let Ok(message) = decode_json(line) else {
+                        let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
                             continue;
                         };
                         insert
-                            .execute(params![
-                                key,
-                                message.role,
-                                message.content,
-                                now,
-                                CURRENT_ENCODING_VERSION
-                            ])
+                            .execute(params![key, message.role, message.content, now])
                             .with_context(|| format!("Failed to import JSONL session {name}"))?;
                         inserted += 1;
                     }
@@ -846,20 +834,17 @@ impl SessionBackend for SqliteSessionBackend {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
-            .prepare("SELECT role, content, history_encoding_version FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
         {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
 
         let rows = match stmt.query_map(params![session_key], |row| {
-            Ok(decode_message(
-                ChatMessage {
-                    role: row.get(0)?,
-                    content: row.get(1)?,
-                },
-                row.get(2)?,
-            ))
+            Ok(ChatMessage {
+                role: row.get(0)?,
+                content: row.get(1)?,
+            })
         }) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -875,7 +860,7 @@ impl SessionBackend for SqliteSessionBackend {
         use crate::session_backend::TimestampedMessage;
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT role, content, created_at, history_encoding_version FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+            "SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -890,7 +875,7 @@ impl SessionBackend for SqliteSessionBackend {
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
             Ok(TimestampedMessage {
-                message: decode_message(ChatMessage { role, content }, row.get(3)?),
+                message: ChatMessage { role, content },
                 created_at,
             })
         }) {
@@ -1020,8 +1005,8 @@ impl SessionBackend for SqliteSessionBackend {
         };
 
         conn.execute(
-            "UPDATE sessions SET role = ?1, content = ?2, history_encoding_version = ?4 WHERE id = ?3",
-            params![message.role, message.content, id, CURRENT_ENCODING_VERSION],
+            "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
+            params![message.role, message.content, id],
         )
         .map_err(std::io::Error::other)?;
 

@@ -117,9 +117,7 @@ impl ToolDispatcher for XmlToolDispatcher {
                 result.name, status, output
             );
         }
-        ConversationMessage::Chat(crate::agent::history::prompt_tool_results_message(format!(
-            "[Tool results]\n{content}"
-        )))
+        ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
     }
 
     fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
@@ -160,9 +158,7 @@ impl ToolDispatcher for XmlToolDispatcher {
                             result.tool_call_id, output
                         );
                     }
-                    vec![crate::agent::history::prompt_tool_results_message(format!(
-                        "[Tool results]\n{content}"
-                    ))]
+                    vec![ChatMessage::user(format!("[Tool results]\n{content}"))]
                 }
             })
             .collect()

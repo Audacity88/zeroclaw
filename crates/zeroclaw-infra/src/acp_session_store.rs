@@ -1,8 +1,5 @@
 //! ACP session persistence.
 
-use crate::session_message_encoding::{
-    CURRENT_ENCODING_VERSION, decode_message, ensure_sqlite_encoding_column,
-};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -155,9 +152,6 @@ impl AcpSessionStore {
              CREATE INDEX IF NOT EXISTS idx_acp_session_events_session ON acp_session_events(session_id, id);",
         )
         .context("Failed to create ACP session schema")?;
-
-        ensure_sqlite_encoding_column(&conn, "acp_messages")
-            .context("Failed to migrate ACP message encoding")?;
 
         Self::ensure_killed_at_column(&conn)
             .context("Failed to migrate ACP session killed marker")?;
@@ -818,19 +812,18 @@ impl AcpSessionStore {
         // regresses or an old row survives a partial migration.
         let mut msg_stmt = conn
             .prepare(
-                "SELECT id, role, content, reasoning_content, history_encoding_version
+                "SELECT id, role, content, reasoning_content
                  FROM acp_messages WHERE session_id = ?1 AND role != 'system' ORDER BY id ASC",
             )
             .context("Failed to prepare message query")?;
 
-        let msg_rows: Vec<(i64, String, String, Option<String>, u32)> = msg_stmt
+        let msg_rows: Vec<(i64, String, String, Option<String>)> = msg_stmt
             .query_map(params![session_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, u32>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -846,7 +839,7 @@ impl AcpSessionStore {
             .context("Failed to prepare tool_call query")?;
 
         let mut out = Vec::with_capacity(msg_rows.len());
-        for (msg_id, role, content, reasoning_content, encoding_version) in msg_rows {
+        for (msg_id, role, content, reasoning_content) in msg_rows {
             // Split this message's tool_calls into ins and outs preserving order.
             let mut ins: Vec<ToolCall> = Vec::new();
             let mut outs: Vec<ToolResultMessage> = Vec::new();
@@ -902,10 +895,7 @@ impl AcpSessionStore {
 
             if ins.is_empty() && outs.is_empty() {
                 // Pure chat message.
-                out.push(ConversationMessage::Chat(decode_message(
-                    ChatMessage { role, content },
-                    encoding_version,
-                )));
+                out.push(ConversationMessage::Chat(ChatMessage { role, content }));
             } else {
                 if !ins.is_empty() {
                     // Assistant turn that issued tool calls. The text may be empty.
@@ -1077,9 +1067,9 @@ impl AcpSessionStore {
                 ConversationMessage::Chat(chat) => {
                     tx.execute(
                         "INSERT INTO acp_messages
-                           (session_id, role, content, reasoning_content, created_at, history_encoding_version)
-                         VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
-                        params![session_id, chat.role, chat.content, now, CURRENT_ENCODING_VERSION],
+                           (session_id, role, content, reasoning_content, created_at)
+                         VALUES (?1, ?2, ?3, NULL, ?4)",
+                        params![session_id, chat.role, chat.content, now],
                     )
                     .context("Failed to insert chat message")?;
                     if chat.role == "assistant" {
@@ -1093,14 +1083,13 @@ impl AcpSessionStore {
                 } => {
                     tx.execute(
                         "INSERT INTO acp_messages
-                           (session_id, role, content, reasoning_content, created_at, history_encoding_version)
-                         VALUES (?1, 'assistant', ?2, ?3, ?4, ?5)",
+                           (session_id, role, content, reasoning_content, created_at)
+                         VALUES (?1, 'assistant', ?2, ?3, ?4)",
                         params![
                             session_id,
                             text.as_deref().unwrap_or(""),
                             reasoning_content,
                             now,
-                            CURRENT_ENCODING_VERSION,
                         ],
                     )
                     .context("Failed to insert assistant tool-call message")?;

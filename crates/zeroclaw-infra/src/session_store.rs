@@ -1,7 +1,6 @@
 //! JSONL-based session persistence for channel conversations.
 
 use crate::session_backend::SessionBackend;
-use crate::session_message_encoding::{decode_json, encode_message};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -133,7 +132,7 @@ impl SessionStore {
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(msg) = decode_json(trimmed) {
+            if let Ok(msg) = serde_json::from_str::<ChatMessage>(trimmed) {
                 messages.push(msg);
             }
         }
@@ -162,7 +161,7 @@ impl SessionStore {
             if trimmed.is_empty() {
                 continue;
             }
-            let msg = decode_json(trimmed).map_err(|e| {
+            let msg: ChatMessage = serde_json::from_str(trimmed).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("corrupt session JSONL line: {e}"),
@@ -197,7 +196,7 @@ impl SessionStore {
             .append(true)
             .open(&path)?;
 
-        let json = serde_json::to_string(&encode_message(message))
+        let json = serde_json::to_string(message)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         writeln!(file, "{json}")?;
@@ -303,7 +302,7 @@ impl SessionStore {
         let path = self.session_path(session_key);
         let mut temp = tempfile::NamedTempFile::new_in(&self.sessions_dir)?;
         for msg in messages {
-            serde_json::to_writer(&mut temp, &encode_message(msg))
+            serde_json::to_writer(&mut temp, msg)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             temp.write_all(b"\n")?;
         }

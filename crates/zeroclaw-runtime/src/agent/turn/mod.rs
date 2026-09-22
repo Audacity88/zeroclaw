@@ -1567,8 +1567,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
             for _ in 0..max_iterations {
                 // Wire roles cannot identify turns: prompt-mode results are
-                // normalized to user messages. Remove precisely the durable
-                // source span, preserving prepared media and the hook suffix.
+                // plain user messages. Remove precisely the durable source
+                // span, preserving prepared media and the hook suffix.
                 let removed_rows =
                     original_body_start..original_body_start + total_dropped_messages;
                 let mut trimmed_post_hook: Vec<_> = post_hook_snapshot
@@ -3677,81 +3677,6 @@ mod reported_budget_tests {
         assert!(
             history.iter().any(|m| m.content.contains("final answer")),
             "the most recent turn survives the trim"
-        );
-    }
-
-    // A prompt-mode tool result keeps its durable tagged role in raw history
-    // while preparation normalizes it to a user-role carrier. The raw trim
-    // probes must therefore price the tagged row the way preparation treats
-    // it: a stale data-URI image marker (an older tool result, not the
-    // trailing run) is stripped from the next request, so it must not be
-    // charged as literal base64 text. Before the tagged role was recognized
-    // here, the raw probe for [B, C] overshot on the marker's bytes and
-    // enforcement deleted B as well as A, discarding a whole retained turn
-    // for image bytes the next request never carries.
-    #[tokio::test]
-    async fn enforce_keeps_stale_tagged_tool_image_turn_when_only_oldest_overshoots() {
-        let data_uri = format!("data:image/png;base64,{}", "A".repeat(40_000));
-        let marker = format!("[{}:{}]", "IMAGE", data_uri);
-        let big = "x".repeat(2000);
-        let mut history = vec![
-            ChatMessage::system("system"),
-            // Turn A: heavy, droppable.
-            ChatMessage::user(format!("turn1 {big}")),
-            ChatMessage::assistant(format!("a1 {big}")),
-            // Turn B: prompt-mode tool exchange. The tagged result carries a
-            // large inline data-URI image marker that is stale once turn C
-            // follows it: preparation strips it from the next request.
-            ChatMessage::user("question b".to_string()),
-            ChatMessage::assistant("calling tool".to_string()),
-            crate::agent::history::prompt_tool_results_message(format!(
-                "[Tool results]\ncaptured {marker}"
-            )),
-            ChatMessage::assistant("b answer".to_string()),
-            // Turn C: the trailing turn.
-            ChatMessage::user("question c".to_string()),
-            ChatMessage::assistant("final answer".to_string()),
-        ];
-        // The heuristic estimate of the population that produced the report
-        // passed preflight (within the budget); the provider then reported
-        // well above the budget, so post-response enforcement runs.
-        let estimated = 600;
-        let reported = 3_200;
-        let budget = 650;
-        enforce_reported_budget(
-            &mut history,
-            reported,
-            estimated,
-            0,
-            budget,
-            None,
-            &NoopObserver,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            false,
-            None,
-            false,
-            0,
-            &mut false,
-        )
-        .await;
-
-        assert!(
-            !history.iter().any(|m| m.content.contains(&big)),
-            "the oldest turn A must be dropped to satisfy the reported budget"
-        );
-        let retained_tagged = history
-            .iter()
-            .find(|m| m.role == zeroclaw_api::model_provider::PROMPT_TOOL_RESULTS_ROLE)
-            .expect(
-                "turn B's tagged tool result must survive: the next request strips its stale image, so B and C fit the budget"
-            );
-        assert!(
-            retained_tagged.content.contains("captured"),
-            "the surviving tagged row must be turn B's result: {retained_tagged:?}"
-        );
-        assert!(
-            history.iter().any(|m| m.content.contains("final answer")),
-            "the trailing turn C must survive"
         );
     }
 

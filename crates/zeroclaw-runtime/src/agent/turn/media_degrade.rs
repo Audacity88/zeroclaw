@@ -3,14 +3,23 @@
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::multimodal;
 
-/// Whether this typed message opens a real user turn. Prompt-mode results
-/// retain their internal role in replay; user-authored result-like text must
-/// still open a turn, including when it carries a failed attachment.
+/// Whether this typed message opens a turn for failed-turn span purposes: a
+/// user message that is not the runtime's prompt-mode `[Tool results]` result
+/// carrier.
+///
+/// A prompt-mode tool round appends its results as a user-role message (see
+/// `history_append::append_tool_round_to_history`), and typed replay preserves
+/// that carrier as an ordinary user chat. A selector that walks back to "the
+/// last user message" would otherwise start the failed-turn span at the
+/// carrier and miss the user prompt that actually opened the turn — including
+/// the attachments that prompt carried. The same prefix rule the whole-turn
+/// trimmer uses for flat boundaries applies here.
 pub fn is_turn_opening_user_message(message: &ConversationMessage) -> bool {
     matches!(
         message,
         ConversationMessage::Chat(chat)
             if chat.role == "user"
+                && !chat.content.starts_with(crate::agent::history_trim::TOOL_RESULTS_PREFIX)
     )
 }
 
@@ -51,20 +60,4 @@ pub fn degrade_media_in_message(message: &mut ConversationMessage) -> usize {
 /// performs the projection.
 pub fn degrade_media_in_messages(messages: &mut [ConversationMessage]) -> usize {
     messages.iter_mut().map(degrade_media_in_message).sum()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use zeroclaw_api::model_provider::ChatMessage;
-
-    #[test]
-    fn literal_result_prefix_opens_a_turn_but_internal_result_does_not() {
-        let literal = ConversationMessage::Chat(ChatMessage::user("[Tool results]\nmy question"));
-        let result = ConversationMessage::Chat(crate::agent::history::prompt_tool_results_message(
-            "[Tool results]\noutput",
-        ));
-        assert!(is_turn_opening_user_message(&literal));
-        assert!(!is_turn_opening_user_message(&result));
-    }
 }
