@@ -5,12 +5,6 @@ use crate::agent::history::estimate_history_tokens;
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::ChatMessage;
 
-/// Prefix the tool loop puts on the user-role message that carries prompt-mode
-/// tool results (see `history_append::append_tool_round_to_history`). Typed
-/// replay preserves that carrier as an ordinary user chat, so span selectors
-/// must not mistake it for the user prompt that opened a turn.
-pub(crate) const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
-
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
 /// was dropped, in which case the caller emits a user-visible event and injects
 /// a breadcrumb so the loss is never silent.
@@ -157,7 +151,10 @@ pub(crate) fn trim_conversation_to_recent_turns(
 }
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
-    msg.role == "user" && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
+    msg.role == "user"
+        && !msg
+            .content
+            .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
 }
 
 fn is_system(msg: &ChatMessage) -> bool {

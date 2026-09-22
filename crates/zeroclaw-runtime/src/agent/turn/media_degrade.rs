@@ -1,6 +1,6 @@
 //! Failed-turn media degradation, shared by the ACP restore and live-session paths.
 
-use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::multimodal;
 
 /// Whether this typed message opens a turn for failed-turn span purposes: a
@@ -19,7 +19,9 @@ pub fn is_turn_opening_user_message(message: &ConversationMessage) -> bool {
         message,
         ConversationMessage::Chat(chat)
             if chat.role == "user"
-                && !chat.content.starts_with(crate::agent::history_trim::TOOL_RESULTS_PREFIX)
+                && !chat
+                    .content
+                    .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
     )
 }
 
@@ -41,54 +43,22 @@ pub fn degrade_media_in_message(message: &mut ConversationMessage) -> usize {
     let ConversationMessage::Chat(chat) = message else {
         return 0;
     };
-    if chat.role == "tool"
-        && let Some(parsed) = zeroclaw_api::tool_carrier::parse_native_tool_carrier(&chat.content)
-        && parsed.declared
-    {
-        if parsed.attachments.is_empty() {
+    if let Some(mut parts) = zeroclaw_api::tool_carrier::classify(&chat.role, &chat.content) {
+        if !parts.declared || parts.attachments.is_empty() {
+            // A legacy carrier declared nothing, so nothing degrades and its
+            // inline markers survive as text; a declaration with nothing in
+            // it has nothing to drop either. The body is verbatim either way.
             return 0;
         }
-        let count = parsed.attachments.len();
-        let body_with_note = if parsed.text.is_empty() {
+        let count = parts.attachments.len();
+        parts.text = if parts.text.is_empty() {
             omitted.to_string()
         } else {
-            format!("{}\n\n{omitted}", parsed.text)
+            format!("{}\n\n{omitted}", parts.text)
         };
-        let mut obj = match serde_json::from_str::<serde_json::Value>(&chat.content) {
-            Ok(serde_json::Value::Object(obj)) => obj,
-            _ => return 0,
-        };
-        obj.insert(
-            "content".to_string(),
-            serde_json::Value::String(body_with_note),
-        );
-        obj.insert(
-            "attachments".to_string(),
-            zeroclaw_api::tool_carrier::render_native_attachments(&[]),
-        );
-        chat.content = serde_json::Value::Object(obj).to_string();
+        chat.content =
+            zeroclaw_api::tool_carrier::rebuild_carrier(&chat.role, &chat.content, &parts, &[]);
         return count;
-    }
-    if zeroclaw_api::tool_carrier::is_prompt_tool_carrier(&chat.content)
-        && let Some(parsed) = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&chat.content)
-        && parsed.declared
-    {
-        if parsed.attachments.is_empty() {
-            return 0;
-        }
-        let count = parsed.attachments.len();
-        let body_with_note = if parsed.text.is_empty() {
-            omitted.to_string()
-        } else {
-            format!("{}\n\n{omitted}", parsed.text)
-        };
-        chat.content = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body_with_note, &[]);
-        return count;
-    }
-    if is_tool_result_carrier_chat(chat) {
-        // Legacy carrier: no declared attachments, and its inline markers are
-        // body text — leave it verbatim.
-        return 0;
     }
     let (cleaned, refs) = multimodal::parse_image_markers(&chat.content);
     if refs.is_empty() {
@@ -100,15 +70,6 @@ pub fn degrade_media_in_message(message: &mut ConversationMessage) -> usize {
         format!("{cleaned}\n\n{omitted}")
     };
     refs.len()
-}
-
-/// Whether this flat chat message is a tool-result carrier in either shape,
-/// including legacy ones (raw non-JSON tool text, or a user message with the
-/// results prefix).
-fn is_tool_result_carrier_chat(chat: &ChatMessage) -> bool {
-    chat.role == "tool"
-        || (chat.role == "user"
-            && zeroclaw_api::tool_carrier::is_prompt_tool_carrier(&chat.content))
 }
 
 /// Replace image references in this message span with an omission note.
@@ -130,6 +91,7 @@ pub fn degrade_media_in_messages(messages: &mut [ConversationMessage]) -> usize 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::model_provider::ChatMessage;
 
     fn chat(role: &str, content: String) -> ConversationMessage {
         ConversationMessage::Chat(ChatMessage {

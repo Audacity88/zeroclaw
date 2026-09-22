@@ -2441,11 +2441,10 @@ fn strip_tool_result_content(text: &str) -> String {
     // line, and that many marker lines before the body. Parse the carrier so
     // the fixed-position header and marker lines drop out exactly, and only
     // the body's tool_result blocks are stripped below.
-    let body = if zeroclaw_api::tool_carrier::is_prompt_tool_carrier(text)
-        && let Some(parsed) = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(text)
-        && parsed.declared
+    let body = if let Some(parts) = zeroclaw_api::tool_carrier::classify("user", text)
+        && parts.declared
     {
-        parsed.text
+        parts.text
     } else {
         text.to_string()
     };

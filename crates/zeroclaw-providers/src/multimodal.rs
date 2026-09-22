@@ -10,8 +10,8 @@ use zeroclaw_api::media::{
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::tool_carrier::{
-    is_prompt_tool_carrier, parse_native_tool_carrier, parse_prompt_tool_carrier,
-    render_native_attachments, render_prompt_tool_carrier,
+    CarrierKind, CarrierParts, classify, image_refs, is_tool_result_carrier, rebuild_carrier,
+    render_prompt_tool_carrier,
 };
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
@@ -471,30 +471,23 @@ pub fn image_marker_summary(content: &str) -> ImageMarkerSummary {
 /// falls back to the text-level [`image_marker_summary`] scan of its
 /// content.
 pub fn message_image_summary(message: &ChatMessage) -> ImageMarkerSummary {
-    if !is_tool_result_carrier(message) {
+    let Some(parts) = classify(&message.role, &message.content) else {
         return image_marker_summary(&message.content);
-    }
-    let Some(parts) = carrier_parts(message) else {
-        // Raw non-JSON tool text: legacy by shape. Nothing is promoted and
-        // the whole text is delivered verbatim.
-        return ImageMarkerSummary {
-            text_bytes: message.content.len(),
-            image_refs: 0,
-        };
     };
     if !parts.declared {
-        // Legacy carrier: the fixed position declared nothing, so no image
-        // is promoted; the body is delivered as text, markers included.
+        // Legacy carrier, raw tool text included: the fixed position
+        // declared nothing, so no image is promoted; the body is delivered
+        // as text, markers included.
         return ImageMarkerSummary {
             text_bytes: parts.text.len(),
             image_refs: 0,
         };
     }
-    let image_refs = carrier_image_refs(&parts).len();
+    let image_ref_count = image_refs(&parts).len();
     match parts.kind {
         CarrierKind::Native => ImageMarkerSummary {
             text_bytes: parts.text.len(),
-            image_refs,
+            image_refs: image_ref_count,
         },
         CarrierKind::Prompt => {
             // The user arm's delivered text: image attachment lines lift out
@@ -508,7 +501,7 @@ pub fn message_image_summary(message: &ChatMessage) -> ImageMarkerSummary {
                 .collect();
             ImageMarkerSummary {
                 text_bytes: render_prompt_tool_carrier(&parts.text, &retained).len(),
-                image_refs,
+                image_refs: image_ref_count,
             }
         }
     }
@@ -525,15 +518,15 @@ pub fn message_image_summary(message: &ChatMessage) -> ImageMarkerSummary {
 /// Non-carriers are cloned verbatim by the replay, so their full content
 /// length is the answer.
 pub fn stripped_message_text_bytes(message: &ChatMessage) -> usize {
-    if !is_tool_result_carrier(message) {
-        return message.content.len();
-    }
-    if let Some(parts) = carrier_parts(message)
+    if let Some(parts) = classify(&message.role, &message.content)
         && parts.declared
     {
         return message_image_summary(message).text_bytes;
     }
-    strip_tool_result_image_markers(message).content.len()
+    if is_tool_result_carrier(&message.role, &message.content) {
+        return strip_tool_result_image_markers(message).content.len();
+    }
+    message.content.len()
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
@@ -562,7 +555,9 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
 pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
-        .filter(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .filter(|message| {
+            message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
+        })
         .map(|message| parse_image_markers(&message.content).1.len())
         .sum()
 }
@@ -571,7 +566,9 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
         .rev()
-        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .find(|message| {
+            message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
+        })
         .map(|message| parse_image_markers(&message.content).1.len())
         .unwrap_or(0)
 }
@@ -630,14 +627,14 @@ pub const MEDIA_PLACEHOLDER: &str = "(media attachment omitted)";
 /// its media markers replaced with the placeholder as before, through the
 /// model-visible rewrite so signed envelope fields replay byte-for-byte.
 pub fn strip_message_media(message: &ChatMessage) -> ChatMessage {
-    if is_tool_result_carrier(message)
-        && let Some(parts) = carrier_parts(message)
-        && parts.declared
-    {
-        let emptied: Vec<RenderedMarker> = Vec::new();
-        return rebuild_carrier(message, &parts, &emptied);
-    }
-    if is_tool_result_carrier(message) {
+    if let Some(parts) = classify(&message.role, &message.content) {
+        if parts.declared {
+            let emptied: Vec<RenderedMarker> = Vec::new();
+            return ChatMessage {
+                role: message.role.clone(),
+                content: rebuild_carrier(&message.role, &message.content, &parts, &emptied),
+            };
+        }
         // Legacy carrier: the body is text; nothing to degrade.
         return message.clone();
     }
@@ -823,7 +820,7 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
             // Audio attachments drop from the declared list instead; the
             // body is never touched, so a body quoting audio syntax stays
             // verbatim under the attachment-identity contract.
-            if let Some(parts) = carrier_parts(m)
+            if let Some(parts) = classify(&m.role, &m.content)
                 && parts.declared
             {
                 let retained: Vec<RenderedMarker> = parts
@@ -834,7 +831,10 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
                     .collect();
                 if retained.len() != parts.attachments.len() {
                     stripped += parts.attachments.len() - retained.len();
-                    return rebuild_carrier(m, &parts, &retained);
+                    return ChatMessage {
+                        role: m.role.clone(),
+                        content: rebuild_carrier(&m.role, &m.content, &parts, &retained),
+                    };
                 }
                 return m.clone();
             }
@@ -954,7 +954,7 @@ pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
             // image attachments drop from the declared list instead (the
             // count the parser checks stays consistent); the body is never
             // touched.
-            if let Some(parts) = carrier_parts(m)
+            if let Some(parts) = classify(&m.role, &m.content)
                 && parts.declared
             {
                 let retained: Vec<RenderedMarker> = parts
@@ -970,7 +970,10 @@ pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
                     .collect();
                 if retained.len() != parts.attachments.len() {
                     stripped += parts.attachments.len() - retained.len();
-                    return rebuild_carrier(m, &parts, &retained);
+                    return ChatMessage {
+                        role: m.role.clone(),
+                        content: rebuild_carrier(&m.role, &m.content, &parts, &retained),
+                    };
                 }
                 return m.clone();
             }
@@ -1016,117 +1019,12 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn is_prompt_tool_result_content(content: &str) -> bool {
-    content.trim_start().starts_with("[Tool results]")
-}
-
-pub(crate) fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
-    message.role == "user" && is_prompt_tool_result_content(&message.content)
-}
-
-fn is_tool_result_carrier(message: &ChatMessage) -> bool {
-    message.role == "tool" || is_prompt_tool_result_message(message)
-}
-
-/// Which carrier shape a tool-result carrier uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CarrierKind {
-    /// `role = "tool"` with a JSON envelope.
-    Native,
-    /// `role = "user"` starting with the results prefix.
-    Prompt,
-}
-
-/// A carrier opened at its fixed position: the verbatim body, the declared
-/// attachments, and whether the position carried a declaration at all.
-#[derive(Debug, Clone)]
-struct CarrierParts {
-    text: String,
-    attachments: Vec<RenderedMarker>,
-    declared: bool,
-    kind: CarrierKind,
-}
-
-/// Open a tool-result carrier at its fixed position. `None` means the message
-/// is not shaped like a carrier at all (raw non-JSON tool text, or user text
-/// without the results prefix); callers treat those as legacy.
-fn carrier_parts(message: &ChatMessage) -> Option<CarrierParts> {
-    if message.role == "tool" {
-        return parse_native_tool_carrier(&message.content).map(|parsed| CarrierParts {
-            text: parsed.text,
-            attachments: parsed.attachments,
-            declared: parsed.declared,
-            kind: CarrierKind::Native,
-        });
-    }
-    if is_prompt_tool_result_message(message) {
-        return parse_prompt_tool_carrier(&message.content).map(|parsed| CarrierParts {
-            text: parsed.text,
-            attachments: parsed.attachments,
-            declared: parsed.declared,
-            kind: CarrierKind::Prompt,
-        });
-    }
-    None
-}
-
-/// The image references a carrier declared, in declaration order. Non-image
-/// kinds are carried but never resolved into image parts.
-fn carrier_image_refs(parts: &CarrierParts) -> Vec<String> {
-    parts
-        .attachments
-        .iter()
-        .filter(|marker| marker.kind == MarkerKind::Image)
-        .map(|marker| marker.target.clone())
-        .collect()
-}
-
-/// Rebuild a carrier message with new attachments, keeping the body verbatim
-/// and every other envelope field (call id, name) untouched.
-fn rebuild_carrier(
-    message: &ChatMessage,
-    parts: &CarrierParts,
-    attachments: &[RenderedMarker],
-) -> ChatMessage {
-    match parts.kind {
-        CarrierKind::Native => {
-            let Ok(serde_json::Value::Object(mut obj)) =
-                serde_json::from_str::<serde_json::Value>(&message.content)
-            else {
-                return message.clone();
-            };
-            // The body is re-written from `parts.text` so a load-failure note
-            // appended during normalization reaches the envelope; when the
-            // text is unchanged this is an identity write.
-            obj.insert(
-                "content".to_string(),
-                serde_json::Value::String(parts.text.clone()),
-            );
-            obj.insert(
-                "attachments".to_string(),
-                render_native_attachments(attachments),
-            );
-            ChatMessage {
-                role: message.role.clone(),
-                content: serde_json::Value::Object(obj).to_string(),
-            }
-        }
-        CarrierKind::Prompt => ChatMessage {
-            role: message.role.clone(),
-            content: render_prompt_tool_carrier(&parts.text, attachments),
-        },
-    }
-}
-
 /// Count the images a message contributes to the outbound request: a carrier
 /// counts its declared image attachments (its body is never scanned); a user
 /// message counts its text markers; everything else counts zero.
 fn count_message_images(message: &ChatMessage) -> usize {
-    if is_tool_result_carrier(message) {
-        let count = carrier_parts(message)
-            .map(|parts| carrier_image_refs(&parts).len())
-            .unwrap_or(0);
-        return count;
+    if let Some(parts) = classify(&message.role, &message.content) {
+        return image_refs(&parts).len();
     }
     if message.role == "user" {
         return parse_image_markers(&message.content).1.len();
@@ -1143,27 +1041,24 @@ fn count_message_images(message: &ChatMessage) -> usize {
 /// instead of `parse_image_markers` so a carrier body containing literal
 /// marker syntax cannot smuggle an unintended image into the request.
 pub fn parse_user_message_image_refs(content: &str) -> (String, Vec<String>) {
-    if is_prompt_tool_carrier(content) {
+    if let Some(parts) = classify("user", content) {
         // A carrier is never body-scanned: a declared carrier contributes
         // its image attachment lines (non-image lines stay in the text), and
         // a legacy carrier contributes nothing at all — its body is text
         // under the attachment-identity contract.
-        let Some(parsed) = parse_prompt_tool_carrier(content) else {
-            return (content.to_string(), Vec::new());
-        };
-        if !parsed.declared {
+        if !parts.declared {
             return (content.to_string(), Vec::new());
         }
         let mut refs = Vec::new();
         let mut retained = Vec::new();
-        for marker in &parsed.attachments {
+        for marker in &parts.attachments {
             if marker.kind == MarkerKind::Image {
                 refs.push(marker.target.clone());
             } else {
                 retained.push(marker.clone());
             }
         }
-        let text = render_prompt_tool_carrier(&parsed.text, &retained);
+        let text = render_prompt_tool_carrier(&parts.text, &retained);
         return (text, refs);
     }
     parse_image_markers(content)
@@ -1179,15 +1074,10 @@ fn warn_on_legacy_carrier_markers(messages: &[ChatMessage]) {
     let mut prompt_carriers = 0usize;
     let mut marker_count = 0usize;
     for message in messages {
-        if !is_tool_result_carrier(message) {
-            continue;
-        }
-        let Some(parts) = carrier_parts(message) else {
-            // Raw non-JSON tool text: legacy by shape.
-            if message.role == "tool" && message.content.contains(IMAGE_MARKER_PREFIX) {
-                native_carriers += 1;
-                marker_count += parse_image_markers(&message.content).1.len();
-            }
+        // `classify` folds raw tool text into the legacy native shape, so
+        // every carrier — declared, legacy envelope, or raw text — is
+        // counted through the same open.
+        let Some(parts) = classify(&message.role, &message.content) else {
             continue;
         };
         if parts.declared || !parts.text.contains(IMAGE_MARKER_PREFIX) {
@@ -1224,16 +1114,16 @@ fn warn_on_legacy_carrier_markers(messages: &[ChatMessage]) {
 /// arrives, so a tool image is never replayed on every later request
 /// forever.
 fn current_turn_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
-    let current_turn_start = messages
-        .iter()
-        .rposition(|message| message.role == "user" && !is_prompt_tool_result_message(message));
+    let current_turn_start = messages.iter().rposition(|message| {
+        message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
+    });
 
     let mut indices = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
         if current_turn_start.is_some_and(|start| index < start) {
             continue;
         }
-        if is_tool_result_carrier(message) {
+        if is_tool_result_carrier(&message.role, &message.content) {
             indices.insert(index);
         }
     }
@@ -1245,7 +1135,7 @@ fn should_normalize_message_images(
     message: &ChatMessage,
     current_turn_tool_result_indices: &HashSet<usize>,
 ) -> bool {
-    if is_tool_result_carrier(message) {
+    if is_tool_result_carrier(&message.role, &message.content) {
         return current_turn_tool_result_indices.contains(&index);
     }
 
@@ -1280,7 +1170,7 @@ pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDis
         .map(|(index, message)| {
             if should_normalize_message_images(index, message, &current_turn_indices) {
                 ImageMarkerDisposition::Normalized
-            } else if is_tool_result_carrier(message) {
+            } else if is_tool_result_carrier(&message.role, &message.content) {
                 ImageMarkerDisposition::Stripped
             } else {
                 ImageMarkerDisposition::Literal
@@ -1307,11 +1197,14 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
     // the body was never scanned, so it stays verbatim. A legacy carrier
     // (pre-upgrade, or a third-party shape) keeps the historical body strip
     // so pre-upgrade sessions send exactly what they sent before.
-    if let Some(parts) = carrier_parts(message)
+    if let Some(parts) = classify(&message.role, &message.content)
         && parts.declared
     {
         let emptied: Vec<RenderedMarker> = Vec::new();
-        return rebuild_carrier(message, &parts, &emptied);
+        return ChatMessage {
+            role: message.role.clone(),
+            content: rebuild_carrier(&message.role, &message.content, &parts, &emptied),
+        };
     }
 
     if !message.content.contains(IMAGE_MARKER_PREFIX) {
@@ -1346,7 +1239,9 @@ fn replay_message_without_stale_tool_images(
     message: &ChatMessage,
     current_turn_tool_result_indices: &HashSet<usize>,
 ) -> ChatMessage {
-    if is_tool_result_carrier(message) && !current_turn_tool_result_indices.contains(&index) {
+    if is_tool_result_carrier(&message.role, &message.content)
+        && !current_turn_tool_result_indices.contains(&index)
+    {
         strip_tool_result_image_markers(message)
     } else {
         message.clone()
@@ -1369,11 +1264,11 @@ async fn normalize_carrier_attachments(
     ctx: &ImageNormalizeCtx<'_>,
     cache: Option<&mut LocalImageCache>,
 ) -> Option<(ChatMessage, bool)> {
-    let parts = carrier_parts(message)?;
+    let parts = classify(&message.role, &message.content)?;
     if !parts.declared {
         return None;
     }
-    let refs = carrier_image_refs(&parts);
+    let refs = image_refs(&parts);
     if refs.is_empty() {
         return None;
     }
@@ -1405,7 +1300,15 @@ async fn normalize_carrier_attachments(
         kind: parts.kind,
     };
     Some((
-        rebuild_carrier(message, &rebuilt_parts, &rebuilt_parts.attachments),
+        ChatMessage {
+            role: message.role.clone(),
+            content: rebuild_carrier(
+                &message.role,
+                &message.content,
+                &rebuilt_parts,
+                &rebuilt_parts.attachments,
+            ),
+        },
         !normalized.data_uris.is_empty(),
     ))
 }
@@ -1492,7 +1395,7 @@ async fn prepare_messages_inner(
             continue;
         }
 
-        if is_tool_result_carrier(message) {
+        if is_tool_result_carrier(&message.role, &message.content) {
             // Current-turn carrier: normalize the declared attachments at the
             // fixed position. Legacy and text-only carriers pass through with
             // the body untouched — a carrier body is never scanned for
@@ -1612,7 +1515,7 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
     let mut user_turn_count = 0usize;
     let mut cutoff = 0usize; // messages at index < cutoff are "too old"
     for (i, m) in messages.iter().enumerate().rev() {
-        if m.role == "user" && !is_prompt_tool_result_message(m) {
+        if m.role == "user" && !is_tool_result_carrier(&m.role, &m.content) {
             user_turn_count += 1;
             if user_turn_count > max_turns {
                 // Everything up to and including this index is too old.
@@ -1630,7 +1533,7 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if i < cutoff && m.role == "user" && !is_prompt_tool_result_message(m) {
+            if i < cutoff && m.role == "user" && !is_tool_result_carrier(&m.role, &m.content) {
                 let (cleaned, refs) = parse_image_markers(&m.content);
                 if refs.is_empty() {
                     return m.clone();
@@ -1736,7 +1639,7 @@ fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
     // A declared carrier drops its oldest image attachments at the fixed
     // position; the body is never touched. Non-image attachments always
     // survive the image cap.
-    if let Some(parts) = carrier_parts(message)
+    if let Some(parts) = classify(&message.role, &message.content)
         && parts.declared
     {
         let mut dropped = 0usize;
@@ -1753,7 +1656,10 @@ fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
             })
             .cloned()
             .collect();
-        return rebuild_carrier(message, &parts, &retained);
+        return ChatMessage {
+            role: message.role.clone(),
+            content: rebuild_carrier(&message.role, &message.content, &parts, &retained),
+        };
     }
 
     if message.role == "tool"
@@ -2362,9 +2268,11 @@ mod tests {
                 // Carrier shape through the production predicates: a declared
                 // carrier's images are its attachments, and a legacy
                 // carrier's body markers are text preparation never promotes.
-                let declared_carrier = is_tool_result_carrier(original)
-                    && carrier_parts(original).is_some_and(|parts| parts.declared);
-                let legacy_carrier = is_tool_result_carrier(original) && !declared_carrier;
+                let declared_carrier = is_tool_result_carrier(&original.role, &original.content)
+                    && classify(&original.role, &original.content)
+                        .is_some_and(|parts| parts.declared);
+                let legacy_carrier =
+                    is_tool_result_carrier(&original.role, &original.content) && !declared_carrier;
                 match disposition {
                     ImageMarkerDisposition::Normalized => {
                         if legacy_carrier {

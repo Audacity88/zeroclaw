@@ -746,7 +746,7 @@ impl HailoOllamaModelProvider {
             }
 
             let (kind, content) = match message.role.as_str() {
-                "user" if multimodal::is_prompt_tool_result_content(&content) => {
+                "user" if zeroclaw_api::tool_carrier::is_tool_result_carrier("user", &content) => {
                     (MessageKind::ToolResult, content)
                 }
                 "user" => (MessageKind::User, content),

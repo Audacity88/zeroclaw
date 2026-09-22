@@ -382,10 +382,6 @@ struct ToolResultEnvelope {
     tool_use_id: Option<String>,
     /// The tool's own output, with the envelope scaffolding removed.
     content: String,
-    /// The attachments declared at the envelope's fixed position. `None`
-    /// marks a legacy envelope (no `attachments` key): zero attachments, and
-    /// the body is text that is never scanned for markers.
-    attachments: Option<Vec<zeroclaw_api::media::RenderedMarker>>,
 }
 
 /// What the `"tool"` arm of [`AnthropicModelProvider::convert_messages`] knows
@@ -1355,7 +1351,6 @@ impl AnthropicModelProvider {
         Some(ToolResultEnvelope {
             tool_use_id: id_field.as_str().map(str::to_string),
             content: result.unwrap_or_default(),
-            attachments: zeroclaw_api::tool_carrier::native_attachments(object.get("attachments")),
         })
     }
 
@@ -1422,12 +1417,16 @@ impl AnthropicModelProvider {
                         Some(parsed) => parsed.content.as_str(),
                         None => msg.content.as_str(),
                     };
+                    // Declaredness and attachments come from the one
+                    // classifier, not from this arm's own envelope read:
                     // `None` is a legacy carrier (no declaration); `Some` is
                     // declared, empty list included. The distinction decides
                     // whether the body may keep the legacy residual sweep.
-                    let attachments = envelope
+                    let parts = zeroclaw_api::tool_carrier::classify("tool", &msg.content);
+                    let attachments = parts
                         .as_ref()
-                        .and_then(|parsed| parsed.attachments.as_deref());
+                        .filter(|parts| parts.declared)
+                        .map(|parts| parts.attachments.as_slice());
                     let tool_msg = if let Some(tool_use_id) = envelope
                         .as_ref()
                         .and_then(|parsed| parsed.tool_use_id.clone())
@@ -1513,9 +1512,8 @@ impl AnthropicModelProvider {
                     // declared and keeps the sweep, mirroring the native
                     // legacy path.
                     let declared_prompt_carrier =
-                        zeroclaw_api::tool_carrier::is_prompt_tool_carrier(&msg.content)
-                            && zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&msg.content)
-                                .is_some_and(|parsed| parsed.declared);
+                        zeroclaw_api::tool_carrier::classify(&msg.role, &msg.content)
+                            .is_some_and(|parts| parts.declared);
                     let (text, image_refs) =
                         crate::multimodal::parse_user_message_image_refs(&msg.content);
                     let mut content_blocks: Vec<NativeContentOut> = Vec::new();
@@ -6678,7 +6676,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "a count-zero carrier's body marker is not an image"
         );
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let blocks = top_level_user_blocks(&native_msgs);
         assert!(
             blocks.iter().all(|block| block["type"] != "image"),
@@ -6722,7 +6721,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "a count-zero carrier's quoted marker is not an image"
         );
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let blocks = top_level_user_blocks(&native_msgs);
         assert!(
             blocks.iter().all(|block| block["type"] != "image"),
@@ -6782,7 +6782,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         .expect("preparation succeeds");
         assert!(prepared.contains_images, "the declared image counts");
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let blocks = top_level_user_blocks(&native_msgs);
         let images: Vec<_> = blocks
             .iter()
@@ -6838,7 +6839,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "a legacy carrier contributes no images"
         );
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let blocks = top_level_user_blocks(&native_msgs);
         assert!(
             blocks.iter().all(|block| block["type"] != "image"),
@@ -6876,7 +6878,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         .expect("preparation succeeds");
         assert!(!prepared.contains_images);
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         // One text block serializes as a bare string, not a block list.
         let content = tool_result["content"]
@@ -6919,7 +6922,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         .expect("preparation succeeds");
         assert!(prepared.contains_images, "the declared image counts");
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let blocks = top_level_user_blocks(&native_msgs);
         let images: Vec<_> = blocks
             .iter()
@@ -6956,7 +6960,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         .await
         .expect("preparation succeeds");
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         // One text block serializes as a bare string, not a block list.
         let content = tool_result["content"]

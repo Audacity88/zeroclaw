@@ -20,10 +20,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::media::{MarkerKind, RenderedMarker};
-use zeroclaw_api::tool_carrier::{
-    is_prompt_tool_carrier, native_attachments, parse_native_tool_carrier,
-    render_native_attachments,
-};
+use zeroclaw_api::tool_carrier::{classify, is_tool_result_carrier, rebuild_carrier};
 use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
@@ -2782,7 +2779,7 @@ impl OpenAiCompatibleModelProvider {
         // A prompt-mode tool carrier contributes only its declared image
         // attachment lines; its body — and a legacy carrier's whole text —
         // is never scanned for markers.
-        if is_prompt_tool_carrier(content) {
+        if is_tool_result_carrier(role, content) {
             let (cleaned_text, image_refs) = multimodal::parse_user_message_image_refs(content);
             if image_refs.is_empty() {
                 return MessageContent::Text(content.to_string());
@@ -2884,31 +2881,17 @@ impl OpenAiCompatibleModelProvider {
     /// (no attachments key) pass through untouched: their bodies are text,
     /// nothing promotes from them, and there is nothing to omit.
     fn sanitize_tool_result_message(content: &str) -> String {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        let Some(mut parts) = classify("tool", content).filter(|parts| parts.declared) else {
             return content.to_string();
         };
-        let Some(serde_json::Value::String(body)) = value.get("content").cloned() else {
-            return content.to_string();
-        };
-        let declared = native_attachments(value.get("attachments"));
-        let Some(attachments) = declared else {
-            return content.to_string();
-        };
-        if attachments.is_empty() {
+        if parts.attachments.is_empty() {
             return content.to_string();
         }
-        let mut text = body;
-        if !text.is_empty() {
-            text.push_str("\n\n");
+        if !parts.text.is_empty() {
+            parts.text.push_str("\n\n");
         }
-        text.push_str(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
-        let mut obj = match value {
-            serde_json::Value::Object(obj) => obj,
-            _ => return content.to_string(),
-        };
-        obj.insert("content".to_string(), serde_json::Value::String(text));
-        obj.insert("attachments".to_string(), render_native_attachments(&[]));
-        serde_json::Value::Object(obj).to_string()
+        parts.text.push_str(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
+        rebuild_carrier("tool", content, &parts, &[])
     }
 
     fn message_content_for_role(
@@ -2918,26 +2901,23 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
         _allow_tool_image_parts: bool,
     ) -> MessageContent {
-        if role == "tool" {
-            // An envelope carrier resolves through its declared attachments
-            // (this is the path `chat_with_history` takes, where the whole
-            // envelope string arrives here); its body is never scanned.
-            // Anything else — raw text, a non-string payload — is a legacy
-            // shape whose body is text under the attachment-identity
-            // contract, passed through verbatim whatever the policy.
-            if let Some(parsed) = parse_native_tool_carrier(content) {
-                let attachments = if parsed.declared {
-                    parsed.attachments
-                } else {
-                    Vec::new()
-                };
-                return self.tool_carrier_content(
-                    &parsed.text,
-                    &attachments,
-                    allow_user_image_parts,
-                );
-            }
-            return MessageContent::Text(content.to_string());
+        if role == "tool"
+            && let Some(parts) = classify(role, content)
+        {
+            // `classify` never returns `None` for a tool message: raw text
+            // and a non-string payload are legacy carriers whose text is
+            // the raw content, so the raw-text fallback this arm once
+            // carried is gone. Declaredness alone decides whether
+            // attachments ride along; an envelope carrier resolves through
+            // its declared attachments (this is the path `chat_with_history`
+            // takes, where the whole envelope string arrives here) and its
+            // body is never scanned.
+            let attachments = if parts.declared {
+                parts.attachments
+            } else {
+                Vec::new()
+            };
+            return self.tool_carrier_content(&parts.text, &attachments, allow_user_image_parts);
         }
         Self::to_message_content(role, content, allow_user_image_parts)
     }
@@ -3072,8 +3052,13 @@ impl OpenAiCompatibleModelProvider {
                     }
                     // The envelope's attachments are the only image source:
                     // the content string is never scanned for markers.
-                    let attachments =
-                        native_attachments(value.get("attachments")).unwrap_or_default();
+                    // Declaredness comes from the one classifier, so this
+                    // seam cannot drift from the adapters on what counts as
+                    // a declaration.
+                    let attachments = classify("tool", &message.content)
+                        .filter(|parts| parts.declared)
+                        .map(|parts| parts.attachments)
+                        .unwrap_or_default();
                     let content = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
