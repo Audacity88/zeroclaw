@@ -6245,6 +6245,228 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A prompt-mode tool result keeps its durable tagged role in history;
+    /// image routing runs on that raw history before preparation normalizes
+    /// the role. The tagged carrier must therefore count as an image-bearing
+    /// tool result: with a configured vision route on a non-vision primary,
+    /// the route is selected (the nonexistent provider surfaces its creation
+    /// error, which only happens once the image is counted) instead of the
+    /// image being silently loaded into the text-only primary's request.
+    #[tokio::test]
+    async fn run_tool_call_loop_routes_tagged_prompt_tool_result_image_to_vision_provider() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = NonVisionModelProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shot.png");
+        // Minimal PNG signature - enough for MIME detection.
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let marker = format!(
+            "[Tool results]\ninspected {} {}]",
+            zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX,
+            path.display()
+        );
+        // Text-only user turn, then the prompt-mode tool result carrying the
+        // image marker under the tagged durable role.
+        let mut history = vec![
+            ChatMessage::user("inspect the screenshot".to_string()),
+            crate::agent::history::prompt_tool_results_message(marker),
+        ];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let observer = NoopObserver;
+
+        let multimodal = zeroclaw_config::schema::MultimodalConfig {
+            vision_model_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: Some("llava:7b".to_string()),
+            ..Default::default()
+        };
+
+        let err = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &multimodal,
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect_err("a tagged tool-result image must select the configured vision route");
+
+        assert!(
+            err.to_string()
+                .contains("failed to create vision model_provider"),
+            "expected the vision route to be attempted for a tagged tool-result image, got: {err}"
+        );
+    }
+
+    /// Companion without a configured vision route: the tagged prompt-tool
+    /// result image must degrade to text-only. The request the non-vision
+    /// primary actually serves carries no image payload: the marker is
+    /// replaced by the placeholder, and neither the filesystem path nor a
+    /// loaded data URI reaches the provider.
+    #[tokio::test]
+    async fn run_tool_call_loop_degrades_tagged_prompt_tool_result_image_without_vision_route() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = RecordingModelProvider::new();
+        let recorded_requests = Arc::clone(&model_provider.requests);
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let marker = format!(
+            "[Tool results]\ninspected {} {}]",
+            zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX,
+            path.display()
+        );
+        let mut history = vec![
+            ChatMessage::user("inspect the screenshot".to_string()),
+            crate::agent::history::prompt_tool_results_message(marker),
+        ];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("a tagged tool-result image must degrade to text-only, not fail the turn");
+
+        assert_eq!(result, "done");
+
+        // Assert on what the provider actually served, not just the role
+        // conversion: exactly one call, and its payload has no image parts,
+        // no marker text, no filesystem path, and no loaded data URI.
+        let requests = recorded_requests
+            .lock()
+            .expect("recorded requests lock should be valid");
+        assert_eq!(requests.len(), 1, "exactly one provider call expected");
+        let sent_blob = requests[0]
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !sent_blob.contains(zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX),
+            "the raw image marker reached the text-only provider: {sent_blob}"
+        );
+        assert!(
+            !sent_blob.contains("data:image"),
+            "a loaded image payload reached the text-only provider: {sent_blob}"
+        );
+        assert!(
+            !sent_blob.contains(path.display().to_string().as_str()),
+            "the image filesystem path reached the text-only provider: {sent_blob}"
+        );
+        assert!(
+            sent_blob.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "the degraded carrier should keep the placeholder prose: {sent_blob}"
+        );
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_vision_provider_creation_failure() {
         let turn_id = uuid::Uuid::new_v4().to_string();

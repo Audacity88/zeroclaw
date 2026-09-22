@@ -920,6 +920,77 @@ mod graceful_summary_metering_tests {
         );
     }
 
+    // The summary's image-degradation decision runs on the raw history before
+    // preparation normalizes roles, so a prompt-mode tool result must count
+    // while it still carries the durable tagged role. Without that, a
+    // loadable marker in a tagged result counted zero images, the summary
+    // skipped the degrade flag, and preparation then loaded the image into
+    // the request of a provider that cannot see it.
+    #[tokio::test]
+    async fn graceful_summary_strips_tagged_prompt_tool_result_image_for_non_vision_model() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let png_path = temp.path().join("shot.png");
+        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+            .expect("write png signature");
+        let marker = format!("[{}:{}]", "IMAGE", png_path.display());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+        };
+        // Prompt-mode tool exchange: a text-only user turn, then the tool
+        // result stored under the tagged durable prompt-results role.
+        let mut history = vec![
+            ChatMessage::user("inspect the screenshot and summarize"),
+            crate::agent::history::prompt_tool_results_message(format!(
+                "[Tool results]\n{marker} captured"
+            )),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-tagged-img",
+            &knobs,
+            None,
+            None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            !captured.contains(&png_path.display().to_string()),
+            "raw image path reached the non-vision provider on the max-iteration path: {captured}"
+        );
+        assert!(
+            !captured.contains("data:image"),
+            "a loaded image payload reached the non-vision provider on the max-iteration path: {captured}"
+        );
+        assert!(
+            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "the degraded marker should be replaced with the placeholder prose: {captured}"
+        );
+    }
+
     // A loadable local image and an already-inline data URI both reach the
     // summary request as validated inline markers: the file is read,
     // MIME-checked and inlined by the normalizer, and the inline marker
