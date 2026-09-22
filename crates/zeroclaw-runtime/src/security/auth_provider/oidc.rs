@@ -822,7 +822,10 @@ mod tests {
     }
 
     async fn start_idp() -> TestIdp {
-        let server = MockServer::start().await;
+        // Keep this authority's port owned until the test ends. A pooled server
+        // can hand the same port to another parallel test while a client still
+        // holds its issuer URL.
+        let server = MockServer::builder().start().await;
         let issuer = server.uri();
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
@@ -1120,7 +1123,7 @@ mod tests {
         for surface in ["discovery", "jwks", "introspection"] {
             for status in [302, 307, 308] {
                 let idp = start_idp().await;
-                let sink = MockServer::start().await;
+                let sink = MockServer::builder().start().await;
                 Mock::given(path("/capture"))
                     .respond_with(ResponseTemplate::new(200))
                     .expect(0)
@@ -1170,9 +1173,24 @@ mod tests {
                         b"token=opaque-token&token_type_hint=access_token"
                     );
                 }
+                let unexpected: Vec<_> = sink
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|request| {
+                        format!(
+                            "{} {} authorization={} body_present={}",
+                            request.method,
+                            request.url.path(),
+                            request.headers.contains_key("authorization"),
+                            !request.body.is_empty()
+                        )
+                    })
+                    .collect();
                 assert!(
-                    sink.received_requests().await.unwrap().is_empty(),
-                    "{surface} status {status} must not deliver any request to the redirect target"
+                    unexpected.is_empty(),
+                    "{surface} status {status} must not deliver any request to the redirect target; observed {unexpected:?}"
                 );
             }
         }
@@ -2121,7 +2139,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_issuer_mismatch_fails_closed() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let issuer = server.uri();
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
@@ -2328,12 +2346,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_idp_fails_closed() {
+    async fn introspection_transport_failure_fails_closed() {
         let idp = start_idp().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/introspect", listener.local_addr().unwrap());
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": idp.issuer,
+                "introspection_endpoint": endpoint,
+            })))
+            .with_priority(1)
+            .mount(&idp.server)
+            .await;
+        let refusing_endpoint = tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                drop(connection);
+            }
+        });
         let provider = idp.provider(OidcValidation::Introspection);
         assert!(provider.discovery().await.is_ok(), "warm discovery first");
-        drop(idp.server);
         let out = provider.verify(&bearer("opaque-token")).await;
+        refusing_endpoint.abort();
+        let _ = refusing_endpoint.await;
         assert!(matches!(
             out,
             AuthOutcome::Denied {
