@@ -6,7 +6,6 @@ use zeroclaw_providers::ChatMessage;
 use zeroclaw_providers::multimodal::ImageMarkerDisposition;
 use zeroclaw_providers::multimodal::image_marker_dispositions;
 use zeroclaw_providers::multimodal::message_image_summary;
-use zeroclaw_providers::multimodal::stripped_message_text_bytes;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
@@ -189,8 +188,8 @@ pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
 /// and a user message is charged for the loadable `[IMAGE:...]` markers
 /// preparation lifts. The per-image charge applies only when preparation
 /// dispatches the images ([`ImageMarkerDisposition::Normalized`]); stale
-/// tool-result carriers are priced as the text preparation delivers for
-/// them ([`stripped_message_text_bytes`]), and system or assistant content
+/// tool-result carriers are priced as their bytes (the same formula as
+/// literal text; see the arm below), and system or assistant content
 /// stays literal text. A message whose markers are all
 /// placeholders keeps the plain-text formula. Single-sourced so the history
 /// and system-floor estimates stay in lock-step.
@@ -207,10 +206,13 @@ fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDispos
         ImageMarkerDisposition::Normalized => {
             summary.text_bytes.div_ceil(4) + summary.image_refs * IMAGE_TOKEN_ESTIMATE + 4
         }
-        // Priced on the text the stale replay pass actually delivers, so a
-        // retained legacy inline payload is budgeted as its stripped text,
-        // not its full body.
-        ImageMarkerDisposition::Stripped => stripped_message_text_bytes(message).div_ceil(4) + 4,
+        // A stale carrier is priced as its bytes: the replay delivers a
+        // legacy carrier verbatim and re-declares a declared one without
+        // touching its body, so the full content length is the price. (A
+        // stale declared envelope still carries its original attachment
+        // list in these bytes; that overcount is the accepted, conservative
+        // known limit.)
+        ImageMarkerDisposition::Stripped => text_estimate,
         // Unreachable after the guard; keeps the arm total.
         ImageMarkerDisposition::Literal => text_estimate,
     }
@@ -220,8 +222,8 @@ fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDispos
 /// heuristic plus ~4 framing tokens per message. Images are charged per
 /// image only where preparation dispatches them: the markers lifted from
 /// user turns and the attachments declared by the tool-result carriers of
-/// the current user turn. Stale tool-result carriers are priced as the text
-/// preparation delivers for them, and system or assistant content is priced
+/// the current user turn. Stale tool-result carriers are priced as their
+/// bytes, and system or assistant content is priced
 /// as text. Trim
 /// probes estimate history suffixes that always retain the newest turn, so
 /// the current turn's tool-result carriers carry the same disposition in
@@ -715,51 +717,6 @@ mod tests {
             estimate_history_tokens(&history),
             expected,
             "a legacy carrier's body markers are text, never images"
-        );
-    }
-
-    #[test]
-    fn stale_tool_result_markers_are_not_charged_as_images() {
-        // A declared carrier returning thirty images: the attachments sit at
-        // the fixed position and the bookend prose is the whole body.
-        let images: Vec<String> = (0..30)
-            .map(|index| format!("/tmp/slide-{index}.png"))
-            .collect();
-        let references: Vec<&str> = images.iter().map(String::as_str).collect();
-        let body = "a\nb";
-        let tool = native_image_carrier(body, &references);
-
-        let prefix = || {
-            vec![
-                ChatMessage::system("s"),
-                ChatMessage::user("u"),
-                ChatMessage::assistant("called tools"),
-            ]
-        };
-
-        // A trailing user turn makes the tool run stale: preparation empties
-        // the declared attachments, so the estimate must price the message
-        // as its delivered text only.
-        let stale_history = [prefix(), vec![tool.clone(), ChatMessage::user("next")]].concat();
-        let stale_control = [prefix(), vec![ChatMessage::user("next")]].concat();
-        let stale_tool_tokens =
-            estimate_history_tokens(&stale_history) - estimate_history_tokens(&stale_control);
-        assert_eq!(
-            stale_tool_tokens,
-            body.len().div_ceil(4) + 4,
-            "a stale declared carrier is priced as its delivered text"
-        );
-        assert!(stale_tool_tokens < IMAGE_TOKEN_ESTIMATE);
-
-        // Without the trailing user message the tool run is the latest one
-        // and its images are dispatched: thirty per-image charges appear.
-        let latest_history = [prefix(), vec![tool]].concat();
-        let latest_control = prefix();
-        let latest_tool_tokens =
-            estimate_history_tokens(&latest_history) - estimate_history_tokens(&latest_control);
-        assert_eq!(
-            latest_tool_tokens - stale_tool_tokens,
-            30 * IMAGE_TOKEN_ESTIMATE
         );
     }
 

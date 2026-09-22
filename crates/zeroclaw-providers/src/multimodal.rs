@@ -465,11 +465,10 @@ pub fn image_marker_summary(content: &str) -> ImageMarkerSummary {
 /// `text_bytes` is its retained body length: the envelope's `content` string
 /// for a native carrier, and the carrier text with its image attachment
 /// lines lifted (non-image lines retained) for a prompt carrier. That is
-/// what a current-turn dispatch delivers; a stale carrier can deliver less
-/// (legacy bodies are stripped in replay), and the estimator prices that
-/// case with [`stripped_message_text_bytes`] instead. Every other message
-/// falls back to the text-level [`image_marker_summary`] scan of its
-/// content.
+/// what a current-turn dispatch delivers; a stale carrier is priced as its
+/// bytes by the estimator instead (see `ImageMarkerDisposition::Stripped`).
+/// Every other message falls back to the text-level [`image_marker_summary`]
+/// scan of its content.
 pub fn message_image_summary(message: &ChatMessage) -> ImageMarkerSummary {
     let Some(parts) = classify(&message.role, &message.content) else {
         return image_marker_summary(&message.content);
@@ -505,28 +504,6 @@ pub fn message_image_summary(message: &ChatMessage) -> ImageMarkerSummary {
             }
         }
     }
-}
-
-/// Byte length of the text the stale replay pass delivers for a message:
-/// measured on the output of the same strip_tool_result_image_markers
-/// rewrite `replay_message_without_stale_tool_images` applies, never
-/// re-derived, so a stale legacy carrier with a large inline payload is
-/// budgeted as the text that survives stripping rather than its full body.
-/// A declared carrier keeps body-as-text pricing: the stale pass empties its
-/// attachment list without touching the body, so marker syntax it quoted
-/// stays text stale or not, and the price is [`message_image_summary`]'s.
-/// Non-carriers are cloned verbatim by the replay, so their full content
-/// length is the answer.
-pub fn stripped_message_text_bytes(message: &ChatMessage) -> usize {
-    if let Some(parts) = classify(&message.role, &message.content)
-        && parts.declared
-    {
-        return message_image_summary(message).text_bytes;
-    }
-    if is_tool_result_carrier(&message.role, &message.content) {
-        return strip_tool_result_image_markers(message).content.len();
-    }
-    message.content.len()
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
@@ -796,16 +773,27 @@ pub fn strip_media_markers_model_visible(message: &ChatMessage) -> String {
 /// A DECLARED carrier never has its text regex-stripped: its audio
 /// attachments drop from the declared list (the count the strict parser
 /// checks stays consistent, so a mixed declaration cannot degrade to legacy
-/// and lose its images), and its body is verbatim. Legacy carriers and
-/// ordinary messages keep the regex strip, which is the pre-attachment
-/// compatibility path.
+/// and lose its images), and its body is verbatim. A LEGACY carrier is
+/// cloned unchanged — its body is text and no seam rewrites it. Ordinary
+/// messages keep the regex strip.
 pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
-    // The gate also catches a declared native carrier whose attachments array
-    // names an audio kind: that shape never matches the marker regex, but the
-    // declared list is handled the same way as a marker line below.
-    if !messages.iter().any(|m| {
-        AUDIO_MARKER_RE.is_match(&m.content) || (m.role == "tool" && m.content.contains("audio"))
-    }) {
+    // The gate fires only for messages the pass below can change: an
+    // ordinary message carrying audio marker syntax, or a declared carrier
+    // whose attachment list names an audio kind. A legacy carrier is cloned
+    // unchanged, so it never fires the pass.
+    if !messages
+        .iter()
+        .any(|m| match classify(&m.role, &m.content) {
+            Some(parts) => {
+                parts.declared
+                    && parts
+                        .attachments
+                        .iter()
+                        .any(|marker| marker.kind == MarkerKind::Audio)
+            }
+            None => AUDIO_MARKER_RE.is_match(&m.content),
+        })
+    {
         return Cow::Borrowed(messages);
     }
 
@@ -820,9 +808,13 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
             // Audio attachments drop from the declared list instead; the
             // body is never touched, so a body quoting audio syntax stays
             // verbatim under the attachment-identity contract.
-            if let Some(parts) = classify(&m.role, &m.content)
-                && parts.declared
-            {
+            if let Some(parts) = classify(&m.role, &m.content) {
+                if !parts.declared {
+                    // A legacy carrier is delivered as its bytes: nothing
+                    // declared, nothing promoted, and no seam rewrites its
+                    // body.
+                    return m.clone();
+                }
                 let retained: Vec<RenderedMarker> = parts
                     .attachments
                     .iter()
@@ -930,16 +922,29 @@ fn strip_undeliverable_image_markers(text: &str) -> (String, usize) {
 /// A DECLARED carrier is never body-scanned here: its image attachments that
 /// name a path or URL (not an inline `data:` URI) drop from the declared
 /// list, and its body stays verbatim, so marker syntax a tool quoted in its
-/// output remains text under the attachment-identity contract. Legacy
-/// carriers and raw non-JSON tool text keep the regex strip, which is the
-/// pre-attachment compatibility path.
+/// output remains text under the attachment-identity contract. A LEGACY
+/// carrier is cloned unchanged: it declared nothing, its body is text, and
+/// this seam does not rewrite it. Ordinary messages keep the regex strip.
 pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
-    // The gate also catches a declared native carrier whose attachments
-    // array names an image kind: that shape never matches the marker regex,
-    // but the declared list below is handled the same way as a marker line.
-    if !messages.iter().any(|m| {
-        IMAGE_MARKER_RE.is_match(&m.content) || (m.role == "tool" && m.content.contains("image"))
-    }) {
+    // The gate fires only for messages the pass below can change: an
+    // ordinary message carrying marker syntax, or a declared carrier whose
+    // attachment list names an image this seam cannot deliver. A legacy
+    // carrier is cloned unchanged, so it never fires the pass.
+    if !messages
+        .iter()
+        .any(|m| match classify(&m.role, &m.content) {
+            Some(parts) => {
+                parts.declared
+                    && parts.attachments.iter().any(|marker| {
+                        marker.kind == MarkerKind::Image
+                            && is_undeliverable_image_reference(&collapse_wrapped_marker(
+                                &marker.target,
+                            ))
+                    })
+            }
+            None => IMAGE_MARKER_RE.is_match(&m.content),
+        })
+    {
         return Cow::Borrowed(messages);
     }
 
@@ -954,9 +959,13 @@ pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
             // image attachments drop from the declared list instead (the
             // count the parser checks stays consistent); the body is never
             // touched.
-            if let Some(parts) = classify(&m.role, &m.content)
-                && parts.declared
-            {
+            if let Some(parts) = classify(&m.role, &m.content) {
+                if !parts.declared {
+                    // A legacy carrier is delivered as its bytes: nothing
+                    // declared, nothing promoted, and no seam rewrites its
+                    // body.
+                    return m.clone();
+                }
                 let retained: Vec<RenderedMarker> = parts
                     .attachments
                     .iter()
@@ -1179,58 +1188,20 @@ pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDis
         .collect()
 }
 
-fn stripped_image_marker_text(content: &str) -> String {
-    let (cleaned, refs) = parse_image_markers(content);
-    if refs.is_empty() {
-        return content.to_string();
-    }
-
-    if cleaned.trim().is_empty() {
-        "[image removed from history]".to_string()
-    } else {
-        cleaned
-    }
-}
-
 fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
     // A declared carrier empties its attachment list at the fixed position;
-    // the body was never scanned, so it stays verbatim. A legacy carrier
-    // (pre-upgrade, or a third-party shape) keeps the historical body strip
-    // so pre-upgrade sessions send exactly what they sent before.
-    if let Some(parts) = classify(&message.role, &message.content)
-        && parts.declared
-    {
-        let emptied: Vec<RenderedMarker> = Vec::new();
-        return ChatMessage {
-            role: message.role.clone(),
-            content: rebuild_carrier(&message.role, &message.content, &parts, &emptied),
-        };
-    }
-
-    if !message.content.contains(IMAGE_MARKER_PREFIX) {
+    // the body was never scanned, so it stays verbatim. Every other carrier
+    // is legacy and is delivered as its bytes: nothing is stripped from it.
+    // (Non-carriers never reach this helper; the replay path calls it only
+    // for carriers.)
+    let Some(parts) = classify(&message.role, &message.content).filter(|parts| parts.declared)
+    else {
         return message.clone();
-    }
-
-    if message.role == "tool"
-        && let Ok(serde_json::Value::Object(mut obj)) =
-            serde_json::from_str::<serde_json::Value>(&message.content)
-        && let Some(serde_json::Value::String(inner)) = obj.get("content").cloned()
-    {
-        let stripped = stripped_image_marker_text(&inner);
-        if stripped == inner {
-            return message.clone();
-        }
-
-        obj.insert("content".to_string(), serde_json::Value::String(stripped));
-        return ChatMessage {
-            role: message.role.clone(),
-            content: serde_json::Value::Object(obj).to_string(),
-        };
-    }
-
+    };
+    let emptied: Vec<RenderedMarker> = Vec::new();
     ChatMessage {
         role: message.role.clone(),
-        content: stripped_image_marker_text(&message.content),
+        content: rebuild_carrier(&message.role, &message.content, &parts, &emptied),
     }
 }
 
@@ -2303,9 +2274,11 @@ mod tests {
                             !inline_image,
                             "{name}[{index}] Stripped must not dispatch an image block"
                         );
+                        // Both stale carriers in these fixtures are legacy:
+                        // replay delivers the body verbatim, marker and all.
                         assert!(
-                            !content.contains(".png"),
-                            "{name}[{index}] Stripped must drop the marker"
+                            content.contains(".png"),
+                            "{name}[{index}] a stale legacy carrier is delivered as its bytes"
                         );
                     }
                     ImageMarkerDisposition::Literal => {
@@ -2909,28 +2882,81 @@ mod tests {
     #[test]
     fn sanitize_image_markers_rewrites_path_markers_in_place() {
         // Emits the seam WARN; serialized against the tests that count it.
+        // Ordinary user text: the seam replaces a loadable path marker with
+        // the placeholder. (A legacy carrier's body is never rewritten here;
+        // the legacy-verbatim test pins that.)
         let _seam_warn_guard = SEAM_WARN_WINDOW.lock().unwrap();
         let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
         let messages = [
             ChatMessage::user("look"),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": format!("saved {marker}"),
-                    "tool_call_id": "toolu_1",
-                })
-                .to_string(),
-            ),
+            ChatMessage::user(format!("saved {marker}")),
         ];
         let sanitized = sanitize_image_markers(&messages);
         assert_eq!(sanitized[0].content, "look");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
         assert_eq!(
-            parsed["content"],
+            sanitized[1].content,
             format!("saved {MEDIA_PLACEHOLDER}"),
-            "the marker inside the native tool-result envelope must be replaced"
+            "the marker in ordinary user text must be replaced"
         );
-        assert_eq!(parsed["tool_call_id"], "toolu_1");
+    }
+
+    #[test]
+    fn legacy_carriers_cross_every_seam_as_their_bytes() {
+        // A legacy carrier (nothing declared at the fixed position) is
+        // delivered, replayed, and priced as its bytes: no seam sweeps,
+        // strips, or rewrites its body, marker syntax and data URIs
+        // included.
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/legacy-shot.png");
+        let data_uri = format!("data:image/png;{}iVBORw0KGgo=", "base64,");
+        let body = format!("saved {marker} and quoted {data_uri} in prose");
+
+        // Legacy native: a pre-upgrade envelope without the attachments key.
+        let legacy_native = ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "tc1",
+                "content": body,
+            })
+            .to_string(),
+        );
+        // Legacy prompt: the results prefix with no count header.
+        let legacy_prompt = ChatMessage::user(format!("[Tool results]\n{body}"));
+
+        for carrier in [&legacy_native, &legacy_prompt] {
+            // The one-shot image seam clones a legacy carrier unchanged; its
+            // gate never even fires, so the input stays borrowed.
+            let messages = [carrier.clone()];
+            match sanitize_image_markers(&messages) {
+                Cow::Borrowed(borrowed) => {
+                    assert_eq!(borrowed[0].content, carrier.content);
+                }
+                _ => panic!("a legacy carrier must not trigger the image seam"),
+            }
+
+            // The stale replay path delivers it verbatim: a history whose
+            // latest user turn is past the carrier, so replay, not
+            // normalization, is the route it takes.
+            let history = vec![
+                ChatMessage::system("s"),
+                ChatMessage::user("u"),
+                ChatMessage::assistant("a"),
+                carrier.clone(),
+                ChatMessage::user("next"),
+            ];
+            let current_turn = current_turn_tool_result_indices(&history);
+            let replayed = replay_message_without_stale_tool_images(3, carrier, &current_turn);
+            assert_eq!(replayed.content, carrier.content);
+            assert_eq!(replayed.role, carrier.role);
+        }
+
+        // Pricing follows the same rule: a legacy carrier contributes no
+        // images, and its summary is its delivered body.
+        let native_summary = message_image_summary(&legacy_native);
+        assert_eq!(native_summary.image_refs, 0);
+        assert_eq!(native_summary.text_bytes, body.len());
+
+        let prompt_summary = message_image_summary(&legacy_prompt);
+        assert_eq!(prompt_summary.image_refs, 0);
+        assert_eq!(prompt_summary.text_bytes, legacy_prompt.content.len());
     }
 
     // The assistant history entry for native tool calls is a JSON envelope
@@ -2940,6 +2966,10 @@ mod tests {
     // rewrites only the envelope's `content` field.
     #[test]
     fn sanitize_image_markers_preserves_signed_reasoning_in_assistant_envelope() {
+        // The converted declared-carrier fixture drops an attachment, which
+        // emits the seam WARN: hold the window so the broadcast warning
+        // cannot land in another test's drain window.
+        let _seam_warn_guard = SEAM_WARN_WINDOW.lock().unwrap();
         let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
         let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
         let tool_calls = serde_json::json!([{
@@ -2959,8 +2989,9 @@ mod tests {
             ),
             ChatMessage::tool(
                 serde_json::json!({
-                    "content": format!("saved {marker}"),
+                    "content": "saved",
                     "tool_call_id": "toolu_1",
+                    "attachments": [{"kind": "image", "target": "/tmp/shot.png"}],
                 })
                 .to_string(),
             ),
@@ -2985,9 +3016,20 @@ mod tests {
         let tool_parsed: serde_json::Value =
             serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
         assert_eq!(
-            tool_parsed["content"],
-            format!("saved {MEDIA_PLACEHOLDER}"),
-            "the tool message's marker is still replaced in place"
+            tool_parsed["content"], "saved",
+            "a declared carrier's body crosses the seam verbatim"
+        );
+        assert!(
+            tool_parsed["attachments"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+            "the undeliverable declared image attachment is dropped from the list"
+        );
+        assert!(
+            !tool_parsed["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("/tmp/shot.png")),
+            "the raw path must not survive as model-visible text"
         );
     }
 
@@ -3099,8 +3141,9 @@ mod tests {
             "a verbatim declared carrier must not emit the strip warning"
         );
 
-        // Legacy control, pinned as compatibility: a legacy native envelope
-        // (no attachments key) with the same quoted marker is still swept.
+        // Legacy control: a legacy native envelope (no attachments key)
+        // with the same quoted marker crosses the seam byte for byte —
+        // its bytes are the delivery, and no seam rewrites them.
         let legacy = ChatMessage::tool(
             serde_json::json!({
                 "tool_call_id": "tc2",
@@ -3110,19 +3153,9 @@ mod tests {
         );
         let messages = [legacy.clone()];
         let sanitized = sanitize_image_markers(&messages);
-        assert_ne!(
+        assert_eq!(
             sanitized[0].content, legacy.content,
-            "the legacy body sweep must still run"
-        );
-        assert!(
-            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
-            "the quoted path reference becomes the placeholder: {}",
-            sanitized[0].content
-        );
-        assert!(
-            !sanitized[0].content.contains(&marker),
-            "the quoted marker must not survive the legacy sweep: {}",
-            sanitized[0].content
+            "a legacy carrier is cloned unchanged, markers and all"
         );
     }
 
@@ -3156,6 +3189,9 @@ mod tests {
     // `content` field and leaves the signed reasoning untouched.
     #[test]
     fn sanitize_audio_markers_preserves_signed_reasoning_in_assistant_envelope() {
+        // Same as the image twin: the converted fixture drops a declared
+        // audio attachment and emits the seam WARN, so hold the window.
+        let _seam_warn_guard = SEAM_WARN_WINDOW.lock().unwrap();
         let marker = format!("[{}:{}]", "AUDIO", "/tmp/clip.wav");
         let reasoning = format!(
             r#"{{"thinking":"listen to {marker} before answering","signature":"sig_abc"}}"#
@@ -3177,8 +3213,9 @@ mod tests {
             ),
             ChatMessage::tool(
                 serde_json::json!({
-                    "content": format!("heard {marker}"),
+                    "content": "heard",
                     "tool_call_id": "toolu_1",
+                    "attachments": [{"kind": "audio", "target": "/tmp/clip.wav"}],
                 })
                 .to_string(),
             ),
@@ -3203,9 +3240,14 @@ mod tests {
         let tool_parsed: serde_json::Value =
             serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
         assert_eq!(
-            tool_parsed["content"],
-            format!("heard {MEDIA_PLACEHOLDER}"),
-            "the tool message's audio marker is still replaced in place"
+            tool_parsed["content"], "heard",
+            "a declared carrier's body crosses the seam verbatim"
+        );
+        assert!(
+            tool_parsed["attachments"]
+                .as_array()
+                .is_some_and(|a| a.is_empty()),
+            "the declared audio attachment is dropped from the list"
         );
     }
 
@@ -3309,41 +3351,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_strips_tool_result_audio_marker() {
-        // The reported failure: a tool result surfaces an audio path. With no
-        // images in history, prep must still strip the marker so the raw
-        // filesystem path never reaches the provider as literal text.
-        let history = vec![
-            ChatMessage::user("call the tool and tell me what you hear"),
-            ChatMessage::tool("[AUDIO:/tmp/clip.wav] recorded 3:00 PM"),
-        ];
-        let cfg = MultimodalConfig::default();
-        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
-        let tool_msg = prepared
-            .messages
-            .iter()
-            .find(|m| m.role == "tool")
-            .expect("tool message survives prep");
-        assert!(
-            !tool_msg.content.contains("/tmp/clip.wav"),
-            "raw audio path must not reach the provider: {}",
-            tool_msg.content
-        );
-        assert!(tool_msg.content.contains(MEDIA_PLACEHOLDER));
-        assert!(!prepared.contains_images);
-    }
-
-    #[tokio::test]
     async fn prepare_messages_preserves_document_marker_for_delivery() {
-        // A tool result that surfaces a document path must reach the provider
-        // intact: the agent copies that path into an outbound reply marker to
-        // deliver the file, and file tools read it on request. Only the audio
-        // kinds degrade.
+        // A tool result that declares a document and an audio attachment:
+        // the document rides the declared list to the provider — the agent
+        // copies that path into an outbound reply marker to deliver the
+        // file, and file tools read it on request — while the audio
+        // attachment drops, because no provider resolves audio into parts
+        // and a bare audio path is not actionable. (A legacy carrier's
+        // body keeps its bytes verbatim, audio markers included.)
+        let attachments = vec![
+            zeroclaw_api::media::RenderedMarker {
+                target: "/tmp/report.pdf".to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Document,
+            },
+            zeroclaw_api::media::RenderedMarker {
+                target: "/tmp/note.wav".to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Audio,
+            },
+        ];
+        let envelope = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": "generated",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string();
         let history = vec![
             ChatMessage::user("send me the report"),
-            ChatMessage::tool(
-                "[DOCUMENT:/workspace/report.pdf] generated, and [AUDIO:/tmp/note.wav]",
-            ),
+            ChatMessage::tool(envelope),
         ];
         let cfg = MultimodalConfig::default();
         let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
@@ -3352,20 +3386,31 @@ mod tests {
             .iter()
             .find(|m| m.role == "tool")
             .expect("tool message survives prep");
+        let parsed = zeroclaw_api::tool_carrier::parse_native_tool_carrier(&tool_msg.content)
+            .expect("carrier stays parseable");
+        assert!(parsed.declared);
+        assert_eq!(
+            parsed.attachments.len(),
+            1,
+            "only the audio attachment drops: {:?}",
+            parsed.attachments
+        );
+        assert_eq!(
+            parsed.attachments[0].kind,
+            zeroclaw_api::media::MarkerKind::Document
+        );
+        assert_eq!(parsed.text, "generated", "the body is verbatim");
         assert!(
-            tool_msg
-                .content
-                .contains("[DOCUMENT:/workspace/report.pdf]"),
-            "document path must stay model-visible for delivery: {}",
+            !tool_msg.content.contains("/tmp/note.wav"),
+            "the audio path must not reach the provider: {}",
             tool_msg.content
         );
         assert!(
-            !tool_msg.content.contains("/tmp/note.wav"),
-            "audio path alongside it must still degrade: {}",
+            tool_msg.content.contains("/tmp/report.pdf"),
+            "the document path stays declared and model-visible: {}",
             tool_msg.content
         );
     }
-
     #[tokio::test]
     async fn prepare_messages_strips_audio_but_keeps_image_marker() {
         let temp = tempfile::tempdir().unwrap();

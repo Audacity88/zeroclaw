@@ -810,66 +810,6 @@ mod graceful_summary_metering_tests {
     // tool-result audio marker in the history must never reach the provider
     // as a raw filesystem path the model would hallucinate over; this pins
     // the combined contract on the max-iteration exit.
-    #[tokio::test]
-    async fn graceful_summary_strips_tool_audio_marker_before_dispatch() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = CapturingProvider {
-            seen: Arc::clone(&seen),
-            vision: false,
-        };
-        // A properly paired assistant tool_call + native tool-result JSON blob,
-        // so the orphaned-tool-message sweep in finish_after_max_iterations keeps
-        // the exchange intact and the audio marker survives to dispatch. This
-        // also exercises stripping a marker embedded inside a tool-result JSON
-        // object (the native-dispatcher shape), not just plain text.
-        let mut history = vec![
-            ChatMessage::user("call the tool and tell me what you hear"),
-            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_1"}]}"#),
-            ChatMessage::tool(
-                r#"{"content":"[AUDIO:/tmp/clip.wav] recorded 3:00 PM","tool_call_id":"toolu_1"}"#,
-            ),
-        ];
-        let pacing = PacingConfig::default();
-        let knobs = LoopKnobs::default();
-        let multimodal_config = MultimodalConfig::default();
-
-        let out = finish_after_max_iterations(
-            &provider,
-            &mut history,
-            "custom",
-            "test-model",
-            "test-model",
-            None,
-            &multimodal_config,
-            &pacing,
-            None,
-            2,
-            String::new(),
-            "trace-req-audio",
-            &knobs,
-            None,
-            None,
-            None,
-            ResolvedContextLimits::legacy_fallback(0),
-            &mut false,
-            super::super::DispatchTokenCounter::default(),
-            &crate::observability::NoopObserver,
-        )
-        .await
-        .expect("graceful summary should succeed");
-
-        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
-        let captured = seen.lock().unwrap().join("\n");
-        assert!(
-            !captured.contains("/tmp/clip.wav"),
-            "raw audio path reached the provider on the max-iteration path: {captured}"
-        );
-        assert!(
-            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
-            "audio marker should be replaced with a placeholder: {captured}"
-        );
-    }
-
     // The summary request is prepared like an in-loop request, so an image a
     // tool DECLARED whose file is not an interpretable image is dropped by
     // the normalizer with a model-facing note: the raw path never reaches
@@ -1084,6 +1024,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            None,
             ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
@@ -1102,13 +1043,17 @@ mod graceful_summary_metering_tests {
             !captured.contains("could not be loaded"),
             "nothing is loaded for a legacy body, so no note is appended: {captured}"
         );
+        // A legacy carrier is delivered as its bytes: the body reaches the
+        // provider verbatim, quoted marker syntax and raw path included, as
+        // text. Nothing infers, sweeps, or strips it.
+        let body = format!("saw {marker} in output");
         assert!(
-            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
-            "the legacy body is delivered as the compatibility sweep leaves it: {captured}"
+            captured.contains(&body),
+            "the legacy body is delivered verbatim: {captured}"
         );
         assert!(
-            !captured.contains(&png_path.display().to_string()),
-            "the raw path must not reach the provider: {captured}"
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "no seam rewrites a legacy carrier's body: {captured}"
         );
     }
 
@@ -1162,6 +1107,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            None,
             ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
@@ -1206,6 +1152,7 @@ mod graceful_summary_metering_tests {
             String::new(),
             "trace-req-img-quote-prompt",
             &knobs,
+            None,
             None,
             None,
             ResolvedContextLimits::legacy_fallback(0),

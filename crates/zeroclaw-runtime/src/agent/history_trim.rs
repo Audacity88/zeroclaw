@@ -1633,90 +1633,18 @@ mod tests {
         );
     }
 
-    // A stale legacy carrier with a huge inline payload: preparation strips
-    // the marker before dispatch, so the estimator must price the message as
-    // the text the stale pass delivers. Priced on the retained body (the old
-    // contract), the same history evicts a whole turn that actually fits.
-    #[tokio::test]
-    async fn stale_legacy_inline_payload_is_priced_as_delivered_text() {
-        let marker = format!(
-            "[{}:data:image/png;base64,{}]",
-            "IMAGE",
-            "A".repeat(600_000)
-        );
-        let body = format!("a\n{marker}\nb");
-        let stale_tool = tool(&body);
-        let history = vec![
-            sys("s"),
-            user("u"),
-            asst("a"),
-            stale_tool.clone(),
-            user("v"),
-        ];
-
-        // The old turn survives at a 32,000-token budget.
-        let result = trim_to_recent_turns(history.clone(), 32_000);
-        assert!(
-            !result.trimmed,
-            "a stale legacy inline payload must be priced as its delivered text, not its body: {} tokens estimated",
-            result.tokens_before
-        );
-        assert_eq!(result.dropped_turns, 0);
-        assert_eq!(result.history.len(), 5);
-
-        // The estimator's charge for the stale tool message equals the text
-        // heuristic on the content preparation actually delivers, computed
-        // here through the real preparation route.
-        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
-            &history,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-        )
-        .await
-        .expect("preparation succeeds");
-        let prepared_tool = prepared
-            .messages
-            .iter()
-            .find(|m| m.role == "tool")
-            .expect("tool message survives preparation");
-        assert_eq!(
-            prepared_tool.content, "a\n\nb",
-            "the stale pass strips the inline marker from the legacy body"
-        );
-        let without_tool = vec![sys("s"), user("u"), asst("a"), user("v")];
-        let stale_tool_tokens =
-            estimate_history_tokens(&history) - estimate_history_tokens(&without_tool);
-        assert_eq!(
-            stale_tool_tokens,
-            prepared_tool.content.len().div_ceil(4) + 4,
-            "the stale tool message is charged as the text the stale pass delivers"
-        );
-
-        // Current-turn control: the same legacy tool message as the LAST
-        // message (no trailing user turn) is charged as the text of its full
-        // body, exactly as dispatched.
-        let current_history = vec![sys("s"), user("u"), asst("a"), stale_tool.clone()];
-        let current_without = vec![sys("s"), user("u"), asst("a")];
-        let current_tool_tokens =
-            estimate_history_tokens(&current_history) - estimate_history_tokens(&current_without);
-        assert_eq!(
-            current_tool_tokens,
-            body.len().div_ceil(4) + 4,
-            "a current-turn legacy carrier is charged as its full body text"
-        );
-    }
-
-    // Short legacy path markers fit the 32k budget whether the tool run is
-    // stale or current, so this fixture no longer separates stale from
-    // current pricing by itself; the large-payload counterexample in
-    // `stale_legacy_inline_payload_is_priced_as_delivered_text` carries that
-    // property.
+    // Legacy path markers are text under the attachment-identity contract,
+    // so a stale legacy carrier is delivered and priced as its bytes: the
+    // marker syntax stays in the body and nothing is stripped. Thirty short
+    // markers fit the 32k budget by bytes, so a tool round that only ever
+    // quoted markers cannot evict a turn that fits.
     #[test]
     fn stale_tool_images_do_not_force_a_trim() {
         let markers: Vec<String> = (0..30)
             .map(|index| format!("[IMAGE:/tmp/stale-{index}.png]"))
             .collect();
         // The latest message is a genuine user turn, so the whole tool run is
-        // stale and preparation strips every marker before dispatch.
+        // stale: replay delivers it verbatim, and its price is its bytes.
         let history = vec![
             sys("s"),
             user("u"),
@@ -1729,7 +1657,7 @@ mod tests {
 
         assert!(
             !result.trimmed,
-            "stale tool images are stripped before dispatch and must not force a trim"
+            "stale tool images are text, not per-image charges, and must not force a trim"
         );
         assert_eq!(result.dropped_turns, 0);
         assert_eq!(result.history.len(), 5);
