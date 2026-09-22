@@ -15,6 +15,18 @@ cli-models-about = Gérer les catalogues de modèles des fournisseurs
 cli-providers-about = Lister les fournisseurs d'IA pris en charge
 cli-channel-about = Gérer les canaux de communication
 cli-integrations-about = Parcourir plus de 50 intégrations
+cli-integrations-unknown = Intégration inconnue : {$name}. Consultez le README pour connaître les intégrations prises en charge ou exécutez {$quickstart} pour configurer un fournisseur de modèles, puis utilisez {$channel_config} pour les canaux.
+cli-integrations-category-heading = Catégorie
+cli-integrations-category-chat = Fournisseurs de chat
+cli-integrations-category-ai-model = Modèles d’IA
+cli-integrations-category-tools-automation = Outils et automatisation
+cli-integrations-category-platform = Plateformes
+cli-integrations-status-heading = Statut
+cli-integrations-status-active = Actif
+cli-integrations-status-available = Disponible
+cli-integrations-setup-heading = Configuration
+cli-integrations-setup-macos-heading = Configuration (macOS uniquement)
+cli-integrations-builtin-heading = Intégrée
 cli-skills-about = Gérer les compétences (capacités définies par l'utilisateur)
 cli-sop-about = Gérer les procédures opérationnelles standard (SOP)
 cli-migrate-about = Migrer les données depuis d'autres runtimes d'agents
@@ -61,6 +73,8 @@ cli-wechat-login-confirmed-missing-field = Connexion confirmée mais {$field} ma
 cli-wechat-connected = ✅ WeChat connecté !
 cli-wechat-bound-success = ✅ Compte WeChat lié avec succès. Vous pouvez maintenant parler à ZeroClaw.
 cli-wechat-invalid-bind-code = ❌ Code de liaison invalide. Veuillez réessayer.
+cli-wechat-bind-denied = ❌ Ce compte est bloqué par une entrée `ignore` dans la configuration. Demandez à l'opérateur de la supprimer, puis réessayez avec le même code.
+cli-wechat-bind-not-saved = ❌ Impossible d'enregistrer la liaison, rien n'a changé. Votre code reste valide ; demandez à l'opérateur de vérifier le fichier de configuration, puis réessayez.
 cli-skills-list-about = Lister toutes les compétences installées
 cli-skills-audit-about = Auditer un répertoire source de compétence ou une compétence installée
 cli-skills-audit-failed = L'audit des compétences a échoué.
@@ -189,6 +203,7 @@ cli-acp-long-about =
 
     Exemples :
     zeroclaw acp                        # démarrer le serveur ACP
+    zeroclaw acp --agent fable         # utiliser fable comme agent par défaut pour les nouvelles sessions
     zeroclaw acp --max-sessions 5       # limiter les sessions concurrently
 cli-daemon-long-about =
     Démarrer le daemon autonome longue durée.
@@ -388,6 +403,8 @@ channel-whatsapp-web-delivery-failure-note-many = (note : je n'ai pas pu livrer 
 channel-line-bind-success = ✅ Appairé ! Vous pouvez maintenant discuter.
 channel-line-bind-invalid-code = ❌ Code invalide. Veuillez réessayer.
 channel-line-bind-rate-limited = ⏳ Trop de tentatives. Réessayez dans { $secs }s.
+channel-line-bind-denied = ❌ Ce compte est bloqué par une entrée `ignore`. Demandez à l'opérateur de la supprimer, puis réessayez.
+channel-line-bind-not-saved = ❌ Impossible d'enregistrer la liaison, rien n'a changé. Votre code reste valide ; demandez à l'opérateur de vérifier le fichier de configuration, puis réessayez.
 channel-telegram-cmd-new-desc = Démarrer une nouvelle session de conversation
 channel-telegram-cmd-clear-desc = Effacer cette session de conversation
 channel-telegram-cmd-stop-desc = Annuler la tâche en cours
@@ -854,11 +871,14 @@ cli-models-status-none = Aucun modèle par défaut configuré.
 turn-interrupted-by-user = [interrompu par l'utilisateur]
 turn-cancelled-client-rpc = [tour annulé via le client]
 turn-stream-interrupted = [flux interrompu]
+turn-failed = [échec du tour]
+turn-failed-attachment-omitted = [pièce jointe omise : le fournisseur l'a rejetée lors du tour en échec]
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) était indisponible ; cette réponse a été générée par { $actual_model } ({ $actual_provider }).
 turn-max-iterations-reached = *Tour arrêté : nombre maximal d’itérations d’outils atteint ({ $max_iterations }).*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = limite de messages de l’historique dépassée
+history-trim-reason-recovery = récupération après dépassement de la fenêtre de contexte
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]
@@ -873,6 +893,8 @@ channel-runtime-matrix-progress-item-too-large = ⚠️ Cette ligne est trop vol
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
+channel-runtime-stop-folded-followup = Rien à arrêter ici : cette réponse a été fusionnée avec le message précédent auquel elle répond, toujours en cours de traitement. Envoyez /stop dans cette conversation pour l'annuler.
+channel-runtime-conversation-busy = Cette conversation compte trop de messages en attente ; celui-ci a été ignoré. Attendez une réponse ou envoyez /stop pour vider vos demandes en file.
 channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `/model <model-id>`.
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
 channel-runtime-agent-scope-rejected = L'expéditeur `{ $sender }` n'est pas autorisé à utiliser `/model --agent` sur l'agent `{ $agent }`. Utilisez `/model --user { $model }` pour un remplacement limité à la session, ou demandez à un administrateur de marquer un groupe de pairs `admin_for_agent_scope = true` avec vous comme membre.
@@ -1094,3 +1116,4 @@ channel-approval-opt-allow-once = Autoriser une fois
 channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
+tool-git-operations-error-docker-runtime-write-unsupported = Les commandes d’écriture Git ne sont pas disponibles avec l’environnement d’exécution Docker, car elles ne peuvent pas être confinées à son conteneur.
