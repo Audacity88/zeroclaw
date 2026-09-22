@@ -255,6 +255,19 @@ impl CostTracker {
         *self.config.write() = config;
     }
 
+    /// Derive an ephemeral tracker whose budget checks read only the
+    /// shared process-wide daily and monthly totals against the global
+    /// limits (read live each check), with no per-agent ceiling and no
+    /// subtree chain: the frozen-mode equivalent of the global tracker.
+    /// An independent nested delegation with no per-hop ceiling (`0` =
+    /// inherit the global limit) uses this so the target runs under the
+    /// shared global limits instead of its delegating parent's
+    /// agent-scoped tracker, while the enforcement mode stays frozen
+    /// from the base exactly as for every other derived tracker.
+    pub fn derived_shared(&self) -> Self {
+        self.derived_with_scope(BudgetScope::Shared)
+    }
+
     /// Derive an ephemeral tracker whose shared daily check uses the base
     /// tracker's global daily limit tightened by `daily_ceiling_usd`
     /// (`config.daily_limit_usd.min(daily_ceiling_usd)`, read live each

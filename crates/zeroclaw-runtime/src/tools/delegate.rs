@@ -893,6 +893,19 @@ impl DelegateTool {
     /// global `[cost]` limits binds the running delegate at its next
     /// budget check.
     ///
+    /// What the child does NOT inherit is decided by the hop's execution
+    /// mode, mirroring `policy_for_target`: a BOUNDED target is gated by
+    /// the caller's per-hop ceiling and carries the ancestor subtree
+    /// chain, while an INDEPENDENT target keeps the tree's frozen
+    /// enforcement mode but runs under its own per-hop ceiling with an
+    /// empty chain, and with no per-hop ceiling it derives the
+    /// shared-global scope instead of reusing the parent's agent scope.
+    /// The frozen-mode inheritance is mode-blind on purpose: once a
+    /// delegation tree is scoped, no nested hop of it may run unscoped
+    /// or re-attributed after a reload, independent targets included, so
+    /// only the ceiling and the chain are mode-scoped, never the scope
+    /// itself.
+    ///
     /// Returns `None` (leave the sub-loop unscoped, matching the previous
     /// behavior) when the base's mode is off - for a root hop the live
     /// global's `enabled`, checked before resolving the global tracker
@@ -943,9 +956,15 @@ impl DelegateTool {
 
         // The child's own tracker: derived from the base for its own alias
         // and ceiling, so the derivation inherits the base's frozen mode.
-        // With no per-hop ceiling (`0` = inherit the global limit) no
-        // derivation happens and the base records the child's usage under
-        // the stamped alias, same as before.
+        // The hop's execution mode decides what else the child inherits,
+        // the same split `policy_for_target` applies to ceilings: only a
+        // BOUNDED target binds the caller's per-hop ceiling and subtree
+        // chain. With no per-hop ceiling (`0` = inherit the global limit)
+        // a ROOT hop still uses the base directly, because the base there
+        // is the process-global tracker whose scope is already the shared
+        // one; a NESTED independent hop derives the shared-global scope
+        // instead, because its base is the parent's agent-scoped tracker.
+        let target_mode = self.mode_for_target(target_alias);
         let scope_tracker = if ceiling_cents > 0 {
             let ceiling_usd = f64::from(ceiling_cents) / 100.0;
             if !track_per_agent {
@@ -957,21 +976,39 @@ impl DelegateTool {
                 // ceiling is looser than the field name suggests.
                 delegate_cost_scope_per_agent_disabled_warn_once();
                 Arc::new(base.derived_shared_capped(ceiling_usd))
+            } else if target_mode == DelegateExecutionMode::Independent {
+                // Independent per-agent scope: the ceiling applies to the
+                // TARGET's own daily spend with an EMPTY chain, so the
+                // caller's exhausted per-hop ceiling cannot refuse this
+                // hop, and this hop's spend never lands in any ancestor's
+                // descendant accumulator. The global daily/monthly limits
+                // still apply to the shared totals on top, so the derived
+                // tracker is never looser than the global tracker.
+                Arc::new(base.derived_for_agent(target_alias, ceiling_usd))
             } else {
-                // Per-agent scope: the ceiling applies to the TARGET's own
-                // daily spend on the shared ledger; the global daily/monthly
-                // limits still apply to the shared totals on top, so the
-                // derived tracker is never looser than the global tracker.
-                // The target's scope also carries the ancestor subtree
-                // chain, derived from the same base the mode came from, so
-                // descendant spend counts against every ancestor's per-hop
-                // ceiling.
+                // Bounded per-agent scope: the ceiling applies to the
+                // TARGET's own daily spend on the shared ledger; the
+                // global daily/monthly limits still apply to the shared
+                // totals on top, so the derived tracker is never looser
+                // than the global tracker. The target's scope also carries
+                // the ancestor subtree chain, derived from the same base
+                // the mode came from, so descendant spend counts against
+                // every ancestor's per-hop ceiling.
                 Arc::new(base.derived_for_agent_in_chain(
                     target_alias,
                     ceiling_usd,
                     base.subtree_chain_for_children(),
                 ))
             }
+        } else if target_mode == DelegateExecutionMode::Independent
+            && self.inherited_cost_tracker.is_some()
+        {
+            // Nested independent hop with no per-hop ceiling: the base is
+            // the parent's scoped tracker, and reusing it outright would
+            // gate this hop on the caller's agent scope (or shared cap).
+            // Derive the frozen-mode equivalent of the global tracker so
+            // `0` still means the shared global limits, read live.
+            Arc::new(base.derived_shared())
         } else {
             base
         };
@@ -15354,6 +15391,123 @@ command = "rm independent-delegate-marker"
         }
     }
 
+    /// Independent-second-hop nested cost fixture: the same shape as
+    /// [`nested_delegate_cost_fixture`], except the first hop's target
+    /// lists `target2` in its explicit `delegates` roster with
+    /// `mode = "independent"` (overriding the same-profile bounded
+    /// default), and the leaf's own per-hop ceiling is
+    /// `leaf_ceiling_cents` instead of a hardwired zero. The root hop
+    /// stays bounded, so the nested delegate tool exists inside the
+    /// first hop's loop and resolves the leaf's independent mode through
+    /// the roster config copied onto it.
+    async fn nested_independent_delegate_cost_fixture(
+        mock_uri: String,
+        daily_limit_usd: f64,
+        hop_ceiling_cents: u32,
+        leaf_ceiling_cents: u32,
+    ) -> DelegateCostFixture {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{CostConfig, OllamaModelProviderConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let workspace_dir = tmp.path().join("workspace");
+        let mut root_config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        root_config.cost = CostConfig {
+            enabled: true,
+            track_per_agent: true,
+            daily_limit_usd,
+            monthly_limit_usd: 10_000.0,
+            ..CostConfig::default()
+        };
+        root_config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("delegate-cost-model".to_string()),
+                    uri: Some(mock_uri),
+                    timeout_secs: Some(10),
+                    pricing: HashMap::from([
+                        ("delegate-cost-model.input".to_string(), 3.0),
+                        ("delegate-cost-model.output".to_string(), 15.0),
+                    ]),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        root_config.risk_profiles.insert(
+            "delegate_cost_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                auto_approve: vec!["delegate".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        for (profile, ceiling_cents) in [
+            ("delegate_cost_root_runtime", 0),
+            ("delegate_cost_hop_runtime", hop_ceiling_cents),
+            ("delegate_cost_leaf_runtime", leaf_ceiling_cents),
+        ] {
+            root_config.runtime_profiles.insert(
+                profile.to_string(),
+                RuntimeProfileConfig {
+                    agentic: true,
+                    max_tool_iterations: 5,
+                    max_cost_per_day_cents: ceiling_cents,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+        }
+        let root = AliasedAgentConfig {
+            model_provider: "ollama.default".into(),
+            risk_profile: "delegate_cost_profile".into(),
+            runtime_profile: "delegate_cost_root_runtime".into(),
+            ..AliasedAgentConfig::default()
+        };
+        let hop = AliasedAgentConfig {
+            runtime_profile: "delegate_cost_hop_runtime".into(),
+            // The second hop is an EXPLICIT independent target: the leaf
+            // runs its own policy, so its cost scope must not carry this
+            // hop's ceiling or subtree chain.
+            delegates: vec![DelegateTargetConfig {
+                agent: "target2".to_string(),
+                mode: DelegateExecutionMode::Independent,
+            }],
+            ..root.clone()
+        };
+        let leaf = AliasedAgentConfig {
+            runtime_profile: "delegate_cost_leaf_runtime".into(),
+            ..root.clone()
+        };
+        root_config.agents.insert("caller".to_string(), root);
+        root_config.agents.insert("target".to_string(), hop);
+        root_config.agents.insert("target2".to_string(), leaf);
+
+        let root_config = Arc::new(root_config);
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let tool = DelegateTool::new(root_config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&root_config))
+            .with_workspace_dir(workspace_dir)
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(root_config.risk_profiles.clone())
+            .with_runtime_profiles(root_config.runtime_profiles.clone())
+            .with_caller_alias("caller");
+
+        DelegateCostFixture {
+            _tmp: tmp,
+            data_dir,
+            config: root_config,
+            tool,
+        }
+    }
+
     #[tokio::test]
     async fn nested_delegate_inherited_ceiling_refuses_second_hop_provider() {
         // The linked-issue acceptance shape: A (root, no per-hop cap) ->
@@ -15463,6 +15617,173 @@ command = "rm independent-delegate-marker"
             "C's spend lands under C's own alias"
         );
         assert!((c_stats.cost_usd - 0.006).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn nested_independent_delegate_ignores_exhausted_parent_ceiling_positive_cap() {
+        // The independent second hop must not inherit the delegating
+        // parent's per-hop ceiling or subtree chain: B (`target`) is
+        // seeded to its $0.01 ceiling and its own first priced call
+        // pushes its total to $0.016, which would refuse a BOUNDED C
+        // through the chain; C (`target2`) runs independently with its
+        // own $1.00 ceiling, so its call must be admitted. The wire count
+        // (B's call plus C's call) is the acceptance signal, and B's
+        // NEXT refusal must report only B's own $0.016 spend: C's $0.006
+        // may not land in B's descendant accumulator, because an
+        // independent target's scope carries no ancestor chain.
+        let (server, captured) = start_scripted_chat_server(&[
+            tool_call_completion_with_usage(
+                DelegateTool::NAME,
+                "call_target2",
+                json!({"agent": "target2", "prompt": "produce a status line"}),
+            ),
+            usage_completion("leaf finished"),
+        ])
+        .await;
+        let fixture =
+            nested_independent_delegate_cost_fixture(server.uri.clone(), 1000.0, 1, 100).await;
+        record_agent_seed_spend(&fixture, "target", 0.01);
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "delegate onward to target2"
+            }))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "B's own next call must still be refused through B's own \
+             exhausted ceiling: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`"),
+            "the refusal must name B, whose own ceiling binds its own next \
+             call: {error}"
+        );
+        assert!(
+            error.contains("$0.0160"),
+            "B's refusal current must be B's own $0.016 ledger spend only; \
+             C's independent $0.006 may not count as B's descendant spend: {error}"
+        );
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            2,
+            "B's own call and C's independent call must both reach the wire: \
+             C's own $1.00 ceiling has room even though B's is exhausted"
+        );
+
+        // Attribution stays per alias: C's spend lands under C's own alias.
+        let c_stats = poll_agent_cost(&fixture.data_dir, "target2").await;
+        assert_eq!(
+            c_stats.request_count, 1,
+            "the independent second hop's provider call must land on the ledger"
+        );
+        assert!((c_stats.cost_usd - 0.006).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn nested_independent_delegate_zero_cap_uses_shared_global_limit() {
+        // An independent second hop with NO own ceiling (`0` = inherit the
+        // global limit) must not run under the delegating parent's
+        // agent-scoped tracker either: with an ample global limit C's
+        // (`target2`) call is admitted exactly as in the positive-cap
+        // test, and with the global daily limit lowered to B's (`target`)
+        // seeded spend, C's call must be refused by the SHARED limit with
+        // an error that names no agent, proving the zero cap resolves to
+        // the shared global limits rather than the caller's scope.
+        let (server, captured) = start_scripted_chat_server(&[
+            tool_call_completion_with_usage(
+                DelegateTool::NAME,
+                "call_target2",
+                json!({"agent": "target2", "prompt": "produce a status line"}),
+            ),
+            usage_completion("leaf finished"),
+        ])
+        .await;
+        let fixture =
+            nested_independent_delegate_cost_fixture(server.uri.clone(), 1000.0, 1, 0).await;
+        record_agent_seed_spend(&fixture, "target", 0.01);
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "delegate onward to target2"
+            }))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "B's own next call must still be refused through B's own \
+             exhausted ceiling: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded for agent `target`") && error.contains("$0.0160"),
+            "B's refusal must name B and report only B's own spend: {error}"
+        );
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            2,
+            "the zero-cap independent hop must be admitted under the ample \
+             global limit: B's call plus C's call"
+        );
+        let c_stats = poll_agent_cost(&fixture.data_dir, "target2").await;
+        assert_eq!(c_stats.request_count, 1);
+        assert!((c_stats.cost_usd - 0.006).abs() < 1e-9);
+
+        // Second scenario: the global daily limit tightened to B's seeded
+        // spend. B's own first call is still admitted (projected spend
+        // only ties the limit), but C's call would push the shared total
+        // over it, so C must be refused by the shared limit BEFORE its
+        // provider is called, with no agent named.
+        let (server, captured) = start_scripted_chat_server(&[tool_call_completion_with_usage(
+            DelegateTool::NAME,
+            "call_target2",
+            json!({"agent": "target2", "prompt": "produce a status line"}),
+        )])
+        .await;
+        let fixture =
+            nested_independent_delegate_cost_fixture(server.uri.clone(), 0.01, 1, 0).await;
+        record_agent_seed_spend(&fixture, "target", 0.01);
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "delegate onward to target2"
+            }))
+            .await
+            .expect("delegate execute returns a result");
+        assert!(
+            !result.success,
+            "the zero-cap independent hop must be refused by the shared \
+             global limit: {result:?}"
+        );
+        let error = result.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("Budget exceeded"),
+            "the refusal must be a budget refusal: {error}"
+        );
+        assert!(
+            !error.contains("for agent"),
+            "the shared-limit refusal names no agent (the ceiling that binds \
+             is the global one, not any agent's): {error}"
+        );
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "only B's own provider call may reach the wire: C must be refused \
+             before its provider"
+        );
+        assert!(
+            read_agent_cost(&fixture.data_dir, "target2").is_none(),
+            "no ledger row may exist for a target whose call was refused \
+             before its provider"
+        );
     }
 
     /// Scripted tool-call completion carrying triple the priced usage of
