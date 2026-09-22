@@ -2,14 +2,49 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+#[cfg(any(test, not(target_os = "macos")))]
+use std::path::PathBuf;
+use std::process::Command;
+#[cfg(any(test, not(target_os = "macos")))]
+use std::process::Stdio;
+#[cfg(any(test, not(target_os = "macos")))]
 use std::time::{Duration, Instant};
 
 pub(super) fn invocation(cmd: &Command, identity: Option<&OsStr>) -> io::Result<Vec<OsString>> {
-    invocation_with(cmd, identity, resolve_helper)
+    #[cfg(target_os = "macos")]
+    {
+        macos_invocation(cmd, identity)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        invocation_with(cmd, identity, resolve_helper)
+    }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_invocation(cmd: &Command, identity: Option<&OsStr>) -> io::Result<Vec<OsString>> {
+    let mut argv = Vec::new();
+    if let Some(identity) = identity.filter(|identity| *identity != cmd.get_program()) {
+        validate_operand(Path::new(cmd.get_program()))?;
+        // macOS ships Bash but not GNU env --argv0. -p ignores inherited
+        // startup hooks; all variable data remains positional, never source.
+        let bash = zeroclaw_config::platform::resolve_executable(OsStr::new("/bin/bash"))?;
+        argv.extend([
+            bash.into_os_string(),
+            OsString::from("-p"),
+            OsString::from("-c"),
+            OsString::from("builtin exec -a \"$1\" \"$2\" \"${@:3}\""),
+            OsString::from("--"),
+            identity.to_owned(),
+        ]);
+    }
+    argv.push(cmd.get_program().to_owned());
+    argv.extend(cmd.get_args().map(OsStr::to_owned));
+    Ok(argv)
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
 pub(super) fn invocation_with(
     cmd: &Command,
     identity: Option<&OsStr>,
@@ -44,6 +79,7 @@ fn validate_operand(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn resolve_helper() -> io::Result<PathBuf> {
     let mut last_error = None;
     for name in ["env", "genv"] {
@@ -66,6 +102,7 @@ fn resolve_helper() -> io::Result<PathBuf> {
     ))
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 fn probe_helper(helper: &Path, timeout: Duration) -> io::Result<()> {
     validate_operand(helper)?;
     // Probe the exact helper without executing any user payload. Old env
@@ -194,6 +231,26 @@ mod tests {
             let error = probe_helper(&helper, timeout).unwrap_err();
             assert_eq!(error.kind(), expected);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identity_trampoline_ignores_inherited_bash_startup_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let startup = dir.path().join("startup.sh");
+        std::fs::write(&startup, "exit 73\n").unwrap();
+        let mut cmd = Command::new("/usr/bin/printf");
+        cmd.args(["%s", "safe"]);
+        let argv = invocation(&cmd, Some(OsStr::new("printf-alias"))).unwrap();
+        assert_eq!(argv[1], "-p");
+        assert_eq!(argv[2], "-c");
+        let output = Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("BASH_ENV", &startup)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"safe");
     }
 
     #[test]

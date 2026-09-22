@@ -399,6 +399,7 @@ fn generate_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn seatbelt_shell_identity_survives_replacing_wrapper() {
@@ -411,10 +412,7 @@ mod tests {
         cmd.args(["-c", "printf '%s' \"$0\""])
             .current_dir(dir.path());
         let invocation =
-            crate::security::shell_identity::invocation_with(&cmd, Some(OsStr::new("sh")), || {
-                Ok(PathBuf::from("/usr/local/bin/genv"))
-            })
-            .unwrap();
+            crate::security::shell_identity::invocation(&cmd, Some(OsStr::new("sh"))).unwrap();
         sandbox.wrap_invocation(&mut cmd, &invocation).unwrap();
         assert_eq!(cmd.get_program(), SANDBOX_EXEC_PATH);
         assert!(
@@ -426,6 +424,49 @@ mod tests {
             )
         );
         assert_eq!(cmd.get_current_dir(), Some(dir.path()));
+    }
+
+    #[test]
+    fn seatbelt_shell_identity_executes_without_gnu_env() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox = SeatbeltSandbox::with_workspace(Some(workspace.path())).unwrap();
+        let mut identity_cmd = Command::new("/bin/sh");
+        identity_cmd
+            .args(["-c", "printf '%s' \"$0\""])
+            .current_dir(workspace.path());
+        sandbox
+            .wrap_shell_command(&mut identity_cmd, Some(OsStr::new("sh")))
+            .unwrap();
+        let output = identity_cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "sandboxed shell failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"sh");
+
+        let payload = OsString::from_vec(b"quotes ' \" ; $() \xff".to_vec());
+        let mut payload_cmd = Command::new("/bin/sh");
+        payload_cmd
+            .args(["-c", "printf '%s\\0' \"$1\"", "unused-$0"])
+            .arg(&payload)
+            .current_dir(workspace.path());
+        sandbox
+            .wrap_shell_command(&mut payload_cmd, Some(OsStr::new("sh")))
+            .unwrap();
+        let output = payload_cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "sandboxed shell payload failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut expected = payload.as_encoded_bytes().to_vec();
+        expected.push(0);
+        assert_eq!(output.stdout, expected);
     }
 
     /// RAII fixture directory under the user's home directory.
