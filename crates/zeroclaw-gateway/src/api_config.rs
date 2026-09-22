@@ -415,20 +415,46 @@ fn schedule_channel_generation_reload(
     });
 }
 
+pub(crate) struct RetainedConfigWrite {
+    _guard: ConfigWriteGuard,
+    _generation_lease: zeroclaw_runtime::live_config_authority::ConfigWriteLease,
+    _agent_reservations: Vec<zeroclaw_runtime::live_config_authority::AgentAdmissionReservation>,
+}
+
+fn reserve_config_write(
+    state: &AppState,
+) -> Result<zeroclaw_runtime::live_config_authority::ConfigWriteLease, ConfigApiError> {
+    state
+        .agent_lifecycle
+        .reserve_config_write()
+        .map_err(|error| ConfigApiError::new(ConfigApiCode::ReloadFailed, error.to_string()))
+}
+
 /// Save `new_config` to disk, then install it as the live config.
 ///
 /// The retained job owns the writer guard through save, publication and channel
-/// retirement/reload even if the request is dropped. Return the guard so callers
-/// can keep subsequent annotation writes in the same critical section.
+/// retirement/reload even if the request is dropped. Return the writer bundle
+/// so callers keep both serialization and generation admission through any
+/// subsequent annotation writes.
 pub(crate) async fn persist_and_swap(
     state: &AppState,
     new_config: zeroclaw_config::schema::Config,
     guard: ConfigWriteGuard,
-) -> Result<ConfigWriteGuard, ConfigApiError> {
+) -> Result<RetainedConfigWrite, ConfigApiError> {
+    persist_and_swap_retaining(state, new_config, guard, Vec::new()).await
+}
+
+async fn persist_and_swap_retaining(
+    state: &AppState,
+    new_config: zeroclaw_config::schema::Config,
+    guard: ConfigWriteGuard,
+    agent_reservations: Vec<zeroclaw_runtime::live_config_authority::AgentAdmissionReservation>,
+) -> Result<RetainedConfigWrite, ConfigApiError> {
     debug_assert!(
         state.config_write_lock.try_lock().is_err(),
         "persist_and_swap caller must hold state.config_write_lock"
     );
+    let generation_lease = reserve_config_write(state)?;
     let config = Arc::clone(&state.config);
     let pending_reload = Arc::clone(&state.pending_reload);
     let controls = state.reload_tx.clone();
@@ -442,7 +468,11 @@ pub(crate) async fn persist_and_swap(
             )
             .await?;
             finish_prepared_channel_generation(prepared, pending_reload).await;
-            Ok(guard)
+            Ok(RetainedConfigWrite {
+                _guard: guard,
+                _generation_lease: generation_lease,
+                _agent_reservations: agent_reservations,
+            })
         }));
     task.await.map_err(|e| {
         ConfigApiError::new(
@@ -450,6 +480,91 @@ pub(crate) async fn persist_and_swap(
             format!("config completion task failed: {e}"),
         )
     })?
+}
+
+#[cfg(test)]
+mod test_pre_save_pause_gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Notify;
+
+    struct Gate {
+        target: PathBuf,
+        reached: Notify,
+        release: Notify,
+        claimed: AtomicBool,
+        released: AtomicBool,
+    }
+
+    static GATES: Mutex<Vec<Arc<Gate>>> = Mutex::new(Vec::new());
+
+    fn disarm(gate: &Arc<Gate>) {
+        gate.released.store(true, Ordering::Release);
+        gate.release.notify_waiters();
+        GATES
+            .lock()
+            .unwrap()
+            .retain(|registered| !Arc::ptr_eq(registered, gate));
+    }
+
+    pub(super) struct GateHandle {
+        gate: Arc<Gate>,
+    }
+
+    impl GateHandle {
+        pub(super) async fn wait_paused(&self) {
+            self.gate.reached.notified().await;
+        }
+
+        pub(super) fn release(&self) {
+            disarm(&self.gate);
+        }
+    }
+
+    impl Drop for GateHandle {
+        fn drop(&mut self) {
+            disarm(&self.gate);
+        }
+    }
+
+    pub(super) fn arm(target: PathBuf) -> GateHandle {
+        let gate = Arc::new(Gate {
+            target,
+            reached: Notify::new(),
+            release: Notify::new(),
+            claimed: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        GATES.lock().unwrap().push(Arc::clone(&gate));
+        GateHandle { gate }
+    }
+
+    pub(super) async fn pause(config_path: &Path) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|gate| gate.target == config_path)
+            .cloned();
+        if let Some(gate) = gate {
+            if gate
+                .claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            gate.reached.notify_one();
+            let released = gate.release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !gate.released.load(Ordering::Acquire) {
+                released.await;
+            }
+        }
+    }
 }
 
 /// Save-and-swap half of the config persistence sequence, split from the
@@ -501,6 +616,9 @@ async fn persist_and_swap_prepared(
     // before the save because treating an unreadable file as absent would
     // let the rollback path delete an existing canonical config.
     let snapshot = read_config_snapshot(&config_path).await?;
+
+    #[cfg(test)]
+    test_pre_save_pause_gate::pause(&config_path).await;
 
     if let Err(e) = new_config.save_dirty().await {
         if let Some(prev) = snapshot {
@@ -686,40 +804,8 @@ pub async fn handle_api_channel_bind(
     // Persist only the refreshed peer policy while retaining the writer and
     // generation completion even if the HTTP caller disconnects.
     working.mark_dirty("peer_groups");
-    let prepared_channel_generation = match state.reload_tx.clone() {
-        Some(controls) => match controls.prepare_channel_generation() {
-            Some(prepared) => Some((prepared, controls)),
-            None => {
-                return error_response(ConfigApiError::new(
-                    ConfigApiCode::ReloadFailed,
-                    "channel generation controls are unavailable; refusing a live channel mutation",
-                ));
-            }
-        },
-        None => None,
-    };
-    let config = Arc::clone(&state.config);
-    let pending_reload = Arc::clone(&state.pending_reload);
-    let task =
-        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
-            let _guard = _cfg_guard;
-            working.save_dirty().await.map_err(|e| {
-                ConfigApiError::new(ConfigApiCode::ReloadFailed, format!("save failed: {e}"))
-            })?;
-            *config.write() = working;
-            pending_reload.store(true, std::sync::atomic::Ordering::Relaxed);
-            finish_prepared_channel_generation(prepared_channel_generation, pending_reload).await;
-            Ok::<(), ConfigApiError>(())
-        }));
-    match task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return error_response(error),
-        Err(error) => {
-            return error_response(ConfigApiError::new(
-                ConfigApiCode::ReloadFailed,
-                format!("channel bind completion task failed: {error}"),
-            ));
-        }
+    if let Err(error) = persist_and_swap(&state, working, _cfg_guard).await {
+        return error_response(error);
     }
 
     Json(serde_json::json!({
@@ -893,7 +979,7 @@ pub async fn handle_prop_put(
         return e.into_response();
     }
 
-    let _agent_config_reservation =
+    let agent_config_reservation =
         match zeroclaw_config::alias_refs::agent_alias_for_prop_path(&body.path)
             .map(|alias| state.agent_lifecycle.reserve_config_mutation(alias))
             .transpose()
@@ -946,7 +1032,14 @@ pub async fn handle_prop_put(
     let config_path = new_config.config_path.clone();
     let mut warnings = new_config.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    let _cfg_guard = match persist_and_swap(&state, new_config, _cfg_guard).await {
+    let _cfg_guard = match persist_and_swap_retaining(
+        &state,
+        new_config,
+        _cfg_guard,
+        agent_config_reservation.into_iter().collect(),
+    )
+    .await
+    {
         Ok(guard) => guard,
         Err(error) => return error_response(error),
     };
@@ -990,7 +1083,7 @@ pub async fn handle_prop_delete(
         return e.into_response();
     }
 
-    let _agent_config_reservation =
+    let agent_config_reservation =
         match zeroclaw_config::alias_refs::agent_alias_for_prop_path(&q.path)
             .map(|alias| state.agent_lifecycle.reserve_config_mutation(alias))
             .transpose()
@@ -1021,7 +1114,14 @@ pub async fn handle_prop_delete(
 
     let mut warnings = new_config.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    if let Err(e) = persist_and_swap(&state, new_config, _cfg_guard).await {
+    if let Err(e) = persist_and_swap_retaining(
+        &state,
+        new_config,
+        _cfg_guard,
+        agent_config_reservation.into_iter().collect(),
+    )
+    .await
+    {
         return error_response(e);
     }
 
@@ -1515,7 +1615,7 @@ pub async fn handle_map_key(
 
     let path = q.path.clone();
     let key = q.key.clone();
-    let _agent_config_reservation = if path == "agents" {
+    let agent_config_reservation = if path == "agents" {
         match state.agent_lifecycle.reserve_config_mutation(key.clone()) {
             Ok(reservation) => Some(reservation),
             Err(error) => {
@@ -1577,7 +1677,14 @@ pub async fn handle_map_key(
         }
 
         working.mark_dirty(&format!("{path}.{key}"));
-        if let Err(e) = persist_and_swap(&state, working, _cfg_guard).await {
+        if let Err(e) = persist_and_swap_retaining(
+            &state,
+            working,
+            _cfg_guard,
+            agent_config_reservation.into_iter().collect(),
+        )
+        .await
+        {
             return error_response(e);
         }
     }
@@ -2247,10 +2354,10 @@ pub async fn handle_patch(
             zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).map(str::to_owned)
         })
         .collect();
-    let mut _agent_config_reservations = Vec::with_capacity(agent_aliases.len());
+    let mut agent_config_reservations = Vec::with_capacity(agent_aliases.len());
     for alias in agent_aliases {
         match state.agent_lifecycle.reserve_config_mutation(&alias) {
-            Ok(reservation) => _agent_config_reservations.push(reservation),
+            Ok(reservation) => agent_config_reservations.push(reservation),
             Err(error) => {
                 return error_response(
                     ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
@@ -2505,10 +2612,13 @@ pub async fn handle_patch(
     // callers see it.
     let mut warnings = working.collect_warnings();
     warnings.extend(scoped_validation_warnings);
-    let _cfg_guard = match persist_and_swap(&state, working, _cfg_guard).await {
-        Ok(guard) => guard,
-        Err(error) => return error_response(error),
-    };
+    let _cfg_guard =
+        match persist_and_swap_retaining(&state, working, _cfg_guard, agent_config_reservations)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => return error_response(error),
+        };
     if !annotations.is_empty()
         && let Err(e) =
             zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
@@ -2896,7 +3006,6 @@ mod tests {
     use async_trait::async_trait;
     use axum::http::StatusCode;
     use http_body_util::BodyExt;
-    use parking_lot::RwLock;
     use std::time::Duration;
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -2976,12 +3085,17 @@ mod tests {
     }
 
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        test_state_from_authority(&authority)
+    }
+
+    fn test_state_from_authority(authority: &zeroclaw_runtime::LiveConfigAuthority) -> AppState {
         let memory: Arc<dyn zeroclaw_memory::Memory> =
             Arc::new(zeroclaw_memory::NoneMemory::new("api-config-test"));
         AppState {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            agent_lifecycle: Default::default(),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -3613,6 +3727,109 @@ mod tests {
             live.channels.telegram.contains_key("newbot"),
             "handle_prop_put's own change must also land"
         );
+    }
+
+    async fn assert_cancelled_prop_save_blocks_generation_handoff(
+        path: &str,
+        value: serde_json::Value,
+        expected_value: &str,
+        expected_alias_reservation: Option<&str>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.gateway.port = 41_000;
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config).unwrap();
+        let state = test_state_from_authority(&authority);
+        let gate = test_pre_save_pause_gate::arm(config_path.clone());
+        let task_state = state.clone();
+        let task_path = path.to_string();
+
+        let request = zeroclaw_spawn::spawn!(handle_prop_put(
+            State(task_state),
+            HeaderMap::new(),
+            axum::Json(PropPutBody {
+                path: task_path,
+                value,
+                comment: None,
+            }),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_paused())
+            .await
+            .expect("real property save must reach the pre-replace pause");
+
+        request.abort();
+        let _ = request.await;
+        if let Some(alias) = expected_alias_reservation {
+            assert_eq!(
+                state.agent_lifecycle.begin_delete(alias).err(),
+                Some(
+                    zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::Reservations {
+                        alias: alias.to_string(),
+                        count: 1,
+                    }
+                ),
+                "request cancellation must not release the agent reservation owned by the save"
+            );
+        }
+
+        let mut drain = Box::pin(authority.drain_agent_lifecycle_retaining_ownership());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), drain.as_mut())
+                .await
+                .is_err(),
+            "generation ownership must not transfer while the retained save is paused"
+        );
+        assert_eq!(
+            state.agent_lifecycle.reserve_config_write().err(),
+            Some(zeroclaw_runtime::live_config_authority::AgentAdmissionError::GenerationClosing),
+            "a closing generation must refuse another config writer"
+        );
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(1), drain.as_mut())
+            .await
+            .expect("generation drain must finish after persistence and publication");
+        let ownership = authority
+            .take_process_ownership()
+            .expect("reload drain must retain process ownership for its successor");
+
+        assert_eq!(state.config.read().get_prop(path).unwrap(), expected_value);
+        let written = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let persisted = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
+        assert_eq!(persisted.get_prop(path).unwrap(), expected_value);
+        let successor =
+            zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(persisted, ownership);
+        assert_eq!(
+            successor.config().read().get_prop(path).unwrap(),
+            expected_value
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_prop_saves_block_generation_handoff_until_publication() {
+        assert_cancelled_prop_save_blocks_generation_handoff(
+            "agents.alpha.enabled",
+            serde_json::json!(false),
+            "false",
+            Some("alpha"),
+        )
+        .await;
+        assert_cancelled_prop_save_blocks_generation_handoff(
+            "gateway.port",
+            serde_json::json!(41_001),
+            "41001",
+            None,
+        )
+        .await;
     }
 
     #[tokio::test]

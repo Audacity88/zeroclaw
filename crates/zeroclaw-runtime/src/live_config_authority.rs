@@ -108,6 +108,7 @@ impl LiveConfigAuthority {
                 return;
             }
             let aliases = self.agent_lifecycle.pending_work_aliases();
+            let active_config_writes = self.agent_lifecycle.active_config_write_count();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -115,6 +116,7 @@ impl LiveConfigAuthority {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "pending_aliases": aliases,
+                        "active_config_writes": active_config_writes,
                         "waited_seconds": DIAGNOSTIC_INTERVAL.as_secs(),
                     })),
                 "daemon generation remains fail-closed while admitted agent work is still running"
@@ -141,6 +143,7 @@ impl LiveConfigAuthority {
                 return;
             }
             let aliases = self.agent_lifecycle.pending_work_aliases();
+            let active_config_writes = self.agent_lifecycle.active_config_write_count();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -148,6 +151,7 @@ impl LiveConfigAuthority {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "pending_aliases": aliases,
+                        "active_config_writes": active_config_writes,
                         "waited_seconds": DIAGNOSTIC_INTERVAL.as_secs(),
                     })),
                 "daemon generation remains fail-closed while admitted agent work is still running"
@@ -551,6 +555,7 @@ impl AliasLifecycleState {
 #[derive(Default)]
 struct AgentLifecycleState {
     aliases: HashMap<String, AliasLifecycleState>,
+    active_config_writes: usize,
     closing: bool,
     // Retained across ordinary drops, but released once a closed generation drains.
     ownership: Option<ConfigOwnershipGuard>,
@@ -638,6 +643,11 @@ pub struct AgentDeleteLease {
     committed: bool,
 }
 
+pub struct ConfigWriteLease {
+    coordinator: AgentLifecycleCoordinator,
+    active: bool,
+}
+
 impl AgentDeleteLease {
     /// Transition a reserved destructive mutation into committed destructive
     /// ownership: advance the alias generation exactly once under the
@@ -717,6 +727,22 @@ impl AgentLifecycleCoordinator {
         alias: impl Into<String>,
     ) -> Result<AgentAdmissionReservation, AgentAdmissionError> {
         self.reserve_admission(alias)
+    }
+
+    /// Retain one config write in this daemon generation. Unlike the
+    /// alias-scoped reservations above, this lease also covers config writes
+    /// that do not target an agent. Generation drain waits for every retained
+    /// writer before transferring process ownership to its successor.
+    pub fn reserve_config_write(&self) -> Result<ConfigWriteLease, AgentAdmissionError> {
+        let mut state = self.state.lock();
+        if state.closing {
+            return Err(AgentAdmissionError::GenerationClosing);
+        }
+        state.active_config_writes += 1;
+        Ok(ConfigWriteLease {
+            coordinator: self.clone(),
+            active: true,
+        })
     }
 
     /// Reserve an alias generation before slow agent construction starts.
@@ -852,6 +878,10 @@ impl AgentLifecycleCoordinator {
         aliases
     }
 
+    fn active_config_write_count(&self) -> usize {
+        self.state.lock().active_config_writes
+    }
+
     pub fn live_session_count(&self, alias: &str) -> usize {
         self.state
             .lock()
@@ -883,7 +913,10 @@ impl AgentLifecycleCoordinator {
             notified.as_mut().enable();
             {
                 let mut state = self.state.lock();
-                if state.closing && state.aliases.values().all(AliasLifecycleState::is_idle) {
+                if state.closing
+                    && state.active_config_writes == 0
+                    && state.aliases.values().all(AliasLifecycleState::is_idle)
+                {
                     drop(state.ownership.take());
                     return;
                 }
@@ -902,7 +935,10 @@ impl AgentLifecycleCoordinator {
             notified.as_mut().enable();
             {
                 let state = self.state.lock();
-                if state.closing && state.aliases.values().all(AliasLifecycleState::is_idle) {
+                if state.closing
+                    && state.active_config_writes == 0
+                    && state.aliases.values().all(AliasLifecycleState::is_idle)
+                {
                     return;
                 }
             }
@@ -992,6 +1028,18 @@ impl Drop for AgentDeleteLease {
         if let Some(lifecycle) = self.coordinator.state.lock().aliases.get_mut(&self.alias) {
             lifecycle.deleting = false;
         }
+        self.coordinator.idle.notify_waiters();
+    }
+}
+
+impl Drop for ConfigWriteLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.coordinator.state.lock();
+        state.active_config_writes = state.active_config_writes.saturating_sub(1);
+        drop(state);
         self.coordinator.idle.notify_waiters();
     }
 }
