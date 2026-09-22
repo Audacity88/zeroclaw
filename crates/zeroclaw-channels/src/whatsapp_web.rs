@@ -702,44 +702,33 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
-        // This channel historically accepted a surrounding-whitespace wildcard
-        // (`entry.trim() == "*"`), which is broader than the shared helper's
-        // exact `"*"` check, so keep that pre-check here.
-        if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
-            return true;
-        }
-        crate::allowlist::is_user_allowed_by(allowed_numbers, phone, |entry, phone| {
-            match (
-                Self::normalize_phone_token(entry),
-                Self::normalize_phone_token(phone),
-            ) {
-                (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
-                _ => false,
-            }
-        })
+        Self::are_numbers_allowed_for_list(allowed_numbers, &[phone])
     }
 
-    /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
-    /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
+    /// One sender reaches this channel under several numbers (its JID, the
+    /// alternate JID and the LID mapping), so they are evaluated as one
+    /// account: a deny naming any of them rejects the sender, whichever number
+    /// would otherwise have carried the grant.
+    #[cfg(feature = "whatsapp-web")]
+    fn are_numbers_allowed_for_list(allowed_numbers: &[String], phones: &[&str]) -> bool {
+        // The surrounding-whitespace wildcard this channel accepts is now what
+        // the shared helper accepts, so there is no broader local notion of the
+        // wildcard left to keep in step with the deny check.
+        crate::allowlist::is_identity_allowed_by(allowed_numbers, phones, Self::phone_matches)
+    }
+
+    /// Both WhatsApp surfaces admit the same accounts, so the raw / `+E.164` /
+    /// JID identity rule lives once in [`crate::whatsapp`] and both call it.
+    /// Keeping a second copy here let the two drift, and the Cloud webhook was
+    /// left comparing exactly while this path canonicalized.
+    #[cfg(feature = "whatsapp-web")]
+    fn phone_matches(entry: &str, phone: &str) -> bool {
+        crate::whatsapp::phone_matches(entry, phone)
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone_token(value: &str) -> Option<String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let user_part = trimmed
-            .split_once('@')
-            .map(|(user, _)| user)
-            .unwrap_or(trimmed)
-            .trim();
-
-        let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            None
-        } else {
-            Some(format!("+{digits}"))
-        }
+        crate::whatsapp::normalize_phone_token(value)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -817,10 +806,19 @@ impl WhatsAppWebChannel {
             None
         };
         let candidates = Self::sender_phone_candidates(sender, sender_alt, mapped_phone.as_deref());
-        let allowed_phone = candidates
-            .iter()
-            .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
-            .cloned();
+        // Authorize the sender as one account first, so a deny naming any of
+        // its numbers is not sidestepped by another number of the same sender.
+        // Only then pick the number to report downstream.
+        let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let allowed_phone = if Self::are_numbers_allowed_for_list(allowed_numbers, &candidate_refs)
+        {
+            candidates
+                .iter()
+                .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
+                .cloned()
+        } else {
+            None
+        };
 
         SenderAllowlistResolution {
             mapped_phone,
@@ -1808,6 +1806,7 @@ impl WhatsAppWebChannel {
                 explicitly_addressed: false,
                 conversation_scope,
                 references: Vec::new(),
+                voice_origin: false,
             })
             .await
         {
@@ -2624,6 +2623,310 @@ fn whatsapp_delivery_failure_note(failure_count: usize) -> Option<String> {
     ))
 }
 
+/// Markdown spans whose doubled marker collapses to WhatsApp's single one.
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_INLINE_SPANS: [(&str, char); 3] = [("**", '*'), ("__", '_'), ("~~", '~')];
+
+/// Convert Markdown to WhatsApp's formatting dialect.
+///
+/// WhatsApp renders `*bold*`, `_italic_`, `~strikethrough~`, `` `code` ``,
+/// ``` ```monospace``` ```, bullet and numbered lists and `>` quotes natively,
+/// and auto-links bare URLs, so only the markers Markdown spells differently
+/// are rewritten. Text already written in WhatsApp style passes through
+/// unchanged.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_to_whatsapp(text: &str) -> String {
+    let mut result_lines: Vec<String> = Vec::new();
+    // Length of the backtick run that opened the current fenced block.
+    let mut open_fence: Option<usize> = None;
+
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+        let run = backtick_run(trimmed, 0);
+
+        if let Some(fence) = open_fence {
+            // Only a run at least as long as the opener with nothing but
+            // whitespace after it closes the block (CommonMark fenced code
+            // blocks); a shorter run or one carrying an info string is content.
+            if run >= fence && trimmed[run..].trim().is_empty() {
+                open_fence = None;
+            }
+            result_lines.push(line.to_string());
+            continue;
+        }
+
+        // An opening fence is three or more backticks whose info string holds
+        // no backtick — ```mono``` on one line is a WhatsApp monospace span.
+        if run >= 3 && !trimmed[run..].contains('`') {
+            // WhatsApp shares the backtick fence but has no notion of an info
+            // string, so it would render `rust` as the first code line.
+            let indent = &line[..line.len() - trimmed.len()];
+            result_lines.push(format!("{indent}{}", &trimmed[..run]));
+            open_fence = Some(run);
+            continue;
+        }
+
+        // Headings: `## Title` → `*Title*`. WhatsApp has no heading of its own.
+        let after_hashes = line.trim_start_matches('#');
+        let level = line.len() - after_hashes.len();
+        if (1..=6).contains(&level) && after_hashes.starts_with(' ') {
+            // The whole line is bold, so `# **Title**` sheds its own bold
+            // markers instead of gaining a second wrapper around them.
+            let title = markdown_inline_to_whatsapp_in(after_hashes.trim(), true);
+            result_lines.push(format!("*{title}*"));
+            continue;
+        }
+
+        result_lines.push(markdown_inline_to_whatsapp(line));
+    }
+
+    result_lines.join("\n")
+}
+
+/// Rewrite the inline Markdown markers of a single non-fenced line.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_inline_to_whatsapp(line: &str) -> String {
+    markdown_inline_to_whatsapp_in(line, false)
+}
+
+/// [`markdown_inline_to_whatsapp`] for text that is already inside a bold
+/// span, where a nested `**bold**` contributes only its text.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_inline_to_whatsapp_in(line: &str, inside_bold: bool) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Inline code is copied verbatim so markers inside it stay literal. A
+        // span closes at the next backtick run of exactly the opening length
+        // (CommonMark code spans); an unmatched run is literal text.
+        if bytes[i] == b'`' {
+            let run = backtick_run(line, i);
+            let end = match find_backtick_run(line, i + run, run) {
+                Some(close) => close + run,
+                None => i + run,
+            };
+            out.push_str(&line[i..end]);
+            i = end;
+            continue;
+        }
+
+        // A bare URL is copied through whole so the `_`, `*` and `~` in its
+        // path stay literal; WhatsApp auto-links it as written.
+        if let Some(end) = bare_url_end(line, i) {
+            out.push_str(&line[i..end]);
+            i = end;
+            continue;
+        }
+
+        // `**bold**` → `*bold*`, `__x__` → `_x_`, `~~strike~~` → `~strike~`.
+        // A single marker is already WhatsApp syntax, so a leading `* ` list
+        // bullet and a lone `*bold*` both fall through untouched.
+        if let Some(&(marker, replacement)) = WHATSAPP_INLINE_SPANS
+            .iter()
+            .find(|(marker, _)| line[i..].starts_with(marker))
+            && let Some(end) = line[i + 2..].find(marker)
+        {
+            let inner = &line[i + 2..i + 2 + end];
+            if inside_bold && replacement == '*' {
+                out.push_str(inner);
+            } else {
+                out.push(replacement);
+                out.push_str(inner);
+                out.push(replacement);
+            }
+            i += 4 + end;
+            continue;
+        }
+
+        // `[text](url)` → `text: url`; WhatsApp auto-links the bare URL. The
+        // destination is read with CommonMark's boundaries (angle-bracket
+        // form, balanced or escaped parentheses, optional title), so its
+        // bytes reach the recipient unchanged; anything else stays literal.
+        if bytes[i] == b'['
+            && let Some(bracket_end) = line[i + 1..].find(']')
+        {
+            let after_bracket = i + 1 + bracket_end + 1;
+            if after_bracket < len
+                && bytes[after_bracket] == b'('
+                && let Some((url, end)) = parse_link_destination(line, after_bracket)
+            {
+                let text = &line[i + 1..i + 1 + bracket_end];
+                out.push_str(text);
+                out.push_str(": ");
+                out.push_str(&url);
+                i = end;
+                continue;
+            }
+        }
+
+        let ch = line[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Length of the backtick run starting at byte `at`.
+#[cfg(feature = "whatsapp-web")]
+fn backtick_run(text: &str, at: usize) -> usize {
+    text.as_bytes()[at..]
+        .iter()
+        .take_while(|&&b| b == b'`')
+        .count()
+}
+
+/// Byte index of the first backtick run of exactly `len` at or after `from`.
+#[cfg(feature = "whatsapp-web")]
+fn find_backtick_run(text: &str, from: usize, len: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let run = backtick_run(text, i);
+        if run == len {
+            return Some(i);
+        }
+        i += run;
+    }
+    None
+}
+
+/// End of the bare URL starting at byte `at`, if one starts there. The URL
+/// runs to whitespace or `<`, less trailing punctuation and an unbalanced `)`
+/// (GFM autolink extension), so `(see https://x/y).` links `https://x/y`.
+#[cfg(feature = "whatsapp-web")]
+fn bare_url_end(text: &str, at: usize) -> Option<usize> {
+    let rest = &text[at..];
+    if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+        return None;
+    }
+    let mut end = at
+        + rest
+            .find(|c: char| c.is_whitespace() || c == '<')
+            .unwrap_or(rest.len());
+    while let Some(last) = text[at..end].chars().next_back() {
+        let url = &text[at..end];
+        let unbalanced_paren = last == ')' && url.matches(')').count() > url.matches('(').count();
+        if !unbalanced_paren && !"?!.,:*_~'\"".contains(last) {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    Some(end)
+}
+
+/// Reads the `(destination "title")` tail of an inline link whose `(` sits at
+/// byte `open`. Returns the destination with backslash escapes resolved and
+/// the byte index just past the closing `)`, or `None` when the bytes are not
+/// a CommonMark link destination (the caller then keeps them literal).
+///
+/// CommonMark allows two destination forms: `<...>` (any characters except an
+/// unescaped `<` or `>`, so spaces are allowed) and a bare run without spaces
+/// or control characters in which parentheses must be balanced or escaped.
+/// An optional title (`"..."`, `'...'` or `(...)`) may follow after spaces.
+#[cfg(feature = "whatsapp-web")]
+fn parse_link_destination(text: &str, open: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let escaped =
+        |at: usize| bytes[at] == b'\\' && bytes.get(at + 1).is_some_and(u8::is_ascii_punctuation);
+    let skip_spaces = |mut at: usize| {
+        while at < bytes.len() && (bytes[at] == b' ' || bytes[at] == b'\t') {
+            at += 1;
+        }
+        at
+    };
+
+    let mut i = skip_spaces(open + 1);
+    let mut url = String::new();
+    if bytes.get(i) == Some(&b'<') {
+        i += 1;
+        loop {
+            match *bytes.get(i)? {
+                b'>' => {
+                    i += 1;
+                    break;
+                }
+                b'<' => return None,
+                _ if escaped(i) => {
+                    url.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                _ => {
+                    let ch = text[i..].chars().next()?;
+                    url.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+    } else {
+        let mut depth = 0usize;
+        loop {
+            match *bytes.get(i)? {
+                b')' if depth == 0 => break,
+                b' ' | b'\t' => break,
+                _ if escaped(i) => {
+                    url.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                b'(' => {
+                    depth += 1;
+                    url.push('(');
+                    i += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    url.push(')');
+                    i += 1;
+                }
+                b if b.is_ascii_control() => return None,
+                _ => {
+                    let ch = text[i..].chars().next()?;
+                    url.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    // A title has no WhatsApp form; it is parsed only to find the closing `)`.
+    let after_destination = i;
+    i = skip_spaces(i);
+    if i > after_destination
+        && let Some(close) = match bytes.get(i) {
+            Some(b'"') => Some(b'"'),
+            Some(b'\'') => Some(b'\''),
+            Some(b'(') => Some(b')'),
+            _ => None,
+        }
+    {
+        let opener = bytes[i];
+        i += 1;
+        loop {
+            let b = *bytes.get(i)?;
+            if escaped(i) {
+                i += 2;
+            } else if b == close {
+                i += 1;
+                break;
+            } else if b == opener && opener == b'(' {
+                return None;
+            } else {
+                i += 1;
+            }
+        }
+        i = skip_spaces(i);
+    }
+
+    (bytes.get(i) == Some(&b')')).then(|| (url, i + 1))
+}
+
 #[cfg(feature = "whatsapp-web")]
 impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -2897,7 +3200,7 @@ impl Channel for WhatsAppWebChannel {
 
         // Send text message
         let outgoing = waproto::whatsapp::Message {
-            conversation: Some(text_content),
+            conversation: Some(markdown_to_whatsapp(&text_content)),
             ..Default::default()
         };
 
@@ -3127,6 +3430,7 @@ impl Channel for WhatsAppWebChannel {
                                                 "whatsapp",
                                                 alias.as_ref(),
                                                 &format!("+{digits}"),
+                                                Self::phone_matches,
                                             )
                                             .await
                                     {
@@ -3357,6 +3661,42 @@ impl Channel for WhatsAppWebChannel {
     async fn health_check(&self) -> bool {
         let bot_handle_guard = self.bot_handle.lock();
         bot_handle_guard.is_some()
+    }
+
+    fn supports_native_polls(&self) -> bool {
+        true
+    }
+
+    /// Post a native WhatsApp poll. Unlike `send`, a recipient outside the
+    /// allowlist is an error rather than a silent no-op: this is a tool call,
+    /// and the caller has to learn that nothing was posted.
+    async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
+        // Validated before the client is touched, so a caller that got the
+        // recipient wrong hears that instead of a connection error.
+        if !Self::is_jid(&poll.recipient) {
+            let normalized = self.normalize_phone(&poll.recipient);
+            anyhow::ensure!(
+                self.is_number_allowed(&normalized),
+                "recipient `{}` is not in this channel's allowlist",
+                poll.recipient
+            );
+        }
+        let deliverable_recipient = Self::resolve_outbound_recipient(&poll.recipient);
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
+
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        Box::pin(
+            client
+                .polls()
+                .create(to, &poll.question, &poll.options, poll.selectable_count),
+        )
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("WhatsApp poll creation failed: {e}")))?;
+        Ok(())
     }
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
@@ -4235,6 +4575,102 @@ mod tests {
         assert!(ch.is_number_allowed("+9999999999"));
     }
 
+    /// Resolve peers the way the daemon does, so these cover the
+    /// config-to-adapter boundary rather than a hand-built vector.
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("whatsapp", alias)
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_survives_the_whitespace_wildcard() {
+        // A wildcard written with surrounding whitespace, resolved from config.
+        // Gating deny emission on the exact string `"*"` emitted no deny here
+        // while this matcher still read the entry as a wildcard.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = [" * "]
+            ignore = ["+15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_an_equivalent_phone_spelling() {
+        // This matcher reads `+15551234567` and `15551234567` as one number.
+        // Resolving the deny by comparing raw strings kept the grant and
+        // dropped the `ignore`, and the sender was then admitted.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["+15551234567"]
+            ignore = ["15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_a_jid_spelling_of_the_granted_number() {
+        // A sender arrives as a JID, which normalizes to the same number.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["*"]
+            ignore = ["15551234567@s.whatsapp.net"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_on_one_sender_number_covers_the_others() {
+        // A sender arrives as several numbers (JID, alternate JID, LID
+        // mapping). Denying one of them must reject the sender rather than
+        // letting the next number pick up the wildcard.
+        let peers = vec!["*".to_string(), "!+15551234567".to_string()];
+        assert!(!WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15551234567"]
+        ));
+        assert!(WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15559999999"]
+        ));
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
@@ -4329,6 +4765,78 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::normalize_phone_token("+1 (555) 123-4567"),
             Some("+15551234567".to_string())
+        );
+    }
+
+    /// Config to writer to runtime, on the one identity WhatsApp spells three
+    /// ways. The writer runs on every reconnect, so a wrong answer here is the
+    /// operator's whole experience of pairing: told it worked, never able to
+    /// talk, and no conflict to act on.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_pairing_write_honors_a_deny_spelled_as_a_jid() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "whatsapp_admin".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp.admin".to_string()),
+                external_peers: vec![PeerUsername::new("+15551234567".to_string())],
+                ignore: vec![PeerUsername::new("15551234567@s.whatsapp.net".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let resolved = config.channel_external_peers("whatsapp", "admin");
+        assert!(
+            !WhatsAppWebChannel::are_numbers_allowed_for_list(&resolved, &["+15551234567"]),
+            "the runtime canonicalizes the JID deny and rejects the account"
+        );
+
+        let err = crate::identity_persist::merge_external_peer(
+            &mut config,
+            "whatsapp",
+            "admin",
+            "+15551234567",
+            WhatsAppWebChannel::phone_matches,
+        )
+        .expect_err("the deny names this account, whichever spelling it uses");
+        assert!(
+            err.to_string().contains("ignore"),
+            "the operator is told which field to edit: {err}"
+        );
+
+        config
+            .peer_groups
+            .get_mut("whatsapp_admin")
+            .expect("group exists")
+            .ignore
+            .clear();
+        assert!(
+            crate::identity_persist::merge_external_peer(
+                &mut config,
+                "whatsapp",
+                "admin",
+                "+15551234567",
+                WhatsAppWebChannel::phone_matches,
+            )
+            .expect("merge succeeds once the deny is gone")
+            .is_none(),
+            "the existing grant is now effective, so nothing needs writing"
+        );
+        let resolved = config.channel_external_peers("whatsapp", "admin");
+        assert!(
+            WhatsAppWebChannel::are_numbers_allowed_for_list(&resolved, &["+15551234567"]),
+            "a no-op write leaves the identity admissible: the recovery path ends"
         );
     }
 
@@ -7507,6 +8015,68 @@ mod tests {
         assert_eq!(ch.approval_timeout_secs, 300);
     }
 
+    // ── Native polls ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_channel(allowed_numbers: &[&str]) -> WhatsAppWebChannel {
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp-polls.db".into()),
+            ..Default::default()
+        };
+        let peers: Vec<String> = allowed_numbers.iter().map(|n| (*n).to_string()).collect();
+        WhatsAppWebChannel::new(
+            &cfg,
+            "poll_alias",
+            Arc::new(move || peers.clone()),
+            Arc::new(Vec::new),
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_request(recipient: &str) -> zeroclaw_api::channel::PollRequest {
+        zeroclaw_api::channel::PollRequest::new(
+            recipient,
+            "Which tasting slot?",
+            vec!["Friday".into(), "Saturday".into()],
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_channel_advertises_native_polls() {
+        assert!(poll_channel(&["+15550001111"]).supports_native_polls());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_poll_without_a_client_reports_the_same_not_connected_error_as_send() {
+        let channel = poll_channel(&["+15550001111"]);
+        let error = channel
+            .send_poll(&poll_request("+15550001111"))
+            .await
+            .expect_err("no client is connected");
+        assert!(error.to_string().contains("not connected"), "{error}");
+    }
+
+    /// `send` drops a disallowed recipient with a warning and reports success.
+    /// A poll is a tool call, so it has to say that nothing was posted.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_poll_to_a_number_outside_the_allowlist_fails_loudly() {
+        let channel = poll_channel(&["+15550001111"]);
+        let error = channel
+            .send_poll(&poll_request("+15559999999"))
+            .await
+            .expect_err("the recipient is not allowed");
+        let message = error.to_string();
+        assert!(message.contains("allowlist"), "{message}");
+        assert!(
+            !message.contains("not connected"),
+            "the allowlist must be checked before the client, so the caller learns the real reason: {message}"
+        );
+    }
+
     /// ...and a config built in Rust now agrees with one parsed from a file.
     ///
     /// This test used to assert the opposite. It pinned `Default::default()` at
@@ -7758,5 +8328,228 @@ mod tests {
             assert_eq!(got_token, token.to_lowercase());
             assert_eq!(got, want);
         }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_inline_markers_collapse_to_whatsapp_syntax() {
+        assert_eq!(markdown_to_whatsapp("**bold**"), "*bold*");
+        assert_eq!(markdown_to_whatsapp("__underscored__"), "_underscored_");
+        assert_eq!(markdown_to_whatsapp("~~gone~~"), "~gone~");
+        assert_eq!(
+            markdown_to_whatsapp("a **b** and ~~c~~ and __d__ end"),
+            "a *b* and ~c~ and _d_ end"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_headings_become_bold_lines() {
+        assert_eq!(markdown_to_whatsapp("# Title"), "*Title*");
+        assert_eq!(markdown_to_whatsapp("###### Deep"), "*Deep*");
+        // Seven hashes is not a heading, and neither is a bare `#tag`.
+        assert_eq!(markdown_to_whatsapp("####### Nope"), "####### Nope");
+        assert_eq!(markdown_to_whatsapp("#tag"), "#tag");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_links_become_text_then_url() {
+        assert_eq!(
+            markdown_to_whatsapp("see [the docs](https://example.com/x) now"),
+            "see the docs: https://example.com/x now"
+        );
+        // A bare URL is left for WhatsApp to auto-link.
+        assert_eq!(
+            markdown_to_whatsapp("https://example.com/x"),
+            "https://example.com/x"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_native_constructs_pass_through() {
+        let native = "- first\n- second\n1. one\n2. two\n> quoted\n`inline code`";
+        assert_eq!(markdown_to_whatsapp(native), native);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn already_whatsapp_styled_text_is_unchanged() {
+        let styled = "*bold* and _italic_ and ~struck~ and `code`";
+        assert_eq!(markdown_to_whatsapp(styled), styled);
+        assert_eq!(
+            markdown_to_whatsapp(&markdown_to_whatsapp("**bold** and __italic__")),
+            "*bold* and _italic_"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn leading_list_marker_is_not_read_as_bold() {
+        assert_eq!(markdown_to_whatsapp("* item one"), "* item one");
+        assert_eq!(
+            markdown_to_whatsapp("* item one\n* item two"),
+            "* item one\n* item two"
+        );
+        assert_eq!(markdown_to_whatsapp("* **hot** item"), "* *hot* item");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn code_fences_keep_their_contents_and_lose_the_language_tag() {
+        assert_eq!(
+            markdown_to_whatsapp("```rust\nlet x = **y**;\n```"),
+            "```\nlet x = **y**;\n```"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("```\n# not a heading\n[a](b)\n```"),
+            "```\n# not a heading\n[a](b)\n```"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mixed_hebrew_and_english_gains_no_direction_marks() {
+        let input = "## סיכום Summary\n**חשוב**: ראה [the docs](https://example.com) עכשיו";
+        let rendered = markdown_to_whatsapp(input);
+        assert_eq!(
+            rendered,
+            "*סיכום Summary*\n*חשוב*: ראה the docs: https://example.com עכשיו"
+        );
+        assert!(!rendered.contains('\u{200f}'));
+        assert!(!rendered.contains('\u{200e}'));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn multi_line_message_converts_heading_list_and_bold() {
+        let input = "# Report\n\nThe **build** is green.\n\n- run `cargo test`\n- read [the log](https://ci.example.com/1)\n";
+        assert_eq!(
+            markdown_to_whatsapp(input),
+            "*Report*\n\nThe *build* is green.\n\n- run `cargo test`\n- read the log: https://ci.example.com/1\n"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn link_destination_boundaries_follow_commonmark() {
+        // An angle-bracket destination may contain spaces.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a b>)"),
+            "docs: https://example.test/a b"
+        );
+        // An escaped parenthesis belongs to the destination.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a\\)b)"),
+            "docs: https://example.test/a)b"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a\\>b>)"),
+            "docs: https://example.test/a>b"
+        );
+        // A title in any of its three forms is dropped, not sent as URL.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x \"Title\")"),
+            "docs: https://example.test/x"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x 'Title')"),
+            "docs: https://example.test/x"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x (Title))"),
+            "docs: https://example.test/x"
+        );
+        // Not a CommonMark link: an unclosed angle bracket or a bare
+        // destination with a space stays literal.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a b)"),
+            "[docs](<https://example.test/a b)"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a b)"),
+            "[docs](https://example.test/a b)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn bare_url_bytes_survive_unchanged() {
+        let url = "https://example.test/a__b__c";
+        assert_eq!(markdown_to_whatsapp(url), url);
+        assert_eq!(
+            markdown_to_whatsapp("see https://example.test/a__b__c now"),
+            "see https://example.test/a__b__c now"
+        );
+        // Trailing punctuation and an unbalanced `)` belong to the sentence,
+        // not the URL, so the markers after a URL still convert.
+        assert_eq!(
+            markdown_to_whatsapp("(see https://example.test/x_(y)_z). **ok**"),
+            "(see https://example.test/x_(y)_z). *ok*"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("**https://example.test/a~~b~~c**"),
+            "*https://example.test/a~~b~~c*"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn link_destination_keeps_balanced_parentheses() {
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a_(b)/c)"),
+            "docs: https://example.test/a_(b)/c"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a__b \"title\") tail"),
+            "docs: https://example.test/a__b tail"
+        );
+        // An unbalanced destination is not a link, and the URL still passes whole.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a_(b"),
+            "[docs](https://example.test/a_(b"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn code_span_closes_only_on_a_matching_backtick_run() {
+        assert_eq!(markdown_to_whatsapp("``a **b**``"), "``a **b**``");
+        assert_eq!(
+            markdown_to_whatsapp("``has ` inside`` and **bold**"),
+            "``has ` inside`` and *bold*"
+        );
+        // An unmatched run is literal text and does not swallow the line.
+        assert_eq!(markdown_to_whatsapp("``open **bold**"), "``open *bold*");
+        assert_eq!(markdown_to_whatsapp("```mono __x__```"), "```mono __x__```");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn longer_fence_encloses_a_triple_backtick_example() {
+        let input = "````\n```rust\nlet x = **y**;\n```\n[a](b)\n````\n**after**";
+        assert_eq!(
+            markdown_to_whatsapp(input),
+            "````\n```rust\nlet x = **y**;\n```\n[a](b)\n````\n*after*"
+        );
+        // A fence line carrying an info string never closes a block.
+        assert_eq!(
+            markdown_to_whatsapp("```\n```rust\n**x**\n```\n**y**"),
+            "```\n```rust\n**x**\n```\n*y*"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn bold_heading_is_wrapped_once_and_stays_put() {
+        assert_eq!(markdown_to_whatsapp("# **Title**"), "*Title*");
+        assert_eq!(
+            markdown_to_whatsapp(&markdown_to_whatsapp("# **Title**")),
+            "*Title*"
+        );
+        // Bold inside a heading is redundant: the whole line is already bold.
+        assert_eq!(markdown_to_whatsapp("## Plain **part**"), "*Plain part*");
+        assert_eq!(markdown_to_whatsapp("## `**` and __u__"), "*`**` and _u_*");
     }
 }
