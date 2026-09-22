@@ -7600,6 +7600,7 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
 struct ConversationRenderWork {
     visible_cached_entries: usize,
     transcript_cached_lines: usize,
+    transcript_snapshot_captured: bool,
     copy_cached_blocks: usize,
     entry_rect_candidates: usize,
     thought_rows_painted: usize,
@@ -7659,7 +7660,9 @@ fn render_conversation(
     let inner_width = area.width.saturating_sub(2);
 
     // ── Rebuild cached lines only when entries changed ────────
-    if state.dirty != LinesDirty::Clean || state.cached_render_width != inner_width {
+    let transcript_content_changed =
+        state.dirty != LinesDirty::Clean || state.cached_render_width != inner_width;
+    if transcript_content_changed {
         // Selection endpoints belong to one stable rendered-content geometry.
         // Viewport movement preserves them, but a cache rebuild does not.
         state.clear_transcript_selection_for_render_change();
@@ -7826,7 +7829,15 @@ fn render_conversation(
             body_area,
         ));
     }
-    capture_transcript_snapshot(f, state, body_area, total_rows, scroll, row_breaks);
+    let transcript_snapshot_captured = capture_transcript_snapshot(
+        f,
+        state,
+        body_area,
+        total_rows,
+        scroll,
+        row_breaks,
+        transcript_content_changed,
+    );
     state.streaming_selection_prefix =
         has_stream_thought.then_some((state.streaming_thought.len(), thought_start, inner_width));
     if state.transcript_selection.is_some() {
@@ -7942,6 +7953,7 @@ fn render_conversation(
         ConversationRenderWork {
             visible_cached_entries: visible_cached_window.entries.len(),
             transcript_cached_lines,
+            transcript_snapshot_captured,
             copy_cached_blocks,
             entry_rect_candidates: visible_cached_window.entries.len(),
             thought_rows_painted,
@@ -7950,7 +7962,7 @@ fn render_conversation(
     }
     #[cfg(not(test))]
     {
-        let _ = copy_cached_blocks;
+        let _ = (copy_cached_blocks, transcript_snapshot_captured);
     }
 }
 
@@ -7987,7 +7999,22 @@ fn capture_transcript_snapshot(
     total_rows: u16,
     scroll: u16,
     row_breaks: Vec<TranscriptRowBreak>,
-) {
+    content_changed: bool,
+) -> bool {
+    let visible_end = scroll.saturating_add(body.height).min(total_rows);
+    if !content_changed
+        && let Some(snapshot) = state.transcript_snapshot.as_mut()
+        && snapshot.area.width == body.width
+        && snapshot.area.height == body.height
+        && snapshot.content_height() == total_rows
+        && (scroll..visible_end)
+            .all(|row| snapshot.cells.contains_key(&row) && snapshot.row_breaks.contains_key(&row))
+    {
+        // A dock can move the conversation without changing its rendered cells.
+        snapshot.set_viewport(body, scroll);
+        return false;
+    }
+
     let captured = TranscriptSnapshot::capture_at(f, body, total_rows, scroll, row_breaks);
     if state.transcript_selection.is_some()
         && let Some(snapshot) = state.transcript_snapshot.as_mut()
@@ -7996,9 +8023,10 @@ fn capture_transcript_snapshot(
         && snapshot.content_height() == total_rows
     {
         snapshot.merge(captured);
-        return;
+        return true;
     }
     state.set_transcript_snapshot(captured);
+    true
 }
 
 fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
@@ -17272,6 +17300,53 @@ mod tests {
     }
 
     #[test]
+    fn transcript_selection_unchanged_redraw_reuses_snapshot_until_content_or_viewport_changes() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        for i in 0..40 {
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        state.mark_dirty_full();
+        state.scroll_to_top();
+
+        let area = Rect::new(0, 0, 40, 10);
+        let backend = TestBackend::new(50, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut draw = |state: &mut ChatState, area| {
+            let mut work = None;
+            terminal
+                .draw(|frame| {
+                    work = Some(render_conversation(frame, state, area));
+                })
+                .expect("draw conversation");
+            work.expect("render work")
+        };
+
+        assert!(draw(&mut state, area).transcript_snapshot_captured);
+        assert!(!draw(&mut state, area).transcript_snapshot_captured);
+
+        let moved = Rect::new(2, 0, area.width, area.height);
+        assert!(!draw(&mut state, moved).transcript_snapshot_captured);
+        assert_eq!(
+            state.transcript_snapshot.as_ref().unwrap().area.x,
+            moved.x + 1,
+            "position-only movement must update hit coordinates without copying cells"
+        );
+
+        state.scroll_down(1);
+        assert!(draw(&mut state, moved).transcript_snapshot_captured);
+
+        state.entries[0] = ChatEntry::AgentMessage(Arc::<str>::from("changed"));
+        state.mark_dirty_full();
+        assert!(draw(&mut state, moved).transcript_snapshot_captured);
+    }
+
+    #[test]
     fn complete_frame_history_work_is_bounded_for_all_transient_modes() {
         for case in [
             CompleteFrameCase::Idle,
@@ -17303,6 +17378,7 @@ mod tests {
             ConversationRenderWork {
                 visible_cached_entries: 0,
                 transcript_cached_lines: 0,
+                transcript_snapshot_captured: true,
                 copy_cached_blocks: 0,
                 entry_rect_candidates: 0,
                 thought_rows_painted: 0,
