@@ -519,7 +519,12 @@ impl AcpSessionStore {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<AcpSessionPage> {
-        let conn = self.conn.lock();
+        // Cursor validation and page hydration must share one snapshot so a
+        // concurrent transcript replacement cannot create false exhaustion.
+        let mut conn = self.conn.lock();
+        let conn = conn
+            .transaction()
+            .context("Failed to begin ACP session page read transaction")?;
         let session_id: i64 = conn
             .query_row(
                 "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
@@ -560,6 +565,19 @@ impl AcpSessionStore {
             return Err(anyhow::Error::msg(format!(
                 "cursor page limit must be between 1 and {ACP_SESSION_MAX_PAGE_SIZE}"
             )));
+        }
+        if cursor.is_some() {
+            let next_row_exists: i64 = conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM acp_messages
+                     WHERE session_id = ?1 AND role != 'system' AND id = ?2 AND id <= ?3
+                 )",
+                params![session_id, state.next_message_id, state.max_message_id],
+                |row| row.get(0),
+            )?;
+            if next_row_exists == 0 {
+                return Err(anyhow::Error::msg("invalid ACP session cursor"));
+            }
         }
         if state.next_message_id == 0 {
             return Ok(AcpSessionPage {
@@ -2766,6 +2784,39 @@ mod tests {
             &older.messages[0],
             ConversationMessage::Chat(message) if message.content == "old"
         ));
+    }
+
+    #[test]
+    fn cursor_rejects_transcript_replacement_and_fresh_request_recovers() {
+        let (_tmp, store) = open_store();
+        store.create_session("replaced", "alpha", "/tmp").unwrap();
+        let transcript = [
+            ConversationMessage::Chat(ChatMessage::user("old")),
+            ConversationMessage::Chat(ChatMessage::assistant("middle")),
+            ConversationMessage::Chat(ChatMessage::assistant("new")),
+        ];
+        store.append_turn("replaced", &transcript).unwrap();
+        let first = store.load_message_page("replaced", 1, None).unwrap();
+        let cursor = first
+            .next_cursor
+            .expect("three messages must leave an older page");
+
+        // Terminal turns replace the authoritative transcript, assigning new
+        // durable row IDs. An older cursor must not report false exhaustion.
+        store
+            .replace_messages_and_breadcrumb("replaced", &transcript, false)
+            .unwrap();
+        let error = store
+            .load_message_page("replaced", 1, Some(&cursor))
+            .expect_err("replacement must invalidate an established cursor");
+        assert_eq!(error.to_string(), "invalid ACP session cursor");
+
+        let fresh = store.load_message_page("replaced", 1, None).unwrap();
+        assert!(matches!(
+            &fresh.messages[0],
+            ConversationMessage::Chat(message) if message.content == "new"
+        ));
+        assert!(fresh.has_older);
     }
 
     #[test]
