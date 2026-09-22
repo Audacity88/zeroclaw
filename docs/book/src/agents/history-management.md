@@ -76,7 +76,7 @@ not a provider tokenizer. Loadable `[IMAGE:...]` markers are charged a fixed
 per-image cost only in messages whose images are dispatched: user turns and the
 tool results of the current user turn. A tool result's images are the
 attachments the tool declared, not marker text in its output. Older tool
-results are priced as the text preparation delivers for them, and system and
+results are priced as their message bytes, and system and
 assistant text is priced as text.
 
 Proactive token-budget trimming runs before the first provider call of a turn
