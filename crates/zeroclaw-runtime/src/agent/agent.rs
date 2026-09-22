@@ -10120,10 +10120,10 @@ mod tests {
         assert_eq!(
             event
                 .attributes
-                .get("trim_target")
+                .get("max_history_turns")
                 .and_then(serde_json::Value::as_u64),
             Some(1),
-            "cap 2 with the default 0.7 fraction floors to a target of 1"
+            "the configured whole-turn cap should be logged"
         );
         assert!(event.attributes.get("agent_alias").is_none());
         assert!(event.attributes.get("channel").is_none());
