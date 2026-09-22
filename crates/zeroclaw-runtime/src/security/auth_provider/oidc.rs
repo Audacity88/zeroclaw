@@ -2359,7 +2359,7 @@ mod tests {
             .with_priority(1)
             .mount(&idp.server)
             .await;
-        let refusing_endpoint = tokio::spawn(async move {
+        let refusing_endpoint = ::zeroclaw_spawn::spawn!(async move {
             while let Ok((connection, _)) = listener.accept().await {
                 drop(connection);
             }
