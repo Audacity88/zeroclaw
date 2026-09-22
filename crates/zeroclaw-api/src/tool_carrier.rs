@@ -32,10 +32,20 @@ pub const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
 /// Prefix of line 2 of a prompt-mode carrier: `[Tool attachments: N]`.
 const TOOL_ATTACHMENTS_HEADER_PREFIX: &str = "[Tool attachments: ";
 
-/// One parsed carrier: the verbatim body, the declared attachments, and
-/// whether the carrier declared them at the fixed position at all.
+/// Which carrier shape a tool-result carrier uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierKind {
+    /// `role = "tool"`: a JSON envelope, or raw tool text (legacy).
+    Native,
+    /// `role = "user"` starting with the results prefix.
+    Prompt,
+}
+
+/// A carrier opened at its fixed position: the verbatim body, the declared
+/// attachments, whether the position carried a declaration at all, and
+/// which shape the carrier takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedToolCarrier {
+pub struct CarrierParts {
     /// The carrier body. For native carriers this is the envelope's
     /// `content` string; for prompt carriers it is everything after the N
     /// marker lines. Never interpreted for markers by anything reading it
@@ -48,6 +58,8 @@ pub struct ParsedToolCarrier {
     /// marks a legacy carrier: zero attachments, and the body is untrusted
     /// text that must not be promoted.
     pub declared: bool,
+    /// Which carrier shape the message uses; see [`CarrierKind`].
+    pub kind: CarrierKind,
 }
 
 /// Whether user-role content is a prompt-mode tool-result carrier. Mirrors
@@ -67,16 +79,17 @@ pub fn is_prompt_tool_carrier(content: &str) -> bool {
 /// conservative reading is legacy — zero attachments, untrusted body —
 /// agreeing with [`native_attachments`]. Array items that do not
 /// deserialize are skipped rather than failing the whole carrier.
-pub fn parse_native_tool_carrier(content: &str) -> Option<ParsedToolCarrier> {
+pub fn parse_native_tool_carrier(content: &str) -> Option<CarrierParts> {
     let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let object = value.as_object()?;
     let text = object.get("content")?.as_str()?.to_string();
     let attachments = native_attachments(object.get("attachments"));
     let declared = attachments.is_some();
-    Some(ParsedToolCarrier {
+    Some(CarrierParts {
         text,
         attachments: attachments.unwrap_or_default(),
         declared,
+        kind: CarrierKind::Native,
     })
 }
 
@@ -117,7 +130,7 @@ pub fn render_native_attachments(attachments: &[RenderedMarker]) -> serde_json::
 /// marker lines are missing or malformed is corrupt and falls back to the
 /// same legacy reading, so a damaged carrier degrades to text rather than to
 /// a wrong attachment list.
-pub fn parse_prompt_tool_carrier(content: &str) -> Option<ParsedToolCarrier> {
+pub fn parse_prompt_tool_carrier(content: &str) -> Option<CarrierParts> {
     let mut lines = content.split('\n');
     if lines.next()? != TOOL_RESULTS_PREFIX {
         return None;
@@ -140,10 +153,11 @@ pub fn parse_prompt_tool_carrier(content: &str) -> Option<ParsedToolCarrier> {
         }
     }
     let text = lines.collect::<Vec<_>>().join("\n");
-    Some(ParsedToolCarrier {
+    Some(CarrierParts {
         text,
         attachments,
         declared: true,
+        kind: CarrierKind::Prompt,
     })
 }
 
@@ -215,11 +229,111 @@ fn parse_attachments_header(line: &str) -> Option<usize> {
     digits.parse::<usize>().ok()
 }
 
-fn legacy_prompt_carrier(content: &str) -> ParsedToolCarrier {
-    ParsedToolCarrier {
+fn legacy_prompt_carrier(content: &str) -> CarrierParts {
+    CarrierParts {
         text: content.to_string(),
         attachments: Vec::new(),
         declared: false,
+        kind: CarrierKind::Prompt,
+    }
+}
+
+/// Classify a message as a tool-result carrier, whichever shape it takes.
+///
+/// `None` means the message is not a tool-result carrier at all: ordinary
+/// user, assistant, or system text. `Some(parts)` with
+/// `parts.declared == false` is a carrier without a declaration — a legacy
+/// native envelope, raw tool text, or a prompt carrier without a valid
+/// count line — whose body is untrusted text: nothing may promote, sweep,
+/// or strip it.
+///
+/// Raw non-JSON `role = "tool"` text classifies as a legacy native carrier
+/// with the raw content as its body, and a user message whose content
+/// merely starts with the results prefix (leading whitespace, or no
+/// parseable header after it) classifies as a legacy prompt carrier the
+/// same way, so no caller needs a separate raw-text fallback: every
+/// tool-shaped message opens through this one function.
+pub fn classify(role: &str, content: &str) -> Option<CarrierParts> {
+    if role == "tool" {
+        return Some(
+            parse_native_tool_carrier(content).unwrap_or_else(|| CarrierParts {
+                text: content.to_string(),
+                attachments: Vec::new(),
+                declared: false,
+                kind: CarrierKind::Native,
+            }),
+        );
+    }
+    if role == "user" && is_prompt_tool_carrier(content) {
+        return Some(
+            parse_prompt_tool_carrier(content).unwrap_or_else(|| CarrierParts {
+                text: content.to_string(),
+                attachments: Vec::new(),
+                declared: false,
+                kind: CarrierKind::Prompt,
+            }),
+        );
+    }
+    None
+}
+
+/// Whether a message is a tool-result carrier in either shape, legacy
+/// included: the same predicate every seam uses, so runtime, providers, and
+/// channels agree on what counts as a carrier even when its shape is
+/// legacy.
+pub fn is_tool_result_carrier(role: &str, content: &str) -> bool {
+    // The same truth table as `classify(..).is_some()` without parsing the
+    // envelope: every `tool` message is a carrier, and a `user` message is one
+    // exactly when it opens with the results prefix. Callers loop over whole
+    // histories with this predicate, so it must not deserialize each body.
+    role == "tool" || (role == "user" && is_prompt_tool_carrier(content))
+}
+
+/// The image references a carrier declared, in declaration order. Non-image
+/// kinds are carried but never resolved into image parts.
+pub fn image_refs(parts: &CarrierParts) -> Vec<String> {
+    parts
+        .attachments
+        .iter()
+        .filter(|marker| marker.kind == MarkerKind::Image)
+        .map(|marker| marker.target.clone())
+        .collect()
+}
+
+/// Rebuild a carrier's content with a new attachment list, taking the body
+/// from `parts` — the only text a caller may have rewritten — and keeping
+/// every other envelope field of `content` untouched.
+pub fn rebuild_carrier(
+    role: &str,
+    content: &str,
+    parts: &CarrierParts,
+    attachments: &[RenderedMarker],
+) -> String {
+    match (parts.kind, role) {
+        (CarrierKind::Native, "tool") => {
+            let Ok(serde_json::Value::Object(mut obj)) =
+                serde_json::from_str::<serde_json::Value>(content)
+            else {
+                return content.to_string();
+            };
+            // The body is re-written from `parts.text` so a load-failure
+            // note appended during normalization reaches the envelope; when
+            // the text is unchanged this is an identity write.
+            obj.insert(
+                "content".to_string(),
+                serde_json::Value::String(parts.text.clone()),
+            );
+            obj.insert(
+                "attachments".to_string(),
+                render_native_attachments(attachments),
+            );
+            serde_json::Value::Object(obj).to_string()
+        }
+        (CarrierKind::Prompt, "user") => render_prompt_tool_carrier(&parts.text, attachments),
+        // A parts/role mismatch cannot come out of `classify`; rebuilding a
+        // shape the message never had would invent content, so the original
+        // bytes are returned instead.
+        _ => content.to_string(),
     }
 }
 
@@ -516,5 +630,82 @@ mod tests {
         assert!(is_prompt_tool_carrier("  [Tool results]\nbody"));
         assert!(!is_prompt_tool_carrier("[Tool results-ish]\nbody"));
         assert!(!is_prompt_tool_carrier("user text"));
+    }
+
+    #[test]
+    fn classify_covers_every_carrier_and_non_carrier_shape() {
+        // Ordinary messages are not carriers.
+        assert!(classify("user", "just a user message").is_none());
+        assert!(classify("assistant", "just an assistant message").is_none());
+
+        // Raw tool text is a legacy native carrier whose body is the text.
+        let parts = classify("tool", "plain output").expect("raw tool text classifies");
+        assert!(!parts.declared);
+        assert!(parts.attachments.is_empty());
+        assert_eq!(parts.text, "plain output");
+        assert_eq!(parts.kind, CarrierKind::Native);
+
+        // A native envelope without the attachments key is legacy; with an
+        // array (empty or not) it is declared; a non-array value is legacy.
+        let legacy = serde_json::json!({"tool_call_id": "call-1", "content": "body"}).to_string();
+        let parts = classify("tool", &legacy).expect("legacy envelope classifies");
+        assert!(!parts.declared);
+        assert_eq!(parts.text, "body");
+        assert_eq!(parts.kind, CarrierKind::Native);
+
+        let empty = native_carrier("body", serde_json::json!([]));
+        let parts = classify("tool", &empty).expect("declared-empty classifies");
+        assert!(parts.declared);
+        assert!(parts.attachments.is_empty());
+        assert_eq!(parts.kind, CarrierKind::Native);
+
+        let two = native_carrier(
+            "body",
+            serde_json::json!([
+                {"kind": "image", "target": "/tmp/a.png"},
+                {"kind": "image", "target": "/tmp/b.png"},
+            ]),
+        );
+        let parts = classify("tool", &two).expect("declared-two classifies");
+        assert!(parts.declared);
+        assert_eq!(
+            parts.attachments,
+            vec![image("/tmp/a.png"), image("/tmp/b.png")]
+        );
+        assert_eq!(image_refs(&parts), vec!["/tmp/a.png", "/tmp/b.png"]);
+
+        let non_array = native_carrier("body", serde_json::json!("nope"));
+        let parts = classify("tool", &non_array).expect("non-array classifies");
+        assert!(!parts.declared);
+        assert!(parts.attachments.is_empty());
+
+        // Prompt carriers: legacy without a count header, declared with
+        // zero, declared with two, legacy again when the marker lines the
+        // count promises are malformed.
+        let legacy_prompt = "[Tool results]\nbody";
+        let parts = classify("user", legacy_prompt).expect("legacy prompt classifies");
+        assert!(!parts.declared);
+        assert_eq!(parts.text, legacy_prompt);
+        assert_eq!(parts.kind, CarrierKind::Prompt);
+
+        let zero = render_prompt_tool_carrier("body", &[]);
+        let parts = classify("user", &zero).expect("count-zero classifies");
+        assert!(parts.declared);
+        assert!(parts.attachments.is_empty());
+        assert_eq!(parts.kind, CarrierKind::Prompt);
+
+        let two = render_prompt_tool_carrier("body", &[image("/tmp/a.png"), image("/tmp/b.png")]);
+        let parts = classify("user", &two).expect("count-two classifies");
+        assert!(parts.declared);
+        assert_eq!(parts.attachments.len(), 2);
+        assert_eq!(image_refs(&parts).len(), 2);
+
+        let malformed = format!(
+            "[Tool results]\n[Tool attachments: 2]\n{}\nbody",
+            marker_line(&image("/tmp/a.png"))
+        );
+        let parts = classify("user", &malformed).expect("malformed prompt classifies");
+        assert!(!parts.declared);
+        assert_eq!(parts.text, malformed);
     }
 }
