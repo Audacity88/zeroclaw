@@ -5223,7 +5223,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
         let sanitized = crate::multimodal::sanitize_image_markers(&messages);
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&sanitized);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&sanitized, CacheTtl::default());
         let assistant = native_msgs
             .iter()
             .find(|m| m.role == "assistant")

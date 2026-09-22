@@ -1042,6 +1042,7 @@ mod graceful_summary_metering_tests {
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
             &multimodal_config,
             &pacing,
@@ -1052,6 +1053,10 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1117,6 +1122,7 @@ mod graceful_summary_metering_tests {
             &mut history,
             "custom",
             "test-model",
+            "test-model",
             None,
             &multimodal_config,
             &pacing,
@@ -1127,6 +1133,10 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            0,
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
         )
         .await
         .expect("graceful summary should succeed");
