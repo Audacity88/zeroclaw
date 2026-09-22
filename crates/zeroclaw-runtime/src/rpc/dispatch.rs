@@ -7553,26 +7553,20 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
-    fn expected_default_shell_family() -> RuntimeShellFamily {
-        #[cfg(target_os = "windows")]
-        {
-            RuntimeShellFamily::Cmd
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            RuntimeShellFamily::Posix
-        }
+    fn expected_default_shell_profile() -> RuntimeShellProfile {
+        zeroclaw_config::platform::create_runtime(&Config::default().runtime)
+            .expect("default native runtime should resolve its shell")
+            .shell_profile()
+            .and_then(RuntimeShellProfile::from_runtime_profile)
+            .expect("default native runtime should expose a shell profile")
     }
 
-    fn expected_default_shell_name() -> &'static str {
-        #[cfg(target_os = "windows")]
-        {
-            "cmd"
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            "sh"
-        }
+    fn expected_default_shell_family() -> RuntimeShellFamily {
+        expected_default_shell_profile().family
+    }
+
+    fn expected_default_shell_name() -> String {
+        expected_default_shell_profile().name
     }
 
     /// A backend whose durable replacement always fails, standing in for a
@@ -10713,7 +10707,7 @@ mod tests {
             context
                 .shell_profile
                 .as_ref()
-                .map(|profile| profile.name.as_str()),
+                .map(|profile| profile.name.clone()),
             Some(expected_default_shell_name())
         );
 
@@ -10781,7 +10775,7 @@ mod tests {
             status
                 .shell_profile
                 .as_ref()
-                .map(|profile| profile.name.as_str()),
+                .map(|profile| profile.name.clone()),
             Some(expected_default_shell_name())
         );
     }
