@@ -2297,25 +2297,38 @@ fn windows_task_stop_command(task_name: &str) -> String {
     format!(
         "$task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{quoted}' }}; \
          if ($null -eq $task) {{ exit 0 }}; \
+         $action = $task.Actions | Select-Object -First 1; \
+         $execute = [string]$action.Execute; \
+         $isLegacyWrapper = $execute.Trim([char]34).EndsWith('.cmd', [System.StringComparison]::OrdinalIgnoreCase); \
+         if ($isLegacyWrapper -and [int]$task.State -eq 1) {{ exit 0 }}; \
+         if ($isLegacyWrapper) {{ exit 6 }}; \
          if ([int]$task.State -ne 4 -and [int]$task.State -ne 2) {{ exit 0 }}; \
          Stop-ScheduledTask -InputObject $task -ErrorAction Stop"
     )
 }
 
-fn stop_running_windows_task(task_name: &str) -> Result<()> {
-    if !matches!(
-        windows_task_state(task_name)?,
-        WindowsTaskState::Running | WindowsTaskState::Queued
-    ) {
-        return Ok(());
+fn windows_task_stop_from_exit_code(code: Option<i32>) -> Result<()> {
+    match code {
+        Some(0) => Ok(()),
+        Some(6) => bail!(
+            "Cannot safely replace the legacy Windows .cmd task unless it is disabled and the machine has rebooted. Run `schtasks /Change /TN \"ZeroClaw Daemon\" /Disable`, reboot Windows, then run `zeroclaw service install` again; the existing task registration was left unchanged."
+        ),
+        Some(code) => bail!("PowerShell task-stop command exited with status {code}"),
+        None => bail!("PowerShell task-stop command terminated without an exit code"),
     }
+}
 
-    run_checked(Command::new("powershell").args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &windows_task_stop_command(task_name),
-    ]))?;
+fn stop_running_windows_task(task_name: &str) -> Result<()> {
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &windows_task_stop_command(task_name),
+        ])
+        .status()
+        .context("Failed to stop the Windows scheduled task")?;
+    windows_task_stop_from_exit_code(status.code())?;
     let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
     loop {
         match windows_task_state(task_name)? {
@@ -4394,6 +4407,21 @@ mod service_helper_tests {
         assert!(windows_task_state_from_exit_code(Some(5)).is_err());
         assert!(windows_task_state_from_exit_code(Some(17)).is_err());
         assert!(windows_task_state_from_exit_code(None).is_err());
+    }
+
+    #[test]
+    fn windows_task_stop_refuses_a_running_legacy_wrapper() {
+        let command = windows_task_stop_command("ZeroClaw Daemon");
+        assert!(command.contains("Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop"));
+        assert!(command.contains("EndsWith('.cmd'"));
+        assert!(!command.contains("$action.Arguments"));
+        assert!(command.contains("{ exit 6 }"));
+        windows_task_stop_from_exit_code(Some(0)).expect("task-scoped stop should succeed");
+        let legacy_error = windows_task_stop_from_exit_code(Some(6))
+            .expect_err("running legacy wrapper must block reinstall");
+        assert!(legacy_error.to_string().contains("left unchanged"));
+        assert!(windows_task_stop_from_exit_code(Some(17)).is_err());
+        assert!(windows_task_stop_from_exit_code(None).is_err());
     }
 
     #[test]

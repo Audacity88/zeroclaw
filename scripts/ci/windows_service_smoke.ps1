@@ -39,6 +39,10 @@ $evidence = [ordered]@{
     legacy_wrapper_process_id = $null
     legacy_daemon_process_id = $null
     legacy_descendant_process_id = $null
+    active_legacy_reinstall_refused = $false
+    ready_legacy_reinstall_refused = $false
+    active_legacy_registration_preserved = $false
+    disabled_legacy_migration_succeeded = $false
     legacy_process_tree_stopped_before_reinstall = $false
     legacy_lookalike_survived_reinstall = $false
     direct_lookalike_survived_reinstall = $false
@@ -185,17 +189,54 @@ try {
         $null -ne $process -and $process.CommandLine -like "*$legacyWrapper*"
     }
 
-    Invoke-Fixture service install | Write-Host
-    $legacyProcessesStopped =
-        ($null -eq (Get-Process -Id $legacyWrapperProcess.ProcessId -ErrorAction SilentlyContinue)) -and
-        ($null -eq (Get-Process -Id $legacyDaemonPid -ErrorAction SilentlyContinue)) -and
-        ($null -eq (Get-Process -Id $legacyDescendantPid -ErrorAction SilentlyContinue))
-    if (-not $legacyProcessesStopped) { throw 'Legacy task process tree survived service reinstall' }
-    $evidence.legacy_process_tree_stopped_before_reinstall = $true
+    $legacyInstallOutput = & $fixture --config-dir $ConfigDir service install 2>&1
+    $legacyInstallExit = $LASTEXITCODE
+    $legacyInstallOutput | Write-Host
+    if ($legacyInstallExit -eq 0 -or $legacyInstallOutput -notmatch 'Cannot safely replace the legacy Windows \.cmd task') {
+        throw "Active legacy reinstall did not fail with the expected guidance: exit=$legacyInstallExit"
+    }
+    $evidence.active_legacy_reinstall_refused = $true
+    $legacyTask = Get-ScheduledTask -TaskName $taskName
+    $legacyAction = $legacyTask.Actions | Select-Object -First 1
+    $legacyExecute = [string]$legacyAction.Execute
+    if (-not $legacyExecute.Trim('"').EndsWith('.cmd', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Active legacy reinstall replaced the existing task registration'
+    }
+    $evidence.active_legacy_registration_preserved = $true
+    $legacyProcessesPreserved =
+        ($null -ne (Get-Process -Id $legacyWrapperProcess.ProcessId -ErrorAction SilentlyContinue)) -and
+        ($null -ne (Get-Process -Id $legacyDaemonPid -ErrorAction SilentlyContinue)) -and
+        ($null -ne (Get-Process -Id $legacyDescendantPid -ErrorAction SilentlyContinue))
+    if (-not $legacyProcessesPreserved) { throw 'Active legacy reinstall terminated a process without proven ownership' }
     if ($null -eq (Get-Process -Id $legacyLookalike.Id -ErrorAction SilentlyContinue)) {
         throw 'Reinstall killed an unrelated shell that only mentioned the legacy wrapper'
     }
     $evidence.legacy_lookalike_survived_reinstall = $true
+
+    & taskkill.exe /PID $legacyWrapperProcess.ProcessId /T /F *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to clean up the test-owned legacy process tree' }
+    Wait-Until -Description 'test-owned legacy process tree cleanup' -Condition {
+        ($null -eq (Get-Process -Id $legacyWrapperProcess.ProcessId -ErrorAction SilentlyContinue)) -and
+            ($null -eq (Get-Process -Id $legacyDaemonPid -ErrorAction SilentlyContinue)) -and
+            ($null -eq (Get-Process -Id $legacyDescendantPid -ErrorAction SilentlyContinue)) -and
+            ([int](Get-ScheduledTask -TaskName $taskName).State -ne 4) -and
+            ([int](Get-ScheduledTask -TaskName $taskName).State -ne 2)
+    }
+    $evidence.legacy_process_tree_stopped_before_reinstall = $true
+
+    $readyInstallOutput = & $fixture --config-dir $ConfigDir service install 2>&1
+    $readyInstallExit = $LASTEXITCODE
+    $readyInstallOutput | Write-Host
+    if ($readyInstallExit -eq 0 -or $readyInstallOutput -notmatch 'Cannot safely replace the legacy Windows \.cmd task') {
+        throw "Ready legacy reinstall did not fail with the expected guidance: exit=$readyInstallExit"
+    }
+    $evidence.ready_legacy_reinstall_refused = $true
+    Disable-ScheduledTask -TaskName $taskName | Out-Null
+    Wait-Until -Description 'disabled legacy task before migration' -Condition {
+        [int](Get-ScheduledTask -TaskName $taskName).State -eq 1
+    }
+    Invoke-Fixture service install | Write-Host
+    $evidence.disabled_legacy_migration_succeeded = $true
     $task = Get-ScheduledTask -TaskName $taskName
     $action = $task.Actions | Select-Object -First 1
     $evidence.action = "$($action.Execute) $($action.Arguments)"
