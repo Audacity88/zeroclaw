@@ -2243,24 +2243,35 @@ fn run_get_content(path: &Path, lines: usize, follow: bool) -> Result<()> {
 fn windows_task_state_command(task_name: &str) -> String {
     let quoted = task_name.replace('\'', "''");
     format!(
-        "$task = Get-ScheduledTask -TaskName '{quoted}' -ErrorAction SilentlyContinue; \
+        "$task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{quoted}' }}; \
          if ($null -eq $task) {{ exit 2 }}; \
          if ([int]$task.State -eq 4) {{ exit 0 }}; \
-         exit 1"
+         if ([int]$task.State -eq 2) {{ exit 3 }}; \
+         if ([int]$task.State -eq 1 -or [int]$task.State -eq 3) {{ exit 4 }}; \
+         exit 5"
     )
 }
 
-fn windows_task_state_from_exit_code(code: Option<i32>) -> Result<Option<bool>> {
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsTaskState {
+    Running,
+    Queued,
+    Idle,
+    Missing,
+}
+
+fn windows_task_state_from_exit_code(code: Option<i32>) -> Result<WindowsTaskState> {
     match code {
-        Some(0) => Ok(Some(true)),
-        Some(1) => Ok(Some(false)),
-        Some(2) => Ok(None),
+        Some(0) => Ok(WindowsTaskState::Running),
+        Some(2) => Ok(WindowsTaskState::Missing),
+        Some(3) => Ok(WindowsTaskState::Queued),
+        Some(4) => Ok(WindowsTaskState::Idle),
         Some(code) => bail!("PowerShell task-state query exited with status {code}"),
         None => bail!("PowerShell task-state query terminated without an exit code"),
     }
 }
 
-fn windows_task_running(task_name: &str) -> Result<Option<bool>> {
+fn windows_task_state(task_name: &str) -> Result<WindowsTaskState> {
     let status = Command::new("powershell")
         .args([
             "-NoProfile",
@@ -2273,30 +2284,29 @@ fn windows_task_running(task_name: &str) -> Result<Option<bool>> {
     windows_task_state_from_exit_code(status.code())
 }
 
-fn windows_task_tree_stop_command(task_name: &str) -> String {
+fn windows_task_running(task_name: &str) -> Result<Option<bool>> {
+    Ok(match windows_task_state(task_name)? {
+        WindowsTaskState::Running => Some(true),
+        WindowsTaskState::Queued | WindowsTaskState::Idle => Some(false),
+        WindowsTaskState::Missing => None,
+    })
+}
+
+fn windows_task_stop_command(task_name: &str) -> String {
     let quoted = task_name.replace('\'', "''");
     format!(
-        "$task = Get-ScheduledTask -TaskName '{quoted}' -ErrorAction SilentlyContinue; \
+        "$task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{quoted}' }}; \
          if ($null -eq $task) {{ exit 0 }}; \
-         $action = $task.Actions | Select-Object -First 1; \
-         $execute = $action.Execute.Trim('\"'); \
-         $isLegacyWrapper = $execute.EndsWith('.cmd', [System.StringComparison]::OrdinalIgnoreCase); \
-         $roots = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{ \
-             ($isLegacyWrapper -and $_.Name -ieq 'cmd.exe' -and $null -ne $_.CommandLine -and $_.CommandLine.IndexOf($execute, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or \
-             (-not $isLegacyWrapper -and $_.ExecutablePath -ieq $execute -and $null -ne $_.CommandLine -and $_.CommandLine -like '*service run-windows-daemon*') \
-         }} | Select-Object -ExpandProperty ProcessId); \
-         $failed = $false; \
-         foreach ($rootProcessId in $roots) {{ \
-             & taskkill.exe /PID $rootProcessId /T /F *> $null; \
-             if ($LASTEXITCODE -ne 0 -and $null -ne (Get-Process -Id $rootProcessId -ErrorAction SilentlyContinue)) {{ $failed = $true }} \
-         }}; \
-         Stop-ScheduledTask -TaskName '{quoted}' -ErrorAction SilentlyContinue; \
-         if ($failed) {{ exit 3 }}"
+         if ([int]$task.State -ne 4 -and [int]$task.State -ne 2) {{ exit 0 }}; \
+         Stop-ScheduledTask -InputObject $task -ErrorAction Stop"
     )
 }
 
 fn stop_running_windows_task(task_name: &str) -> Result<()> {
-    if windows_task_running(task_name)? != Some(true) {
+    if !matches!(
+        windows_task_state(task_name)?,
+        WindowsTaskState::Running | WindowsTaskState::Queued
+    ) {
         return Ok(());
     }
 
@@ -2304,20 +2314,20 @@ fn stop_running_windows_task(task_name: &str) -> Result<()> {
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        &windows_task_tree_stop_command(task_name),
+        &windows_task_stop_command(task_name),
     ]))?;
     let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
     loop {
-        match windows_task_running(task_name)? {
-            Some(true) if Instant::now() < deadline => {
+        match windows_task_state(task_name)? {
+            WindowsTaskState::Running | WindowsTaskState::Queued if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Some(true) => {
+            WindowsTaskState::Running | WindowsTaskState::Queued => {
                 bail!(
                     "Timed out waiting for Windows scheduled task {task_name} to stop before reinstall"
                 );
             }
-            Some(false) | None => return Ok(()),
+            WindowsTaskState::Idle | WindowsTaskState::Missing => return Ok(()),
         }
     }
 }
@@ -4362,17 +4372,26 @@ mod service_helper_tests {
     fn windows_task_state_probe_uses_invariant_numeric_state_and_exit_codes() {
         assert_eq!(
             windows_task_state_command("ZeroClaw Daemon"),
-            "$task = Get-ScheduledTask -TaskName 'ZeroClaw Daemon' -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 2 }; if ([int]$task.State -eq 4) { exit 0 }; exit 1"
+            "$task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object { $_.TaskName -eq 'ZeroClaw Daemon' }; if ($null -eq $task) { exit 2 }; if ([int]$task.State -eq 4) { exit 0 }; if ([int]$task.State -eq 2) { exit 3 }; if ([int]$task.State -eq 1 -or [int]$task.State -eq 3) { exit 4 }; exit 5"
         );
         assert_eq!(
             windows_task_state_from_exit_code(Some(0)).unwrap(),
-            Some(true)
+            WindowsTaskState::Running
         );
         assert_eq!(
-            windows_task_state_from_exit_code(Some(1)).unwrap(),
-            Some(false)
+            windows_task_state_from_exit_code(Some(4)).unwrap(),
+            WindowsTaskState::Idle
         );
-        assert_eq!(windows_task_state_from_exit_code(Some(2)).unwrap(), None);
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(2)).unwrap(),
+            WindowsTaskState::Missing
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(3)).unwrap(),
+            WindowsTaskState::Queued
+        );
+        assert!(windows_task_state_from_exit_code(Some(1)).is_err());
+        assert!(windows_task_state_from_exit_code(Some(5)).is_err());
         assert!(windows_task_state_from_exit_code(Some(17)).is_err());
         assert!(windows_task_state_from_exit_code(None).is_err());
     }

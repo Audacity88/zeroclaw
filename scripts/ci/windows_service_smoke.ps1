@@ -22,6 +22,7 @@ $fixture = if (Test-Path -LiteralPath $FixturePath) {
 }
 $ConfigDir = [IO.Path]::GetFullPath($ConfigDir)
 $legacyConfigDir = Join-Path $env:RUNNER_TEMP 'zeroclaw-legacy-service-smoke'
+$lookalikeConfigDir = Join-Path $env:RUNNER_TEMP 'zeroclaw-unrelated-service-smoke'
 $legacyWrapper = Join-Path $legacyConfigDir 'zeroclaw-daemon.cmd'
 $legacyStdout = Join-Path $legacyConfigDir 'daemon.stdout.log'
 $legacyStderr = Join-Path $legacyConfigDir 'daemon.stderr.log'
@@ -39,6 +40,8 @@ $evidence = [ordered]@{
     legacy_daemon_process_id = $null
     legacy_descendant_process_id = $null
     legacy_process_tree_stopped_before_reinstall = $false
+    legacy_lookalike_survived_reinstall = $false
+    direct_lookalike_survived_reinstall = $false
     stdout_bytes = $null
     stderr_bytes = $null
     capture_setup_failure_result = $null
@@ -47,6 +50,8 @@ $evidence = [ordered]@{
         'The task is started manually, so this does not prove the ONLOGON trigger.'
     )
 }
+$legacyLookalike = $null
+$directLookalike = $null
 
 function Invoke-Fixture {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
@@ -116,6 +121,7 @@ if ($CleanupOnly) {
     Remove-SmokeTask
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $legacyConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $lookalikeConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     exit 0
 }
 
@@ -133,6 +139,7 @@ try {
     Remove-SmokeTask
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $legacyConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $lookalikeConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
     New-Item -ItemType Directory -Force -Path $legacyConfigDir | Out-Null
     Set-CurrentUserOwner -Path $ConfigDir
@@ -172,6 +179,12 @@ try {
     $evidence.legacy_daemon_process_id = $legacyDaemonPid
     $evidence.legacy_descendant_process_id = $legacyDescendantPid
 
+    $legacyLookalike = Start-Process -FilePath $env:ComSpec -ArgumentList @('/K', ('type "{0}"' -f $legacyWrapper)) -WindowStyle Hidden -PassThru
+    Wait-Until -Description 'unrelated shell mentioning the wrapper' -Condition {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($legacyLookalike.Id)" -ErrorAction SilentlyContinue
+        $null -ne $process -and $process.CommandLine -like "*$legacyWrapper*"
+    }
+
     Invoke-Fixture service install | Write-Host
     $legacyProcessesStopped =
         ($null -eq (Get-Process -Id $legacyWrapperProcess.ProcessId -ErrorAction SilentlyContinue)) -and
@@ -179,6 +192,10 @@ try {
         ($null -eq (Get-Process -Id $legacyDescendantPid -ErrorAction SilentlyContinue))
     if (-not $legacyProcessesStopped) { throw 'Legacy task process tree survived service reinstall' }
     $evidence.legacy_process_tree_stopped_before_reinstall = $true
+    if ($null -eq (Get-Process -Id $legacyLookalike.Id -ErrorAction SilentlyContinue)) {
+        throw 'Reinstall killed an unrelated shell that only mentioned the legacy wrapper'
+    }
+    $evidence.legacy_lookalike_survived_reinstall = $true
     $task = Get-ScheduledTask -TaskName $taskName
     $action = $task.Actions | Select-Object -First 1
     $evidence.action = "$($action.Execute) $($action.Arguments)"
@@ -258,6 +275,52 @@ try {
         ($null -eq (Get-Process -Id $descendantPid -ErrorAction SilentlyContinue))
     }
 
+    New-Item -ItemType Directory -Force -Path $lookalikeConfigDir | Out-Null
+    Set-CurrentUserOwner -Path $lookalikeConfigDir
+    New-Item -ItemType Directory -Force -Path (Join-Path $lookalikeConfigDir 'logs') | Out-Null
+    Set-CurrentUserOwner -Path (Join-Path $lookalikeConfigDir 'logs')
+    foreach ($logName in @('daemon.stdout.log', 'daemon.stderr.log')) {
+        New-Item -ItemType File -Force -Path (Join-Path $lookalikeConfigDir 'logs' $logName) | Out-Null
+        Set-CurrentUserOwner -Path (Join-Path $lookalikeConfigDir 'logs' $logName)
+    }
+    $directLookalike = Start-Process -FilePath $fixture -ArgumentList @('--config-dir', ('"{0}"' -f $lookalikeConfigDir), 'service', 'run-windows-daemon') -WindowStyle Hidden -PassThru
+    Wait-Until -Description 'unrelated same-binary runner' -TimeoutSeconds 90 -Condition {
+        (Test-Path -LiteralPath (Join-Path $lookalikeConfigDir 'daemon-started.pid')) -and
+            ($null -ne (Get-Process -Id $directLookalike.Id -ErrorAction SilentlyContinue))
+    }
+    Remove-Item -LiteralPath (Join-Path $ConfigDir 'daemon-started.pid'), (Join-Path $ConfigDir 'descendant.pid') -Force -ErrorAction SilentlyContinue
+    Invoke-Fixture service start | Write-Host
+    Wait-Until -Description 'registered direct runner tree before reinstall' -Condition {
+        ([int](Get-ScheduledTask -TaskName $taskName).State -eq 4) -and
+            (Test-Path -LiteralPath (Join-Path $ConfigDir 'daemon-started.pid')) -and
+            (Test-Path -LiteralPath (Join-Path $ConfigDir 'descendant.pid'))
+    }
+    $registeredRunner = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -eq $fixture -and
+            $_.CommandLine -like "*$ConfigDir*" -and
+            $_.CommandLine -like '*service run-windows-daemon*'
+        } | Select-Object -First 1
+    if ($null -eq $registeredRunner) { throw 'Registered direct runner was not found before reinstall' }
+    $registeredDaemonPid = [int](Get-Content -LiteralPath (Join-Path $ConfigDir 'daemon-started.pid') -Raw).Trim()
+    $registeredDescendantPid = [int](Get-Content -LiteralPath (Join-Path $ConfigDir 'descendant.pid') -Raw).Trim()
+    $registeredDaemon = Get-CimInstance Win32_Process -Filter "ProcessId = $registeredDaemonPid"
+    $registeredDescendant = Get-CimInstance Win32_Process -Filter "ProcessId = $registeredDescendantPid"
+    if ($null -eq $registeredDaemon -or $registeredDaemon.ParentProcessId -ne $registeredRunner.ProcessId -or
+        $null -eq $registeredDescendant -or $registeredDescendant.ParentProcessId -ne $registeredDaemonPid) {
+        throw 'Registered direct runner tree did not have the expected process ancestry'
+    }
+    Invoke-Fixture service install | Write-Host
+    if (($null -ne (Get-Process -Id $registeredRunner.ProcessId -ErrorAction SilentlyContinue)) -or
+        ($null -ne (Get-Process -Id $registeredDaemonPid -ErrorAction SilentlyContinue)) -or
+        ($null -ne (Get-Process -Id $registeredDescendantPid -ErrorAction SilentlyContinue))) {
+        throw 'Registered direct runner tree survived service reinstall'
+    }
+    if ($null -eq (Get-Process -Id $directLookalike.Id -ErrorAction SilentlyContinue)) {
+        throw 'Reinstall killed an unrelated same-binary runner with another config directory'
+    }
+    $evidence.direct_lookalike_survived_reinstall = $true
+
     Invoke-Fixture service uninstall | Write-Host
     Remove-Item -LiteralPath (Join-Path $ConfigDir 'logs') -Recurse -Force
     Set-Content -LiteralPath (Join-Path $ConfigDir 'logs') -Value 'blocks log directory creation' -NoNewline
@@ -281,6 +344,11 @@ try {
     $evidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDir 'windows-service-smoke.json') -Encoding UTF8
 }
 finally {
+    foreach ($ownedProcess in @($legacyLookalike, $directLookalike)) {
+        if ($null -ne $ownedProcess -and $null -ne (Get-Process -Id $ownedProcess.Id -ErrorAction SilentlyContinue)) {
+            & taskkill.exe /PID $ownedProcess.Id /T /F *> $null
+        }
+    }
     try {
         $taskState = Get-ScheduledTask -TaskName $taskName
         $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
@@ -309,6 +377,7 @@ finally {
     try { Remove-SmokeTask } catch { Write-Warning "Cleanup failed: $_" }
     Remove-Item -LiteralPath $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $legacyConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $lookalikeConfigDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($transcriptStarted) { Stop-Transcript | Out-Null }
 }
 
