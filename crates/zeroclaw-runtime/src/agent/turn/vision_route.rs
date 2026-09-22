@@ -1,5 +1,7 @@
 //! Vision model-provider routing and per-iteration message preparation.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use zeroclaw_config::schema::{Config, MultimodalConfig};
 use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderCapabilityError, multimodal};
@@ -10,6 +12,20 @@ pub(crate) struct ResolvedVisionProvider {
     pub(crate) provider: Box<dyn ModelProvider>,
     pub(crate) provider_name: String,
     pub(crate) model: String,
+}
+
+/// The exact `file_read` read ledger for one image-marker path: the
+/// string-level `is_path_allowed` check first (no filesystem access for a
+/// path it rejects), then the same symlink-aware readability check
+/// `file_read` applies (`resolve_tool_path` + `is_resolved_path_readable`).
+/// This does synchronous filesystem work (symlink resolution, metadata),
+/// so it must only be called from the blocking task inside
+/// `multimodal::count_latest_user_resolvable_image_markers`, never on the
+/// async executor thread.
+pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+    policy.is_path_allowed(&path_str)
+        && policy.is_resolved_path_readable(&policy.resolve_tool_path(&path_str))
 }
 
 /// Decide this turn's image-input route.
@@ -27,14 +43,16 @@ pub(crate) struct ResolvedVisionProvider {
 /// refusal. A local reference counts only when it is absolute, the policy's
 /// string-level check admits it, the same symlink-aware read ledger the
 /// `file_read` tool applies admits the resolved target, and the file exists.
-/// The resolvable count (and its probes) is computed only on that
-/// no-vision, no-fallback branch: a vision-capable primary or a configured
-/// vision fallback never touches the filesystem for this decision, and the
-/// probe count is bounded by the policy-allowed absolute-path markers of
-/// the latest user message, one message, never the whole history (one async
-/// `tokio::fs::metadata` probe per policy-allowed marker; a path the policy
+/// The resolvable count is computed only on that no-vision, no-fallback
+/// branch: a vision-capable primary or a configured vision fallback never
+/// touches the filesystem for this decision, and the work is bounded by the
+/// absolute local-path markers of the latest user message, one message,
+/// never the whole history: at most `multimodal::MAX_RESOLVABILITY_CANDIDATES`
+/// (16) of them reach the policy check plus one `std::fs::metadata` probe,
+/// all on a single `spawn_blocking` task off the async executor; markers past
+/// that bound count as resolvable before any policy call. A path the policy
 /// rejects, a relative reference, a data URI, or a remote URL is never
-/// probed). `None` fails closed: no local path resolves, so a configless
+/// probed. `None` fails closed: no local path resolves, so a configless
 /// caller degrades to a text-only turn instead of erroring, and data-URI
 /// and remote references are unaffected by `None`.
 pub(crate) async fn resolve_vision_provider(
@@ -116,36 +134,45 @@ pub(crate) async fn resolve_vision_provider(
         } else {
             // A local marker reference counts as resolvable only when the
             // agent's filesystem policy would let its file tools read it:
-            // the pure string-level `is_path_allowed` check runs first (no
+            // the string-level `is_path_allowed` check runs first (no
             // filesystem access at all for a path it rejects), and a
             // surviving reference is then held to the same symlink-aware
             // read ledger `file_read` applies (`resolve_tool_path` +
-            // `is_resolved_path_readable`) before the gate's one async
-            // metadata probe. Without a policy (`None`) no local path
+            // `is_resolved_path_readable`). That ledger does synchronous
+            // filesystem work (symlink resolution, metadata), so it runs
+            // on ONE `spawn_blocking` task inside
+            // `count_latest_user_resolvable_image_markers`, never on the
+            // async executor thread.
+            //
+            // This is the ONLY place the resolvable count is computed: a
+            // vision-capable primary or a configured vision fallback never
+            // touches the filesystem for this decision. The work is
+            // bounded by `multimodal::MAX_RESOLVABILITY_CANDIDATES` (16)
+            // absolute local-path markers of the latest user message (one
+            // message, never the whole history); markers past the bound
+            // are counted as resolvable BEFORE any policy call, so an
+            // oversized message fails toward this error rather than a
+            // silent degrade, and cannot buy unbounded policy work with
+            // unbounded markers. Without a policy (`None`) no local path
             // resolves: fail closed to the degrade branch.
             //
-            // This is the ONLY place the resolvable count (and its metadata
-            // probes) is computed: a vision-capable primary or a configured
-            // vision fallback never probes the filesystem for this decision,
-            // and the probe count is bounded by the policy-allowed
-            // absolute-path markers of the latest user message (one message,
-            // never the whole history) and capped at
-            // `multimodal::MAX_RESOLVABILITY_PROBES` (16) metadata calls per
-            // gate evaluation; policy-accepted markers beyond the cap count
-            // as resolvable without probing, so an oversized message fails
-            // toward this error rather than a silent degrade.
-            let path_allowed = |path: &std::path::Path| -> bool {
-                security.is_some_and(|policy| {
-                    let path_str = path.to_string_lossy();
-                    policy.is_path_allowed(&path_str)
-                        && policy.is_resolved_path_readable(&policy.resolve_tool_path(&path_str))
-                })
-            };
+            // The policy is cloned once per gate evaluation onto the
+            // blocking task (plain data: Vecs, PathBufs, Strings, and a
+            // cheaply-cloned tracker), and this branch is the cold
+            // no-vision, no-fallback path, so the clone never runs on a
+            // hot vision-capable turn.
+            let policy = security.cloned();
+            let path_allowed: Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync> =
+                Arc::new(move |path: &std::path::Path| {
+                    policy
+                        .as_ref()
+                        .is_some_and(|policy| policy_permits_image_path(policy, path))
+                });
             let latest_user_resolvable_marker_count =
                 multimodal::count_latest_user_resolvable_image_markers(
                     history,
                     multimodal_config.allow_remote_fetch,
-                    &path_allowed,
+                    path_allowed,
                 )
                 .await;
             if latest_user_resolvable_marker_count > 0 {
@@ -736,6 +763,207 @@ vision = false
         assert!(
             capability_error.message.contains("1 image marker(s)"),
             "the refusal must count the loadable marker: {capability_error}"
+        );
+    }
+
+    /// The production predicate, bounded and off the executor: a real
+    /// `SecurityPolicy` (workspace_dir + workspace_only) behind
+    /// `policy_permits_image_path`, 20 absolute markers in one user
+    /// message. Only the first 16 (the candidate bound) reach the
+    /// predicate at all, and they reach it on the blocking thread: the
+    /// first call runs the same entered/release handshake as the
+    /// providers-side off-executor test, which can only pass while the
+    /// runtime's single thread stays responsive, i.e. while the
+    /// predicate is NOT running on it. This is the budget regression
+    /// the reviewers asked for: after the bound is spent, overflow
+    /// markers count WITHOUT any policy call, so the unbounded
+    /// symlink-resolving policy work of the old shape is gone. The
+    /// dangling symlink at position 3 exercises the `read_link` branch
+    /// of `resolve_symlinked_path` (it resolves to an in-workspace
+    /// missing target, so the policy allows it and only the existence
+    /// probe rejects it). Do NOT "simplify" this onto a multi_thread
+    /// runtime; see the providers-side test for why.
+    #[tokio::test]
+    async fn production_policy_predicate_is_bounded_and_runs_off_the_executor() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let first = workspace.path().join("first.png");
+        let second = workspace.path().join("second.png");
+        std::fs::write(&first, png).unwrap();
+        std::fs::write(&second, png).unwrap();
+        let dangling = workspace.path().join("dangling.png");
+        let missing_target = workspace.path().join("no-such-target.png");
+        // Position 3: a dangling symlink inside the workspace. On
+        // non-unix there is no symlink to make, so the path simply stays
+        // missing and the expected counts are unchanged.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&missing_target, &dangling).unwrap();
+        let outside_file = outside.path().join("host-secret.png");
+        std::fs::write(&outside_file, b"an existing file outside the read boundary").unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Neither mpsc end is `Sync`, and the predicate must be; the
+        // mutexes make the captured sender and receiver shareable without
+        // changing the handshake (the predicate blocks in `recv_timeout`
+        // inside its mutex while the watcher holds no lock).
+        let entered_tx = std::sync::Mutex::new(entered_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls_for_predicate = std::sync::Arc::clone(&calls);
+        let released_for_predicate = std::sync::Arc::clone(&released);
+        let path_allowed: Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync> =
+            Arc::new(move |path: &std::path::Path| -> bool {
+                let first_call =
+                    calls_for_predicate.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                if first_call {
+                    entered_tx
+                        .lock()
+                        .expect("entered sender lockable")
+                        .send(())
+                        .expect("entered signal sendable");
+                    let arrived = release_rx
+                        .lock()
+                        .expect("release receiver lockable")
+                        .recv_timeout(std::time::Duration::from_secs(5));
+                    released_for_predicate
+                        .store(arrived.is_ok(), std::sync::atomic::Ordering::SeqCst);
+                }
+                policy_permits_image_path(&policy, path)
+            });
+        // The watcher runs detached on the runtime's own thread pool via
+        // the sanctioned spawn wrapper (plain `tokio::spawn` is
+        // workspace-disallowed); its handle is intentionally dropped.
+        let _watcher = zeroclaw_spawn::spawn!(async move {
+            loop {
+                if entered_rx.try_recv().is_ok() {
+                    release_tx.send(()).expect("release signal sendable");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        let mut marker_paths = vec![first, second, dangling, outside_file];
+        for i in 5..=20 {
+            marker_paths.push(workspace.path().join(format!("missing-{i}.png")));
+        }
+        let marker_text = marker_paths
+            .iter()
+            .map(|path| format!("[IMAGE: {}]", path.display()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let messages = vec![ChatMessage::user(format!("look at these {marker_text}"))];
+        assert_eq!(
+            multimodal::count_latest_user_resolvable_image_markers(&messages, false, path_allowed)
+                .await,
+            2 + (20 - multimodal::MAX_RESOLVABILITY_CANDIDATES),
+            "two existing in-workspace files count; the dangling symlink, the \
+             outside file, and the missing files do not; the four overflow \
+             markers count without any check"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            multimodal::MAX_RESOLVABILITY_CANDIDATES,
+            "the production predicate runs only for the 16 candidates; the 4 \
+             overflow markers get no policy call at all"
+        );
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "the runtime-thread watcher observed the production predicate and \
+             released it, so the policy work ran off the executor thread"
+        );
+    }
+
+    /// The overflow count reaches the refusal through the production
+    /// wiring: 20 absolute markers with two existing in-workspace files
+    /// among the first 16 candidates, through the real
+    /// `resolve_vision_provider` on the no-vision, no-fallback path.
+    /// The refusal must count 6: the two loadable candidates plus the
+    /// four overflow markers that were never checked. Pins that the
+    /// candidate-bound semantics (overflow counts as resolvable) is
+    /// what the turn actually sees, not just what the helper returns.
+    #[tokio::test]
+    async fn resolve_vision_provider_refuses_with_overflow_count_on_non_vision_provider() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let first = workspace.path().join("first.png");
+        let second = workspace.path().join("second.png");
+        std::fs::write(&first, png).unwrap();
+        std::fs::write(&second, png).unwrap();
+        let security = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        let multimodal = MultimodalConfig::default();
+        let mut marker_paths = vec![first, second];
+        for i in 3..=20 {
+            marker_paths.push(workspace.path().join(format!("missing-{i}.png")));
+        }
+        let marker_text = marker_paths
+            .iter()
+            .map(|path| format!("[IMAGE: {}]", path.display()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let history = vec![ChatMessage::user(format!("look at these {marker_text}"))];
+
+        let err = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            Some(&security),
+        )
+        .await
+        .err()
+        .expect("resolvable markers on a non-vision provider must fail the turn");
+
+        let capability_error = err
+            .downcast_ref::<ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.model_provider, "primary");
+        assert_eq!(capability_error.capability, "vision");
+        assert!(
+            capability_error.message.contains("6 image marker(s)"),
+            "the refusal must count the two loadable candidates plus the four \
+             unchecked overflow markers: {capability_error}"
         );
     }
 
