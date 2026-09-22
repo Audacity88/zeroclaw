@@ -8,7 +8,7 @@ use zeroclaw_api::media::{
     PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension, image_mime_from_magic,
     is_provider_image_mime,
 };
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, PROMPT_TOOL_RESULTS_ROLE};
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 pub const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
@@ -743,8 +743,15 @@ pub(crate) fn is_prompt_tool_result_content(content: &str) -> bool {
     content.trim_start().starts_with("[Tool results]")
 }
 
+/// Prompt-mode tool results carry the durable [`PROMPT_TOOL_RESULTS_ROLE`] in
+/// stored history and `user` once normalized for a provider. Both spellings
+/// must qualify here: routing, counting, and estimation run on the raw
+/// history before normalization, and treating the tagged rows as
+/// non-carriers there made them invisible to image decisions that
+/// preparation (which sees the normalized `user` rows) would still make.
 pub(crate) fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
-    message.role == "user" && is_prompt_tool_result_content(&message.content)
+    (message.role == "user" || message.role == PROMPT_TOOL_RESULTS_ROLE)
+        && is_prompt_tool_result_content(&message.content)
 }
 
 fn is_tool_result_carrier(message: &ChatMessage) -> bool {
@@ -1751,6 +1758,61 @@ mod tests {
                 ImageMarkerDisposition::Normalized,
                 ImageMarkerDisposition::Normalized,
             ]
+        );
+    }
+
+    #[test]
+    fn tagged_prompt_tool_results_share_dispositions_with_normalized_user_rows() {
+        // Routing and estimation read the raw history (tagged durable role);
+        // preparation reads the provider-normalized copy (user role). The two
+        // spellings of the same prompt-tool result must yield identical
+        // dispositions, or a stale tool image is priced as literal text while
+        // preparation strips it, and a trailing tool image is invisible to
+        // routing while preparation loads it.
+        let marker =
+            |reference: &str| format!("[Tool results]\nshot {} {reference}]", IMAGE_MARKER_PREFIX);
+        let tagged = vec![
+            ChatMessage::user("look at the screenshot"),
+            ChatMessage::assistant("calling tool"),
+            ChatMessage {
+                role: PROMPT_TOOL_RESULTS_ROLE.to_string(),
+                content: marker("data:image/png;base64,iVBORw0KGgo="),
+            },
+            ChatMessage::assistant("calling again"),
+            ChatMessage::user("and now?"),
+            ChatMessage {
+                role: PROMPT_TOOL_RESULTS_ROLE.to_string(),
+                content: marker("data:image/png;base64,iVBORw0KGgo="),
+            },
+        ];
+        let normalized: Vec<ChatMessage> = tagged
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                if message.role == PROMPT_TOOL_RESULTS_ROLE {
+                    message.role = "user".to_string();
+                }
+                message
+            })
+            .collect();
+
+        let expected = vec![
+            ImageMarkerDisposition::Normalized,
+            ImageMarkerDisposition::Literal,
+            ImageMarkerDisposition::Stripped,
+            ImageMarkerDisposition::Literal,
+            ImageMarkerDisposition::Normalized,
+            ImageMarkerDisposition::Normalized,
+        ];
+        assert_eq!(
+            image_marker_dispositions(&tagged),
+            expected,
+            "the stale tagged carrier must be Stripped and the trailing one Normalized"
+        );
+        assert_eq!(
+            image_marker_dispositions(&normalized),
+            expected,
+            "the tagged and user spellings must agree: routing and estimation see the raw history while preparation sees the normalized copy"
         );
     }
 

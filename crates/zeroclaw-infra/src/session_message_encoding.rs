@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::model_provider::ChatMessage;
 
-pub const PROMPT_TOOL_RESULTS_ROLE: &str = "zeroclaw_prompt_tool_results";
+pub use zeroclaw_api::model_provider::PROMPT_TOOL_RESULTS_ROLE;
+
 pub(crate) const CURRENT_ENCODING_VERSION: u32 = 1;
 
 /// Only unversioned storage may use this historical heuristic. Old literal
