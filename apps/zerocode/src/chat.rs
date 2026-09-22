@@ -4095,12 +4095,15 @@ impl Chat {
                         .await;
                 }
             }
-            Some(ChatTabAction::NewSession) if !state.turn_in_flight => {
+            Some(ChatTabAction::NewSession) => {
                 // `Ctrl+N` no longer restarts the focused session in place.
                 // It asks the app to open the same add-session picker the
                 // sidebar `[+]` opens, so the focused session stays tracked and
                 // the cap, cancellation, error and remote-Code directory
                 // behavior cannot drift between the chord and the affordance.
+                // Like `[+]`, this is allowed while a turn is in flight: adding
+                // a sibling session must not depend on — or interrupt — the
+                // running turn.
                 self.add_session_requested = true;
             }
             Some(ChatTabAction::SwitchSession) => {
