@@ -187,6 +187,7 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
     use zeroclaw_config::providers::ChannelRef;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+    use zeroclaw_runtime::control_plane::ControlPlaneHandle;
     use zeroclaw_runtime::peers::resolve_peer_set;
     use zeroclaw_runtime::tools::SendMessageToPeerTool;
 
@@ -235,7 +236,9 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     );
 
     let cfg = Arc::new(cfg);
-    let tool = SendMessageToPeerTool::new(cfg.clone(), "alpha");
+    let control_plane_dir = TempDir::new().unwrap();
+    let control_plane = ControlPlaneHandle::open(control_plane_dir.path()).unwrap();
+    let tool = SendMessageToPeerTool::new(cfg.clone(), "alpha").with_control_plane(control_plane);
 
     let to_gamma = tool
         .execute(json!({
@@ -273,6 +276,11 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
         "in-process delivery output must name its routing path so the agent can reason about delivery semantics, got: {:?}",
         to_beta.output
     );
+    assert!(
+        to_beta.output.contains("task_id="),
+        "accepted in-process delivery must expose its durable task id, got: {:?}",
+        to_beta.output
+    );
 }
 
 #[tokio::test]
@@ -283,6 +291,7 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
     use zeroclaw_config::providers::ChannelRef;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+    use zeroclaw_runtime::control_plane::ControlPlaneHandle;
     use zeroclaw_runtime::peers::resolve_peer_set;
     use zeroclaw_runtime::tools::SendMessageToPeerTool;
 
@@ -317,7 +326,9 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
     );
 
     let cfg = Arc::new(cfg);
-    let tool = SendMessageToPeerTool::new(cfg, "alpha");
+    let control_plane_dir = TempDir::new().unwrap();
+    let control_plane = ControlPlaneHandle::open(control_plane_dir.path()).unwrap();
+    let tool = SendMessageToPeerTool::new(cfg, "alpha").with_control_plane(control_plane);
     let prod = tool
         .execute(json!({
             "channel": "telegram.prod",
@@ -329,6 +340,10 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
     assert!(
         prod.success,
         "exact alias dispatch should succeed: {prod:?}"
+    );
+    assert!(
+        prod.output.contains("task_id="),
+        "accepted in-process delivery must expose its durable task id: {prod:?}"
     );
 
     let dev = tool
