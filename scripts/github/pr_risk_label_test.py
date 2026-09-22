@@ -341,6 +341,21 @@ class RiskClassifierTest(unittest.TestCase):
                 "@@ -1,1 +1,1 @@\n-on: [pull_request]\n+on: [pull_request_target]\n",
             ),
             (
+                "elevated pull_request_target",
+                ".github/workflows/other.yml",
+                "@@ -1,1 +1,1 @@\n-on: pull_request\n+on: pull_request_target\n",
+            ),
+            (
+                "elevated pull_request_target",
+                ".github/workflows/other.yml",
+                '@@ -1,1 +1,1 @@\n-on: "pull_request"\n+on: "pull_request_target"\n',
+            ),
+            (
+                "elevated pull_request_target",
+                ".github/workflows/other.yml",
+                "@@ -1,1 +1,1 @@\n-on: {pull_request: {}}\n+on: {pull_request_target: {}}\n",
+            ),
+            (
                 "toolchain install or container baseline",
                 "dev/Containerfile",
                 "@@ -1,1 +1,1 @@\n-FROM ubuntu:22.04\n+FROM ubuntu:24.04\n",
@@ -427,6 +442,22 @@ class RiskClassifierTest(unittest.TestCase):
         self.assertEqual(workflow_comment_report["proposed_risk"], "risk:medium")
         self.assertEqual(workflow_comment_report["matching_evidence"], [])
 
+        workflow_inert_command_report = evaluate(
+            FakeAPI(
+                pull(),
+                [
+                    changed_file(
+                        ".github/workflows/docs-check.yml",
+                        1,
+                        1,
+                        "@@ -20,1 +20,1 @@\n-      - run: echo ok\n+      - run: echo release secrets.RELEASE_TOKEN\n",
+                    )
+                ],
+            )
+        )
+        self.assertEqual(workflow_inert_command_report["proposed_risk"], "risk:medium")
+        self.assertEqual(workflow_inert_command_report["matching_evidence"], [])
+
         docs_report = evaluate(
             FakeAPI(
                 pull(),
@@ -474,6 +505,21 @@ class RiskClassifierTest(unittest.TestCase):
         )
         self.assertEqual(fixture_report["proposed_risk"], "risk:medium")
         self.assertEqual(fixture_report["matching_evidence"], [])
+
+    def test_changed_line_policy_escalates_removed_workflow_permission_restrictions(self) -> None:
+        cases = [
+            "@@ -7,1 +7,0 @@\n-    contents: read\n",
+            "@@ -7,1 +7,0 @@\n-    permissions: read-all\n",
+            "@@ -7,1 +7,0 @@\n-    permissions: {contents: none}\n",
+        ]
+        for patch in cases:
+            with self.subTest(patch=patch):
+                report = evaluate(FakeAPI(pull(), [changed_file(".github/workflows/docs-check.yml", 0, 1, patch)]))
+                self.assertEqual(report["proposed_risk"], "risk:high")
+                self.assertEqual(
+                    report["matching_evidence"][0]["content_rules"],
+                    ["workflow permission expansion"],
+                )
 
     def test_changed_line_policy_fails_closed_when_content_sensitive_patch_is_missing(self) -> None:
         report = evaluate(FakeAPI(pull(), [changed_file(".github/workflows/docs-check.yml", patch=None)]))
@@ -659,8 +705,54 @@ mod tests {
 fn production() {
     println!("production");
 }
+                }
+                """,
+            ),
+            (
+                "commented cfg attribute does not create test range",
+                changed_file(
+                    path,
+                    1,
+                    1,
+                    "@@ -5,1 +5,1 @@\n-    return false;\n+    return true;\n",
+                ),
+                """/*
+#[cfg(test)]
+*/
+pub fn allowed() -> bool {
+    return false;
 }
 """,
+                """/*
+#[cfg(test)]
+*/
+pub fn allowed() -> bool {
+    return true;
+}
+""",
+            ),
+            (
+                "raw string cfg attribute does not create test range",
+                changed_file(
+                    path,
+                    1,
+                    1,
+                    "@@ -6,1 +6,1 @@\n-    return false;\n+    return true;\n",
+                ),
+                '''const NOTE: &str = r#"
+#[cfg(test)]
+"#;
+pub fn allowed() -> bool {
+    return false;
+}
+''',
+                '''const NOTE: &str = r#"
+#[cfg(test)]
+"#;
+pub fn allowed() -> bool {
+    return true;
+}
+''',
             ),
         ]
         for name, file, base_source, head_source in cases:

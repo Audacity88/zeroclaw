@@ -75,6 +75,8 @@ WORKFLOW_PERMISSION_KEYS = (
 )
 WORKFLOW_PERMISSION_KEY_RE = "(?:" + "|".join(re.escape(key) for key in WORKFLOW_PERMISSION_KEYS) + ")"
 WORKFLOW_METADATA_KEY_RE = re.compile(r"^\s*(?:-\s*)?(?:name|run-name)\s*:")
+WORKFLOW_WRITE_SCALAR_RE = r"""["']?write(?:-all)?["']?"""
+WORKFLOW_READ_RESTRICTED_SCALAR_RE = r"""["']?(?:read(?:-all)?|none|\{\})["']?"""
 
 
 class ContentRule(NamedTuple):
@@ -286,14 +288,25 @@ def workflow_semantic_line(line: str) -> str | None:
 
 
 def workflow_permission_write(line: str) -> bool:
-    scalar = r"""["']?write(?:-all)?["']?"""
     key = rf"""["']?{WORKFLOW_PERMISSION_KEY_RE}["']?"""
     return any(
         re.search(pattern, line)
         for pattern in (
-            rf"^\s*permissions\s*:\s*{scalar}\s*(?:#.*)?$",
-            rf"^\s*{key}\s*:\s*{scalar}\s*(?:#.*)?$",
-            rf"^\s*permissions\s*:\s*\{{[^}}]*{key}\s*:\s*{scalar}(?=\s*(?:[,}}#]|$))",
+            rf"^\s*permissions\s*:\s*{WORKFLOW_WRITE_SCALAR_RE}\s*(?:#.*)?$",
+            rf"^\s*{key}\s*:\s*{WORKFLOW_WRITE_SCALAR_RE}\s*(?:#.*)?$",
+            rf"^\s*permissions\s*:\s*\{{[^}}]*{key}\s*:\s*{WORKFLOW_WRITE_SCALAR_RE}(?=\s*(?:[,}}#]|$))",
+        )
+    )
+
+
+def workflow_permission_restriction(line: str) -> bool:
+    key = rf"""["']?{WORKFLOW_PERMISSION_KEY_RE}["']?"""
+    return any(
+        re.search(pattern, line)
+        for pattern in (
+            rf"^\s*permissions\s*:\s*{WORKFLOW_READ_RESTRICTED_SCALAR_RE}\s*(?:#.*)?$",
+            rf"^\s*{key}\s*:\s*{WORKFLOW_READ_RESTRICTED_SCALAR_RE}\s*(?:#.*)?$",
+            rf"^\s*permissions\s*:\s*\{{[^}}]*{key}\s*:\s*{WORKFLOW_READ_RESTRICTED_SCALAR_RE}(?=\s*(?:[,}}#]|$))",
         )
     )
 
@@ -309,12 +322,33 @@ def workflow_oidc_write(line: str) -> bool:
 
 
 def workflow_pull_request_target(line: str) -> bool:
+    event = r"""["']?pull_request_target["']?"""
     return any(
         re.search(pattern, line)
         for pattern in (
             r"^\s*pull_request_target\s*:\s*(?:#.*)?$",
             r"^\s*-\s*pull_request_target\s*(?:#.*)?$",
             r"^\s*on\s*:\s*\[[^\]]*\bpull_request_target\b[^\]]*\]\s*(?:#.*)?$",
+            rf"^\s*on\s*:\s*{event}\s*(?:#.*)?$",
+            rf"^\s*on\s*:\s*\{{[^}}]*{event}\s*:\s*",
+        )
+    )
+
+
+def workflow_secret_access(line: str) -> bool:
+    return (
+        re.search(r"\$\{\{\s*secrets\.", line) is not None
+        or re.search(r"""^\s*["']?secrets["']?\s*:""", line) is not None
+    )
+
+
+def workflow_release_behavior(line: str) -> bool:
+    return any(
+        re.search(pattern, line)
+        for pattern in (
+            r"^\s*(?:-\s*)?run\s*:\s*gh\s+release\s+(?:create|upload)\b",
+            r"^\s*tags\s*:",
+            r"^\s*-\s*[\"']?v[0-9]+\.[0-9]+\.[0-9]+",
         )
     )
 
@@ -330,6 +364,10 @@ def content_rule_matches(path: str, rule: ContentRule, line: str) -> bool:
             return workflow_oidc_write(semantic_line)
         if rule.name == "elevated pull_request_target":
             return workflow_pull_request_target(semantic_line)
+        if rule.name == "secret access":
+            return workflow_secret_access(semantic_line)
+        if rule.name == "release behavior":
+            return workflow_release_behavior(semantic_line)
         return rule.pattern.search(semantic_line) is not None
     return rule.pattern.search(line) is not None
 
@@ -576,7 +614,7 @@ def cfg_test_ranges(source: str) -> list[tuple[int, int]]:
     lines = source.splitlines()
     structural_lines = rust_structural_text(source).splitlines()
     ranges: list[tuple[int, int]] = []
-    for index, line in enumerate(lines):
+    for index, line in enumerate(structural_lines):
         if not CFG_TEST_RE.match(line):
             continue
         next_index = index + 1
@@ -753,6 +791,22 @@ def content_evidence_for_file(item: dict[str, Any], content_rules: tuple[Content
         for rule in rules:
             if content_rule_matches(path, rule, line):
                 matches.append(rule.name)
+                line_numbers.append(line_number)
+    if is_workflow_yaml(path) and any(rule.name == "workflow permission expansion" for rule in rules):
+        added_permission_lines = {
+            line_number
+            for line_number, line in new_changed
+            if (semantic_line := workflow_semantic_line(line)) is not None
+            and (workflow_permission_write(semantic_line) or workflow_permission_restriction(semantic_line))
+        }
+        for line_number, line in old_changed:
+            semantic_line = workflow_semantic_line(line)
+            if (
+                line_number not in added_permission_lines
+                and semantic_line is not None
+                and workflow_permission_restriction(semantic_line)
+            ):
+                matches.append("workflow permission expansion")
                 line_numbers.append(line_number)
     if not matches:
         return None
