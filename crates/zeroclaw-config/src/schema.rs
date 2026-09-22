@@ -831,6 +831,31 @@ pub enum AuthMode {
     OAuth,
 }
 
+/// Prompt-cache entry lifetime to request for this provider's Anthropic
+/// cache markers. `"5m"` is the API default; `"1h"` extends the cache
+/// entry lifetime to one hour so a pause longer than five minutes does
+/// not force a full-price rewrite of the cached prefix. Meaningful only
+/// where Anthropic-shaped `cache_control` markers reach the API: the
+/// native Anthropic provider always places them, compatible providers
+/// only behind `cache_passthrough` (with passthrough off the setting is
+/// inert). One TTL applies to every marker this implementation places;
+/// operator-supplied `cache_control` (via `provider_extra` or raw tool
+/// JSON) sits outside that guarantee and must order 1h before 5m when
+/// mixing lifetimes in one request.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum CacheTtl {
+    /// Standard 5-minute cache lifetime (the API default).
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// 1-hour cache lifetime; cache writes bill at a premium write rate.
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
 /// Named model_provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -960,6 +985,25 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub cache_passthrough: bool,
+    /// Cache entry lifetime requested for this provider's Anthropic
+    /// prompt-cache markers. `"5m"` (default) keeps the standard
+    /// 5-minute lifetime; `"1h"` requests a 1-hour lifetime so a pause
+    /// longer than five minutes does not force a full-price rewrite of
+    /// the cached prefix. The 1h lifetime bills cache writes at a
+    /// premium write rate (nominal planning figure: twice the input
+    /// price), so it pays off only when turns regularly resume more
+    /// than five minutes after the last request.
+    ///
+    /// The native Anthropic provider applies this to every cache marker
+    /// it places in a request. Compatible providers apply it only when
+    /// `cache_passthrough` is enabled; without passthrough no markers
+    /// are placed at all and this field is inert (no parse-time warning:
+    /// an operator may stage the key before switching passthrough on).
+    /// Providers that emit their own cache markers by other means
+    /// (openrouter) ignore this setting.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
@@ -13178,6 +13222,19 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_log_persistence_retention_max_age_days")]
     pub log_persistence_retention_max_age_days: u64,
 
+    /// Maximum number of log entries (non-empty JSONL lines) per segment file
+    /// when `log_persistence = "rotating"`. When the active file's line count
+    /// reaches this cap, it is rotated to an archive (an O(1) rename — no
+    /// content is rewritten), the same mechanism as
+    /// `log_persistence_max_bytes`, so each archive produced by this trigger
+    /// holds exactly this many entries in steady state; an existing active
+    /// file that already exceeds the cap when this feature is first enabled
+    /// is archived whole on the next append. `0` disables entry-count rotation.
+    /// Ignored unless `log_persistence = "rotating"`; the `rolling` policy
+    /// keeps its own in-place trim governed by `log_persistence_max_entries`.
+    #[serde(default = "default_log_persistence_max_entries_per_segment")]
+    pub log_persistence_max_entries_per_segment: usize,
+
     /// Tool I/O capture policy: "off" | "redacted" | "full".
     /// - `off`: only tool name + outcome + duration land in the log.
     /// - `redacted` (default): tool input + output are leak-scanned and
@@ -13265,6 +13322,8 @@ impl Default for ObservabilityConfig {
             log_persistence_retention_max_files: default_log_persistence_retention_max_files(),
             log_persistence_retention_max_age_days: default_log_persistence_retention_max_age_days(
             ),
+            log_persistence_max_entries_per_segment:
+                default_log_persistence_max_entries_per_segment(),
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
@@ -13303,6 +13362,11 @@ fn default_log_persistence_rotate_daily() -> bool {
 /// Keep a week of rotated archives by default.
 fn default_log_persistence_retention_max_files() -> usize {
     7
+}
+
+/// Entry-count rotation off by default; operators opt in with an explicit cap.
+fn default_log_persistence_max_entries_per_segment() -> usize {
+    0
 }
 
 /// Age-based cleanup off by default; count-based retention governs unless set.
@@ -19413,23 +19477,44 @@ pub enum SandboxBackend {
 }
 
 /// Audit logging configuration
+///
+/// **Scope:** the audit trail currently records certificate issuance and
+/// renewal. Command execution is NOT audited: no runtime path calls
+/// `AuditLogger::log_command_event` outside tests, so no tool command, its
+/// arguments, its approval or its rejection is ever written here. Treat this
+/// section as the certificate trail, not as a record of what the agent ran.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.audit"]
 pub struct AuditConfig {
-    /// Enable audit logging
+    /// Enable audit logging.
+    ///
+    /// Defaults to `true`, which is what keeps the certificate issuance and
+    /// renewal trail being written. Setting it to `false` turns that trail
+    /// off: certificate issuance and renewal then have no audit-log record.
+    /// Enabling it does not start recording command execution, which has no
+    /// production writer.
     #[serde(default = "default_audit_enabled")]
     pub enabled: bool,
 
-    /// Path to audit log file (relative to zeroclaw dir)
+    /// Path to audit log file (relative to zeroclaw dir).
+    ///
+    /// Receives the certificate issuance and renewal events. No command
+    /// execution record is ever written to it.
     #[serde(default = "default_audit_log_path")]
     pub log_path: String,
 
-    /// Maximum log size in MB before rotation
+    /// Maximum log size in MB before rotation.
+    ///
+    /// Applies to the certificate trail written at `log_path`.
     #[serde(default = "default_audit_max_size_mb")]
     pub max_size_mb: u32,
 
-    /// Sign events with HMAC for tamper evidence
+    /// Sign events with HMAC for tamper evidence.
+    ///
+    /// Applies to the certificate trail written at `log_path`. It cannot make
+    /// command execution tamper-evident, because command execution is not
+    /// recorded.
     #[serde(default)]
     pub sign_events: bool,
 }
@@ -21822,22 +21907,24 @@ impl Config {
             .collect()
     }
 
-    /// Voice-peer usernames for `<channel_type>.<alias>` that should always
-    /// receive TTS voice replies.
-    ///
-    /// A `[peer_groups.<name>]` contributes when its `channel` field matches
-    /// (type-wide or dotted) **and** `output_modality = "voice"`.
+    /// Peer usernames for `<channel_type>.<alias>` from every
+    /// `[peer_groups.<name>]` whose `channel` matches (type-wide or dotted)
+    /// **and** whose `output_modality` is `modality`. Deduped, in group
+    /// iteration order.
     ///
     /// This is the live-resolve counterpart of `channel_external_peers`,
-    /// filtered to voice-only peer groups. No cache — single source of truth
+    /// filtered to one output modality. No cache — single source of truth
     /// is `self.peer_groups`.
-    pub fn channel_voice_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
-        use crate::multi_agent::OutputModality;
-
+    pub fn channel_modality_peers(
+        &self,
+        channel_type: &str,
+        alias: &str,
+        modality: crate::multi_agent::OutputModality,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for group in self.peer_groups.values() {
-            if group.output_modality != OutputModality::Voice {
+            if group.output_modality != modality {
                 continue;
             }
             let group_matches = match group.channel.split_once('.') {
@@ -21854,10 +21941,9 @@ impl Config {
                 }
             }
         }
-        // Voice delivery is delivery, so the same `ignore` that denies a sender
-        // has to remove them here. This walked `external_peers` directly and
-        // never consulted `ignore` at all, so an explicitly ignored peer still
-        // received proactive TTS.
+        // Modality selection controls reply and proactive delivery, so the same
+        // `ignore` that denies a sender has to remove them here. This walks
+        // `external_peers` directly and otherwise never consults `ignore`.
         //
         // Subtract the denies directly rather than filtering through
         // `channel_addressable_peers`: that view answers a different question
@@ -21870,7 +21956,7 @@ impl Config {
             .filter_map(|peer| peer_deny_identity(peer))
             .map(|peer| peer.trim().trim_start_matches('@').to_lowercase())
             .collect();
-        // `ignore = ["*"]` denies every sender, so nothing is voiced.
+        // `ignore = ["*"]` denies every sender, so no modality applies.
         if denied.iter().any(|peer| peer == "*") {
             return Vec::new();
         }
@@ -21879,6 +21965,17 @@ impl Config {
                 || !denied.contains(&peer.trim().trim_start_matches('@').to_lowercase())
         });
         out
+    }
+
+    /// Voice-peer usernames for `<channel_type>.<alias>` that should always
+    /// receive TTS voice replies: the `channel_modality_peers` of
+    /// `output_modality = "voice"`.
+    pub fn channel_voice_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
+        self.channel_modality_peers(
+            channel_type,
+            alias,
+            crate::multi_agent::OutputModality::Voice,
+        )
     }
 
     /// Sender usernames authorized to issue `/model --agent <model>` on
@@ -22633,6 +22730,28 @@ impl Config {
                     format!("providers.models.{family}.{alias}.wire_api"),
                 ));
             }
+        }
+        // `security.audit` is the certificate issuance and renewal trail, and
+        // nothing else: `AuditLogger::log_command_event` has no production
+        // caller, so tool commands are never recorded. Turning the section off
+        // therefore removes the only record it does produce while adding no
+        // command record in exchange, and `AuditLogger::log` returns `Ok(())`
+        // without writing, so nothing else reports the loss. Warn on the
+        // disabling value, and say in the same breath which record the
+        // operator does and does not get, so nobody reads "audit" as a record
+        // of what the agent ran.
+        if !self.security.audit.enabled {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+                "security.audit.enabled=false: certificates are issued and renewed with no \
+                 audit record. Command execution is not audited either way, because no \
+                 production path records tool commands. Leave the section enabled to keep \
+                 the certificate trail, and use an external supervisor or logging wrapper \
+                 that observes the ZeroClaw process, or OS-level process accounting, if you \
+                 need a record of what ran."
+                    .to_string(),
+                "security.audit.enabled",
+            ));
         }
         warnings
     }
@@ -27701,6 +27820,35 @@ mod tests {
         assert!(
             !serialized.contains("cache_passthrough"),
             "default cache_passthrough must be omitted from serialized config"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cache_ttl_deserializes_and_defaults_to_omitted() {
+        let one_hour: ModelProviderConfig = toml::from_str("cache_ttl = \"1h\"").unwrap();
+        assert_eq!(one_hour.cache_ttl, Some(CacheTtl::OneHour));
+        assert_eq!(
+            toml::to_string(&one_hour).unwrap(),
+            "cache_ttl = \"1h\"\n",
+            "an explicitly configured cache_ttl must round-trip its wire string"
+        );
+
+        let five_minutes: ModelProviderConfig = toml::from_str("cache_ttl = \"5m\"").unwrap();
+        assert_eq!(five_minutes.cache_ttl, Some(CacheTtl::FiveMinutes));
+
+        let serialized = toml::to_string(&ModelProviderConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("cache_ttl"),
+            "absent cache_ttl must be omitted from serialized config"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cache_ttl_rejects_unknown_lifetime() {
+        let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
+        assert!(
+            parsed.is_err(),
+            "cache_ttl is a closed enum; unknown lifetimes must not parse into a silent default"
         );
     }
 
@@ -38852,6 +39000,73 @@ group_policy = "disabled"
         );
     }
 
+    // The certificate issuance and renewal trail is written through this
+    // section, so the default has to stay `true`: an operator who never
+    // touches `[security.audit]` still gets the certificate record. Both the
+    // typed default and the omitted-TOML path are asserted, because the two
+    // are separate code paths (`Default` versus `serde(default = ...)`).
+    #[test]
+    async fn audit_config_default_is_enabled() {
+        assert!(
+            AuditConfig::default().enabled,
+            "security.audit.enabled must default to true so certificate \
+             issuance and renewal stay audited"
+        );
+
+        let config: Config = toml::from_str("").expect("empty TOML loads with defaults");
+        assert!(config.security.audit.enabled);
+    }
+
+    // Disabling the section silently stops the certificate trail:
+    // `AuditLogger::log` returns `Ok(())` without writing, so the caller sees
+    // a success it did not get. The warning is the only place that says so.
+    #[test]
+    async fn collect_warnings_flags_disabled_audit_dropping_certificate_record() {
+        let mut config: Config = toml::from_str(
+            r#"
+[security.audit]
+enabled = false
+"#,
+        )
+        .expect("explicit audit setting loads from TOML");
+        suppress_semantic_memory_warning(&mut config);
+
+        let warnings = warnings_with_code(
+            &config,
+            crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+        );
+        assert_eq!(warnings.len(), 1);
+        let w = &warnings[0];
+        assert_eq!(w.path, "security.audit.enabled");
+        assert!(
+            w.message
+                .contains("issued and renewed with no audit record"),
+            "warning should name the certificate record that is lost: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("Command execution is not audited"),
+            "warning should scope the claim to command execution rather than \
+             to the whole section: {}",
+            w.message
+        );
+    }
+
+    // The default config keeps the certificate trail, so there is nothing to
+    // report and no operator sees this warning on a stock install.
+    #[test]
+    async fn collect_warnings_silent_when_audit_left_default() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        assert!(
+            warnings_with_code(
+                &config,
+                crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+            )
+            .is_empty()
+        );
+    }
+
     /// The section is opt-in, so an operator who has not touched it is told
     /// nothing.
     #[test]
@@ -45174,6 +45389,116 @@ allowed_users = []
         assert!(
             warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
             "a bare type-wide ref must never warn, even though it authorizes every alias"
+        );
+    }
+
+    /// Each modality resolves to its own groups' members only, and
+    /// `channel_voice_peers` — the resolver proactive delivery consults — sees
+    /// nothing but the `voice` group.
+    #[test]
+    async fn channel_modality_peers_filters_by_modality() {
+        use crate::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "always_voice".to_string(),
+            PeerGroupConfig {
+                channel: "matrix.default".into(),
+                external_peers: vec![PeerUsername::new("@alice:server")],
+                output_modality: OutputModality::Voice,
+                ..PeerGroupConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "always_text".to_string(),
+            PeerGroupConfig {
+                channel: "matrix.default".into(),
+                external_peers: vec![PeerUsername::new("@bob:server")],
+                output_modality: OutputModality::Text,
+                ..PeerGroupConfig::default()
+            },
+        );
+        // No explicit modality: the default is `mirror`.
+        config.peer_groups.insert(
+            "family".to_string(),
+            PeerGroupConfig {
+                channel: "matrix".into(),
+                external_peers: vec![PeerUsername::new("@carol:server")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Voice),
+            vec!["@alice:server".to_string()],
+            "voice resolves the voice group only"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Text),
+            vec!["@bob:server".to_string()],
+            "text resolves the text group only"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Mirror),
+            vec!["@carol:server".to_string()],
+            "mirror resolves the group without an explicit modality"
+        );
+        assert_eq!(
+            config.channel_voice_peers("matrix", "default"),
+            vec!["@alice:server".to_string()],
+            "the voice resolver never names a text or mirror member"
+        );
+        assert!(
+            config
+                .channel_modality_peers("matrix", "other", OutputModality::Voice)
+                .is_empty(),
+            "a dotted group does not apply to another alias"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "other", OutputModality::Mirror),
+            vec!["@carol:server".to_string()],
+            "a type-wide group applies to every alias"
+        );
+    }
+
+    #[test]
+    async fn channel_modality_peers_drop_an_ignored_peer() {
+        use crate::multi_agent::OutputModality;
+
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.matrix_voice]
+            channel = "matrix"
+            external_peers = ["@alice:server", "@voice-ok:server"]
+            output_modality = "voice"
+
+            [peer_groups.matrix_text]
+            channel = "matrix"
+            external_peers = ["@alice:server", "@text-ok:server"]
+            output_modality = "text"
+
+            [peer_groups.matrix_mirror]
+            channel = "matrix"
+            external_peers = ["@alice:server", "@mirror-ok:server"]
+
+            [peer_groups.matrix_block]
+            channel = "matrix"
+            ignore = ["alice:server"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Voice),
+            vec!["@voice-ok:server".to_string()]
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Text),
+            vec!["@text-ok:server".to_string()]
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Mirror),
+            vec!["@mirror-ok:server".to_string()]
         );
     }
 
