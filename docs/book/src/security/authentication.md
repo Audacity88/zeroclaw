@@ -189,15 +189,47 @@ cron jobs, attachments, personality files, per-agent cost queries, and SOP
 authoring, `allowed_agents = ["*"]` covers only the agents the
 configuration defines, not any alias a request names.
 
-One current limitation is deliberate: per-tool selectors are not yet
-enforced inside agent sessions, so a principal whose `allowed_tools` is
-constrained (neither `admin` nor `"*"`) is **refused** `session/new`,
-`session/prompt`, `sops/run`, and `sops/decide` rather than silently
-under-enforced. Grant `allowed_tools = ["*"]` until the session-assembly
-change lands.
+Tool selectors compose by intersection at agent assembly, on top of the
+coarse grant: model-facing tool execution is `tools = ["execute"]`, and a
+principal without that grant receives a tool-less session whatever its
+`allowed_tools` names, including `"*"`. With the grant held, a session
+created by a constrained principal only receives the tools its
+`allowed_tools` names (an empty list yields a tool-less session), on top
+of whatever the agent's own risk profile allows. After a queued prompt is
+admitted, authorization is rechecked against the shared resolver, including
+credential expiry and revocation. The current principal selector narrows
+static tools, the deferred search registry, already-activated tools, and
+pinned MCP resource content (each pinned block is admitted under its
+`<server>__<uri>` name and is withdrawn from later prompts once the selector
+no longer names it); removed tools cannot be reactivated. Reused sessions
+are narrowed before their next turn, and rehydrated sessions are rebuilt
+under current grants. Agent selectors are checked before a turn and before
+rehydration.
 
-That refusal does not cover every route to an agent's tools. Cron jobs and
-SOP authoring check only the agent selector. A constrained principal
+Narrowing never adds tools back to an existing agent. After expanding grants,
+create a new session to receive the expanded surface. No new config snapshot
+or independent principal-policy cache is stored in the agent.
+
+Deferred MCP instructions are derived from the remaining loadable tools and
+shown only when `tool_search` is exposed. A principal needs both `tool_search`
+and the named deferred MCP tool for on-demand activation; the helper is never
+implicitly granted. Permitted `mode = "always"` MCP tools are preactivated and
+remain callable without the helper.
+
+If either the principal's tool selector or agent selector is constrained,
+`delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
+are unavailable, including skill aliases wrapping those tools. These nested
+paths do not yet carry both current principal ceilings; the ordinary parent
+turn remains usable. Admin principals and principals with both selectors set
+to `"*"` keep their agent's configured nested capabilities.
+
+The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
+constructor remains available. RPC uses the additive
+`from_live_config_with_tui_env_and_principal_tools` constructor and reapplies
+the shared resolver's grants at prompt admission.
+
+That composition does not cover every route to an agent's tools. Cron jobs
+and SOP authoring check only the agent selector. A constrained principal
 holding cron grants can create a shell job for its agent, or give an
 existing agent job a new prompt and trigger it, and one holding SOP create
 or update grants can save a procedure whose trigger runs it later. Treat
