@@ -1718,16 +1718,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let llm_started_at = announce_llm_request(
-            &ctx,
-            &provider_request_messages,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            iteration,
-        )
-        .await;
-
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
@@ -1735,6 +1725,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             None
         };
+        let llm_started_at = announce_llm_request(
+            &ctx,
+            &provider_request_messages,
+            request_tools,
+            active_model_provider,
+            active_model_provider_name,
+            provider_request_model,
+            iteration,
+        )
+        .await;
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
         let base_provider_supports_native_tools = model_provider
             .capabilities_for_model(dispatch_model)
