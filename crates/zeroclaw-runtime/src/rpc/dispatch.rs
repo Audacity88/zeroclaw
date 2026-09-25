@@ -12729,10 +12729,10 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
-            decision: None,
             agent: Some(agent.to_string()),
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 
@@ -15225,9 +15225,9 @@ mod tests {
             location: None,
             deterministic,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
-            decision: None,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
