@@ -8999,6 +8999,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -9088,6 +9089,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             initiating_agent: None,
+            decided_mode: None,
         };
         let pr = PersistedRun::new(
             run.clone(),
@@ -9170,6 +9172,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -14136,6 +14139,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -14312,6 +14316,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).unwrap();
         let mut groups = HashMap::new();
@@ -14627,6 +14632,7 @@ mod tests {
             agent: None,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).expect("save temporary SOP");
 
@@ -14765,6 +14771,7 @@ mod tests {
             agent: None,
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         };
         crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
 
@@ -14866,6 +14873,7 @@ mod tests {
                 agent: None,
                 admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
+                decision: None,
             }
         }
 

@@ -7011,6 +7011,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     let sop_adapters = build_sop_adapters(&current_config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
+                        &current_config.decision_models,
                         &current_config.data_dir,
                         &current_config.install_root_dir(),
                         mem,
@@ -8486,6 +8487,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     let sop_adapters = build_sop_adapters(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
+                        &config.decision_models,
                         &config.data_dir,
                         &config.install_root_dir(),
                         mem,
@@ -11632,6 +11634,7 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
         route: Some(route),
         forge,
         llm,
+        decision: std::collections::HashMap::default(),
     }
 }
 
@@ -15669,6 +15672,7 @@ mod tests {
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -15971,6 +15975,7 @@ mod tests {
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: owner.map(str::to_string),
+            decision: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));
 
@@ -16202,6 +16207,7 @@ mod tests {
                 admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
                 agent: Some(CRON_SOP_AGENT.to_string()),
+                decision: None,
             }]);
         }
 
@@ -16311,6 +16317,7 @@ mod tests {
                 admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
                 max_pending_approvals: 0,
                 agent: Some(CRON_SOP_AGENT.to_string()),
+                decision: None,
             }]);
         }
 
