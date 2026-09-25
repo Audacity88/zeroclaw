@@ -4260,6 +4260,7 @@ impl RpcDispatcher {
         Ok(self.ctx.sessions.get_agent(sid).await)
     }
 
+    #[cfg(test)]
     async fn rehydrate_reaped_session(
         &self,
         sid: &str,
@@ -9788,7 +9789,6 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
-            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -12729,6 +12729,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            decision: None,
             agent: Some(agent.to_string()),
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
