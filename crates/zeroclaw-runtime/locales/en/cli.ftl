@@ -703,6 +703,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
 cli-quickstart-error-provider-required = provider type, alias, and model are required
@@ -1305,5 +1306,7 @@ channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
+
+rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
