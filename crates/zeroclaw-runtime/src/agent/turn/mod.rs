@@ -3205,9 +3205,17 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            let step_result = crate::sop::executor::scope_step_call_sink(
-                                step_call_sink.clone(),
-                                Box::pin(run_tool_call_loop(ToolLoop {
+                            // Owned here, not a `&mut None` temporary: the step
+                            // future is built inside the run-attribution scope and
+                            // awaited after it, so a temporary would be dropped
+                            // while the future still borrows it.
+                            let mut nested_memory_preamble: Option<String> = None;
+                            let step_result = ::zeroclaw_log::scope!(
+                                sop_run_id: run_id.as_str(),
+                                =>
+                                crate::sop::executor::scope_step_call_sink(
+                                    step_call_sink.clone(),
+                                    Box::pin(run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -3261,7 +3269,7 @@ async fn drive_live_sop_actions(
                                     ),
                                     history: nested_history,
                                     history_has_trim_breadcrumb: &mut nested_crumb_present,
-                                    injected_memory_preamble: &mut None,
+                                    injected_memory_preamble: &mut nested_memory_preamble,
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),
@@ -3306,7 +3314,8 @@ async fn drive_live_sop_actions(
                                     turn_id: &nested_turn_id,
                                     served_route_sink: None,
                                     sop_reassembly,
-                                })),
+                                    })),
+                                )
                             )
                             .await;
                             // Replay child loop's new messages to the parent's

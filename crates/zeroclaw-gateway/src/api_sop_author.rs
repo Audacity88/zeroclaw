@@ -153,6 +153,10 @@ pub async fn handle_sop_graph(
 pub struct SopRunBody {
     #[serde(default)]
     pub payload: Option<String>,
+    /// Optional semantic work-item key shared with another producer, such as a
+    /// Git-channel event. Matching keys coalesce only while the first run is active.
+    #[serde(default)]
+    pub dedup_key: Option<String>,
 }
 
 /// Fire a Manual run for the named SOP and return its `run_id`.
@@ -227,6 +231,25 @@ pub async fn handle_sop_run(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    let dedup_key = body
+        .dedup_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    if dedup_key
+        .is_some_and(|key| key.len() > zeroclaw_runtime::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "dedup_key exceeds {} bytes",
+                    zeroclaw_runtime::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
+                )
+            })),
+        )
+            .into_response();
+    }
 
     let event = zeroclaw_runtime::sop::SopEvent {
         source: zeroclaw_runtime::sop::SopTriggerSource::Manual,
@@ -235,8 +258,14 @@ pub async fn handle_sop_run(
         timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
     };
 
-    let results =
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &name).await;
+    let results = if let Some(dedup_key) = dedup_key {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to_deduplicated(
+            engine, audit, event, &name, dedup_key,
+        )
+        .await
+    } else {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &name).await
+    };
     zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
 
     for result in &results {
@@ -1133,7 +1162,10 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path("nightly".to_string()),
-            Json(SopRunBody { payload: None }),
+            Json(SopRunBody {
+                payload: None,
+                dedup_key: None,
+            }),
         )
         .await;
 
@@ -1163,7 +1195,10 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path("nightly".to_string()),
-            Json(SopRunBody { payload: None }),
+            Json(SopRunBody {
+                payload: None,
+                dedup_key: None,
+            }),
         )
         .await;
 
@@ -1189,7 +1224,10 @@ mod tests {
             State(state.clone()),
             HeaderMap::new(),
             Path("nightly".to_string()),
-            Json(SopRunBody { payload: None }),
+            Json(SopRunBody {
+                payload: None,
+                dedup_key: None,
+            }),
         )
         .await;
 

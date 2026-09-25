@@ -11267,12 +11267,12 @@ async fn dispatch_channel_sop_event(
         }
         ingress
     }
-    .dispatch(
+    .dispatch_deduplicated(
         zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
         Some(topic),
         Some(&msg.content),
         target_sop.as_deref(),
-        None,
+        msg.id.clone(),
     )
     .await;
     true
