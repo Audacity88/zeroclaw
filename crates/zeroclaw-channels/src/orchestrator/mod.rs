@@ -703,6 +703,7 @@ struct ChannelRuntimeContext {
     persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 /// Acquire the per-conversation-history-key persistence lock so that
@@ -1724,48 +1725,31 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 /// key retains `msg.sender` even when conversation history is shared
 /// (`ReplyTarget` scope). Without the sender, one member's message or `/stop`
 /// in a shared session would cancel another member's active request.
-/// Doubles every `_` in one component of an interruption key. Joining escaped
-/// components with a single `_` keeps the join injective, so an alias or a
-/// reply target that contains an underscore cannot collide with another
-/// listener's key.
-fn escape_scope_component(part: &str) -> String {
-    part.replace('_', "__")
-}
-
+/// Encodes the conversation scope tuple canonically using length-prefixed
+/// components to prevent boundary collisions between adjacent components
+/// (e.g., `#room_` + `alice` vs `#room` + `_alice`). Both `Sender` and
+/// `ReplyTarget` variants use the same injective representation.
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    match (msg.conversation_scope, msg.interruption_scope_id.as_deref()) {
-        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, Some(scope)) => {
-            sanitize_session_key(&format!("{}_{}_{}", channel_scope(msg), scope, msg.sender))
-        }
-        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, None) => {
-            sanitize_session_key(&format!(
-                "{}_{}_{}",
-                channel_scope(msg),
-                msg.reply_target,
-                msg.sender
-            ))
-        }
-        // The Sender arms stay in their raw four/three-component form: an
-        // interruption scope id may legitimately carry characters such as the
-        // `$thread1` form pinned by the tests below, and every consumer of this
-        // key compares only keys produced here. They are alias-aware, though:
-        // two listeners of the same channel type on one reply target must not
-        // share an interruption slot, or one listener's `/stop` cancels the
-        // other's turn. Every component is escaped before the `_` join, so an
-        // underscore inside an alias or a reply target cannot forge the
-        // separator and collapse two listeners back onto one key.
-        (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
-            "{}_{}_{}_{}",
-            escape_scope_component(&channel_scope(msg)),
-            escape_scope_component(&msg.reply_target),
-            escape_scope_component(&msg.sender),
-            escape_scope_component(scope)
+    let tag = match msg.conversation_scope {
+        zeroclaw_api::channel::ChannelConversationScope::Sender => "sender",
+        zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
+    };
+    let ch = channel_scope(msg);
+    let target = &msg.reply_target;
+    let sender = &msg.sender;
+    match msg.interruption_scope_id.as_deref() {
+        Some(scope) => format!(
+            "{tag}:{}:{ch}:{}:{target}:{}:{sender}:{}:{scope}",
+            ch.len(),
+            target.len(),
+            sender.len(),
+            scope.len()
         ),
-        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => format!(
-            "{}_{}_{}",
-            escape_scope_component(&channel_scope(msg)),
-            escape_scope_component(&msg.reply_target),
-            escape_scope_component(&msg.sender)
+        None => format!(
+            "{tag}:{}:{ch}:{}:{target}:{}:{sender}",
+            ch.len(),
+            target.len(),
+            sender.len()
         ),
     }
 }
@@ -3152,9 +3136,9 @@ fn normalize_peer_username(raw: &str) -> String {
     raw.trim_start_matches('@').to_ascii_lowercase()
 }
 
-/// Whether the inbound sender belongs to an `output_modality = "voice"` peer
-/// group on the channel the message arrived on. The answer travels to the
-/// channel as `SendMessage::force_voice` / `SendMessage::suppress_voice`.
+/// Whether the inbound sender's peer group on the channel the message arrived
+/// on wants this reply voiced. The answer travels to the channel as
+/// `SendMessage::force_voice` / `SendMessage::suppress_voice`.
 ///
 /// Returns a tri-state, not a bool, because "no opinion" and "no" must stay
 /// distinguishable:
@@ -3163,11 +3147,20 @@ fn normalize_peer_username(raw: &str) -> String {
 ///   voice-peer groups are configured for it, or a miss on Telegram must leave
 ///   the channel's input-driven voice mode in charge. The caller keeps the
 ///   channel's own fallback intact.
-/// - `Some(true)` — the sender matches a configured voice peer.
-/// - `Some(false)` — voice peers ARE configured for this channel and the
-///   sender is not among them. This is the authoritative negative: callers
-///   must not fall back to room membership, or a non-member sender in a room
-///   that also contains a voice-group member would incorrectly get voiced.
+/// - `Some(true)` — the sender matches a configured voice peer, or a Matrix
+///   `mirror` peer whose message was a voice note.
+/// - `Some(false)` — the sender is a Matrix `text` peer, a Matrix `mirror`
+///   peer whose message was text, or voice peers ARE configured for this
+///   channel and the sender is not among them. This is the authoritative
+///   negative: callers must not fall back to room membership, or a non-member
+///   sender in a room that also contains a voice-group member would
+///   incorrectly get voiced.
+///
+/// On Matrix the groups are consulted in the order `voice`, `text`, `mirror`,
+/// so a sender named by more than one gets the first match. A `mirror` verdict
+/// is `msg.voice_origin` — the inbound event's own voice flag, never the
+/// transcript or an earlier message in the room — so it is bound to this one
+/// message and cannot leak between senders or turns.
 ///
 /// The decision lives here because this is the only place that holds both the
 /// sender and the reply target. A channel that inspects its own outbound
@@ -3197,36 +3190,54 @@ fn sender_prefers_voice(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> Option<bool> {
+    use zeroclaw_config::multi_agent::OutputModality;
+
     let channel_type = msg.channel.as_str();
     let matrix = channel_type.starts_with("matrix");
     if !(matrix || channel_type.starts_with("telegram")) {
         return None;
     }
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(channel_type);
-    let voice_peers: Vec<String> = ctx
-        .prompt_config
-        .channel_voice_peers(channel_type, channel_alias)
-        .into_iter()
-        .map(|p| normalize_peer_username(&p))
-        .collect();
-    if voice_peers.is_empty() {
-        return None;
-    }
-    let identities = std::iter::once(normalize_peer_username(msg.sender.as_str())).chain(
-        msg.platform_sender_id
-            .as_deref()
-            .map(normalize_peer_username),
-    );
-    if identities.into_iter().any(|identity| {
-        crate::allowlist::is_user_allowed(
-            &voice_peers,
-            &identity,
-            crate::allowlist::Match::Sensitive,
+    let identities: Vec<String> = std::iter::once(normalize_peer_username(msg.sender.as_str()))
+        .chain(
+            msg.platform_sender_id
+                .as_deref()
+                .map(normalize_peer_username),
         )
-    }) {
+        .collect();
+    // The normalized peers of every group of `modality` on this channel.
+    let peers_of = |modality: OutputModality| -> Vec<String> {
+        ctx.prompt_config
+            .channel_modality_peers(channel_type, channel_alias, modality)
+            .into_iter()
+            .map(|p| normalize_peer_username(&p))
+            .collect()
+    };
+    // Whether `peers` names the sender; `false` for an unconfigured modality.
+    let names_sender = |peers: &[String]| -> bool {
+        !peers.is_empty()
+            && identities.iter().any(|identity| {
+                crate::allowlist::is_user_allowed(
+                    peers,
+                    identity,
+                    crate::allowlist::Match::Sensitive,
+                )
+            })
+    };
+    let voice_peers = peers_of(OutputModality::Voice);
+    if names_sender(&voice_peers) {
         return Some(true);
     }
-    matrix.then_some(false)
+    if !matrix {
+        return None;
+    }
+    if names_sender(&peers_of(OutputModality::Text)) {
+        return Some(false);
+    }
+    if names_sender(&peers_of(OutputModality::Mirror)) {
+        return Some(msg.voice_origin);
+    }
+    (!voice_peers.is_empty()).then_some(false)
 }
 
 /// Maps a [`sender_prefers_voice`] verdict to the
@@ -4235,6 +4246,11 @@ fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
+    // The turn engine owns local capacity rejection. Keep its typed terminal
+    // reason even when an outer context includes a provider's overflow text.
+    if zeroclaw_runtime::agent::context_window_exceeded_from_error(err).is_some() {
+        return false;
+    }
     let lower = err.to_string().to_lowercase();
     [
         "exceeds the context window",
@@ -8589,10 +8605,16 @@ async fn process_channel_message_body(
             Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
             _ => msg.channel.clone(),
         };
-        zeroclaw_runtime::sop::dispatch::SopIngress::new(
-            ctx.sop_engine.as_ref(),
-            ctx.sop_audit.as_deref(),
-        )
+        {
+            let mut ingress = zeroclaw_runtime::sop::dispatch::SopIngress::new(
+                ctx.sop_engine.as_ref(),
+                ctx.sop_audit.as_deref(),
+            );
+            if let Some(sink) = ctx.sop_driver_sink.as_ref() {
+                ingress = ingress.with_driver_sink(sink);
+            }
+            ingress
+        }
         .dispatch(
             zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
             Some(&topic),
@@ -10180,16 +10202,17 @@ async fn process_channel_message_body(
             } else {
                 // No `send_via` override: the peer group the sender belongs to
                 // decides. A positive verdict sets `force_voice` with
-                // `suppress_voice` left `None` (a `text` group stays the
-                // channel default rather than an explicit override). A
-                // negative verdict is authoritative — the sender is known to
-                // be outside every voice group configured for this channel —
-                // so it is carried as an explicit `suppress_voice_override`
-                // rather than left to fall back to room-membership lookup,
-                // which would incorrectly voice a reply to a non-member
-                // sender in a room that also contains a voice-group member.
-                // `None` (no groups configured, or a non-Matrix channel)
-                // keeps that membership fallback intact.
+                // `suppress_voice` left `None`. A negative verdict is
+                // authoritative — the sender is a `text` peer, a `mirror` peer
+                // who sent text, or known to be outside every voice group
+                // configured for this channel — so it is carried as an
+                // explicit `suppress_voice_override` rather than left to fall
+                // back to room-membership lookup, which would incorrectly
+                // voice a reply to a non-member sender in a room that also
+                // contains a voice-group member. A Matrix `mirror` member's
+                // verdict follows the message's `voice_origin`. `None` (no
+                // groups configured, or a non-Matrix channel) keeps that
+                // membership fallback intact.
                 let (suppress, force_voice) =
                     voice_override_from_sender_verdict(sender_prefers_voice(&ctx, &msg));
                 (
@@ -10426,15 +10449,23 @@ async fn process_channel_message_body(
                         .await;
                 }
             } else {
-                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                let context_window_exceeded =
+                    zeroclaw_runtime::agent::context_window_exceeded_from_error(&e);
+                let safe_error = if context_window_exceeded.is_some() {
+                    String::new()
+                } else {
+                    zeroclaw_providers::sanitize_api_error(&e.to_string())
+                };
                 eprintln!(
-                    "  ❌ LLM error after {}ms: {safe_error}",
+                    "  ❌ Turn error after {}ms: {safe_error}",
                     started_at.elapsed().as_millis(),
                 );
 
                 // Evict cached model_provider on auth errors so the next request
                 // re-creates it with fresh OAuth credentials.
-                if zeroclaw_providers::reliable::is_auth_error(&e) {
+                if context_window_exceeded.is_none()
+                    && zeroclaw_providers::reliable::is_auth_error(&e)
+                {
                     let cache_key = provider_cache_key(
                         &route.model_provider,
                         route.api_key.as_deref(),
@@ -10455,6 +10486,20 @@ async fn process_channel_message_body(
                         );
                     }
                 }
+                let mut error_attributes = ::serde_json::json!({
+                    "model_provider": route.model_provider,
+                    "model": route.model,
+                    "sender": msg.sender,
+                });
+                if let Some(exceeded) = context_window_exceeded {
+                    error_attributes["error_kind"] = "context_window_exceeded".into();
+                    error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
+                    error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                    error_attributes["provider_attempted"] = false.into();
+                } else {
+                    error_attributes["error_kind"] = "provider_error".into();
+                    error_attributes["error"] = safe_error.clone().into();
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -10462,15 +10507,11 @@ async fn process_channel_message_body(
                         .with_duration(
                             u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                         )
-                        .with_attrs(::serde_json::json!({
-                            "model_provider": route.model_provider,
-                            "model": route.model,
-                            "sender": msg.sender,
-                            "error": safe_error,
-                        })),
+                        .with_attrs(error_attributes),
                     "channel_message_error"
                 );
-                let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
+                let should_rollback_user_turn =
+                    context_window_exceeded.is_none() && should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
                     && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
@@ -10758,6 +10799,7 @@ struct AgentRouter {
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 impl AgentRouter {
@@ -10769,6 +10811,7 @@ impl AgentRouter {
             single_ctx: Some(ctx),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         }
     }
 
@@ -10777,6 +10820,7 @@ impl AgentRouter {
         owner_by_channel_key: HashMap<String, String>,
         sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
         sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+        sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
     ) -> Self {
         Self {
             by_agent: Arc::new(by_agent),
@@ -10784,6 +10828,7 @@ impl AgentRouter {
             single_ctx: None,
             sop_engine,
             sop_audit,
+            sop_driver_sink,
         }
     }
 
@@ -11126,10 +11171,12 @@ async fn dispatch_channel_sop_gate(
     };
     match outcome {
         Ok(outcome) => {
+            let driver_handles = router.sop_driver_sink.as_ref().map(|sink| sink.handles());
             zeroclaw_runtime::sop::drive_resumed_broker_action(
                 config,
                 Arc::clone(engine),
                 router.sop_audit.clone(),
+                driver_handles.as_ref(),
                 &outcome,
             );
             ::zeroclaw_log::record!(
@@ -11215,16 +11262,22 @@ async fn dispatch_channel_sop_event(
     };
 
     let target_sop = channel_sop_target(msg);
-    zeroclaw_runtime::sop::dispatch::SopIngress::new(
-        router.sop_engine.as_ref(),
-        router.sop_audit.as_deref(),
-    )
-    .dispatch(
+    {
+        let mut ingress = zeroclaw_runtime::sop::dispatch::SopIngress::new(
+            router.sop_engine.as_ref(),
+            router.sop_audit.as_deref(),
+        );
+        if let Some(sink) = router.sop_driver_sink.as_ref() {
+            ingress = ingress.with_driver_sink(sink);
+        }
+        ingress
+    }
+    .dispatch_deduplicated(
         zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
         Some(topic),
         Some(&msg.content),
         target_sop.as_deref(),
-        None,
+        msg.id.clone(),
     )
     .await;
     true
@@ -11765,12 +11818,51 @@ pub fn channel_alias_configured(config: &Config, channel_type: &str, alias: &str
     }
 }
 
+/// The `peer_groups` key that holds bindings for `<channel_type>.<alias>`, or
+/// `None` when no group carries that ref yet.
+///
+/// For reporting where a binding lives. The writer selects its target by the
+/// group's `channel` field, so the conventional `<type>_<alias>` name is a
+/// guess that may name nothing at all.
+#[must_use]
+pub fn channel_peer_group_key(config: &Config, channel_type: &str, alias: &str) -> Option<String> {
+    crate::identity_persist::instance_group_key(config, channel_type, alias)
+}
+
+/// The `peer_groups` key that already authorizes `identity`, for reporting an
+/// `already_bound` result without guessing a name. Delegates to the
+/// crate-private `identity_persist::authorizing_group_key`.
+#[must_use]
+pub fn channel_authorizing_group_key(
+    config: &Config,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+) -> Option<String> {
+    crate::identity_persist::authorizing_group_key(
+        config,
+        channel_type,
+        alias,
+        identity,
+        |entry, user| {
+            entry.trim().trim_start_matches('@').to_lowercase()
+                == user.trim().trim_start_matches('@').to_lowercase()
+        },
+    )
+}
+
 /// Add `identity` to the peer group bound to `<type>.<alias>` in-place.
 ///
-/// Returns `Ok(true)` when the identity was newly added, `Ok(false)` when it
-/// was already present. Pure config mutation — no disk write, no daemon
-/// restart — so it is the single core shared by the CLI
-/// (`bind_telegram_identity`) and the gateway bind endpoint. The `channel`
+/// Returns `Ok(Some(key))` naming the `peer_groups` key actually written when
+/// the identity was newly added, `Ok(None)` when it was already present, and
+/// `Err` when an `ignore` entry denies the identity, because neither of those
+/// answers would leave it admissible. Callers that report where the identity
+/// landed must use the returned key: the writer selects its target by the
+/// group's `channel` field, so a custom key such as `[peer_groups.ops]` is a
+/// legitimate destination and the conventional `<type>_<alias>` name may not
+/// exist at all. Pure config
+/// mutation — no disk write, no daemon restart — so it is the single core
+/// shared by the CLI (`bind_telegram_identity`) and the gateway bind endpoint. The `channel`
 /// field is the dotted `<type>.<alias>` ref so authorization stays scoped to
 /// the bound alias; a bare type would broaden the peer across every alias of
 /// that type.
@@ -11779,10 +11871,7 @@ pub fn bind_channel_identity_into(
     channel_type: &str,
     alias: &str,
     identity: &str,
-) -> Result<bool> {
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-
+) -> Result<Option<String>> {
     let Some(normalize) = channel_identity_normalizer(channel_type) else {
         anyhow::bail!(
             "Channel type `{channel_type}` does not support identity binding \
@@ -11807,31 +11896,29 @@ pub fn bind_channel_identity_into(
         );
     }
 
-    let group_name = format!("{channel_type}_{alias}");
-    let channel_ref = format!("{channel_type}.{alias}");
-    let group = config
-        .peer_groups
-        .entry(group_name)
-        .or_insert_with(|| PeerGroupConfig {
-            channel: ChannelRef::new(channel_ref),
-            ..PeerGroupConfig::default()
-        });
-
-    if group
-        .external_peers
-        .iter()
-        .any(|p| normalize(p.as_str()) == normalized)
-    {
-        return Ok(false);
-    }
-
-    group.external_peers.push(PeerUsername::new(normalized));
-    Ok(true)
+    // Everything after the closed-set and alias gates is the shared paired
+    // identity write, so it goes through the one writer that selects its target
+    // the way the runtime reader selects it: by the group's `channel` field,
+    // never by the `peer_groups` map key. Keys are arbitrary, so a group keyed
+    // `telegram_alerts` may carry `channel = "telegram.other"`; opening it by
+    // key wrote the grant where this channel's reader never looks while another
+    // channel's reader picked it up, and still reported success.
+    crate::identity_persist::merge_external_peer(
+        config,
+        channel_type,
+        alias,
+        &normalized,
+        |entry, identity| normalize(entry) == normalize(identity),
+    )
 }
 
 /// Telegram-specific thin wrapper over [`bind_channel_identity_into`], kept
 /// for the CLI entry point and its unit tests.
-fn bind_telegram_identity_into(config: &mut Config, identity: &str, alias: &str) -> Result<bool> {
+fn bind_telegram_identity_into(
+    config: &mut Config,
+    identity: &str,
+    alias: &str,
+) -> Result<Option<String>> {
     bind_channel_identity_into(config, "telegram", alias, identity)
 }
 
@@ -11839,7 +11926,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str
     let normalized = normalize_telegram_identity(identity);
     let mut updated = config.clone();
 
-    if !bind_telegram_identity_into(&mut updated, identity, alias)? {
+    if bind_telegram_identity_into(&mut updated, identity, alias)?.is_none() {
         println!("✅ Telegram identity already bound to telegram.{alias}: {normalized}");
         return Ok(());
     }
@@ -12461,8 +12548,7 @@ fn build_channel_by_id(
                 let snapshot = wc.clone();
                 Arc::new(move || {
                     let config = cfg_arc.read();
-                    let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                    external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                    let external_peers = wecom_ws_external_peers(&config, &alias);
 
                     if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                         WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
@@ -12910,6 +12996,18 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+/// The resolved peer policy for a WeCom WebSocket alias.
+///
+/// This channel is written both `wecom-ws` and `wecom_ws` in `peer_groups`, and
+/// every startup path has to resolve both spellings in one pass: resolving them
+/// separately and concatenating leaves a wildcard under one spelling unaware of
+/// an `ignore` under the other. Named once so the one-shot and normal startup
+/// paths cannot answer this differently again.
+#[cfg(feature = "channel-wecom-ws")]
+pub(crate) fn wecom_ws_external_peers(config: &Config, alias: &str) -> Vec<String> {
+    config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], alias)
+}
+
 /// Fold constructed channel plugins into the configured-channel set.
 ///
 /// Plugin channels join the ordinary set rather than getting a lifecycle of
@@ -13159,7 +13257,7 @@ pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None, None);
     configured_channel_map(&configured)
 }
 
@@ -13172,7 +13270,7 @@ pub fn register_channels_for_tools(
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None, None);
 
     let handles = [
         ask_user_handle.as_ref(),
@@ -13349,6 +13447,15 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
         .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
 }
 
+#[cfg(any(feature = "channel-bluesky", feature = "channel-reddit"))]
+fn live_external_peer_resolver(
+    config: Arc<RwLock<Config>>,
+    channel_type: &'static str,
+    alias: String,
+) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+    Arc::new(move || config.read().channel_external_peers(channel_type, &alias))
+}
+
 /// Build the Matrix channel for `[channels.matrix.<alias>]` with every
 /// live-config resolver installed, mirroring
 /// [`build_configured_discord_channel`].
@@ -13418,11 +13525,12 @@ fn collect_configured_channels(
     tool_specs: &[(String, String)],
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
     #[cfg(not(feature = "channel-amqp"))]
-    let _ = (&sop_engine, &sop_audit);
+    let _ = (&sop_engine, &sop_audit, &sop_driver_sink);
     #[allow(unused_mut)]
     let mut channels = Vec::new();
 
@@ -14214,6 +14322,7 @@ fn collect_configured_channels(
             dispatch: amqp.dispatch,
             engine: sop_engine.clone(),
             audit: sop_audit.clone(),
+            driver_sink: sop_driver_sink.clone(),
             alias: alias.clone(),
             peer_resolver,
         }) {
@@ -14631,8 +14740,7 @@ fn collect_configured_channels(
             let snapshot = wc_ws.clone();
             Arc::new(move || {
                 let config = cfg_arc.read();
-                let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                let external_peers = wecom_ws_external_peers(&config, &alias);
 
                 if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                     WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
@@ -14808,6 +14916,8 @@ fn collect_configured_channels(
         if !rd.enabled {
             continue;
         }
+        let peer_resolver =
+            live_external_peer_resolver(Arc::clone(config_arc), "reddit", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Reddit",
             alias: Some(alias.clone()),
@@ -14818,6 +14928,7 @@ fn collect_configured_channels(
                 rd.refresh_token.clone(),
                 rd.username.clone(),
                 rd.subreddits.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -14841,6 +14952,8 @@ fn collect_configured_channels(
         if !bs.enabled {
             continue;
         }
+        let peer_resolver =
+            live_external_peer_resolver(Arc::clone(config_arc), "bluesky", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Bluesky",
             alias: Some(alias.clone()),
@@ -14848,6 +14961,7 @@ fn collect_configured_channels(
                 alias.clone(),
                 bs.handle.clone(),
                 bs.app_password.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -15024,7 +15138,8 @@ fn peer_group_dangling_warning_lines(config: &Config) -> Vec<String> {
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
+    let mut channels =
+        collect_configured_channels(&config_arc, "health check", &[], None, None, None);
 
     // Take an owned snapshot before the `.await`: the parking_lot guard is not
     // Send and must not be held across the async constructor.
@@ -15595,6 +15710,7 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Result<()> {
     Box::pin(start_channels_with_plugin_webhooks(
         config,
@@ -15603,6 +15719,7 @@ pub async fn start_channels(
         sop_engine,
         sop_audit,
         None,
+        sop_driver_sink,
     ))
     .await
 }
@@ -15618,6 +15735,10 @@ pub async fn start_channels_with_plugin_webhooks(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+    // The daemon generation's driver sink: channel-started runs hand their first
+    // action to it, so one reload drains every driver the generation owns.
+    // `None` standalone, where the process bounds the run instead.
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Result<()> {
     let plugin_webhook_registry_lease = plugin_webhooks
         .as_ref()
@@ -16004,6 +16125,7 @@ pub async fn start_channels_with_plugin_webhooks(
                 &tool_specs,
                 sop_engine.clone(),
                 sop_audit.clone(),
+                sop_driver_sink.clone(),
             );
 
             #[cfg(feature = "channel-nostr")]
@@ -16065,6 +16187,7 @@ pub async fn start_channels_with_plugin_webhooks(
                                 alias: alias.clone(),
                                 engine: engine.clone(),
                                 audit: audit.clone(),
+                                driver_sink: sop_driver_sink.clone(),
                             },
                         )),
                     });
@@ -16294,6 +16417,7 @@ pub async fn start_channels_with_plugin_webhooks(
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: sop_engine.clone(),
             sop_audit: sop_audit.clone(),
+            sop_driver_sink: sop_driver_sink.clone(),
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
@@ -16383,7 +16507,13 @@ pub async fn start_channels_with_plugin_webhooks(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    let router = AgentRouter::multi(
+        agent_ctxs,
+        owner_by_channel_key,
+        sop_engine,
+        sop_audit,
+        sop_driver_sink.clone(),
+    );
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -16805,6 +16935,7 @@ fn concurrent_persist_lock_serialization() {
     };
 
     let ctx = Arc::new(ChannelRuntimeContext {
+        sop_driver_sink: None,
         channels_by_name: Arc::new(HashMap::new()),
         model_provider: Arc::new(tests::DummyModelProvider),
         model_provider_ref: Arc::new("test".into()),
@@ -17063,6 +17194,7 @@ fn test_channel_ctx_with_backend(
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        sop_driver_sink: None,
     })
 }
 
@@ -17181,6 +17313,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        sop_driver_sink: None,
     })
 }
 
@@ -18294,6 +18427,51 @@ pub(crate) mod tests {
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    #[cfg(feature = "channel-reddit")]
+    #[test]
+    fn reddit_peer_resolver_uses_the_production_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.ops]
+            channel = "reddit.ops"
+            external_peers = ["authorized-redditor"]
+
+            [peer_groups.other]
+            channel = "reddit.other"
+            external_peers = ["wrong-redditor"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        let resolver =
+            live_external_peer_resolver(Arc::new(RwLock::new(config)), "reddit", "ops".to_string());
+
+        assert_eq!(resolver(), vec!["authorized-redditor".to_string()]);
+    }
+
+    #[cfg(feature = "channel-bluesky")]
+    #[test]
+    fn bluesky_peer_resolver_uses_the_production_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.work]
+            channel = "bluesky.work"
+            external_peers = ["allowed.bsky.social"]
+
+            [peer_groups.other]
+            channel = "bluesky.other"
+            external_peers = ["wrong.bsky.social"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        let resolver = live_external_peer_resolver(
+            Arc::new(RwLock::new(config)),
+            "bluesky",
+            "work".to_string(),
+        );
+
+        assert_eq!(resolver(), vec!["allowed.bsky.social".to_string()]);
+    }
+
     fn source_block_after<'a>(
         source: &'a str,
         marker: &str,
@@ -18715,6 +18893,112 @@ pub(crate) mod tests {
             None,
             "the configured base=none policy must be resolved only by Matrix rendering"
         );
+    }
+
+    #[test]
+    fn local_capacity_cause_is_not_a_provider_overflow() {
+        let error = anyhow::Error::new(zeroclaw_runtime::agent::ContextWindowExceeded {
+            estimated_tokens: 65_537,
+            model_context_window: 65_536,
+        })
+        .context("maximum context length; private provider diagnostics");
+        assert!(!is_context_window_overflow_error(&error));
+        let message =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-context-window-exceeded-error");
+        assert_eq!(
+            channel_user_error_message(&error, "private fallback"),
+            format!("⚠️ Error: {message}")
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn matrix_context_window_failure_is_delivered_and_logged_before_provider_dispatch() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        while rx.try_recv().is_ok() {}
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+        ));
+        let provider = Arc::new(PrecheckProbeModelProvider::default());
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "private".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                ..Default::default()
+            },
+        );
+        config.providers.models.custom.insert(
+            "capacity".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    context_window: Some(64),
+                    ..Default::default()
+                },
+            },
+        );
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel_impl.clone(),
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "custom.capacity",
+            None,
+        );
+        ctx.provider_cache
+            .lock()
+            .unwrap()
+            .insert("custom.capacity".to_string(), provider.clone());
+        let msg = ChannelMessage {
+            id: "matrix-capacity-error".to_string(),
+            explicitly_addressed: true,
+            sender: "capacity-sender".to_string(),
+            reply_target: "!private:example.com".to_string(),
+            content: "private-context-prompt ".repeat(256),
+            channel: "matrix".to_string(),
+            channel_alias: Some("private".to_string()),
+            timestamp: 1,
+            ..Default::default()
+        };
+        process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+
+        let terminal =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-context-window-exceeded-error");
+        let expected = format!("⚠️ Error: {terminal}");
+        assert_eq!(
+            *channel_impl.sent_messages.lock().await,
+            [format!("!private:example.com:{expected}")]
+        );
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.precheck_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            ctx.provider_cache
+                .lock()
+                .unwrap()
+                .contains_key("custom.capacity")
+        );
+        assert!(!channel_impl.cancelled_drafts.lock().await.is_empty());
+
+        let event = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|value| {
+                value.get("message").and_then(|v| v.as_str()) == Some("channel_message_error")
+                    && value.pointer("/attributes/sender").and_then(|v| v.as_str())
+                        == Some("capacity-sender")
+            })
+            .expect("local capacity failure must emit a channel error event");
+        let attributes = &event["attributes"];
+        assert_eq!(attributes["error_kind"], "context_window_exceeded");
+        assert_eq!(attributes["provider_attempted"], false);
+        assert_eq!(attributes["model_context_window"], 64);
+        assert!(attributes["estimated_tokens"].as_u64().unwrap() > 64);
+        assert!(attributes.get("history_compacted").is_none());
+        assert!(attributes.get("error").is_none());
+        assert!(!event.to_string().contains("private-context-prompt"));
     }
 
     #[test]
@@ -20085,6 +20369,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -20264,6 +20549,7 @@ temperature = 0.3
             owners,
             None,
             None,
+            None,
         );
 
         let resolved_alpha = router.resolve(&alpha_msg).expect("alpha owner");
@@ -20367,6 +20653,7 @@ temperature = 0.3
         let router = AgentRouter::multi(
             HashMap::from([("shared-agent".to_string(), Arc::clone(&shared_ctx))]),
             owners,
+            None,
             None,
             None,
         );
@@ -20554,6 +20841,7 @@ temperature = 0.3
 
         let base_ctx = (*router_test_ctx()).clone();
         let ctx = Arc::new(ChannelRuntimeContext {
+            sop_driver_sink: None,
             prompt_config: Arc::new(cfg),
             ..base_ctx
         });
@@ -20584,7 +20872,7 @@ temperature = 0.3
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.clamps".to_string(), "clamps".to_string());
         owners.insert("discord.glados".to_string(), "glados".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg_clamps = channel_message("discord", Some("clamps"));
         let msg_glados = channel_message("discord", Some("glados"));
@@ -20607,7 +20895,7 @@ temperature = 0.3
         by_agent.insert("agent_a".to_string(), Arc::clone(&agent_a_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.bot_a".to_string(), "agent_a".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let cli_msg = channel_message("cli", None);
         assert!(router.resolve(&cli_msg).is_none(), "cli has no owner");
@@ -20620,7 +20908,7 @@ temperature = 0.3
         by_agent.insert("ops".to_string(), Arc::clone(&notion_agent_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("notion".to_string(), "ops".to_string());
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
@@ -20646,7 +20934,7 @@ temperature = 0.3
         let legacy_ctx = router_test_ctx();
         let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
         by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
-        let router = AgentRouter::multi(by_agent, owners, None, None);
+        let router = AgentRouter::multi(by_agent, owners, None, None, None);
 
         let msg = channel_message("mattermost", Some("default"));
         let resolved = router.resolve(&msg).expect("fallback owner resolves");
@@ -21049,6 +21337,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         }
     }
 
@@ -21527,6 +21816,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -21630,6 +21920,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -21751,6 +22042,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -21876,6 +22168,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -22716,7 +23009,8 @@ api_key = "anthropic-key"
     /// delivery flags (`suppress_voice`, `force_voice`) and not only on
     /// recipient and text. `telegram(drafts)` names it `telegram` and, when
     /// asked, advertises draft support so a test can drive the streaming
-    /// finalization arm as well as the plain send.
+    /// finalization arm as well as the plain send; `matrix()` names it
+    /// `matrix` for the plain send.
     struct SendMessageRecordingChannel {
         channel_name: &'static str,
         drafts: bool,
@@ -22742,6 +23036,13 @@ api_key = "anthropic-key"
             Self {
                 channel_name: "telegram",
                 drafts,
+                ..Self::default()
+            }
+        }
+
+        fn matrix() -> Self {
+            Self {
+                channel_name: "matrix",
                 ..Self::default()
             }
         }
@@ -23771,6 +24072,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -23877,6 +24179,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -25566,6 +25869,7 @@ BTC is currently around $65,000 based on latest tool output."#
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine =
             zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
@@ -26719,6 +27023,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -26812,6 +27117,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -26986,6 +27292,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27190,6 +27497,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27377,6 +27685,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -27573,6 +27882,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -28143,6 +28453,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -28291,6 +28602,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -28417,6 +28729,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -28721,6 +29034,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -28846,6 +29160,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -28996,6 +29311,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29132,6 +29448,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29253,6 +29570,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29392,6 +29710,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29555,6 +29874,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -29742,6 +30062,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -30231,6 +30552,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -30350,6 +30672,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -30476,6 +30799,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -31949,6 +32273,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -32099,6 +32424,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32264,6 +32590,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32426,6 +32753,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32585,6 +32913,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -32791,6 +33120,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33027,6 +33357,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -33167,6 +33498,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -33700,6 +34032,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -33833,6 +34166,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -33970,6 +34304,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -34099,6 +34434,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -34228,6 +34564,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -34644,6 +34981,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -35811,7 +36149,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // retains the sender so one member cannot cancel another's request.
         assert_eq!(
             interruption_scope_key(&msg),
-            "wecom_ws_work_group--room-1_zeroclaw_user"
+            "reply_target:13:wecom_ws.work:13:group--room-1:13:zeroclaw_user:13:group--room-1"
         );
     }
 
@@ -36170,6 +36508,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -38855,6 +39194,30 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    fn text_peer_group(
+        channel: &str,
+        members: &[&str],
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::OutputModality;
+        zeroclaw_config::multi_agent::PeerGroupConfig {
+            output_modality: OutputModality::Text,
+            ..peer_group(channel, members, false)
+        }
+    }
+
+    /// `mirror` is the default modality, so this is what a `[peer_groups.*]`
+    /// entry without an explicit `output_modality` resolves to.
+    fn mirror_peer_group(
+        channel: &str,
+        members: &[&str],
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::OutputModality;
+        zeroclaw_config::multi_agent::PeerGroupConfig {
+            output_modality: OutputModality::Mirror,
+            ..peer_group(channel, members, false)
+        }
+    }
+
     /// A Matrix reply is addressed to `!room:server`, while the peer group
     /// names `@user:server`. Resolving the modality here — where the inbound
     /// sender is still in hand — is what makes a user-ID voice group work.
@@ -38866,6 +39229,15 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: Some("default".into()),
             content: "hello".into(),
             ..Default::default()
+        }
+    }
+
+    /// The same message as a voice note: the Matrix inbound handler sets
+    /// `voice_origin` from the event's own MSC3245 flag.
+    fn matrix_voice_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            voice_origin: true,
+            ..matrix_msg(sender)
         }
     }
 
@@ -39254,6 +39626,138 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// A Matrix room message from a sender the mirror group names, as the
+    /// inbound handler forwards it.
+    fn matrix_room_message(
+        sender: &str,
+        voice_origin: bool,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "$event-1:server".to_string(),
+            timestamp: 1,
+            voice_origin,
+            ..matrix_msg(sender)
+        }
+    }
+
+    /// Drives the real dispatch and reply-delivery path with a mirror group
+    /// that names the sender.
+    fn matrix_mirror_delivery_ctx(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "family".to_string(),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        test_runtime_ctx_with_observer_and_tools(
+            channel,
+            model_provider,
+            zeroclaw_config::schema::Config {
+                peer_groups,
+                ..Default::default()
+            },
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            tools,
+        )
+    }
+
+    #[tokio::test]
+    async fn matrix_mirror_voice_origin_is_force_voiced_on_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+        let ctx = matrix_mirror_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            matrix_room_message("@alice:server", true),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "!room:server");
+        assert!(
+            reply.force_voice,
+            "a mirror member's voice note must be answered with voice, got {reply:?}"
+        );
+        assert!(
+            !reply.suppress_voice,
+            "a voice-origin mirror reply must not be suppressed, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_mirror_text_origin_stays_text_on_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+        let ctx = matrix_mirror_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            matrix_room_message("@alice:server", false),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "!room:server");
+        assert!(
+            !reply.force_voice,
+            "a mirror member's text message must not be voiced, got {reply:?}"
+        );
+        assert!(
+            reply.suppress_voice,
+            "a text-origin mirror reply is an explicit suppression, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_explicit_text_override_beats_a_mirror_voice_origin() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+        let send_via = tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            Arc::new(parking_lot::RwLock::new(
+                HashMap::<String, Arc<dyn Channel>>::new(),
+            )),
+            Arc::new(HashMap::<String, zeroclaw_config::multi_agent::PeerGroupConfig>::new),
+        );
+        let ctx = matrix_mirror_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(SendViaTextRoutingProvider),
+            vec![Box::new(send_via)],
+        );
+
+        process_channel_message(
+            ctx,
+            matrix_room_message("@alice:server", true),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "!room:server");
+        assert!(
+            reply.suppress_voice,
+            "the explicit text override must win over the voice-origin mirror verdict, got {reply:?}"
+        );
+        assert!(
+            !reply.force_voice,
+            "the explicit text override must not force voice, got {reply:?}"
+        );
+    }
+
     #[test]
     fn matrix_voice_group_member_gets_a_voiced_reply_by_user_id() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -39331,6 +39835,38 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// The mirror counterpart of the composition above: a mirror member's
+    /// voice note reaches the channel as `force_voice`, and their text message
+    /// as an explicit suppression.
+    #[test]
+    fn a_mirror_matrix_sender_composes_to_the_message_origin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert_eq!(
+            voice_override_from_sender_verdict(sender_prefers_voice(
+                &ctx,
+                &matrix_voice_msg("@alice:server")
+            )),
+            (None, true),
+            "a mirror member's voice note forces voice with membership fallback intact"
+        );
+        assert_eq!(
+            voice_override_from_sender_verdict(sender_prefers_voice(
+                &ctx,
+                &matrix_msg("@alice:server")
+            )),
+            (Some(true), false),
+            "a mirror member's text message must reach the channel as an explicit \
+             suppression, or `should_voice` falls back to room membership"
+        );
+    }
+
     #[test]
     fn matrix_voice_group_wildcard_voices_every_sender() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -39360,24 +39896,168 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// A `mirror` member's verdict is the inbound event's own voice flag, so
+    /// a voice note is answered with voice and a text message with text.
     #[test]
-    fn a_mirror_peer_group_does_not_voice() {
-        // `mirror` is the default modality and Matrix does not implement it;
-        // only an explicit `voice` group speaks. Because `channel_voice_peers`
-        // filters non-voice groups out entirely, this is "no voice groups
-        // configured" (`None`), not "sender rejected by a voice group"
-        // (`Some(false)`).
+    fn matrix_mirror_group_member_mirrors_the_message_origin() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut groups = std::collections::HashMap::new();
         groups.insert(
             "family".into(),
-            peer_group("matrix.default", &["@alice:server"], false),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_voice_msg("@alice:server")),
+            Some(true),
+            "a mirror member's voice note is answered with voice"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            Some(false),
+            "a mirror member's text message is answered with text, as an explicit \
+             suppression so room membership cannot voice it"
+        );
+    }
+
+    /// `voice` and `text` groups are fixed modalities: the message's origin
+    /// does not move them.
+    #[test]
+    fn matrix_voice_and_text_groups_ignore_the_message_origin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "always_voice".into(),
+            voice_peer_group("matrix.default", &["@alice:server"]),
+        );
+        groups.insert(
+            "always_text".into(),
+            text_peer_group("matrix.default", &["@bob:server"]),
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
         assert_eq!(
             sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
-            None
+            Some(true),
+            "a voice member's text message is still voiced"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_voice_msg("@bob:server")),
+            Some(false),
+            "a text member's voice note is still answered in text"
+        );
+    }
+
+    /// The verdict is bound to the one message it was computed for: a
+    /// member's voice note does not voice a non-member's reply in the same
+    /// room, nor the member's own next text message.
+    #[test]
+    fn matrix_mirror_verdicts_do_not_leak_between_senders_or_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_voice_msg("@alice:server")),
+            Some(true)
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@bob:server")),
+            None,
+            "a non-member in the same room keeps 'no opinion' when the channel \
+             has no voice group"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            Some(false),
+            "the member's next text message is answered in text"
+        );
+
+        // With a voice group also configured, the non-member gets the
+        // authoritative negative that every non-member on the channel gets.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let mut groups2 = std::collections::HashMap::new();
+        groups2.insert(
+            "family".into(),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        groups2.insert(
+            "always_voice".into(),
+            voice_peer_group("matrix.default", &["@carol:server"]),
+        );
+        let ctx2 = channel_runtime_context_with_peer_groups(tmp2.path(), groups2);
+
+        assert_eq!(
+            sender_prefers_voice(&ctx2, &matrix_voice_msg("@alice:server")),
+            Some(true)
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx2, &matrix_msg("@bob:server")),
+            Some(false),
+            "a non-member is an authoritative negative once a voice group exists"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx2, &matrix_msg("@alice:server")),
+            Some(false)
+        );
+    }
+
+    /// A sender named by an explicit `voice` or `text` group and by a `mirror`
+    /// group gets the explicit modality: `voice` first, then `text`, then
+    /// `mirror`, whatever the message's origin.
+    #[test]
+    fn explicit_modalities_beat_a_mirror_membership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            mirror_peer_group("matrix.default", &["@alice:server", "@bob:server"]),
+        );
+        groups.insert(
+            "always_voice".into(),
+            voice_peer_group("matrix.default", &["@alice:server"]),
+        );
+        groups.insert(
+            "always_text".into(),
+            text_peer_group("matrix.default", &["@bob:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            Some(true),
+            "voice membership voices a text message despite the mirror membership"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_voice_msg("@bob:server")),
+            Some(false),
+            "text membership keeps a voice note in text despite the mirror membership"
+        );
+    }
+
+    /// Mirror resolution is Matrix-only: another channel's mirror group is
+    /// left to that channel's own input-driven modality.
+    #[test]
+    fn mirror_groups_on_other_channels_are_not_answered_here() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            mirror_peer_group("telegram.default", &["@alice"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        let mut msg = telegram_msg("@alice");
+        msg.voice_origin = true;
+        assert_eq!(
+            sender_prefers_voice(&ctx, &msg),
+            None,
+            "a Telegram mirror member's voice note is 'no opinion'"
         );
     }
 
@@ -40190,6 +40870,7 @@ BTC is currently around $65,000 based on latest tool output."#
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         };
         run_message_dispatch_loop(rx, router, 1).await;
 
@@ -41729,6 +42410,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -41914,6 +42596,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         // Keep all three futures heap-backed to fit the Windows test-thread stack.
@@ -42438,6 +43121,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         })
     }
 
@@ -42932,6 +43616,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -42959,6 +43644,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 subject: None,
                 internal_sop_event: None,
                 references: Vec::new(),
+                voice_origin: false,
             },
             CancellationToken::new(),
         )
@@ -43091,6 +43777,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -43828,7 +44515,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels
@@ -43880,7 +44567,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels
@@ -43916,7 +44603,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -43947,7 +44634,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         assert!(
             channels.iter().any(|entry| entry.display_name == "Discord"),
@@ -43997,7 +44684,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
 
         let discord_channels: Vec<_> = channels
             .iter()
@@ -44054,7 +44741,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config.clone()));
-        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(
             channel_map.contains_key("discord.ops"),
@@ -44072,6 +44759,7 @@ This is an example JSON object for profile settings."#;
         let router = AgentRouter::multi(
             HashMap::from([("worker".to_string(), worker_ctx)]),
             owners,
+            None,
             None,
             None,
         );
@@ -44121,7 +44809,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(channel_map.contains_key("discord.ops"));
         assert!(
@@ -44285,7 +44973,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "email with no agent reference should not be collected"
@@ -44302,7 +44990,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels
                 .iter()
@@ -44331,7 +45019,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
             "enabled Signal without credentials must not be collected (would crashloop)"
@@ -44353,7 +45041,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels.iter().any(|entry| entry.display_name == "Signal"),
             "enabled Signal with credentials must be collected"
@@ -44376,7 +45064,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels
                 .iter()
@@ -44401,7 +45089,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels
                 .iter()
@@ -44885,7 +45573,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let entry = channels
             .iter()
             .find(|entry| entry.display_name == "VoiceWake")
@@ -46108,6 +46796,7 @@ This is an example JSON object for profile settings."#;
             ),
         );
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            sop_driver_sink: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig {
                 vision_model_provider: Some(format!("custom:{}", vision_server.uri())),
                 vision_model: Some("test-vision-model".to_string()),
@@ -46146,6 +46835,7 @@ This is an example JSON object for profile settings."#;
                 subject: None,
                 internal_sop_event: None,
                 references: Vec::new(),
+                voice_origin: false,
             },
             CancellationToken::new(),
         )
@@ -46618,6 +47308,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -46739,6 +47430,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -46904,6 +47596,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
@@ -47218,6 +47911,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -47377,6 +48071,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -47528,6 +48223,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -47699,6 +48395,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         process_channel_message(
@@ -47831,7 +48528,7 @@ This is an example JSON object for profile settings."#;
     fn bind_telegram_into_non_default_alias_is_resolvable() {
         let mut config = config_with_telegram_alias("alerts");
         let newly = bind_telegram_identity_into(&mut config, "123456789", "alerts").unwrap();
-        assert!(newly, "first bind should report newly added");
+        assert!(newly.is_some(), "first bind should report newly added");
         // The live resolver the channel uses must now see the identity.
         assert!(
             config
@@ -47872,9 +48569,15 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_telegram_into_is_idempotent() {
         let mut config = config_with_telegram_alias("alerts");
-        assert!(bind_telegram_identity_into(&mut config, "123", "alerts").unwrap());
         assert!(
-            !bind_telegram_identity_into(&mut config, "123", "alerts").unwrap(),
+            bind_telegram_identity_into(&mut config, "123", "alerts")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            bind_telegram_identity_into(&mut config, "123", "alerts")
+                .unwrap()
+                .is_none(),
             "second bind of same identity should report already present"
         );
         assert_eq!(
@@ -47909,7 +48612,11 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_channel_into_uses_scoped_dotted_channel_ref() {
         let mut config = config_with_telegram_alias("alerts");
-        assert!(bind_channel_identity_into(&mut config, "telegram", "alerts", "@user").unwrap());
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "@user")
+                .unwrap()
+                .is_some()
+        );
         let group = config
             .peer_groups
             .get("telegram_alerts")
@@ -47929,6 +48636,227 @@ This is an example JSON object for profile settings."#;
             config
                 .channel_external_peers("telegram", "other")
                 .is_empty()
+        );
+    }
+
+    /// Install an `ignore` entry on the peer group the bound alias resolves
+    /// from, the way an operator blocklisting an account would.
+    #[cfg(feature = "channel-telegram")]
+    fn ignore_identity_on(config: &mut Config, channel_type: &str, alias: &str, identity: &str) {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        config.peer_groups.insert(
+            format!("{channel_type}_{alias}_blocked"),
+            PeerGroupConfig {
+                channel: ChannelRef::new(format!("{channel_type}.{alias}")),
+                ignore: vec![PeerUsername::new(identity.to_string())],
+                ..PeerGroupConfig::default()
+            },
+        );
+    }
+
+    /// The CLI and the HTTP bind endpoint share this core, and the in-channel
+    /// `/bind` writers already refuse a write an `ignore` would shadow. This
+    /// core appended the grant and reported success, so the operator was told
+    /// the account was bound while the admission matcher still rejected it.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_an_identity_an_ignore_denies() {
+        let mut config = config_with_telegram_alias("alerts");
+        ignore_identity_on(&mut config, "telegram", "alerts", "123456789");
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("a denied identity must not report a successful bind");
+        assert!(
+            err.to_string().contains("ignore"),
+            "error should tell the operator what to edit, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("123456789"),
+            "identities are personal data and callers log this error: {err}"
+        );
+        assert!(
+            config
+                .peer_groups
+                .get("telegram_alerts")
+                .is_none_or(|g| g.external_peers.is_empty()),
+            "a refused bind must not leave a grant behind"
+        );
+        // The refusal is only honest if the identity really was inadmissible.
+        assert!(!crate::allowlist::is_user_allowed(
+            &config.channel_external_peers("telegram", "alerts"),
+            "123456789",
+            crate::allowlist::Match::Sensitive,
+        ));
+    }
+
+    /// A grant a deny shadows is not a usable binding either, so the
+    /// already-present answer would be just as false as the success one. This
+    /// is why the deny is checked before the idempotency short-circuit.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_denied_identity_that_is_already_granted() {
+        let mut config = config_with_telegram_alias("alerts");
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        ignore_identity_on(&mut config, "telegram", "alerts", "123456789");
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("a shadowed grant must be reported, not answered `already bound`");
+        assert!(err.to_string().contains("ignore"), "got: {err}");
+    }
+
+    /// The deny is matched with the channel's own identity rule, so the
+    /// spelling the operator reached for does not decide whether it lands.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_differently_spelled_deny() {
+        // Telegram strips a leading `@`, so `@zeroclaw_user` and
+        // `zeroclaw_user` are one account on both sides of the comparison.
+        for ignored in ["@zeroclaw_user", "zeroclaw_user"] {
+            for bound in ["@zeroclaw_user", "zeroclaw_user"] {
+                let mut config = config_with_telegram_alias("alerts");
+                ignore_identity_on(&mut config, "telegram", "alerts", ignored);
+                assert!(
+                    bind_channel_identity_into(&mut config, "telegram", "alerts", bound).is_err(),
+                    "`ignore = [\"{ignored}\"]` must refuse a bind of `{bound}`"
+                );
+            }
+        }
+    }
+
+    /// An unrelated `ignore` must not block a legitimate bind.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_still_binds_an_unignored_identity() {
+        let mut config = config_with_telegram_alias("alerts");
+        ignore_identity_on(&mut config, "telegram", "alerts", "999999999");
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        assert!(crate::allowlist::is_user_allowed(
+            &config.channel_external_peers("telegram", "alerts"),
+            "123456789",
+            crate::allowlist::Match::Sensitive,
+        ));
+    }
+
+    /// Peer-group map keys are arbitrary; the runtime authorizes by the
+    /// group's `channel` field. Selecting the write target by key therefore
+    /// appended the grant to whatever group happened to be named
+    /// `telegram_alerts`, even one bound to a different instance, and reported
+    /// success while the requested channel stayed unauthorized.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_does_not_write_through_a_mismatched_group_key() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.channels.telegram.insert(
+            "other".to_string(),
+            config.channels.telegram["alerts"].clone(),
+        );
+        // Conventional key for `alerts`, but bound to `other`.
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.other".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("the conventional key belongs to another channel");
+        assert!(
+            err.to_string().contains("telegram.other"),
+            "the error should name the channel ref that actually owns the key, got: {err}"
+        );
+        assert!(
+            config.peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "nothing may be written into another channel's group"
+        );
+        // And the other channel did not silently gain the peer either.
+        assert!(
+            config
+                .channel_external_peers("telegram", "other")
+                .is_empty()
+        );
+    }
+
+    /// The bare-type variant: a group keyed `telegram_alerts` carrying
+    /// `channel = "telegram"` reads for every alias, so appending there would
+    /// broaden the grant across all of them.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_bare_type_key_collision() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789").is_err()
+        );
+        assert!(
+            config.peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "a type-wide group must not be widened by an alias-scoped bind"
+        );
+    }
+
+    /// The write lands in the group the reader matches even when that group is
+    /// not the conventionally named one.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_writes_into_the_group_the_reader_matches() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.peer_groups.insert(
+            "some_other_name".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            config.peer_groups["some_other_name"].external_peers.len(),
+            1,
+            "the identity belongs in the group whose channel ref the reader matches"
+        );
+        assert!(
+            !config.peer_groups.contains_key("telegram_alerts"),
+            "no conventional group should be minted when one already reads for this channel"
+        );
+        assert!(
+            config
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"123456789".to_string())
         );
     }
 
@@ -48181,15 +49109,19 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:6:matrix:4:room:5:alice"
+        );
 
+        // Empty alias is treated like no alias by channel_scope.
         let empty_alias_msg = zeroclaw_api::channel::ChannelMessage {
             channel_alias: Some(String::new()),
             ..msg
         };
         assert_eq!(
             interruption_scope_key(&empty_alias_msg),
-            "matrix_room_alice"
+            "sender:6:matrix:4:room:5:alice"
         );
     }
 
@@ -48210,14 +49142,16 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:6:matrix:4:room:5:alice:8:$thread1"
+        );
     }
 
     #[test]
     fn interruption_scope_key_keeps_listeners_apart_when_underscores_collide() {
-        // Without escaping, `slack.work` + `room_x` and `slack.work_room` + `x`
-        // both render as `slack.work_room_x_alice`, which would let one
-        // listener's `/stop` cancel the other listener's turn.
+        // Without length-prefixed canonical encoding, `slack.work` + `room_x` and `slack.work_room` + `x`
+        // could collide across component boundaries.
         let scoped = |alias: &str, reply_target: &str| zeroclaw_api::channel::ChannelMessage {
             id: "1".into(),
             sender: "alice".into(),
@@ -48237,8 +49171,14 @@ This is an example JSON object for profile settings."#;
         let short_alias = interruption_scope_key(&scoped("work", "room_x"));
         let long_alias = interruption_scope_key(&scoped("work_room", "x"));
 
-        assert_eq!(short_alias, "slack.work_room__x_alice_1234567890.000100");
-        assert_eq!(long_alias, "slack.work__room_x_alice_1234567890.000100");
+        assert_eq!(
+            short_alias,
+            "sender:10:slack.work:6:room_x:5:alice:17:1234567890.000100"
+        );
+        assert_eq!(
+            long_alias,
+            "sender:15:slack.work_room:1:x:5:alice:17:1234567890.000100"
+        );
         assert_ne!(short_alias, long_alias);
     }
 
@@ -48260,7 +49200,10 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:5:slack:4:C123:5:alice"
+        );
     }
 
     /// Two listeners of the same channel type sharing one reply target must not
@@ -48284,7 +49227,10 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "slack.work_room_alice");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:10:slack.work:4:room:5:alice"
+        );
 
         let mut other_listener = msg.clone();
         other_listener.channel_alias = Some("personal".into());
@@ -48296,7 +49242,10 @@ This is an example JSON object for profile settings."#;
         // Without an alias the key keeps its historical raw form.
         let mut unaliased = msg.clone();
         unaliased.channel_alias = None;
-        assert_eq!(interruption_scope_key(&unaliased), "slack_room_alice");
+        assert_eq!(
+            interruption_scope_key(&unaliased),
+            "sender:5:slack:4:room:5:alice"
+        );
     }
 
     #[test]
@@ -48320,7 +49269,212 @@ This is an example JSON object for profile settings."#;
         // The scope id keeps its raw form; only the channel scope gains the alias.
         assert_eq!(
             interruption_scope_key(&msg),
-            "slack.work_C123_alice_$thread1"
+            "sender:10:slack.work:4:C123:5:alice:8:$thread1"
+        );
+    }
+
+    #[test]
+    fn interruption_scope_key_prevents_component_boundary_collision() {
+        // (irc.default, #room_, alice) and (irc.default, #room, _alice) previously both
+        // produced `irc.default_#room___alice` due to delimiter escaping.
+        // Length-prefixed encoding must keep them distinct for both Sender and ReplyTarget.
+        let irc_msg =
+            |target: &str, sender: &str, scope: zeroclaw_api::channel::ChannelConversationScope| {
+                zeroclaw_api::channel::ChannelMessage {
+                    id: "1".into(),
+                    sender: sender.into(),
+                    reply_target: target.into(),
+                    content: "hi".into(),
+                    channel: "irc".into(),
+                    channel_alias: Some("default".into()),
+                    timestamp: 0,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    conversation_scope: scope,
+                    attachments: vec![],
+                    subject: None,
+                    ..Default::default()
+                }
+            };
+
+        // Sender scope variants
+        let sender_room_underscore = irc_msg(
+            "#room_",
+            "alice",
+            zeroclaw_api::channel::ChannelConversationScope::Sender,
+        );
+        let sender_user_underscore = irc_msg(
+            "#room",
+            "_alice",
+            zeroclaw_api::channel::ChannelConversationScope::Sender,
+        );
+        assert_eq!(
+            interruption_scope_key(&sender_room_underscore),
+            "sender:11:irc.default:6:#room_:5:alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&sender_user_underscore),
+            "sender:11:irc.default:5:#room:6:_alice"
+        );
+        assert_ne!(
+            interruption_scope_key(&sender_room_underscore),
+            interruption_scope_key(&sender_user_underscore)
+        );
+
+        // ReplyTarget scope variants
+        let reply_room_underscore = irc_msg(
+            "#room_",
+            "alice",
+            zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+        );
+        let reply_user_underscore = irc_msg(
+            "#room",
+            "_alice",
+            zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+        );
+        assert_eq!(
+            interruption_scope_key(&reply_room_underscore),
+            "reply_target:11:irc.default:6:#room_:5:alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&reply_user_underscore),
+            "reply_target:11:irc.default:5:#room:6:_alice"
+        );
+        assert_ne!(
+            interruption_scope_key(&reply_room_underscore),
+            interruption_scope_key(&reply_user_underscore)
+        );
+
+        // Cross-scope: Sender vs ReplyTarget with identical components must never collide
+        assert_ne!(
+            interruption_scope_key(&sender_room_underscore),
+            interruption_scope_key(&reply_room_underscore)
+        );
+
+        // Leading and trailing underscores across all boundaries:
+        // 1. Channel scope boundary
+        let ch_underscore = zeroclaw_api::channel::ChannelMessage {
+            channel: "irc_default".into(),
+            channel_alias: None,
+            reply_target: "room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        let target_underscore = zeroclaw_api::channel::ChannelMessage {
+            channel: "irc".into(),
+            channel_alias: None,
+            reply_target: "_default_room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        assert_ne!(
+            interruption_scope_key(&ch_underscore),
+            interruption_scope_key(&target_underscore)
+        );
+
+        // 2. Sender vs scope_id boundary
+        let mut sender_underscore_trailing = sender_room_underscore.clone();
+        sender_underscore_trailing.sender = "alice_".into();
+        sender_underscore_trailing.interruption_scope_id = Some("thread".into());
+
+        let mut scope_underscore_leading = sender_room_underscore.clone();
+        scope_underscore_leading.sender = "alice".into();
+        scope_underscore_leading.interruption_scope_id = Some("_thread".into());
+
+        assert_ne!(
+            interruption_scope_key(&sender_underscore_trailing),
+            interruption_scope_key(&scope_underscore_leading)
+        );
+
+        // 3. None scope_id vs empty string scope_id vs non-empty scope_id
+        let mut msg_none = sender_room_underscore.clone();
+        msg_none.interruption_scope_id = None;
+
+        let mut msg_empty = sender_room_underscore.clone();
+        msg_empty.interruption_scope_id = Some("".into());
+
+        let mut msg_some = sender_room_underscore.clone();
+        msg_some.interruption_scope_id = Some("t".into());
+
+        assert_ne!(
+            interruption_scope_key(&msg_none),
+            interruption_scope_key(&msg_empty)
+        );
+        assert_ne!(
+            interruption_scope_key(&msg_none),
+            interruption_scope_key(&msg_some)
+        );
+        assert_ne!(
+            interruption_scope_key(&msg_empty),
+            interruption_scope_key(&msg_some)
+        );
+    }
+
+    /// Sibling scopes with boundary underscores (e.g. `(telegram.default, room_, alice)`
+    /// vs `(telegram.default, room, _alice)`) must not cancel each other's turn when /stop is sent.
+    #[tokio::test]
+    async fn message_dispatch_boundary_colliding_scopes_do_not_cancel_each_other() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            // Scope A: (telegram.default, room_, alice) starts an in-flight turn
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "m1".into(),
+                sender: "alice".into(),
+                reply_target: "room_".into(),
+                content: "please think slowly".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+            // Scope B: (telegram.default, room, _alice) sends /stop while Scope A is in flight.
+            // Delimiter-escaped keys collapsed both to `telegram.default_room___alice`.
+            // Canonical length-prefixed keys keep them distinct so Scope A continues.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "s1".into(),
+                sender: "_alice".into(),
+                reply_target: "room".into(),
+                content: "/stop".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let stop_no_task =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task");
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.contains("please think slowly")),
+            "Scope A turn must complete despite Scope B /stop: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.ends_with(&stop_no_task)),
+            "Scope B /stop must resolve to no task of its own: {sent:?}"
         );
     }
 
@@ -48414,6 +49568,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -50621,6 +51776,7 @@ Done."#;
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_sink: None,
         }
     }
 
@@ -50664,6 +51820,7 @@ Done."#;
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -50719,6 +51876,7 @@ Done."#;
         };
         let engine = Arc::new(Mutex::new(engine));
         let router = AgentRouter {
+            sop_driver_sink: None,
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: None,
@@ -51328,7 +52486,7 @@ mod omitted_feature_tests {
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             channels.iter().all(|c| c.display_name != "Telegram"),
             "Telegram must be absent from collect_configured_channels when \
