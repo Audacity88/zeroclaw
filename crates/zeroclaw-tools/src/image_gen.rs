@@ -526,14 +526,19 @@ impl Tool for ImageGenTool {
             });
         }
 
-        let mut result = self.generate(args).await?;
-        // A generated image saved to an ephemeral workspace never reaches the
-        // host and is lost at session end; warn loudly on success
-        if !self.persistent_writes && result.success {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
-        }
-        Ok(result)
+        let result = self.generate(args).await?;
+        Ok(warn_if_ephemeral(self.persistent_writes, result))
     }
+}
+
+/// A generated image saved to an ephemeral workspace never reaches the host
+/// and is lost at session end; warn loudly on success. The warning rewrites
+/// the text only: the declared image attachment must survive it.
+fn warn_if_ephemeral(persistent_writes: bool, mut result: ToolResult) -> ToolResult {
+    if !persistent_writes && result.success {
+        result.output.map_text(with_ephemeral_workspace_warning);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1048,6 +1053,40 @@ mod tests {
         assert_eq!(
             resolve_image_filename(Some("   "), 1_000),
             "generated_image_1000"
+        );
+    }
+
+    #[test]
+    fn ephemeral_warning_keeps_the_declared_attachment() {
+        let marker = RenderedMarker {
+            target: "/ws/images/generated_image_42.png".into(),
+            kind: MarkerKind::Image,
+        };
+        let generated = ToolResult {
+            success: true,
+            output: "File: /ws/images/generated_image_42.png".into(),
+            error: None,
+        }
+        .with_attachment(marker.clone());
+
+        let warned = warn_if_ephemeral(false, generated.clone());
+        assert!(
+            warned.output.contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must be present, got: {}",
+            warned.output
+        );
+        assert!(
+            warned
+                .output
+                .contains("File: /ws/images/generated_image_42.png")
+        );
+        assert_eq!(warned.output.attachments(), std::slice::from_ref(&marker));
+
+        let persistent = warn_if_ephemeral(true, generated);
+        assert!(!persistent.output.contains("EPHEMERAL WORKSPACE"));
+        assert_eq!(
+            persistent.output.attachments(),
+            std::slice::from_ref(&marker)
         );
     }
 

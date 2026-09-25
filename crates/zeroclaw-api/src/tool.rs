@@ -99,6 +99,13 @@ impl ToolOutput {
         std::mem::take(&mut self.attachments)
     }
 
+    /// Rewrite the display text in place, keeping the structured value and the
+    /// declared attachments. Use this instead of rebuilding the output from a
+    /// `String` (`.into()` goes through [`ToolOutput::text`], which drops both).
+    pub fn map_text(&mut self, f: impl FnOnce(&str) -> String) {
+        self.text = f(&self.text);
+    }
+
     /// The structured value, when the tool declared one.
     pub fn data(&self) -> Option<&serde_json::Value> {
         self.data.as_ref()
@@ -782,6 +789,21 @@ mod tests {
             with_ephemeral_workspace_warning(""),
             EPHEMERAL_WORKSPACE_WARNING
         );
+    }
+
+    #[test]
+    fn map_text_keeps_data_and_attachments() {
+        let marker = crate::media::RenderedMarker {
+            target: "/ws/images/out.png".into(),
+            kind: crate::media::MarkerKind::Image,
+        };
+        let mut output = ToolOutput::json_with_text(serde_json::json!({"k": 1}), "body")
+            .with_attachment(marker.clone());
+        output.map_text(with_ephemeral_workspace_warning);
+        assert!(output.as_str().starts_with(EPHEMERAL_WORKSPACE_WARNING));
+        assert!(output.as_str().ends_with("\n\nbody"));
+        assert_eq!(output.data(), Some(&serde_json::json!({"k": 1})));
+        assert_eq!(output.attachments(), std::slice::from_ref(&marker));
     }
 
     #[test]
