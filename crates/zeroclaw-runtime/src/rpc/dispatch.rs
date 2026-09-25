@@ -22219,7 +22219,8 @@ mod tests {
             Some(Arc::clone(&acp_store)),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-plan-replay".into());
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-plan-replay".into());
+        dispatcher.set_authenticated_for_test();
 
         let sid = "acp-reaped-plan";
         dispatcher
