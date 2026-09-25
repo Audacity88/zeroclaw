@@ -1306,9 +1306,9 @@ mod graceful_summary_metering_tests {
     // when the primary that receives the request verifies thinking
     // signatures — so the summary's text-only degrade path must keep the
     // envelope byte-identical too, not just the one-shot seam. The history
-    // carries a path-form marker in the user turn so the summary actually
-    // takes the degrade branch; the placeholder in the captured request is
-    // the probe that it ran.
+    // carries a path-form marker in an earlier user turn so the summary
+    // actually takes the carried-over-image degrade branch; the placeholder in
+    // the captured request is the probe that it ran.
     #[tokio::test]
     async fn graceful_summary_degrade_replays_signed_thinking_unmodified() {
         let user_marker = format!("[{}:{}]", "IMAGE", "/tmp/degrade.png");
@@ -1335,6 +1335,7 @@ mod graceful_summary_metering_tests {
                 })
                 .to_string(),
             ),
+            ChatMessage::user("continue without images"),
         ];
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
