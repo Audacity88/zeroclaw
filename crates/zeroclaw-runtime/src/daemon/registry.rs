@@ -28,6 +28,10 @@ pub type GatewayStarter = Box<
             Option<broadcast::Sender<Value>>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
+            // The daemon's canonical live pairing authority. Shared with
+            // the RPC native auth provider so /pair and revocation act on
+            // both surfaces at once; `None` only for standalone gateways.
+            Option<zeroclaw_config::pairing::PairingGuard>,
             Option<GatewayReadinessReporter>,
         ) -> StarterFuture
         + Send
@@ -63,12 +67,24 @@ pub struct DaemonRegistry {
     channels_start: Option<ChannelsStarter>,
     socket_start: Option<SocketStarter>,
     wss_start: Option<RpcStarter>,
+    relay_start: Option<RpcStarter>,
+    enroll_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
     /// Shared SOP engine built by the daemon reload loop. Passed through to
     /// RpcContext so RPC/TUI agent sessions share the same engine.
     sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    sop_driver_handles: Option<crate::sop::SopDriverHandles>,
 }
+
+/// The SOP wiring one daemon generation hands from `main` into the RPC
+/// context: the shared engine, the audit logger, and the generation's
+/// driver supervisor set.
+type SopWiring = (
+    Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    Option<Arc<crate::sop::SopAuditLogger>>,
+    Option<crate::sop::SopDriverHandles>,
+);
 
 impl DaemonRegistry {
     /// Create an empty registry. Missing starters are treated as unwired
@@ -115,6 +131,35 @@ impl DaemonRegistry {
         self.wss_start.is_some()
     }
 
+    pub fn register_relay(&mut self, starter: RpcStarter) -> &mut Self {
+        self.relay_start = Some(starter);
+        self
+    }
+
+    pub(crate) fn has_relay_start(&self) -> bool {
+        self.relay_start.is_some()
+    }
+
+    pub(crate) fn take_relay_start(&mut self) -> Option<RpcStarter> {
+        self.relay_start.take()
+    }
+
+    /// Register the certificate enrollment endpoint (the bootstrap surface a
+    /// certless client reaches for its first cert). Supervised like the WSS
+    /// listener; the starter parks when `[enroll]` is disabled.
+    pub fn register_enroll(&mut self, starter: RpcStarter) -> &mut Self {
+        self.enroll_start = Some(starter);
+        self
+    }
+
+    pub(crate) fn has_enroll_start(&self) -> bool {
+        self.enroll_start.is_some()
+    }
+
+    pub(crate) fn take_enroll_start(&mut self) -> Option<RpcStarter> {
+        self.enroll_start.take()
+    }
+
     pub fn register_mqtt(&mut self, starter: MqttStarter) -> &mut Self {
         self.mqtt_start = Some(starter);
         self
@@ -150,19 +195,20 @@ impl DaemonRegistry {
         &mut self,
         sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
         sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+        sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     ) -> &mut Self {
         self.sop_engine = sop_engine;
         self.sop_audit = sop_audit;
+        self.sop_driver_handles = sop_driver_handles;
         self
     }
 
-    pub(crate) fn take_sop_engine(
-        &mut self,
-    ) -> (
-        Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
-        Option<Arc<crate::sop::SopAuditLogger>>,
-    ) {
-        (self.sop_engine.take(), self.sop_audit.take())
+    pub(crate) fn take_sop_engine(&mut self) -> SopWiring {
+        (
+            self.sop_engine.take(),
+            self.sop_audit.take(),
+            self.sop_driver_handles.take(),
+        )
     }
 }
 
@@ -171,7 +217,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {
