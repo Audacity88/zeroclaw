@@ -15944,10 +15944,10 @@ mod tests {
             };
             let (result, successor) = tokio::join!(operation, replace);
             let err = result.expect_err(method);
-            assert_eq!(err.code, FORBIDDEN, "{method}: {}", err.message);
+            assert_eq!(err.code, SESSION_NOT_FOUND, "{method}: {}", err.message);
             assert!(
-                err.message.contains("not found or not owned"),
-                "{method}: uniform denial, got {}",
+                err.message.contains("Session changed while queued"),
+                "{method}: stale local incarnation, got {}",
                 err.message
             );
             assert_eq!(
@@ -23702,10 +23702,9 @@ mod tests {
             auth,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        (
-            RpcDispatcher::new(ctx, tx, "test-supervised-generation".to_string()),
-            clears,
-        )
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-supervised-generation".to_string());
+        dispatcher.set_authenticated_for_test();
+        (dispatcher, clears)
     }
 
     fn make_secret_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
@@ -28745,7 +28744,7 @@ mod tests {
         });
         let result = assert_rpc_blocks_on_config_write_lock(
             ctx,
-            async move { dispatcher.handle_config_set(&params).await },
+            async move { Box::pin(dispatcher.handle_config_set(&params)).await },
             "config/set must block on config_write_lock while it is held",
         )
         .await;
