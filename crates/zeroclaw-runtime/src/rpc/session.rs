@@ -108,6 +108,39 @@ pub struct RpcSession {
     /// binding never carries one, so the common path costs one `Option`
     /// check.
     pending_generation: Option<Arc<tokio::sync::Notify>>,
+
+    /// Owning principal for session isolation. `None` for sessions created
+    /// by unscoped connections (shared operator, admin): such sessions are
+    /// visible to unscoped connections and invisible to scoped principals.
+    pub owner_principal_id: Option<String>,
+}
+
+/// Where a session's durable row lives. Exactly one durable location is
+/// authoritative for a resolved session; readers and destroyers act on it and
+/// never search again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurableSession {
+    /// A chat-backend row under this exact storage key (`rpc_<id>`,
+    /// `gw_<id>`, or the raw id for channel sessions).
+    Chat { key: String },
+    /// A row in the dedicated ACP session store, keyed by the session UUID.
+    Acp,
+}
+
+/// The canonical resolution of a session id: the live incarnation (if any),
+/// the durable row (if any), and the ONE owner every located record agrees
+/// on. Built by the dispatcher's resolver, which refuses ids whose records
+/// disagree about their owner, so authorization and every subsequent read or
+/// destruction concern the same stored resource.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRecord {
+    /// Generation of the live incarnation, when one is present. Operations
+    /// re-validate this exact value at their admission boundary.
+    pub live_generation: Option<u64>,
+    /// The durable row, when one exists.
+    pub durable: Option<DurableSession>,
+    /// The owning principal; `None` for legacy / unscoped-creator records.
+    pub owner: Option<String>,
 }
 
 /// Canonical live-session data returned when `session/new` reattaches to an
@@ -123,6 +156,7 @@ pub struct ResumedRpcSession {
 pub(crate) enum ResumeExistingError {
     DifferentAgent,
     DifferentChatMode,
+    DifferentPrincipal,
     StaleIncarnation,
 }
 
@@ -131,6 +165,7 @@ impl ResumeExistingError {
         match self {
             Self::DifferentAgent => "session belongs to a different agent",
             Self::DifferentChatMode => "session uses a different chat mode",
+            Self::DifferentPrincipal => "session not found or not owned by this principal",
             Self::StaleIncarnation => "session changed while resuming",
         }
     }
@@ -158,6 +193,7 @@ impl RpcSession {
             owner_tui_id: None,
             generation: 0,
             pending_generation: None,
+            owner_principal_id: None,
         }
     }
 
@@ -173,6 +209,13 @@ impl RpcSession {
     /// Bind this session to a TUI owner.
     pub fn with_owner(mut self, tui_id: Option<String>) -> Self {
         self.owner_tui_id = tui_id;
+        self
+    }
+
+    /// Bind this session to its owning principal (scoped principals only;
+    /// unscoped connections pass `None`).
+    pub fn with_owner_principal(mut self, principal_id: Option<String>) -> Self {
+        self.owner_principal_id = principal_id;
         self
     }
 
@@ -393,7 +436,9 @@ impl SessionStore {
 
     /// Publish a newly constructed session only when no live incarnation is
     /// already present. `session/new` uses this at the external boundary so
-    /// two concurrent resume requests cannot replace one another.
+    /// two concurrent resume requests cannot replace one another, and so a
+    /// `session/new` can never replace (and thereby hijack) an existing
+    /// session's agent, whoever owns it.
     pub async fn insert_if_absent(
         &self,
         id: String,
@@ -453,6 +498,7 @@ impl SessionStore {
     /// `Agent`. A supplied session ID is a resume selector: when the live
     /// incarnation already exists, rebuilding it would fork provider history
     /// from an in-flight predecessor turn.
+    #[cfg(test)]
     pub(crate) async fn resume_existing(
         &self,
         id: &str,
@@ -461,6 +507,50 @@ impl SessionStore {
         owner_tui_id: Option<String>,
         expected_access: Option<(u64, Option<&str>)>,
     ) -> Result<Option<ResumedRpcSession>, ResumeExistingError> {
+        let result = self
+            .resume_existing_authorized(
+                id,
+                agent_alias,
+                chat_mode,
+                owner_tui_id,
+                None,
+                expected_access,
+                |_, _| Ok::<(), std::convert::Infallible>(()),
+            )
+            .await?;
+        Ok(result.map(|result| match result {
+            Ok(session) => session,
+            Err(never) => match never {},
+        }))
+    }
+
+    /// Reattach the live session `id` for a caller, claiming it for
+    /// `owner_tui_id`.
+    ///
+    /// `expected_principal` is the caller's authorization scope: `Some(id)` for a
+    /// scoped principal, who may rebind only to a live incarnation stamped
+    /// with that exact owner; `None` for an unscoped connection. The check
+    /// runs under the store lock against the record being rebound, so a
+    /// foreign incarnation installed after an earlier ownership read cannot
+    /// be adopted. A scoped mismatch is reported as absent, never as a
+    /// distinguishable denial.
+    ///
+    /// `authorize` then judges that record's agent alias and workspace before
+    /// anything changes, under the same lock that guards the claim, so a
+    /// caller it refuses neither takes ownership nor observes a session that
+    /// was swapped in after the check. Its refusal comes back as `Ok(Some(Err))`.
+    /// Ownership and binding are both required: one says the session is the
+    /// caller's, the other that the caller may still run it.
+    pub(crate) async fn resume_existing_authorized<E>(
+        &self,
+        id: &str,
+        agent_alias: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        owner_tui_id: Option<String>,
+        expected_principal: Option<&str>,
+        expected_access: Option<(u64, Option<&str>)>,
+        authorize: impl FnOnce(&str, &str) -> Result<(), E>,
+    ) -> Result<Option<Result<ResumedRpcSession, E>>, ResumeExistingError> {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(id) else {
             return if expected_access.is_some() {
@@ -469,6 +559,11 @@ impl SessionStore {
                 Ok(None)
             };
         };
+        if let Some(expected) = expected_principal
+            && session.owner_principal_id.as_deref() != Some(expected)
+        {
+            return Err(ResumeExistingError::DifferentPrincipal);
+        }
         if let Some((expected_generation, expected_owner)) = expected_access
             && (session.generation != expected_generation
                 || session.owner_tui_id.as_deref() != expected_owner)
@@ -481,6 +576,9 @@ impl SessionStore {
         if &session.chat_mode != chat_mode {
             return Err(ResumeExistingError::DifferentChatMode);
         }
+        if let Err(refused) = authorize(&session.agent_alias, &session.workspace_dir) {
+            return Ok(Some(Err(refused)));
+        }
 
         if owner_tui_id.is_some() {
             session.owner_tui_id = owner_tui_id;
@@ -491,12 +589,12 @@ impl SessionStore {
             .try_lock()
             .map(|agent| agent.history().len())
             .unwrap_or_default();
-        Ok(Some(ResumedRpcSession {
+        Ok(Some(Ok(ResumedRpcSession {
             agent: Arc::clone(&session.agent),
             agent_alias: session.agent_alias.clone(),
             workspace_dir: session.workspace_dir.clone(),
             message_count,
-        }))
+        })))
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -693,6 +791,19 @@ impl SessionStore {
     /// becomes a no-op.
     pub async fn get_generation(&self, id: &str) -> Option<u64> {
         self.sessions.lock().await.get(id).map(|s| s.generation)
+    }
+
+    /// The owning principal and generation of the LIVE incarnation under
+    /// `id`, read together under the store lock. Ownership is a property of
+    /// one incarnation: an operation that authorized against generation `g`
+    /// must find this exact pair again at its admission boundary, or the
+    /// record it authorized is not the record it is about to act on.
+    pub async fn owner_and_generation(&self, id: &str) -> Option<(Option<String>, u64)> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|s| (s.owner_principal_id.clone(), s.generation))
     }
 
     /// Await the test-only pause gate before validating generation in
@@ -1145,6 +1256,27 @@ impl SessionStore {
         removed
     }
 
+    /// Remove the live incarnation under `id` only if it is still the one
+    /// with `generation`. A successor installed under the same id after the
+    /// caller authorized its predecessor is left untouched, and the caller
+    /// learns the removal did not happen.
+    pub async fn remove_generation(&self, id: &str, generation: u64) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(id).is_none_or(|s| s.generation != generation) {
+            return false;
+        }
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
+            self.record_cancel_cause(id, CancelCause::SessionRemoved);
+            token.cancel();
+        }
+        sessions.remove(id).is_some()
+    }
+
     pub async fn evict_same_mode_sibling(
         &self,
         tui_id: &str,
@@ -1192,6 +1324,15 @@ impl SessionStore {
     pub async fn session_owner_tui_id(&self, session_id: &str) -> Option<Option<String>> {
         let sessions = self.sessions.lock().await;
         sessions.get(session_id).map(|s| s.owner_tui_id.clone())
+    }
+
+    /// Read the owning-principal stamp from a LIVE session. Same tri-state
+    /// contract as [`Self::session_owner_tui_id`].
+    pub async fn session_owner_principal(&self, session_id: &str) -> Option<Option<String>> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .map(|s| s.owner_principal_id.clone())
     }
 
     /// Capture the incarnation and owner checked by a session-scoped request.
@@ -1416,6 +1557,25 @@ impl SessionStore {
             notify.notify_waiters();
         }
         removed
+    }
+
+    /// [`Self::kill_session`] bound to one incarnation: kills only if the
+    /// live record under `id` still carries `generation`.
+    pub async fn kill_session_generation(&self, id: &str, generation: u64) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(id).is_none_or(|s| s.generation != generation) {
+            return false;
+        }
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
+            self.record_cancel_cause(id, CancelCause::AdminKill);
+            token.cancel();
+        }
+        sessions.remove(id).is_some()
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately

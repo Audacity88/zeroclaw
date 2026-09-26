@@ -1061,8 +1061,13 @@ impl AcpServer {
             let sid = session_id.clone();
             let alias = agent_alias.clone();
             let wsd = workspace_dir.clone();
+            // The orchestrator ACP transport (CLI/IDE-native) carries no
+            // authenticated gateway principal, so these sessions are stamped
+            // with a NULL owner -- visible only to unscoped connections, never
+            // to a scoped gateway principal (RFC 7141 F2).
             let created =
-                tokio::task::spawn_blocking(move || store.create_session(&sid, &alias, &wsd)).await;
+                tokio::task::spawn_blocking(move || store.create_session(&sid, &alias, &wsd, None))
+                    .await;
             let error = match created {
                 Ok(Ok(_)) => None,
                 Ok(Err(e)) => Some(e.to_string()),
@@ -3984,7 +3989,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-acp-usage-order";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
@@ -5212,7 +5222,12 @@ mod tests {
 
         let session_id = "sess-restore-ignores-conn-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5293,7 +5308,12 @@ mod tests {
 
         let session_id = "sess-restore-missing-config-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5333,7 +5353,12 @@ mod tests {
 
         let session_id = "sess-resume-disabled-owner";
         store
-            .create_session(session_id, "agent-alpha", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "agent-alpha",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5372,7 +5397,12 @@ mod tests {
 
         let session_id = "sess-resume-ignores-conn-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -7023,7 +7053,12 @@ mod tests {
 
         let session_id = "sess-load-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -7091,7 +7126,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-load-trimmed-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -7173,7 +7213,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-load-crumb-replay";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let crumb = ConversationMessage::Chat(ChatMessage::user(
             zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string(),
@@ -7267,7 +7312,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-failed-turn-persist";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         // User prompt + a completed tool call/result that was already shown to
@@ -7448,7 +7498,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-failed-turn-incomplete-tool";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         // This is the durable shape left by a failure after the model emitted
@@ -7682,7 +7737,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "same-shape-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let before = vec![
             ConversationMessage::Chat(ChatMessage::user(
@@ -7754,7 +7814,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "session-load-restore-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let over_cap = vec![
             ConversationMessage::Chat(ChatMessage::user("turn one request")),
@@ -7819,7 +7884,12 @@ mod tests {
         let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "session-resume-restore-trim";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         let over_cap = vec![
             ConversationMessage::Chat(ChatMessage::user("turn one request")),
@@ -7894,7 +7964,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-replace-not-append";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let old_turn = vec![
@@ -8129,7 +8204,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-resume-sanitize";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         // A failed turn left an unmatched native call...
         store
@@ -8225,7 +8305,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-replay-vs-seed";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -8319,7 +8404,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-rejected-image";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -8419,7 +8509,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cross-locale-failed-turn";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -8742,7 +8837,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-carrier-failed-turn";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -9037,7 +9137,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-trim-repair-alignment";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -9430,7 +9535,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cancelled-turn";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -10168,7 +10278,12 @@ mod tests {
         // Create and load the session once to put it in memory
         let session_id = "sess-already-active";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         server
             .handle_session_load(&serde_json::json!({
@@ -10221,7 +10336,7 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cross-agent-load";
         store
-            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -10264,7 +10379,7 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cross-agent-resume";
         store
-            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -10320,7 +10435,12 @@ mod tests {
 
         let session_id = "sess-resume-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -10368,7 +10488,12 @@ mod tests {
 
         let session_id = "sess-resume-plan";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         // A durable plan exists from a prior turn.
         store
@@ -10504,7 +10629,7 @@ mod tests {
         // Pre-create a stored session that we'll attempt to load
         let stored_id = "sess-load-limit-test";
         store
-            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -10548,7 +10673,7 @@ mod tests {
         // Pre-create a stored session that we'll attempt to resume
         let stored_id = "sess-resume-limit-test";
         store
-            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -10591,7 +10716,12 @@ mod tests {
 
         let session_id = "sess-load-store-err";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         // Drop the schema via a second connection to force a "no such table"
@@ -10648,7 +10778,12 @@ mod tests {
 
         let session_id = "sess-resume-store-err";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let db_path = cwd.path().join("sessions/acp-sessions.db");

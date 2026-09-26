@@ -727,9 +727,20 @@ pub async fn run_with_authority(
     let tui_registry =
         std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
 
+    // Canonical live pairing authority for this daemon generation. The
+    // gateway serves /pair, rotation, and revocation from THIS instance
+    // and the RPC native auth provider verifies against it, so a pairing
+    // change reaches both surfaces immediately (no boot-time snapshot).
+    let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+        config.gateway.require_pairing,
+        &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
+    ));
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
+        let gateway_pairing = pairing_guard.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
         let gateway_reload_controls = GatewayReloadControls {
@@ -754,6 +765,7 @@ pub async fn run_with_authority(
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
                 let live_config_authority = gateway_live_config_authority.clone();
+                let pairing = gateway_pairing.as_ref().clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 async move {
@@ -766,6 +778,7 @@ pub async fn run_with_authority(
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
+                        Some(pairing),
                         readiness_reporter,
                     )
                     .await
@@ -854,7 +867,7 @@ pub async fn run_with_authority(
         || registry.has_enroll_start();
 
     // Extract shared SOP engine from registry for RpcContext.
-    let (sop_engine, sop_audit) = registry.take_sop_engine();
+    let (sop_engine, sop_audit, sop_driver_handles) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -983,6 +996,15 @@ pub async fn run_with_authority(
 
         let (rpc_config, rpc_config_write_lock) =
             RpcContext::config_handles_for_authority(&live_config_authority);
+        let rpc_auth = std::sync::Arc::new(
+            crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
+                |e| {
+                    anyhow::Error::msg(format!(
+                        "building the RPC inbound authentication layer: {e:#}"
+                    ))
+                },
+            )?,
+        );
 
         Some(std::sync::Arc::new(RpcContext {
             #[cfg(test)]
@@ -1011,8 +1033,10 @@ pub async fn run_with_authority(
             acp_session_store,
             sop_engine,
             sop_audit,
+            sop_driver_handles,
             hooks,
             cert_audit,
+            auth: rpc_auth,
         }))
     } else {
         None
@@ -4087,6 +4111,7 @@ mod tests {
                   event_tx,
                   reload_controls,
                   tui_registry,
+                  _pairing,
                   _ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
@@ -4414,7 +4439,7 @@ mod tests {
             })
         }));
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _authority, _events, controls, _tui, _ready| {
+            move |_host, _port, _config, _authority, _events, controls, _tui, _pairing, _ready| {
                 let reload_sent = reload_sent.clone();
                 let session_ready = session_ready.clone();
                 Box::pin(async move {
@@ -4539,6 +4564,7 @@ mod tests {
                   _event_tx,
                   reload_controls,
                   _tui_reg,
+                  _pairing,
                   _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
@@ -6797,6 +6823,7 @@ mod tests {
                   _event_tx,
                   reload_controls,
                   _tui_reg,
+                  _pairing,
                   _ready_tx| {
                 let accepted = accepted.clone();
                 Box::pin(async move {
