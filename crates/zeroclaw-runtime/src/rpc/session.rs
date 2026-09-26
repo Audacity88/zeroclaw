@@ -1,6 +1,6 @@
 //! RPC session state.
 
-use crate::agent::agent::{Agent, TurnEvent};
+use crate::agent::agent::{Agent, SteeringMessage, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -233,7 +233,7 @@ pub struct SessionStore {
     /// Steering sender of each session's running turn, keyed by the same
     /// generation as its cancel token so the turn's exit removes exactly its
     /// own entry.
-    steering: std::sync::Mutex<HashMap<String, (u64, tokio::sync::mpsc::Sender<String>)>>,
+    steering: std::sync::Mutex<HashMap<String, (u64, tokio::sync::mpsc::Sender<SteeringMessage>)>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
     /// Monotonic counter incremented on every `insert` that installs or
@@ -1385,7 +1385,7 @@ impl SessionStore {
         &self,
         id: &str,
         generation: u64,
-        sender: tokio::sync::mpsc::Sender<String>,
+        sender: tokio::sync::mpsc::Sender<SteeringMessage>,
     ) {
         self.steering
             .lock()
@@ -1395,6 +1395,14 @@ impl SessionStore {
 
     /// Queue a steering message for the session's running turn.
     pub fn steer_session(&self, id: &str, content: String) -> SteerOutcome {
+        self.steer_session_with_provenance(id, SteeringMessage::unknown(content))
+    }
+
+    pub(crate) fn steer_session_with_provenance(
+        &self,
+        id: &str,
+        message: SteeringMessage,
+    ) -> SteerOutcome {
         let sender = self
             .steering
             .lock()
@@ -1404,7 +1412,7 @@ impl SessionStore {
         let Some(sender) = sender else {
             return SteerOutcome::NoActiveTurn;
         };
-        match sender.try_send(content) {
+        match sender.try_send(message) {
             Ok(()) => SteerOutcome::Accepted,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => SteerOutcome::QueueFull,
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => SteerOutcome::NoActiveTurn,

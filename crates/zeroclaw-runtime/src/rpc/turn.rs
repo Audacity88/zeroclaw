@@ -1,6 +1,8 @@
 //! Shared turn execution. Single source of truth for spawn-drain-cancel.
 
-use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
+use crate::agent::agent::{
+    Agent, SteeringMessage, StreamedTurnError, StreamedTurnSuccess, TurnEvent,
+};
 use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
 use crate::rpc::types::{ProviderUsageTotals, TurnUsageTotals};
@@ -84,6 +86,65 @@ where
     F: Fn(TurnEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    execute_turn_impl(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        steering_rx.map(SteeringReceiver::Legacy),
+        on_event,
+    )
+    .await
+}
+
+pub(crate) async fn execute_turn_with_provenance<F, Fut>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<SteeringMessage>>,
+    on_event: F,
+) -> Result<TurnOutcome, TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    execute_turn_impl(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        steering_rx.map(SteeringReceiver::Stamped),
+        on_event,
+    )
+    .await
+}
+
+enum SteeringReceiver {
+    Legacy(mpsc::Receiver<String>),
+    Stamped(mpsc::Receiver<SteeringMessage>),
+}
+
+async fn execute_turn_impl<F, Fut>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<SteeringReceiver>,
+    on_event: F,
+) -> Result<TurnOutcome, TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
@@ -108,18 +169,42 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
+            let run_turn = async {
+                match steering_rx.as_mut() {
+                    Some(SteeringReceiver::Legacy(rx)) => {
+                        guard
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_clone),
+                                Some(rx),
+                            )
+                            .await
+                    }
+                    Some(SteeringReceiver::Stamped(rx)) => {
+                        guard
+                            .turn_streamed_with_steering_provenance_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_clone),
+                                Some(rx),
+                            )
+                            .await
+                    }
+                    None => {
+                        guard
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_clone),
+                                None,
+                            )
+                            .await
+                    }
+                }
+            };
             TOOL_LOOP_COST_TRACKING_CONTEXT
-                .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            steering_rx.as_mut(),
-                        )
-                        .instrument(span),
-                )
+                .scope(cost_context, run_turn.instrument(span))
                 .await
         })
         .await

@@ -3,14 +3,14 @@
 use super::context::{ConfigWriteGuard, RpcContext};
 use super::session::DurableSession;
 use super::transport::RpcTransport;
-use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
+use super::turn::{TurnAttribution, TurnOutcome, execute_turn_with_provenance};
 use super::types::*;
 
 const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-use crate::agent::agent::TurnEvent;
+use crate::agent::agent::{SteeringMessage, TurnEvent};
 use crate::sop::SopGraphExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
@@ -4835,7 +4836,7 @@ impl RpcDispatcher {
             .register_cancel_token_guard(sid, cancel.clone());
         // Steering shares the cancel token's generation, so the same exit
         // that unregisters the token closes this turn to steering.
-        let (steering_tx, steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+        let (steering_tx, steering_rx) = tokio::sync::mpsc::channel::<SteeringMessage>(32);
         if let Some(generation) = cancel_registration.generation() {
             self.ctx
                 .sessions
@@ -5148,7 +5149,7 @@ impl RpcDispatcher {
             super::turn::TurnUsageFold::default(),
         ));
         let usage_fold_for_events = Arc::clone(&usage_fold);
-        let turn = execute_turn(
+        let turn = execute_turn_with_provenance(
             agent,
             prompt.clone(),
             cancel.clone(),
@@ -5827,11 +5828,20 @@ impl RpcDispatcher {
         }
         self.authorize_session_owner(&req.session_id, Method::SessionSteer)
             .await?;
-        match self
-            .ctx
-            .sessions
-            .steer_session(&req.session_id, req.content)
-        {
+        match self.ctx.sessions.steer_session_with_provenance(
+            &req.session_id,
+            SteeringMessage::known(
+                req.content,
+                IngressContext {
+                    message_id: None,
+                    source_class: SourceClass::External,
+                    sender: self.owner_principal_id(),
+                    transport: Transport::Rpc,
+                    trust: TrustClass::Untrusted,
+                    origin: TurnOrigin::Interactive,
+                },
+            ),
+        ) {
             crate::rpc::session::SteerOutcome::Accepted => to_result(SessionSteerResult {
                 session_id: req.session_id,
                 accepted: true,
@@ -15566,6 +15576,76 @@ mod tests {
             .await
             .expect_err("still not bob's");
         assert_eq!(err.code, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn session_steer_stamps_the_acting_principal_not_the_session_owner() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "carol".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4444),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "a-steer",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("alice creates her session");
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        sessions.register_steering("a-steer", 1, sender);
+        let result = carol
+            .handle_session_steer(&json!({"session_id": "a-steer", "content": "admin correction"}))
+            .await
+            .expect("the administrator may steer another owner's session");
+        assert_eq!(result["accepted"], json!(true));
+
+        let message = receiver.try_recv().expect("RPC steering was queued");
+        let ingress = message
+            .ingress()
+            .expect("authorized RPC steering has provenance");
+        assert_eq!(message.content(), "admin correction");
+        assert_eq!(ingress.sender.as_deref(), Some("user:carol"));
+        assert_eq!(ingress.transport, Transport::Rpc);
+        assert_eq!(ingress.source_class, SourceClass::External);
+        assert_eq!(ingress.trust, TrustClass::Untrusted);
+        assert_eq!(
+            sessions.session_owner_principal("a-steer").await,
+            Some(Some("user:alice".into()))
+        );
+
+        assert_eq!(
+            sessions.steer_session("a-steer", "legacy correction".into()),
+            crate::rpc::session::SteerOutcome::Accepted,
+        );
+        let legacy = receiver.try_recv().expect("legacy steering was queued");
+        assert_eq!(legacy.content(), "legacy correction");
+        assert!(
+            legacy.ingress().is_none(),
+            "legacy strings have unknown provenance"
+        );
     }
 
     /// Durable owner identity is separate from the administrator bypass: an
