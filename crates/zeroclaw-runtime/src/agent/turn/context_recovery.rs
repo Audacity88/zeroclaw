@@ -283,7 +283,9 @@ mod tests {
         assert!(!json.contains("private reasoning"));
         let tmp = tempfile::TempDir::new().unwrap();
         let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
-        store.create_session("typed-trim", "agent", "/tmp").unwrap();
+        store
+            .create_session("typed-trim", "agent", "/tmp", None)
+            .unwrap();
         store
             .persist_retained_context_seed("typed-trim", &first.retained_messages, first.breadcrumb)
             .unwrap();
