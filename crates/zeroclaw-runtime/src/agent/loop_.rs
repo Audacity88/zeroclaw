@@ -19498,9 +19498,10 @@ Let me check the result."#;
             }
             if summary {
                 assert_eq!(next.schema_tokens, 0, "the summary is tools-free");
+                let mut tail = next.messages.iter().rev();
+                assert_eq!(tail.next().unwrap().content, "hook suffix");
                 assert!(
-                    next.messages
-                        .last()
+                    tail.next()
                         .unwrap()
                         .content
                         .starts_with("Agent exceeded maximum tool iterations")
