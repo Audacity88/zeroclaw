@@ -2,6 +2,7 @@
 //! LLM for a tools-free final summary (with step timeout + cancel select)
 //! and return it appended to the accumulated display text, or bail.
 
+use super::StreamDelta;
 use super::execution::SettledAttemptSummary;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
@@ -73,6 +74,7 @@ pub(crate) async fn finish_after_max_iterations(
     turn_id: &str,
     knobs: &LoopKnobs,
     event_tx: Option<&Sender<TurnEvent>>,
+    on_delta: Option<&Sender<StreamDelta>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     config: Option<&Config>,
     multimodal_config: &MultimodalConfig,
@@ -461,6 +463,9 @@ pub(crate) async fn finish_after_max_iterations(
     // narration earlier iterations already streamed, and resending it here
     // would duplicate it in the client.
     super::events::emit_posthoc_turn_chunk(event_tx, &segment).await;
+    if let Some(tx) = on_delta {
+        let _ = tx.send(StreamDelta::Text(segment.clone())).await;
+    }
     accumulated_display_text.push_str(&segment);
     Ok(accumulated_display_text)
 }
@@ -469,7 +474,7 @@ pub(crate) async fn finish_after_max_iterations(
 mod graceful_summary_metering_tests {
     use super::{CompletionLimit, finish_after_max_iterations};
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
-    use crate::agent::turn::LoopKnobs;
+    use crate::agent::turn::{LoopKnobs, StreamDelta};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -537,6 +542,7 @@ mod graceful_summary_metering_tests {
         provider: &dyn ModelProvider,
         accumulated_display_text: String,
         event_tx: Option<&Sender<TurnEvent>>,
+        on_delta: Option<&Sender<StreamDelta>>,
     ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
@@ -556,6 +562,7 @@ mod graceful_summary_metering_tests {
             "trace-req-test",
             &knobs,
             event_tx,
+            on_delta,
             None,
             None,
             &multimodal_config,
@@ -570,7 +577,7 @@ mod graceful_summary_metering_tests {
     }
 
     async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
-        run_summary_with_events(provider, String::new(), None).await
+        run_summary_with_events(provider, String::new(), None, None).await
     }
 
     // The graceful summary now routes through the metered provider seam: under a
@@ -620,7 +627,7 @@ mod graceful_summary_metering_tests {
         let out = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(ctx),
-                run_summary_with_events(&provider, String::new(), Some(&event_tx)),
+                run_summary_with_events(&provider, String::new(), Some(&event_tx), None),
             )
             .await
             .expect("graceful summary should succeed");
@@ -949,6 +956,7 @@ mod graceful_summary_metering_tests {
                 Some(&tx),
                 None,
                 None,
+                None,
                 &MultimodalConfig::default(),
                 None,
                 None,
@@ -1037,6 +1045,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
+            None,
             &multimodal_config,
             None,
             None,
@@ -1109,6 +1118,7 @@ mod graceful_summary_metering_tests {
             String::new(),
             "trace-req-img-drop",
             &knobs,
+            None,
             None,
             None,
             None,
@@ -1188,6 +1198,7 @@ mod graceful_summary_metering_tests {
             String::new(),
             "trace-req-img-inline",
             &knobs,
+            None,
             None,
             None,
             None,
@@ -1278,6 +1289,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
+            None,
             &multimodal_config,
             None,
             None,
@@ -1363,6 +1375,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             None,
+            None,
             &multimodal_config,
             None,
             None,
@@ -1401,19 +1414,32 @@ mod graceful_summary_metering_tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
 
-        let out = run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
-            .await
-            .expect("graceful summary should succeed");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<StreamDelta>(8);
+        let out = run_summary_with_events(
+            &provider,
+            "earlier narration".to_string(),
+            Some(&tx),
+            Some(&delta_tx),
+        )
+        .await
+        .expect("graceful summary should succeed");
 
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
 
-        let mut chunk_delta = None;
+        let mut chunk_deltas = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let TurnEvent::Chunk { delta } = event {
-                chunk_delta = Some(delta);
+                chunk_deltas.push(delta);
             }
         }
-        let delta = chunk_delta.expect("max-iteration exit must emit a TurnEvent::Chunk");
+        assert_eq!(
+            chunk_deltas.len(),
+            1,
+            "max-iteration exit must emit exactly one TurnEvent::Chunk"
+        );
+        let delta = chunk_deltas
+            .pop()
+            .expect("max-iteration exit must emit a TurnEvent::Chunk");
         assert!(
             delta.contains("wrap-up summary"),
             "chunk must carry the summary text: {delta}"
@@ -1425,6 +1451,14 @@ mod graceful_summary_metering_tests {
         assert!(
             !delta.contains("earlier narration"),
             "chunk must not re-send narration already streamed in earlier iterations: {delta}"
+        );
+        assert!(matches!(
+            delta_rx.recv().await,
+            Some(StreamDelta::Text(draft_delta)) if draft_delta == delta
+        ));
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "summary must emit one draft delta"
         );
     }
 
@@ -1476,7 +1510,7 @@ mod graceful_summary_metering_tests {
             text: raw.to_string(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
-        run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
+        run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx), None)
             .await
             .expect("graceful summary should succeed");
         let mut chunk_delta = None;
