@@ -4062,7 +4062,11 @@ mod tests {
     /// At the cap, one new image rewrites exactly the oldest image-bearing
     /// message; an image-free follow-up produces a byte-identical provider
     /// view; the next new image evicts the next-oldest image. This pins the
-    /// bounded, deterministic eviction the cap events report.
+    /// bounded, deterministic eviction the cap events report, for persistent
+    /// user images with age trimming disabled and no tool-result images.
+    /// Outside that scope, a current-turn tool image going stale undoes its
+    /// eviction of a user image on the next turn, and `max_image_turns` can
+    /// age out an image on an image-free turn.
     #[tokio::test]
     async fn image_cap_eviction_is_bounded_and_prefix_stable() {
         let temp = tempfile::tempdir().unwrap();
