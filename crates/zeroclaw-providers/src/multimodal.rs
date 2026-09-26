@@ -1146,6 +1146,10 @@ async fn prepare_messages_inner(
         let trimmed = trim_images_by_age(&normalized_messages, config.max_image_turns);
         let after = count_image_markers(&trimmed);
         if after < before {
+            // Indices into this preparation's message list, zero-based,
+            // system message included: the span the age trim rewrote in this
+            // request, relative to this same preparation's untrimmed input.
+            let span = trimmed_span(&normalized_messages, &trimmed);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1154,10 +1158,8 @@ async fn prepare_messages_inner(
                         "images_before": before,
                         "images_after": after,
                         "images_dropped": before - after,
-                        "earliest_mutated_index": first_changed_message(
-                            &normalized_messages,
-                            &trimmed,
-                        ),
+                        "first_trimmed_index": span.map(|s| s.0),
+                        "last_trimmed_index": span.map(|s| s.1),
                     })),
                 "multimodal: age-trimmed old images from conversation history"
             );
@@ -1169,13 +1171,17 @@ async fn prepare_messages_inner(
 
     // Apply the per-request image cap after normalization so failed image refs
     // do not consume budget and evict older images that could still be sent.
-    // The trim runs before the event so its attrs can name the first mutated
-    // message: a provider prompt cache is rewritten from that message to the
-    // end of history on this request, and the index attributes that cost.
+    // The trim runs before the event so its attrs can name the span of
+    // messages this request's trim rewrote; see `trimmed_span` for what the
+    // indices mean and how consecutive events relate.
     let capped_messages = if has_successful_images && count_image_markers(&age_trimmed) > max_images
     {
         let images_before_cap = count_image_markers(&age_trimmed);
         let trimmed = trim_old_images(&age_trimmed, max_images);
+        // Indices into this preparation's message list, zero-based, system
+        // message included: the span the cap trim rewrote in this request,
+        // relative to this same preparation's untrimmed input.
+        let span = trimmed_span(&age_trimmed, &trimmed);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1183,7 +1189,8 @@ async fn prepare_messages_inner(
                 .with_attrs(::serde_json::json!({
                     "images_after_normalization": images_before_cap,
                     "max_images": max_images,
-                    "earliest_mutated_index": first_changed_message(&age_trimmed, &trimmed),
+                    "first_trimmed_index": span.map(|s| s.0),
+                    "last_trimmed_index": span.map(|s| s.1),
                     "images_evicted": images_before_cap - count_image_markers(&trimmed),
                 })),
             "multimodal: post-normalization image cap exceeded — trimming oldest images"
@@ -1301,16 +1308,23 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
         .collect()
 }
 
-/// First index whose role or content differs between the pre-trim and
-/// post-trim history. `None` when a trim left every message untouched; a
-/// provider prompt cache is rewritten from the first changed message to the
-/// end of history, so trim events name that index to attribute the rewrite
-/// cost to the trim that caused it.
-fn first_changed_message(before: &[ChatMessage], after: &[ChatMessage]) -> Option<usize> {
+/// First and last index whose role or content differs between a trim's
+/// stage input and its stage output, or `None` when the trim changed
+/// nothing. Both indices are into this preparation's message list,
+/// zero-based, system message included: the span names what the trim
+/// rewrote in THIS request, relative to that same request's own untrimmed
+/// input. The comparison never touches the previous request, and the event
+/// itself does not know it. Consecutive events for one conversation can
+/// still be compared by a reader: a `last_trimmed_index` that grew alongside
+/// a grown `images_evicted` marks the request whose new image moved the
+/// eviction frontier, while an unchanged pair means no new rewrite.
+fn trimmed_span(before: &[ChatMessage], after: &[ChatMessage]) -> Option<(usize, usize)> {
+    let differs = |(a, b): (&ChatMessage, &ChatMessage)| a.role != b.role || a.content != b.content;
     before
         .iter()
         .zip(after.iter())
-        .position(|(a, b)| a.role != b.role || a.content != b.content)
+        .position(differs)
+        .zip(before.iter().zip(after.iter()).rposition(differs))
 }
 
 /// Drop the `drop_here` oldest image markers from `text`, keeping the newest.
@@ -4135,10 +4149,10 @@ mod tests {
         let p3 = prepare_messages_for_provider(&history, &config)
             .await
             .unwrap();
-        let d3 = first_changed_message(&p2.messages, &p3.messages);
+        let d3 = trimmed_span(&p2.messages, &p3.messages);
         assert_eq!(
             d3,
-            Some(3),
+            Some((3, 3)),
             "sixth image mutates the second-oldest image message"
         );
         assert_eq!(p3.messages[3].content, "[image removed from history]");
@@ -4152,6 +4166,16 @@ mod tests {
         let mut rx = zeroclaw_log::subscribe_or_install();
         while rx.try_recv().is_ok() {}
 
+        // A failing assertion must not skip the hook cleanup, so the clear
+        // lives in a drop guard rather than a trailing call.
+        struct HookCleanup;
+        impl Drop for HookCleanup {
+            fn drop(&mut self) {
+                zeroclaw_log::clear_broadcast_hook();
+            }
+        }
+        let _cleanup = HookCleanup;
+
         let temp = tempfile::tempdir().unwrap();
         let png_data = [
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
@@ -4160,37 +4184,46 @@ mod tests {
             0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
             0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
-        let config = MultimodalConfig {
-            max_images: 4,
-            max_image_size_mb: 5,
-            allow_remote_fetch: false,
-            max_image_turns: 0,
-            ..Default::default()
-        };
         let img = |i: usize| {
             let p = temp.path().join(format!("img{i}.png"));
             std::fs::write(&p, png_data).unwrap();
             p
         };
-        let mut history = vec![ChatMessage::system("sys")];
-        for i in 0..5 {
-            let content = if i == 1 {
-                format!("[IMAGE:{}]", img(i).display())
-            } else {
-                format!("[IMAGE:{}]\ncaption {i}", img(i).display())
-            };
-            history.push(ChatMessage::user(content));
-            history.push(ChatMessage::assistant(format!("saw {i}")));
-        }
+        // One image-only turn (i == 1), captioned turns otherwise, each
+        // answered; the image-only message becomes the removal placeholder
+        // once its image is evicted.
+        let history_with = |turns: usize| {
+            let mut history = vec![ChatMessage::system("sys")];
+            for i in 0..turns {
+                let content = if i == 1 {
+                    format!("[IMAGE:{}]", img(i).display())
+                } else {
+                    format!("[IMAGE:{}]\ncaption {i}", img(i).display())
+                };
+                history.push(ChatMessage::user(content));
+                history.push(ChatMessage::assistant(format!("saw {i}")));
+            }
+            history
+        };
 
-        // The fifth image trips the cap; the WARN must name the message the
-        // trim rewrote, not just the counts.
+        // Scenario 1: four images against `max_images: 3`. The
+        // (`max_images`, `images_after_normalization`) pair (3, 4) is
+        // unique to this invocation among the crate's tests, so another
+        // test's frame can never be selected here.
+        let config = MultimodalConfig {
+            max_images: 3,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let history = history_with(4);
         let _ = prepare_messages_for_provider(&history, &config)
             .await
             .unwrap();
 
-        // Other tests in this process emit into the same channel; select the
-        // cap WARN frame, never just the first frame.
+        // Other tests in this process emit into the same channel; select on
+        // the message text plus both values, never just the first frame.
         let mut found = None;
         while let Ok(value) = rx.try_recv() {
             let attrs = &value["attributes"];
@@ -4198,7 +4231,42 @@ mod tests {
                 .as_str()
                 .is_some_and(|m| m.contains("post-normalization image cap exceeded"))
                 && value["severity_text"] == "WARN"
-                && attrs["max_images"] == 4
+                && attrs["max_images"] == 3
+                && attrs["images_after_normalization"] == 4
+            {
+                found = Some(value);
+                break;
+            }
+        }
+        let frame =
+            found.expect("cap WARN frame with max_images 3 and 4 images after normalization");
+        assert_eq!(frame["attributes"]["first_trimmed_index"], 1);
+        assert_eq!(frame["attributes"]["last_trimmed_index"], 1);
+        assert_eq!(frame["attributes"]["images_evicted"], 1);
+
+        // Scenario 2: five images against `max_images: 2` evicts several
+        // images in one trim; the pair (2, 5) is likewise unique to this
+        // invocation.
+        let config = MultimodalConfig {
+            max_images: 2,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let history = history_with(5);
+        let _ = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        let mut found = None;
+        while let Ok(value) = rx.try_recv() {
+            let attrs = &value["attributes"];
+            if value["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("post-normalization image cap exceeded"))
+                && value["severity_text"] == "WARN"
+                && attrs["max_images"] == 2
                 && attrs["images_after_normalization"] == 5
             {
                 found = Some(value);
@@ -4206,10 +4274,12 @@ mod tests {
             }
         }
         let frame =
-            found.expect("cap WARN frame with max_images 4 and 5 images after normalization");
-        assert_eq!(frame["attributes"]["earliest_mutated_index"], 1);
-        assert_eq!(frame["attributes"]["images_evicted"], 1);
-        zeroclaw_log::clear_broadcast_hook();
+            found.expect("cap WARN frame with max_images 2 and 5 images after normalization");
+        // The span covers every message the trim rewrote: first is the
+        // oldest image message, last the newest evicted one.
+        assert_eq!(frame["attributes"]["first_trimmed_index"], 1);
+        assert_eq!(frame["attributes"]["last_trimmed_index"], 5);
+        assert_eq!(frame["attributes"]["images_evicted"], 3);
     }
 
     #[tokio::test]
