@@ -30235,7 +30235,8 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_persists_model_switch_with_route_credential() {
+    async fn process_channel_message_preserves_trim_provenance_and_route_credential_across_model_switch()
+     {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -30278,6 +30279,22 @@ BTC is currently around $65,000 based on latest tool output."#
         // later resolved by the channel switch handler.
         let prompt_config = {
             let mut cfg = zeroclaw_config::schema::Config::default();
+            cfg.runtime_profiles.insert(
+                "trim-switch".to_string(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_context_tokens: Some(8_000),
+                    ..Default::default()
+                },
+            );
+            cfg.agents.insert(
+                "test-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from(
+                        "trim-switch",
+                    ),
+                    ..Default::default()
+                },
+            );
             {
                 let entry = cfg
                     .providers
@@ -30369,7 +30386,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
-            context_token_budget: 0,
+            context_token_budget: 8_000,
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -30382,6 +30399,19 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
             sop_driver_sink: None,
         });
+
+        let route_key = "telegram_chat-1_alice";
+        runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                route_key.to_string(),
+                vec![
+                    ChatMessage::user("old request ".repeat(4_000)),
+                    ChatMessage::assistant("old response"),
+                ],
+            );
 
         process_channel_message(
             runtime_ctx.clone(),
@@ -30422,9 +30452,21 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         }
 
+        let trim_events = observer
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
+            .count();
+        assert_eq!(
+            trim_events, 1,
+            "the model-switch retry must preserve breadcrumb provenance instead of trimming \
+             the same synthetic row again"
+        );
+
         // After the switch handler runs, the route override must be
         // persisted for this sender with the resolved api_key.
-        let route_key = "telegram_chat-1_alice";
         let persisted = runtime_ctx
             .route_overrides
             .lock()

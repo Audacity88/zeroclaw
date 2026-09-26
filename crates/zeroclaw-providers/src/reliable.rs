@@ -9778,7 +9778,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_context_treats_prompt_tool_results_as_part_of_turn() {
+    fn truncate_for_context_treats_tool_result_carriers_as_part_of_turn() {
         let mut messages = vec![
             ChatMessage::system("sys"),
             ChatMessage::user("old request"),
