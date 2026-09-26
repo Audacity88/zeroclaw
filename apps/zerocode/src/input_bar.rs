@@ -2819,6 +2819,40 @@ mod tests {
     }
 
     #[test]
+    fn explicit_input_binding_replaces_selection_default_and_claim() {
+        use crate::keymap::{Chord, InputBarAction as KeymapInputBarAction, overrides};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        overrides::set_row(
+            KeymapInputBarAction::TAG,
+            "cursor_left",
+            vec![Chord::shift(KeyCode::Left)],
+        );
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("draft");
+        assert_eq!(
+            KeymapInputBarAction::from_chord(&key),
+            Some(KeymapInputBarAction::CursorLeft)
+        );
+        assert!(!bar.claims_edit_key(&key));
+
+        overrides::reset();
+        overrides::set_row(KeymapInputBarAction::TAG, "copy_selection", Vec::new());
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("draft");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(bar.has_selection());
+        let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!bar.claims_edit_key(&copy));
+        assert!(matches!(bar.handle_key(copy), InputBarAction::NotHandled));
+        overrides::reset();
+    }
+
+    #[test]
     fn keyboard_selection_uses_visual_rows_and_word_boundaries() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
