@@ -932,6 +932,8 @@ cli-config-secret-set = {$path} is set (encrypted secret — value not displayed
 cli-config-secret-unset = {$path} is not set (encrypted secret)
 cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
+cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
+model-switch-catalog-failed = Could not load catalog for configured provider profile {$provider}: {$error}
 cli-config-backed-up = Backed up to {$path}
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
@@ -1035,7 +1037,7 @@ turn-context-window-exceeded-error = This request exceeds the selected model's c
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
-history-trim-reason-message-cap = history message limit exceeded
+history-trim-reason-message-cap = history turn limit exceeded
 history-trim-reason-recovery = context window overflow recovery
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can

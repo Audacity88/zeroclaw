@@ -140,11 +140,36 @@ pub(crate) async fn prepare_messages_for_iteration(
     degrade_strip_images: bool,
     image_cache: Option<&mut multimodal::LocalImageCache>,
 ) -> Result<multimodal::PreparedMessages> {
+    prepare_messages_with_source_rows(
+        history,
+        multimodal_config,
+        degrade_strip_images,
+        image_cache,
+    )
+    .await
+    .map(|(prepared, _)| prepared)
+}
+
+pub(super) async fn prepare_messages_with_source_rows(
+    history: &[ChatMessage],
+    multimodal_config: &MultimodalConfig,
+    degrade_strip_images: bool,
+    image_cache: Option<&mut multimodal::LocalImageCache>,
+) -> Result<(multimodal::PreparedMessages, Vec<usize>)> {
     // Enforce the universal leading-turn-order invariant before any provider
     // sees the history: strict providers reject a first non-system turn that is
     // not `user`, which context trims and session restores can produce.
     let mut sanitized = history.to_vec();
+    let system_end = sanitized
+        .iter()
+        .take_while(|message| message.is_system())
+        .count();
     ChatMessage::sanitize_leading_turn_order(&mut sanitized);
+    // Sanitization removes only the orphan span after leading system rows.
+    let removed = history.len() - sanitized.len();
+    let source_rows: Vec<usize> = (0..system_end)
+        .chain(system_end + removed..history.len())
+        .collect();
     if !sanitized.iter().any(ChatMessage::is_user) {
         anyhow::bail!(
             "refusing to dispatch to provider: prepared history has no user turn \
@@ -152,7 +177,7 @@ pub(crate) async fn prepare_messages_for_iteration(
         );
     }
     let history = sanitized.as_slice();
-    if degrade_strip_images {
+    let prepared = if degrade_strip_images {
         // Text-only fallback: replace every media marker with the prose
         // placeholder so no filesystem path or data URI reaches the
         // text-only provider, while surrounding text (captions, tool
@@ -189,12 +214,40 @@ pub(crate) async fn prepare_messages_for_iteration(
             }
             None => multimodal::prepare_messages_for_provider(history, multimodal_config).await,
         }
-    }
+    }?;
+    anyhow::ensure!(
+        prepared.messages.len() == source_rows.len(),
+        "message preparation changed source-row cardinality"
+    );
+    Ok((prepared, source_rows))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preparation_preserves_source_rows_across_sanitization_and_media() {
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant("orphan call"),
+            ChatMessage::tool("orphan result"),
+            ChatMessage::user("[Tool results] is literal user text"),
+            ChatMessage::assistant("current call"),
+            ChatMessage::user("[Tool results]\nresult"),
+            ChatMessage::user("new question [IMAGE:/unread.png]"),
+        ];
+        let (prepared, source_rows) =
+            prepare_messages_with_source_rows(&history, &MultimodalConfig::default(), true, None)
+                .await
+                .unwrap();
+        assert_eq!(source_rows, vec![0, 3, 4, 5, 6]);
+        assert_eq!(prepared.messages[1].content, history[3].content);
+        assert_eq!(prepared.messages[3].role, "user");
+        assert_eq!(prepared.messages[3].content, history[5].content);
+        assert!(!prepared.messages[4].content.contains("[IMAGE:"));
+        assert!(prepared.messages[4].content.contains("new question"));
+    }
 
     #[tokio::test]
     async fn prepare_messages_for_iteration_populates_and_reuses_image_cache() {
