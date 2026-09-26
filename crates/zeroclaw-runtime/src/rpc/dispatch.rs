@@ -15359,7 +15359,7 @@ mod tests {
         // agent's own tools.
         let current = dispatcher.current_prompt_authority().unwrap();
         let rebuilt = current
-            .rehydrate_reaped_session(sid, current.stamped_grants())
+            .rehydrate_reaped_session(sid, current.stamped_grants(), None)
             .await
             .expect("an unrestricted principal's rehydration is never refused")
             .expect("the reaped session rehydrates");
@@ -15376,7 +15376,7 @@ mod tests {
         refresh_test_principal(&dispatcher, &["file_read"], &["*"]);
         let current = dispatcher.current_prompt_authority().unwrap();
         let rebuilt = current
-            .rehydrate_reaped_session(sid, current.stamped_grants())
+            .rehydrate_reaped_session(sid, current.stamped_grants(), None)
             .await
             .expect("a constrained principal rehydrates its own owner-stamped session")
             .expect("the reaped session rehydrates for its owner");
@@ -15399,7 +15399,7 @@ mod tests {
         refresh_test_principal(&dispatcher, &["*"], &[]);
         let current = dispatcher.current_prompt_authority().unwrap();
         let refused = current
-            .rehydrate_reaped_session(sid, current.stamped_grants())
+            .rehydrate_reaped_session(sid, current.stamped_grants(), None)
             .await;
         assert!(
             refused.as_ref().map(Option::is_none).unwrap_or(true),
@@ -16018,30 +16018,32 @@ mod tests {
 
         // Store level: the predicate is evaluated against the record itself.
         let foreign = sessions
-            .resume_existing(
+            .resume_existing_authorized(
                 "shared-id",
                 "test-agent",
                 &ChatMode::Acp,
                 None,
                 Some("user:alice"),
+                None,
                 |_, _| Ok::<(), JsonRpcError>(()),
             )
             .await;
         assert!(
             matches!(
                 foreign,
-                Err("session not found or not owned by this principal")
+                Err(crate::rpc::session::ResumeExistingError::DifferentPrincipal)
             ),
             "a foreign live incarnation is not rebound"
         );
         assert!(
             sessions
-                .resume_existing(
+                .resume_existing_authorized(
                     "shared-id",
                     "test-agent",
                     &ChatMode::Acp,
                     None,
                     Some("user:bob"),
+                    None,
                     |_, _| Ok::<(), JsonRpcError>(()),
                 )
                 .await
@@ -16051,10 +16053,11 @@ mod tests {
         );
         assert!(
             sessions
-                .resume_existing(
+                .resume_existing_authorized(
                     "shared-id",
                     "test-agent",
                     &ChatMode::Acp,
+                    None,
                     None,
                     None,
                     |_, _| Ok::<(), JsonRpcError>(()),
@@ -16191,7 +16194,7 @@ mod tests {
         // Reap the live incarnation; the durable row stays alice's.
         assert!(sessions.remove("a1").await);
         carol
-            .rehydrate_reaped_session("a1", carol.stamped_grants())
+            .rehydrate_reaped_session("a1", carol.stamped_grants(), None)
             .await
             .expect("the administrator restores alice's reaped session");
         assert_eq!(
@@ -19529,8 +19532,8 @@ mod tests {
         assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
     }
 
-    #[test]
-    fn session_approve_cannot_resolve_another_sessions_request() {
+    #[tokio::test]
+    async fn session_approve_cannot_resolve_another_sessions_request() {
         let dispatcher = make_approval_test_dispatcher();
         let (tx, mut rx) =
             tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
@@ -19546,6 +19549,7 @@ mod tests {
                 "request_id": "req-owner",
                 "decision": "allow_once"
             }))
+            .await
             .unwrap();
 
         assert_eq!(result["acknowledged"], false);
@@ -19558,6 +19562,7 @@ mod tests {
                 "request_id": "req-owner",
                 "decision": "reject"
             }))
+            .await
             .unwrap();
         assert_eq!(owner_result["acknowledged"], true);
         assert_eq!(
@@ -23182,7 +23187,7 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "acp-cancel-after-publication";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         acp_store
             .append_turn(
@@ -23427,7 +23432,7 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "acp-reaped-kill-001";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
             .expect("seed restorable ACP session");
         let (prompt_registered, release_prompt) = sessions.set_test_prompt_registration_pause();
 
@@ -23539,7 +23544,7 @@ mod tests {
 
         let sid = "acp-alias-mismatch-001";
         acp_store
-            .create_session(sid, "test-agent", "/tmp/test-agent")
+            .create_session(sid, "test-agent", "/tmp/test-agent", None)
             .expect("test should seed durable ACP session");
 
         let resumed = dispatcher
@@ -23919,7 +23924,7 @@ mod tests {
             .expect("supervised dispatcher has an ACP store");
         let session_id = "reaped-acp-during-other-agent-delete";
         acp_store
-            .create_session(session_id, "test-agent", tmp.path().to_str().unwrap())
+            .create_session(session_id, "test-agent", tmp.path().to_str().unwrap(), None)
             .expect("seed restorable ACP session");
 
         let delete_handle = dispatcher.spawn_handle();
@@ -31216,7 +31221,7 @@ mod tests {
         // rehydrate_reaped_session can reinstall it under the same ID.
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace)
+            .create_session(&session_id, "test-agent", &workspace, None)
             .expect("ACP session row must be created");
 
         let (entered, release, done) = sessions.set_test_gated_op_pause();
@@ -31349,7 +31354,7 @@ mod tests {
             let dispatcher = Arc::new(dispatcher);
             let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
             acp_store
-                .create_session(&sid, "test-agent", tmp.path().to_str().unwrap())
+                .create_session(&sid, "test-agent", tmp.path().to_str().unwrap(), None)
                 .unwrap();
             sessions.remove(&sid).await;
 
@@ -31443,7 +31448,7 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "rejected-rehydration";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         let gate = Arc::clone(&dispatcher.ctx.config_write_lock)
             .lock_owned()

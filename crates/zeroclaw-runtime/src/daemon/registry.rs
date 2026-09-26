@@ -269,7 +269,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {
@@ -348,7 +348,7 @@ mod tests {
         let gateway: GatewayStarter = Box::new({
             let expected_config = expected_config.clone();
             let expected_write_lock = expected_write_lock.clone();
-            move |_, _, _, received_authority, _, _, _, _| {
+            move |_, _, _, received_authority, _, _, _, _, _| {
                 assert!(Arc::ptr_eq(&expected_config, &received_authority.config()));
                 assert!(Arc::ptr_eq(
                     &expected_write_lock,
@@ -375,6 +375,7 @@ mod tests {
             0,
             Config::default(),
             authority.clone(),
+            None,
             None,
             None,
             None,

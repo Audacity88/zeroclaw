@@ -540,7 +540,7 @@ mod tests {
         config.heartbeat.agent = "victim".to_string();
         AcpSessionStore::new(&config.data_dir)
             .unwrap()
-            .create_session("live", "victim", "/tmp/victim")
+            .create_session("live", "victim", "/tmp/victim", None)
             .unwrap();
 
         let preview = plan_agent_delete(&config, "victim");

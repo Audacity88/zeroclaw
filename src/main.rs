@@ -8753,15 +8753,6 @@ Add pricing to the active provider profile or supply a catalog entry."
                         .as_ref()
                         .map(|supervisor| supervisor.drivers.clone()),
                 );
-                let result = Box::pin(channels::start_channels_with_authority(
-                    authority,
-                    None,
-                    cancel,
-                    sop_engine,
-                    sop_audit,
-                    sop_driver_sink,
-                ))
-                .await;
                 // Channel-ingress half of the supervisor: the sink registers
                 // every driver it spawns in the generation's supervisor set.
                 let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
@@ -8775,6 +8766,15 @@ Add pricing to the active provider profile or supply a catalog entry."
                     }
                     _ => None,
                 };
+                let result = Box::pin(channels::start_channels_with_authority(
+                    authority,
+                    None,
+                    cancel,
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_sink,
+                ))
+                .await;
 
                 // `channel start` runs one configuration generation and exits,
                 // but drivers still hold the engine; drain them before the
