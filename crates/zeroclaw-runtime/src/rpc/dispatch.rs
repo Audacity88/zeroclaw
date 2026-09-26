@@ -1889,13 +1889,6 @@ impl RpcDispatcher {
     /// then the gateway prefix, then the raw id.
     ///
     /// Returns `Ok(None)` when the id names nothing anywhere.
-    async fn resolve_session_record(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
-        self.resolve_session_record_for_mode(session_id, None).await
-    }
-
     async fn resolve_session_record_for_mode(
         &self,
         session_id: &str,
@@ -3536,7 +3529,8 @@ impl RpcDispatcher {
         // Validate the durable owner and surface before consuming a checkpoint,
         // including resumes with an explicit cwd. Reload after recovery so the
         // Agent sees promoted history rather than the pre-recovery snapshot.
-        let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpSessionData> = None;
+        let mut preloaded_acp: Option<Box<zeroclaw_infra::acp_session_store::AcpSessionData>> =
+            None;
         if resuming
             && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(ref store) = self.ctx.acp_session_store
@@ -3655,7 +3649,7 @@ impl RpcDispatcher {
                     })?;
                     match recovered {
                         zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data) => {
-                            preloaded_acp = Some(*data);
+                            preloaded_acp = Some(data);
                         }
                         zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing
                         | zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
@@ -3856,7 +3850,7 @@ impl RpcDispatcher {
         };
 
         enum AcpSessionNewLoad {
-            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
+            Restored(Box<zeroclaw_infra::acp_session_store::AcpSessionData>),
             Created,
             Killed,
         }
@@ -3897,7 +3891,7 @@ impl RpcDispatcher {
                             match store_cloned.load_session_for_restore(&sid)? {
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
                                 data,
-                            ) => Ok(AcpSessionNewLoad::Restored(*data)),
+                            ) => Ok(AcpSessionNewLoad::Restored(data)),
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
                                 store_cloned.create_session_with_interaction_surface(
                                     &sid,
@@ -4256,10 +4250,14 @@ impl RpcDispatcher {
                 .as_ref()
                 .and_then(|record| record.live_generation)
         {
-            return Err(rpc_err(
-                SESSION_NOT_FOUND,
-                "Session was replaced before close",
-            ));
+            return Err(if self.scoped_principal_id().is_some() {
+                rpc_err(
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
+                )
+            } else {
+                rpc_err(SESSION_NOT_FOUND, "Session was replaced before close")
+            });
         }
         // Cancellation must be signalled before waiting: the admitted prompt
         // owns this permit until its terminal state and transcript writes are
@@ -4284,7 +4282,14 @@ impl RpcDispatcher {
                     closed: true,
                 });
             }
-            return Err(rpc_err(SESSION_NOT_FOUND, "Session was replaced"));
+            return Err(if self.scoped_principal_id().is_some() {
+                rpc_err(
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
+                )
+            } else {
+                rpc_err(SESSION_NOT_FOUND, "Session was replaced")
+            });
         }
         // Close exactly the incarnation that was authorized: a successor
         // installed under this id while the permit was awaited is not ours to
