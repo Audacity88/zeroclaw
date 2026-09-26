@@ -9130,7 +9130,6 @@ impl ChatState {
         if let Some(menu) = self.context_menu.as_mut() {
             // The overlay redraws independently; rebuilding transcript lines clears its selection.
             menu.select_step(delta);
-            self.dirty = LinesDirty::Full;
         }
     }
 
