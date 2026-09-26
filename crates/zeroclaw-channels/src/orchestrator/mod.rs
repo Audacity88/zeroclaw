@@ -13040,8 +13040,19 @@ impl GuardedLocalGitChannel {
         if !current.enabled {
             anyhow::bail!("local git channel is disabled");
         }
-        let current_serialized = serde_json::to_string(current)
-            .map_err(|e| anyhow::anyhow!("serializing live git channel configuration: {e}"))?;
+        let current_serialized = serde_json::to_string(current).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "git_alias": self.git_alias,
+                        "error": e.to_string(),
+                    })),
+                "local git channel configuration serialization failed"
+            );
+            anyhow::Error::msg(format!("serializing live git channel configuration: {e}"))
+        })?;
         if current_serialized != self.serialized_config {
             anyhow::bail!("local git channel configuration changed");
         }
