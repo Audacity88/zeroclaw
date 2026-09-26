@@ -6099,6 +6099,8 @@ mod sop_step_reassembly_tests {
             &AdmissionObserver(lifecycle.clone()),
             &mut history,
             None,
+            None,
+            None,
             Some("zeta"),
             None,
             None,
