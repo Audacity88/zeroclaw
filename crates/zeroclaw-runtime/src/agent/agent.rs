@@ -3992,7 +3992,7 @@ impl Agent {
                     ) {
                         IngressDecision::Loop | IngressDecision::Annotate { .. } => {}
                         IngressDecision::Gate { .. } => {
-                            // Phase 2: divert this injection into the SOP run.
+                            // SOP diversion is not wired yet; preserve Loop behavior.
                         }
                         IngressDecision::Drop { .. } => continue,
                     }
@@ -4267,7 +4267,8 @@ impl Agent {
                                 pending_admitted_steering.push(message);
                             }
                             IngressDecision::Gate { .. } => {
-                                // Phase 2: divert this injection into the SOP run.
+                                // SOP diversion is not wired yet; preserve Loop behavior.
+                                pending_admitted_steering.push(message);
                             }
                             IngressDecision::Drop { .. } => {}
                         }
