@@ -13172,26 +13172,30 @@ mod tests {
     #[tokio::test]
     async fn scoped_listing_refuses_parent_components_whether_or_not_the_path_exists() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = tmp.path();
         let outside = root.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let config = fs_listing_config(&tmp, 4242, None);
-        let workspace = config
-            .agent_workspace_dir("test-agent")
-            .canonicalize()
-            .unwrap();
+        let workspace = config.agent_workspace_dir("test-agent");
         let ctx = enforcement_ctx(config);
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
-        // Both paths climb back to the shared temporary parent, without
-        // assuming a Unix root. Only the first probe exists.
-        let workspace_from_root = workspace.strip_prefix(&root).unwrap();
+        // Keep the non-verbatim spelling: joining `..` to a canonicalized
+        // Windows path would remove the component before the RPC sees it.
+        let workspace_from_root = workspace.strip_prefix(root).unwrap();
         let existing = outside.join("..").join(workspace_from_root);
         let absent = outside
             .join("absent")
             .join("..")
             .join("..")
             .join(workspace_from_root);
+        for path in [&existing, &absent] {
+            assert!(
+                path.components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir)),
+                "the probe must retain a parent component: {path:?}"
+            );
+        }
         let mut codes = Vec::new();
         for path in [
             existing.as_path(),
