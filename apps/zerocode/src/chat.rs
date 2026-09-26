@@ -9383,6 +9383,7 @@ impl ChatState {
             }
             SessionUpdate::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
                 token_budget,
@@ -9394,8 +9395,14 @@ impl ChatState {
                 ..
             } => {
                 self.freeze_prompt_settled_stream();
-                let dropped = dropped_messages.to_string();
+                let dropped = dropped_turns.unwrap_or(dropped_messages).to_string();
                 let kept = kept_turns.to_string();
+                let dropped_kind = if dropped_turns == Some(1) {
+                    "one"
+                } else {
+                    "other"
+                };
+                let kept_kind = if kept_turns == 1 { "one" } else { "other" };
                 // The unsatisfiable newest-turn/schema floor is flagged
                 // explicitly by the runtime: the retained request cannot fit
                 // the configured budget even though history MAY have been
@@ -9415,13 +9422,19 @@ impl ChatState {
                     match (tokens_before, tokens_after) {
                         (Some(before), Some(after)) => {
                             let mut notice = crate::i18n::t_args(
-                                "zc-chat-history-trimmed-tokens",
+                                if dropped_turns.is_some() {
+                                    "zc-chat-history-trimmed-tokens-turns"
+                                } else {
+                                    "zc-chat-history-trimmed-tokens"
+                                },
                                 &[
                                     ("reason", &reason),
                                     ("before", &before.to_string()),
                                     ("after", &after.to_string()),
                                     ("dropped", &dropped),
                                     ("kept", &kept),
+                                    ("dropped-kind", dropped_kind),
+                                    ("kept-kind", kept_kind),
                                 ],
                             );
                             // The configured budget is context, never the trim
@@ -9452,8 +9465,18 @@ impl ChatState {
                             notice
                         }
                         _ => crate::i18n::t_args(
-                            "zc-chat-history-trimmed",
-                            &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
+                            if dropped_turns.is_some() {
+                                "zc-chat-history-trimmed-turns"
+                            } else {
+                                "zc-chat-history-trimmed"
+                            },
+                            &[
+                                ("reason", &reason),
+                                ("dropped", &dropped),
+                                ("kept", &kept),
+                                ("dropped-kind", dropped_kind),
+                                ("kept-kind", kept_kind),
+                            ],
                         ),
                     }
                 };
@@ -17750,6 +17773,7 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 12,
+            dropped_turns: Some(4),
             kept_turns: 3,
             reason: "history message limit exceeded".to_string(),
             token_budget: None,
@@ -17764,8 +17788,56 @@ mod tests {
             s.entries().last(),
             Some(ChatEntry::SystemMessage(text))
                 if text.contains("history message limit exceeded")
-                    && text.contains("12")
+                    && text.contains("4 older turns dropped")
                     && text.contains("3")
+        ));
+    }
+
+    #[test]
+    fn legacy_history_trimmed_update_reports_message_count() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            dropped_turns: None,
+            kept_turns: 3,
+            reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("12 messages dropped") && text.contains("3 turns kept")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_update_uses_singular_turn_copy() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "history turn limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("1 older turn dropped; 1 turn kept")
         ));
     }
 
@@ -17775,6 +17847,7 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 12,
+            dropped_turns: None,
             kept_turns: 33,
             reason: "context token budget exceeded".to_string(),
             token_budget: Some(500_000),
@@ -17803,11 +17876,50 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_turn_counts_preserve_token_sources_and_floor_precedence() {
+        for (dropped_turns, floor) in [(1, false), (0, false), (1, true)] {
+            let mut s = state();
+            s.apply_update(SessionUpdate::HistoryTrimmed {
+                session_id: "sess-1".to_string(),
+                dropped_messages: 12,
+                dropped_turns: Some(dropped_turns),
+                kept_turns: 2,
+                reason: "context token budget exceeded".to_string(),
+                token_budget: Some(10_000),
+                tokens_before: Some(20_000),
+                tokens_after: Some(if floor { 12_000 } else { 6_000 }),
+                tokens_before_source: Some("provider".to_string()),
+                tokens_after_source: Some("calibrated".to_string()),
+                unsatisfiable_floor: floor.then_some(true),
+            });
+            let Some(ChatEntry::SystemMessage(text)) = s.entries().last() else {
+                panic!("expected trim notice");
+            };
+            if floor {
+                assert!(text.contains("could not be trimmed below the configured token budget"));
+                assert!(!text.contains("history was trimmed"));
+            } else {
+                let expected = if dropped_turns == 1 {
+                    "1 older turn dropped"
+                } else {
+                    "0 older turns dropped"
+                };
+                assert!(text.contains(expected), "{text}");
+                assert!(text.contains("2 turns kept"), "{text}");
+                assert!(text.contains("20000") && text.contains("6000"));
+                assert!(text.contains("provider") && text.contains("estimate"));
+                assert!(!text.contains("12 older"));
+            }
+        }
+    }
+
+    #[test]
     fn history_trimmed_recovery_below_configured_budget_does_not_claim_budget_governed() {
         let mut s = state();
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 4,
+            dropped_turns: None,
             kept_turns: 2,
             reason: "context window overflow recovery".to_string(),
             token_budget: Some(500_000),
@@ -17835,6 +17947,7 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 4,
+            dropped_turns: None,
             kept_turns: 2,
             reason: "context window overflow recovery".to_string(),
             token_budget: None,
@@ -17865,6 +17978,7 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 0,
+            dropped_turns: None,
             kept_turns: 1,
             reason: "context token budget exceeded".to_string(),
             token_budget: Some(100_000),
@@ -17895,6 +18009,7 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 2,
+            dropped_turns: None,
             kept_turns: 1,
             reason: "context token budget exceeded".to_string(),
             token_budget: Some(100_000),
@@ -17923,6 +18038,7 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 1,
+            dropped_turns: None,
             kept_turns: 1,
             reason: "context token budget exceeded".to_string(),
             token_budget: Some(100_000),
@@ -17947,6 +18063,7 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 2,
+            dropped_turns: None,
             kept_turns: 1,
             reason: "context token budget exceeded".to_string(),
             token_budget: Some(10_000),

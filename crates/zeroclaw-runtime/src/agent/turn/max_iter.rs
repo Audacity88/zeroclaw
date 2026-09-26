@@ -266,6 +266,7 @@ pub(crate) async fn finish_after_max_iterations(
                         let _ = tx
                             .send(TurnEvent::HistoryTrimmed {
                                 dropped_messages,
+                                dropped_turns,
                                 kept_turns: trim.kept_turns,
                                 reason: reason.clone(),
                                 token_budget: Some(event_budget as u64),
