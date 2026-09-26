@@ -2500,6 +2500,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         knobs,
         event_tx.as_ref(),
+        on_delta.as_ref(),
         turn_state.canonical.as_deref_mut(),
         summary_limits,
         &mut turn_state.crumb_present,
