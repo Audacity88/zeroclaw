@@ -1444,6 +1444,7 @@ pub async fn run(
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
+                &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
@@ -1721,7 +1722,7 @@ pub async fn run(
         tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
         tool_descs.push((
         "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
+        "Capture a screenshot of the current screen. Returns the saved file path. Use when: visual verification, UI inspection, debugging displays.",
     ));
         tool_descs.push((
         "image_info",
@@ -3154,6 +3155,7 @@ pub(crate) async fn process_message_shared(
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
+                &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
@@ -7429,6 +7431,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.replace_sops_for_test(vec![sop]);
@@ -7583,6 +7586,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
             step_scope_enforce: true,
@@ -9983,6 +9987,9 @@ mod tests {
             ChatMessage::user("run tool calls"),
         ];
         let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
@@ -10024,11 +10031,11 @@ mod tests {
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
-            on_delta: None,
+            on_delta: Some(delta_tx),
             shared_budget: None,
             channel: None,
             collected_receipts: None,
-            event_tx: None,
+            event_tx: Some(event_tx),
             steering: None,
             new_messages_out: None,
             image_cache: None,
@@ -10057,6 +10064,24 @@ mod tests {
             .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
             .count();
         assert_eq!(feedback_count, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES);
+
+        let fallback =
+            crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
+        let mut event_chunks = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push(delta);
+            }
+        }
+        assert_eq!(event_chunks, vec![fallback.to_string()]);
+
+        let mut draft_text = Vec::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let DraftEvent::Text(text) = delta {
+                draft_text.push(text);
+            }
+        }
+        assert_eq!(draft_text, vec![fallback]);
     }
 
     #[tokio::test]
