@@ -1487,7 +1487,9 @@ mod tests {
             let authority = LiveConfigAuthority::new(config.clone());
             let mut engine = SopEngine::new(SopConfig::default())
                 .with_execution_capability(authority.execution_capability());
-            engine.set_sops_for_test(vec![test_sop("queued")]);
+            let mut sop = test_sop("queued");
+            sop.agent = Some("alpha".into());
+            engine.set_sops_for_test(vec![sop]);
             let action = engine.start_run("queued", manual_event()).unwrap();
             let run_id = extract_run_id(&action);
             if closed {

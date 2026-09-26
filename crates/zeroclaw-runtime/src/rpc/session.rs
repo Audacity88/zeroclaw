@@ -873,13 +873,13 @@ impl SessionStore {
     }
 
     /// Pause point for [`Self::set_test_rehydrate_seed_pause`]: signals
-    /// `arrived` and parks on `release`. No-op unless the pause is armed.
+    /// `arrived` and parks on `release` once. No-op unless the pause is armed.
     #[cfg(test)]
     pub(crate) async fn wait_test_rehydrate_seed_pause(&self) {
         let (arrived, release) = {
-            let guard = self.test_rehydrate_seed_pause.lock().unwrap();
-            match &*guard {
-                Some((a, r)) => (a.clone(), r.clone()),
+            let mut guard = self.test_rehydrate_seed_pause.lock().unwrap();
+            match guard.take() {
+                Some(gate) => gate,
                 None => return,
             }
         };
