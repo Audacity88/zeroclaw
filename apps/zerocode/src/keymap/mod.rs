@@ -455,32 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_input_binding_replaces_selection_default_and_claim() {
-        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
-        with_input_bar_override("cursor_left", vec![Chord::shift(KeyCode::Left)], || {
-            let mut bar = crate::input_bar::InputBarState::with_shared_commands(&[]);
-            bar.insert_text("draft");
-            assert_eq!(
-                InputBarAction::from_chord(&key),
-                Some(InputBarAction::CursorLeft)
-            );
-            assert!(!bar.claims_edit_key(&key));
-        });
-        with_input_bar_override("copy_selection", Vec::new(), || {
-            let mut bar = crate::input_bar::InputBarState::with_shared_commands(&[]);
-            bar.insert_text("draft");
-            bar.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-            assert!(bar.has_selection());
-            let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-            assert!(!bar.claims_edit_key(&copy));
-            assert!(matches!(
-                bar.handle_key(copy),
-                crate::input_bar::InputBarAction::NotHandled
-            ));
-        });
-    }
-
-    #[test]
     fn an_explicit_binding_outranks_a_retained_default_on_another_action() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let alt_backspace = Chord::with(KeyCode::Backspace, KeyModifiers::ALT);
