@@ -75,7 +75,7 @@ pub struct AcpSessionData {
 pub enum AcpSessionRestore {
     Missing,
     Killed,
-    Restorable(AcpSessionData),
+    Restorable(Box<AcpSessionData>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -865,7 +865,7 @@ impl AcpSessionStore {
             }
         };
 
-        Ok(AcpSessionRestore::Restorable(AcpSessionData {
+        Ok(AcpSessionRestore::Restorable(Box::new(AcpSessionData {
             session_uuid: session_uuid.to_string(),
             principal_id,
             agent_alias,
@@ -877,7 +877,7 @@ impl AcpSessionStore {
             messages,
             trim_breadcrumb,
             retained_context,
-        }))
+        })))
     }
 
     /// List restorable sessions as lightweight summaries, ordered by most recent

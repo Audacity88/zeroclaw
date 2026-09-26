@@ -1882,14 +1882,24 @@ impl RpcDispatcher {
     /// as ambiguous rather than letting a caller authorize against one and
     /// then read or destroy another through a prefixed-id or ACP/chat
     /// collision. Store failures are errors, never absence. A live session's
-    /// mode selects its durable domain; a reaped ACP/chat collision is
-    /// ambiguous even when both rows have the same owner. Among chat keys
-    /// the RPC-prefixed key wins, then the gateway prefix, then the raw id.
+    /// mode selects its durable domain; `session/new` may supply its selected
+    /// mode and an admitted operation may retain its captured mode. An
+    /// unqualified reaped ACP/chat collision is ambiguous even when both
+    /// rows have the same owner. Among chat keys the RPC-prefixed key wins,
+    /// then the gateway prefix, then the raw id.
     ///
     /// Returns `Ok(None)` when the id names nothing anywhere.
     async fn resolve_session_record(
         &self,
         session_id: &str,
+    ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
+        self.resolve_session_record_for_mode(session_id, None).await
+    }
+
+    async fn resolve_session_record_for_mode(
+        &self,
+        session_id: &str,
+        selected_mode: Option<&ChatMode>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
         use super::session::{DurableSession, SessionRecord};
         let mut owners: Vec<Option<String>> = Vec::new();
@@ -1944,6 +1954,12 @@ impl RpcDispatcher {
             return Ok(None);
         };
         if owners.iter().any(|owner| *owner != first) {
+            if self.scoped_principal_id().is_some() {
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
+                ));
+            }
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -1964,7 +1980,7 @@ impl RpcDispatcher {
         // present in both stores has no canonical mode and must be reopened
         // explicitly rather than letting either store win by lookup order.
         let durable = match (
-            live.as_ref().map(|(_, _, mode)| mode),
+            live.as_ref().map(|(_, _, mode)| mode).or(selected_mode),
             has_acp,
             chat_durable,
         ) {
@@ -1972,6 +1988,15 @@ impl RpcDispatcher {
             (Some(ChatMode::Acp), false, _) => None,
             (Some(ChatMode::Chat), _, chat) | (None, false, chat) => chat,
             (None, true, Some(_)) => {
+                if self
+                    .scoped_principal_id()
+                    .is_some_and(|mine| first.as_deref() != Some(mine.as_str()))
+                {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        "Session not found or not owned by this principal",
+                    ));
+                }
                 return Err(rpc_err(
                     INVALID_PARAMS,
                     "Session ID matches both ACP and Chat durable history; reconnect the intended session before mutating it",
@@ -2000,7 +2025,19 @@ impl RpcDispatcher {
         session_id: &str,
         method: Method,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
-        let record = self.resolve_session_record(session_id).await?;
+        self.authorize_session_owner_for_mode(session_id, method, None)
+            .await
+    }
+
+    async fn authorize_session_owner_for_mode(
+        &self,
+        session_id: &str,
+        method: Method,
+        selected_mode: Option<&ChatMode>,
+    ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
+        let record = self
+            .resolve_session_record_for_mode(session_id, selected_mode)
+            .await?;
         match self.scoped_principal_id() {
             Some(mine) => match &record {
                 Some(rec) if rec.owner.as_deref() == Some(mine.as_str()) => Ok(record),
@@ -2056,7 +2093,16 @@ impl RpcDispatcher {
         session_id: &str,
         authorized: Option<&super::session::SessionRecord>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
-        let current = self.resolve_session_record(session_id).await?;
+        let selected_mode = authorized
+            .filter(|record| record.live_generation.is_some())
+            .and_then(|record| match record.durable.as_ref() {
+                Some(DurableSession::Acp) => Some(ChatMode::Acp),
+                Some(DurableSession::Chat { .. }) => Some(ChatMode::Chat),
+                None => None,
+            });
+        let current = self
+            .resolve_session_record_for_mode(session_id, selected_mode.as_ref())
+            .await?;
         let scope = self.scoped_principal_id();
         if let Some(mine) = scope.as_deref()
             && current
@@ -3297,6 +3343,7 @@ impl RpcDispatcher {
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
+        let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
         let resuming = req.session_id.is_some();
         if let Some(existing) = req.session_id.as_deref() {
             // Resuming targets an EXISTING session: enforce its ownership
@@ -3304,19 +3351,23 @@ impl RpcDispatcher {
             // uniform not-found-or-not-owned denial; a brand-new id passes
             // because it exists nowhere yet). The live rebind below repeats
             // the check under the store lock against the exact incarnation.
-            if self.resolve_session_record(existing).await?.is_some() {
-                self.authorize_session_owner(existing, Method::SessionNew)
-                    .await?;
+            if self
+                .resolve_session_record_for_mode(existing, Some(&chat_mode))
+                .await?
+                .is_some()
+            {
+                self.authorize_session_owner_for_mode(
+                    existing,
+                    Method::SessionNew,
+                    Some(&chat_mode),
+                )
+                .await?;
             }
         }
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let chat_mode = req
-            .chat_mode
-            .clone()
-            .unwrap_or(crate::rpc::types::ChatMode::Chat);
         if req.interaction_surface.is_some()
             && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
         {
@@ -3398,8 +3449,12 @@ impl RpcDispatcher {
 
         // A durable row can appear while admission is queued. Resolve its
         // owner again before building or stamping a replacement session.
-        let admitted_record = if self.resolve_session_record(&session_id).await?.is_some() {
-            self.authorize_session_owner(&session_id, Method::SessionNew)
+        let admitted_record = if self
+            .resolve_session_record_for_mode(&session_id, Some(&chat_mode))
+            .await?
+            .is_some()
+        {
+            self.authorize_session_owner_for_mode(&session_id, Method::SessionNew, Some(&chat_mode))
                 .await?
         } else {
             None
@@ -3600,7 +3655,7 @@ impl RpcDispatcher {
                     })?;
                     match recovered {
                         zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data) => {
-                            preloaded_acp = Some(data);
+                            preloaded_acp = Some(*data);
                         }
                         zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing
                         | zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
@@ -3842,7 +3897,7 @@ impl RpcDispatcher {
                             match store_cloned.load_session_for_restore(&sid)? {
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
                                 data,
-                            ) => Ok(AcpSessionNewLoad::Restored(data)),
+                            ) => Ok(AcpSessionNewLoad::Restored(*data)),
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
                                 store_cloned.create_session_with_interaction_surface(
                                     &sid,
@@ -4359,7 +4414,9 @@ impl RpcDispatcher {
                 // A hard-cancelled turn may already have dropped its live
                 // generation. Keep the durable target only if its owner and
                 // storage domain still match the authorized record.
-                let current = self.resolve_session_record(sid).await?;
+                let current = self
+                    .resolve_session_record_for_mode(sid, requested_mode.as_ref())
+                    .await?;
                 if current.as_ref().is_some_and(|record| {
                     record.live_generation.is_none()
                         && authorized.as_ref().is_some_and(|authorized| {
@@ -5124,7 +5181,14 @@ impl RpcDispatcher {
                 None,
             )
             .await;
-            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+            return Err(if self.scoped_principal_id().is_some() {
+                rpc_err(
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
+                )
+            } else {
+                rpc_err(SESSION_NOT_FOUND, "Session not found")
+            });
         }
 
         let agent = match self.ctx.sessions.get_agent(sid).await {
@@ -6605,7 +6669,12 @@ impl RpcDispatcher {
                 // Hard cancellation can remove the captured live generation
                 // before admission. Its durable row is still the authorized
                 // target only if the owner and storage domain are unchanged.
-                let current = self.resolve_session_record(&req.session_id).await?;
+                let current = self
+                    .resolve_session_record_for_mode(
+                        &req.session_id,
+                        requested_identity.as_ref().map(|(_, mode)| mode),
+                    )
+                    .await?;
                 if current.as_ref().is_some_and(|record| {
                     record.live_generation.is_none()
                         && authorized.as_ref().is_some_and(|authorized| {
@@ -16104,17 +16173,21 @@ mod tests {
         chat_backend
             .set_session_principal("rpc_collide", "user:bob")
             .unwrap();
-        for (who, label) in [(&alice, "alice"), (&bob, "bob"), (&fixture, "operator")] {
+        for (who, label, expected_code) in [
+            (&alice, "alice", FORBIDDEN),
+            (&bob, "bob", FORBIDDEN),
+            (&fixture, "operator", INTERNAL_ERROR),
+        ] {
             let err = who
                 .handle_session_messages_for_test(&json!({"session_id": "collide"}))
                 .await
                 .expect_err(label);
-            assert_eq!(err.code, INTERNAL_ERROR, "{label}: {}", err.message);
-            assert!(
-                err.message.contains("disagree"),
-                "{label}: ambiguity must be named, got {}",
-                err.message
-            );
+            assert_eq!(err.code, expected_code, "{label}: {}", err.message);
+            if expected_code == INTERNAL_ERROR {
+                assert!(err.message.contains("disagree"));
+            } else {
+                assert!(err.message.contains("not found or not owned"));
+            }
         }
 
         acp_store
@@ -16127,20 +16200,22 @@ mod tests {
             .handle_session_messages_for_test(&json!({"session_id": "collide-2"}))
             .await
             .expect_err("an ACP/chat pair with different owners is ambiguous");
-        assert_eq!(err.code, INTERNAL_ERROR);
+        assert_eq!(err.code, FORBIDDEN);
 
-        // Records that agree are served, from the ACP row.
+        // A reaped id with two durable domains has no canonical mode even
+        // when both records agree about ownership. Only the owner sees that
+        // collision; another scoped principal gets the uniform denial.
         acp_store
             .create_session("agree", "test-agent", "/ws", Some("user:alice"))
             .unwrap();
         chat_backend
             .set_session_principal("rpc_agree", "user:alice")
             .unwrap();
-        let served = alice
+        let err = alice
             .handle_session_messages_for_test(&json!({"session_id": "agree"}))
             .await
-            .expect("consistent records are served");
-        assert_eq!(served["total"], json!(0));
+            .expect_err("reaped ACP and Chat records need an explicit mode");
+        assert_eq!(err.code, INVALID_PARAMS);
         let err = bob
             .handle_session_messages_for_test(&json!({"session_id": "agree"}))
             .await
@@ -24684,13 +24759,6 @@ mod tests {
                 ))],
             )
             .unwrap();
-        chat_backend
-            .append(
-                &format!("rpc_{sid}"),
-                &ChatMessage::assistant("queued Chat history"),
-            )
-            .unwrap();
-
         let queue_guard = sessions.session_queue.acquire(sid).await.unwrap();
         let chat_handle = dispatcher.spawn_handle();
         let chat_task = zeroclaw_spawn::spawn!(async move {
@@ -24723,6 +24791,15 @@ mod tests {
         .await
         .expect("reaped read should queue behind the pending Chat owner");
 
+        // Keep the reader's initial owner lookup unambiguous. The queued
+        // Chat replacement then installs the second durable domain before
+        // either operation is admitted, exercising the post-wait recheck.
+        chat_backend
+            .append(
+                &format!("rpc_{sid}"),
+                &ChatMessage::assistant("queued Chat history"),
+            )
+            .unwrap();
         drop(queue_guard);
         chat_task.await.unwrap().expect("queued Chat session/new");
         let result = messages_task
