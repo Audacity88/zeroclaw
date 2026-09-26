@@ -6828,8 +6828,9 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
     let Some(anchor) = snapshot.selection_anchor_rect(selection) else {
         return;
     };
-    let copy_label = context_menu_action_label(ChatContextMenuAction::Copy);
-    let add_to_chat_label = context_menu_action_label(ChatContextMenuAction::AddToChat);
+    let copy_label =
+        context_menu_action_label(ChatContextMenuAction::Copy, Some(CopyHitKind::Transcript));
+    let add_to_chat_label = context_menu_action_label(ChatContextMenuAction::AddToChat, None);
     let Some(rects) =
         transcript_action_rects(&copy_label, &add_to_chat_label, anchor, snapshot.area)
     else {
@@ -11708,9 +11709,12 @@ mod tests {
             .expect("render captures transcript cells");
         let (row, column) = snapshot
             .cells
-            .chunks(usize::from(snapshot.area.width))
-            .enumerate()
+            .iter()
             .find_map(|(row, cells)| {
+                let visible_row = (*row).checked_sub(snapshot.scroll)?;
+                if visible_row >= snapshot.area.height {
+                    return None;
+                }
                 cells
                     .iter()
                     .map(|cell| cell.symbol.as_str())
@@ -11718,7 +11722,7 @@ mod tests {
                     .find("https://example.complete")
                     .map(|column| {
                         (
-                            snapshot.area.y + row as u16,
+                            snapshot.area.y + visible_row,
                             snapshot.area.x + column as u16,
                         )
                     })
@@ -11937,6 +11941,7 @@ mod tests {
             text: Arc::<str>::from("message"),
             kind: CopyHitKind::Message,
             group: 0,
+            action: CopyHitAction::Copy,
         });
         let queue = ChatContextMenuTarget::Queue(7);
 
