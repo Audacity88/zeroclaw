@@ -20543,34 +20543,14 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn acp_turn_complete_and_list_acp_report_the_same_projected_count() {
-        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage, projected_entry_count};
-        use zeroclaw_infra::acp_session_store::AcpSessionStore;
+    /// The representative parity shape both count-parity tests replay: a
+    /// user chat, a batch with text and two calls, a folded and a duplicate
+    /// result, a reused call id, a degenerate empty batch, and results
+    /// including an orphan. Projects to 7 entries.
+    fn parity_fixture() -> Vec<ConversationMessage> {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
-        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
-            4, 10, 60,
-        ));
-        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let acp_store = Arc::new(AcpSessionStore::new(tmp.path()).unwrap());
-        let ctx = RpcContext::for_persistence_tests(
-            config,
-            Arc::clone(&sessions),
-            None,
-            Some(Arc::clone(&acp_store)),
-        );
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
-        let sid = "boundary-count";
-        let ws = tmp.path().to_str().unwrap();
-
-        // Seed the store with the representative parity shape: a user chat,
-        // a batch with text and two calls, a folded and a duplicate result,
-        // a reused call id, and an orphan result.
-        acp_store.create_session(sid, "test-agent", ws, None).unwrap();
-        let history = vec![
+        vec![
             ConversationMessage::Chat(ChatMessage::user("plain chat")),
             ConversationMessage::AssistantToolCalls {
                 text: Some("batch with text".into()),
@@ -20634,7 +20614,38 @@ mod tests {
                     tool_name: "shell".into(),
                 },
             ]),
-        ];
+        ]
+    }
+
+    #[tokio::test]
+    async fn acp_turn_complete_and_list_acp_report_the_same_projected_count() {
+        use zeroclaw_api::model_provider::projected_entry_count;
+        use zeroclaw_infra::acp_session_store::AcpSessionStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let acp_store = Arc::new(AcpSessionStore::new(tmp.path()).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            None,
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let sid = "boundary-count";
+        let ws = tmp.path().to_str().unwrap();
+
+        // Seed the store with the representative parity shape (the shared
+        // fixture above).
+        acp_store
+            .create_session(sid, "test-agent", ws, None)
+            .unwrap();
+        let history = parity_fixture();
         acp_store.append_turn(sid, &history).unwrap();
         let seeded = projected_entry_count(&history);
         assert_eq!(seeded, 7);
@@ -21681,73 +21692,8 @@ mod tests {
     #[test]
     fn projected_entry_count_matches_conversation_message_entries() {
         use zeroclaw_api::model_provider::projected_entry_count;
-        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
 
-        let msgs = vec![
-            ConversationMessage::Chat(ChatMessage::user("plain chat")),
-            ConversationMessage::AssistantToolCalls {
-                text: Some("batch with text".into()),
-                tool_calls: vec![
-                    ToolCall {
-                        id: "shared".into(),
-                        name: "shell".into(),
-                        arguments: r#"{"command":"pwd"}"#.into(),
-                        extra_content: None,
-                    },
-                    ToolCall {
-                        id: "solo".into(),
-                        name: "read".into(),
-                        arguments: "{}".into(),
-                        extra_content: None,
-                    },
-                ],
-                reasoning_content: None,
-            },
-            ConversationMessage::ToolResults(vec![
-                ToolResultMessage {
-                    tool_call_id: "shared".into(),
-                    content: "/tmp".into(),
-                    tool_name: "shell".into(),
-                },
-                ToolResultMessage {
-                    tool_call_id: "shared".into(),
-                    content: "duplicate result".into(),
-                    tool_name: "shell".into(),
-                },
-            ]),
-            ConversationMessage::AssistantToolCalls {
-                text: Some(String::new()),
-                tool_calls: vec![ToolCall {
-                    id: "shared".into(),
-                    name: "shell".into(),
-                    arguments: r#"{"command":"ls"}"#.into(),
-                    extra_content: None,
-                }],
-                reasoning_content: None,
-            },
-            ConversationMessage::AssistantToolCalls {
-                text: None,
-                tool_calls: vec![],
-                reasoning_content: None,
-            },
-            ConversationMessage::ToolResults(vec![
-                ToolResultMessage {
-                    tool_call_id: "solo".into(),
-                    content: "contents".into(),
-                    tool_name: "read".into(),
-                },
-                ToolResultMessage {
-                    tool_call_id: "shared".into(),
-                    content: "second fold".into(),
-                    tool_name: "shell".into(),
-                },
-                ToolResultMessage {
-                    tool_call_id: "orphan".into(),
-                    content: "late result".into(),
-                    tool_name: "shell".into(),
-                },
-            ]),
-        ];
+        let msgs = parity_fixture();
 
         assert_eq!(
             projected_entry_count(&msgs),
