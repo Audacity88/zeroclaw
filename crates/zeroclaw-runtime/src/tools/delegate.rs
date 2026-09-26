@@ -8762,9 +8762,13 @@ mod tests {
                 ..RiskProfileConfig::default()
             },
         );
-        config
-            .risk_profiles
-            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.risk_profiles.insert(
+            "target_profile".to_string(),
+            RiskProfileConfig {
+                auto_approve: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
         config.runtime_profiles.insert(
             "target_agentic".to_string(),
             RuntimeProfileConfig {
