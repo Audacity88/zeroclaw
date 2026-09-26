@@ -878,6 +878,7 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 None,
+                None,
                 &MultimodalConfig::default(),
                 Some(&hooks),
                 None,
