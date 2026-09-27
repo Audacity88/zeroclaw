@@ -56,6 +56,7 @@ pub(crate) fn record_llm_failure(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_recover_context_overflow(
     injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
