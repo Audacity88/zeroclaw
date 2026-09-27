@@ -3749,6 +3749,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             tokens_before_source: None,
             tokens_after_source: None,
             unsatisfiable_floor: None,
+            retained_context: None,
         })
         .expect("history trim event should produce a frame");
 
