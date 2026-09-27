@@ -702,6 +702,7 @@ pub async fn run_with_authority(
     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    let mut channels_handle: Option<JoinHandle<()>> = None;
 
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
@@ -816,7 +817,7 @@ pub async fn run_with_authority(
             let cancel_for_supervisor = channels_cancel.clone();
             let generation_control = channel_generation_control.clone();
             let channels_live_config_authority = live_config_authority.clone();
-            handles.push(spawn_component_supervisor(
+            channels_handle = Some(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
@@ -1315,6 +1316,13 @@ pub async fn run_with_authority(
     let drain = await_rpc_connection_drain(&rpc_connection_count).await;
     let exit_result = settle_exit_against_drain(exit_result, drain);
 
+    // Channel teardown owns listener cleanup plus all accepted message work.
+    // Keep that supervisor out of the generic 500 ms component pool: its
+    // internal absolute deadline is five seconds, and a reload may start a
+    // replacement generation only after this owner has actually retired.
+    let channels_retired = retire_channels_supervisor(channels_handle).await;
+    let exit_result = settle_exit_against_channel_retirement(exit_result, channels_retired);
+
     // Grace window for cooperative shutdown of each component supervisor. The
     // RPC listeners are already past their own drain by this point, so this
     // only covers the supervisor loop returning after its component did.
@@ -1594,6 +1602,59 @@ fn settle_exit_against_drain(exit: Result<DaemonExit>, drain: RpcDrain) -> Resul
             .with_attrs(::serde_json::json!({ "connections": outstanding })),
         "Reload refused: RPC work from the retiring generation is still unwinding; shutting down \
          instead so a replacement generation cannot overlap it"
+    );
+    Ok(DaemonExit::Shutdown)
+}
+
+const CHANNEL_SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
+
+async fn retire_channels_supervisor(handle: Option<JoinHandle<()>>) -> bool {
+    let Some(mut handle) = handle else {
+        return true;
+    };
+    tokio::select! {
+        biased;
+        result = &mut handle => {
+            if let Err(error) = result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                    "Channel supervisor ended without establishing clean retirement"
+                );
+                false
+            } else {
+                true
+            }
+        }
+        () = tokio::time::sleep(CHANNEL_SUPERVISOR_SHUTDOWN_GRACE) => {
+            handle.abort();
+            let _ = handle.await;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Channel supervisor did not retire inside its shutdown allowance"
+            );
+            false
+        }
+    }
+}
+
+fn settle_exit_against_channel_retirement(
+    exit: Result<DaemonExit>,
+    channels_retired: bool,
+) -> Result<DaemonExit> {
+    if channels_retired || !matches!(exit, Ok(DaemonExit::Reload)) {
+        return exit;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "Reload refused: channel work from the retiring generation is still unwinding; shutting \
+         down instead so a replacement generation cannot overlap it"
     );
     Ok(DaemonExit::Shutdown)
 }
@@ -2957,6 +3018,54 @@ mod tests {
         assert!(
             control.begin_attempt(&daemon_cancel).is_none(),
             "retired generation must not admit a replacement attempt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_channels_shutdown_allows_cleanup_past_generic_grace() {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_by_task = std::sync::Arc::clone(&finished);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            finished_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert!(
+            retire_channels_supervisor(Some(handle)).await,
+            "channel cleanup longer than the generic 500 ms grace must still retire cleanly"
+        );
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the channel cleanup future must complete rather than be detached"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_channels_shutdown_refuses_reload_when_retirement_times_out() {
+        struct RetirementProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for RetirementProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = RetirementProbe(std::sync::Arc::clone(&dropped));
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        });
+
+        let retired = retire_channels_supervisor(Some(handle)).await;
+        assert!(!retired, "a timed-out channel generation is not retired");
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the timed-out supervisor must be aborted and joined"
+        );
+        assert_eq!(
+            settle_exit_against_channel_retirement(Ok(DaemonExit::Reload), retired).unwrap(),
+            DaemonExit::Shutdown,
+            "reload must be refused when channel retirement is unproven"
         );
     }
 

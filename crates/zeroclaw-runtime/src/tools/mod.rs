@@ -1263,7 +1263,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
         root_config,
         canvas_store,
         is_subagent_caller,
-        tui_env,
+        tui_env.map(Arc::new),
         sop_engine,
         sop_audit,
         live_config,

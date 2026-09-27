@@ -882,7 +882,7 @@ pub async fn handle_section_select(
         let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
             async move {
                 let _reservation = reservation;
-                select_section(state, section, key, alias).await
+                select_section(state, principal, section, key, alias).await
             },
         ));
         return match task.await {
@@ -893,10 +893,16 @@ pub async fn handle_section_select(
             )),
         };
     }
-    select_section(state, section, key, alias).await
+    select_section(state, principal, section, key, alias).await
 }
 
-async fn select_section(state: AppState, section: String, key: String, alias: String) -> Response {
+async fn select_section(
+    state: AppState,
+    principal: crate::principal_gate::RequestPrincipal,
+    section: String,
+    key: String,
+    alias: String,
+) -> Response {
     // Held through the swap at the end of this handler so a concurrent
     // config writer can't land between this read and the save below.
     let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)

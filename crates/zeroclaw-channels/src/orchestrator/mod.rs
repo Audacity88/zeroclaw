@@ -95,8 +95,9 @@ pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use anyhow::{Context, Result};
+use futures_util::FutureExt;
 use parking_lot::RwLock;
-use portable_atomic::{AtomicU64, AtomicUsize, Ordering};
+use portable_atomic::{AtomicU64, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -124,6 +125,7 @@ use zeroclaw_providers::{
     self, ChatMessage, ModelProvider, ProviderDispatch, SafeguardFallbackKind,
     SafeguardFallbackNotice, scope_safeguard_fallback, take_last_safeguard_fallback,
 };
+use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
@@ -260,12 +262,14 @@ const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group messa
 // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
 #[allow(unused_imports)]
 pub use zeroclaw_runtime::agent::system_prompt::{
-    BOOTSTRAP_MAX_CHARS, build_system_prompt, build_system_prompt_with_mode,
-    build_system_prompt_with_mode_and_autonomy, build_system_prompt_with_mode_and_effective_tools,
+    BOOTSTRAP_MAX_CHARS, COMPACT_BOOTSTRAP_MAX_CHARS, build_system_prompt,
+    build_system_prompt_with_mode, build_system_prompt_with_mode_and_autonomy,
+    build_system_prompt_with_mode_and_effective_tools,
 };
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
+const CHANNEL_GENERATION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 #[cfg(test)]
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
@@ -950,73 +954,50 @@ impl Drop for IngressOrderRegistration {
     }
 }
 
-/// Tracks detached post-hook routing tasks so shutdown cannot race a turn that
-/// has not reached its final lane yet.
+/// Owns detached channel-runtime tasks so shutdown can drain them or abort and
+/// join every remainder before the channel generation retires.
 struct IngressTaskTracker {
-    active: AtomicUsize,
-    drained: tokio::sync::Notify,
-    force_stop: CancellationToken,
+    tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl IngressTaskTracker {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            active: AtomicUsize::new(0),
-            drained: tokio::sync::Notify::new(),
-            force_stop: CancellationToken::new(),
+            tasks: Mutex::new(tokio::task::JoinSet::new()),
         })
     }
 
-    fn track(self: &Arc<Self>) -> IngressTaskRegistration {
-        self.active.fetch_add(1, Ordering::AcqRel);
-        IngressTaskRegistration {
-            tracker: Arc::clone(self),
+    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(result) = tasks.try_join_next() {
+            log_worker_join_result(result);
         }
-    }
-
-    fn spawn(
-        self: &Arc<Self>,
-        future: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> tokio::task::JoinHandle<()> {
-        let tracked = self.track();
-        let force_stop = self.force_stop.clone();
-        zeroclaw_spawn::spawn!(async move {
-            let _tracked = tracked;
-            tokio::select! {
-                biased;
-                _ = force_stop.cancelled() => {}
-                _ = future => {}
-            }
-        })
-    }
-
-    fn force_stop(&self) {
-        self.force_stop.cancel();
+        tasks.spawn(future);
     }
 
     async fn wait_drained(&self) {
-        loop {
-            let drained = self.drained.notified();
-            tokio::pin!(drained);
-            drained.as_mut().enable();
-
-            if self.active.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            drained.await;
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        while let Some(result) = tasks.join_next().await {
+            log_worker_join_result(result);
         }
     }
-}
 
-struct IngressTaskRegistration {
-    tracker: Arc<IngressTaskTracker>,
-}
-
-impl Drop for IngressTaskRegistration {
-    fn drop(&mut self) {
-        if self.tracker.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.tracker.drained.notify_waiters();
+    async fn drain_until(&self, deadline: tokio::time::Instant) -> bool {
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        while !tasks.is_empty() {
+            match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                Ok(Some(result)) => log_worker_join_result(result),
+                Ok(None) => return true,
+                Err(_) => {
+                    tasks.abort_all();
+                    while let Some(result) = tasks.join_next().await {
+                        log_worker_join_result(result);
+                    }
+                    return false;
+                }
+            }
         }
+        true
     }
 }
 
@@ -1220,14 +1201,21 @@ impl ConversationLaneRegistry {
                 break;
             };
 
-            // Each slot is processed in its own task so a panic — in a hook,
-            // or anywhere down the processing path — is contained and logged:
-            // the lane keeps serving its queue and still retires through
-            // `next_slot`, instead of dying with its registration stuck in the
-            // registry and `wait_drained` hanging on shutdown.
+            // Contain a turn panic inside its lane without spawning an
+            // unowned descendant that could outlive generation shutdown.
             let registry = Arc::clone(&self);
-            let worker = self.tasks.spawn(registry.process_turn(turn));
-            log_worker_join_result(worker.await);
+            if std::panic::AssertUnwindSafe(registry.process_turn(turn))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Channel message worker crashed"
+                );
+            }
         }
     }
 
@@ -1278,12 +1266,12 @@ impl ConversationLaneRegistry {
             }
         };
 
-        let Some(_turn_lease) =
+        let Some(turn_lease) =
             self.reserve_turn(turn.ctx.agent_alias.as_str(), turn.agent_generation)
         else {
             return;
         };
-        run_conversation_turn(*turn, permit, self.cancel.clone()).await;
+        run_conversation_turn(*turn, permit, self.cancel.clone(), Arc::new(turn_lease)).await;
     }
 
     fn reserve_turn(
@@ -1346,23 +1334,14 @@ impl ConversationLaneRegistry {
 
     /// Wait until every lane has retired, so shutdown lets queued turns finish.
     async fn wait_drained(&self) {
-        loop {
-            // Register before re-reading the map: a lane retiring between the
-            // check and the registration would otherwise never wake this up.
-            let notified = self.drained.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+        self.tasks.wait_drained().await;
+        self.lanes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
 
-            if self
-                .lanes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-            {
-                return;
-            }
-            notified.await;
-        }
+    async fn drain_until(&self, deadline: tokio::time::Instant) -> bool {
+        let drained = self.tasks.drain_until(deadline).await;
+        self.lanes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        drained
     }
 }
 
@@ -1487,17 +1466,12 @@ fn spawn_inbound_routing(
     busy_notice_tasks: Arc<IngressTaskTracker>,
     slot: InboundSlot,
 ) {
-    let tracked_task = tracker.track();
-    let worker = tracker.spawn(route_inbound_slot(
+    tracker.spawn(route_inbound_slot(
         lanes,
         busy_notice_budget,
         busy_notice_tasks,
         slot,
     ));
-    zeroclaw_spawn::spawn!(async move {
-        log_worker_join_result(worker.await);
-        drop(tracked_task);
-    });
 }
 
 /// Drive one debounce bucket into the lane slot reserved for it.
@@ -1547,7 +1521,7 @@ async fn retire_owned_bucket(
 
 fn spawn_debounce_forwarder(
     first: tokio::sync::oneshot::Receiver<String>,
-    tracker: &Arc<IngressTaskTracker>,
+    tasks: &Arc<IngressTaskTracker>,
 ) -> (
     tokio::sync::oneshot::Receiver<String>,
     tokio::sync::mpsc::UnboundedSender<DebounceBucketExtension>,
@@ -1555,7 +1529,7 @@ fn spawn_debounce_forwarder(
     let (slot_tx, slot_rx) = tokio::sync::oneshot::channel();
     let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    tracker.spawn(async move {
+    tasks.spawn(async move {
         let mut pending = first;
         // Admission permits of every follow-up retained in this bucket. They
         // are held until the bucket resolves either way — delivery (the
@@ -7181,6 +7155,16 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+/// After a clean listener return (no error), decide whether the supervisor
+/// should restart. Cancellation means the operator asked for shutdown — the
+/// exit is expected and must not restart. Any other clean return is
+/// unexpected and must restart.
+fn should_restart_listener_after_clean_return(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    !cancel.is_cancelled()
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -7198,6 +7182,10 @@ fn spawn_supervised_listener(
         Duration::from_secs(CHANNEL_HEALTH_HEARTBEAT_SECS),
         cancel,
     )
+}
+
+fn prepare_supervised_channel(ch: &Arc<dyn Channel>, cancel: &CancellationToken) {
+    ch.set_cancel_token(cancel.clone());
 }
 
 /// Record one health observation for a supervised listener.
@@ -7287,19 +7275,45 @@ fn spawn_supervised_listener_with_health_interval(
                     tokio::pin!(listen_future);
 
                     loop {
+                        let mut shutdown = false;
                         tokio::select! {
                             biased;
-                            () = cancel.cancelled() => return,
+                            () = cancel.cancelled() => {
+                                shutdown = true;
+                            }
                             _ = health.tick() => {
                                 mark_listener_health(&*ch, &component);
                             }
                             result = &mut listen_future => break result,
                         }
+                        if shutdown {
+                            if ch.uses_cancel_token() {
+                                // Wait for the listener to finish cleanup
+                                // so session teardown runs before exit.
+                                let _ = tokio::time::timeout(
+                                    CHANNEL_GENERATION_SHUTDOWN_GRACE,
+                                    listen_future,
+                                )
+                                .await;
+                            }
+                            return;
+                        }
+                        // Health tick fired; loop back.
                     }
                 };
 
+                // Cancellation owns the outcome even when it races the
+                // listener's return: do not publish a failure or restart a
+                // generation that is already retiring.
+                if cancel.is_cancelled() {
+                    return;
+                }
+
                 match result {
                     Ok(()) => {
+                        if !should_restart_listener_after_clean_return(&cancel) {
+                            return;
+                        }
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -7798,8 +7812,14 @@ async fn process_channel_message(
     cancellation_token: CancellationToken,
 ) {
     let delivery_message_id = msg.id.clone();
-    process_channel_message_with_delivery_id(ctx, msg, cancellation_token, delivery_message_id)
-        .await;
+    process_channel_message_with_delivery_id(
+        ctx,
+        msg,
+        cancellation_token,
+        delivery_message_id,
+        None,
+    )
+    .await;
 }
 
 async fn process_channel_message_with_delivery_id(
@@ -7807,6 +7827,7 @@ async fn process_channel_message_with_delivery_id(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     delivery_message_id: String,
+    turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -7833,6 +7854,7 @@ async fn process_channel_message_with_delivery_id(
                 cancellation_token,
                 composite_for_body,
                 delivery_message_id,
+                turn_lease,
             )
             .await;
         }
@@ -8793,6 +8815,7 @@ async fn process_channel_message_body(
     cancellation_token: CancellationToken,
     channel_composite: String,
     delivery_message_id: String,
+    turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
 ) {
     ::zeroclaw_log::record!(
         INFO,
@@ -8900,6 +8923,7 @@ async fn process_channel_message_body(
             let sender = msg.sender.clone();
             let channel_label = channel.name().to_string();
             let span = ::zeroclaw_log::attribution_span!(&*channel);
+            let ack_lease = turn_lease.clone();
             Some(zeroclaw_spawn::spawn!(
             ::zeroclaw_log::scope!(
                 category: "channel",
@@ -8908,6 +8932,7 @@ async fn process_channel_message_body(
                 sender: sender.as_str(),
                 message_id: message_id_label.as_str(),
                 => async move {
+                    let _lease = ack_lease;
                     if let Err(e) = channel
                         .add_reaction(&reply_target, &message_id, "\u{1F440}")
                         .await
@@ -9644,12 +9669,14 @@ async fn process_channel_message_body(
             let channel = Arc::clone(channel_ref);
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
+            let draft_lease = turn_lease.clone();
             if matrix_single_message_streaming {
                 let interval_ms = matrix_draft_update_interval_ms(ctx.as_ref(), &msg);
                 let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
                 let matrix_config = Arc::clone(&ctx.prompt_config);
                 let matrix_alias = msg.channel_alias.clone().unwrap_or_default();
                 Some(zeroclaw_spawn::spawn!(async move {
+                    let _lease = draft_lease;
                     run_matrix_single_message_draft_updater(
                         rx,
                         channel,
@@ -9680,6 +9707,7 @@ async fn process_channel_message_body(
                 let leak_detection = ctx.prompt_config.security.leak_detection.clone();
                 let content_format = outbound_content_format_for_channel(&msg.channel);
                 Some(zeroclaw_spawn::spawn!(async move {
+                    let _lease = draft_lease;
                     run_draft_updater_with_leak_detection(
                         channel,
                         reply_target,
@@ -9760,12 +9788,15 @@ async fn process_channel_message_body(
         let notify_channel = target_channel.clone();
         let notify_reply_target = msg.reply_target.clone();
         let notify_thread_root = followup_thread_id(&msg);
+        let notify_lease = turn_lease.clone();
         let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
             Some(zeroclaw_spawn::spawn!(async move {
+                let _lease = notify_lease;
                 while notify_rx.recv().await.is_some() {}
             }))
         } else {
             Some(zeroclaw_spawn::spawn!(async move {
+                let _lease = notify_lease;
                 let thread_ts = notify_thread_root;
                 while let Some(text) = notify_rx.recv().await {
                     if let Some(ref ch) = notify_channel {
@@ -9854,6 +9885,10 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
+    let execution_tree_budget = ExecutionTreeBudget::from_limit(
+        ctx.prompt_config
+            .effective_max_execution_tree_iterations(&ctx.agent_alias),
+    );
     let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -9912,7 +9947,7 @@ async fn process_channel_message_body(
                 channel_reply_target: Some(msg.reply_target.as_str()),
                 cancellation_token: Some(cancellation_token.clone()),
                 on_delta: delta_tx.clone(),
-                shared_budget: None,
+                shared_budget: execution_tree_budget.clone(),
                 channel: approval_channel.as_deref(),
                 // Collector is meaningful only when the generator is active.
                 // Pass None when receipts are disabled so the call site
@@ -10363,7 +10398,9 @@ async fn process_channel_message_body(
                 let temperature = ctx.temperature;
                 let user_msg = msg.content.clone();
                 let assistant_resp = history_response.clone();
+                let autosave_lease = turn_lease.clone();
                 zeroclaw_spawn::spawn!(async move {
+                    let _lease = autosave_lease;
                     if let Err(e) = memory_strategy
                         .consolidate_turn(
                             &user_msg,
@@ -11014,6 +11051,7 @@ async fn run_conversation_turn(
     turn: PendingTurn,
     permit: tokio::sync::OwnedSemaphorePermit,
     generation_cancel: CancellationToken,
+    turn_lease: Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>,
 ) {
     let PendingTurn {
         ctx,
@@ -11027,8 +11065,14 @@ async fn run_conversation_turn(
     let execution_permit = permit;
 
     let Some(registration) = registration else {
-        process_channel_message_with_delivery_id(ctx, msg, generation_cancel, delivery_message_id)
-            .await;
+        process_channel_message_with_delivery_id(
+            ctx,
+            msg,
+            generation_cancel,
+            delivery_message_id,
+            Some(Arc::clone(&turn_lease)),
+        )
+        .await;
         drop(dispatch_ownership);
         drop(execution_permit);
         drop(pending_work);
@@ -11050,6 +11094,7 @@ async fn run_conversation_turn(
         msg,
         registration.cancellation.clone(),
         delivery_message_id,
+        Some(Arc::clone(&turn_lease)),
     )
     .await;
     drop(registration);
@@ -11638,7 +11683,7 @@ async fn run_message_dispatch_loop(
     router: AgentRouter,
     max_in_flight_messages: usize,
 ) {
-    run_message_dispatch_loop_with_cancel(
+    run_message_dispatch_loop_until_cancelled(
         rx,
         router,
         max_in_flight_messages,
@@ -11647,7 +11692,7 @@ async fn run_message_dispatch_loop(
     .await;
 }
 
-async fn run_message_dispatch_loop_with_cancel(
+async fn run_message_dispatch_loop_until_cancelled(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
@@ -11666,6 +11711,7 @@ async fn run_message_dispatch_loop_with_cancel(
     let task_sequence = Arc::new(AtomicU64::new(1));
     let ingress_order = IngressOrderRegistry::new();
     let ingress_tasks = IngressTaskTracker::new();
+    let debounce_tasks = IngressTaskTracker::new();
     let lanes = ConversationLaneRegistry::new(
         Arc::clone(&semaphore),
         router.agent_lifecycle.clone(),
@@ -11685,11 +11731,15 @@ async fn run_message_dispatch_loop_with_cancel(
     // bucket another, still-live turn is waiting in.
     let mut debounce_bucket_owners: HashMap<String, u64> = HashMap::new();
 
-    while let Some(msg) = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => None,
-        msg = rx.recv() => msg,
-    } {
+    let cancelled = loop {
+        let msg = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break true,
+            msg = rx.recv() => match msg {
+                Some(msg) => msg,
+                None => break false,
+            },
+        };
         // Acquire picker-delivery ownership at the first definitive queue
         // consumption boundary. Every `continue`, semaphore shutdown, debounce
         // cancellation, worker abort, and normal completion below then settles
@@ -11944,7 +11994,7 @@ async fn run_message_dispatch_loop_with_cancel(
 
             let debounce_result = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => break,
+                _ = cancel.cancelled() => break true,
                 result = ctx.debouncer.debounce_with_window(&debounce_key, &msg.content, debounce_window) => result,
             };
             match debounce_result {
@@ -11988,7 +12038,7 @@ async fn run_message_dispatch_loop_with_cancel(
                         _ => (rx, pending_work),
                     };
 
-                    let (content, bucket) = spawn_debounce_forwarder(rx, &ingress_tasks);
+                    let (content, bucket) = spawn_debounce_forwarder(rx, &debounce_tasks);
                     debounce_buckets.retain(|_, open| !open.is_closed());
                     debounce_bucket_owners.retain(|key, _| debounce_buckets.contains_key(key));
                     debounce_buckets.insert(debounce_key.clone(), bucket);
@@ -12116,26 +12166,63 @@ async fn run_message_dispatch_loop_with_cancel(
                 order: ingress_order.register(&source_key),
             }),
         );
-    }
-
-    drop(debounce_buckets);
-    let drain = async {
-        ingress_tasks.wait_drained().await;
-        lanes.wait_drained().await;
-        lanes.tasks.wait_drained().await;
-        notice_tasks.wait_drained().await;
     };
-    if tokio::time::timeout(Duration::from_secs(5), drain)
-        .await
-        .is_err()
-    {
-        ingress_tasks.force_stop();
-        lanes.tasks.force_stop();
-        notice_tasks.force_stop();
-        // Wait for dropped futures to release their leases and registrations
-        // before permitting the next runtime generation to start.
+
+    if cancelled {
+        // Stop admission first, then cancel every accepted turn. Closing the
+        // execution semaphore lets queued lane entries retire without starting
+        // new model work while active turns observe their own cancellation.
+        rx.close();
+        pending_budget.close();
+        semaphore.close();
+        busy_notice_budget.close();
+        stop_reply_budget.close();
+
+        let active_cancellations: Vec<CancellationToken> = in_flight_by_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .flat_map(|states| states.iter().map(|state| state.cancellation.clone()))
+            .collect();
+        for turn_cancel in active_cancellations {
+            turn_cancel.cancel();
+        }
+
+        // Debounce timers live inside each agent runtime context. Retire every
+        // open key against every live context so its reserved routing slot is
+        // released before task draining begins.
+        let debounce_keys: Vec<String> = debounce_buckets.keys().cloned().collect();
+        for key in &debounce_keys {
+            if let Some(ctx) = &router.single_ctx {
+                let _ = ctx.debouncer.cancel(key).await;
+            }
+            for ctx in router.by_agent.values() {
+                let _ = ctx.debouncer.cancel(key).await;
+            }
+        }
+        debounce_buckets.clear();
+        debounce_bucket_owners.clear();
+
+        // One absolute generation deadline covers routing, debounce, lane,
+        // and notice ownership. Any remainder is aborted and joined by its
+        // owning task set before this dispatcher returns.
+        let deadline = tokio::time::Instant::now() + CHANNEL_GENERATION_SHUTDOWN_GRACE;
+        let ingress_clean = ingress_tasks.drain_until(deadline).await;
+        let debounce_clean = debounce_tasks.drain_until(deadline).await;
+        let lanes_clean = lanes.drain_until(deadline).await;
+        let notices_clean = notice_tasks.drain_until(deadline).await;
+        if !(ingress_clean && debounce_clean && lanes_clean && notices_clean) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "channel generation shutdown aborted unfinished message tasks"
+            );
+        }
+    } else {
         ingress_tasks.wait_drained().await;
-        lanes.tasks.wait_drained().await;
+        debounce_tasks.wait_drained().await;
+        lanes.wait_drained().await;
         notice_tasks.wait_drained().await;
     }
 }
@@ -16583,7 +16670,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.resolved.compact_context {
-            Some(6000)
+            Some(COMPACT_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };
@@ -17051,6 +17138,9 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         return Ok(());
     }
     let (_, cron_channel_registry_lease) = publish_cron_channel_registry(&prepared_channels);
+    for cc in &prepared_channels {
+        prepare_supervised_channel(&cc.channel, &cancel);
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
     let listener_handles: Vec<_> = prepared_channels
         .iter()
@@ -17083,7 +17173,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     // picker ack registrations are reclaimed.
     #[cfg(feature = "channel-telegram")]
     let _picker_ack_cleanup = ModelPickerAckCleanupGuard;
-    run_message_dispatch_loop_with_cancel(rx, router, max_in_flight, cancel.clone()).await;
+    run_message_dispatch_loop_until_cancelled(rx, router, max_in_flight, cancel.clone()).await;
 
     for h in listener_handles {
         let _ = h.await;
@@ -18902,6 +18992,33 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
+        let tracker = IngressTaskTracker::new();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tracker.spawn(async move {
+            let _ = completed_tx.send(());
+        });
+        completed_rx.await.unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tracker.spawn(async move {
+            let _ = release_rx.await;
+        });
+        assert_eq!(
+            tracker
+                .tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "a completed task must not remain alongside the live task"
+        );
+
+        release_tx.send(()).unwrap();
+        tracker.wait_drained().await;
+    }
 
     #[test]
     fn shared_room_history_keeps_the_speaker_for_any_channel() {
@@ -33207,7 +33324,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let dispatch_cancel = cancel.clone();
             let router =
                 AgentRouter::single(runtime_ctx).with_agent_lifecycle(agent_lifecycle.clone());
-            let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel(
+            let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_until_cancelled(
                 rx,
                 router,
                 2,
@@ -38185,12 +38302,9 @@ BTC is currently around $65,000 based on latest tool output."#
             generation
         );
         execution.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            lanes.wait_drained().await;
-            lanes.tasks.wait_drained().await;
-        })
-        .await
-        .expect("stale queued work must retire without calling the gated provider");
+        tokio::time::timeout(Duration::from_secs(1), lanes.wait_drained())
+            .await
+            .expect("stale queued work must retire without calling the gated provider");
         assert_eq!(budget.available_permits(), 1);
         assert_eq!(execution.available_permits(), 1);
         assert_eq!(lifecycle.active_turn_count(ctx.agent_alias.as_str()), 0);
@@ -38212,15 +38326,20 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn forced_dispatch_task_retirement_releases_lifecycle_and_admission() {
+    async fn forced_dispatch_task_retirement_preserves_child_lease_until_child_finishes() {
         let tracker = IngressTaskTracker::new();
         let lifecycle =
             zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
-        let lease = lifecycle.reserve_turn("test-agent").unwrap();
+        let lease = Arc::new(lifecycle.reserve_turn("test-agent").unwrap());
+        let child_lease = Arc::clone(&lease);
+        let child = zeroclaw_spawn::spawn!(async move {
+            let _lease = child_lease;
+            std::future::pending::<()>().await;
+        });
         let budget = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = Arc::clone(&budget).try_acquire_owned().unwrap();
         let (started, ready) = tokio::sync::oneshot::channel();
-        let worker = tracker.spawn(async move {
+        tracker.spawn(async move {
             let _lease = lease;
             let _permit = permit;
             let _ = started.send(());
@@ -38228,13 +38347,16 @@ BTC is currently around $65,000 based on latest tool output."#
         });
         ready.await.unwrap();
         assert_eq!(lifecycle.active_turn_count("test-agent"), 1);
-        tracker.force_stop();
-        tokio::time::timeout(Duration::from_secs(1), tracker.wait_drained())
-            .await
-            .unwrap();
-        worker.await.unwrap();
-        assert_eq!(lifecycle.active_turn_count("test-agent"), 0);
+        assert!(
+            !tracker
+                .drain_until(tokio::time::Instant::now() + Duration::from_millis(10))
+                .await
+        );
+        assert_eq!(lifecycle.active_turn_count("test-agent"), 1);
         assert_eq!(budget.available_permits(), 1);
+        child.abort();
+        let _ = child.await;
+        assert_eq!(lifecycle.active_turn_count("test-agent"), 0);
     }
 
     /// Refusing a flood must not turn into an unbounded detached outbound
@@ -46662,6 +46784,31 @@ This is an example JSON object for profile settings."#;
         err: Mutex<Option<anyhow::Error>>,
     }
 
+    /// A test channel that opts into the cooperative cancellation contract:
+    /// `uses_cancel_token()` returns `true`, `set_cancel_token` stores the
+    /// token, and `listen()` awaits cancellation before running a bounded,
+    /// probe-able cleanup phase. Used to prove the supervisor waits for
+    /// participating listeners to finish cleanup before exiting.
+    struct ParticipatingCancelChannel {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        cleanups: Arc<AtomicUsize>,
+        token: Mutex<Option<CancellationToken>>,
+        cleanup_started: Arc<tokio::sync::Notify>,
+        cleanup_finish_allowed: Arc<tokio::sync::Notify>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ParticipatingCancelChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     /// A channel whose listener stays alive for as long as the supervisor
     /// watches it — the reported shape where Telegram long-polls a bad bot
     /// token and absorbs the 404 without ever returning from `listen`.
@@ -46705,6 +46852,42 @@ This is an example JSON object for profile settings."#;
         }
         fn alias(&self) -> &str {
             "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ParticipatingCancelChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_cancel_token(&self, token: CancellationToken) {
+            *self.token.lock().unwrap() = Some(token);
+        }
+
+        fn uses_cancel_token(&self) -> bool {
+            true
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let token = self.token.lock().unwrap().clone();
+            if let Some(token) = token {
+                token.cancelled().await;
+            }
+            // Cleanup phase: signal start, then wait for the test to
+            // release it so the supervisor's grace period is observable.
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            self.cleanup_started.notify_one();
+            self.cleanup_finish_allowed.notified().await;
+            Ok(())
         }
     }
 
@@ -47108,6 +47291,149 @@ This is an example JSON object for profile settings."#;
                 .contains("listen boom")
         );
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn should_restart_listener_after_clean_return_respects_cancellation() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(
+            should_restart_listener_after_clean_return(&cancel),
+            "must restart when cancellation has not been triggered"
+        );
+        cancel.cancel();
+        assert!(
+            !should_restart_listener_after_clean_return(&cancel),
+            "must not restart after cancellation was triggered"
+        );
+    }
+
+    /// A participating listener (via `PacedChannel`) must be allowed to
+    /// finish cleanup before the supervisor exits: cancellation while the
+    /// listener is mid-cleanup keeps the supervisor alive, then a clean
+    /// return yields one call, one cleanup, zero restarts, no error.
+    #[tokio::test]
+    async fn supervised_listener_waits_for_participating_cleanup_on_cancel() {
+        struct Pacing {
+            interval: u64,
+            depth: u16,
+        }
+        impl zeroclaw_config::schema::HasReplyPacing for Pacing {
+            fn reply_min_interval_secs(&self) -> u64 {
+                self.interval
+            }
+            fn reply_queue_depth_max(&self) -> u16 {
+                self.depth
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let cleanup_finish_allowed = Arc::new(tokio::sync::Notify::new());
+        let channel_name = format!("test-cancel-participating-{}", uuid::Uuid::new_v4());
+        let component = format!("channel:{channel_name}");
+        let inner: Arc<dyn Channel> = Arc::new(ParticipatingCancelChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            cleanups: Arc::clone(&cleanups),
+            token: Mutex::new(None),
+            cleanup_started: Arc::clone(&cleanup_started),
+            cleanup_finish_allowed: Arc::clone(&cleanup_finish_allowed),
+        });
+
+        // Wrap through the real PacedChannel with pacing enabled so the
+        // token forwards through the production wrapper boundary.
+        let channel = crate::paced_channel::PacedChannel::wrap(
+            inner,
+            &Pacing {
+                interval: 1,
+                depth: 16,
+            },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Use the same production helper as start_channels so this protects
+        // the real token-injection boundary rather than a test-only setup.
+        prepare_supervised_channel(&channel, &cancel);
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        // Give the listener time to enter listen() and park on cancellation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        cleanup_started.notified().await;
+
+        assert_eq!(
+            cleanups.load(Ordering::SeqCst),
+            1,
+            "listener should enter cleanup exactly once"
+        );
+        assert!(
+            !handle.is_finished(),
+            "supervisor must wait for participating cleanup, not exit immediately"
+        );
+
+        // Release cleanup; the supervisor should then exit cleanly.
+        cleanup_finish_allowed.notify_one();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        result
+            .expect("supervisor must exit after cleanup completes")
+            .expect("supervisor task must join cleanly after cleanup completes");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "listener ran more than once"
+        );
+        assert_eq!(
+            cleanups.load(Ordering::SeqCst),
+            1,
+            "cleanup ran more than once"
+        );
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let c = &snapshot["components"][&component];
+        assert_eq!(
+            c["restart_count"].as_u64().unwrap_or(0),
+            0,
+            "must not restart on intentional shutdown"
+        );
+        assert!(
+            c["status"].is_null() || c["status"].as_str() != Some("error"),
+            "must not record component error on intentional shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_dispatch_loop_exits_with_sender_retained() {
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let dispatch_cancel = cancel.clone();
+        let handle = zeroclaw_spawn::spawn!(run_message_dispatch_loop_until_cancelled(
+            rx,
+            AgentRouter::single(ctx),
+            1,
+            dispatch_cancel,
+        ));
+
+        // Keep the sender alive exactly as a listener/router does. Generation
+        // cancellation, not channel closure, must retire the dispatcher.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("dispatch loop must not wait for every sender to drop")
+            .expect("dispatch loop task must join cleanly");
+        drop(tx);
     }
 
     #[tokio::test]
