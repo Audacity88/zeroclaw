@@ -289,8 +289,14 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let effective_path = self
+        // Snapshot once: session resume can rebind the value, so use the same
+        // environment for launcher resolution and the child process.
+        let tui_env_snapshot = self
             .tui_env
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let effective_path = tui_env_snapshot
             .as_ref()
             .and_then(|env| env.get("PATH"))
             .map(OsStr::new);
@@ -342,14 +348,7 @@ impl Tool for ShellTool {
 
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
         // conflict — the user's real PATH etc. should take precedence over
-        // whatever the daemon process inherited. Snapshot once: the value can
-        // be rebound on session resume, so read it under the lock and clone the
-        // `Arc` handle out (cheap; no map copy).
-        let tui_env_snapshot = self
-            .tui_env
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        // whatever the daemon process inherited.
         if let Some(ref tui_env) = tui_env_snapshot {
             for (k, v) in tui_env.iter() {
                 cmd.env(k, v);
