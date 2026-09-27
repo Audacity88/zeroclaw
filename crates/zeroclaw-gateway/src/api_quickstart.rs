@@ -1,11 +1,6 @@
 //! HTTP routes for the Quickstart flow.
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::presets::BuilderSubmission;
 use zeroclaw_runtime::quickstart::{
@@ -14,7 +9,6 @@ use zeroclaw_runtime::quickstart::{
 };
 
 use super::AppState;
-use super::api::require_auth;
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -35,10 +29,7 @@ pub enum ApplyResult {
     },
 }
 
-pub async fn handle_state(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_state(State(state): State<AppState>) -> impl IntoResponse {
     let cfg = state.config.read().clone();
     let body = zeroclaw_runtime::quickstart::snapshot_state(&cfg);
     (StatusCode::OK, Json(body)).into_response()
@@ -56,13 +47,9 @@ pub struct FieldsResult {
 }
 
 pub async fn handle_fields(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
     Json(req): Json<FieldsRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let body = FieldsResult {
         fields: zeroclaw_runtime::quickstart::field_shape(req.section, &req.type_key),
     };
@@ -71,12 +58,8 @@ pub async fn handle_fields(
 
 pub async fn handle_validate(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(submission): Json<BuilderSubmission>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let cfg = state.config.read().clone();
     let body = match validate_only_with_surface(&submission, &cfg, Surface::Web) {
         Ok(()) => ValidateResult::Ok,
@@ -96,25 +79,30 @@ pub struct DismissRequest {
 }
 
 pub async fn handle_dismiss(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
     Json(req): Json<DismissRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     record_dismissed(&req.run_id, req.surface, req.last_step);
     (StatusCode::NO_CONTENT, ()).into_response()
 }
 
 pub async fn handle_apply(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    principal: crate::principal_gate::RequestPrincipal,
     Json(submission): Json<BuilderSubmission>,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+) -> axum::response::Response {
+    // Quickstart can write an open-ended set of config paths. Refuse a
+    // principal without whole-config authority before reserving the alias.
+    let authorization = match crate::principal_gate::authorize_whole_config_write(
+        &principal,
+        &[
+            zeroclaw_api::grants::Verb::Create,
+            zeroclaw_api::grants::Verb::Update,
+        ],
+    ) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
     let reservation = match state
         .agent_lifecycle
         .reserve_config_mutation(&submission.agent.name)
@@ -138,7 +126,7 @@ pub async fn handle_apply(
     let task =
         zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
             let _reservation = reservation;
-            apply_reserved(state, submission).await
+            apply_reserved(state, submission, authorization).await
         }));
     match task.await {
         Ok(response) => response,
@@ -155,6 +143,7 @@ pub async fn handle_apply(
 async fn apply_reserved(
     state: AppState,
     submission: BuilderSubmission,
+    authorization: crate::principal_gate::ConfigWriteAuthorization,
 ) -> axum::response::Response {
     // Held through the swap below (and across `apply_with_surface`'s own
     // save, which runs while this guard is held) so a concurrent config
@@ -172,6 +161,7 @@ async fn apply_reserved(
     .await;
     let body = match result {
         Ok(agent) => {
+            authorization.publish_persisted(&working);
             *state.config.write() = working;
             state
                 .pending_reload
@@ -272,7 +262,7 @@ mod tests {
                 personality_files: vec![],
             },
         };
-        let response = handle_apply(State(state.clone()), HeaderMap::new(), Json(submission()))
+        let response = handle_apply(State(state.clone()), None, Json(submission()))
             .await
             .into_response();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -294,7 +284,7 @@ mod tests {
         assert!(!workspace.exists());
 
         drop(cleanup);
-        let response = handle_apply(State(state.clone()), HeaderMap::new(), Json(submission()))
+        let response = handle_apply(State(state.clone()), None, Json(submission()))
             .await
             .into_response();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
