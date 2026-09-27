@@ -10507,13 +10507,18 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn image_cap_eviction_keeps_prior_native_messages_identical() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let png_data = [
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
-            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
+        // A real PNG: preparation decodes pixels and drops corrupt images.
+        let png_data = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
         let config = zeroclaw_config::schema::MultimodalConfig {
             max_images: 4,
             max_image_size_mb: 5,
@@ -10523,7 +10528,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         let img = |i: usize| {
             let p = temp.path().join(format!("img{i}.png"));
-            std::fs::write(&p, png_data).unwrap();
+            std::fs::write(&p, &png_data).unwrap();
             p
         };
         // Four image turns (one image-only, three with captions), each answered.
@@ -10574,6 +10579,20 @@ data: {\"type\":\"message_stop\"}\n\n";
             img(4).display()
         )));
         let p1 = convert_stripped(&history, &config).await;
+        // The fixtures must reach the wire as image blocks; otherwise the
+        // stability assertions below hold with no image in play.
+        let image_blocks = |messages: &[String]| {
+            messages
+                .iter()
+                .map(|m| m.matches("\"type\":\"image\"").count())
+                .sum::<usize>()
+        };
+        assert_eq!(image_blocks(&p0), 4, "all four fixtures reach the wire");
+        assert_eq!(
+            image_blocks(&p1),
+            4,
+            "the cap keeps exactly four image blocks"
+        );
 
         // Image-free follow-up.
         history.push(ChatMessage::assistant("saw 4"));

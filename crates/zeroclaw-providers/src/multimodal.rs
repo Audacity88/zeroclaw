@@ -9150,13 +9150,7 @@ mod tests {
     #[tokio::test]
     async fn image_cap_eviction_is_bounded_and_prefix_stable() {
         let temp = tempfile::tempdir().unwrap();
-        let png_data = [
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
-            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
+        let png_data = valid_png();
         let config = MultimodalConfig {
             max_images: 4,
             max_image_size_mb: 5,
@@ -9166,7 +9160,7 @@ mod tests {
         };
         let img = |i: usize| {
             let p = temp.path().join(format!("img{i}.png"));
-            std::fs::write(&p, png_data).unwrap();
+            std::fs::write(&p, &png_data).unwrap();
             p
         };
         // Four image turns (one image-only, three with captions), each answered.
@@ -9194,6 +9188,17 @@ mod tests {
         let p1 = prepare_messages_for_provider(&history, &config)
             .await
             .unwrap();
+        // The fixtures must decode: a rejected image would still be trimmed by
+        // marker count but never reach the provider, and the contract below
+        // would pass without a single image block in play.
+        let inlined = |p: &PreparedMessages| {
+            p.messages
+                .iter()
+                .filter(|m| m.content.contains("data:image"))
+                .count()
+        };
+        assert_eq!(inlined(&p0), 4, "all four fixtures inline before the cap");
+        assert_eq!(inlined(&p1), 4, "the cap keeps exactly four inlined images");
         let changed1: Vec<usize> = p0
             .messages
             .iter()
@@ -9261,16 +9266,10 @@ mod tests {
         let _cleanup = HookCleanup;
 
         let temp = tempfile::tempdir().unwrap();
-        let png_data = [
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
-            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
+        let png_data = valid_png();
         let img = |i: usize| {
             let p = temp.path().join(format!("img{i}.png"));
-            std::fs::write(&p, png_data).unwrap();
+            std::fs::write(&p, &png_data).unwrap();
             p
         };
         // One image-only turn (i == 1), captioned turns otherwise, each
