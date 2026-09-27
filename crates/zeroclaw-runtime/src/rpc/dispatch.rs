@@ -25334,7 +25334,7 @@ mod tests {
             config.runtime_profiles.insert(
                 "default".into(),
                 zeroclaw_config::schema::RuntimeProfileConfig {
-                    max_history_messages: Some(2),
+                    max_history_messages: Some(1),
                     ..Default::default()
                 },
             );
