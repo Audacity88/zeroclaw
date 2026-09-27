@@ -25,7 +25,7 @@ pub fn create_runtime_with_path(
 
     match config.kind {
         RuntimeKind::Native => {
-            let shell = config.shell.clone().unwrap_or_else(|| "sh".into());
+            let shell = config.shell.clone().unwrap_or_else(native::default_shell);
             #[cfg(unix)]
             validate_shell(&shell)?;
             #[cfg(windows)]
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn factory_native_default_shell_is_sh() {
+    fn factory_native_default_shell_uses_platform_resolver() {
         let cfg = RuntimeConfig {
             kind: RuntimeKind::Native,
             shell: None,
@@ -244,11 +244,13 @@ mod tests {
         let cmd = rt
             .build_shell_command("echo hi", &std::env::temp_dir())
             .unwrap();
-        let expected = crate::platform::resolve_executable(std::ffi::OsStr::new("sh")).unwrap();
+        let selected = native::default_shell();
+        let expected =
+            crate::platform::resolve_executable(std::ffi::OsStr::new(&selected)).unwrap();
         assert_eq!(
             cmd.as_std().get_program(),
             expected.as_os_str(),
-            "default shell should use the resolved executable path"
+            "platform default {selected:?} should use the resolved executable path"
         );
     }
 
