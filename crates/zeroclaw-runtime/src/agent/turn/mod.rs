@@ -3783,6 +3783,7 @@ mod reported_budget_tests {
     // below calls the production function with an explicit turn identity.
     #[allow(clippy::too_many_arguments)]
     async fn enforce_reported_budget(
+        injected_memory_preamble: &mut Option<MemoryPreamble>,
         history: &mut Vec<ChatMessage>,
         reported_input_tokens: usize,
         reported_population_estimated: usize,
@@ -3798,6 +3799,7 @@ mod reported_budget_tests {
         crumb_present: &mut bool,
     ) {
         super::enforce_reported_budget(
+            injected_memory_preamble,
             history,
             reported_input_tokens,
             reported_population_estimated,
@@ -3857,6 +3859,7 @@ mod reported_budget_tests {
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         let observer = TrimObserver::default();
         super::enforce_reported_budget(
+            &mut None,
             &mut history,
             estimated * 4,
             estimated,
