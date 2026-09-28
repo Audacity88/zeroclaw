@@ -2942,6 +2942,7 @@ async fn usage_event_coherent_tuple_vision_route() {
         let cfg_arc = Arc::new(cfg.clone());
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live_config: None,
             live: None,
         };
         let mut base_resp = text_response("base response");
@@ -3137,6 +3138,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         let cfg_arc = Arc::new(cfg.clone());
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live_config: None,
             live: None,
         };
 
@@ -3319,6 +3321,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     let cfg_arc = Arc::new(cfg.clone());
     let switch_cfg = ProviderSwitchConfig {
         config: Some(cfg_arc),
+        live_config: None,
         live: None,
     };
 
