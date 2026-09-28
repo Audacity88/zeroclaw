@@ -3233,12 +3233,25 @@ impl DelegateTool {
                                 scope_delegate_session_key(session_key, async move {
                                     crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                                         .scope(receipt_scope, async move {
-                                            Box::pin(inner.execute_sync(
+                                            // Erase the worker future's type, as
+                                            // `#[async_trait]` does on the `Tool::execute`
+                                            // path: the spawn's `Send` proof otherwise
+                                            // walks every layer of the delegated loop and
+                                            // overflows the trait-solver recursion limit
+                                            // (E0275). A plain `Box::pin` does not stop it.
+                                            let worker: std::pin::Pin<
+                                                Box<
+                                                    dyn std::future::Future<
+                                                            Output = anyhow::Result<ToolResult>,
+                                                        > + Send
+                                                        + '_,
+                                                >,
+                                            > = Box::pin(inner.execute_sync(
                                                 &agent_name,
                                                 &prompt,
                                                 &args_clone,
-                                            ))
-                                            .await
+                                            ));
+                                            worker.await
                                         })
                                         .await
                                 }),
