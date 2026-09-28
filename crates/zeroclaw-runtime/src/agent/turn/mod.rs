@@ -6098,6 +6098,7 @@ mod sop_step_reassembly_tests {
             cancellation_token,
             max_tool_iterations,
             None,
+            None,
         )
         .await
     }
@@ -6109,6 +6110,7 @@ mod sop_step_reassembly_tests {
         budget: ExecutionTreeBudget,
         cancellation_token: CancellationToken,
         max_tool_iterations: usize,
+        security: Option<&crate::security::SecurityPolicy>,
         hooks: Option<&crate::hooks::HookRunner>,
     ) -> Result<String> {
         let observer = crate::observability::NoopObserver {};
@@ -6138,7 +6140,7 @@ mod sop_step_reassembly_tests {
                     observer: &observer,
                     silent: true,
                     approval: None,
-                    security: None,
+                    security,
                     multimodal_config: &multimodal,
                     config: None,
                     hooks,
@@ -6282,6 +6284,10 @@ mod sop_step_reassembly_tests {
         )
         .unwrap();
         let prompt = format!("describe [IMAGE:{}]", image.display());
+        let security = crate::security::SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
         let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
         for (cancel, change_model) in [(false, false), (false, true), (true, true)] {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -6307,6 +6313,7 @@ mod sop_step_reassembly_tests {
                 budget.clone(),
                 CancellationToken::new(),
                 10,
+                None,
                 Some(&hooks),
             )
             .await;
@@ -6334,13 +6341,15 @@ mod sop_step_reassembly_tests {
             );
         }
         let mut history = vec![ChatMessage::user(prompt)];
-        let result = run_budgeted_test_loop(
+        let result = run_budgeted_test_loop_with_hooks(
             &TextProvider,
             &mut history,
             &tools,
             ExecutionTreeBudget::root(1),
             CancellationToken::new(),
             10,
+            Some(&security),
+            None,
         )
         .await;
         assert!(
