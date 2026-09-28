@@ -16365,6 +16365,12 @@ command = "rm independent-delegate-marker"
                 delegation_policy: DelegationPolicy {
                     mode: DelegationMode::Allow,
                 },
+                // A bounded child denies tools that are not auto-approved, and
+                // these tests need the between-call config tools to run.
+                auto_approve: vec![
+                    "config_lowering_tool".to_string(),
+                    "config_mode_flip_tool".to_string(),
+                ],
                 ..RiskProfileConfig::default()
             },
         );
@@ -17489,7 +17495,7 @@ command = "rm independent-delegate-marker"
                 delegation_policy: DelegationPolicy {
                     mode: DelegationMode::Allow,
                 },
-                auto_approve: vec!["delegate".to_string()],
+                auto_approve: vec!["delegate".to_string(), "config_mode_flip_tool".to_string()],
                 ..RiskProfileConfig::default()
             },
         );
