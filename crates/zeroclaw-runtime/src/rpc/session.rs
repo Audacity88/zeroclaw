@@ -966,9 +966,21 @@ impl SessionStore {
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
         let done = self.wait_test_gate().await;
-        let merged = self.preview_overrides(id, &patch).await?;
+        let merged = match self.preview_overrides(id, &patch).await {
+            Some(merged) => merged,
+            None => {
+                self.signal_test_gate_done(done);
+                return None;
+            }
+        };
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(id)?;
+        let session = match sessions.get_mut(id) {
+            Some(session) => session,
+            None => {
+                self.signal_test_gate_done(done);
+                return None;
+            }
+        };
         if session.generation != generation {
             self.signal_test_gate_done(done);
             return None;

@@ -33620,13 +33620,13 @@ mod tests {
     //
     // These tests use a SessionStore test-only gate to pause stale work
     // after the generation is captured but before the gated method commits,
-    // then remove and recreate the session while stale work is paused. A
+    // then remove the session and start same-ID recreation while stale work is paused. A
     // live same-ID `session/new` is now an idempotent resume; explicit removal
     // still creates a successor generation and exercises the stale-work gate.
 
     /// Deterministic race: `session/configure` captures the original
     /// generation, enters the gated method, then the session is removed and
-    /// recreated while the stale configure is paused. The stale work must be
+    /// recreation starts while the stale configure is paused. The stale work must be
     /// rejected and the successor must remain untouched.
     #[tokio::test]
     async fn session_configure_stale_gen_replaced_during_provider_build() {
@@ -33661,7 +33661,9 @@ mod tests {
 
         // Wait for the handler to enter the gate (generation captured,
         // commit pending).
-        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("configure must reach the provider-update gate");
 
         // Explicitly end the old incarnation before recreating the same ID.
         // A live same-ID session/new must resume rather than replace it.
@@ -33670,29 +33672,40 @@ mod tests {
             make_model_refresh_test_config(&tmp),
             Arc::clone(&sessions),
         );
-        let replace_res = dispatcher2
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "cwd": workspace,
-                "session_id": session_id,
-            }))
-            .await;
+        let replace_sid = session_id.clone();
+        let replace = zeroclaw_spawn::spawn!(async move {
+            dispatcher2
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "cwd": workspace,
+                    "session_id": replace_sid,
+                }))
+                .await
+        });
+        tokio::task::yield_now().await;
         assert!(
-            replace_res.is_ok(),
-            "session/new recreation must succeed: {replace_res:?}"
+            !replace.is_finished(),
+            "replacement must not complete before the configure gate is released"
         );
 
-        // Release the gate — stale work sees the generation mismatch.
+        // Releasing the stale configure also releases its admission boundary.
         release.notify_one();
-
-        // Wait for the gated method to exit.
-        done.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), done.notified())
+            .await
+            .expect("stale configure must leave the gate");
         sessions.clear_test_gated_op_pause();
-
         let res = handle.await.expect("spawned configure must not panic");
         assert!(
             res.is_err(),
-            "stale-generation configure after replacement must fail; got: {res:?}"
+            "stale-generation configure after removal must fail; got: {res:?}"
+        );
+        let replace_res = tokio::time::timeout(std::time::Duration::from_secs(5), replace)
+            .await
+            .expect("replacement must finish after configure releases admission")
+            .expect("replacement task must not panic");
+        assert!(
+            replace_res.is_ok(),
+            "session/new recreation must succeed: {replace_res:?}"
         );
 
         // Successor must be completely untouched — it was created from
@@ -33731,7 +33744,7 @@ mod tests {
     /// Deterministic race: config/set triggers an async refresh. The
     /// refresh snapshots the session identity, acquires the per-session
     /// lock, builds the provider, then blocks at `apply_model_provider`.
-    /// The session is removed and recreated via `session/new` while paused.
+    /// The session is removed and recreation starts via `session/new` while paused.
     /// The stale refresh must skip the successor.
     #[tokio::test]
     async fn config_set_refresh_stale_gen_replaced_during_provider_build() {
@@ -33765,7 +33778,9 @@ mod tests {
 
         // Wait for the inline refresh to reach the gate (snapshot captured,
         // provider built, apply pending).
-        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("config/set refresh must reach the provider-update gate");
 
         // Explicitly end the old incarnation before recreating the same ID.
         assert!(sessions.remove(&session_id).await);
@@ -33774,28 +33789,39 @@ mod tests {
             Arc::clone(&sessions),
         );
         let workspace = tmp.path().join("workspace");
-        let replace_res = dispatcher2
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "cwd": workspace,
-                "session_id": session_id,
-            }))
-            .await;
+        let replace_sid = session_id.clone();
+        let replace = zeroclaw_spawn::spawn!(async move {
+            dispatcher2
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "cwd": workspace,
+                    "session_id": replace_sid,
+                }))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !replace.is_finished(),
+            "replacement must not complete before the refresh gate is released"
+        );
+
+        // The stale refresh has no live session to update. Its completion
+        // releases the admission boundary for same-ID recreation.
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), done.notified())
+            .await
+            .expect("stale refresh must leave the gate");
+        sessions.clear_test_gated_op_pause();
+        let res = config_set.await.expect("config/set task must complete");
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+        let replace_res = tokio::time::timeout(std::time::Duration::from_secs(5), replace)
+            .await
+            .expect("replacement must finish after refresh releases admission")
+            .expect("replacement task must not panic");
         assert!(
             replace_res.is_ok(),
             "session/new recreation must succeed: {replace_res:?}"
         );
-
-        // Release the gate — stale refresh sees generation mismatch.
-        release.notify_one();
-
-        // Wait for the gated method to exit, then clean up.
-        done.notified().await;
-        sessions.clear_test_gated_op_pause();
-
-        // The inline refresh has run its course, so config/set can now settle.
-        let res = config_set.await.expect("config/set task must complete");
-        assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
         // Successor must be untouched by the stale refresh — it was
         // created from config with model "old-model". The refresh tried
