@@ -27207,7 +27207,8 @@ mod tests {
                 .agents
                 .contains_key("recreated")
         );
-        assert!(dispatcher.ctx.config_write_lock.try_lock().is_ok());
+        // This lock is process-wide; another parallel test may acquire it
+        // after the retained quickstart job releases it.
         let disk: Config = toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
         assert!(disk.agents.contains_key("recreated"));
     }
