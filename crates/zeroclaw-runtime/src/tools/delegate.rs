@@ -17495,7 +17495,7 @@ command = "rm independent-delegate-marker"
                 delegation_policy: DelegationPolicy {
                     mode: DelegationMode::Allow,
                 },
-                auto_approve: vec!["delegate".to_string(), "config_mode_flip_tool".to_string()],
+                auto_approve: vec!["delegate".to_string(), "live_config_flip_tool".to_string()],
                 ..RiskProfileConfig::default()
             },
         );
