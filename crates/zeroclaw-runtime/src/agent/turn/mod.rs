@@ -1212,6 +1212,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         turn_state.canonical.as_deref_mut(),
                         config,
                         multimodal_config,
+                        security,
                         hooks,
                         image_cache.as_deref_mut(),
                         |provider, selected_model| {
@@ -2528,6 +2529,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_state.canonical.as_deref_mut(),
         config,
         multimodal_config,
+        security,
         hooks,
         image_cache,
         |provider, selected_model| {
@@ -6136,6 +6138,7 @@ mod sop_step_reassembly_tests {
                     observer: &observer,
                     silent: true,
                     approval: None,
+                    security: None,
                     multimodal_config: &multimodal,
                     config: None,
                     hooks,
