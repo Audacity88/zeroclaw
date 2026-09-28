@@ -352,10 +352,18 @@ try {
         throw 'Registered direct runner tree did not have the expected process ancestry'
     }
     Invoke-Fixture service install | Write-Host
-    if (($null -ne (Get-Process -Id $registeredRunner.ProcessId -ErrorAction SilentlyContinue)) -or
-        ($null -ne (Get-Process -Id $registeredDaemonPid -ErrorAction SilentlyContinue)) -or
-        ($null -ne (Get-Process -Id $registeredDescendantPid -ErrorAction SilentlyContinue))) {
-        throw 'Registered direct runner tree survived service reinstall'
+    $survivors = @()
+    foreach ($entry in @(
+        @{ role = 'runner'; process_id = $registeredRunner.ProcessId }
+        @{ role = 'daemon'; process_id = $registeredDaemonPid }
+        @{ role = 'descendant'; process_id = $registeredDescendantPid }
+    )) {
+        if ($null -ne (Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue)) {
+            $survivors += "$($entry.role)=$($entry.process_id)"
+        }
+    }
+    if ($survivors.Count -gt 0) {
+        throw "Registered direct runner tree survived service reinstall: $($survivors -join ', ')"
     }
     if ($null -eq (Get-Process -Id $directLookalike.Id -ErrorAction SilentlyContinue)) {
         throw 'Reinstall killed an unrelated same-binary runner with another config directory'
