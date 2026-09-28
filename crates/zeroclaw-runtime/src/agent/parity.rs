@@ -186,6 +186,9 @@ async fn parity_l1_engine_honors_excluded_tools() {
             },
         ),
         history: &mut history,
+        // Test transcripts start fresh: no prior trim, no crumb.
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,
@@ -380,6 +383,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
     // The live-SOP path: re-assemble the step agent's own execution context.
     let owned = crate::agent::turn::assemble_owned_execution(
         &config,
+        None,
         "restricted",
         Arc::clone(&engine),
         None,

@@ -291,6 +291,27 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// Project a full agent conversation history down to the flat `ChatMessage`
+/// shape durable session backends store: user/assistant chat turns only,
+/// system prompt excluded (the backend restores against the caller's own
+/// system prompt, not a persisted one). `AssistantToolCalls` and
+/// `ToolResults` are tool-loop plumbing that durable session transcripts have
+/// never persisted; only the visible chat turns are kept.
+///
+/// Callers that own the agent's authoritative post-turn history (after
+/// budget-enforcement trimming) should use this to replace a durable
+/// transcript wholesale rather than appending the turn's delta on top of a
+/// transcript the agent may have already trimmed underneath it.
+pub fn durable_chat_messages(history: &[ConversationMessage]) -> Vec<ChatMessage> {
+    history
+        .iter()
+        .filter_map(|message| match message {
+            ConversationMessage::Chat(chat) if chat.role != "system" => Some(chat.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A chunk of content from a streaming response.
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
@@ -455,6 +476,18 @@ pub enum StreamError {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// The connection for the failing request hop could not be opened
+    /// (connect, TLS handshake or DNS), as reported by the transport at
+    /// the send site. For a request that followed no redirect, nothing
+    /// was delivered. A redirect-following client may already have
+    /// delivered an earlier hop; callers that must not re-send delivered
+    /// work cannot rely on this variant alone.
+    ///
+    /// The display text matches [`StreamError::Http`] so logs, diagnostics
+    /// and user-facing messages are unchanged.
+    #[error("HTTP error: {0}")]
+    ConnectFailed(String),
+
     #[error("JSON parse error: {0}")]
     Json(serde_json::Error),
 
@@ -466,6 +499,16 @@ pub enum StreamError {
 
     #[error(transparent)]
     ModelRefusal(#[from] Box<ModelRefusalError>),
+
+    /// The provider already exhausted its own retry/fallback budget producing
+    /// this error; consumers must not retry or fall back. Produced only when a
+    /// completed non-streaming call is synthesized into a stream (the wrapped
+    /// failure already survived the full ladder). A genuine streaming leg never
+    /// emits it, so fallback recovery for streamed failures is unaffected.
+    /// The payload is the completed call's failure; consumers walk its chain
+    /// for the typed terminal cause beneath it.
+    #[error("terminal provider error: {0}")]
+    Terminal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -481,6 +524,14 @@ pub struct ProviderCapabilityError {
     pub capability: String,
     pub message: String,
 }
+
+/// Typed marker returned when a provider intentionally has no live model-list
+/// endpoint. Callers may use a separate canonical static catalog only for this
+/// condition; transport, authentication, and malformed-response failures must
+/// remain actionable.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("live model listing is not supported for this model_provider")]
+pub struct ModelListingUnsupportedError;
 
 /// ModelProvider capabilities declaration.
 /// Describes what features a model_provider supports, enabling intelligent
@@ -679,7 +730,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     ) -> anyhow::Result<String>;
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        anyhow::bail!("live model listing is not supported for this model_provider")
+        Err(ModelListingUnsupportedError.into())
     }
 
     /// Fetch the list of available models with pricing data for this
@@ -1085,6 +1136,20 @@ mod capability_tests {
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
+    }
+
+    #[tokio::test]
+    async fn default_model_listing_returns_typed_unsupported_error() {
+        let error = NativeAccessorOnlyProvider
+            .list_models()
+            .await
+            .expect_err("default model listing must be unsupported");
+        assert!(
+            error
+                .downcast_ref::<super::ModelListingUnsupportedError>()
+                .is_some(),
+            "default listing error must preserve the typed unsupported marker: {error}"
+        );
     }
 
     #[test]
