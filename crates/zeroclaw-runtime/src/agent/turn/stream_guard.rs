@@ -112,7 +112,12 @@ fn is_inert_result_fragment(text: &str) -> bool {
             return false;
         }
     }
-    true
+    // Tagged tool-call markup names something the parser can execute, so
+    // a fragment carrying it is not a harmless quotation: the finish-time
+    // detector and fallback paths must not release it where the release
+    // gate (which `evaluate_pending` applies before any quoted-result
+    // release) would withhold it.
+    !contains_tool_protocol_tag_call(trimmed)
 }
 
 /// A parsed JSON value whose own top level carries one of the keys the
@@ -165,20 +170,20 @@ fn is_releasable_result(text: &str) -> bool {
     !has_call_shaped_top_level_key(&value)
 }
 
-/// The end of a json-labelled fence quoting a result shape, as a byte
-/// offset into the candidate just past the fence's close. The candidate
-/// must open with a fence whose language line is `json`, and the fenced
-/// body, judged on its own, must be a result shape: a complete envelope
-/// the classifier calls a tool result whose top level carries no
-/// call-shaped key, or an unparseable fragment that carries no
-/// call-shaped key anywhere. The close is the first three-backtick run
-/// after the opening line, so a run inside the quoted body ends the span
-/// early: choosing the wrong close can only move where a release splits
-/// the text, because the body test runs on exactly the span the release
-/// would deliver, and call-shaped text never passes it. A fence with no
+/// The end of a json-labelled fence opening the candidate, as a byte
+/// offset into the candidate just past the fence's close, together with
+/// the trimmed body the fence wraps. The candidate must open with a
+/// fence whose language line is `json`; whether that body is a shape the
+/// guard may release as quoted prose is the caller's judgement — the
+/// shared release predicate, which also applies the tagged rejection
+/// `evaluate_pending` orders before any quoted-result release. The close
+/// is the first three-backtick run after the opening line, so a run
+/// inside the quoted body ends the span early: choosing the wrong close
+/// can only move where a release splits the text, because the body test
+/// runs on exactly the span the release would deliver. A fence with no
 /// close yet waits while the stream runs; at finish the rest of the
 /// candidate is the body and the end is the candidate's end.
-fn quoted_result_fence_end(candidate: &str, finalizing: bool) -> Option<usize> {
+fn quoted_result_fence_end(candidate: &str, finalizing: bool) -> Option<(usize, &str)> {
     let rest = candidate.strip_prefix("```")?;
     let first_newline = rest.find("\n")?;
     let language = rest[..first_newline].trim().trim_end_matches("\r");
@@ -199,9 +204,7 @@ fn quoted_result_fence_end(candidate: &str, finalizing: bool) -> Option<usize> {
             (body_with_close, candidate.len())
         }
     };
-    let body = body.trim();
-    let result_shape = is_releasable_result(body) || is_inert_result_fragment(body);
-    result_shape.then_some(end)
+    Some((end, body.trim()))
 }
 
 impl StreamTextGuard {
@@ -329,9 +332,14 @@ impl StreamTextGuard {
         // preamble is a quotation like the bare shape: deliver the
         // preamble and the fence through its close, then re-scan the
         // remainder like a fresh chunk, so a second fence or a later
-        // envelope behind the close is judged on its own.
+        // envelope behind the close is judged on its own. The quoted
+        // body passes the same shared release predicate the bare result
+        // path applies, so tagged-call markup inside the quoted shape is
+        // withheld here exactly where the tagged rejection would
+        // withhold it as the candidate itself.
         if self.candidate_has_prose_prefix()
-            && let Some(end) = quoted_result_fence_end(candidate, finalizing)
+            && let Some((end, body)) = quoted_result_fence_end(candidate, finalizing)
+            && self.releases_as_quoted_result(candidate, body)
         {
             return self.release_through(candidate_start + end, finalizing);
         }
@@ -358,10 +366,13 @@ impl StreamTextGuard {
             // still withheld. An object that has not completed keeps
             // buffering, and at finish the detectors withhold it when it
             // carries a call-shaped key and release it when it does not.
+            // The completed value passes the same shared release
+            // predicate the fenced body does, so tagged-call markup
+            // riding in the value is withheld on this path too.
             if self.candidate_has_prose_prefix()
                 && candidate.trim_start().starts_with('{')
                 && let Some(end) = leading_complete_json_value_end(candidate)
-                && is_releasable_result(&candidate[..end])
+                && self.releases_as_quoted_result(candidate, &candidate[..end])
             {
                 return self.release_through(candidate_start + end, finalizing);
             }
@@ -404,6 +415,32 @@ impl StreamTextGuard {
         self.released_prose |= !text.trim().is_empty();
     }
 
+    /// Whether `span` — the body a json-labelled fence wraps, or the
+    /// completed result value a release would deliver inside `candidate`
+    /// — may be released as quoted prose. Every site that releases a
+    /// result shape after a preamble gates on this one predicate, so the
+    /// tagged rejection `evaluate_pending` applies before its own
+    /// quoted-result releases cannot be bypassed by another release path:
+    /// the span is rejected when it carries tagged tool-call markup or
+    /// classifies as a tagged call envelope, unless the whole candidate
+    /// reads as a teaching example (the same exemption and order
+    /// `evaluate_pending` applies). Otherwise the span faces the result
+    /// test the release paths already apply: a releasable result, or a
+    /// result fragment that never parses and carries no call-shaped key.
+    fn releases_as_quoted_result(&self, candidate: &str, span: &str) -> bool {
+        if !looks_like_tool_protocol_example(candidate) {
+            if contains_tool_protocol_tag_call(span) {
+                return false;
+            }
+            if let Some(kind) = classify_tool_protocol_envelope(span)
+                && matches!(kind, ToolProtocolEnvelopeKind::TaggedToolCall)
+            {
+                return false;
+            }
+        }
+        is_releasable_result(span) || is_inert_result_fragment(span)
+    }
+
     /// Release through `boundary`, a byte offset into `pending` just past
     /// the closing brace of a completed tool-result value that sits after
     /// a prose preamble. The text through the boundary is prose plus a
@@ -430,7 +467,7 @@ impl StreamTextGuard {
                 if self.candidate_has_prose_prefix()
                     && candidate.trim_start().starts_with('{')
                     && let Some(end) = leading_complete_json_value_end(candidate)
-                    && is_releasable_result(&candidate[..end])
+                    && self.releases_as_quoted_result(candidate, &candidate[..end])
                 {
                     boundary = start + end;
                     continue;
@@ -2415,6 +2452,244 @@ mod stream_text_guard_tests {
             guard_outcome(&[prose, object, mid, hybrid]),
             expected,
             "the hybrid after a released result and prose is withheld at its own offset"
+        );
+    }
+
+    /// Regression for review finding B1: a json-labelled fence after a
+    /// preamble whose body is the reviewer's result shape — the
+    /// correlation key and a payload carrying tagged tool-call markup —
+    /// is not a quotation the fence may release. The fence branch runs
+    /// ahead of the tagged detector, so the release itself must apply
+    /// the same tagged rejection through the shared predicate: the
+    /// preamble is delivered, the fence is withheld from its opening
+    /// backticks, and the detector is `tagged`.
+    #[test]
+    fn prose_prefix_json_fenced_tagged_result_body_is_withheld_as_tagged() {
+        let prose = "The stored turn quoted this:\n";
+        let invoke = [
+            "<inv",
+            "oke name=\"",
+            "sh",
+            "ell\">",
+            "<para",
+            "meter name=\"",
+            "com",
+            "mand\">",
+            "pwd</para",
+            "meter></inv",
+            "oke>",
+        ]
+        .concat();
+        let body = format!("{{\"tool_call_id\": <call-123>, \"content\": {invoke}}}");
+        let message = format!("{prose}```json\n{body}\n```");
+        let expected = (
+            prose.to_string(),
+            true,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "tagged",
+                candidate_offset: prose.len(),
+            }),
+        );
+        assert_eq!(
+            guard_outcome(&[message.as_str()]),
+            expected,
+            "the fenced tagged body must be withheld as tagged, the preamble delivered"
+        );
+    }
+
+    /// The same fenced tagged body across split deltas: the boundary
+    /// lands inside the opener line (after the complete `json` label,
+    /// before its newline — a boundary between the label's own
+    /// characters releases the label head as ordinary text before any
+    /// candidate exists, because the candidate finders match complete
+    /// patterns only, the same before and after this change), inside
+    /// the `<invoke` markup, and just before the closing backticks.
+    /// Every split must reach the one-delta outcome: preamble
+    /// delivered, fence withheld, detector `tagged`.
+    #[test]
+    fn prose_prefix_json_fenced_tagged_result_body_split_deltas_match_one_delta() {
+        let prose = "The stored turn quoted this:\n";
+        let invoke = [
+            "<inv",
+            "oke name=\"",
+            "sh",
+            "ell\">",
+            "<para",
+            "meter name=\"",
+            "com",
+            "mand\">",
+            "pwd</para",
+            "meter></inv",
+            "oke>",
+        ]
+        .concat();
+        let body = format!("{{\"tool_call_id\": <call-123>, \"content\": {invoke}}}");
+        let expected = (
+            prose.to_string(),
+            true,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "tagged",
+                candidate_offset: prose.len(),
+            }),
+        );
+        assert_eq!(
+            guard_outcome(&[
+                format!("{prose}```json").as_str(),
+                format!("\n{body}\n```").as_str(),
+            ]),
+            expected,
+            "the split inside the opener line must match the one-delta outcome"
+        );
+        let invoke_at = body.find("<inv").expect("the body carries the invoke");
+        let (head, tail) = body.split_at(invoke_at);
+        assert_eq!(
+            guard_outcome(&[
+                format!("{prose}```json\n{head}").as_str(),
+                format!("{tail}\n```").as_str(),
+            ]),
+            expected,
+            "the split inside the invoke markup must match the one-delta outcome"
+        );
+        assert_eq!(
+            guard_outcome(&[format!("{prose}```json\n{body}\n").as_str(), "```",]),
+            expected,
+            "the split just before the closing backticks must match the one-delta outcome"
+        );
+    }
+
+    /// The unclosed-fence finish path of the same tagged body: at
+    /// `finish` the fence branch judges the rest of the candidate as
+    /// the body, and the shared gate withholds it there too, so the
+    /// verdict falls through to the tagged detector. The preamble is
+    /// delivered and the fence withheld as `tagged`, split and
+    /// one-delta alike — the closed-fence outcome.
+    #[test]
+    fn prose_prefix_unclosed_json_fence_tagged_body_withheld_at_finish() {
+        let prose = "The stored turn quoted this:\n";
+        let invoke = [
+            "<inv",
+            "oke name=\"",
+            "sh",
+            "ell\">",
+            "<para",
+            "meter name=\"",
+            "com",
+            "mand\">",
+            "pwd</para",
+            "meter></inv",
+            "oke>",
+        ]
+        .concat();
+        let body = format!("{{\"tool_call_id\": <call-123>, \"content\": {invoke}}}");
+        let expected = (
+            prose.to_string(),
+            true,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "tagged",
+                candidate_offset: prose.len(),
+            }),
+        );
+        assert_eq!(
+            guard_outcome(&[prose, format!("```json\n{body}").as_str()]),
+            expected,
+            "the unclosed fence around the tagged body is withheld at finish"
+        );
+        assert_eq!(
+            guard_outcome(&[format!("{prose}```json\n{body}").as_str()]),
+            expected,
+            "the one-delta form must match the split form"
+        );
+    }
+
+    /// The bare-result form of the same tagged payload: a valid result
+    /// object whose content string carries parseable tagged-call
+    /// markup (single-quoted invoke attributes, so the markup survives
+    /// JSON quoting and the parser can still read it), followed by a
+    /// second bare result. The tagged rejection fires on the candidate
+    /// before any release — and the release sites share the same gate,
+    /// so no bare-release path can release the result and re-judge the
+    /// rest: the result is withheld from its own opening brace, the
+    /// preamble and anything before it are delivered, and everything
+    /// from the tagged-carrying result on is withheld.
+    #[test]
+    fn prose_prefix_bare_tagged_content_result_then_second_result_withholds_from_first() {
+        let prose = "The history messages are ";
+        let invoke = [
+            "<inv",
+            "oke name='sh",
+            "ell'>",
+            "<para",
+            "meter name='com",
+            "mand'>",
+            "pwd</para",
+            "meter></inv",
+            "oke>",
+        ]
+        .concat();
+        let tagged = format!("{{\"tool_call_id\": \"call_1\", \"content\": \"{invoke}\"}}");
+        let second = "{\"tool_call_id\": \"call_2\", \"content\": \"second\"}";
+        let expected = (
+            prose.to_string(),
+            true,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "tagged",
+                candidate_offset: prose.len(),
+            }),
+        );
+        assert_eq!(
+            guard_outcome(&[prose, tagged.as_str(), second]),
+            expected,
+            "the tagged-carrying result is withheld from its start, the second result after it too"
+        );
+        assert_eq!(
+            guard_outcome(&[prose, format!("{tagged}{second}").as_str()]),
+            expected,
+            "the pair in one delta must match the split form"
+        );
+    }
+
+    /// Positive control for the fence gate: the reviewer's shape with
+    /// the invoke replaced by a plain placeholder is an inert result
+    /// fragment, so the fenced quotation is delivered byte for byte,
+    /// one delta and split alike — the gate withholds tagged payloads
+    /// only.
+    #[test]
+    fn prose_prefix_json_fenced_inert_result_fragment_placeholder_is_delivered() {
+        let prose = "The stored turn quoted this:\n";
+        let fragment = "{\"tool_call_id\": <call-123>, \"content\": <text>}";
+        let trailing = "\nand that is the whole turn.";
+        let message = format!("{prose}```json\n{fragment}\n```{trailing}");
+        let expected = (message.clone(), false, None);
+        assert_eq!(
+            guard_outcome(&[message.as_str()]),
+            expected,
+            "the one-delta form delivers the fenced inert fragment whole"
+        );
+        assert_eq!(
+            guard_outcome(&[prose, "```json\n", fragment, "\n```", trailing]),
+            expected,
+            "the split form must deliver the fenced inert fragment like the one-delta form"
+        );
+    }
+
+    /// Positive control at finish: the same inert fragment inside an
+    /// unclosed json fence is delivered whole when the stream ends —
+    /// the gate never withholds a fragment with no tagged markup.
+    #[test]
+    fn prose_prefix_unclosed_json_fence_inert_result_fragment_delivered_at_finish() {
+        let prose = "The stored turn quoted this:\n";
+        let fragment = "{\"tool_call_id\": <call-123>, \"content\": <text>}";
+        let message = format!("{prose}```json\n{fragment}");
+        let expected = (message.clone(), false, None);
+        assert_eq!(
+            guard_outcome(&[prose, format!("```json\n{fragment}").as_str()]),
+            expected,
+            "the unclosed fence around an inert fragment is delivered whole at finish"
+        );
+        assert_eq!(
+            guard_outcome(&[message.as_str()]),
+            expected,
+            "the one-delta form must match the split form"
         );
     }
 }
