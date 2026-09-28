@@ -1564,43 +1564,47 @@ async fn delete_agent_cascade(
     let pending_reload = Arc::clone(&state.pending_reload);
     let reload_controls = state.reload_tx.clone();
     let cleanup_alias = alias.to_string();
-    let cleanup = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(async move {
-        // Save the prepared config and install the matching live snapshot;
-        // a true pre-commit save error rolls back disk state and ends this
-        // task with the reservation uncommitted and generations unchanged.
-        let prepared = persist_and_swap_prepared(
-            live_config,
-            pending_reload.clone(),
-            reload_controls,
-            working.clone(),
-            authorization,
-        )
-        .await?;
-        // Committed: advance the alias generation exactly once.
-        // Synchronous — no await between the live swap and this commit.
-        lifecycle_lease.commit_destructive_mutation();
-        // Retire and await the channel generation while still holding the
-        // config write guard, then schedule the daemon reload.
-        finish_prepared_channel_generation(prepared, pending_reload).await;
-        // Release the gateway-wide config write lock before slow cleanup.
-        drop(guard);
-        let archive =
-            crate::agent_owned_state::archive_agent_workspace(&working, &cleanup_alias, &workspace)
-                .await;
-        let archive_dir = archive.archive_dir;
-        let mut warnings = archive.warnings;
-        let owned = crate::agent_owned_state::cascade_owned_state(
-            &working,
-            &memory,
-            session_backend.as_ref(),
-            &cleanup_alias,
-            &archive_dir,
-        )
-        .await;
-        warnings.extend(owned.warnings.iter().cloned());
-        // The committed lease releases only when this future completes.
-        Ok((archive_dir, warnings, owned))
-    });
+    let cleanup =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            // Save the prepared config and install the matching live snapshot;
+            // a true pre-commit save error rolls back disk state and ends this
+            // task with the reservation uncommitted and generations unchanged.
+            let prepared = persist_and_swap_prepared(
+                live_config,
+                pending_reload.clone(),
+                reload_controls,
+                working.clone(),
+                authorization,
+            )
+            .await?;
+            // Committed: advance the alias generation exactly once.
+            // Synchronous — no await between the live swap and this commit.
+            lifecycle_lease.commit_destructive_mutation();
+            // Retire and await the channel generation while still holding the
+            // config write guard, then schedule the daemon reload.
+            finish_prepared_channel_generation(prepared, pending_reload).await;
+            // Release the gateway-wide config write lock before slow cleanup.
+            drop(guard);
+            let archive = crate::agent_owned_state::archive_agent_workspace(
+                &working,
+                &cleanup_alias,
+                &workspace,
+            )
+            .await;
+            let archive_dir = archive.archive_dir;
+            let mut warnings = archive.warnings;
+            let owned = crate::agent_owned_state::cascade_owned_state(
+                &working,
+                &memory,
+                session_backend.as_ref(),
+                &cleanup_alias,
+                &archive_dir,
+            )
+            .await;
+            warnings.extend(owned.warnings.iter().cloned());
+            // The committed lease releases only when this future completes.
+            Ok((archive_dir, warnings, owned))
+        }));
     let (archive_dir, warnings, owned) = match cleanup.await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => return error,
