@@ -199,6 +199,11 @@ Examples:
         /// Host of the running gateway to query; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Print one JSON object (`pairing_code`, `message`) instead of text,
+        /// for programs such as the desktop app
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -347,6 +352,17 @@ pub enum AgentsCommands {
     Create {
         /// New agent alias (lowercase alphanumeric + single underscore)
         alias: String,
+    },
+    /// Export an agent and the config closure it needs to a portable bundle
+    Export {
+        /// Agent alias to export
+        alias: String,
+        /// Destination bundle directory (created if it does not exist)
+        #[arg(long, short)]
+        out: std::path::PathBuf,
+        /// Replace the contents of a destination directory that already has files
+        #[arg(long)]
+        force: bool,
     },
     /// Rename an agent alias, rewriting every reference to it
     Rename {
