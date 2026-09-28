@@ -45,6 +45,10 @@ $evidence = [ordered]@{
     disabled_legacy_migration_succeeded = $false
     legacy_process_tree_stopped_before_reinstall = $false
     legacy_lookalike_survived_reinstall = $false
+    active_direct_reinstall_refused = $false
+    ready_direct_reinstall_refused = $false
+    direct_registration_preserved = $false
+    disabled_direct_reinstall_succeeded = $false
     direct_lookalike_survived_reinstall = $false
     stdout_bytes = $null
     stderr_bytes = $null
@@ -52,6 +56,7 @@ $evidence = [ordered]@{
     limitations = @(
         'The hosted runner is elevated, so this does not reproduce non-elevated installation failure.'
         'The task is started manually, so this does not prove the ONLOGON trigger.'
+        'The fixture cleans up its own processes before Disabled replacement; it does not simulate or prove an operator reboot.'
     )
 }
 $legacyLookalike = $null
@@ -192,7 +197,7 @@ try {
     $legacyInstallOutput = & $fixture --config-dir $ConfigDir service install 2>&1
     $legacyInstallExit = $LASTEXITCODE
     $legacyInstallOutput | Write-Host
-    if ($legacyInstallExit -eq 0 -or $legacyInstallOutput -notmatch 'Cannot safely replace the legacy Windows \.cmd task') {
+    if ($legacyInstallExit -eq 0 -or $legacyInstallOutput -notmatch 'Cannot safely replace the Windows scheduled task') {
         throw "Active legacy reinstall did not fail with the expected guidance: exit=$legacyInstallExit"
     }
     $evidence.active_legacy_reinstall_refused = $true
@@ -227,7 +232,7 @@ try {
     $readyInstallOutput = & $fixture --config-dir $ConfigDir service install 2>&1
     $readyInstallExit = $LASTEXITCODE
     $readyInstallOutput | Write-Host
-    if ($readyInstallExit -eq 0 -or $readyInstallOutput -notmatch 'Cannot safely replace the legacy Windows \.cmd task') {
+    if ($readyInstallExit -eq 0 -or $readyInstallOutput -notmatch 'Cannot safely replace the Windows scheduled task') {
         throw "Ready legacy reinstall did not fail with the expected guidance: exit=$readyInstallExit"
     }
     $evidence.ready_legacy_reinstall_refused = $true
@@ -351,24 +356,61 @@ try {
         $null -eq $registeredDescendant -or $registeredDescendant.ParentProcessId -ne $registeredDaemonPid) {
         throw 'Registered direct runner tree did not have the expected process ancestry'
     }
-    Invoke-Fixture service install | Write-Host
+    $registeredAction = (Get-ScheduledTask -TaskName $taskName).Actions | Select-Object -First 1
+    $activeDirectInstallOutput = & $fixture --config-dir $ConfigDir service install 2>&1
+    $activeDirectInstallExit = $LASTEXITCODE
+    $activeDirectInstallOutput | Write-Host
+    if ($activeDirectInstallExit -eq 0 -or $activeDirectInstallOutput -notmatch 'Cannot safely replace the Windows scheduled task') {
+        throw "Running direct-runner reinstall did not fail with the expected guidance: exit=$activeDirectInstallExit"
+    }
+    $evidence.active_direct_reinstall_refused = $true
+    $activeAction = (Get-ScheduledTask -TaskName $taskName).Actions | Select-Object -First 1
+    if ($activeAction.Execute -ne $registeredAction.Execute -or $activeAction.Arguments -ne $registeredAction.Arguments) {
+        throw 'Running direct-runner reinstall changed the task registration'
+    }
     $survivors = @()
     foreach ($entry in @(
         @{ role = 'runner'; process_id = $registeredRunner.ProcessId }
         @{ role = 'daemon'; process_id = $registeredDaemonPid }
         @{ role = 'descendant'; process_id = $registeredDescendantPid }
     )) {
-        if ($null -ne (Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue)) {
+        if ($null -eq (Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue)) {
             $survivors += "$($entry.role)=$($entry.process_id)"
         }
     }
     if ($survivors.Count -gt 0) {
-        throw "Registered direct runner tree survived service reinstall: $($survivors -join ', ')"
+        throw "Running direct-runner reinstall stopped registered processes: $($survivors -join ', ')"
     }
+
+    Invoke-Fixture service stop | Write-Host
+    Wait-Until -Description 'test-owned direct runner tree cleanup before Ready refusal' -Condition {
+        ([int](Get-ScheduledTask -TaskName $taskName).State -eq 3) -and
+            ($null -eq (Get-Process -Id $registeredRunner.ProcessId -ErrorAction SilentlyContinue)) -and
+            ($null -eq (Get-Process -Id $registeredDaemonPid -ErrorAction SilentlyContinue)) -and
+            ($null -eq (Get-Process -Id $registeredDescendantPid -ErrorAction SilentlyContinue))
+    }
+    $readyDirectInstallOutput = & $fixture --config-dir $ConfigDir service install 2>&1
+    $readyDirectInstallExit = $LASTEXITCODE
+    $readyDirectInstallOutput | Write-Host
+    if ($readyDirectInstallExit -eq 0 -or $readyDirectInstallOutput -notmatch 'Cannot safely replace the Windows scheduled task') {
+        throw "Ready direct-runner reinstall did not fail with the expected guidance: exit=$readyDirectInstallExit"
+    }
+    $evidence.ready_direct_reinstall_refused = $true
+    $readyAction = (Get-ScheduledTask -TaskName $taskName).Actions | Select-Object -First 1
+    if ($readyAction.Execute -ne $registeredAction.Execute -or $readyAction.Arguments -ne $registeredAction.Arguments) {
+        throw 'Ready direct-runner reinstall changed the task registration'
+    }
+    $evidence.direct_registration_preserved = $true
     if ($null -eq (Get-Process -Id $directLookalike.Id -ErrorAction SilentlyContinue)) {
         throw 'Reinstall killed an unrelated same-binary runner with another config directory'
     }
     $evidence.direct_lookalike_survived_reinstall = $true
+    Disable-ScheduledTask -TaskName $taskName | Out-Null
+    Wait-Until -Description 'disabled direct task before replacement' -Condition {
+        [int](Get-ScheduledTask -TaskName $taskName).State -eq 1
+    }
+    Invoke-Fixture service install | Write-Host
+    $evidence.disabled_direct_reinstall_succeeded = $true
 
     Invoke-Fixture service uninstall | Write-Host
     Remove-Item -LiteralPath (Join-Path $ConfigDir 'logs') -Recurse -Force
