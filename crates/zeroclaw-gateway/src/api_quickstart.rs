@@ -91,6 +91,9 @@ pub async fn handle_apply(
     principal: crate::principal_gate::RequestPrincipal,
     Json(submission): Json<BuilderSubmission>,
 ) -> axum::response::Response {
+    let cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
+        .lock_owned()
+        .await;
     // Quickstart can write an open-ended set of config paths. Refuse a
     // principal without whole-config authority before reserving the alias.
     let authorization = match crate::principal_gate::authorize_whole_config_write(
@@ -99,6 +102,7 @@ pub async fn handle_apply(
             zeroclaw_api::grants::Verb::Create,
             zeroclaw_api::grants::Verb::Update,
         ],
+        &cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -126,7 +130,7 @@ pub async fn handle_apply(
     let task =
         zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
             let _reservation = reservation;
-            apply_reserved(state, submission, authorization).await
+            apply_reserved(state, submission, authorization, cfg_guard).await
         }));
     match task.await {
         Ok(response) => response,
@@ -144,13 +148,11 @@ async fn apply_reserved(
     state: AppState,
     submission: BuilderSubmission,
     authorization: crate::principal_gate::ConfigWriteAuthorization,
+    _cfg_guard: crate::ConfigWriteGuard,
 ) -> axum::response::Response {
     // Held through the swap below (and across `apply_with_surface`'s own
     // save, which runs while this guard is held) so a concurrent config
     // writer can't land between this read and the swap.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
     let mut working = state.config.read().clone();
     // The staged policy is compiled BEFORE Quickstart's first write, so a
     // rejected one cannot reach disk and then be reported as not saved.

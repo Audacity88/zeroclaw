@@ -1331,33 +1331,7 @@ fn credential_is_live(
     inbound: &crate::rpc::auth::RpcInboundAuth,
     auth: &crate::rpc::auth::ConnectionAuth,
 ) -> Result<(), crate::rpc::auth::AuthDenied> {
-    use crate::rpc::auth::AuthDenied;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if let Some(expires_at) = auth.principal.expires_at
-        && expires_at <= now
-    {
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
-        ));
-    }
-    if let Some(revalidate_by) = auth.principal.revalidate_by
-        && revalidate_by <= now
-    {
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-        ));
-    }
-    if let Some(hash) = auth.native_token_hash.as_deref()
-        && !inbound.pairing().token_hash_is_paired(hash)
-    {
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
-        ));
-    }
-    Ok(())
+    inbound.credential_is_live(auth)
 }
 
 /// The authority `auth` holds for `method` under the accepted policy in force
@@ -1369,26 +1343,16 @@ fn current_authority(
     method: Method,
 ) -> Result<zeroclaw_api::grants::ResolvedGrants, crate::rpc::auth::AuthDenied> {
     use crate::rpc::auth::AuthDenied;
-    credential_is_live(inbound, auth)?;
-    let resolved = inbound
-        .resolve_current(auth)
-        .map_err(AuthDenied::from_deny_reason)?;
-    if resolved.generation != inbound.generation() {
-        // The accepted state moved between the resolution and this read.
-        // Fail closed rather than act under a policy nobody observed.
-        return Err(AuthDenied::auth_required(
-            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
-        ));
-    }
+    let grants = inbound.current_grants(auth)?;
     if let MethodAuthz::Requires(resource, verb) = method.authz()
-        && !resolved.grants.permits(resource, verb)
+        && !grants.permits(resource, verb)
     {
         return Err(AuthDenied::forbidden(format!(
             "Principal is not granted {resource}:{verb} (required by {})",
             method.wire_name()
         )));
     }
-    Ok(resolved.grants)
+    Ok(grants)
 }
 
 impl RpcDispatcher {
@@ -7004,21 +6968,65 @@ impl RpcDispatcher {
         }
     }
 
-    async fn handle_memory_list(&self, params: &Value) -> RpcResult {
-        let mem = self
+    /// Validate the requested agent, then retain the live context handle for
+    /// a private plane. Only an authorized shared-plane request needs the
+    /// agent-scoped shared view built from agent configuration.
+    async fn memory_for_request(
+        &self,
+        method: Method,
+        requested_agent: Option<&str>,
+        private_plane: bool,
+    ) -> Result<(Arc<dyn zeroclaw_api::memory_traits::Memory>, Option<String>), JsonRpcError> {
+        let memory = self
             .ctx
             .memory
-            .as_ref()
+            .clone()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let Some(alias) = requested_agent
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+        else {
+            return Ok((memory, None));
+        };
+        self.selector_agent(method, alias)?;
+        let config = self.ctx.config.read().clone();
+        if !config.agents.contains_key(alias) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Unknown agent {alias:?} (no [agents.{alias}] entry configured)"),
+            ));
+        }
+        if private_plane {
+            return Ok((memory, Some(alias.to_string())));
+        }
+        let api_key = config
+            .resolved_model_provider_for_agent(alias)
+            .and_then(|(_, _, provider)| provider.api_key.clone());
+        let shared = zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
+            .await
+            .map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Agent memory unavailable: {error:#}"),
+                )
+            })?;
+        Ok((shared, Some(alias.to_string())))
+    }
+
+    async fn handle_memory_list(&self, params: &Value) -> RpcResult {
         let req: MemoryListParams = parse_params(params)?;
         let category = req.category.as_deref().map(Self::parse_memory_category);
         // The plane follows the caller's identity (private for every
         // authenticated principal, shared for the operator), composed with
         // the agent dimension; see `memory_plane`.
-        let entries = match self.memory_plane(req.plane.as_deref(), Method::MemoryList)? {
+        let plane = self.memory_plane(req.plane.as_deref(), Method::MemoryList)?;
+        let (mem, agent) = self
+            .memory_for_request(Method::MemoryList, req.agent.as_deref(), plane.is_some())
+            .await?;
+        let entries = match plane {
             Some(scope) => mem
                 .list_for_principal(
-                    &scope.with_agent(req.agent.clone()),
+                    &scope.with_agent(agent),
                     category.as_ref(),
                     req.session_id.as_deref(),
                 )
@@ -7035,16 +7043,15 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_search(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemorySearchParams = parse_params(params)?;
-        let entries = match self.memory_plane(req.plane.as_deref(), Method::MemorySearch)? {
+        let plane = self.memory_plane(req.plane.as_deref(), Method::MemorySearch)?;
+        let (mem, agent) = self
+            .memory_for_request(Method::MemorySearch, req.agent.as_deref(), plane.is_some())
+            .await?;
+        let entries = match plane {
             Some(scope) => mem
                 .recall_for_principal(
-                    &scope.with_agent(req.agent.clone()),
+                    &scope.with_agent(agent),
                     &req.query,
                     req.limit,
                     req.session_id.as_deref(),
@@ -7074,15 +7081,14 @@ impl RpcDispatcher {
     /// rows in memory and fetch the full `content` only when the
     /// detail pane opens. Dropped on detail close.
     async fn handle_memory_get(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryGetParams = parse_params(params)?;
-        let entry = match self.memory_plane(req.plane.as_deref(), Method::MemoryGet)? {
+        let plane = self.memory_plane(req.plane.as_deref(), Method::MemoryGet)?;
+        let (mem, agent) = self
+            .memory_for_request(Method::MemoryGet, req.agent.as_deref(), plane.is_some())
+            .await?;
+        let entry = match plane {
             Some(scope) => mem
-                .get_for_principal(&scope.with_agent(req.agent.clone()), &req.key)
+                .get_for_principal(&scope.with_agent(agent), &req.key)
                 .await
                 .map_err(|e| Self::map_private_memory_err(&e))?,
             None => mem
@@ -7100,21 +7106,20 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_store(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryStoreParams = parse_params(params)?;
         let category = req
             .category
             .as_deref()
             .map(Self::parse_memory_category)
             .unwrap_or(MemoryCategory::Custom("user".into()));
-        match self.memory_plane(req.plane.as_deref(), Method::MemoryStore)? {
+        let plane = self.memory_plane(req.plane.as_deref(), Method::MemoryStore)?;
+        let (mem, agent) = self
+            .memory_for_request(Method::MemoryStore, req.agent.as_deref(), plane.is_some())
+            .await?;
+        match plane {
             Some(scope) => mem
                 .store_for_principal(
-                    &scope.with_agent(req.agent.clone()),
+                    &scope.with_agent(agent),
                     &req.key,
                     &req.content,
                     category,
@@ -7134,15 +7139,14 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_delete(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryDeleteParams = parse_params(params)?;
-        match self.memory_plane(req.plane.as_deref(), Method::MemoryDelete)? {
+        let plane = self.memory_plane(req.plane.as_deref(), Method::MemoryDelete)?;
+        let (mem, agent) = self
+            .memory_for_request(Method::MemoryDelete, req.agent.as_deref(), plane.is_some())
+            .await?;
+        match plane {
             Some(scope) => mem
-                .forget_for_principal(&scope.with_agent(req.agent.clone()), &req.key)
+                .forget_for_principal(&scope.with_agent(agent), &req.key)
                 .await
                 .map_err(|e| Self::map_private_memory_err(&e))?,
             None => mem
@@ -18338,6 +18342,178 @@ mod tests {
             Some("user:alice"),
             "restoration pins memory to the durable owner, not the restorer"
         );
+    }
+
+    /// Use the live memory handle while adding a second configured agent;
+    /// member principals remain entitled only to `test-agent`.
+    fn two_agent_memory_ctx(tmp: &tempfile::TempDir) -> Arc<RpcContext> {
+        let (ctx, _sessions, _memory) = memory_isolation_ctx(tmp);
+        let mut config = ctx.config.read().clone();
+        let peer = config
+            .agents
+            .get("test-agent")
+            .cloned()
+            .expect("the fixture configures test-agent");
+        config.agents.insert("other-agent".into(), peer);
+        let member = config
+            .permission_profiles
+            .get_mut("member")
+            .expect("the fixture defines the member profile");
+        member.allowed_agents = vec!["test-agent".into()];
+        ctx.auth.refresh_from_config(&config).unwrap();
+        *ctx.config.write() = config;
+        ctx
+    }
+
+    /// A principal entitled to one agent cannot name another agent's memory.
+    #[tokio::test]
+    async fn memory_agent_parameter_is_bound_by_the_agent_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = two_agent_memory_ctx(&tmp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+
+        let foreign_list = alice
+            .handle_memory_list(&json!({"agent": "other-agent"}))
+            .await
+            .expect_err("a foreign agent's memory is refused");
+        assert_eq!(foreign_list.code, FORBIDDEN, "{}", foreign_list.message);
+        assert!(
+            foreign_list.message.contains("not entitled to agent"),
+            "{}",
+            foreign_list.message
+        );
+        let foreign_search = alice
+            .handle_memory_search(&json!({
+                "query": "anything",
+                "agent": "other-agent",
+            }))
+            .await
+            .expect_err("a foreign agent's memory is refused");
+        assert_eq!(foreign_search.code, FORBIDDEN, "{}", foreign_search.message);
+        let foreign_get = alice
+            .handle_memory_get(&json!({"key": "anything", "agent": "other-agent"}))
+            .await
+            .expect_err("a foreign agent cannot be selected for memory/get");
+        assert_eq!(foreign_get.code, FORBIDDEN, "{}", foreign_get.message);
+
+        alice
+            .handle_memory_list(&json!({"agent": "test-agent"}))
+            .await
+            .expect("the entitled agent's memory is readable");
+    }
+
+    /// The agent selector composes with the owner's private plane. A named
+    /// administrator stays private by default, and same-key rows belonging to
+    /// another owner or agent remain untouched by an agent-scoped delete.
+    #[tokio::test]
+    async fn memory_agent_parameter_preserves_owner_and_agent_boundaries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = two_agent_memory_ctx(&tmp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+
+        for (dispatcher, agent, content) in [
+            (&carol, "test-agent", "carol-test-boundary"),
+            (&carol, "other-agent", "carol-other-boundary"),
+            (&alice, "test-agent", "alice-test-boundary"),
+        ] {
+            dispatcher
+                .handle_memory_store(&json!({
+                    "key": "boundary-key",
+                    "content": content,
+                    "agent": agent,
+                }))
+                .await
+                .unwrap_or_else(|e| panic!("store {content}: {}", e.message));
+        }
+
+        for (dispatcher, agent, content) in [
+            (&carol, "test-agent", "carol-test-boundary"),
+            (&carol, "other-agent", "carol-other-boundary"),
+            (&alice, "test-agent", "alice-test-boundary"),
+        ] {
+            let entry = dispatcher
+                .handle_memory_get(&json!({"key": "boundary-key", "agent": agent}))
+                .await
+                .unwrap_or_else(|e| panic!("get {content}: {}", e.message));
+            assert_eq!(entry["entry"]["content"], content);
+            let search = dispatcher
+                .handle_memory_search(&json!({"query": "boundary", "agent": agent}))
+                .await
+                .unwrap_or_else(|e| panic!("search {content}: {}", e.message));
+            assert_eq!(search["entries"][0]["content"], content);
+        }
+
+        carol
+            .handle_memory_delete(&json!({"key": "boundary-key", "agent": "test-agent"}))
+            .await
+            .expect("delete only carol's test-agent row");
+        for (dispatcher, agent, content) in [
+            (&carol, "other-agent", "carol-other-boundary"),
+            (&alice, "test-agent", "alice-test-boundary"),
+        ] {
+            let entry = dispatcher
+                .handle_memory_get(&json!({"key": "boundary-key", "agent": agent}))
+                .await
+                .unwrap_or_else(|e| panic!("surviving get {content}: {}", e.message));
+            assert_eq!(entry["entry"]["content"], content);
+        }
+    }
+
+    /// An unscoped operator's `agent` selects that agent's memory: rows are
+    /// stored under it, listed from it, and a delete through one agent does not
+    /// remove the same key held by another.
+    #[tokio::test]
+    async fn memory_agent_parameter_selects_the_agent_memory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = two_agent_memory_ctx(&tmp);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(ctx, tx, "unix:test".into());
+        operator.set_authenticated_for_test();
+
+        for agent in ["test-agent", "other-agent"] {
+            operator
+                .handle_memory_store(&json!({
+                    "key": "shared-key",
+                    "content": format!("{agent} content"),
+                    "agent": agent,
+                }))
+                .await
+                .unwrap_or_else(|e| panic!("store for {agent}: {}", e.message));
+        }
+        let contents = |result: Value| -> Vec<String> {
+            result["entries"]
+                .as_array()
+                .expect("entries is an array")
+                .iter()
+                .map(|e| e["content"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let listed = operator
+            .handle_memory_list(&json!({"agent": "test-agent"}))
+            .await
+            .expect("list test-agent");
+        assert_eq!(contents(listed), vec!["test-agent content".to_string()]);
+
+        operator
+            .handle_memory_delete(&json!({"key": "shared-key", "agent": "test-agent"}))
+            .await
+            .expect("delete through test-agent");
+        let remaining = operator
+            .handle_memory_list(&json!({"agent": "other-agent"}))
+            .await
+            .expect("list other-agent");
+        assert_eq!(
+            contents(remaining),
+            vec!["other-agent content".to_string()],
+            "a delete through one agent must not remove another agent's row"
+        );
+
+        let unknown = operator
+            .handle_memory_list(&json!({"agent": "missing-agent"}))
+            .await
+            .expect_err("an unconfigured agent is refused");
+        assert_eq!(unknown.code, INVALID_PARAMS, "{}", unknown.message);
     }
 
     #[test]

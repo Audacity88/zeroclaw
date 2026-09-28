@@ -833,6 +833,7 @@ pub async fn handle_api_channel_bind(
     let authorization = match authorize_config_write(
         &principal,
         ConfigWriteSet::by_effect(&before, &working, [external_peers.as_str()]),
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -1056,6 +1057,7 @@ pub async fn handle_prop_put(
             &new_config,
             new_config.dirty_paths.iter().map(String::as_str),
         ),
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -1150,6 +1152,7 @@ pub async fn handle_prop_delete(
             new_config.dirty_paths.iter().map(String::as_str),
         )
         .with(q.path.clone(), Verb::Delete),
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -1444,6 +1447,7 @@ pub async fn handle_delete_map_key(
                 working.dirty_paths.iter().map(String::as_str),
             )
             .with(removed_path, Verb::Delete),
+            &_cfg_guard,
         ) {
             Ok(authorization) => authorization,
             Err(denied) => return denied.into_response(),
@@ -1543,6 +1547,7 @@ async fn delete_agent_cascade(
             working.dirty_paths.iter().map(String::as_str),
         )
         .with(format!("agents.{alias}"), Verb::Delete),
+        &guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -1658,6 +1663,7 @@ async fn delete_config_cascade(
             working.dirty_paths.iter().map(String::as_str),
         )
         .with(format!("{path}.{key}"), Verb::Delete),
+        &guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -1728,6 +1734,7 @@ pub async fn handle_map_key(
                 working.dirty_paths.iter().map(String::as_str),
             )
             .with(created_path, Verb::Create),
+            &_cfg_guard,
         ) {
             Ok(authorization) => authorization,
             Err(denied) => return denied.into_response(),
@@ -2067,6 +2074,7 @@ pub async fn handle_rename_map_key(
                     )
                     .with(from_path, Verb::Delete)
                     .with(to_path, Verb::Create),
+                    &_cfg_guard,
                 ) {
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
@@ -2110,11 +2118,14 @@ async fn rename_config_cascade(
         working.mark_dirty(path);
     }
     let before = state.config.read().clone();
-    let authorization =
-        match authorize_config_write(principal, rename_write_set(&before, &working, body)) {
-            Ok(authorization) => authorization,
-            Err(denied) => return denied.into_response(),
-        };
+    let authorization = match authorize_config_write(
+        principal,
+        rename_write_set(&before, &working, body),
+        &guard,
+    ) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
     if let Err(e) = persist_and_swap(state, authorization, working, guard).await {
         return e;
     }
@@ -2248,6 +2259,7 @@ async fn rename_agent_cascade(
         ConfigWriteSet::default()
             .with(format!("{}.{from}", body.path), Verb::Delete)
             .with(format!("{}.{to}", body.path), Verb::Create),
+        &guard,
     ) {
         return denied.into_response();
     }
@@ -2270,6 +2282,7 @@ async fn rename_agent_cascade(
                 let authorization = match authorize_config_write(
                     principal,
                     rename_write_set(&before, &working, body),
+                    &guard,
                 ) {
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
@@ -2483,6 +2496,7 @@ pub async fn handle_refresh_context_window(
             &working,
             working.dirty_paths.iter().map(String::as_str),
         ),
+        &_cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
@@ -2775,7 +2789,7 @@ pub async fn handle_patch(
     for op in ops.iter().filter(|op| op.op == "remove") {
         writes = writes.with(json_pointer_to_dotted(&op.path), Verb::Delete);
     }
-    let authorization = match authorize_config_write(&principal, writes) {
+    let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
@@ -2888,7 +2902,7 @@ pub async fn handle_init(
         ),
         |writes, section| writes.with(section.clone(), Verb::Create),
     );
-    let authorization = match authorize_config_write(&principal, writes) {
+    let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
@@ -2920,7 +2934,8 @@ pub async fn handle_migrate(
     // A migration rewrites the file as a whole; its write set cannot be
     // enumerated up front, so a scoped principal needs the wildcard
     // selector.
-    let authorization = match authorize_whole_config_write(&principal, &[Verb::Update]) {
+    let authorization = match authorize_whole_config_write(&principal, &[Verb::Update], &_cfg_guard)
+    {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
@@ -3439,7 +3454,8 @@ mod tests {
         working.mark_dirty("channels.cli");
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
 
-        let authorization = authorize_config_write(&None, ConfigWriteSet::default()).unwrap();
+        let authorization =
+            authorize_config_write(&None, ConfigWriteSet::default(), &guard).unwrap();
         assert!(
             persist_and_swap(&state, authorization, working, guard)
                 .await
@@ -3465,7 +3481,8 @@ mod tests {
         config.mark_dirty("channels.cli");
         let state = test_state(config.clone());
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let authorization = authorize_config_write(&None, ConfigWriteSet::default()).unwrap();
+        let authorization =
+            authorize_config_write(&None, ConfigWriteSet::default(), &guard).unwrap();
         let result = persist_and_swap(&state, authorization, config, guard).await;
 
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -3494,7 +3511,8 @@ mod tests {
         working.mark_dirty("channels.cli");
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
 
-        let authorization = authorize_config_write(&None, ConfigWriteSet::default()).unwrap();
+        let authorization =
+            authorize_config_write(&None, ConfigWriteSet::default(), &guard).unwrap();
         let _guard = persist_and_swap(&state, authorization, working, guard)
             .await
             .unwrap();
@@ -3612,7 +3630,7 @@ mod tests {
         let (status, json) = response_json(
             handle_prop_delete(
                 State(state.clone()),
-                HeaderMap::new(),
+                None,
                 Query(PropQuery {
                     path: "agents.blocked.enabled".to_string(),
                 }),
@@ -3708,7 +3726,7 @@ mod tests {
         let (status, _json) = response_json(
             handle_prop_put(
                 State(state.clone()),
-                HeaderMap::new(),
+                None,
                 axum::Json(PropPutBody {
                     path: "agents.recreated.enabled".to_string(),
                     value: serde_json::json!(true),
@@ -3736,6 +3754,7 @@ mod tests {
         let (status, _json) = response_json(
             handle_patch(
                 State(state.clone()),
+                None,
                 HeaderMap::new(),
                 axum::Json(serde_json::json!([{
                     "op": "add",
@@ -3764,7 +3783,7 @@ mod tests {
         let (status, _json) = response_json(
             handle_map_key(
                 State(state.clone()),
-                HeaderMap::new(),
+                None,
                 Query(MapKeyQuery {
                     path: "agents".to_string(),
                     key: "recreated".to_string(),
@@ -4002,7 +4021,7 @@ mod tests {
 
         let request = zeroclaw_spawn::spawn!(handle_prop_put(
             State(task_state),
-            HeaderMap::new(),
+            None,
             axum::Json(PropPutBody {
                 path: task_path,
                 value,
@@ -5404,8 +5423,13 @@ mod tests {
         let state = crate::api::test_state(config.clone());
         let generation_before = state.agent_lifecycle.alias_generation("victim");
 
-        let resp =
-            delete_agent_cascade(&state, "victim", test_agent_delete_lease(&state, "victim")).await;
+        let resp = delete_agent_cascade(
+            &state,
+            &None,
+            "victim",
+            test_agent_delete_lease(&state, "victim"),
+        )
+        .await;
 
         assert!(
             !resp.status().is_success(),
@@ -6018,7 +6042,7 @@ mod tests {
         let (status, json) = response_json(
             handle_api_channel_bind(
                 axum::extract::State(state),
-                axum::http::HeaderMap::new(),
+                None,
                 axum::Json(ChannelBindBody {
                     channel_type: "telegram".to_string(),
                     alias: "alerts".to_string(),
@@ -6049,7 +6073,6 @@ mod tests {
         let (status, json) = response_json(
             handle_delete_plan(
                 axum::extract::State(state),
-                axum::http::HeaderMap::new(),
                 axum::extract::Query(MapKeyQuery {
                     path: "agents".to_string(),
                     key: "busy".to_string(),
