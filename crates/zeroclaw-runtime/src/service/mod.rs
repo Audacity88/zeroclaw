@@ -4396,7 +4396,7 @@ mod service_helper_tests {
         assert!(command.contains("Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop"));
         assert!(command.contains("[int]$task.State -eq 1"));
         assert!(!command.contains("Stop-ScheduledTask"));
-        assert!(command.contains("{ exit 6 }"));
+        assert!(command.ends_with("exit 6"));
         windows_task_replaceable_from_exit_code(Some(0))
             .expect("missing or disabled task should be replaceable");
         let active_error = windows_task_replaceable_from_exit_code(Some(6))
