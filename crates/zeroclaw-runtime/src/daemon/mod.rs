@@ -344,7 +344,7 @@ impl Drop for StartupReadinessAttempt {
 }
 
 mod registry;
-pub use registry::{DaemonRegistry, GatewayReloadControls};
+pub use registry::{DaemonInboundAuthority, DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -738,10 +738,27 @@ pub async fn run_with_authority(
         config.gateway.pairing_code,
     ));
 
+    // One inbound-auth state for this daemon generation. The RPC context
+    // and the supervised gateway authenticate against the same accepted
+    // policy over the same live configuration, and both publish into it
+    // under the process-wide config write lock. A revocation persisted
+    // through either surface therefore binds the other before the writer
+    // returns, not at the next daemon reload.
+    let live_config = live_config_authority.config();
+    let inbound_auth = std::sync::Arc::new(
+        crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
+            |e| anyhow::Error::msg(format!("building the inbound authentication layer: {e:#}")),
+        )?,
+    );
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
-        let gateway_pairing = pairing_guard.clone();
+        let gateway_authority = DaemonInboundAuthority {
+            pairing: pairing_guard.as_ref().clone(),
+            inbound_auth: std::sync::Arc::clone(&inbound_auth),
+            config: std::sync::Arc::clone(&live_config),
+        };
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
         let gateway_reload_controls = GatewayReloadControls {
@@ -766,7 +783,7 @@ pub async fn run_with_authority(
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
                 let live_config_authority = gateway_live_config_authority.clone();
-                let pairing = gateway_pairing.as_ref().clone();
+                let authority = gateway_authority.clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 async move {
@@ -779,7 +796,7 @@ pub async fn run_with_authority(
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
-                        Some(pairing),
+                        Some(authority),
                         readiness_reporter,
                     )
                     .await
@@ -997,15 +1014,10 @@ pub async fn run_with_authority(
 
         let (rpc_config, rpc_config_write_lock) =
             RpcContext::config_handles_for_authority(&live_config_authority);
-        let rpc_auth = std::sync::Arc::new(
-            crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
-                |e| {
-                    anyhow::Error::msg(format!(
-                        "building the RPC inbound authentication layer: {e:#}"
-                    ))
-                },
-            )?,
-        );
+        // The generation's shared inbound-auth state (see `inbound_auth`
+        // above): the gateway authenticates and publishes against these same
+        // instances.
+        let rpc_auth = std::sync::Arc::clone(&inbound_auth);
 
         Some(std::sync::Arc::new(RpcContext {
             #[cfg(test)]

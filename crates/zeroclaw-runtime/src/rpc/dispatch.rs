@@ -140,6 +140,7 @@ pub enum Method {
     // Config
     ConfigGet,
     ConfigSet,
+    ConfigSetMany,
     ConfigValidate,
     ConfigReload,
     ConfigList,
@@ -264,6 +265,7 @@ impl Method {
         // Config
         (Method::ConfigGet, "config/get"),
         (Method::ConfigSet, "config/set"),
+        (Method::ConfigSetMany, "config/set-many"),
         (Method::ConfigValidate, "config/validate"),
         (Method::ConfigReload, "config/reload"),
         (Method::ConfigList, "config/list"),
@@ -413,7 +415,7 @@ impl Method {
             | M::ConfigStatus
             | M::ConfigCatalog
             | M::ConfigCatalogModels => (Resource::Config, Verb::Read),
-            M::ConfigSet | M::ConfigReload | M::ConfigMapKeyRename => {
+            M::ConfigSet | M::ConfigSetMany | M::ConfigReload | M::ConfigMapKeyRename => {
                 (Resource::Config, Verb::Update)
             }
             M::ConfigMapKeyCreate => (Resource::Config, Verb::Create),
@@ -673,6 +675,8 @@ enum LiveSessionRefreshScope {
     ModelProvider(String),
     Agent(String),
     ModelRoutes,
+    /// Transient union derived from one atomic config/set-many request.
+    Batch(Vec<Self>),
     /// A provider alias rename (`providers.models.<family>.<from>` ->
     /// `<to>`). This cannot reuse `ModelProvider(new_ref)`: the cascade
     /// rewrites *config* referrers to the new alias, but a session's
@@ -702,6 +706,17 @@ impl LiveSessionRefreshScope {
         overrides: &SessionOverrides,
     ) -> Result<Option<String>, String> {
         match self {
+            Self::Batch(scopes) => {
+                for scope in scopes {
+                    if let Some(provider) =
+                        scope.resolve_provider_ref(config, session_agent, overrides)?
+                    {
+                        return Ok(Some(provider));
+                    }
+                }
+                Ok(None)
+            }
+
             Self::ModelProvider(target_ref) => {
                 let effective_ref = overrides.model_provider.as_deref().or_else(|| {
                     config
@@ -3152,6 +3167,7 @@ impl RpcDispatcher {
             // Config
             Method::ConfigGet => self.handle_config_get(params),
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
+            Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
             Method::ConfigValidate => self.handle_config_validate(),
             Method::ConfigReload => self.handle_config_reload(),
             Method::ConfigList => self.handle_config_list(params),
@@ -7367,53 +7383,7 @@ impl RpcDispatcher {
         // the heap rather than inflating this async fn's stack frame across the
         // awaits below.
         let mut config = Box::new(old_config.clone());
-        if config.ensure_map_key_for_path(&req.prop) {
-            // Refused to vivify the reserved `default` agent: return a
-            // reserved error rather than a downstream "Unknown property".
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                "alias `default` is reserved and cannot be created",
-            ));
-        }
-        let info = config
-            .prop_fields()
-            .into_iter()
-            .find(|f| f.name == req.prop);
-        // Polymorphic value: strings pass through, everything else coerced.
-        let value_str = match &req.value {
-            Value::String(s) => s.clone(),
-            other => match zeroclaw_config::typed_value::coerce_for_set_prop(
-                other,
-                info.as_ref().map(|i| i.kind),
-            ) {
-                Ok(coerced) => coerced,
-                Err(e) => return Err(rpc_err(INVALID_PARAMS, e.message)),
-            },
-        };
-        // Reject the masked sentinel for secrets — surfaces echo the
-        // masked display value back when no real edit happened, and
-        // letting that through silently clobbers the live secret with
-        // the literal masked string.
-        let is_secret_prop = info
-            .as_ref()
-            .is_some_and(|i| i.is_secret || i.derived_from_secret)
-            || zeroclaw_config::schema::Config::prop_is_secret(&req.prop);
-        if is_secret_prop
-            && (value_str == zeroclaw_config::traits::MASKED_SECRET
-                || value_str == "****"
-                || value_str.is_empty())
-        {
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                format!(
-                    "Refusing to overwrite secret `{}` with a masked or empty value",
-                    req.prop
-                ),
-            ));
-        }
-        if let Err(e) = config.set_prop_persistent(&req.prop, &value_str) {
-            return Err(rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")));
-        }
+        Self::stage_config_set(&mut config, &req.prop, &req.value)?;
         let config_path = config.config_path.clone();
         if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
@@ -7459,6 +7429,218 @@ impl RpcDispatcher {
             prop: req.prop,
             set: true,
         })
+    }
+
+    /// Upper bound on entries in one `config/set-many` batch. See
+    /// [`Self::handle_config_set_many`] for why the bound exists.
+    const CONFIG_SET_MANY_MAX_ENTRIES: usize = 256;
+
+    /// `config/set-many`: stage an ordered batch of `config/set` entries on
+    /// one working copy and commit it with a single `save_and_swap_config`,
+    /// so fields that are only valid together (a `[users.<name>]` entry's
+    /// `uid` and `permission_profiles`) can be authored without an invalid
+    /// intermediate state ever being checked, saved, or installed. Whatever
+    /// commit-time checks `save_and_swap_config` performs run once, over the
+    /// final state. An entry that fails to stage aborts the whole batch
+    /// before anything is saved or swapped, and the error names its index.
+    ///
+    /// Holds `config_write_lock` from the first staged entry through the
+    /// swap, so no concurrent config writer can interleave with the batch.
+    ///
+    /// Every entry is authorized against the accepted policy after the write
+    /// lock is acquired and before any entry is staged. A batch cannot commit
+    /// using grants revoked while it waited or smuggle a forbidden path among
+    /// permitted entries.
+    ///
+    /// The batch is capped at [`Self::CONFIG_SET_MANY_MAX_ENTRIES`]: every
+    /// entry re-walks `prop_fields()` on the working copy (it must, because
+    /// vivifying a map key changes the field set) while `config_write_lock`
+    /// is held, so an unbounded batch would let one frame hold every other
+    /// config writer off for as long as it liked. Real batches are a form's
+    /// worth of fields; an over-long batch is a caller error like an empty one.
+    async fn handle_config_set_many(&self, params: &Value) -> RpcResult {
+        let req: ConfigSetManyParams = parse_params(params)?;
+        if req.sets.is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                crate::i18n::get_required_cli_string("rpc-config-set-many-empty"),
+            ));
+        }
+        if req.sets.len() > Self::CONFIG_SET_MANY_MAX_ENTRIES {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                crate::i18n::get_required_cli_string_with_args(
+                    "rpc-config-set-many-limit",
+                    &[
+                        ("limit", &Self::CONFIG_SET_MANY_MAX_ENTRIES.to_string()),
+                        ("count", &req.sets.len().to_string()),
+                    ],
+                ),
+            ));
+        }
+        for (index, entry) in req.sets.iter().enumerate() {
+            self.selector_config_write(Method::ConfigSetMany, &entry.prop)
+                .map_err(|e| {
+                    rpc_err(
+                        e.code,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "rpc-config-set-many-entry-rejected",
+                            &[
+                                ("index", &index.to_string()),
+                                ("prop", &entry.prop),
+                                ("reason", &e.message),
+                            ],
+                        ),
+                    )
+                })?;
+        }
+        let aliases: std::collections::BTreeSet<_> = req
+            .sets
+            .iter()
+            .filter_map(|entry| zeroclaw_config::alias_refs::agent_alias_for_prop_path(&entry.prop))
+            .collect();
+        let _agent_config_reservations: Vec<_> = aliases
+            .into_iter()
+            .map(|alias| self.ctx.agent_lifecycle.reserve_config_mutation(alias))
+            .collect::<Result<_, _>>()
+            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+        let channel_agents: std::collections::BTreeSet<_> = req
+            .sets
+            .iter()
+            .filter_map(|entry| agent_alias_from_channel_auth_prop(&entry.prop))
+            .collect();
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        for (index, entry) in req.sets.iter().enumerate() {
+            self.recheck_config_write_authority(
+                Method::ConfigSetMany,
+                Some(&entry.prop),
+                &config_write_guard,
+            )
+            .map_err(|e| {
+                rpc_err(
+                    e.code,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "rpc-config-set-many-entry-rejected",
+                        &[
+                            ("index", &index.to_string()),
+                            ("prop", &entry.prop),
+                            ("reason", &e.message),
+                        ],
+                    ),
+                )
+            })?;
+        }
+        // Boxed for the same stack-frame reason as in `handle_config_set`.
+        let old_config = self.ctx.config.read().clone();
+        let channel_generation_revocation = self.prepare_channel_generation_revocation(
+            req.sets
+                .iter()
+                .any(|entry| is_channel_generation_prop(&entry.prop)),
+            &old_config,
+        )?;
+        let mut config = Box::new(old_config.clone());
+        for (index, entry) in req.sets.iter().enumerate() {
+            Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
+                rpc_err(
+                    e.code,
+                    crate::i18n::get_required_cli_string_with_args(
+                        "rpc-config-set-many-entry-rejected",
+                        &[
+                            ("index", &index.to_string()),
+                            ("prop", &entry.prop),
+                            ("reason", &e.message),
+                        ],
+                    ),
+                )
+            })?;
+        }
+        // The request paths describe the affected live views; the candidate
+        // config remains their canonical source. Prepare all affected sessions
+        // before the one commit, including batches that change several routes.
+        let scopes: Vec<_> = req
+            .sets
+            .iter()
+            .filter_map(|entry| LiveSessionRefreshScope::for_prop(&entry.prop))
+            .collect();
+        if scopes.is_empty() {
+            self.save_and_swap_config(*config, &config_write_guard)
+                .await?;
+        } else {
+            Box::pin(self.commit_config_with_live_session_refresh(
+                *config,
+                &config_write_guard,
+                &LiveSessionRefreshScope::Batch(scopes),
+            ))
+            .await?;
+        }
+        let _config_write_guard = self
+            .finish_channel_generation_mutation(channel_generation_revocation, config_write_guard)
+            .await?;
+        let new_config = self.ctx.config.read().clone();
+        for alias in channel_agents {
+            self.refresh_live_channel_handles_between_configs(&old_config, &new_config, &alias)
+                .await;
+        }
+        let props: Vec<String> = req.sets.into_iter().map(|entry| entry.prop).collect();
+        let providers: std::collections::BTreeSet<_> = props
+            .iter()
+            .filter_map(|prop| model_provider_ref_from_provider_profile_prop(prop))
+            .collect();
+        for provider in providers {
+            self.refresh_memory_embedder_for_model_provider(&provider);
+        }
+        to_result(ConfigSetManyResult { props, set: true })
+    }
+
+    /// Stage one `config/set` entry on a working copy of the config:
+    /// materialize the parent map key when the path names a new alias,
+    /// coerce the polymorphic value, refuse a masked or empty secret, and
+    /// apply the persistent write. Never touches the live config or disk;
+    /// the caller commits the working copy, or drops it on error.
+    fn stage_config_set(
+        config: &mut Config,
+        prop: &str,
+        value: &Value,
+    ) -> Result<(), JsonRpcError> {
+        if config.ensure_map_key_for_path(prop) {
+            // Refused to vivify the reserved `default` agent: return a
+            // reserved error rather than a downstream "Unknown property".
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "alias `default` is reserved and cannot be created",
+            ));
+        }
+        let info = config.prop_fields().into_iter().find(|f| f.name == prop);
+        // Polymorphic value: strings pass through, everything else coerced.
+        let value_str = match value {
+            Value::String(s) => s.clone(),
+            other => zeroclaw_config::typed_value::coerce_for_set_prop(
+                other,
+                info.as_ref().map(|i| i.kind),
+            )
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
+        };
+        // Reject the masked sentinel for secrets — surfaces echo the
+        // masked display value back when no real edit happened, and
+        // letting that through silently clobbers the live secret with
+        // the literal masked string.
+        let is_secret_prop = info
+            .as_ref()
+            .is_some_and(|i| i.is_secret || i.derived_from_secret)
+            || Config::prop_is_secret(prop);
+        if is_secret_prop
+            && (value_str == zeroclaw_config::traits::MASKED_SECRET
+                || value_str == "****"
+                || value_str.is_empty())
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
+            ));
+        }
+        config
+            .set_prop_persistent(prop, &value_str)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
     }
 
     fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
@@ -15793,7 +15975,7 @@ mod tests {
         assert_eq!(sessions.has_forwarded_environment(sid).await, Some(true));
         assert!(sessions.remove(sid).await);
         dispatcher
-            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants(), None)
             .await
             .unwrap()
             .unwrap();
@@ -15807,7 +15989,7 @@ mod tests {
         // Deliberately pass the stamped pre-demotion grants: environment
         // selection must resolve current eligibility at construction time.
         dispatcher
-            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants(), None)
             .await
             .unwrap()
             .unwrap();
@@ -18147,7 +18329,7 @@ mod tests {
         // Rehydration by an administrator keeps the durable owner's plane.
         assert!(sessions.remove("a-mem").await);
         carol
-            .rehydrate_reaped_session("a-mem", carol.stamped_grants())
+            .rehydrate_reaped_session("a-mem", carol.stamped_grants(), None)
             .await
             .expect("the administrator restores alice's session");
         let agent = sessions.get_agent("a-mem").await.expect("restored");
@@ -28657,6 +28839,616 @@ mod tests {
         assert!(res.is_ok(), "config/delete must succeed: {res:?}");
 
         wait_for_temperature(&dispatcher, &session_id, None).await;
+    }
+
+    // ── config/set-many ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn config_set_many_respects_alias_deletion_and_channel_retirement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config
+            .create_map_key("agents", "batch_agent")
+            .expect("create batch agent");
+        let new_cli = !config.channels.cli;
+        config.save().await.unwrap();
+        let (dispatcher, clears) = make_supervised_generation_dispatcher(config);
+        let deleting = dispatcher
+            .ctx
+            .agent_lifecycle
+            .begin_delete("batch_agent")
+            .expect("reserve deletion");
+        let batch = json!({"sets": [
+            {"prop": "agents.batch_agent.enabled", "value": false},
+            {"prop": "channels.cli", "value": new_cli},
+        ]});
+
+        dispatcher
+            .handle_config_set_many(&batch)
+            .await
+            .expect_err("batch must not write across an alias deletion");
+        assert!(dispatcher.ctx.config.read().agents["batch_agent"].enabled);
+        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        drop(deleting);
+        dispatcher
+            .handle_config_set_many(&batch)
+            .await
+            .expect("batch commits after deletion reservation ends");
+        assert!(!dispatcher.ctx.config.read().agents["batch_agent"].enabled);
+        assert_eq!(dispatcher.ctx.config.read().channels.cli, new_cli);
+        assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Authenticated capture dispatcher over a TempDir-rooted config that
+    /// has one permission profile for roster entries to reference. The config
+    /// is saved first so a rejected batch can be checked byte-for-byte on disk.
+    async fn make_set_many_test_dispatcher(
+        tmp: &tempfile::TempDir,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config
+            .create_map_key("permission_profiles", "operator")
+            .expect("create permission_profiles.operator");
+        config.save().await.expect("seed config.toml");
+        let (mut dispatcher, rx, _sessions) = make_dispatcher_with_capture(config);
+        dispatcher.set_authenticated_for_test();
+        (dispatcher, rx)
+    }
+
+    /// Send one request through `process_line` (the wire dispatch path, not
+    /// the handler) and return the parsed response frame.
+    async fn rpc_roundtrip(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        dispatcher.process_line(&line.to_string()).await;
+        let frame = rx.recv().await.expect("RPC response frame");
+        serde_json::from_str(&frame).expect("response frame is valid JSON")
+    }
+
+    fn alice_user_sets() -> Value {
+        json!([
+            {"prop": "users.alice.uid", "value": 1001},
+            {"prop": "users.alice.permission_profiles", "value": ["operator"]},
+        ])
+    }
+
+    #[tokio::test]
+    async fn config_set_many_authors_a_complete_user_entry_in_one_commit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut dispatcher, mut rx) = make_set_many_test_dispatcher(&tmp).await;
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": alice_user_sets()}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "batch must commit: {response}"
+        );
+        assert_eq!(
+            response["result"],
+            json!({"props": ["users.alice.uid", "users.alice.permission_profiles"], "set": true})
+        );
+
+        let live = dispatcher.ctx.config.read().clone();
+        let alice = live
+            .users
+            .get("alice")
+            .expect("batch must create users.alice");
+        assert_eq!(alice.uid, Some(1001));
+        assert_eq!(alice.permission_profiles, vec!["operator".to_string()]);
+        alice
+            .validate("alice")
+            .expect("the committed entry must satisfy the roster rules");
+
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        let alice = reparsed
+            .users
+            .get("alice")
+            .unwrap_or_else(|| panic!("users.alice must reach disk; on-disk file:\n{on_disk}"));
+        assert_eq!(alice.uid, Some(1001));
+        assert_eq!(alice.permission_profiles, vec!["operator".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn config_set_many_rejects_the_whole_batch_and_names_the_failing_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let (mut dispatcher, mut rx) = make_set_many_test_dispatcher(&tmp).await;
+        let disk_before = std::fs::read_to_string(&config_path).unwrap();
+        let (live_before, dirty_before) = {
+            let live = dispatcher.ctx.config.read();
+            (
+                serde_json::to_value(&*live).unwrap(),
+                live.dirty_paths.clone(),
+            )
+        };
+
+        // Entries 0 and 1 stage cleanly (entry 0 auto-creates `users.alice`
+        // on the working copy); entry 2 fails. None of it may land.
+        for (bad_entry, why) in [
+            (
+                json!({"prop": "users.alice.no_such_field", "value": "x"}),
+                "unknown prop",
+            ),
+            (
+                json!({"prop": "users.alice.uid", "value": "not-a-uid"}),
+                "unparseable value",
+            ),
+        ] {
+            let mut sets = alice_user_sets();
+            sets.as_array_mut().unwrap().push(bad_entry);
+            let response = rpc_roundtrip(
+                &mut dispatcher,
+                &mut rx,
+                "config/set-many",
+                json!({"sets": sets}),
+            )
+            .await;
+            let message = response["error"]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{why}: batch must be rejected: {response}"));
+            assert!(
+                message.contains("entry 2"),
+                "{why}: error must name the failing index: {message}"
+            );
+
+            let live = dispatcher.ctx.config.read();
+            assert!(
+                !live.users.contains_key("alice"),
+                "{why}: no entry of a rejected batch may reach the live config"
+            );
+            assert_eq!(
+                serde_json::to_value(&*live).unwrap(),
+                live_before,
+                "{why}: live config must be untouched"
+            );
+            assert_eq!(
+                live.dirty_paths, dirty_before,
+                "{why}: dirty set must be untouched"
+            );
+            drop(live);
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap(),
+                disk_before,
+                "{why}: nothing may reach disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_set_many_applies_entries_in_order_so_a_later_write_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut dispatcher, mut rx) = make_set_many_test_dispatcher(&tmp).await;
+
+        let mut sets = alice_user_sets();
+        sets.as_array_mut()
+            .unwrap()
+            .push(json!({"prop": "users.alice.uid", "value": 1002}));
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": sets}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "batch must commit: {response}"
+        );
+
+        assert_eq!(dispatcher.ctx.config.read().users["alice"].uid, Some(1002));
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            reparsed.users["alice"].uid,
+            Some(1002),
+            "the later entry must win on disk too; on-disk file:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_many_rejects_an_empty_batch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let (mut dispatcher, mut rx) = make_set_many_test_dispatcher(&tmp).await;
+        let disk_before = std::fs::read_to_string(&config_path).unwrap();
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": []}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "an empty batch is a caller error, not a silent no-op: {response}"
+        );
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), disk_before);
+    }
+
+    /// The cap is inclusive: a batch of exactly the maximum commits, one more
+    /// is refused before the lock is taken and nothing reaches disk.
+    #[tokio::test]
+    async fn config_set_many_rejects_a_batch_over_the_entry_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let (mut dispatcher, mut rx) = make_set_many_test_dispatcher(&tmp).await;
+        let disk_before = std::fs::read_to_string(&config_path).unwrap();
+        let cap = RpcDispatcher::CONFIG_SET_MANY_MAX_ENTRIES;
+        let port_sets = |n: usize| -> Value {
+            Value::Array(
+                (0..n)
+                    .map(|i| json!({"prop": "gateway.port", "value": 4000 + i}))
+                    .collect(),
+            )
+        };
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": port_sets(cap + 1)}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "a batch over the cap is a caller error: {response}"
+        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("at most {cap} entries")),
+            "the error must name the cap: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            disk_before,
+            "a refused batch must not reach disk"
+        );
+        assert_ne!(dispatcher.ctx.config.read().gateway.port, 4000 + cap as u16);
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": port_sets(cap)}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "a batch of exactly the cap must commit: {response}"
+        );
+        assert_eq!(
+            dispatcher.ctx.config.read().gateway.port,
+            4000 + (cap - 1) as u16,
+            "the last entry of a full batch must win"
+        );
+    }
+
+    /// The batch's only commit point is `save_and_swap_config`: when that
+    /// refuses (here, an unwritable config path), nothing staged is installed.
+    #[tokio::test]
+    async fn config_set_many_installs_nothing_when_the_commit_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let not_a_dir = tmp.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, "").unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: not_a_dir.join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let (mut dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        dispatcher.set_authenticated_for_test();
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": [{"prop": "gateway.port", "value": 4242}]}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_some(),
+            "an unwritable config path must refuse the commit: {response}"
+        );
+        assert_ne!(
+            dispatcher.ctx.config.read().gateway.port,
+            4242,
+            "a refused commit must not install the staged snapshot"
+        );
+    }
+
+    #[test]
+    fn config_set_many_revoked_while_queued_is_refused_before_staging() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = config_write_roster_config(&tmp, 4242, &["providers.*"]);
+            config.save().await.unwrap();
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read(tmp.path().join("config.toml")).unwrap();
+            let live_before = serde_json::to_value(&*ctx.config.read()).unwrap();
+            let params = json!({"sets": [
+                {"prop": "providers.models.anthropic.default.model", "value": "revoked"},
+                {"prop": "providers.models.openai.fresh.model", "value": "must-not-create"}
+            ]});
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set_many(&params).await },
+                revoke_alice_config_writes,
+            )
+            .await;
+            assert_eq!(result.unwrap_err().code, FORBIDDEN);
+            assert_eq!(
+                std::fs::read(tmp.path().join("config.toml")).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(&*ctx.config.read()).unwrap(),
+                live_before
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn config_set_many_refreshes_routes_and_capacity_in_one_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "reasoning".into(),
+                model_provider: "openai.test-provider".into(),
+                model: "old-model".into(),
+                api_key: None,
+            });
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let before = dispatcher.ctx.auth.accepted_revision();
+        dispatcher
+            .handle_config_set_many(&json!({"sets": [
+                {"prop": "providers.models.openai.test-provider.context_window", "value": 32000},
+                {"prop": "model_routes.reasoning.model", "value": "batched-model"}
+            ]}))
+            .await
+            .expect("the whole batch must commit");
+        assert_eq!(dispatcher.ctx.auth.accepted_revision(), before + 1);
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .unwrap();
+        let agent = agent.lock().await;
+        let route = agent.resolved_route_for_test("hint:reasoning");
+        assert_eq!(route.model, "batched-model");
+        let limits = agent.context_limits_for_route(&route.provider_name, &route.model);
+        assert_eq!(limits.model_context_window, 32000);
+    }
+
+    /// A roster principal bound through the real local handshake (peer
+    /// credential `uid`), over a TempDir-rooted config so a commit can save.
+    async fn authenticated_roster_dispatcher(
+        tmp: &tempfile::TempDir,
+        mut config: zeroclaw_config::schema::Config,
+        uid: u32,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config.save().await.expect("seed config.toml");
+        let ctx = enforcement_ctx(config);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "unix:test".into()).with_transport(
+            crate::rpc::transport::TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid },
+        );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster principal authenticates");
+        (dispatcher, rx)
+    }
+
+    /// Every entry is checked against the caller's config-path selector
+    /// before the first is staged: one refused path refuses the batch
+    /// wholesale, even when the entries before it are individually allowed.
+    #[tokio::test]
+    async fn config_set_many_refuses_wholesale_when_any_path_is_outside_the_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = roster_config(4242);
+        {
+            let profile = config.permission_profiles.get_mut("reader").unwrap();
+            profile.config_write_paths = vec!["gateway.*".into()];
+            profile.grants.insert(
+                zeroclaw_api::grants::Resource::Config,
+                vec![zeroclaw_api::grants::Verb::Update],
+            );
+        }
+        config
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("create anthropic.default");
+        let port_before = config.gateway.port;
+        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
+        let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": [
+                {"prop": "gateway.port", "value": port_before + 1},
+                {"prop": "providers.models.anthropic.default.model", "value": "denied-model"},
+            ]}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(FORBIDDEN),
+            "a path outside the selector must refuse the batch: {response}"
+        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("entry 1"),
+            "error must name the refused entry: {message}"
+        );
+        assert_eq!(
+            dispatcher.ctx.config.read().gateway.port,
+            port_before,
+            "the allowed entry before the refused one must not have been applied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            disk_before,
+            "nothing may reach disk"
+        );
+
+        // Control: the same principal may batch the allowed path alone, so
+        // it was the selector — not the coarse Config:Update gate — that
+        // refused above.
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": [{"prop": "gateway.port", "value": port_before + 1}]}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "a batch within the selector must commit: {response}"
+        );
+        assert_eq!(dispatcher.ctx.config.read().gateway.port, port_before + 1);
+    }
+
+    /// The motivating case: `save_and_swap_config` validates the auth
+    /// sections before persisting, so a `[users.<name>]` entry cannot be
+    /// authored one field at a time in either order — each single
+    /// `config/set` is refused. The same two writes in one batch commit.
+    #[tokio::test]
+    async fn config_set_many_authors_a_user_whose_fields_are_refused_one_at_a_time() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .create_map_key("permission_profiles", "operator")
+            .expect("create permission_profiles.operator");
+        config.users.insert(
+            "root-operator".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
+        let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+        for (entry, missing) in [
+            (
+                json!({"prop": "users.bob.uid", "value": 1001}),
+                "users.bob.permission_profiles is required",
+            ),
+            (
+                json!({"prop": "users.bob.permission_profiles", "value": ["operator"]}),
+                "users.bob.uid is required",
+            ),
+        ] {
+            let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/set", entry).await;
+            let message = response["error"]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a lone write must be refused: {response}"));
+            assert!(
+                message.contains(missing),
+                "refusal must name the missing co-required field: {message}"
+            );
+            assert!(
+                !dispatcher.ctx.config.read().users.contains_key("bob"),
+                "a refused single write must not install a half-authored user"
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+                disk_before,
+                "a refused single write must not reach disk"
+            );
+        }
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": [
+                {"prop": "users.bob.uid", "value": 1001},
+                {"prop": "users.bob.permission_profiles", "value": ["operator"]},
+            ]}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "the same two writes in one batch must commit: {response}"
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        let bob = reparsed
+            .users
+            .get("bob")
+            .unwrap_or_else(|| panic!("users.bob must reach disk; on-disk file:\n{on_disk}"));
+        assert_eq!(bob.uid, Some(1001));
+        assert_eq!(bob.permission_profiles, vec!["operator".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn config_set_many_blocks_while_config_write_lock_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut dispatcher, mut rx) = make_set_many_test_dispatcher(&tmp).await;
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let response = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move {
+                Ok(rpc_roundtrip(
+                    &mut dispatcher,
+                    &mut rx,
+                    "config/set-many",
+                    json!({"sets": alice_user_sets()}),
+                )
+                .await)
+            },
+            "config/set-many must block on config_write_lock while it is held",
+        )
+        .await
+        .expect("the scaffold returns the response frame");
+        assert!(
+            response.get("error").is_none(),
+            "config/set-many must commit once the guard is released: {response}"
+        );
+
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            on_disk.contains("[users.alice]"),
+            "config/set-many must persist once unblocked; on-disk file:\n{on_disk}"
+        );
     }
 
     // -----------------------------------------------------------------------

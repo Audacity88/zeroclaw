@@ -13,8 +13,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 /// The live configuration state shared by one supervised daemon generation.
 ///
-/// The write lock is deliberately paired with the config Arc so every
-/// mutation path uses the same serialization witness as the live state.
+/// The write lock is the process-wide config transaction lock, shared with
+/// writers that do not hold this authority.
 #[derive(Clone)]
 pub struct LiveConfigAuthority {
     config: Arc<RwLock<Config>>,
@@ -27,7 +27,7 @@ impl LiveConfigAuthority {
     pub fn new(config: Config) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
         }
     }
@@ -44,12 +44,12 @@ impl LiveConfigAuthority {
     pub fn new_with_ownership(config: Config, ownership: ConfigOwnershipGuard) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::with_ownership(ownership),
         }
     }
 
-    /// Pair an existing live config handle with a local mutation witness.
+    /// Pair an existing live config handle with the process-wide mutation lock.
     ///
     /// This preserves standalone callers that already own an `Arc<RwLock<Config>>`
     /// without claiming that their config participates in a supervised daemon's
@@ -57,7 +57,7 @@ impl LiveConfigAuthority {
     pub fn from_config(config: Arc<RwLock<Config>>) -> Self {
         Self {
             config,
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
         }
     }
@@ -1065,13 +1065,13 @@ mod tests {
     }
 
     #[test]
-    fn from_config_preserves_config_and_allocates_local_write_lock() {
+    fn from_config_preserves_config_and_shares_process_write_lock() {
         let config = Arc::new(RwLock::new(Config::default()));
         let authority = LiveConfigAuthority::from_config(Arc::clone(&config));
         let other = LiveConfigAuthority::from_config(config.clone());
 
         assert!(Arc::ptr_eq(&config, &authority.config()));
-        assert!(!Arc::ptr_eq(
+        assert!(Arc::ptr_eq(
             &authority.config_write_lock(),
             &other.config_write_lock()
         ));

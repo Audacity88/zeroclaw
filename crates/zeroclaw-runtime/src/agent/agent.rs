@@ -541,6 +541,9 @@ pub type ConfigGeneration =
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    /// Live shared config used by tools whose security policy must reflect the
+    /// next dispatch even when model/provider state remains generation-pinned.
+    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     /// Live shared config this snapshot is refreshed from when the caller owns
     /// an acknowledged model-generation refresh transaction. `None` for
     /// one-shot/test agents and direct ACP/WS agents pinned until reconnect.
@@ -1676,6 +1679,7 @@ impl Agent {
             None => {
                 self.provider_switch_config = Some(ProviderSwitchConfig {
                     config: Some(config_generation),
+                    live_config: None,
                     live: None,
                 });
             }
@@ -2738,7 +2742,7 @@ impl Agent {
             };
 
         let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
+            if let Some(cap_config) = live_config.clone() {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
                     cap_config
@@ -2817,6 +2821,7 @@ impl Agent {
                         .as_ref()
                         .map_or_else(|| Arc::new(config.clone()), |cell| Arc::clone(&cell.read())),
                 ),
+                live_config: live_config.clone(),
                 live: live_config_for_generation,
             });
         if let Some(generation) = config_generation {
@@ -3672,15 +3677,18 @@ impl Agent {
                         // route snapshot.
                         served_route_sink: None,
                         // Live-daemon SOP path: re-assemble a nested step's agent
-                        // when it delegates elsewhere. Config survives only via
-                        // `provider_switch_config`; with `None` (test builder) a
-                        // cross-agent step FAILS CLOSED rather than inheriting
-                        // this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        // when it delegates elsewhere. Snapshot config and the
+                        // optional live policy handle survive via
+                        // `provider_switch_config`; test builders without that
+                        // context fail closed instead of inheriting this turn.
+                        sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                            c.config.as_deref().map(|config| {
+                                crate::agent::turn::SopStepReassembly {
+                                    config,
+                                    live_config: c.live_config.clone(),
+                                }
+                            })
+                        }),
                     },
                 )),
             ),
@@ -4253,15 +4261,18 @@ impl Agent {
                             turn_id: &turn_id,
                             served_route_sink: Some(served_route_sink.clone()),
                             // Live-daemon SOP path: re-assemble a nested step's
-                            // agent when it delegates elsewhere. Config survives
-                            // only via `provider_switch_config`; with `None`
-                            // (test builder) a cross-agent step FAILS CLOSED
-                            // rather than inheriting this turn's context.
-                            sop_reassembly: self
-                                .provider_switch_config
-                                .as_ref()
-                                .and_then(|c| c.config.as_deref())
-                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            // agent when it delegates elsewhere. Snapshot config
+                            // and the optional live policy handle survive via
+                            // `provider_switch_config`; test builders without
+                            // that context fail closed instead of inheriting it.
+                            sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                                c.config.as_deref().map(|config| {
+                                    crate::agent::turn::SopStepReassembly {
+                                        config,
+                                        live_config: c.live_config.clone(),
+                                    }
+                                })
+                            }),
                         },
                     )),
                 ),
@@ -15491,6 +15502,7 @@ vision_model_provider = "custom.vision"
             .multimodal_config(config.multimodal.clone())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             // Auto-approve so the image-injecting tool runs and the vision route
@@ -15822,6 +15834,7 @@ model_provider = "custom.primary"
             .model_name("primary-model".into())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             .build()
@@ -16039,6 +16052,7 @@ model_provider = "custom.only"
             .model_name("large-model".into())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             .build()
@@ -16428,6 +16442,7 @@ model_provider = "custom.only"
             "large-v1",
             Some(ProviderSwitchConfig {
                 config: Some(Arc::clone(&generation.read())),
+                live_config: None,
                 live: Some(Arc::clone(&live)),
             }),
         );
@@ -16507,6 +16522,7 @@ model_provider = "custom.only"
             "large-v1",
             Some(ProviderSwitchConfig {
                 config: Some(Arc::clone(&generation.read())),
+                live_config: None,
                 live: None,
             }),
         );
@@ -16694,6 +16710,7 @@ model_provider = "custom.only"
 
         let switch_config = ProviderSwitchConfig {
             config: Some(Arc::new(config)),
+            live_config: None,
             live: None,
         };
         let mut agent = build_test_agent("openai.primary", "current-model", Some(switch_config));
@@ -16725,6 +16742,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
 
@@ -16770,6 +16788,7 @@ model_provider = "custom.only"
         let cfg_arc = std::sync::Arc::new(cfg);
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live_config: None,
             live: None,
         };
 
@@ -16810,6 +16829,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
 
@@ -16863,6 +16883,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
         let mut agent = build_test_agent("ollama.large", "large", Some(switch_cfg));
@@ -16924,6 +16945,7 @@ model_provider = "custom.only"
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live_config: None,
             live: None,
         };
 
@@ -17119,6 +17141,7 @@ model_provider = "custom.only"
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
+            live_config: None,
             live: None,
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
