@@ -3516,9 +3516,10 @@ impl RpcDispatcher {
         // above authorized whatever existed then, this authorizes what exists
         // now. A scoped mismatch surfaces as the uniform ownership denial.
         let resume_scope = self.scoped_principal_id();
+        let mut retained_remote_admission = None;
         if resuming {
             let non_local = self.transport_kind != crate::rpc::transport::TransportKind::Local;
-            let remote_resume_admission = if non_local {
+            if non_local {
                 let guard = self
                     .ctx
                     .sessions
@@ -3551,10 +3552,8 @@ impl RpcDispatcher {
                 if let Some(agent) = self.ctx.sessions.get_agent(&session_id).await {
                     self.ensure_transport_can_use_session_agent(&agent).await?;
                 }
-                Some((guard, grants))
-            } else {
-                None
-            };
+                retained_remote_admission = Some(guard);
+            }
             match self
                 .ctx
                 .sessions
@@ -3582,7 +3581,7 @@ impl RpcDispatcher {
                             session_id,
                             &chat_mode,
                             existing?,
-                            remote_resume_admission.map(|(guard, _)| guard),
+                            retained_remote_admission,
                         )
                         .await;
                 }
@@ -3595,7 +3594,6 @@ impl RpcDispatcher {
                 }
                 Err(message) => return Err(rpc_err(INVALID_PARAMS, message)),
             }
-            drop(remote_resume_admission);
         }
 
         // Session replacement and prompt execution share one admission
@@ -3613,13 +3611,16 @@ impl RpcDispatcher {
         // place. Publishing goes through `insert_admitted` (which does NOT
         // re-acquire the permit) rather than `insert`, so the permit-1
         // per-session semaphore is never acquired twice.
-        let _admission = self
-            .ctx
-            .sessions
-            .session_queue
-            .acquire(&session_id)
-            .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        let _admission = if let Some(guard) = retained_remote_admission {
+            guard
+        } else {
+            self.ctx
+                .sessions
+                .session_queue
+                .acquire(&session_id)
+                .await
+                .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
+        };
 
         // The wait for admission is unbounded, so the principal's profile,
         // credential, or pairing may have changed while this request was
@@ -10376,6 +10377,122 @@ mod tests {
             Some("tui-local"),
             "refused WSS resume must not take the local session's TUI ownership stamp"
         );
+    }
+
+    async fn assert_wss_session_new_holds_first_admission_through_fallback(
+        local_chat_mode: crate::rpc::types::ChatMode,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut local, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        local = local.with_local_session_channel_factory(session_factory_stub());
+        local.set_tui_id_for_test(Some("tui-local".into()));
+        let sid = match local_chat_mode {
+            crate::rpc::types::ChatMode::Chat => "remote-first-same-mode-race",
+            crate::rpc::types::ChatMode::Acp => "remote-first-cross-mode-race",
+        };
+
+        let initial_permit = sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .expect("the test owns initial session admission");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut remote =
+            super::RpcDispatcher::new(std::sync::Arc::clone(&local.ctx), tx, "wss:test".into())
+                .with_transport(
+                    crate::rpc::transport::TransportKind::Wss,
+                    crate::security::auth_provider::Credential::None,
+                );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-remote".into()));
+
+        let remote_request = serde_json::json!({
+            "agent_alias": "test-agent",
+            "session_id": sid,
+            "chat_mode": "chat",
+        });
+        let remote_new = zeroclaw_spawn::spawn!(async move {
+            remote.handle_session_new_for_test(&remote_request).await
+        });
+        wait_for_session_admission_waiter(&local.ctx, sid).await;
+
+        let local_mode = match local_chat_mode {
+            crate::rpc::types::ChatMode::Chat => "chat",
+            crate::rpc::types::ChatMode::Acp => "acp",
+        };
+        let local_request = serde_json::json!({
+            "agent_alias": "test-agent",
+            "session_id": sid,
+            "chat_mode": local_mode,
+        });
+        let local_new = zeroclaw_spawn::spawn!(async move {
+            local.handle_session_new_for_test(&local_request).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sessions.session_queue.queue_depth(sid).await < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the local request must queue behind the remote request");
+
+        drop(initial_permit);
+        remote_new
+            .await
+            .expect("remote session/new task must not panic")
+            .expect("the first admitted remote request must complete its fallback");
+        local_new
+            .await
+            .expect("local session/new task must not panic")
+            .expect("the queued local request should run after remote fallback");
+
+        assert_eq!(
+            sessions.chat_mode(sid).await.as_ref(),
+            Some(&local_chat_mode)
+        );
+        assert_eq!(
+            sessions
+                .session_owner_tui_id(sid)
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-local")
+        );
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("the final session must remain live");
+        let has_local_channel = agent
+            .lock()
+            .await
+            .channel_handles()
+            .reaction
+            .read()
+            .contains_key("git.main");
+        assert_eq!(
+            has_local_channel,
+            matches!(local_chat_mode, crate::rpc::types::ChatMode::Acp),
+            "same-mode local resume must preserve the remote incarnation, while a later cross-mode local request may replace it"
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_session_new_holds_first_admission_through_same_mode_fallback() {
+        assert_wss_session_new_holds_first_admission_through_fallback(
+            crate::rpc::types::ChatMode::Chat,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wss_session_new_holds_first_admission_through_cross_mode_fallback() {
+        assert_wss_session_new_holds_first_admission_through_fallback(
+            crate::rpc::types::ChatMode::Acp,
+        )
+        .await;
     }
 
     #[tokio::test]
