@@ -442,14 +442,15 @@ impl StreamTextGuard {
     }
 
     /// Release through `boundary`, a byte offset into `pending` just past
-    /// the closing brace of a completed tool-result value that sits after
-    /// a prose preamble. The text through the boundary is prose plus a
+    /// the closing brace of a completed tool-result value, or the close
+    /// of a json-labelled fence quoting a result shape, each after a
+    /// prose preamble. The text through the boundary is prose plus a
     /// quoted result, so deliver it, then re-scan the remainder exactly
     /// as `push` treats a fresh chunk: a later unquoted envelope in that
     /// remainder is still found and withheld, with its own prose prefix
-    /// released. Another completed result behind a prose preamble in the
-    /// remainder releases the same way, so the re-scan loops instead of
-    /// recursing.
+    /// released. Another completed result or quoted-result fence behind a
+    /// prose preamble in the remainder releases the same way, so the
+    /// re-scan loops instead of recursing.
     fn release_through(&mut self, mut boundary: usize, finalizing: bool) -> Option<String> {
         let mut release = String::new();
         loop {
@@ -464,6 +465,20 @@ impl StreamTextGuard {
             if let Some(start) = find_embedded_protocol_candidate_start(&self.pending) {
                 self.pending_candidate_start = Some(start);
                 let candidate = self.pending.get(start..).unwrap_or(&self.pending);
+                // The same quoted-result fence test `evaluate_pending`
+                // applies first: a prose-prefixed candidate opening with
+                // a json fence whose body passes the shared release
+                // predicate releases through the fence's close, so
+                // consecutive quoted-result fences drain through this
+                // loop instead of recursing one `evaluate_pending` into
+                // `release_through` pair per fence.
+                if self.candidate_has_prose_prefix()
+                    && let Some((end, body)) = quoted_result_fence_end(candidate, finalizing)
+                    && self.releases_as_quoted_result(candidate, body)
+                {
+                    boundary = start + end;
+                    continue;
+                }
                 if self.candidate_has_prose_prefix()
                     && candidate.trim_start().starts_with('{')
                     && let Some(end) = leading_complete_json_value_end(candidate)
@@ -474,6 +489,18 @@ impl StreamTextGuard {
                 }
                 // A full pattern is evaluated immediately, exactly like
                 // `push` treats a fresh chunk carrying one.
+                //
+                // `evaluate_pending` on this candidate cannot reach a
+                // branch that calls `release_through` again for it: the
+                // loop has already tested the same predicates
+                // (`candidate_has_prose_prefix` plus the shared release
+                // predicate over the fence body or the completed leading
+                // value, via the same finders' candidate start) on this
+                // exact candidate with unchanged guard state, and both
+                // returned false here. Its remaining outcomes — the
+                // prefix wait, a suppression, or a whole-buffer release —
+                // never re-enter `release_through`, so the re-scan stays
+                // iterative no matter how many quoted shapes follow.
                 if let Some(text) = self.evaluate_pending(finalizing) {
                     release.push_str(&text);
                 }
@@ -2690,6 +2717,95 @@ mod stream_text_guard_tests {
             guard_outcome(&[message.as_str()]),
             expected,
             "the one-delta form must match the split form"
+        );
+    }
+
+    /// Regression for review finding B2: prose followed by two
+    /// thousand quoted-result fences in one delta. The fence release
+    /// used to re-enter `evaluate_pending` per fence, whose fence
+    /// branch called `release_through` again — one nested pair per
+    /// fence, deep enough to overflow a 128 KiB stack. The re-scan now
+    /// loops: every fence drains through the release loop, the
+    /// delivered output equals the input byte for byte, and nothing is
+    /// flagged.
+    #[test]
+    fn two_thousand_quoted_result_fences_in_one_delta_release_without_recursion() {
+        let prose = "The history messages are ";
+        let fence = "```json\n{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}\n```";
+        let mut input = format!("{prose}{fence}");
+        for _ in 1..2000 {
+            input.push(' ');
+            input.push_str(fence);
+        }
+        let assert_input = input.clone();
+        let moved = input;
+        let handle = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let mut guard = guard_with_tool();
+                let forwarded = push_all(&mut guard, &[moved.as_str()]);
+                (forwarded, guard.suppressed_protocol)
+            })
+            .expect("the small-stack thread must spawn");
+        let (forwarded, suppressed) = handle.join().expect("the loop must not overflow the stack");
+        assert_eq!(
+            forwarded, assert_input,
+            "every fence is delivered byte for byte"
+        );
+        assert!(
+            !suppressed,
+            "two thousand clean fences must not flag anything"
+        );
+    }
+
+    /// Control for the fence loop: the same two thousand fences with a
+    /// known-tool call envelope behind the last one. The loop drains
+    /// every fence, the re-scan seeds the envelope as the next
+    /// candidate, and the detector withholds it at its own offset: the
+    /// delivered text is exactly the preamble and the fences, the
+    /// envelope is withheld, and the diagnostic records the byte offset
+    /// of the envelope's first byte in the concatenated input.
+    #[test]
+    fn two_thousand_quoted_result_fences_then_known_tool_envelope_withholds_envelope() {
+        let prose = "The history messages are ";
+        let fence = "```json\n{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}\n```";
+        let envelope = "{\"tool_calls\": [{\"function\": {\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}]}";
+        let mut delivered = format!("{prose}{fence}");
+        for _ in 1..2000 {
+            delivered.push(' ');
+            delivered.push_str(fence);
+        }
+        let expected_offset = delivered.len() + 1;
+        let input = format!("{delivered} {envelope}");
+        // The space before the envelope is prose ahead of the withheld
+        // candidate: the suppression itself releases it, so the
+        // delivered text carries the trailing space.
+        let assert_delivered = input[..expected_offset].to_string();
+        let moved = input;
+        let handle = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let mut guard = guard_with_tool();
+                let forwarded = push_all(&mut guard, &[moved.as_str()]);
+                (forwarded, guard.suppressed_protocol, guard.suppression)
+            })
+            .expect("the small-stack thread must spawn");
+        let (forwarded, suppressed, suppression) =
+            handle.join().expect("the loop must not overflow the stack");
+        assert_eq!(
+            forwarded, assert_delivered,
+            "the preamble and every fence are delivered, the envelope is not"
+        );
+        assert!(
+            suppressed,
+            "the known-tool envelope behind the fences is withheld"
+        );
+        assert_eq!(
+            suppression,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "function_call",
+                candidate_offset: expected_offset,
+            })
         );
     }
 }
