@@ -3717,24 +3717,18 @@ mod tests {
         store
             .create_session("bad-empty", "alpha", "/tmp", None)
             .unwrap();
-        store
-            .append_turn(
-                "bad-empty",
-                &[ConversationMessage::AssistantToolCalls {
-                    text: None,
-                    tool_calls: Vec::new(),
-                    reasoning_content: None,
-                }],
-            )
-            .unwrap();
+        // `append_turn` persists nothing for a zero-entry tool-call batch, so
+        // the empty assistant row a malformed-only group hangs off is written
+        // directly, as an older binary or a damaged DB would leave it.
         let conn = store.conn.lock();
-        let message_id: i64 = conn
-            .query_row(
-                "SELECT id FROM acp_messages WHERE session_id = (SELECT id FROM acp_sessions WHERE session_uuid = 'bad-empty')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES ((SELECT id FROM acp_sessions WHERE session_uuid = 'bad-empty'),
+                     'assistant', '', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let message_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO acp_tool_calls
              (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
