@@ -19,13 +19,123 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
 - `fallback_models`: alternate model IDs on the same provider alias.
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
-- `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
-- `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
+- `wire_api`, `native_tools`, `provider_extra`, `think`, `thinking_passthrough`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
+- `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
 - `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
+- `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default) or `"1h"`. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
+
+## Anthropic thinking passthrough
+
+`thinking_passthrough = true` on an OpenAI-compatible provider entry opts that
+alias into Anthropic **extended-thinking passthrough**: the runtime's thinking
+budget is forwarded to the gateway, gateway thinking responses are normalized
+into replayable signed blocks, and signed blocks are replayed on outbound
+history.
+
+Before reaching for this flag, check whether the gateway also exposes an
+Anthropic Messages endpoint. If it does, point a
+`[providers.models.anthropic.<alias>]` entry at it with `uri`; the native
+provider handles thinking, signed-block replay, and prompt caching without
+translation. `thinking_passthrough` is for gateways that offer only the Chat
+Completions surface.
+
+```toml
+[providers.models.custom.my-gateway]
+uri = "https://your-gateway.example.com"
+model = "claude-group/claude-fable-5"
+api_key = "..."
+wire_api = "chat_completions"
+thinking_passthrough = true
+```
+
+### What it does
+
+- **Request side**: when the runtime supplies native thinking params, request
+  bodies gain an Anthropic-shaped object at the top level:
+  `{"thinking": {"type": "enabled", "budget_tokens": N}}`. An explicit
+  `provider_extra` key always wins over the injected object, so you can pin a
+  custom shape through the escape hatch. Temperature and `max_tokens`
+  normalization follow the object that is actually sent, so an explicit
+  `{type = "off"}` keeps your temperature and limit, and an explicit `enabled`
+  object with its own `budget_tokens` raises `max_tokens` above that budget.
+  When a thinking object is injected,
+  the request's temperature is set to 1.0, as Anthropic requires; explicit
+  temperatures apply only when thinking is off. When a fixed thinking budget
+  is injected, `max_tokens` is likewise raised to `budget_tokens + 1` if the
+  configured limit is not above the budget, as Anthropic requires.
+- **Capture**: gateway thinking responses are normalized into the same
+  newline-delimited signed-JSON format the native Anthropic provider stores in
+  `reasoning_content` (one `{"thinking": ..., "signature": ...}` line per
+  block). Signature-only blocks (empty text, valid signature: the shape
+  TrueFoundry emits) are preserved. With the flag off, gateway
+  `reasoning_content` / `thinking_blocks` responses flow exactly as before,
+  so DeepSeek/GLM/Qwen reasoning behavior is untouched.
+- **Replay**: signed history reconstructs a `thinking_blocks` array on
+  outbound assistant messages and suppresses the string fields. The
+  reconstruction is all-or-nothing; see the limitation below. The
+  `replay_assistant_reasoning = false` override still wins: providers that
+  reject reasoning input receive nothing under any flag combination.
+
+### Requirements and limitations
+
+- **Requires a translating gateway.** The flag is only meaningful for
+  OpenAI-compatible endpoints that translate between OpenAI Chat Completions
+  and the Anthropic Messages API (LiteLLM documents this translation; the
+  shape was verified against a live TrueFoundry gateway). Pointed at a
+  non-translating upstream, the injected `thinking` object is an unknown
+  parameter and the request fails with **HTTP 400**. That is the designed
+  failure mode: loud, at the first request, not silent.
+- **Unsigned thinking voids the replay.** Thinking blocks Anthropic accepts
+  on input must carry a valid signature. History whose reasoning is unsigned
+  (streamed text, or a gateway that strips signatures) sends no reasoning at
+  all rather than fabricating blocks a gateway would reject: any unparseable
+  line or signature-less thinking line voids the whole message's replay (no
+  partial sequences). Structurally invalid `redacted_thinking` blocks (no
+  data payload) are omitted individually while their valid siblings replay.
+  The captured block whitelist is exactly `thinking` (text and/or signature
+  required) and `redacted_thinking` (opaque `data` required, replayed
+  verbatim and signature-less by design); any other block type a gateway
+  emits is skipped on capture and never forwarded on replay. The
+  prompt-guided fallback path replays the same validated blocks, so a second
+  schema fallback does not drop the signed trajectory.
+- **Nested content blocks are not captured.** Only top-level
+  `reasoning_content`, `reasoning`, and `thinking_blocks` fields are read.
+  Anthropic-shaped blocks nested inside a `content` array are not captured;
+  file an issue with a wire sample if your gateway emits them.
+- **Passthrough disables streaming on the leaf.** Capture normalization
+  applies to non-streaming responses, and gateway SSE thinking frames are
+  unverified territory, so the provider reports itself as non-streaming:
+  when it is the serving provider, the whole tool loop runs on the
+  non-streaming wire, where signed capture and replay stay correct. Two
+  boundary cases: a Router that resolves this provider dispatches its
+  non-streaming path and synthesizes the standard stream events, and a
+  reliability domain containing a streaming-capable fallback may serve the
+  turn on that fallback (surfacing the standard fallback notice), so
+  operators who require every turn on the opted-in provider should configure
+  an all-non-streaming domain. Turn-by-turn streaming on the leaf resumes
+  when wire-first streaming support lands.
+- **Thinking shape follows the model.** The injected object matches the
+  native provider's style resolution: fixed-budget models get
+  `{"type": "enabled", "budget_tokens": N}`, adaptive-only models
+  (Opus 4.7, the whole Fable 5 family) get `{"type": "adaptive"}` with no
+  budget key. Gateway model IDs may carry routing prefixes
+  (`claude-group/...`); resolution matches on substrings, so prefixed IDs
+  resolve to the same shape as bare names. When the runtime requests a
+  display mode, the snake_case `display` key rides on both shapes
+  (`omitted`, `updates`, `summarized`); with no display requested the key
+  is omitted entirely.
+- **Escape hatch**: for shapes this feature does not cover, `provider_extra`
+  still merges arbitrary top-level JSON into every request body, including a
+  static `thinking` object, at your own risk, with no response handling.
+
+### See also
+
+- Native extended thinking on the Anthropic provider: #10542.
+- Request-body escape hatch: `provider_extra` above; [reference](../reference/config.md#providers).
 
 ## Field resolution order
 
@@ -108,8 +218,7 @@ output headroom. The fields have separate owners:
   not an input-history limit.
 - `runtime_profiles.astra.max_context_tokens` is ZeroClaw's estimated local
   trimming threshold. It may be smaller than `context_window`.
-- `runtime_profiles.astra.max_tool_iterations` limits the agentic tool loop,
-  while `max_history_messages` separately bounds retained message count.
+- `runtime_profiles.astra.max_tool_iterations` limits the agentic tool loop, while `max_history_messages` separately bounds retained complete user turns, including their tool exchanges. The channel sender cache retains its separate row-based limit.
 - `runtime.reasoning_effort` is the global provider-facing reasoning level.
   ZeroClaw currently accepts `minimal`, `low`, `medium`, `high`, and `xhigh`.
   Astra's public API accepts `low`, `medium`, `high`, `xhigh`, and `max`, so use
@@ -275,11 +384,15 @@ Requirements and caveats:
 - **Size and TTL.** Anthropic caches only prefixes of at least 1024 tokens
   (2048 on some smaller models), and entries expire after roughly five
   minutes, refreshed on each read. Short or infrequent conversations see
-  no benefit.
+  no benefit. The lifetime is configurable per provider with `cache_ttl`;
+  see [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - **Writes bill at a premium.** Tokens written to the cache are billed at
-  a premium (1.25x on the observed route) and reads come back at a large
-  discount. A route that writes the cache on every request without ever
-  reading it costs more than no caching at all.
+  a premium over the input price; the observed route bills the 5-minute
+  default's writes at 1.25x. Writes under the 1h lifetime may bill at a
+  different rate; see [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime)
+  for the planning figure. Reads come back at a large discount. A route
+  that writes the cache on every request without ever reading it costs
+  more than no caching at all.
 - **Qualify the exact route first.** A gateway exposes many model aliases
   to the same upstream account, and an alias that accepts and bills cache
   writes can still never serve cache reads. Before relying on the flag in
@@ -302,6 +415,68 @@ Requirements and caveats:
   rolling message breakpoint. The live gateway qualification showed that
   with a system prompt present, tool-schema tokens sit inside the cached
   prefix anyway.
+
+## Choosing a 1h cache lifetime
+
+`cache_ttl = "1h"` requests a one-hour lifetime for the cache entries this
+provider's markers create instead of the default five minutes. Use it when
+conversations regularly resume more than five minutes after the previous
+request: every resumed turn pays a full-price cache rewrite for a prefix a
+longer lifetime would have kept alive.
+
+The break-even arithmetic, with P the base input price of the prefix: a
+5m cache write costs 1.25P and a 1h write costs 2P, so choosing the 1h
+lifetime costs 0.75P more per cache write (a hit refreshes the entry, so
+the premium is paid on each write, not per hour). Each expiry the longer
+lifetime avoids saves 1.25P minus the 0.1P read, about 1.15P. For a
+140k-token prefix at a $10/M input rate, P is $1.40: about $1.05 of
+extra write premium per 1h write, about $1.61 saved per avoided expiry,
+so the first avoided pause nets roughly $0.56 and every pause after that
+nets the full $1.61. The saving is bounded: it exists for a prefix reused
+after a gap longer than five minutes and shorter than one hour, and a
+gap past the hour pays the 2x write again with no saving. On top of the
+write premium, the 1h lifetime adds a small cost on every appended tail:
+a few thousand tokens times 0.75 times the input rate, two to three
+cents per turn for a few-thousand-token tail at that rate. (The 0.1x
+read rate is the common figure; some models differ, so check Anthropic's
+prompt-caching pricing table for the model in question.) Conversations
+that pause between five minutes and an hour favor `"1h"`; conversations
+that stay active, end quickly, or pause past the hour favor the default.
+
+Plan against Anthropic's nominal 2x cache-write price. A gateway in front
+of the API may bill 1h writes at its own rate. The ledger prices cache
+writes at the configured or live `cache_write_per_mtok` rate when one is
+present, and at the plain input rate when only the catalog fallback
+applies (the catalog carries no write rate). `cache_ttl` does not select
+a write rate: an operator who moves an entry to `"1h"` should set the
+provider's write rate to match what the route actually charges.
+
+Two caveats from live route qualification: survival past five minutes was
+demonstrated twice, at six and forty-nine minutes; a full one-hour
+lifetime was not measured. And one TTL applies to every marker this
+implementation generates: the native Anthropic provider's system, tool,
+and rolling-message markers and the compatible passthrough breakpoints
+all carry the configured lifetime. Operator-supplied `cache_control`
+(through `provider_extra` body fields or raw tool JSON) sits outside
+that guarantee, and any mixed lifetimes in one request must satisfy
+Anthropic's ordering rule (a 1h marker before a 5m one).
+
+```toml
+[providers.models.custom.claude-via-gateway]
+uri = "https://<gateway-host>/v1"
+model = "<anthropic-routed model>"
+api_key = "op://platform/gateway/api-key"
+cache_passthrough = true
+cache_ttl = "1h"
+```
+
+On a native Anthropic entry the same key works without `cache_passthrough`:
+
+```toml
+[providers.models.anthropic.direct]
+model = "claude-sonnet-4-5"
+cache_ttl = "1h"
+```
 
 ## Image input limits
 

@@ -15,10 +15,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::FutureExt;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde_json::json;
 use std::any::Any;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -39,6 +41,7 @@ struct PeerInboxTask {
 /// agent's resolved peer set.
 pub struct SendMessageToPeerTool {
     config: Arc<Config>,
+    live_config: Option<Arc<RwLock<Config>>>,
     sender_alias: String,
     description: String,
     task_control_plane: Option<ControlPlaneHandle>,
@@ -46,10 +49,19 @@ pub struct SendMessageToPeerTool {
 
 impl SendMessageToPeerTool {
     pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Self {
+        Self::new_with_live_config(config, sender_alias, None)
+    }
+
+    pub(crate) fn new_with_live_config(
+        config: Arc<Config>,
+        sender_alias: impl Into<String>,
+        live_config: Option<Arc<RwLock<Config>>>,
+    ) -> Self {
         let sender_alias = sender_alias.into();
         let description = build_description();
         Self {
             config,
+            live_config,
             sender_alias,
             description,
             task_control_plane: None,
@@ -213,22 +225,31 @@ impl Tool for SendMessageToPeerTool {
                 .cloned()
                 .unwrap_or_else(|| target.clone());
 
-            let cfg = (*self.config).clone();
+            let cfg = Arc::clone(&self.config);
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
+            let turn_recipient_alias = recipient_alias.clone();
             let body = message.clone();
+            let live_config = self.live_config.clone();
             let control_plane = self
                 .task_control_plane
                 .clone()
                 .or_else(|| global_control_plane().cloned());
-            let Some(control_plane) = control_plane else {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(crate::i18n::get_required_cli_string(
-                        "peer-delivery-control-plane-unavailable",
-                    )),
-                });
+            let control_plane = match control_plane {
+                Some(handle) => handle,
+                None => match crate::control_plane::non_daemon_control_plane(&cfg.data_dir).await {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(crate::i18n::get_required_cli_string_with_args(
+                                "peer-delivery-control-plane-unavailable",
+                                &[("error", &format!("{error:#}"))],
+                            )),
+                        });
+                    }
+                },
             };
             let task_store = Arc::clone(&control_plane.store);
             let task = match admit_peer_inbox_task(
@@ -278,7 +299,7 @@ impl Tool for SendMessageToPeerTool {
                 "peer-message accepted for in-process delivery"
             );
             // Build the recipient's cost-tracking context from `&cfg` before
-            // `cfg` moves into `process_message` below — a detached
+            // `cfg` moves into the recipient turn below — a detached
             // `zeroclaw_spawn::spawn!` task does not inherit the caller's
             // task-locals, so the recipient's turn would otherwise run with
             // no cost context and its spend would go unrecorded.
@@ -291,19 +312,35 @@ impl Tool for SendMessageToPeerTool {
             let task_owner_boot_id = task.owner_boot_id.clone();
             zeroclaw_spawn::spawn!(async move {
                 // Keep the large turn future out of the nested cost-scope wrappers.
-                let turn = Box::pin(crate::agent::loop_::process_message(
-                    cfg,
-                    &recipient_alias,
-                    &body,
-                    None,
-                    zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                    // Initiator only: the recipient turn executes under its
-                    // own alias; the sender's canonical alias travels as
-                    // provenance, resolved before the detached spawn.
-                    Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                        sender_alias: sender.clone(),
-                    }),
-                ));
+                // The recipient executes under its own alias; the sender's
+                // canonical alias is provenance for the detached turn.
+                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
+                    if let Some(live_config) = live_config {
+                        Box::pin(
+                            crate::agent::loop_::process_message_shared_with_live_config(
+                                cfg,
+                                live_config,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                    sender_alias: sender.clone(),
+                                }),
+                            ),
+                        )
+                    } else {
+                        Box::pin(crate::agent::loop_::process_message_shared(
+                            cfg,
+                            &turn_recipient_alias,
+                            &body,
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                            Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                sender_alias: sender.clone(),
+                            }),
+                        ))
+                    };
                 let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
                 if let Err(error) = settle_peer_inbox_task(
                     task_store.as_ref(),
@@ -402,7 +439,7 @@ where
     F: FnOnce(),
 {
     let registry = registry.ok_or_else(|| {
-        anyhow::anyhow!("in-process peer delivery requires an available daemon control plane")
+        anyhow::anyhow!("in-process peer delivery requires an available durable task store")
     })?;
     let task = PeerInboxTask {
         id: uuid::Uuid::new_v4().to_string(),
@@ -879,7 +916,7 @@ mod tests {
         )
         .await
         .expect_err("missing control plane must reject delivery");
-        assert!(error.to_string().contains("available daemon control plane"));
+        assert!(error.to_string().contains("available durable task store"));
         assert_eq!(dispatches.load(Ordering::SeqCst), 0);
 
         let registry = MockRegistry::rejecting();
