@@ -371,6 +371,10 @@ rpc_type! {
         /// "page N of M" / "load older" affordances.
         #[serde(default)]
         pub start: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub next_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_older: Option<bool>,
     }
 }
 
@@ -381,6 +385,10 @@ rpc_type! {
         pub limit: Option<usize>,
         #[serde(default)]
         pub before_index: Option<usize>,
+        /// Presence of this field opts into bounded ACP cursor pagination.
+        /// `null` requests the newest page; a string continues a walk.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cursor: Option<String>,
     }
 }
 
@@ -445,6 +453,11 @@ rpc_type! {
         pub session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane: `"private"` (the caller's own; the default for every
+        /// authenticated principal) or `"shared"` (honoured only for callers
+        /// with the admin bypass, audited).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -469,6 +482,9 @@ rpc_type! {
         pub until: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -487,6 +503,11 @@ rpc_type! {
     /// `memory/get` params — fetch one entry's full content by key.
     pub struct MemoryGetParams {
         pub key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -510,6 +531,9 @@ rpc_type! {
         pub session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -526,6 +550,9 @@ rpc_type! {
         pub key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -666,6 +693,25 @@ rpc_type! {
 rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
+        pub set: bool,
+    }
+}
+
+rpc_type! {
+    /// An ordered batch of `config/set` entries committed as one unit: every
+    /// entry is staged on a single working copy in order (a later entry for
+    /// the same prop wins), and the result is saved and installed once, or
+    /// not at all. Must contain at least one entry and at most the
+    /// dispatcher's batch cap (256); either bound violated is `INVALID_PARAMS`.
+    pub struct ConfigSetManyParams {
+        pub sets: Vec<ConfigSetParams>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSetManyResult {
+        /// The props written, in request order.
+        pub props: Vec<String>,
         pub set: bool,
     }
 }
@@ -1327,8 +1373,70 @@ rpc_type! {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    /// Parameters shared by every `X/subscribe` method.
+    #[derive(Default)]
+    pub struct SubscribeParams {
+        /// Resume after this sequence number: frames from `since_seq + 1`
+        /// that are still buffered are replayed before live delivery. Omit
+        /// for live frames only.
+        #[serde(default)]
+        pub since_seq: Option<u64>,
+        /// The `epoch` the client's `since_seq` came from (returned by the
+        /// subscribe result). Sequence numbers restart in every hub, so
+        /// `since_seq` resumes only when this matches the current epoch;
+        /// otherwise, or when omitted, every frame still buffered is replayed
+        /// after a `subscription/lagged` with `epoch_changed: true`.
+        #[serde(default)]
+        pub epoch: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Every notification of the subscription carries `subscription_id` and
+    /// its `seq`. `seq` here is the newest sequence number at subscribe time.
     pub struct LogsSubscribeResult {
         pub subscribed: bool,
+        pub subscription_id: String,
+        pub seq: u64,
+        /// The hub's epoch: pass it back with `since_seq` to resume.
+        pub epoch: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelParams {
+        pub subscription_id: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelResult {
+        /// `false` when no subscription with that id is open on this
+        /// connection (already ended, or never existed).
+        pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    /// `subscription/lagged`: frames `from_seq` up to (not including)
+    /// `resume_seq` are gone; delivery continues at `resume_seq`.
+    pub struct SubscriptionLagged {
+        pub subscription_id: String,
+        pub from_seq: u64,
+        pub resume_seq: u64,
+        /// The client's `since_seq` came from another epoch (the daemon
+        /// restarted or reloaded). Nothing it saw can be matched here: this
+        /// epoch's frames from `resume_seq` on are replayed, and those before
+        /// it are gone.
+        #[serde(default)]
+        pub epoch_changed: bool,
+    }
+}
+
+rpc_type! {
+    /// `events/history`: recent observer frames, oldest first.
+    pub struct EventsHistoryResult {
+        pub events: Vec<serde_json::Value>,
     }
 }
 
@@ -1779,6 +1887,18 @@ mod tests {
             let wire = serde_json::to_value(&params).unwrap();
             assert_eq!(wire["keep_siblings"], json!(keep));
         }
+    }
+
+    #[test]
+    fn session_messages_params_omit_absent_cursor() {
+        let params = SessionMessagesParams {
+            session_id: "session".into(),
+            limit: None,
+            before_index: None,
+            cursor: None,
+        };
+        let wire = serde_json::to_value(params).unwrap();
+        assert!(wire.get("cursor").is_none());
     }
 
     #[test]

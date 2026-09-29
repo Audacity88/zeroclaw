@@ -1,5 +1,6 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
+use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::agent::prompt::{
     InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
 };
@@ -11,6 +12,7 @@ use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::schema::Config;
@@ -144,48 +146,63 @@ pub(crate) enum RoutedApproval {
 pub(crate) async fn resolve_routed_approval(
     handles: &tools::PerToolChannelHandle,
     route: &zeroclaw_config::autonomy::ApprovalRoute,
-    recipient: &str,
+    _recipient: &str,
     request: &zeroclaw_api::channel::ChannelApprovalRequest,
 ) -> RoutedApproval {
-    let approver: Option<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = handles
-        .read()
-        .iter()
-        .find(|(name, _)| name.as_str() == route.approver_channel)
-        .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
+    let approver_recipient = route
+        .approver_recipient
+        .as_deref()
+        .map(str::trim)
+        .filter(|recipient| !recipient.is_empty());
+    let approver: Option<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = approver_recipient
+        .and_then(|_| {
+            handles
+                .read()
+                .iter()
+                .find(|(name, _)| name.as_str() == route.approver_channel)
+                .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
+        });
 
     // `source` is tracked alongside `reason` so the fail-closed deny below can
     // say WHY no operator decided, rather than leaving the caller to guess from
     // a missing decider.
     let (reason, source): (&str, zeroclaw_api::channel::ApprovalSource) =
         if let Some((channel_name, channel)) = approver {
+            let approver_recipient = approver_recipient.unwrap_or_default();
             let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
             // Attributed, not legacy: if the approver channel synthesizes its own
             // `Some(Deny)` (its inner timeout firing before this outer one), that
             // is a runtime denial and must not be relabelled as the approver's
             // decision just because a response came back.
-            match tokio::time::timeout(dur, channel.request_approval_attributed(recipient, request))
+            match channel
+                .request_approval_attributed_with_timeout(approver_recipient, request, dur)
                 .await
             {
-                Ok(Ok(Some(attributed))) => {
+                Ok(Some(attributed)) if attributed.source.is_runtime_fail_closed() => (
+                    "approver returned a runtime fail-closed response",
+                    attributed.source,
+                ),
+                Ok(Some(attributed)) => {
                     return RoutedApproval::Decided {
                         response: attributed.response,
                         decider: Some(channel_name),
                         source: attributed.source,
                     };
                 }
-                Ok(Ok(None)) => (
+                Ok(None) => (
                     "approver returned no decision",
                     zeroclaw_api::channel::ApprovalSource::Unreachable,
                 ),
-                Ok(Err(_)) => (
+                Err(_) => (
                     "approver channel unreachable",
                     zeroclaw_api::channel::ApprovalSource::Unreachable,
                 ),
-                Err(_) => (
-                    "approver timed out",
-                    zeroclaw_api::channel::ApprovalSource::TimedOut,
-                ),
             }
+        } else if approver_recipient.is_none() {
+            (
+                "approver recipient not configured",
+                zeroclaw_api::channel::ApprovalSource::Unavailable,
+            )
         } else {
             (
                 "approver channel not registered",
@@ -237,6 +254,7 @@ pub(crate) async fn resolve_routed_approval(
 pub(crate) struct RoutedApprovalChannel {
     handles: tools::PerToolChannelHandle,
     route: zeroclaw_config::autonomy::ApprovalRoute,
+    origin: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
 }
 
 impl RoutedApprovalChannel {
@@ -244,7 +262,39 @@ impl RoutedApprovalChannel {
         handles: tools::PerToolChannelHandle,
         route: zeroclaw_config::autonomy::ApprovalRoute,
     ) -> Self {
-        Self { handles, route }
+        Self {
+            handles,
+            route,
+            origin: None,
+        }
+    }
+
+    fn with_origin(
+        handles: tools::PerToolChannelHandle,
+        route: zeroclaw_config::autonomy::ApprovalRoute,
+        origin: Arc<dyn zeroclaw_api::channel::Channel>,
+    ) -> Self {
+        Self {
+            handles,
+            route,
+            origin: Some(origin),
+        }
+    }
+}
+
+/// Build the route-aware approval channel used by channel-driven turns.
+///
+/// The returned trait object asks the configured approver first. Only an
+/// explicit `inherit-originator` route policy delegates to `origin`; missing
+/// or unavailable approvers under the default policy remain runtime denials.
+pub fn routed_approval_channel(
+    handles: tools::PerToolChannelHandle,
+    route: zeroclaw_config::autonomy::ApprovalRoute,
+    origin: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
+) -> Arc<dyn zeroclaw_api::channel::Channel> {
+    match origin {
+        Some(origin) => Arc::new(RoutedApprovalChannel::with_origin(handles, route, origin)),
+        None => Arc::new(RoutedApprovalChannel::new(handles, route)),
     }
 }
 
@@ -308,10 +358,58 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
                 zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(response, source)
                     .with_decider_opt(decider),
             )),
-            // No originating channel to inherit on this path; let the gate apply
-            // the non-interactive default (auto-deny).
-            RoutedApproval::Fallthrough => Ok(None),
+            RoutedApproval::Fallthrough => match self.origin.as_ref() {
+                Some(origin) => match origin
+                    .request_approval_attributed(recipient, request)
+                    .await?
+                {
+                    Some(response) => Ok(Some(response)),
+                    None => Ok(Some(
+                        zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                            zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                            zeroclaw_api::channel::ApprovalSource::Unavailable,
+                        ),
+                    )),
+                },
+                // An explicit inherit-originator route with no usable origin
+                // is still a routed approval failure, not a direct channel's
+                // declaration that it lacks approval support.
+                None => Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unavailable,
+                    ),
+                )),
+            },
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestTurnEntryPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TestTurnEntryPause {
+    pub(crate) fn new() -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            entered,
+            release,
+        )
+    }
+
+    async fn wait(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
     }
 }
 
@@ -321,6 +419,7 @@ struct HistoryTrimNotice {
     dropped_turns: usize,
     kept_turns: usize,
     reason: String,
+    retained_context: zeroclaw_api::agent::RetainedContextSnapshot,
 }
 
 impl HistoryTrimNotice {
@@ -337,6 +436,7 @@ impl HistoryTrimNotice {
             tokens_before_source: None,
             tokens_after_source: None,
             unsatisfiable_floor: None,
+            retained_context: Some(self.retained_context),
         }
     }
 }
@@ -352,11 +452,19 @@ async fn forward_history_trim_notice(
 
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
+    /// Shared with the shell tool and RPC session admission; this is the
+    /// immutable execution environment, not a cached authorization decision.
+    forwarded_environment: Option<crate::tools::ForwardedEnvironment>,
     /// Sealed per-agent tool set. Stored as a [`crate::tools::scoped::ScopedToolRegistry`]
     /// so it can only be handed to the turn engine after passing through
     /// `assemble()` (the seal).
     tools: crate::tools::scoped::ScopedToolRegistry,
     memory: Arc<dyn Memory>,
+    /// The security policy the memory-backed tools were assembled with. Kept so
+    /// that [`Agent::route_memory_to_principal`] can rebuild those tools over a
+    /// principal-scoped handle without re-deriving policy: session memory must
+    /// follow its owner across the tools too, not only the `memory` field.
+    memory_security: Arc<SecurityPolicy>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
@@ -401,6 +509,12 @@ pub struct Agent {
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
+    /// The agent's filesystem policy, stored so turns can apply the same
+    /// read ledger the file tools apply (the no-vision image-marker gate).
+    /// Always set by config-backed construction; configless test builders
+    /// get `SecurityPolicy::default()` (whose `workspace_dir` is `.`), which
+    /// fails that gate closed to a degrade.
+    security: Arc<crate::security::SecurityPolicy>,
     /// Compatibility fallback for configless builders. When an
     /// `ApprovalManager` exists, its autonomy level remains canonical.
     autonomy_level: crate::security::AutonomyLevel,
@@ -424,6 +538,10 @@ pub struct Agent {
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     tool_search: Option<Arc<crate::tools::ToolSearchTool>>,
+    /// The principal whose private memory plane `memory` is pinned to, set by
+    /// `route_memory_to_principal` at session construction. `None` = the
+    /// shared/legacy handle (the shared operator's sessions).
+    memory_principal: Option<String>,
     /// MCP pinned resources, read once at construction from each server's
     /// `pinned_resources` and provenance-wrapped (`trust="untrusted-external"`).
     /// Kept as attributed blocks rather than pre-rendered text so a later
@@ -457,6 +575,8 @@ pub struct Agent {
     channel_name: String,
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    turn_entry_pause: Option<TestTurnEntryPause>,
     /// The `DelegateTool` this Agent's registry registered, in its concrete
     /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
     /// otherwise cannot drive the *constructed* delegate's nested-registry
@@ -527,6 +647,9 @@ pub type ConfigGeneration =
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    /// Live shared config used by tools whose security policy must reflect the
+    /// next dispatch even when model/provider state remains generation-pinned.
+    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     /// Live shared config this snapshot is refreshed from when the caller owns
     /// an acknowledged model-generation refresh transaction. `None` for
     /// one-shot/test agents and direct ACP/WS agents pinned until reconnect.
@@ -591,6 +714,7 @@ pub struct AgentBuilder {
     model_provider: Option<Box<dyn ModelProvider>>,
     tools: Option<crate::tools::scoped::ScopedToolRegistry>,
     memory: Option<Arc<dyn Memory>>,
+    memory_security: Option<Arc<SecurityPolicy>>,
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
@@ -615,6 +739,7 @@ pub struct AgentBuilder {
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
+    security: Option<Arc<crate::security::SecurityPolicy>>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
     shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
@@ -630,6 +755,8 @@ pub struct AgentBuilder {
     config_generation: Option<ConfigGeneration>,
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    turn_entry_pause: Option<TestTurnEntryPause>,
     #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
@@ -652,6 +779,7 @@ impl AgentBuilder {
             model_provider: None,
             tools: None,
             memory: None,
+            memory_security: None,
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
@@ -676,6 +804,7 @@ impl AgentBuilder {
             allowed_tools: None,
             response_cache: None,
             security_summary: None,
+            security: None,
             autonomy_level: None,
             shell_profile: None,
             approval_route: None,
@@ -691,6 +820,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
+            #[cfg(test)]
+            turn_entry_pause: None,
             #[cfg(test)]
             delegate_tool: None,
         }
@@ -716,6 +847,15 @@ impl AgentBuilder {
 
     pub fn memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// The security policy the memory tools were assembled with, retained so a
+    /// later `route_memory_to_principal` can rebind those tools to the routed
+    /// handle. Defaults to a permissive policy if unset (test builders); the
+    /// production constructor always supplies the agent's real policy.
+    pub fn memory_security(mut self, security: Arc<SecurityPolicy>) -> Self {
+        self.memory_security = Some(security);
         self
     }
 
@@ -764,7 +904,7 @@ impl AgentBuilder {
     }
 
     #[cfg(test)]
-    fn structured_max_history_turns(self, max: usize) -> Self {
+    pub(crate) fn structured_max_history_turns(self, max: usize) -> Self {
         self.structured_history_turn_limit_resolver(Arc::new(move || max))
     }
 
@@ -868,6 +1008,16 @@ impl AgentBuilder {
 
     pub fn security_summary(mut self, summary: Option<String>) -> Self {
         self.security_summary = summary;
+        self
+    }
+
+    /// Set the agent's filesystem policy. Config-backed construction passes
+    /// the same `Arc<SecurityPolicy>` the agent's file tools were built
+    /// with, so the no-vision image-marker gate applies the identical read
+    /// ledger. Unset builders get `SecurityPolicy::default()`, whose
+    /// `workspace_dir` is `.` (the process cwd).
+    pub fn security(mut self, security: Arc<crate::security::SecurityPolicy>) -> Self {
+        self.security = Some(security);
         self
     }
 
@@ -990,6 +1140,12 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_turn_entry_pause(mut self, pause: TestTurnEntryPause) -> Self {
+        self.turn_entry_pause = Some(pause);
+        self
+    }
+
     pub fn exclude_memory(mut self, exclude: bool) -> Self {
         self.exclude_memory = exclude;
         self
@@ -1072,7 +1228,11 @@ impl AgentBuilder {
                 anyhow::Error::msg("model_provider is required")
             })?,
             tools,
+            forwarded_environment: None,
             memory: memory.clone(),
+            memory_security: self
+                .memory_security
+                .unwrap_or_else(|| Arc::new(SecurityPolicy::default())),
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -1136,6 +1296,12 @@ impl AgentBuilder {
             model_route_resolver,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
+            // Configless (test) builders have no policy to store; the default
+            // (workspace_dir ".") is only a placeholder so the field is never
+            // absent, and the no-vision marker gate fails closed under it.
+            security: self
+                .security
+                .unwrap_or_else(|| Arc::new(crate::security::SecurityPolicy::default())),
             approval_route: self.approval_route,
             autonomy_level: self
                 .autonomy_level
@@ -1147,6 +1313,7 @@ impl AgentBuilder {
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             tool_search: None,
+            memory_principal: None,
             mcp_pinned: self.mcp_pinned,
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
@@ -1159,6 +1326,8 @@ impl AgentBuilder {
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
+            #[cfg(test)]
+            turn_entry_pause: self.turn_entry_pause,
             #[cfg(test)]
             delegate_tool: self.delegate_tool,
         })
@@ -1270,6 +1439,38 @@ impl Agent {
         &self.history
     }
 
+    /// Return the owner-maintained structured history for native persistence.
+    /// The Agent history is already replayed from the provider buffer with
+    /// positional memory provenance applied; callers must not reconstruct it
+    /// from flat wire messages or infer tool pairs from text.
+    pub(crate) fn retained_context_snapshot(&self) -> zeroclaw_api::agent::RetainedContextSnapshot {
+        zeroclaw_api::agent::RetainedContextSnapshot {
+            retained_messages: self
+                .history
+                .iter()
+                .filter(|message| {
+                    !matches!(
+                        message,
+                        ConversationMessage::Chat(chat) if chat.role == "system"
+                    )
+                })
+                .map(|message| match message {
+                    ConversationMessage::AssistantToolCalls {
+                        text,
+                        tool_calls,
+                        reasoning_content: _,
+                    } => ConversationMessage::AssistantToolCalls {
+                        text: text.clone(),
+                        tool_calls: tool_calls.clone(),
+                        reasoning_content: None,
+                    },
+                    other => other.clone(),
+                })
+                .collect(),
+            breadcrumb: self.history_has_trim_breadcrumb,
+        }
+    }
+
     /// Remove the trailing assistant interruption marker
     /// (`turn-interrupted-by-user`) the tool loop appends to live history when a
     /// turn is cancelled, returning whether one was removed. When cancellation
@@ -1283,19 +1484,23 @@ impl Agent {
     /// string stays owned by the runtime here rather than being re-derived and
     /// content-matched at the call site.
     pub fn strip_trailing_interruption_marker(&mut self) -> bool {
+        Self::strip_interruption_marker_from(&mut self.history)
+    }
+
+    pub(crate) fn strip_interruption_marker_from(history: &mut Vec<ConversationMessage>) -> bool {
         let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
         let is_marker = matches!(
-            self.history.last(),
+            history.last(),
             Some(ConversationMessage::Chat(message))
                 if message.role == "assistant" && message.content == marker
         );
         if is_marker {
-            self.history.pop();
+            history.pop();
             return true;
         }
 
         let folded_suffix = format!("\n\n{marker}");
-        let Some(ConversationMessage::Chat(message)) = self.history.last_mut() else {
+        let Some(ConversationMessage::Chat(message)) = history.last_mut() else {
             return false;
         };
         if message.role != "assistant" || !message.content.ends_with(&folded_suffix) {
@@ -1332,6 +1537,76 @@ impl Agent {
             return 0;
         };
         crate::agent::turn::media_degrade::degrade_media_in_messages(&mut self.history[start..])
+    }
+
+    /// Replace one completed turn only after confirming that the live history
+    /// still ends with the exact messages the turn committed. A mismatch is a
+    /// fail-closed signal: callers must discard this Agent rather than mixing
+    /// generations in its provider history.
+    pub fn replace_history_suffix(
+        &mut self,
+        expected_suffix: &[ConversationMessage],
+        replacement: Vec<ConversationMessage>,
+    ) -> bool {
+        if expected_suffix.is_empty() || self.history.len() < expected_suffix.len() {
+            return false;
+        }
+        let start = self.history.len() - expected_suffix.len();
+        if !self.history[start..]
+            .iter()
+            .zip(expected_suffix)
+            .all(|(live, expected)| Self::conversation_messages_equal(live, expected))
+        {
+            return false;
+        }
+        self.history.truncate(start);
+        self.history.extend(replacement);
+        true
+    }
+
+    fn conversation_messages_equal(
+        left: &ConversationMessage,
+        right: &ConversationMessage,
+    ) -> bool {
+        match (left, right) {
+            (ConversationMessage::Chat(left), ConversationMessage::Chat(right)) => {
+                left.role == right.role && left.content == right.content
+            }
+            (
+                ConversationMessage::AssistantToolCalls {
+                    text: left_text,
+                    tool_calls: left_calls,
+                    reasoning_content: left_reasoning,
+                },
+                ConversationMessage::AssistantToolCalls {
+                    text: right_text,
+                    tool_calls: right_calls,
+                    reasoning_content: right_reasoning,
+                },
+            ) => {
+                left_text == right_text
+                    && left_reasoning == right_reasoning
+                    && left_calls.len() == right_calls.len()
+                    && left_calls.iter().zip(right_calls).all(|(left, right)| {
+                        left.id == right.id
+                            && left.name == right.name
+                            && left.arguments == right.arguments
+                            && left.extra_content == right.extra_content
+                    })
+            }
+            (
+                ConversationMessage::ToolResults(left_results),
+                ConversationMessage::ToolResults(right_results),
+            ) => {
+                left_results.len() == right_results.len()
+                    && left_results.iter().zip(right_results).all(|(left, right)| {
+                        left.tool_call_id == right.tool_call_id
+                            && left.content == right.content
+                            && left.tool_name == right.tool_name
+                    })
+            }
+            _ => false,
+        }
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {
@@ -1646,6 +1921,7 @@ impl Agent {
             None => {
                 self.provider_switch_config = Some(ProviderSwitchConfig {
                     config: Some(config_generation),
+                    live_config: None,
                     live: None,
                 });
             }
@@ -1678,6 +1954,51 @@ impl Agent {
         if let Ok(sys) = self.build_system_prompt() {
             self.history[0] = ConversationMessage::Chat(ChatMessage::system(sys));
         }
+    }
+
+    /// Pin this session's memory to its OWNER's private plane (RFC 7141).
+    ///
+    /// Called once at session construction with the session owner's scope,
+    /// never with a later caller's: an administrator prompting another
+    /// principal's session must not re-route that session's memory. Every
+    /// memory operation the session's tools and loop issue afterwards goes to
+    /// the backend's principal-scoped forms; a backend without private support
+    /// fails them closed. The shared operator (no owner) keeps the legacy
+    /// shared handle. Idempotent: a second call with the same owner is a no-op,
+    /// and a call with a different owner is refused.
+    pub fn route_memory_to_principal(
+        &mut self,
+        scope: zeroclaw_api::memory_traits::PrincipalScope,
+    ) -> anyhow::Result<()> {
+        if let Some(current) = &self.memory_principal {
+            if *current == scope.principal_id {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "session memory is already pinned to principal {current:?}; refusing to re-route it"
+            );
+        }
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&self.memory),
+            scope.clone(),
+        ));
+        self.memory = Arc::clone(&routed);
+        // The memory-backed tools each captured a clone of the shared handle at
+        // assembly. Swapping only `self.memory` would leave those tools writing
+        // and reading the shared plane while the agent reports its memory as
+        // private — so rebind them to the routed handle here, before any prompt
+        // exercises them. This never adds a tool name: memory tools already
+        // withdrawn by policy narrowing stay withdrawn.
+        self.tools
+            .rebind_memory_tools(routed, Arc::clone(&self.memory_security));
+        self.memory_principal = Some(scope.principal_id);
+        Ok(())
+    }
+
+    /// The principal whose private plane this session's memory is pinned to,
+    /// if any.
+    pub fn memory_principal(&self) -> Option<&str> {
+        self.memory_principal.as_deref()
     }
 
     /// Apply a current principal tool ceiling to an existing session. This is
@@ -2216,8 +2537,13 @@ impl Agent {
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
-        let runtime: Arc<dyn platform::RuntimeAdapter> =
-            Arc::from(platform::create_runtime(&config.runtime)?);
+        let tui_path = tui_env
+            .as_ref()
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let runtime: Arc<dyn platform::RuntimeAdapter> = Arc::from(
+            platform::create_runtime_with_path(&config.runtime, tui_path)?,
+        );
         // Per-agent workspace becomes the SecurityPolicy boundary
         // (file_read/write/edit + shell tool jail to the agent's own
         // dir). The session-cwd override still wins so ACP sessions
@@ -2318,6 +2644,7 @@ impl Agent {
 
         let acp_sessions =
             acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
+        let tui_env = tui_env.map(Arc::new);
         let all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
             Arc::new(config.clone()),
             &security,
@@ -2336,7 +2663,7 @@ impl Agent {
             config,
             canvas_store,
             false,
-            tui_env,
+            tui_env.clone(),
             sop_engine,
             sop_audit,
             // Daemon-backed constructors supply the shared handle; tools that
@@ -2509,7 +2836,7 @@ impl Agent {
             };
 
         let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
+            if let Some(cap_config) = live_config.clone() {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
                     cap_config
@@ -2529,6 +2856,7 @@ impl Agent {
             .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
+            .memory_security(Arc::clone(&security))
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
@@ -2566,6 +2894,7 @@ impl Agent {
             .skills_prompt_mode(config.effective_skills_prompt_mode(agent_alias))
             .auto_save(config.memory.auto_save)
             .exclude_memory(exclude_memory)
+            .security(Arc::clone(&security))
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
             .approval_route(risk_profile.approval_route.clone())
@@ -2587,6 +2916,7 @@ impl Agent {
                         .as_ref()
                         .map_or_else(|| Arc::new(config.clone()), |cell| Arc::clone(&cell.read())),
                 ),
+                live_config: live_config.clone(),
                 live: live_config_for_generation,
             });
         if let Some(generation) = config_generation {
@@ -2594,6 +2924,7 @@ impl Agent {
         }
         let mut agent = builder.build()?;
 
+        agent.forwarded_environment = tui_env;
         agent.tool_search = tool_search_handle;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
@@ -2607,6 +2938,10 @@ impl Agent {
         };
 
         Ok(agent)
+    }
+
+    pub(crate) fn forwarded_environment(&self) -> Option<crate::tools::ForwardedEnvironment> {
+        self.forwarded_environment.clone()
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
@@ -2686,6 +3021,7 @@ impl Agent {
             dropped_turns: result.dropped_turns,
             kept_turns: result.kept_turns,
             reason,
+            retained_context: self.retained_context_snapshot(),
         })
     }
 
@@ -3066,6 +3402,7 @@ impl Agent {
                 .map(|_| target.index)
         });
         let mut replayed: Vec<ConversationMessage> = Vec::with_capacity(loop_messages.len());
+        let mut tool_names = std::collections::HashMap::<String, String>::new();
         let push_tool_results = |replayed: &mut Vec<ConversationMessage>,
                                  results: Vec<ToolResultMessage>| {
             if let Some(ConversationMessage::ToolResults(previous)) = replayed.last_mut() {
@@ -3085,7 +3422,7 @@ impl Agent {
                         && c.get("name").is_some_and(serde_json::Value::is_string)
                 })
             {
-                let tool_calls = calls
+                let tool_calls: Vec<_> = calls
                     .iter()
                     .map(|c| zeroclaw_providers::ToolCall {
                         id: c
@@ -3103,9 +3440,12 @@ impl Agent {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        extra_content: None,
+                        extra_content: c.get("extra_content").filter(|v| !v.is_null()).cloned(),
                     })
                     .collect();
+                for call in &tool_calls {
+                    tool_names.insert(call.id.clone(), call.name.clone());
+                }
                 replayed.push(ConversationMessage::AssistantToolCalls {
                     text: obj
                         .get("content")
@@ -3131,10 +3471,10 @@ impl Agent {
                                     .and_then(|c| c.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
-                                // Provider-wire tool messages do not carry the
-                                // producing tool name; replayed results fall back
-                                // to blind canonicalization
-                                tool_name: String::new(),
+                                tool_name: tool_names
+                                    .get(v.get("tool_call_id")?.as_str()?)
+                                    .cloned()
+                                    .unwrap_or_default(),
                             })
                         })
                         .collect();
@@ -3155,9 +3495,12 @@ impl Agent {
                             .and_then(|c| c.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        // No provenance on the provider-wire shape; blind canon
-                        // applies as before
-                        tool_name: String::new(),
+                        tool_name: v
+                            .get("tool_call_id")
+                            .and_then(|id| id.as_str())
+                            .and_then(|id| tool_names.get(id))
+                            .cloned()
+                            .unwrap_or_default(),
                     };
                     push_tool_results(&mut replayed, vec![result]);
                     continue;
@@ -3180,6 +3523,23 @@ impl Agent {
             }
         }
         replayed
+    }
+
+    pub(crate) fn replay_loop_messages_for_retention(
+        loop_messages: &[ChatMessage],
+    ) -> Vec<ConversationMessage> {
+        Self::replay_loop_messages(loop_messages, None)
+    }
+
+    pub(crate) fn replay_loop_messages_with_memory(
+        loop_messages: &[ChatMessage],
+        preamble: &str,
+        index: usize,
+    ) -> Vec<ConversationMessage> {
+        Self::replay_loop_messages(
+            loop_messages,
+            Some(MemoryPreambleTarget { preamble, index }),
+        )
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
@@ -3270,7 +3630,10 @@ impl Agent {
                     &selected_route.provider_name,
                     &selected_route.model,
                     &effective_model,
-                ) {
+                    Some(self.security.as_ref()),
+                )
+                .await
+                {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         let _ = self.trim_history(Some(&turn_id));
@@ -3331,7 +3694,7 @@ impl Agent {
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
-        let mut loop_injected_memory_preamble: Option<String> = None;
+        let mut loop_injected_memory_preamble: Option<super::turn::MemoryPreamble> = None;
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -3355,6 +3718,8 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
+        let execution_tree_budget =
+            ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
         let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
             Some(cost_context.clone()),
             crate::agent::tool_receipts::scope_receipts(
@@ -3387,6 +3752,7 @@ impl Agent {
                                 receipt_generator: receipt_scope
                                     .as_ref()
                                     .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                security: Some(self.security.as_ref()),
                             },
                             crate::agent::loop_::ResolvedRuntimeKnobs {
                                 max_tool_iterations: self.config.resolved.max_tool_iterations,
@@ -3408,7 +3774,7 @@ impl Agent {
                         channel_reply_target: None,
                         cancellation_token: None,
                         on_delta: None,
-                        shared_budget: None,
+                        shared_budget: execution_tree_budget.clone(),
                         channel: None,
                         collected_receipts: receipt_scope
                             .as_ref()
@@ -3435,15 +3801,18 @@ impl Agent {
                         // route snapshot.
                         served_route_sink: None,
                         // Live-daemon SOP path: re-assemble a nested step's agent
-                        // when it delegates elsewhere. Config survives only via
-                        // `provider_switch_config`; with `None` (test builder) a
-                        // cross-agent step FAILS CLOSED rather than inheriting
-                        // this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        // when it delegates elsewhere. Snapshot config and the
+                        // optional live policy handle survive via
+                        // `provider_switch_config`; test builders without that
+                        // context fail closed instead of inheriting this turn.
+                        sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                            c.config.as_deref().map(|config| {
+                                crate::agent::turn::SopStepReassembly {
+                                    config,
+                                    live_config: c.live_config.clone(),
+                                }
+                            })
+                        }),
                     },
                 )),
             ),
@@ -3520,10 +3889,10 @@ impl Agent {
             // message before stripping it.
             let injected =
                 loop_injected_memory_preamble
-                    .as_deref()
-                    .map(|preamble| MemoryPreambleTarget {
-                        preamble,
-                        index: new_prefix_len,
+                    .as_ref()
+                    .map(|target| MemoryPreambleTarget {
+                        preamble: &target.preamble,
+                        index: target.index,
                     });
             self.history.clear();
             self.history
@@ -3673,6 +4042,11 @@ impl Agent {
             });
         }
 
+        #[cfg(test)]
+        if let Some(pause) = self.turn_entry_pause.clone() {
+            pause.wait().await;
+        }
+
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
             let system_prompt = self
@@ -3730,7 +4104,10 @@ impl Agent {
                     &selected_route.provider_name,
                     &selected_route.model,
                     &effective_model,
-                ) {
+                    Some(self.security.as_ref()),
+                )
+                .await
+                {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         let notice = self.trim_history(Some(&turn_id));
@@ -3818,7 +4195,7 @@ impl Agent {
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
-        let mut loop_injected_memory_preamble: Option<String> = None;
+        let mut loop_injected_memory_preamble: Option<super::turn::MemoryPreamble> = None;
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         // Track total canonical ChatMessage length so prefix detection is not
         // confused by `sync_pending` which always grows `loop_history` via the
@@ -3855,6 +4232,8 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let execution_tree_budget =
+            ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         // Sink the loop writes the final serving route into each round, so the
@@ -3876,7 +4255,12 @@ impl Agent {
                 new_msgs.push(interruption.clone());
                 self.history.push(interruption);
                 committed_response.push_str(&marker);
-                let notice = self.trim_history(Some(&turn_id));
+                let mut notice = self.trim_history(Some(&turn_id));
+                if let Some(notice) = notice.as_mut() {
+                    Self::strip_interruption_marker_from(
+                        &mut notice.retained_context.retained_messages,
+                    );
+                }
                 forward_history_trim_notice(&event_tx, notice).await;
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -3958,6 +4342,7 @@ impl Agent {
                                     receipt_generator: receipt_scope
                                         .as_ref()
                                         .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                    security: Some(self.security.as_ref()),
                                 },
                                 crate::agent::loop_::ResolvedRuntimeKnobs {
                                     max_tool_iterations: self.config.resolved.max_tool_iterations,
@@ -3990,7 +4375,7 @@ impl Agent {
                             channel_reply_target: None,
                             cancellation_token: cancel_token.clone(),
                             on_delta: None,
-                            shared_budget: None,
+                            shared_budget: execution_tree_budget.clone(),
                             channel: approval_bridge.as_deref(),
                             collected_receipts: receipt_scope
                                 .as_ref()
@@ -4014,15 +4399,18 @@ impl Agent {
                             turn_id: &turn_id,
                             served_route_sink: Some(served_route_sink.clone()),
                             // Live-daemon SOP path: re-assemble a nested step's
-                            // agent when it delegates elsewhere. Config survives
-                            // only via `provider_switch_config`; with `None`
-                            // (test builder) a cross-agent step FAILS CLOSED
-                            // rather than inheriting this turn's context.
-                            sop_reassembly: self
-                                .provider_switch_config
-                                .as_ref()
-                                .and_then(|c| c.config.as_deref())
-                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            // agent when it delegates elsewhere. Snapshot config
+                            // and the optional live policy handle survive via
+                            // `provider_switch_config`; test builders without
+                            // that context fail closed instead of inheriting it.
+                            sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                                c.config.as_deref().map(|config| {
+                                    crate::agent::turn::SopStepReassembly {
+                                        config,
+                                        live_config: c.live_config.clone(),
+                                    }
+                                })
+                            }),
                         },
                     )),
                 ),
@@ -4116,10 +4504,10 @@ impl Agent {
                 // when retained, opens the canonical tail at `new_prefix_len`.
                 let injected =
                     loop_injected_memory_preamble
-                        .as_deref()
-                        .map(|preamble| MemoryPreambleTarget {
-                            preamble,
-                            index: new_prefix_len,
+                        .as_ref()
+                        .map(|target| MemoryPreambleTarget {
+                            preamble: &target.preamble,
+                            index: target.index,
                         });
                 self.history.clear();
                 self.history
@@ -4139,9 +4527,16 @@ impl Agent {
                     let notice = self.trim_history(Some(&turn_id));
                     forward_history_trim_notice(&event_tx, notice).await;
 
+                    // Spending the root's reserved final slot is terminal for
+                    // the whole turn. Steering that arrives during that
+                    // tools-free completion cannot start another round on the
+                    // already exhausted tree budget.
+                    let tree_budget_finalized = execution_tree_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.remaining() == 0);
                     let has_more_steering =
                         steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
-                    if has_more_steering {
+                    if has_more_steering && !tree_budget_finalized {
                         continue;
                     }
 
@@ -4287,7 +4682,14 @@ impl Agent {
                         }
                         error
                     };
-                    let notice = self.trim_history(Some(&turn_id));
+                    let mut notice = self.trim_history(Some(&turn_id));
+                    if crate::agent::loop_::is_tool_loop_cancelled(&error)
+                        && let Some(notice) = notice.as_mut()
+                    {
+                        Self::strip_interruption_marker_from(
+                            &mut notice.retained_context.retained_messages,
+                        );
+                    }
                     forward_history_trim_notice(&event_tx, notice).await;
                     return Err(StreamedTurnError {
                         error,
@@ -4984,6 +5386,108 @@ mod tests {
         let mut agent = blank_input_agent(model_provider);
         let err = agent.turn("").await.expect_err("blank turn must fail");
         assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    /// Regression for the memory-handle binding order: `route_memory_to_principal`
+    /// must rebind the actual memory TOOLS to the owner's private plane, not only
+    /// the `Agent.memory` field. Exercises the real `memory_store`/`memory_recall`
+    /// tools against owner / other-owner / shared sentinels — asserting tool
+    /// BEHAVIOUR, not merely the `memory_principal()` marker.
+    #[tokio::test]
+    async fn routing_rebinds_the_memory_tools_to_the_owners_private_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_tools::memory_recall::MemoryRecallTool;
+        use zeroclaw_tools::memory_store::MemoryStoreTool;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+
+        // Seed a sentinel on the SHARED plane and one on ANOTHER owner's plane.
+        shared
+            .store("s", "shared-secret", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let mallory = PrincipalScope::new("user:mallory");
+        shared
+            .store_for_principal(&mallory, "m", "mallory-secret", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let raw_tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(MemoryStoreTool::new(
+                Arc::clone(&shared),
+                Arc::clone(&security),
+            )),
+            Box::new(MemoryRecallTool::new(Arc::clone(&shared))),
+        ];
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                raw_tools,
+            ))
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+
+        // Pin the session to alice's private plane; this must rebind the tools.
+        agent
+            .route_memory_to_principal(PrincipalScope::new("user:alice"))
+            .unwrap();
+
+        // The store tool must write to ALICE's private plane, not the shared one.
+        let store = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == "memory_store")
+            .expect("memory_store present");
+        store
+            .execute(serde_json::json!({"key": "note", "content": "alice-note"}))
+            .await
+            .unwrap();
+
+        // Shared plane is untouched by the owned session's store.
+        assert!(
+            shared.get("note").await.unwrap().is_none(),
+            "an owned session's memory_store must not land on the shared plane"
+        );
+        // It DID land on alice's private plane.
+        let on_alice = shared
+            .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+            .await
+            .unwrap()
+            .expect("alice's private plane holds the note");
+        assert_eq!(on_alice.content, "alice-note");
+
+        // The recall tool must read ONLY alice's plane: neither the shared
+        // sentinel nor mallory's sentinel is reachable through the tool.
+        let recall = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == "memory_recall")
+            .expect("memory_recall present");
+        let result = recall
+            .execute(serde_json::json!({"query": "secret"}))
+            .await
+            .unwrap();
+        let text = format!("{result:?}");
+        assert!(
+            !text.contains("shared-secret"),
+            "recall leaked the shared plane: {text}"
+        );
+        assert!(
+            !text.contains("mallory-secret"),
+            "recall leaked another owner's plane: {text}"
+        );
     }
 
     #[tokio::test]
@@ -6715,6 +7219,59 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "StreamingSteeringModelProvider"
+        }
+    }
+
+    struct GatedFinalCompletionProvider {
+        calls: Arc<AtomicUsize>,
+        started: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedFinalCompletionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("root-final".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started
+                .send(())
+                .await
+                .expect("final-completion test should still be observing the provider");
+            self.release.notified().await;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("root-final".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GatedFinalCompletionProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GatedFinalCompletionProvider"
         }
     }
 
@@ -10281,6 +10838,35 @@ mod tests {
             .expect("agent builder should succeed with valid config")
     }
 
+    #[test]
+    fn replace_history_suffix_is_atomic_on_structural_mismatch() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_history_test_agent(32, observer);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("old")),
+            ConversationMessage::Chat(ChatMessage::assistant("finished")),
+        ];
+        let expected = agent.history[1..].to_vec();
+        let replacement = vec![ConversationMessage::Chat(ChatMessage::assistant("safe"))];
+
+        assert!(agent.replace_history_suffix(&expected, replacement.clone()));
+        assert!(matches!(
+            agent.history.last(),
+            Some(ConversationMessage::Chat(message)) if message.content == "safe"
+        ));
+
+        let before = agent.history.clone();
+        assert!(!agent.replace_history_suffix(
+            &[ConversationMessage::Chat(ChatMessage::assistant("wrong"))],
+            vec![ConversationMessage::Chat(ChatMessage::assistant("partial"))],
+        ));
+        assert_eq!(
+            serde_json::to_value(&agent.history).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "a mismatch must not partially mutate"
+        );
+    }
+
     fn seed_old_trim_test_turn(agent: &mut Agent) {
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
@@ -12491,6 +13077,7 @@ mod tests {
                 _: Option<&str>,
             ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
                 Ok(vec![zeroclaw_memory::MemoryEntry {
+                    principal_id: None,
                     id: "deploy".into(),
                     key: "deploy".into(),
                     content: self.content.clone(),
@@ -12906,6 +13493,68 @@ mod tests {
             provider_steering.content.ends_with("]\n\nsecond"),
             "the provider's steering turn must end with the raw user text, got: {}",
             provider_steering.content
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_budget_final_completion_is_terminal_when_steering_arrives() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut config = zeroclaw_config::schema::AliasedAgentConfig::default();
+        config.resolved.max_execution_tree_iterations = Some(1);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(GatedFinalCompletionProvider {
+                calls: Arc::clone(&calls),
+                started: started_tx,
+                release: Arc::clone(&release),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            agent
+                .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("final-completion provider should start")
+            .expect("final-completion provider signal should remain connected");
+        steering_tx
+            .send("too late for another budgeted round".into())
+            .await
+            .expect("steering message should enqueue during final completion");
+        release.notify_one();
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("the reserved final completion must remain successful");
+        assert!(outcome.response.contains("root-final"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "queued steering must not start a second round on the exhausted tree budget"
         );
     }
 
@@ -14990,6 +15639,7 @@ vision_model_provider = "custom.vision"
             .multimodal_config(config.multimodal.clone())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             // Auto-approve so the image-injecting tool runs and the vision route
@@ -15321,6 +15971,7 @@ model_provider = "custom.primary"
             .model_name("primary-model".into())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             .build()
@@ -15538,6 +16189,7 @@ model_provider = "custom.only"
             .model_name("large-model".into())
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(Arc::new(config.clone())),
+                live_config: None,
                 live: None,
             })
             .build()
@@ -15852,6 +16504,7 @@ model_provider = "custom.only"
             "large-v1",
             Some(ProviderSwitchConfig {
                 config: Some(Arc::clone(&generation.read())),
+                live_config: None,
                 live: Some(Arc::clone(&live)),
             }),
         );
@@ -15931,6 +16584,7 @@ model_provider = "custom.only"
             "large-v1",
             Some(ProviderSwitchConfig {
                 config: Some(Arc::clone(&generation.read())),
+                live_config: None,
                 live: None,
             }),
         );
@@ -15988,6 +16642,33 @@ model_provider = "custom.only"
             Some(ConversationMessage::Chat(message))
                 if message.content == "ordinary assistant text"
         ));
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(marker)));
+        let mut snapshot = agent.retained_context_snapshot();
+        assert!(Agent::strip_interruption_marker_from(
+            &mut snapshot.retained_messages
+        ));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("bare-cancel", "agent", "/tmp", None)
+            .unwrap();
+        store
+            .persist_retained_context_seed("bare-cancel", &snapshot.retained_messages, false)
+            .unwrap();
+        drop(store);
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        let restored = store
+            .load_session("bare-cancel")
+            .unwrap()
+            .unwrap()
+            .retained_context
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(snapshot.retained_messages).unwrap()
+        );
     }
 
     #[test]
@@ -16118,6 +16799,7 @@ model_provider = "custom.only"
 
         let switch_config = ProviderSwitchConfig {
             config: Some(Arc::new(config)),
+            live_config: None,
             live: None,
         };
         let mut agent = build_test_agent("openai.primary", "current-model", Some(switch_config));
@@ -16149,6 +16831,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
 
@@ -16194,6 +16877,7 @@ model_provider = "custom.only"
         let cfg_arc = std::sync::Arc::new(cfg);
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live_config: None,
             live: None,
         };
 
@@ -16234,6 +16918,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
 
@@ -16287,6 +16972,7 @@ model_provider = "custom.only"
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
             live: None,
         };
         let mut agent = build_test_agent("ollama.large", "large", Some(switch_cfg));
@@ -16348,6 +17034,7 @@ model_provider = "custom.only"
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live_config: None,
             live: None,
         };
 
@@ -16543,6 +17230,7 @@ model_provider = "custom.only"
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
+            live_config: None,
             live: None,
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
@@ -16772,11 +17460,14 @@ mod approval_route_tests {
         Answer(ChannelApprovalResponse),
         NoDecision,
         Slow,
+        RuntimeTimeout,
     }
 
     struct StubChannel {
         name: String,
         behavior: StubBehavior,
+        seen_recipient: Arc<parking_lot::Mutex<Option<String>>>,
+        seen_route_timeout: Option<Arc<parking_lot::Mutex<Option<std::time::Duration>>>>,
     }
 
     impl zeroclaw_api::attribution::Attributable for StubChannel {
@@ -16816,6 +17507,54 @@ mod approval_route_tests {
                     tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                     Ok(Some(ChannelApprovalResponse::Approve))
                 }
+                StubBehavior::RuntimeTimeout => Ok(Some(ChannelApprovalResponse::Deny)),
+            }
+        }
+
+        async fn request_approval_attributed(
+            &self,
+            recipient: &str,
+            request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+            *self.seen_recipient.lock() = Some(recipient.to_string());
+            if matches!(&self.behavior, StubBehavior::RuntimeTimeout) {
+                return Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ),
+                ));
+            }
+
+            self.request_approval(recipient, request)
+                .await
+                .map(|response| {
+                    response.map(zeroclaw_api::channel::AttributedApprovalResponse::operator)
+                })
+        }
+
+        async fn request_approval_attributed_with_timeout(
+            &self,
+            recipient: &str,
+            request: &ChannelApprovalRequest,
+            timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+            if let Some(seen) = &self.seen_route_timeout {
+                *seen.lock() = Some(timeout);
+            }
+            match tokio::time::timeout(
+                timeout,
+                self.request_approval_attributed(recipient, request),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ),
+                )),
             }
         }
     }
@@ -16840,17 +17579,31 @@ mod approval_route_tests {
     fn route(approver: &str, policy: OnNoApprover) -> ApprovalRoute {
         ApprovalRoute {
             approver_channel: approver.into(),
+            approver_recipient: Some("configured-approver-recipient".into()),
             on_no_approver: policy,
             timeout_secs: 1,
         }
     }
 
+    fn seen_recipient() -> Arc<parking_lot::Mutex<Option<String>>> {
+        Arc::new(parking_lot::Mutex::new(None))
+    }
+
+    fn stub(name: &str, behavior: StubBehavior) -> StubChannel {
+        StubChannel {
+            name: name.into(),
+            behavior,
+            seen_recipient: seen_recipient(),
+            seen_route_timeout: None,
+        }
+    }
+
     #[tokio::test]
     async fn approver_answer_is_used_and_attributed() {
-        let h = registry(vec![StubChannel {
-            name: "ops".into(),
-            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
-        }]);
+        let h = registry(vec![stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        )]);
         match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
             RoutedApproval::Decided {
                 response,
@@ -16871,6 +17624,50 @@ mod approval_route_tests {
             }
             RoutedApproval::Fallthrough => panic!("expected a routed decision"),
         }
+    }
+
+    #[tokio::test]
+    async fn routed_approval_uses_configured_approver_recipient() {
+        let seen = seen_recipient();
+        let mut approver = stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        );
+        approver.seen_recipient = Arc::clone(&seen);
+        let h = registry(vec![approver]);
+
+        let out =
+            resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "origin", &req()).await;
+        assert!(matches!(out, RoutedApproval::Decided { .. }));
+        assert_eq!(
+            seen.lock().as_deref(),
+            Some("configured-approver-recipient"),
+            "the approver hop must not reuse the origin recipient"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_approval_delegates_the_configured_timeout_to_the_channel() {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let mut approver = stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        );
+        approver.seen_route_timeout = Some(Arc::clone(&seen));
+        let h = registry(vec![approver]);
+
+        let out =
+            resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "origin", &req()).await;
+
+        assert!(matches!(
+            out,
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Approve,
+                source: zeroclaw_api::channel::ApprovalSource::Operator,
+                ..
+            }
+        ));
+        assert_eq!(*seen.lock(), Some(std::time::Duration::from_secs(1)));
     }
 
     #[tokio::test]
@@ -16915,11 +17712,49 @@ mod approval_route_tests {
     }
 
     #[tokio::test]
+    async fn missing_approver_recipient_fails_closed_by_default() {
+        let mut route = route("ops", OnNoApprover::Deny);
+        route.approver_recipient = None;
+        let h = registry(vec![stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        )]);
+        let out = resolve_routed_approval(&h, &route, "origin", &req()).await;
+        assert!(matches!(
+            out,
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                source: zeroclaw_api::channel::ApprovalSource::Unavailable,
+                decider: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_approver_recipient_inherits_when_opted_in() {
+        let mut route = route("ops", OnNoApprover::InheritOriginator);
+        route.approver_recipient = Some("  ".into());
+        let h = registry(vec![stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Deny),
+        )]);
+        let origin = Arc::new(stub(
+            "origin",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        ));
+        let bridge = routed_approval_channel(h, route, Some(origin));
+        let out = bridge
+            .request_approval_attributed("origin-recipient", &req())
+            .await
+            .unwrap()
+            .expect("inherit-originator should ask the origin channel");
+        assert_eq!(out.response, ChannelApprovalResponse::Approve);
+        assert_eq!(out.source, zeroclaw_api::channel::ApprovalSource::Operator);
+    }
+
+    #[tokio::test]
     async fn no_decision_fails_closed() {
-        let h = registry(vec![StubChannel {
-            name: "ops".into(),
-            behavior: StubBehavior::NoDecision,
-        }]);
+        let h = registry(vec![stub("ops", StubBehavior::NoDecision)]);
         let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
         assert!(
             matches!(
@@ -16938,10 +17773,7 @@ mod approval_route_tests {
     // resolves in ~1s of real time without needing tokio's `test-util` clock.
     #[tokio::test]
     async fn slow_approver_times_out_and_fails_closed() {
-        let h = registry(vec![StubChannel {
-            name: "ops".into(),
-            behavior: StubBehavior::Slow,
-        }]);
+        let h = registry(vec![stub("ops", StubBehavior::Slow)]);
         let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
         // A timeout is the case most easily mistaken for a user's "no": the
         // route returns Some(Deny) exactly as an operator denial would.
@@ -16958,15 +17790,83 @@ mod approval_route_tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_attributed_timeout_inherits_to_originator() {
+        let origin = Arc::new(stub(
+            "origin",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        ));
+        let bridge = routed_approval_channel(
+            registry(vec![stub("ops", StubBehavior::RuntimeTimeout)]),
+            route("ops", OnNoApprover::InheritOriginator),
+            Some(origin),
+        );
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("runtime timeout should fall through to the originator");
+
+        assert_eq!(out.response, ChannelApprovalResponse::Approve);
+        assert_eq!(out.source, zeroclaw_api::channel::ApprovalSource::Operator);
+        assert!(out.decided_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_attributed_timeout_denies_without_decider() {
+        let h = registry(vec![stub("ops", StubBehavior::RuntimeTimeout)]);
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+
+        match &out {
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                decider,
+                source: zeroclaw_api::channel::ApprovalSource::TimedOut,
+            } => assert!(
+                decider.is_none(),
+                "a runtime timeout denial must not name a deciding operator"
+            ),
+            _ => panic!("runtime timeout must fail closed without a decider: {out:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_denial_is_final_under_inherit_policy() {
+        let h = registry(vec![stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Deny),
+        )]);
+        let out = resolve_routed_approval(
+            &h,
+            &route("ops", OnNoApprover::InheritOriginator),
+            "r",
+            &req(),
+        )
+        .await;
+
+        match &out {
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                decider: Some(decider),
+                source: zeroclaw_api::channel::ApprovalSource::Operator,
+            } => assert_eq!(decider, "ops"),
+            _ => panic!("an operator denial must remain final under inherit-originator: {out:?}"),
+        }
+    }
+
     use zeroclaw_api::channel::Channel as _;
 
     #[tokio::test]
     async fn routed_channel_returns_and_attributes_approver_decision() {
-        let h = registry(vec![StubChannel {
-            name: "ops".into(),
-            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
-        }]);
-        let bridge = RoutedApprovalChannel::new(h, route("ops", OnNoApprover::Deny));
+        let h = registry(vec![stub(
+            "ops",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        )]);
+        let origin = Arc::new(stub(
+            "origin",
+            StubBehavior::Answer(ChannelApprovalResponse::Deny),
+        ));
+        let bridge = routed_approval_channel(h, route("ops", OnNoApprover::Deny), Some(origin));
         let out = bridge
             .request_approval_attributed("r", &req())
             .await
@@ -16978,6 +17878,75 @@ mod approval_route_tests {
             Some("ops"),
             "the gate attributes the approval to the deciding channel"
         );
+    }
+
+    #[tokio::test]
+    async fn routed_channel_does_not_reach_origin_for_default_missing_approver() {
+        let origin = Arc::new(stub(
+            "origin",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        ));
+        let bridge = routed_approval_channel(
+            registry(vec![]),
+            route("ops", OnNoApprover::Deny),
+            Some(origin),
+        );
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("the default route must produce a fail-closed denial");
+
+        assert_eq!(out.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            out.source,
+            zeroclaw_api::channel::ApprovalSource::Unavailable
+        );
+        assert!(out.decided_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn routed_channel_inherit_delegates_to_origin() {
+        let origin = Arc::new(stub(
+            "origin",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        ));
+        let bridge = routed_approval_channel(
+            registry(vec![]),
+            route("ops", OnNoApprover::InheritOriginator),
+            Some(origin),
+        );
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("explicit inherit-originator must ask the initiating channel");
+
+        assert_eq!(out.response, ChannelApprovalResponse::Approve);
+        assert_eq!(out.source, zeroclaw_api::channel::ApprovalSource::Operator);
+        assert!(out.decided_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn routed_channel_inherit_fails_closed_when_origin_has_no_decision() {
+        let origin = Arc::new(stub("origin", StubBehavior::NoDecision));
+        let bridge = routed_approval_channel(
+            registry(vec![]),
+            route("ops", OnNoApprover::InheritOriginator),
+            Some(origin),
+        );
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("an unsupported origin must become a runtime denial");
+
+        assert_eq!(out.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            out.source,
+            zeroclaw_api::channel::ApprovalSource::Unavailable
+        );
+        assert!(out.decided_by.is_none());
     }
 
     #[tokio::test]
@@ -17000,15 +17969,21 @@ mod approval_route_tests {
     }
 
     #[tokio::test]
-    async fn routed_channel_inherit_returns_none_on_channelless_path() {
+    async fn routed_channel_inherit_fails_closed_on_channelless_path() {
         let bridge = RoutedApprovalChannel::new(
             registry(vec![]),
             route("ops", OnNoApprover::InheritOriginator),
         );
-        let out = bridge.request_approval("r", &req()).await.unwrap();
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("a missing origin must become a runtime denial");
+        assert_eq!(out.response, ChannelApprovalResponse::Deny);
         assert_eq!(
-            out, None,
-            "no originator to inherit; gate applies the non-interactive auto-deny"
+            out.source,
+            zeroclaw_api::channel::ApprovalSource::Unavailable
         );
+        assert!(out.decided_by.is_none());
     }
 }
