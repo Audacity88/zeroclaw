@@ -420,10 +420,10 @@ where
     .await
     {
         Ok(result) => result,
-        Err(payload) => Err(anyhow::anyhow!(
+        Err(payload) => Err(anyhow::Error::msg(format!(
             "peer recipient turn panicked: {}",
             panic_payload_message(payload.as_ref())
-        )),
+        ))),
     }
 }
 
@@ -439,7 +439,7 @@ where
     F: FnOnce(),
 {
     let registry = registry.ok_or_else(|| {
-        anyhow::anyhow!("in-process peer delivery requires an available durable task store")
+        anyhow::Error::msg("in-process peer delivery requires an available durable task store")
     })?;
     let task = PeerInboxTask {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1012,7 +1012,7 @@ mod tests {
             settle_peer_inbox_task(
                 &store,
                 &failure_task,
-                Err(anyhow::anyhow!("recipient failed")),
+                Err(anyhow::Error::msg("recipient failed")),
             )
             .await
             .expect("failure settlement")
@@ -1085,7 +1085,7 @@ mod tests {
         let settled = settle_peer_inbox_task(
             &registry,
             &task_for_settlement("task-winner"),
-            Err(anyhow::anyhow!("recipient failed")),
+            Err(anyhow::Error::msg("recipient failed")),
         )
         .await
         .expect("losing CAS is not a settlement error");
