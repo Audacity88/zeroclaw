@@ -7553,7 +7553,7 @@ fn render_conversation(
     if state.dirty != LinesDirty::Clean || state.cached_render_width != inner_width {
         // Selection endpoints belong to one stable rendered-content geometry.
         // Viewport movement preserves them, but a cache rebuild does not.
-        state.clear_transcript_selection();
+        state.clear_transcript_selection_for_render_change();
         state.rebuild_lines(inner_width);
     }
 
