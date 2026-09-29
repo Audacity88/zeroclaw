@@ -19,16 +19,16 @@ use zeroclaw_config::schema::CacheTtl;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Per-image ceiling for base64-encoded payloads, shared with the multimodal
+/// structural check so this adapter and the pre-dispatch resolvability count
+/// cannot drift apart on what an image may weigh (see
+/// `MAX_ENCODED_IMAGE_PAYLOAD_BYTES` in `crate::multimodal`). Anthropic
+/// documents 10 MB encoded per image for the direct API; its separate
+/// per-request budget (32 MB across all images) is not enforced here.
+use crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES;
 use crate::safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
-/// Anthropic's documented per-image ceiling for the direct API: 10 MB
-/// **base64-encoded**. Measured on the encoded payload length, unlike the
-/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
-/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
-/// two ceilings stay consistent with each other. Anthropic's separate
-/// per-request budget (32 MB across all images) is not enforced here.
-const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
 /// parsing and would otherwise sit in a text position. See
 /// [`AnthropicModelProvider::sweep_residual_image_data`].
@@ -267,17 +267,26 @@ fn anthropic_beta_features(
     }
 }
 
-/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
-/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
-/// require `adaptive`; budget-based models require `enabled`.
+/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7, the
+/// whole Fable 5 family) reject the fixed-budget `enabled` shape with HTTP
+/// 400 and require `adaptive`; budget-based models require `enabled`.
+///
+/// Shared crate-wide: the OpenAI-compatible passthrough builder resolves the
+/// same style so gateway requests match the native provider's shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicThinkingStyle {
+pub(crate) enum AnthropicThinkingStyle {
     Budget,
     Adaptive,
 }
 
-fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
-    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
+/// Substring matching on purpose: gateway model IDs may carry routing
+/// prefixes (`claude-group/claude-opus-4-7`) that must resolve to the same
+/// style as the bare model name. The whole Fable 5 family is adaptive-only,
+/// so the bare `claude-fable-5` substring intentionally covers `fable-5` and
+/// `fable-5-1` alike; a hypothetical future budget-shaped member of the
+/// family would need this matcher revisited.
+pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5") {
         AnthropicThinkingStyle::Adaptive
     } else {
         AnthropicThinkingStyle::Budget
@@ -4539,6 +4548,16 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert_eq!(
             anthropic_thinking_style("claude-fable-5-1-20260815"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        // The whole Fable 5 family is adaptive-only: bare fable-5 and
+        // gateway-prefixed IDs resolve like fable-5-1.
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-group/claude-fable-5"),
             AnthropicThinkingStyle::Adaptive
         );
         // Budget-based families keep the `enabled` shape.
@@ -10933,5 +10952,152 @@ data: {\"type\":\"message_stop\"}\n\n";
             serde_json::from_str(&reasoning).expect("reasoning_content line must be a JSON object");
         assert_eq!(parsed["thinking"], "");
         assert_eq!(parsed["signature"], "sigX");
+    }
+
+    /// Remove every `cache_control` key at any depth. The rolling cache
+    /// breakpoint moves to the newest message by design, so eviction
+    /// stability is asserted with every breakpoint stripped: everything
+    /// else must stay byte-identical across requests.
+    fn strip_cache_control(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove("cache_control");
+                for child in map.values_mut() {
+                    strip_cache_control(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items.iter_mut() {
+                    strip_cache_control(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Eviction stability must survive the Anthropic request converter, not
+    /// just prepared-message equality. The same fixture as the multimodal
+    /// contract test (four user images, a fifth image, then an image-free
+    /// user turn; `max_images: 4`, `max_image_turns: 0`) goes through the
+    /// production conversion sequence of `chat`: prepare, convert, then the
+    /// rolling cache breakpoint. The breakpoint moves by design; everything
+    /// else must not.
+    #[tokio::test]
+    async fn image_cap_eviction_keeps_prior_native_messages_identical() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // A real PNG: preparation decodes pixels and drops corrupt images.
+        let png_data = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
+        let config = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let img = |i: usize| {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, &png_data).unwrap();
+            p
+        };
+        // Four image turns (one image-only, three with captions), each answered.
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..4 {
+            let content = if i == 1 {
+                format!("[IMAGE:{}]", img(i).display())
+            } else {
+                format!("[IMAGE:{}]\ncaption {i}", img(i).display())
+            };
+            history.push(ChatMessage::user(content));
+            history.push(ChatMessage::assistant(format!("saw {i}")));
+        }
+
+        // The conversion sequence of `chat`, mirrored: prepare, convert,
+        // then the rolling breakpoint on a long conversation.
+        async fn convert_stripped(
+            messages: &[ChatMessage],
+            config: &zeroclaw_config::schema::MultimodalConfig,
+        ) -> Vec<String> {
+            let prepared = crate::multimodal::prepare_messages_for_provider(messages, config)
+                .await
+                .expect("preparation must succeed");
+            let (_, mut native) =
+                AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+            if AnthropicModelProvider::should_cache_conversation(&prepared.messages) {
+                AnthropicModelProvider::apply_cache_to_last_message(
+                    &mut native,
+                    CacheTtl::default(),
+                );
+            }
+            native
+                .iter()
+                .map(|message| {
+                    let mut value =
+                        serde_json::to_value(message).expect("serialize native message");
+                    strip_cache_control(&mut value);
+                    value.to_string()
+                })
+                .collect()
+        }
+
+        let p0 = convert_stripped(&history, &config).await;
+
+        // Fifth image arrives: the oldest image message loses its image.
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 4",
+            img(4).display()
+        )));
+        let p1 = convert_stripped(&history, &config).await;
+        // The fixtures must reach the wire as image blocks; otherwise the
+        // stability assertions below hold with no image in play.
+        let image_blocks = |messages: &[String]| {
+            messages
+                .iter()
+                .map(|m| m.matches("\"type\":\"image\"").count())
+                .sum::<usize>()
+        };
+        assert_eq!(image_blocks(&p0), 4, "all four fixtures reach the wire");
+        assert_eq!(
+            image_blocks(&p1),
+            4,
+            "the cap keeps exactly four image blocks"
+        );
+
+        // Image-free follow-up.
+        history.push(ChatMessage::assistant("saw 4"));
+        history.push(ChatMessage::user("no image this time"));
+        let p2 = convert_stripped(&history, &config).await;
+
+        // Every pre-existing serialized native message stays byte-identical
+        // on the image-free follow-up, breakpoints aside.
+        assert_eq!(
+            &p2[..p1.len()],
+            p1.as_slice(),
+            "the image-free follow-up must not change any prior native message"
+        );
+
+        // Exactly one message differs from before the fifth image: the
+        // position holding the oldest image, the first user message.
+        let changed: Vec<usize> = p0
+            .iter()
+            .zip(p1.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![0],
+            "the fifth image must rewrite only the oldest image message"
+        );
     }
 }

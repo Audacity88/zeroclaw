@@ -681,9 +681,14 @@ struct ChannelRuntimeContext {
     session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
-    /// `[autonomy]` config; auto-denies tools that would need interactive
-    /// approval since no operator is present on channel runs.
+    /// `[risk_profiles]` config while preserving the initiating channel as a
+    /// backchannel for supervised shell approval.
     approval_manager: Arc<ApprovalManager>,
+    /// The agent's filesystem policy, built once per agent at channel start
+    /// (the same `Arc` the agent's tools were assembled with) and threaded
+    /// into each turn's execution context so the no-vision image-marker
+    /// gate applies the identical read ledger the file tools apply.
+    security: Arc<SecurityPolicy>,
     activated_tools:
         Option<std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>>,
     cost_tracking: Option<ChannelCostTrackingState>,
@@ -708,6 +713,37 @@ struct ChannelRuntimeContext {
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
+}
+
+/// Build the channel turn's non-interactive manager while retaining the
+/// initiating channel as an approval backchannel for supervised shell calls.
+fn channel_approval_manager(
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> ApprovalManager {
+    ApprovalManager::for_non_interactive_backchannel(risk_profile)
+}
+
+/// Create the approval state and channel for one channel-originated turn.
+/// Mutable `Always` grants stay on this fresh manager; an explicit approval
+/// route wraps the initiating channel so only `inherit-originator` can fall
+/// back to it.
+fn channel_turn_approval(
+    manager: &ApprovalManager,
+    risk_profile: Option<&zeroclaw_config::schema::RiskProfileConfig>,
+    channels_by_name: &HashMap<String, Arc<dyn Channel>>,
+    origin: Option<Arc<dyn Channel>>,
+) -> (ApprovalManager, Option<Arc<dyn Channel>>) {
+    let approval_channel = match risk_profile.and_then(|profile| profile.approval_route.clone()) {
+        Some(route) => {
+            let handles = Arc::new(RwLock::new(channels_by_name.clone()));
+            Some(zeroclaw_runtime::agent::agent::routed_approval_channel(
+                handles, route, origin,
+            ))
+        }
+        None => origin,
+    };
+
+    (manager.for_new_turn(), approval_channel)
 }
 
 /// Acquire the per-conversation-history-key persistence lock so that
@@ -7677,7 +7713,9 @@ impl Channel for ApprovalTypingChannel {
             .request_approval_attributed(recipient, request)
             .await;
         if response.as_ref().is_ok_and(|response| {
-            response.as_ref().is_some_and(|response| {
+            // Unsupported approval is not a denial: the runtime may continue
+            // under ordinary shell policy without granting approval.
+            response.as_ref().is_none_or(|response| {
                 matches!(
                     response.response,
                     zeroclaw_api::channel::ChannelApprovalResponse::Approve
@@ -9295,7 +9333,7 @@ async fn process_channel_message_body(
     // already captured and restored wholesale below (`outgoing_user_turn_raw_content`
     // / `strip_volatile_preamble_before_persist`), which covers the recalled-memory
     // preamble too, so there is no separate byte-length to record here.
-    let mut channel_injected_memory_preamble: Option<String> = None;
+    let mut channel_injected_memory_preamble = None;
 
     // Kept so a post-loop trim resync can restore the current turn to this
     // clean content before persisting; the durable transcript must never
@@ -9731,6 +9769,15 @@ async fn process_channel_message_body(
             (Some(channel), None) => Some(Arc::clone(channel)),
             (None, _) => None,
         };
+    let active_risk_profile = ctx
+        .prompt_config
+        .risk_profile_for_agent(ctx.agent_alias.as_str());
+    let (approval_manager, approval_channel) = channel_turn_approval(
+        &ctx.approval_manager,
+        active_risk_profile,
+        ctx.channels_by_name.as_ref(),
+        approval_channel,
+    );
 
     // Wrap observer to forward tool events as live thread messages.
     // Bounded so a slow downstream channel cannot grow this queue
@@ -9867,7 +9914,10 @@ async fn process_channel_message_body(
                         tools_registry: ctx.tools_registry.as_ref(),
                         observer: notify_observer.as_ref() as &dyn Observer,
                         silent: true,
-                        approval: Some(&*ctx.approval_manager),
+                        approval: Some(&approval_manager),
+                        // The agent's own policy (built at channel start with
+                        // its tools) governs the no-vision marker gate.
+                        security: Some(ctx.security.as_ref()),
                         multimodal_config: &ctx.multimodal,
                         // Full config for the vision route to resolve the
                         // configured `vision_model_provider`'s alias options - the
@@ -13496,8 +13546,8 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
             .is_some_and(|(channel_type, _)| channel_type == message_base)
 }
 
-/// Active `<type>.<alias>` channel references from enabled agents and SOP
-/// approval routes.
+/// Active `<type>.<alias>` channel references from enabled agents and approval
+/// routes (SOP gates plus risk profiles used by enabled agents).
 ///
 /// When no agent declares channel bindings, collection falls back to legacy
 /// behavior and accepts all enabled channels.
@@ -13508,9 +13558,10 @@ struct ActiveChannelAliases {
     /// Bindings declared by all agents, including disabled owners. Their
     /// presence prevents legacy fallback from activating disabled channels.
     all_known_bindings: HashSet<String>,
-    /// `<type>.<alias>` named by an approval request or escalation route.
-    /// These channels are live to deliver and receive SOP gate replies, but
-    /// they remain absent from the agent ownership map for ordinary traffic.
+    /// `<type>.<alias>` named by an approval request, escalation route, or an
+    /// active agent's risk-profile approval route. These channels are live to
+    /// deliver approval replies, but remain absent from the agent ownership map
+    /// for ordinary traffic.
     approval_route_bindings: HashSet<String>,
 }
 
@@ -13532,11 +13583,28 @@ impl ActiveChannelAliases {
 
     /// Computes the canonical channel-binding view used by collection and
     /// startup checks. Disabled owners never activate channels, while an
-    /// explicit SOP approval route keeps its delivery channel live without
+    /// explicit approval route keeps its delivery channel live without
     /// assigning it to an agent.
     fn compute(config: &Config) -> Self {
         let configured_channel_aliases = config.channels_by_alias();
-        let approval_route_bindings = config
+        let resolve_route_channel_key = |channel_key: &str| {
+            if channel_key.is_empty() {
+                return Vec::new();
+            }
+            if channel_key.contains('.') {
+                return vec![channel_key.to_string()];
+            }
+
+            let enabled_aliases: Vec<_> = configured_channel_aliases
+                .iter()
+                .filter(|channel| channel.enabled && channel.channel_type == channel_key)
+                .collect();
+            match enabled_aliases.as_slice() {
+                [channel] => vec![format!("{}.{}", channel.channel_type, channel.alias)],
+                _ => vec![channel_key.to_string()],
+            }
+        };
+        let sop_route_channel_keys = config
             .sop
             .approval
             .policies
@@ -13550,20 +13618,17 @@ impl ActiveChannelAliases {
             .filter_map(|route| {
                 route.and_then(zeroclaw_runtime::sop::approval::channel_route::parse_approval_route)
             })
-            .flat_map(|(channel_key, _)| {
-                if channel_key.contains('.') {
-                    return vec![channel_key.to_string()];
-                }
-
-                let enabled_aliases: Vec<_> = configured_channel_aliases
-                    .iter()
-                    .filter(|channel| channel.enabled && channel.channel_type == channel_key)
-                    .collect();
-                match enabled_aliases.as_slice() {
-                    [channel] => vec![format!("{}.{}", channel.channel_type, channel.alias)],
-                    _ => vec![channel_key.to_string()],
-                }
-            })
+            .map(|(channel_key, _)| channel_key);
+        let risk_profile_route_channel_keys = config
+            .agents
+            .values()
+            .filter(|agent| agent.enabled)
+            .filter_map(|agent| config.risk_profiles.get(agent.risk_profile.trim()))
+            .filter_map(|profile| profile.approval_route.as_ref())
+            .map(|route| route.approver_channel.as_str());
+        let approval_route_bindings = sop_route_channel_keys
+            .chain(risk_profile_route_channel_keys)
+            .flat_map(resolve_route_channel_key)
             .collect();
 
         Self {
@@ -16093,8 +16158,6 @@ pub async fn start_channels_with_plugin_webhooks(
         return Ok(());
     }
 
-    zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
-
     let enabled_agents = enabled_agent_aliases(&config);
     if enabled_agents.is_empty() {
         anyhow::bail!("start_channels requires at least one enabled [agents.<alias>] entry");
@@ -16722,7 +16785,7 @@ pub async fn start_channels_with_plugin_webhooks(
             ack_reactions: config.channels.ack_reactions,
             show_tool_calls: config.channels.show_tool_calls,
             session_store: shared_session_store.clone(),
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
+            approval_manager: Arc::new(channel_approval_manager(&risk_profile)),
             activated_tools: ch_activated_handle,
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
@@ -16754,6 +16817,7 @@ pub async fn start_channels_with_plugin_webhooks(
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: sop_engine.clone(),
             sop_audit: sop_audit.clone(),
+            security: Arc::clone(&security),
             sop_driver_sink: sop_driver_sink.clone(),
         });
 
@@ -17353,6 +17417,7 @@ fn concurrent_persist_lock_serialization() {
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
         sop_engine: None,
         sop_audit: None,
+        security: Arc::new(SecurityPolicy::default()),
     });
     ctx.conversation_histories
         .lock()
@@ -17452,6 +17517,7 @@ fn test_channel_ctx_with_backend(
 ) -> Arc<ChannelRuntimeContext> {
     Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(HashMap::new()),
+        security: Arc::new(SecurityPolicy::default()),
         model_provider: Arc::new(tests::DummyModelProvider),
         model_provider_ref: Arc::new("test".into()),
         agent_alias: Arc::new("test".into()),
@@ -17572,6 +17638,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
 
     Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(channels_by_name),
+        security: Arc::new(SecurityPolicy::default()),
         model_provider,
         model_provider_ref: Arc::new("test".into()),
         agent_alias: Arc::new("test".into()),
@@ -18926,6 +18993,67 @@ pub(crate) mod tests {
         if let Err(payload) = handle.join() {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn channel_approval_manager_prompts_for_supervised_shell() {
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            allowed_commands: vec!["rm".to_string()],
+            block_high_risk_commands: false,
+            ..Default::default()
+        };
+        let manager = channel_approval_manager(&risk_profile);
+
+        assert_eq!(
+            manager.approval_requirement("shell"),
+            zeroclaw_runtime::approval::ApprovalRequirement::Prompt
+        );
+        assert!(manager.needs_approval("shell"));
+    }
+
+    #[test]
+    fn channel_turn_approval_freshens_state_and_selects_configured_route() {
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                approver_channel: "ops.default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manager = channel_approval_manager(&risk_profile);
+        manager.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "test.txt"}),
+            &zeroclaw_runtime::approval::ApprovalResponse::Always,
+            "origin",
+        );
+        let origin: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+
+        let (fresh, routed) = channel_turn_approval(
+            &manager,
+            Some(&risk_profile),
+            &HashMap::new(),
+            Some(Arc::clone(&origin)),
+        );
+
+        assert!(fresh.needs_approval("file_write"));
+        assert_eq!(
+            fresh.approval_requirement("shell"),
+            zeroclaw_runtime::approval::ApprovalRequirement::Prompt
+        );
+        assert!(fresh.session_allowlist().is_empty());
+        assert_eq!(
+            routed.expect("configured route wrapper").name(),
+            "approval-route"
+        );
+
+        let (_, origin_channel) =
+            channel_turn_approval(&manager, None, &HashMap::new(), Some(Arc::clone(&origin)));
+        assert!(
+            Arc::ptr_eq(&origin_channel.expect("origin approval channel"), &origin),
+            "without approval_route the initiating channel remains the approval surface"
+        );
     }
 
     struct CountingObserver {
@@ -20737,6 +20865,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -20811,6 +20940,7 @@ temperature = 0.3
         let single_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&single_registry),
             session_store: Some(Arc::clone(&single_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
 
@@ -20880,12 +21010,14 @@ temperature = 0.3
             channels_by_name: Arc::clone(&multi_registry),
             agent_alias: Arc::new("alpha-agent".to_string()),
             session_store: Some(Arc::clone(&multi_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
         let beta_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&multi_registry),
             agent_alias: Arc::new("beta-agent".to_string()),
             session_store: Some(Arc::clone(&multi_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
         let mut config = Config::default();
@@ -21000,6 +21132,7 @@ temperature = 0.3
             memory: memory_for_ctx,
             auto_save_memory: true,
             ack_reactions: false,
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
 
@@ -21093,6 +21226,7 @@ temperature = 0.3
             Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
         let ctx = ChannelRuntimeContext {
             session_store: Some(Arc::clone(&session_store)),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         };
         let cases = [
@@ -21212,6 +21346,7 @@ temperature = 0.3
             sop_driver_sink: None,
             prompt_config: Arc::new(cfg.clone()),
             live_config: Arc::new(RwLock::new(cfg)),
+            security: Arc::new(SecurityPolicy::default()),
             ..base_ctx
         });
 
@@ -21707,6 +21842,7 @@ temperature = 0.3
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         }
     }
@@ -22187,6 +22323,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         };
 
@@ -22292,6 +22429,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         };
 
@@ -22415,6 +22553,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         };
 
@@ -22542,6 +22681,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         };
 
@@ -24567,6 +24707,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -24675,6 +24816,7 @@ api_key = "anthropic-key"
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -26387,6 +26529,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: Some(Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(
                 Arc::new(NoopMemory),
             ))),
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base).clone()
         });
 
@@ -27520,6 +27663,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -27615,6 +27759,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -27708,6 +27853,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -27914,6 +28060,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(LeakingNarratingToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -28103,6 +28250,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -28301,6 +28449,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -28873,6 +29022,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
+            security: Arc::new(SecurityPolicy::default()),
             model_provider: Arc::new(NarratingNativeToolProvider {
                 calls: AtomicUsize::new(0),
             }),
@@ -29109,6 +29259,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29237,6 +29388,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29318,6 +29470,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
             ),
             show_receipts_in_response: true,
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -29543,6 +29696,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29670,6 +29824,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_driver_sink: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -29819,6 +29974,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -29957,6 +30113,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -30080,6 +30237,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -30221,6 +30379,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -30386,6 +30545,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -30592,6 +30752,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -31108,6 +31269,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -31229,6 +31391,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -31357,6 +31520,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -32833,6 +32997,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -32985,6 +33150,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -33152,6 +33318,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -33320,6 +33487,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -33481,6 +33649,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -33689,6 +33858,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -33927,6 +34097,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34069,6 +34240,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34396,7 +34568,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn approval_wait_pauses_typing_and_only_approval_resumes_it() {
+    async fn approval_wait_resumes_typing_for_approval_or_unsupported_response() {
         use zeroclaw_api::channel::{
             ApprovalSource, AttributedApprovalResponse, ChannelApprovalRequest,
             ChannelApprovalResponse,
@@ -34432,7 +34604,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 false,
                 false,
             ),
-            (PendingApprovalOutcome::Response(None), false, false),
+            (PendingApprovalOutcome::Response(None), true, false),
             (PendingApprovalOutcome::Error, false, true),
         ];
 
@@ -34499,7 +34671,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     }
                 })
                 .await
-                .expect("approved work should resume typing");
+                .expect("continuing work should resume typing");
             } else {
                 tokio::task::yield_now().await;
                 assert_eq!(
@@ -34511,6 +34683,150 @@ BTC is currently around $65,000 based on latest tool output."#
 
             typing.pause().await;
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_approval_resumes_typing_through_shell_gate() {
+        struct ShellProvider(Arc<PendingApprovalChannel>);
+
+        impl zeroclaw_api::attribution::Attributable for ShellProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                ToolCallingModelProvider.role()
+            }
+            fn alias(&self) -> &str {
+                "shell-typing-test"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for ShellProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while self.0.start_typing_calls.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("initial typing must start before the approval request");
+                Ok(
+                    r#"<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>"#
+                        .into(),
+                )
+            }
+
+            async fn chat_with_history(
+                &self,
+                messages: &[ChatMessage],
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                if messages
+                    .iter()
+                    .any(|message| message.content.contains("[Tool results]"))
+                {
+                    Ok("done".into())
+                } else {
+                    self.chat_with_system(None, "", model, temperature).await
+                }
+            }
+        }
+
+        struct ShellProbe {
+            channel: Arc<PendingApprovalChannel>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for ShellProbe {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                NamedMockTool("shell").role()
+            }
+            fn alias(&self) -> &str {
+                "shell"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for ShellProbe {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Observe approval and typing at execution"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}})
+            }
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                assert_eq!(
+                    args["approved"], false,
+                    "unsupported must not grant approval"
+                );
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while self.channel.start_typing_calls.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("typing must resume for the continuing shell call");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                NamedMockTool("shell").execute(args).await
+            }
+        }
+
+        let channel = Arc::new(PendingApprovalChannel::new(
+            PendingApprovalOutcome::Response(None),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent_cfg.precheck.enabled = false;
+        let mut ctx = test_runtime_ctx_with_observer_and_tools(
+            channel.clone(),
+            Arc::new(ShellProvider(channel.clone())),
+            Default::default(),
+            agent_cfg,
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(ShellProbe {
+                channel: channel.clone(),
+                calls: calls.clone(),
+            })],
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("unshared test context")
+            .approval_manager = Arc::new(channel_approval_manager(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ));
+        let turn = process_channel_message(
+            ctx,
+            ChannelMessage {
+                id: "typing-fallback".into(),
+                sender: "test-user".into(),
+                reply_target: "test-room".into(),
+                content: "show the working directory".into(),
+                channel: "approval-test".into(),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        );
+        let release = async {
+            channel.approval_started.notified().await;
+            assert_eq!(channel.stop_typing_calls.load(Ordering::SeqCst), 1);
+            channel.approval_release.notify_one();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(turn, release);
+        })
+        .await
+        .expect("channel turn should complete");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -34604,6 +34920,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34739,6 +35056,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -34878,6 +35196,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -35009,6 +35328,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -35140,6 +35460,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -35558,6 +35879,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -37086,6 +37408,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -42990,6 +43313,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -43177,6 +43501,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -43703,6 +44028,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
     }
@@ -44200,6 +44526,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -44371,6 +44698,7 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -45340,6 +45668,84 @@ This is an example JSON object for profile settings."#;
         assert!(
             channel_map.contains_key("discord.ops"),
             "the approval route's configured channel must be live for adapter delivery"
+        );
+
+        let collected_keys: Vec<String> = channel_map.keys().cloned().collect();
+        let owners = build_owner_by_channel_key(&config, &["worker".to_string()], &collected_keys);
+        assert!(
+            !owners.contains_key("discord.ops"),
+            "approval-route liveness must not create an agent owner"
+        );
+
+        let worker_ctx = router_test_ctx();
+        let router = AgentRouter::multi(
+            HashMap::from([("worker".to_string(), worker_ctx)]),
+            owners,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            router
+                .resolve(&channel_message("discord", Some("ops")))
+                .is_none(),
+            "ordinary traffic on the approval-only alias must not reach the worker"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn risk_profile_approval_route_collects_unowned_channel_without_agent_dispatch() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                risk_profile: "supervised".into(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "supervised".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                    approver_channel: "discord.ops".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let active = ActiveChannelAliases::compute(&config);
+        assert!(
+            active.contains("discord.ops"),
+            "a risk-profile approval route must activate its unowned alias"
+        );
+
+        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None, None);
+        let channel_map = configured_channel_map(&configured);
+        assert!(
+            channel_map.contains_key("discord.ops"),
+            "the risk-profile approver must be available in the routed channel registry"
         );
 
         let collected_keys: Vec<String> = channel_map.keys().cloned().collect();
@@ -47607,6 +48013,7 @@ This is an example JSON object for profile settings."#;
                 describe_images: true,
                 ..Default::default()
             },
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -47780,6 +48187,7 @@ This is an example JSON object for profile settings."#;
                 describe_images: true,
                 ..Default::default()
             },
+            security: Arc::new(SecurityPolicy::default()),
             ..(*base_ctx).clone()
         });
 
@@ -47945,6 +48353,7 @@ This is an example JSON object for profile settings."#;
                     describe_images: true,
                     ..Default::default()
                 },
+                security: Arc::new(SecurityPolicy::default()),
                 ..(*base_ctx).clone()
             });
 
@@ -48038,6 +48447,13 @@ This is an example JSON object for profile settings."#;
         channels_by_name.insert(channel.name().to_string(), channel);
 
         // DummyModelProvider has default capabilities (vision: false).
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
@@ -48119,6 +48535,10 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy {
+                workspace_dir: photo_dir.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
             sop_driver_sink: None,
         });
 
@@ -48129,7 +48549,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -48161,6 +48581,13 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
@@ -48242,6 +48669,10 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy {
+                workspace_dir: photo_dir.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
             sop_driver_sink: None,
         });
 
@@ -48251,7 +48682,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -48413,6 +48844,7 @@ This is an example JSON object for profile settings."#;
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
+            security: Arc::new(SecurityPolicy::default()),
         });
 
         process_channel_message(
@@ -48725,6 +49157,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -48886,6 +49319,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -49039,6 +49473,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -49212,6 +49647,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
@@ -50386,6 +50822,7 @@ This is an example JSON object for profile settings."#;
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         });
 
