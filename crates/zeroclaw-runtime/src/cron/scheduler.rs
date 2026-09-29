@@ -2972,14 +2972,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo selected-owner").unwrap();
-        // Legacy rows resolve their owner through the selected config.
-        let conn = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
-        conn.execute(
-            "UPDATE cron_jobs SET agent_alias = '' WHERE id = ?1",
-            [&job.id],
-        )
-        .unwrap();
-        drop(conn);
         config
             .agents
             .get_mut(TEST_AGENT)
@@ -2994,7 +2986,9 @@ mod tests {
         {
             let handle = authority.config();
             let mut live = handle.write();
+            // Disable the stored owner so the moved claim becomes effective.
             live.agents.get_mut(TEST_AGENT).unwrap().cron_jobs.clear();
+            live.agents.get_mut(TEST_AGENT).unwrap().enabled = false;
             live.agents
                 .get_mut("other")
                 .unwrap()

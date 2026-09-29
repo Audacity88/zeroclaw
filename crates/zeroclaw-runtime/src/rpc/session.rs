@@ -1537,6 +1537,17 @@ impl SessionStore {
         self.register_cancel_token_locked(&mut tokens, id, None, token)
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_cancel_token_for_generation_for_test(
+        &self,
+        id: &str,
+        session_generation: u64,
+        token: tokio_util::sync::CancellationToken,
+    ) -> u64 {
+        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        self.register_cancel_token_locked(&mut tokens, id, Some(session_generation), token)
+    }
+
     fn register_cancel_token_locked(
         &self,
         tokens: &mut HashMap<String, CancelTokenEntry>,
@@ -1770,7 +1781,13 @@ impl SessionStore {
         if current_generation != expected_generation {
             return None;
         }
-        Some(self.signal_cancellation(id, cause))
+        Some(
+            if cause == CancelCause::ClientRpc && expected_generation.is_none() {
+                self.signal_cancellation(id, cause)
+            } else {
+                self.signal_cancellation_for_generation(id, expected_generation, cause)
+            },
+        )
     }
 
     /// Signal an in-flight turn before a close/delete handler waits for the
@@ -2179,6 +2196,25 @@ mod tests {
             );
             assert_eq!(registration.finish(), None);
         }
+    }
+
+    #[tokio::test]
+    async fn client_cancellation_signals_unbound_prompt_registration() {
+        let store = make_store(4);
+        let token = tokio_util::sync::CancellationToken::new();
+        let (_guard, registration) = store
+            .acquire_prompt("reaped", None, token.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .signal_cancellation_for_incarnation("reaped", None, CancelCause::ClientRpc)
+                .await,
+            Some(true)
+        );
+        assert!(token.is_cancelled());
+        assert_eq!(registration.finish(), Some(CancelCause::ClientRpc));
     }
 
     #[tokio::test]

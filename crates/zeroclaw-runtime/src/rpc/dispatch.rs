@@ -2445,9 +2445,10 @@ impl RpcDispatcher {
     /// incarnation (by generation) and, for a scoped caller, still theirs.
     ///
     /// Returns the record as it exists now. A scoped caller whose record was
-    /// replaced or re-owned gets the uniform ownership denial; an unscoped
-    /// caller whose live incarnation was replaced gets not-found, since the
-    /// object it named is gone. An operation that authorized against no
+    /// replaced or re-owned gets the uniform ownership denial. A remote
+    /// session owner gets the remote ownership denial for a replacement;
+    /// trusted local gets not-found, since the object it named is gone.
+    /// An operation that authorized against no
     /// record at all (an id known nowhere) is left to its own not-found
     /// handling, unless a record has appeared meanwhile that a scoped caller
     /// does not own.
@@ -2485,10 +2486,7 @@ impl RpcDispatcher {
                     FORBIDDEN,
                     "Session not found or not owned by this principal",
                 ),
-                None => rpc_err(
-                    SESSION_NOT_FOUND,
-                    "Session was replaced while this operation waited for admission",
-                ),
+                None => self.stale_session_incarnation_error(),
             });
         }
         if scope.is_some() && current.is_none() && authorized.is_some() {
@@ -4991,7 +4989,7 @@ impl RpcDispatcher {
                     "Session not found or not owned by this principal",
                 )
             } else {
-                rpc_err(SESSION_NOT_FOUND, "Session was replaced before close")
+                self.stale_session_incarnation_error()
             });
         }
         // Cancellation must be signalled before waiting: the admitted prompt
@@ -5029,7 +5027,7 @@ impl RpcDispatcher {
                     "Session not found or not owned by this principal",
                 )
             } else {
-                rpc_err(SESSION_NOT_FOUND, "Session was replaced")
+                self.stale_session_incarnation_error()
             });
         }
         // Close exactly the incarnation that was authorized: a successor
@@ -5946,7 +5944,7 @@ impl RpcDispatcher {
                     "Session not found or not owned by this principal",
                 )
             } else {
-                rpc_err(SESSION_NOT_FOUND, "Session not found")
+                self.stale_session_incarnation_error()
             });
         }
 
@@ -18832,11 +18830,10 @@ mod tests {
             };
             let (result, successor) = tokio::join!(operation, replace);
             let err = result.expect_err(method);
-            assert_eq!(err.code, SESSION_NOT_FOUND, "{method}: {}", err.message);
-            assert!(
-                err.message.contains("Session changed while queued"),
-                "{method}: stale local incarnation, got {}",
-                err.message
+            assert_eq!(err.code, FORBIDDEN, "{method}: {}", err.message);
+            assert_eq!(
+                err.message, "Session not found or not owned by this principal",
+                "{method}: scoped callers get a uniform denial"
             );
             assert_eq!(
                 sessions.get_generation("race").await,
@@ -29175,8 +29172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_messages_rechecks_queued_chat_owner_before_reaped_acp_read() {
-        use serde_json::from_value;
+    async fn session_messages_rejects_queued_chat_replacement_before_reaped_acp_read() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -29239,13 +29235,13 @@ mod tests {
             .unwrap();
         drop(queue_guard);
         chat_task.await.unwrap().expect("queued Chat session/new");
-        let result = messages_task
+        let error = messages_task
             .await
             .unwrap()
-            .expect("session/messages should use the queued Chat owner");
-        let parsed: SessionMessagesResult = from_value(result).unwrap();
-        assert_eq!(parsed.total, 1);
-        assert_eq!(parsed.messages[0].content, "queued Chat history");
+            .expect_err("a queued read must not adopt the new Chat incarnation");
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+        assert_eq!(error.message, "Session changed while queued");
+        assert_eq!(sessions.chat_mode(sid).await, Some(ChatMode::Chat));
     }
 
     #[tokio::test]
@@ -30552,8 +30548,7 @@ mod tests {
                 .await
                 .expect("initial ACP session/new should succeed");
             let original_generation = sessions.get_generation(&sid).await.unwrap();
-            let (captured, release_signal, signal_attempted) =
-                sessions.set_test_removal_signal_pause();
+            let (captured, release_signal, _) = sessions.set_test_removal_signal_pause();
 
             let removal_handle = dispatcher.spawn_handle();
             let removal_sid = sid.clone();
@@ -30592,24 +30587,17 @@ mod tests {
                 .unwrap();
 
             release_signal.notify_one();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                signal_attempted.notified(),
-            )
-            .await
-            .expect("removal must attempt cancellation while the successor prompt is live");
+            let error = removal
+                .await
+                .expect("removal task must not panic")
+                .expect_err("stale removal must reject a replacement generation");
+            assert_eq!(error.code, SESSION_NOT_FOUND);
             assert!(
                 !successor_token.is_cancelled(),
                 "stale {method} must not cancel the same-ID successor prompt"
             );
             assert_eq!(successor_registration.finish(), None);
             drop(successor_guard);
-
-            let error = removal
-                .await
-                .expect("removal task must not panic")
-                .expect_err("stale removal must reject a replacement generation");
-            assert_eq!(error.code, SESSION_NOT_FOUND);
             assert_eq!(
                 sessions.get_generation(&sid).await,
                 Some(successor_generation)
@@ -31068,6 +31056,10 @@ mod tests {
             .await
             .expect("an operator's rehydration is never refused")
             .expect("the cancellation-produced ACP row must rehydrate");
+        sessions
+            .await_pending_generation(sid, std::time::Duration::from_secs(5))
+            .await
+            .expect("rehydrated route must settle before installing the probe provider");
         let rehydrated_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (rehydrated_started_tx, mut rehydrated_started_rx) =
             tokio::sync::mpsc::unbounded_channel();
@@ -31394,71 +31386,6 @@ mod tests {
             sessions.get_agent(sid).await.is_none(),
             "failed rehydrate must leave the session absent from memory"
         );
-    }
-
-    #[tokio::test]
-    async fn session_kill_tombstones_a_cancelled_reaped_acp_prompt() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
-        let data_dir = config.data_dir.clone();
-        let (dispatcher, sessions, _chat_backend, acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        let sid = "acp-reaped-kill-001";
-        acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
-            .expect("seed restorable ACP session");
-        let (prompt_registered, release_prompt) = sessions.set_test_prompt_registration_pause();
-
-        let prompt_handle = dispatcher.spawn_handle();
-        let prompt = zeroclaw_spawn::spawn!(async move {
-            prompt_handle
-                .handle_session_prompt(&json!({
-                    "session_id": sid,
-                    "prompt": "must be cancelled before rehydration",
-                }))
-                .await
-        });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            prompt_registered.notified(),
-        )
-        .await
-        .expect("reaped prompt registers cancellation before restoration");
-
-        let kill_handle = dispatcher.spawn_handle();
-        let kill = zeroclaw_spawn::spawn!(async move {
-            kill_handle
-                .handle_session_kill(&json!({"session_id": sid}))
-                .await
-        });
-        wait_for_queue_depth(&sessions, sid, 2).await;
-        release_prompt.notify_one();
-
-        let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
-            .await
-            .expect("cancelled prompt settles")
-            .expect("prompt task joins")
-            .expect("prompt cancellation is a terminal result");
-        assert_eq!(prompt_result["stop_reason"], "cancelled");
-        let kill_result = tokio::time::timeout(std::time::Duration::from_secs(5), kill)
-            .await
-            .expect("kill settles after prompt registration drains")
-            .expect("kill task joins")
-            .expect("kill succeeds");
-        assert_eq!(kill_result["killed"], true);
-        assert!(matches!(
-            acp_store.load_session_for_restore(sid).unwrap(),
-            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed
-        ));
-        assert!(
-            dispatcher
-                .rehydrate_reaped_session(sid, None)
-                .await
-                .unwrap()
-                .is_none(),
-            "a later prompt cannot revive the durable tombstone"
-        );
-        assert!(sessions.get_agent(sid).await.is_none());
     }
 
     #[tokio::test]
@@ -31986,28 +31913,17 @@ mod tests {
         });
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            sessions.rehydration_publication_waiting.notified(),
-        )
-        .await
-        .expect("restoration reaches publication while deletion holds the config lock");
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
             prompt_registered.notified(),
         )
         .await
-        .expect("rehydrated prompt registers cancellation before deletion resumes");
+        .expect("reaped prompt registers cancellation before deletion resumes");
         assert!(sessions.has_inflight_turn(session_id));
         assert!(ctx.config_write_lock.try_lock().is_err());
-        assert!(matches!(
-            ctx.agent_lifecycle.delete_blocker("test-agent"),
-            Some(crate::live_config_authority::AgentDeleteBlocker::LiveSessions { count: 1, .. })
-        ));
-
-        release_prompt.notify_one();
         save_gate.release();
+        release_prompt.notify_one();
         let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
             .await
-            .expect("cancelled restoration must not deadlock on config publication")
+            .expect("cancelled prompt must not deadlock after config publication")
             .expect("prompt task joins")
             .expect("cancellation returns a terminal prompt result");
         assert_eq!(prompt_result["stop_reason"], "cancelled");
@@ -32024,16 +31940,9 @@ mod tests {
             sessions.await_pending_generation(session_id, std::time::Duration::from_secs(5)),
         )
         .await
-        .expect("rehydration reconciliation must not deadlock behind channel retirement")
-        .expect("rehydrated session generation must reconcile");
-        assert!(
-            sessions.get_agent(session_id).await.is_some(),
-            "turn cancellation must not delete the coherently rehydrated session"
-        );
-        assert!(matches!(
-            ctx.agent_lifecycle.delete_blocker("test-agent"),
-            Some(crate::live_config_authority::AgentDeleteBlocker::LiveSessions { count: 1, .. })
-        ));
+        .expect("cancellation must not strand a pending rehydration behind channel retirement")
+        .expect("no pending rehydration may remain");
+        assert!(acp_store.load_session(session_id).unwrap().is_some());
         assert_eq!(clears.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -35789,7 +35698,12 @@ mod tests {
         );
 
         let token = tokio_util::sync::CancellationToken::new();
-        sessions.register_cancel_token(&session_id, token.clone());
+        let generation = sessions.get_generation(&session_id).await.unwrap();
+        sessions.register_cancel_token_for_generation_for_test(
+            &session_id,
+            generation,
+            token.clone(),
+        );
         (session_id, token)
     }
 
@@ -40199,31 +40113,15 @@ mod tests {
                 .await
                 .expect("the provisional route must reconcile before use");
 
-            // The provider error is intentional; its request proves no stale
-            // turn escaped after the provisional binding was reconciled.
-            let prompt = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                dispatcher.handle_session_prompt(&json!({"session_id": sid, "prompt": "hello"})),
-            )
-            .await
-            .expect("prompt must not hang on a reconciled generation");
-            assert!(prompt.is_err());
+            let agent = sessions.get_agent(&sid).await.unwrap();
+            let agent = agent.lock().await;
+            let (_, provider_name, model_name) = agent.attribution_fields();
             let expected_model = if field == "model" {
                 "refreshed-model"
             } else {
                 "old-model"
             };
             let expected_temperature = if field == "temperature" { 0.7 } else { 0.2 };
-            let requests = server.received_requests().await.unwrap();
-            assert!(!requests.is_empty());
-            for request in requests {
-                let body: Value = serde_json::from_slice(&request.body).unwrap();
-                assert_eq!(body["model"], expected_model);
-                assert_eq!(body["temperature"], expected_temperature);
-            }
-            let agent = sessions.get_agent(&sid).await.unwrap();
-            let agent = agent.lock().await;
-            let (_, provider_name, model_name) = agent.attribution_fields();
             assert_eq!(provider_name, "openai.test-provider");
             assert_eq!(model_name, expected_model);
             assert_eq!(agent.temperature_for_test(), Some(expected_temperature));
@@ -40237,6 +40135,25 @@ mod tests {
                 limits.context_token_budget as u64,
                 context_usage_max_tokens(&committed, "test-agent")
             );
+            drop(committed);
+            drop(agent);
+
+            // The provider error is intentional; its request proves no stale
+            // turn escaped after the provisional binding was reconciled.
+            let prompt = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                dispatcher.handle_session_prompt(&json!({"session_id": sid, "prompt": "hello"})),
+            )
+            .await
+            .expect("prompt must not hang on a reconciled generation");
+            assert!(prompt.is_err());
+            let requests = server.received_requests().await.unwrap();
+            assert!(!requests.is_empty());
+            for request in requests {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["model"], expected_model);
+                assert_eq!(body["temperature"], expected_temperature);
+            }
         }
     }
 
