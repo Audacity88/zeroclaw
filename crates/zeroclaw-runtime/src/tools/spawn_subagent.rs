@@ -96,6 +96,12 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
         execution_capability: None,
         execution_admission: None,
         sop_step_scope: crate::sop::active_scope::active_headless_step_scope(),
+        // Not yet propagated: a sub-turn spawned by an internally
+        // initiated parent (e.g. a cron turn delegating) loses the
+        // parent's initiating principal here. Inheritance semantics for
+        // nested dispatch belong to the reply-provenance slice of the
+        // internal-turn contract; until then absence is explicit.
+        internal_principal: None,
     }
 }
 

@@ -12,6 +12,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
@@ -224,7 +226,7 @@ impl Tool for SendMessageToPeerTool {
             let body = message.clone();
             let live_config = self.live_config.clone();
             // Build the recipient's cost-tracking context from `&cfg` before
-            // `cfg` moves into `process_message_shared` below — a detached
+            // `cfg` moves into the recipient turn below — a detached
             // `zeroclaw_spawn::spawn!` task does not inherit the caller's
             // task-locals, so the recipient's turn would otherwise run with
             // no cost context and its spend would go unrecorded.
@@ -233,11 +235,9 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
-                // The admitted recipient turn contains a complete agent loop;
-                // allocate it before adding the cost scopes so this detached
-                // worker does not construct the combined future on its stack.
-                let turn = Box::pin(
-                    crate::agent::loop_::process_message_shared_with_live_config_and_admission(
+                // Keep the admitted recipient turn out of the cost-scope wrappers.
+                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = Box::pin(
+                    crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
                         cfg,
                         live_config,
                         &turn_recipient_alias,
@@ -245,6 +245,9 @@ impl Tool for SendMessageToPeerTool {
                         None,
                         zeroclaw_api::ingress::TurnOrigin::AgentDirect,
                         admission,
+                        Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                            sender_alias: sender.clone(),
+                        }),
                     ),
                 );
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
