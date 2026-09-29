@@ -4430,6 +4430,7 @@ mod tests {
             vec![contested.clone()],
             &unique_component("contested"),
             &None,
+            None,
         )
         .await;
         assert!(
@@ -4491,7 +4492,14 @@ mod tests {
         assert_eq!(resolve_owning_agent(&config, &legacy), Some(TEST_AGENT));
 
         assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
-        process_due_jobs(&config, vec![legacy], &unique_component("sole"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![legacy],
+            &unique_component("sole"),
+            &None,
+            None,
+        )
+        .await;
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(

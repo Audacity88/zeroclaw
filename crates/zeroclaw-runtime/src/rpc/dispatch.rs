@@ -31725,6 +31725,8 @@ mod tests {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: Some(reload_tx),
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -36163,6 +36165,7 @@ mod tests {
                 "test-agent",
                 &crate::rpc::types::ChatMode::Chat,
                 expected_generation,
+                None,
             )
             .await
         {
@@ -36280,6 +36283,7 @@ mod tests {
                 "test-agent",
                 &crate::rpc::types::ChatMode::Chat,
                 Some(original_generation),
+                None,
             )
             .await
         {

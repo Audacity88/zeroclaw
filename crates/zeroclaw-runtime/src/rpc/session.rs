@@ -2020,8 +2020,8 @@ mod tests {
                     CancelCause::ClientRpc => signal_store.cancel_session("s"),
                     CancelCause::SessionRemoved => signal_store.signal_session_removal("s"),
                     CancelCause::AdminKill => signal_store.signal_session_kill("s"),
-                    CancelCause::ConnectionClosed => {
-                        unreachable!("connection closure is not a session-scoped RPC signal")
+                    CancelCause::ConnectionClosed | CancelCause::ChannelGeneration => {
+                        unreachable!("this test only exercises session-scoped RPC signals")
                     }
                 }
             });

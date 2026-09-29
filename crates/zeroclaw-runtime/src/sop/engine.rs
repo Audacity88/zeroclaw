@@ -7814,6 +7814,7 @@ mod tests {
             run_id,
             step,
             context,
+            ..
         } = action
         else {
             panic!("expected step 2 to execute, got {action:?}");
