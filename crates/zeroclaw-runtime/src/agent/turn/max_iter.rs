@@ -1310,6 +1310,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1327,6 +1328,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
@@ -1397,6 +1399,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1414,6 +1417,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),
@@ -1448,6 +1452,7 @@ mod graceful_summary_metering_tests {
             ChatMessage::user(carrier.clone()),
         ];
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1465,6 +1470,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             &multimodal_config,
+            None,
             None,
             None,
             |_, _| ResolvedContextLimits::legacy_fallback(0),

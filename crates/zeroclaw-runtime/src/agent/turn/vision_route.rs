@@ -1691,7 +1691,9 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
         )
+        .await
         .expect("no capability error on a plain degrade");
         assert!(vision.is_none());
         assert!(degrade, "the declared attachment must trigger the degrade");
@@ -1735,7 +1737,9 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
         )
+        .await
         .expect("no capability error");
         assert!(!degrade, "body markers alone must not degrade anything");
     }
