@@ -40113,30 +40113,30 @@ mod tests {
                 .await
                 .expect("the provisional route must reconcile before use");
 
-            let agent = sessions.get_agent(&sid).await.unwrap();
-            let agent = agent.lock().await;
-            let (_, provider_name, model_name) = agent.attribution_fields();
             let expected_model = if field == "model" {
                 "refreshed-model"
             } else {
                 "old-model"
             };
             let expected_temperature = if field == "temperature" { 0.7 } else { 0.2 };
-            assert_eq!(provider_name, "openai.test-provider");
-            assert_eq!(model_name, expected_model);
-            assert_eq!(agent.temperature_for_test(), Some(expected_temperature));
-            let limits = agent.context_limits_for_route(&provider_name, &model_name);
-            let committed = dispatcher.ctx.config.read();
-            assert_eq!(
-                limits.model_context_window,
-                committed.effective_model_context_window("test-agent")
-            );
-            assert_eq!(
-                limits.context_token_budget as u64,
-                context_usage_max_tokens(&committed, "test-agent")
-            );
-            drop(committed);
-            drop(agent);
+            {
+                let agent = sessions.get_agent(&sid).await.unwrap();
+                let agent = agent.lock().await;
+                let (_, provider_name, model_name) = agent.attribution_fields();
+                assert_eq!(provider_name, "openai.test-provider");
+                assert_eq!(model_name, expected_model);
+                assert_eq!(agent.temperature_for_test(), Some(expected_temperature));
+                let limits = agent.context_limits_for_route(&provider_name, &model_name);
+                let committed = dispatcher.ctx.config.read();
+                assert_eq!(
+                    limits.model_context_window,
+                    committed.effective_model_context_window("test-agent")
+                );
+                assert_eq!(
+                    limits.context_token_budget as u64,
+                    context_usage_max_tokens(&committed, "test-agent")
+                );
+            }
 
             // The provider error is intentional; its request proves no stale
             // turn escaped after the provisional binding was reconciled.
