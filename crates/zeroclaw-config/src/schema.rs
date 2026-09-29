@@ -28107,64 +28107,6 @@ mod tests {
         assert_eq!(contested[0].path, "agents");
     }
 
-    fn claiming_agent(enabled: bool, ids: &[&str]) -> super::AliasedAgentConfig {
-        super::AliasedAgentConfig {
-            enabled,
-            cron_jobs: ids.iter().map(|s| (*s).to_string()).collect(),
-            ..Default::default()
-        }
-    }
-
-    #[::core::prelude::v1::test]
-    fn cron_job_claim_distinguishes_every_shape() {
-        use super::CronJobClaim;
-        let mut config = super::Config::default();
-        config
-            .agents
-            .insert("a".into(), claiming_agent(true, &["sole", "shared"]));
-        config
-            .agents
-            .insert("b".into(), claiming_agent(true, &["shared"]));
-        config
-            .agents
-            .insert("off".into(), claiming_agent(false, &["dormant", "shared"]));
-
-        assert_eq!(config.cron_job_claim("sole"), CronJobClaim::Sole("a"));
-        assert_eq!(
-            config.cron_job_claim("shared"),
-            CronJobClaim::Contested(vec!["a", "b"]),
-            "a disabled claimant does not count toward contention"
-        );
-        assert_eq!(config.cron_job_claim("dormant"), CronJobClaim::DisabledOnly);
-        assert_eq!(config.cron_job_claim("nobody"), CronJobClaim::Unclaimed);
-
-        // Only the sole claim names an owner; a contested id has none.
-        assert_eq!(config.agent_for_cron_job("sole"), Some("a"));
-        assert_eq!(config.agent_for_cron_job("shared"), None);
-        assert_eq!(config.agent_for_cron_job("dormant"), None);
-        assert_eq!(config.agent_for_cron_job("nobody"), None);
-    }
-
-    #[::core::prelude::v1::test]
-    fn contested_cron_claim_is_a_validation_warning() {
-        let mut config = super::Config::default();
-        config
-            .agents
-            .insert("a".into(), claiming_agent(true, &["shared", "mine"]));
-        config
-            .agents
-            .insert("b".into(), claiming_agent(true, &["shared"]));
-        let warnings = config.collect_warnings();
-        let contested: Vec<_> = warnings
-            .iter()
-            .filter(|w| w.code == "cron_job_contested_claim")
-            .collect();
-        assert_eq!(contested.len(), 1, "{warnings:?}");
-        assert!(contested[0].message.contains("`shared`"));
-        assert!(contested[0].message.contains("a, b"));
-        assert_eq!(contested[0].path, "agents");
-    }
-
     #[::core::prelude::v1::test]
     fn cache_passthrough_deserializes_and_defaults_to_omitted() {
         let enabled: ModelProviderConfig = toml::from_str("cache_passthrough = true").unwrap();

@@ -458,6 +458,7 @@ where
             depth: 0,
             parent_id: None,
             originator_route: Some(channel.to_string()),
+            originator_chain: Vec::new(),
             delivered: false,
             idem_key: None,
             principal_id: Some(sender_alias.to_string()),
