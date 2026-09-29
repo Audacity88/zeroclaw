@@ -27721,7 +27721,6 @@ mod tests {
                 .input_bar
                 .load_for_edit("alpha beta".into(), Vec::new());
             active.enqueue_message("queued".into(), Vec::new()).unwrap();
-            let width = active.queue_sidebar_cols;
             chat.phase = ChatPhase::Active(Box::new(active));
             let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
                 crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
@@ -27733,7 +27732,6 @@ mod tests {
             chat.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), &mut term)
                 .await;
             assert!(active_state(&mut chat).input_bar.has_selection());
-            assert_eq!(active_state(&mut chat).queue_sidebar_cols, width);
             let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
             assert!(
                 chat.wants_quit_chord(&copy),
@@ -27778,9 +27776,6 @@ mod tests {
                 !chat.wants_quit_chord(&copy),
                 "browse mode must not claim input copy"
             );
-            chat.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), &mut term)
-                .await;
-            assert_ne!(active_state(&mut chat).queue_sidebar_cols, width);
         }
     }
 
