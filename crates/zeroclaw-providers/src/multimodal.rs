@@ -1042,11 +1042,9 @@ pub async fn count_latest_user_resolvable_image_markers(
     remote_allowed: bool,
     path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
 ) -> usize {
-    let Some(message) = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
-    else {
+    let Some(message) = messages.iter().rev().find(|message| {
+        message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
+    }) else {
         return 0;
     };
     // Inline, I/O-free classification: `inline` counts references that
