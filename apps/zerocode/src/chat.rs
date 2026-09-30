@@ -7765,12 +7765,7 @@ fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLin
     let mut screen_row = 0u16;
     for line in lines {
         let rows = wrapped_rows(line, width);
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        let urls = recognized_url_ranges(&text);
+        let (text, urls) = actionable_url_ranges(line);
         if !urls.is_empty() {
             // Private color tags carry occurrence identity through Paragraph's
             // actual wrapping and alignment; these colors are never displayed.
@@ -9587,12 +9582,7 @@ fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
 
 fn style_recognized_urls(lines: &mut [Line<'static>]) {
     for line in lines {
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        let ranges = recognized_url_ranges(&text);
+        let (_, ranges) = actionable_url_ranges(line);
         if ranges.is_empty() {
             continue;
         }
@@ -9635,6 +9625,128 @@ fn style_recognized_urls(lines: &mut [Line<'static>]) {
     }
 }
 
+const DISABLED_URL_UNDERLINE_COLOR: ratatui::style::Color = ratatui::style::Color::Rgb(1, 0, 1);
+
+fn disables_url_actions(span: &Span<'static>) -> bool {
+    span.style.underline_color == Some(DISABLED_URL_UNDERLINE_COLOR)
+}
+
+fn disabled_url_actions_style() -> Style {
+    Style {
+        underline_color: Some(DISABLED_URL_UNDERLINE_COLOR),
+        ..Style::default()
+    }
+}
+
+fn actionable_url_ranges(line: &Line<'static>) -> (String, Vec<(usize, usize, String)>) {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let mut disabled_ranges = Vec::new();
+    let mut offset = 0usize;
+    for span in &line.spans {
+        let end = offset + span.content.len();
+        if disables_url_actions(span) {
+            disabled_ranges.push((offset, end));
+        }
+        offset = end;
+    }
+    let urls = recognized_url_ranges(&text)
+        .into_iter()
+        .filter(|(start, end, _)| {
+            !disabled_ranges
+                .iter()
+                .any(|(disabled_start, disabled_end)| start < disabled_end && disabled_start < end)
+        })
+        .collect();
+    (text, urls)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableCellLine<'a> {
+    text: &'a str,
+    disabled_url_ranges: Vec<(usize, usize)>,
+}
+
+fn table_wrap_break(grapheme: &str) -> bool {
+    grapheme == "\u{200b}" || (grapheme != "\u{00a0}" && grapheme.chars().all(char::is_whitespace))
+}
+
+fn wrap_table_cell(text: &str, budget: usize) -> Vec<TableCellLine<'_>> {
+    let fragments =
+        if text.is_empty() || budget == 0 || crate::display_width::display_width(text) <= budget {
+            vec![(0, text.len())]
+        } else {
+            let graphemes = crate::display_width::grapheme_widths(text)
+                .map(|(start, grapheme, width)| {
+                    (
+                        start,
+                        start + grapheme.len(),
+                        width,
+                        table_wrap_break(grapheme),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut fragments = Vec::new();
+            let mut start_index = 0usize;
+            while start_index < graphemes.len() {
+                let mut width = 0usize;
+                let mut end_index = start_index;
+                let mut last_break = None;
+                while end_index < graphemes.len() {
+                    let next_width = width.saturating_add(graphemes[end_index].2);
+                    if end_index > start_index && next_width > budget {
+                        break;
+                    }
+                    width = next_width;
+                    end_index += 1;
+                    if graphemes[end_index - 1].3 {
+                        last_break = Some(end_index);
+                    }
+                    if width > budget {
+                        break;
+                    }
+                }
+                if end_index < graphemes.len() {
+                    end_index = last_break
+                        .filter(|index| *index > start_index)
+                        .unwrap_or(end_index);
+                }
+                let start = graphemes[start_index].0;
+                let end = graphemes[end_index - 1].1;
+                fragments.push((start, end));
+                start_index = end_index;
+            }
+            fragments
+        };
+
+    let split_urls = recognized_url_ranges(text)
+        .into_iter()
+        .filter(|(url_start, url_end, _)| {
+            !fragments
+                .iter()
+                .any(|(start, end)| start <= url_start && url_end <= end)
+        })
+        .collect::<Vec<_>>();
+    fragments
+        .into_iter()
+        .map(|(start, end)| TableCellLine {
+            text: &text[start..end],
+            disabled_url_ranges: split_urls
+                .iter()
+                .filter_map(|(url_start, url_end, _)| {
+                    let overlap_start = start.max(*url_start);
+                    let overlap_end = end.min(*url_end);
+                    (overlap_start < overlap_end)
+                        .then_some((overlap_start - start, overlap_end - start))
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn render_table(
     rows: Vec<Vec<String>>,
     alignments: Vec<pulldown_cmark::Alignment>,
@@ -9658,69 +9770,79 @@ fn render_table(
         }
     }
 
-    // Natural width per column = longest cell.
+    // Natural width per column = longest cell. Minimum width is the widest
+    // grapheme in the column so wrapping never splits or drops a display unit.
     let mut natural: Vec<usize> = vec![0; cols];
+    let mut minimum: Vec<usize> = vec![0; cols];
     for row in &grid {
         for (i, cell) in row.iter().enumerate() {
             natural[i] = natural[i].max(crate::display_width::display_width(cell.as_str()));
+            minimum[i] = minimum[i].max(
+                crate::display_width::grapheme_widths(cell)
+                    .map(|(_, _, width)| width)
+                    .max()
+                    .unwrap_or(0),
+            );
         }
     }
 
     // Frame budget: `│` borders (cols+1) + one-cell padding either side
     // of each cell (cols * 2).
     let frame = (cols + 1) + cols * 2;
+    let avail = (width as usize).saturating_sub(frame);
     let total_natural: usize = natural.iter().sum();
 
-    if frame.saturating_add(total_natural) > width as usize {
-        let mut out = Vec::new();
-        let header = &grid[0];
-        let body = &grid[1..];
-
-        if body.is_empty() {
-            return header
-                .iter()
-                .map(|cell| {
-                    Line::from(Span::styled(
-                        cell.clone(),
-                        theme::body_style().add_modifier(Modifier::BOLD),
-                    ))
-                })
-                .collect();
-        }
-
-        for (row_index, row) in body.iter().enumerate() {
-            if row_index > 0 {
-                out.push(Line::default());
+    let widths: Vec<usize> = if total_natural <= avail || total_natural == 0 {
+        natural.clone()
+    } else {
+        // Preserve every column and distribute the available content width
+        // proportionally. The minimum grid is wider than `width` only when the
+        // viewport cannot hold each column's widest grapheme plus its frame.
+        let mut widths = minimum.clone();
+        let minimum_total: usize = minimum.iter().sum();
+        let remaining = avail.saturating_sub(minimum_total);
+        let extra = natural
+            .iter()
+            .zip(&minimum)
+            .map(|(natural, minimum)| natural.saturating_sub(*minimum))
+            .collect::<Vec<_>>();
+        let total_extra: usize = extra.iter().sum();
+        if total_extra > 0 {
+            let mut remainders = Vec::with_capacity(cols);
+            for (index, extra_width) in extra.iter().copied().enumerate() {
+                let weighted = (extra_width as u128) * (remaining as u128);
+                widths[index] += usize::try_from(weighted / total_extra as u128)
+                    .unwrap_or(usize::MAX)
+                    .min(extra_width);
+                remainders.push((weighted % total_extra as u128, index));
             }
-            for (column_index, value) in row.iter().enumerate() {
-                let label = header[column_index].trim();
-                let mut spans = Vec::new();
-                if !label.is_empty() {
-                    spans.push(Span::styled(
-                        format!("{label}: "),
-                        theme::body_style().add_modifier(Modifier::BOLD),
-                    ));
+
+            let mut leftover = avail.saturating_sub(widths.iter().sum());
+            remainders.sort_unstable_by(|left, right| right.cmp(left));
+            for (_, index) in remainders {
+                if leftover == 0 {
+                    break;
                 }
-                spans.push(Span::styled(value.clone(), theme::body_style()));
-                out.push(Line::from(spans));
+                if widths[index] < natural[index] {
+                    widths[index] += 1;
+                    leftover -= 1;
+                }
             }
         }
-        return out;
-    }
+        widths
+    };
 
-    let widths = natural;
-
-    fn pad_cell(s: &str, budget: usize, align: MdAlign) -> String {
+    fn cell_padding(s: &str, budget: usize, align: MdAlign) -> (usize, usize) {
         let w = crate::display_width::display_width(s);
         let slack = budget.saturating_sub(w);
         match align {
-            MdAlign::Right => format!("{}{}", " ".repeat(slack), s),
+            MdAlign::Right => (slack, 0),
             MdAlign::Center => {
                 let left = slack / 2;
                 let right = slack - left;
-                format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+                (left, right)
             }
-            MdAlign::None | MdAlign::Left => format!("{}{}", s, " ".repeat(slack)),
+            MdAlign::None | MdAlign::Left => (0, slack),
         }
     }
 
@@ -9736,28 +9858,59 @@ fn render_table(
         Line::from(Span::styled(s, theme::dim_style()))
     };
 
-    let render_row = |cells: &[String]| -> Line<'static> {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
-        for (i, cell) in cells.iter().enumerate() {
-            let budget = widths[i];
-            let align = alignments.get(i).copied().unwrap_or(MdAlign::None);
-            let padded = pad_cell(cell, budget, align);
-            spans.push(Span::raw(format!(" {padded} ")));
-            spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
-        }
-        Line::from(spans)
+    let render_row = |cells: &[String]| -> Vec<Line<'static>> {
+        let wrapped_cells = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| wrap_table_cell(cell, widths[index]))
+            .collect::<Vec<_>>();
+        let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1);
+
+        (0..row_height)
+            .map(|line_index| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
+                for (index, cell_lines) in wrapped_cells.iter().enumerate() {
+                    let align = alignments.get(index).copied().unwrap_or(MdAlign::None);
+                    if let Some(fragment) = cell_lines.get(line_index) {
+                        let (left_padding, right_padding) =
+                            cell_padding(fragment.text, widths[index], align);
+                        spans.push(Span::raw(format!(" {}", " ".repeat(left_padding))));
+                        let mut cursor = 0usize;
+                        for (start, end) in &fragment.disabled_url_ranges {
+                            if *start > cursor {
+                                spans.push(Span::raw(fragment.text[cursor..*start].to_string()));
+                            }
+                            spans.push(Span::styled(
+                                fragment.text[*start..*end].to_string(),
+                                disabled_url_actions_style(),
+                            ));
+                            cursor = *end;
+                        }
+                        spans.push(Span::raw(format!(
+                            "{}{} ",
+                            &fragment.text[cursor..],
+                            " ".repeat(right_padding)
+                        )));
+                    } else {
+                        spans.push(Span::raw(format!(" {} ", " ".repeat(widths[index]))));
+                    }
+                    spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
+                }
+                Line::from(spans)
+            })
+            .collect()
     };
 
     let mut out: Vec<Line<'static>> = Vec::new();
     out.push(border("\u{250C}", "\u{252C}", "\u{2510}"));
     let mut iter = grid.into_iter();
     if let Some(header) = iter.next() {
-        out.push(render_row(&header));
+        out.extend(render_row(&header));
         out.push(border("\u{251C}", "\u{253C}", "\u{2524}"));
     }
     for row in iter {
-        out.push(render_row(&row));
+        out.extend(render_row(&row));
     }
     out.push(border("\u{2514}", "\u{2534}", "\u{2518}"));
     out
@@ -28238,6 +28391,251 @@ mod tests {
     }
 
     #[test]
+    fn md_table_wraps_cells_without_losing_the_grid_or_content() {
+        let width = 32;
+        let lines = markdown_to_lines(
+            "| key | value |\n|-----|-------|\n| mode | this cell is far too long for one row |\n",
+            width,
+        );
+        let out = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !out.contains('\u{2026}'),
+            "wrapped content must not truncate: {out}"
+        );
+        for word in ["this", "cell", "far", "too", "long", "for", "one", "row"] {
+            assert!(
+                out.contains(word),
+                "missing {word:?} from wrapped table: {out}"
+            );
+        }
+        let data_lines = out
+            .lines()
+            .filter(|line| {
+                line.contains("mode")
+                    || ["this", "cell", "long", "row"]
+                        .iter()
+                        .any(|word| line.contains(word))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            data_lines.len() > 1,
+            "data row should grow vertically: {out}"
+        );
+        assert!(
+            data_lines
+                .iter()
+                .all(|line| line.starts_with('\u{2502}') && line.ends_with('\u{2502}')),
+            "every wrapped line must retain table borders: {out}"
+        );
+        assert!(
+            lines.iter().all(|line| {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                crate::display_width::display_width(&text) <= width as usize
+            }),
+            "feasible table lines must stay within width {width}: {out}"
+        );
+    }
+
+    #[test]
+    fn md_table_wrapped_url_fragments_are_not_actionable() {
+        let lines = markdown_to_lines(
+            "| col |\n|-----|\n| https://example.com/a/very/long/path |\n\nhttps://example.org/ok\n",
+            24,
+        );
+        let wrapped_fragments = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| disables_url_actions(span))
+            .collect::<Vec<_>>();
+        assert!(!wrapped_fragments.is_empty(), "wrapped table URL fragments");
+        assert!(
+            wrapped_fragments.iter().all(|span| {
+                span.style.fg != Some(theme::active().accent)
+                    && !span.style.add_modifier.contains(Modifier::UNDERLINED)
+            }),
+            "partial table URLs must not look actionable: {lines:?}"
+        );
+        let reconstructed = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| disables_url_actions(span))
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(
+            reconstructed.contains("https://example.com/a/very/long/path"),
+            "wrapped URL content must remain complete: {reconstructed:?}"
+        );
+
+        let regions = url_line_regions_for_lines(&lines, 24);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls[0].2, "https://example.org/ok");
+        let expected_row = lines
+            .iter()
+            .take_while(|line| {
+                !line
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains("https://example.org/ok"))
+            })
+            .map(|line| wrapped_rows(line, 24))
+            .fold(0u16, u16::saturating_add);
+        assert_eq!(regions[0].row, expected_row);
+    }
+
+    #[test]
+    fn md_table_fitting_url_remains_actionable() {
+        let lines = markdown_to_lines("| col |\n|-----|\n| https://example.com/ok |\n", 80);
+        let regions = url_line_regions_for_lines(&lines, 80);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls[0].2, "https://example.com/ok");
+    }
+
+    #[test]
+    fn md_table_neighbor_url_remains_actionable_when_another_cell_wraps() {
+        let first_cell = "0123456789012345678901234567890123456789";
+        let url = "https://a.co";
+        let lines = markdown_to_lines(
+            &format!("| value | link |\n|-------|------|\n| {first_cell} | {url} |\n"),
+            58,
+        );
+        let fragments = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| disables_url_actions(span))
+            .collect::<Vec<_>>();
+        assert!(
+            fragments.is_empty(),
+            "non-URL wrapping must not suppress a neighboring URL: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.spans
+                        .iter()
+                        .any(|span| span.content.chars().any(|ch| ch.is_ascii_digit()))
+                })
+                .count()
+                > 1,
+            "first cell should wrap into a taller row: {lines:?}"
+        );
+
+        let regions = url_line_regions_for_lines(&lines, 58);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls[0].2, url);
+        let expected_row = lines
+            .iter()
+            .take_while(|line| !line.spans.iter().any(|span| span.content.contains(url)))
+            .map(|line| wrapped_rows(line, 58))
+            .fold(0u16, u16::saturating_add);
+        assert_eq!(regions[0].row, expected_row);
+    }
+
+    #[test]
+    fn md_table_fitting_url_remains_actionable_beside_split_url_in_same_cell() {
+        let split_url = "https://example.com/a/very/long/path";
+        let fitting_url = "https://b.co";
+        let lines = markdown_to_lines(
+            &format!("| links |\n|-------|\n| {split_url} {fitting_url} |\n"),
+            32,
+        );
+        let regions = url_line_regions_for_lines(&lines, 32);
+        assert_eq!(
+            regions.len(),
+            1,
+            "only the complete URL should be actionable"
+        );
+        assert_eq!(regions[0].urls.len(), 1);
+        assert_eq!(regions[0].urls[0].2, fitting_url);
+
+        let reconstructed = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .replace(
+                [
+                    ' ', '\u{2502}', '\u{250C}', '\u{2500}', '\u{2510}', '\u{251C}', '\u{253C}',
+                    '\u{2524}', '\u{2514}', '\u{2534}', '\u{2518}',
+                ],
+                "",
+            );
+        assert!(reconstructed.contains(split_url));
+        assert!(reconstructed.contains(fitting_url));
+    }
+
+    #[test]
+    fn md_table_cell_wrapping_preserves_break_characters_exactly() {
+        for input in ["a  b", "a\u{200b}b"] {
+            let reconstructed = wrap_table_cell(input, 2)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<String>();
+            assert_eq!(reconstructed, input);
+        }
+    }
+
+    #[test]
+    fn md_table_cell_wrapping_handles_more_than_u16_max_whitespace() {
+        let input = " ".repeat(70_000);
+        let wrapped = wrap_table_cell(&input, 65_536);
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(
+            wrapped.iter().map(|line| line.text).collect::<String>(),
+            input
+        );
+    }
+
+    #[test]
+    fn md_table_cell_fitting_unicode_and_zero_width_content_stays_whole() {
+        for (input, budget) in [("\u{754c}", 2), ("\u{200b}", 1), ("e\u{301}", 1)] {
+            let wrapped = wrap_table_cell(input, budget);
+            assert_eq!(
+                wrapped,
+                vec![TableCellLine {
+                    text: input,
+                    disabled_url_ranges: Vec::new(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn md_table_wraps_wide_graphemes_without_exceeding_feasible_width() {
+        let width = 8;
+        let lines = markdown_to_lines("| A |\n|---|\n| \u{754c}\u{754c}\u{754c} |\n", width);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered.matches('\u{754c}').count(), 3);
+        assert!(lines.iter().all(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            crate::display_width::display_width(&text) <= width as usize
+        }));
+    }
+
+    #[test]
     fn md_table_pads_emoji_presentation_to_two_cells() {
         // 🏔️ is U+1F3D4 + U+FE0F. Natural column width must be 2 (not 1), so a
         // wider sibling cell still leaves a full cell of space after the glyph.
@@ -28340,11 +28738,9 @@ mod tests {
     #[test]
     fn md_table_with_no_width_still_emits_lines() {
         // Defensive: zero width must not panic and must not emit infinite
-        // padding. The stacked fallback retains the source content.
+        // padding. The minimum grapheme-safe grid may exceed an impossible viewport.
         let out = markdown_to_lines("| A |\n|---|\n| 1 |\n", 0);
         assert!(!out.is_empty());
-        assert_eq!(out[0].spans[0].content.as_ref(), "A: ");
-        assert_eq!(out[0].spans[1].content.as_ref(), "1");
     }
 
     fn att(name: &str) -> PendingAttachment {
@@ -34039,57 +34435,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    #[test]
-    fn md_table_stacks_and_preserves_content_when_width_is_tight() {
-        let input = "| Name | Detail |\n|---|---|\n| first | this cell is far too long for a tiny width |\n";
-        let lines = markdown_to_lines(input, 20);
-        let out = rendered_lines(&lines);
-
-        assert!(
-            !out.contains('\u{2026}'),
-            "must not truncate table cells: {out}"
-        );
-        assert!(
-            !out.contains('\u{2502}'),
-            "oversized table should stack: {out}"
-        );
-        assert!(out.contains("Name: first"), "missing first field: {out}");
-        assert!(
-            out.contains("Detail: this cell is far too long for a tiny width"),
-            "missing complete detail: {out}"
-        );
-        assert!(
-            lines.iter().any(|line| wrapped_rows(line, 20) > 1),
-            "long stacked values should wrap into multiple screen rows"
-        );
-    }
-
-    #[test]
-    fn md_table_stacked_layout_preserves_unicode_and_row_boundaries() {
-        let input = "| 状態 | 説明 |\n|---|---|\n| ✅ | 長い日本語の説明です |\n| ⚠️ | second record remains reachable |\n";
-        let lines = markdown_to_lines(input, 12);
-        let out = rendered_lines(&lines);
-
-        assert!(out.contains("状態: ✅"), "missing wide-glyph field: {out}");
-        assert!(
-            out.contains("説明: 長い日本語の説明です"),
-            "missing CJK value: {out}"
-        );
-        assert!(
-            out.contains("説明: second record remains reachable"),
-            "missing second record: {out}"
-        );
-        assert_eq!(
-            lines.iter().filter(|line| line.spans.is_empty()).count(),
-            1,
-            "stacked records should have one separator: {out}"
-        );
-        assert!(
-            lines.iter().map(|line| wrapped_rows(line, 12)).sum::<u16>() > lines.len() as u16,
-            "narrow values should increase rendered row count"
-        );
     }
 
     #[test]
