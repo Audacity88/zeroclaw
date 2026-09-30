@@ -597,8 +597,9 @@ impl BrowserTool {
 
     /// Point `agent_browser_command` at a fake binary for tests. The only
     /// setter for [`Self::agent_browser_bin`]: production keeps `None` and
-    /// launches the installed `agent-browser`.
-    #[cfg(test)]
+    /// launches the installed `agent-browser`. Unix-only because every
+    /// caller drives a `#!/bin/sh` fake binary.
+    #[cfg(all(test, unix))]
     fn set_agent_browser_bin_for_tests(&mut self, bin: std::path::PathBuf) {
         self.agent_browser_bin = Some(bin);
     }
