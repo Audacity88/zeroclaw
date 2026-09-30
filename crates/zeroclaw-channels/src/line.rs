@@ -3415,7 +3415,7 @@ mod tests {
             0,
         )
         .with_api_base_url(&api_server.uri())
-        .with_persistence_authority(LiveConfigAuthority::new(config));
+        .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(config));
 
         // The guard is shared into `LineState`, so it outlives the move into
         // the webhook task and still answers for the code afterwards.
@@ -3509,7 +3509,7 @@ mod tests {
             0,
         )
         .with_api_base_url(&api_server.uri())
-        .with_persistence_authority(LiveConfigAuthority::new(config));
+        .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(config));
 
         let guard = ch.pairing.as_ref().expect("pairing offered").clone();
         let code = guard.pairing_code().expect("a fresh guard issues a code");

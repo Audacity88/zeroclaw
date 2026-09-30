@@ -1336,12 +1336,15 @@ mod tests {
         // The irreversible save+publish phase runs retained; the requester
         // only awaits the join handle. Simulate the requester disappearing
         // exactly while the save is paused inside the post-rename window.
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         let job = spawn_agent_lifecycle_job(Box::pin(async move {
             // `commit` owns the writer guard and the generation write lease for
             // the whole body; dropping this future is what releases them.
             let mut config = working;
             config.save_dirty().await?;
             commit.publish(revision, config)?;
+            drop(commit);
+            let _ = completed_tx.send(());
             Ok::<(), anyhow::Error>(())
         }));
         let requester = zeroclaw_spawn::spawn!(async move {
@@ -1354,18 +1357,14 @@ mod tests {
         assert!(requester.await.unwrap_err().is_cancelled());
         gate.release();
 
-        // The commit must complete on its own: publication lands, the
-        // writer guard releases, and the work lease drops.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while authority.published_revision() == prior_revision {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cancelled requester must not abandon the dispatched commit"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // Observe this retained task after its guard and lease are released;
+        // another authority may immediately acquire the shared writer mutex.
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed_rx)
+            .await
+            .expect("cancelled requester must not abandon the dispatched commit")
+            .expect("retained commit must signal completion");
+        assert_eq!(authority.published_revision(), revision);
         assert_eq!(authority.live_handle().read().gateway.host, "0.0.0.0");
-        assert!(!authority.config_write_lock_is_held());
         assert_eq!(authority.agent_lifecycle().active_config_write_count(), 0);
     }
 

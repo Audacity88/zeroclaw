@@ -15559,7 +15559,7 @@ fn collect_configured_channels_with_authority(
             continue;
         }
         let peer_resolver =
-            live_external_peer_resolver(Arc::clone(config_arc), "reddit", alias.clone());
+            live_external_peer_resolver(config_arc.clone(), "reddit", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Reddit",
             alias: Some(alias.clone()),
@@ -15595,7 +15595,7 @@ fn collect_configured_channels_with_authority(
             continue;
         }
         let peer_resolver =
-            live_external_peer_resolver(Arc::clone(config_arc), "bluesky", alias.clone());
+            live_external_peer_resolver(config_arc.clone(), "bluesky", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Bluesky",
             alias: Some(alias.clone()),
