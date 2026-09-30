@@ -25,83 +25,151 @@ pub(crate) const TOOL_NAME_LIMIT: usize = 64;
 /// nested synchronous delegate. Well under the reaper's heartbeat-age limit.
 pub(crate) const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Tool calls tracked as in flight at once; the oldest is dropped beyond this.
+const ACTIVE_CALLS_LIMIT: usize = 32;
+
 pub(crate) struct DelegateProgressSink {
-    state: Mutex<TaskProgress>,
+    state: Mutex<SinkState>,
     changed: tokio::sync::Notify,
     /// The background task's own receipt collector (never the launching
     /// turn's); `None` when receipts are off.
     receipts: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
+#[derive(Default)]
+struct SinkState {
+    progress: TaskProgress,
+    /// Calls started and not yet finished, oldest first. With parallel tools
+    /// several are in flight; completions are matched by call id when the
+    /// provider supplied one, else by name to the oldest unmatched start.
+    active: Vec<ActiveCall>,
+}
+
+struct ActiveCall {
+    call_id: Option<String>,
+    tool: TaskProgressTool,
+}
+
+impl SinkState {
+    /// `last_tool` is the newest call still running, else the last finished.
+    fn refresh_last_tool(&mut self, finished: Option<TaskProgressTool>) {
+        if let Some(running) = self.active.last() {
+            self.progress.last_tool = Some(running.tool.clone());
+        } else if let Some(finished) = finished {
+            self.progress.last_tool = Some(finished);
+        }
+    }
+}
+
 impl DelegateProgressSink {
     pub(crate) fn new(receipts: Option<Arc<std::sync::Mutex<Vec<String>>>>) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(TaskProgress::default()),
+            state: Mutex::new(SinkState::default()),
             changed: tokio::sync::Notify::new(),
             receipts,
         })
     }
 
-    /// Record the wall-clock budget the delegated loop runs under.
+    /// Record the wall-clock budget the delegated work runs under.
     pub(crate) fn set_timeout_budget(&self, secs: u64) {
-        self.state.lock().timeout_budget_secs = Some(secs);
+        self.state.lock().progress.timeout_budget_secs = Some(secs);
         self.changed.notify_one();
+    }
+
+    /// Record one model request issued outside an observed tool loop (the
+    /// single-call delegate path).
+    pub(crate) fn note_model_request(&self) {
+        self.update(|state| {
+            state.progress.iterations = state.progress.iterations.saturating_add(1);
+        });
+    }
+
+    /// Record activity with no count attached, such as a model reply
+    /// arriving on the single-call path.
+    pub(crate) fn note_activity(&self) {
+        self.update(|_| {});
     }
 
     /// Current progress, with the receipt tail read from the collector.
     pub(crate) fn snapshot(&self) -> TaskProgress {
-        let mut progress = self.state.lock().clone();
+        let mut progress = self.state.lock().progress.clone();
         if let Some(receipts) = &self.receipts {
             let receipts = receipts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let skip = receipts.len().saturating_sub(RECEIPT_TAIL_LIMIT);
-            progress.receipt_tail = receipts[skip..].to_vec();
+            progress.receipt_tail = receipts[skip..]
+                .iter()
+                .map(|entry| bounded_receipt_entry(entry))
+                .collect();
         }
         progress
     }
 
-    fn apply(&self, event: &ObserverEvent) {
-        let now = chrono::Utc::now().to_rfc3339();
+    fn update(&self, change: impl FnOnce(&mut SinkState)) {
         let mut state = self.state.lock();
+        change(&mut state);
+        state.progress.last_activity_at = Some(chrono::Utc::now().to_rfc3339());
+        drop(state);
+        self.changed.notify_one();
+    }
+
+    fn apply(&self, event: &ObserverEvent) {
         match event {
-            ObserverEvent::LlmRequest { .. } => {
-                state.iterations = state.iterations.saturating_add(1);
-            }
-            ObserverEvent::LlmResponse { .. } => {}
-            ObserverEvent::ToolCallStart { tool, .. } => {
-                state.last_tool = Some(TaskProgressTool {
-                    name: bounded_tool_name(tool),
-                    started_at: Some(now.clone()),
-                    finished_at: None,
-                    success: None,
+            ObserverEvent::LlmRequest { .. } => self.note_model_request(),
+            ObserverEvent::LlmResponse { .. } => self.note_activity(),
+            ObserverEvent::ToolCallStart {
+                tool, tool_call_id, ..
+            } => self.update(|state| {
+                state.active.push(ActiveCall {
+                    call_id: tool_call_id.clone(),
+                    tool: TaskProgressTool {
+                        name: bounded_tool_name(tool),
+                        started_at: Some(chrono::Utc::now().to_rfc3339()),
+                        finished_at: None,
+                        success: None,
+                    },
                 });
-            }
-            ObserverEvent::ToolCall { tool, success, .. } => {
+                let excess = state.active.len().saturating_sub(ACTIVE_CALLS_LIMIT);
+                state.active.drain(..excess);
+                state.refresh_last_tool(None);
+            }),
+            ObserverEvent::ToolCall {
+                tool,
+                tool_call_id,
+                success,
+                ..
+            } => self.update(|state| {
                 let name = bounded_tool_name(tool);
-                state.tools_completed = state.tools_completed.saturating_add(1);
-                let started_at = match &state.last_tool {
-                    Some(last) if last.name == name && last.finished_at.is_none() => {
-                        last.started_at.clone()
-                    }
-                    _ => None,
+                let matched = match tool_call_id {
+                    Some(id) => state
+                        .active
+                        .iter()
+                        .position(|call| call.call_id.as_deref() == Some(id.as_str())),
+                    None => state
+                        .active
+                        .iter()
+                        .position(|call| call.call_id.is_none() && call.tool.name == name),
                 };
+                let started_at = matched.and_then(|at| state.active.remove(at).tool.started_at);
                 let finished = TaskProgressTool {
                     name,
                     started_at,
-                    finished_at: Some(now.clone()),
+                    finished_at: Some(chrono::Utc::now().to_rfc3339()),
                     success: Some(*success),
                 };
-                state.last_tool = Some(finished.clone());
-                state.recent_tools.push(finished);
-                let excess = state.recent_tools.len().saturating_sub(RECENT_TOOLS_LIMIT);
-                state.recent_tools.drain(..excess);
-            }
-            _ => return,
+                state.progress.tools_completed = state.progress.tools_completed.saturating_add(1);
+                state.progress.recent_tools.push(finished.clone());
+                let excess = state
+                    .progress
+                    .recent_tools
+                    .len()
+                    .saturating_sub(RECENT_TOOLS_LIMIT);
+                state.progress.recent_tools.drain(..excess);
+                state.refresh_last_tool(Some(finished));
+            }),
+            _ => {}
         }
-        state.last_activity_at = Some(now);
-        drop(state);
-        self.changed.notify_one();
     }
 }
 
@@ -123,6 +191,16 @@ impl Observer for DelegateProgressSink {
 
 fn bounded_tool_name(name: &str) -> String {
     name.chars().take(TOOL_NAME_LIMIT).collect()
+}
+
+/// Collector entries read `<tool name>: <signed token>`. The name is bounded
+/// like every other tool name here; the token is kept whole so it still
+/// verifies.
+fn bounded_receipt_entry(entry: &str) -> String {
+    match entry.rsplit_once(": ") {
+        Some((name, token)) => format!("{}: {token}", bounded_tool_name(name)),
+        None => entry.to_string(),
+    }
 }
 
 /// Write `sink`'s progress to the task row whenever it changes and at least
@@ -273,6 +351,127 @@ mod tests {
             !encoded.contains(secret),
             "arguments and results must never reach the stored progress: {encoded}"
         );
+    }
+
+    fn start_with_id(tool: &str, id: Option<&str>) -> ObserverEvent {
+        ObserverEvent::ToolCallStart {
+            tool: tool.into(),
+            tool_call_id: id.map(Into::into),
+            arguments: None,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: None,
+        }
+    }
+
+    fn done_with_id(tool: &str, id: Option<&str>) -> ObserverEvent {
+        ObserverEvent::ToolCall {
+            tool: tool.into(),
+            tool_call_id: id.map(Into::into),
+            duration: Duration::from_millis(1),
+            success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: None,
+        }
+    }
+
+    #[test]
+    fn interleaved_parallel_calls_keep_the_running_call_visible() {
+        let sink = DelegateProgressSink::new(None);
+        sink.record_event(&start_with_id("slow_a", Some("call_a")));
+        let a_started = sink.snapshot().last_tool.unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        sink.record_event(&start_with_id("fast_b", Some("call_b")));
+        let b_started = sink.snapshot().last_tool.unwrap();
+        assert_eq!(b_started.name, "fast_b", "newest running call is shown");
+        sink.record_event(&done_with_id("fast_b", Some("call_b")));
+
+        let progress = sink.snapshot();
+        let last = progress.last_tool.expect("last tool");
+        assert_eq!(
+            last.name, "slow_a",
+            "a finished fast call must not hide the call still running"
+        );
+        assert!(last.finished_at.is_none());
+        assert_eq!(
+            last.started_at, a_started.started_at,
+            "A keeps its own start"
+        );
+        assert_eq!(progress.recent_tools.len(), 1);
+        assert_eq!(progress.recent_tools[0].name, "fast_b");
+        assert_eq!(progress.recent_tools[0].started_at, b_started.started_at);
+
+        sink.record_event(&done_with_id("slow_a", Some("call_a")));
+        let last = sink.snapshot().last_tool.expect("last tool");
+        assert_eq!(last.name, "slow_a");
+        assert!(last.finished_at.is_some(), "nothing left running: {last:?}");
+    }
+
+    #[test]
+    fn same_name_calls_match_their_own_start_times() {
+        let sink = DelegateProgressSink::new(None);
+        sink.record_event(&start_with_id("shell", Some("first")));
+        let first_start = sink.snapshot().last_tool.unwrap().started_at;
+        std::thread::sleep(Duration::from_millis(5));
+        sink.record_event(&start_with_id("shell", Some("second")));
+        let second_start = sink.snapshot().last_tool.unwrap().started_at;
+        assert_ne!(first_start, second_start);
+        sink.record_event(&done_with_id("shell", Some("first")));
+
+        let progress = sink.snapshot();
+        assert_eq!(
+            progress.recent_tools[0].started_at, first_start,
+            "the older call's completion keeps the older start time"
+        );
+        assert_eq!(
+            progress.last_tool.unwrap().started_at,
+            second_start,
+            "the newer call is still running"
+        );
+
+        // Without provider call ids, completion matches the oldest start by name.
+        let sink = DelegateProgressSink::new(None);
+        sink.record_event(&start_with_id("shell", None));
+        let first_start = sink.snapshot().last_tool.unwrap().started_at;
+        std::thread::sleep(Duration::from_millis(5));
+        sink.record_event(&start_with_id("shell", None));
+        sink.record_event(&done_with_id("shell", None));
+        assert_eq!(sink.snapshot().recent_tools[0].started_at, first_start);
+    }
+
+    #[test]
+    fn receipt_tail_bounds_the_name_and_keeps_the_token() {
+        let long_name = "m".repeat(200);
+        let token = "zc-receipt-1790781952-AbHncFOqODEH1ywZWNzkO5hIwByRbcj7qEeGt2LTFZI";
+        let receipts = Arc::new(std::sync::Mutex::new(vec![format!("{long_name}: {token}")]));
+        let sink = DelegateProgressSink::new(Some(receipts));
+        let tail = sink.snapshot().receipt_tail;
+        assert_eq!(
+            tail,
+            vec![format!("{}: {token}", "m".repeat(TOOL_NAME_LIMIT))]
+        );
+    }
+
+    #[test]
+    fn single_call_notes_count_the_request_and_record_activity() {
+        let sink = DelegateProgressSink::new(None);
+        sink.set_timeout_budget(120);
+        sink.note_model_request();
+        let progress = sink.snapshot();
+        assert_eq!(progress.iterations, 1);
+        let first_activity = progress.last_activity_at.clone();
+        assert!(first_activity.is_some());
+        std::thread::sleep(Duration::from_millis(5));
+        sink.note_activity();
+        let progress = sink.snapshot();
+        assert_eq!(progress.iterations, 1, "a reply is activity, not a request");
+        assert_ne!(progress.last_activity_at, first_activity);
+        assert_eq!(progress.timeout_budget_secs, Some(120));
     }
 
     #[test]

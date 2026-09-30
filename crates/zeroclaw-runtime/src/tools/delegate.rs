@@ -2891,11 +2891,20 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        // A single-call background delegate has no tool loop to observe, so
+        // its one model request and the reply are recorded here.
+        if let Some(sink) = self.progress.as_deref() {
+            sink.set_timeout_budget(timeout_secs);
+            sink.note_model_request();
+        }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
         )
         .await;
+        if let Some(sink) = self.progress.as_deref() {
+            sink.note_activity();
+        }
 
         let result = match result {
             Ok(inner) => inner,
@@ -10323,6 +10332,113 @@ mod tests {
             receipts.is_empty(),
             "detached receipts must not append to the launching turn's collector: {receipts:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn single_call_background_delegate_counts_its_model_request() {
+        let (server, _captured) = start_scripted_chat_server(&[
+            serde_json::json!({"choices": [{"message": {"content": "single done"}}]}),
+        ])
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("single-test-model".to_string()),
+            api_key: Some("single-test-key".to_string()),
+            timeout_secs: Some(5),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: zeroclaw_config::autonomy::DelegationPolicy {
+                    mode: zeroclaw_config::autonomy::DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(tmp.path().join("workspace"))
+            .with_providers_models(providers_models);
+
+        let started = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "one call in background",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(started.success, "background delegate failed: {started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+        let done = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_eq!(done.status, BackgroundTaskStatus::Completed, "{done:?}");
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+        let progress = &view["progress"];
+        assert_eq!(
+            progress["iterations"], 1,
+            "the one request is counted: {view}"
+        );
+        assert!(progress["last_activity_at"].is_string(), "{view}");
+        assert!(progress["timeout_budget_secs"].as_u64().is_some(), "{view}");
+        assert_eq!(progress["tools_completed"], 0, "{view}");
     }
 
     /// Blocks inside `execute` until released, so a test can read a
