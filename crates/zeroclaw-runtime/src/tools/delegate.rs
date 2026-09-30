@@ -10737,7 +10737,8 @@ mod tests {
             thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         });
 
@@ -10790,7 +10791,8 @@ mod tests {
             thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         });
 
@@ -10831,7 +10833,8 @@ mod tests {
             thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         });
 
@@ -10887,7 +10890,8 @@ mod tests {
             thinking_delegate_fixture(DelegateExecutionMode::Bounded, target_thinking);
         let provider = ThinkingRecordingModelProvider::default();
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
             display: None,
         });
 

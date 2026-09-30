@@ -60,6 +60,7 @@ pub(crate) fn record_llm_failure(
 pub(crate) async fn try_recover_context_overflow(
     injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
+    model: &str,
     e: &anyhow::Error,
     iteration: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
@@ -118,6 +119,7 @@ pub(crate) async fn try_recover_context_overflow(
             // uses, owner-aware so a pre-existing crumb does not stack and a
             // genuine user turn equal to the breadcrumb is never mistaken.
             *crumb_present = insert_breadcrumb_deduped(&mut recovered_history, *crumb_present);
+            super::strip_reasoning_after_prefix_rewrite(&mut recovered_history, model);
             // Recompute from the final recovered history (breadcrumb included)
             // so the reported count matches what the retried call sends.
             tokens_after = crate::agent::history::estimate_history_tokens(&recovered_history);
@@ -231,6 +233,117 @@ mod tests {
     use zeroclaw_providers::ChatMessage;
 
     #[tokio::test]
+    async fn recovery_invalidates_reasoning_only_after_rewrite_on_selected_models() {
+        for (model, strips) in [
+            ("claude-fable-5-1", true),
+            ("claude-fable-5", true),
+            ("claude-opus-4-5", true),
+            ("claude-sonnet-4-5", false),
+            ("other-model", false),
+        ] {
+            let envelope = |id: &str| {
+                crate::agent::loop_::build_native_assistant_history(
+                    "progress",
+                    &[zeroclaw_providers::ToolCall {
+                        id: id.into(),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                        extra_content: Some(serde_json::json!({"opaque_signature": id})),
+                    }],
+                    Some("signed reasoning"),
+                )
+            };
+            let result = |id: &str| ChatMessage {
+                role: "tool".into(),
+                content: serde_json::json!({"tool_call_id": id, "content": "done"}).to_string(),
+            };
+            let mut history = vec![
+                ChatMessage::system("system"),
+                ChatMessage::user("newer ask"),
+                ChatMessage::assistant(envelope("prior-call")),
+                result("prior-call"),
+                ChatMessage::user("current ask"),
+                ChatMessage::assistant(envelope("in-flight-call")),
+                result("in-flight-call"),
+            ];
+            let mut crumb = false;
+            let untouched = serde_json::to_value(&history).unwrap();
+            assert!(
+                !super::try_recover_context_overflow(
+                    &mut None,
+                    &mut history,
+                    model,
+                    &anyhow::Error::msg("ordinary failure"),
+                    0,
+                    None,
+                    None,
+                    &NoopObserver,
+                    limits(32_000),
+                    None,
+                    "test",
+                    &mut crumb,
+                )
+                .await
+            );
+            assert_eq!(serde_json::to_value(&history).unwrap(), untouched);
+            history.splice(
+                1..1,
+                [
+                    ChatMessage::user("older ask ".repeat(4000)),
+                    ChatMessage::assistant("older answer"),
+                ],
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            assert!(
+                super::try_recover_context_overflow(
+                    &mut None,
+                    &mut history,
+                    model,
+                    &anyhow::Error::msg("maximum context length exceeded"),
+                    1,
+                    Some(&tx),
+                    None,
+                    &NoopObserver,
+                    limits(32_000),
+                    None,
+                    "test",
+                    &mut crumb,
+                )
+                .await,
+                "{model}"
+            );
+            assert!(crumb);
+            for id in ["prior-call", "in-flight-call"] {
+                let assistant = history
+                    .iter()
+                    .find(|message| message.role == "assistant" && message.content.contains(id))
+                    .unwrap();
+                let envelope: serde_json::Value = serde_json::from_str(&assistant.content).unwrap();
+                assert_eq!(
+                    envelope.get("reasoning_content").is_none(),
+                    strips,
+                    "{model}"
+                );
+                assert_eq!(
+                    envelope["tool_calls"][0]["extra_content"]["opaque_signature"],
+                    id
+                );
+                assert!(
+                    history
+                        .iter()
+                        .any(|message| message.role == "tool" && message.content.contains(id))
+                );
+            }
+            let zeroclaw_api::agent::TurnEvent::HistoryTrimmed { tokens_after, .. } =
+                rx.try_recv().unwrap()
+            else {
+                panic!("real trim must publish its final retained population");
+            };
+            assert_eq!(tokens_after, Some(estimate_history_tokens(&history) as u64));
+        }
+    }
+
+    #[tokio::test]
     async fn retained_snapshot_tracks_injected_memory_across_retry_turn_trims() {
         let preamble = "private recalled memory\n";
         let genuine = format!("{preamble}genuine retry text");
@@ -262,6 +375,7 @@ mod tests {
             super::try_recover_context_overflow(
                 &mut injected,
                 &mut history,
+                "claude-sonnet-4-5",
                 &error,
                 0,
                 Some(&tx),
@@ -316,6 +430,7 @@ mod tests {
             super::try_recover_context_overflow(
                 &mut injected,
                 &mut history,
+                "claude-sonnet-4-5",
                 &error,
                 1,
                 Some(&tx),
@@ -358,6 +473,7 @@ mod tests {
         super::try_recover_context_overflow(
             injected_memory_preamble,
             history,
+            "claude-sonnet-4-5",
             error,
             iteration,
             event_tx,
@@ -409,6 +525,7 @@ mod tests {
         let recovered = super::try_recover_context_overflow(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &anyhow::Error::msg("maximum context length exceeded"),
             1,
             None,

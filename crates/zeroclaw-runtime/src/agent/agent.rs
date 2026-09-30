@@ -474,10 +474,10 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
-    /// Resolves the structured-history turn limit from canonical config at use time.
+    /// Resolves the structured-history cap and low-water fraction together.
     /// Daemon-backed sessions capture the shared live config handle so reloads
     /// affect existing sessions without duplicating config-derived state.
-    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_trim_policy_resolver: Option<Arc<dyn Fn() -> (usize, f32) + Send + Sync>>,
     /// Resolves limits from canonical config for the provider/model route that
     /// is active when a turn starts. The route itself remains the source of truth.
     context_limits_resolver: Option<ContextLimitsResolver>,
@@ -721,7 +721,7 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
-    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_trim_policy_resolver: Option<Arc<dyn Fn() -> (usize, f32) + Send + Sync>>,
     context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -786,7 +786,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_history_turn_limit_resolver: None,
+            structured_history_trim_policy_resolver: None,
             context_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
@@ -891,11 +891,11 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_turn_limit_resolver(
+    fn structured_history_trim_policy_resolver(
         mut self,
-        resolver: Arc<dyn Fn() -> usize + Send + Sync>,
+        resolver: Arc<dyn Fn() -> (usize, f32) + Send + Sync>,
     ) -> Self {
-        self.structured_history_turn_limit_resolver = Some(resolver);
+        self.structured_history_trim_policy_resolver = Some(resolver);
         self
     }
 
@@ -906,7 +906,7 @@ impl AgentBuilder {
 
     #[cfg(test)]
     pub(crate) fn structured_max_history_turns(self, max: usize) -> Self {
-        self.structured_history_turn_limit_resolver(Arc::new(move || max))
+        self.structured_history_trim_policy_resolver(Arc::new(move || (max, 1.0)))
     }
 
     pub fn multimodal_config(
@@ -1264,7 +1264,7 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_turn_limit_resolver: self.structured_history_turn_limit_resolver,
+            structured_history_trim_policy_resolver: self.structured_history_trim_policy_resolver,
             context_limits_resolver: self.context_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name,
@@ -2976,17 +2976,22 @@ impl Agent {
                 })
             };
 
-        let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
+        let structured_history_trim_policy_resolver: Arc<dyn Fn() -> (usize, f32) + Send + Sync> =
             if let Some(cap_config) = live_config.clone() {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
-                    cap_config
-                        .read()
-                        .effective_structured_max_history_messages(&cap_agent_alias)
+                    let config = cap_config.read();
+                    (
+                        config.effective_structured_max_history_messages(&cap_agent_alias),
+                        config.effective_history_trim_low_water(&cap_agent_alias),
+                    )
                 })
             } else {
-                let max = config.effective_structured_max_history_messages(agent_alias);
-                Arc::new(move || max)
+                let policy = (
+                    config.effective_structured_max_history_messages(agent_alias),
+                    config.effective_history_trim_low_water(agent_alias),
+                );
+                Arc::new(move || policy)
             };
 
         let builder = Agent::builder();
@@ -3014,7 +3019,7 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_history_turn_limit_resolver(structured_history_turn_limit_resolver)
+            .structured_history_trim_policy_resolver(structured_history_trim_policy_resolver)
             .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
@@ -3086,20 +3091,44 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max_turns = self
-            .structured_history_turn_limit_resolver
+        let (max_turns, low_water) = self
+            .structured_history_trim_policy_resolver
             .as_ref()
-            .map_or(self.config.resolved.max_history_messages, |resolve| {
-                resolve()
-            });
+            .map_or(
+                (
+                    self.config.resolved.max_history_messages,
+                    self.config.resolved.history_trim_low_water,
+                ),
+                |resolve| resolve(),
+            );
+        let target_turns = crate::agent::history_trim::history_trim_target(max_turns, low_water);
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
             max_turns,
+            target_turns,
             self.history_has_trim_breadcrumb,
         );
         self.history = result.history;
         if !result.trimmed {
             return None;
+        }
+
+        if zeroclaw_providers::claude_models::claude_keeps_prior_thinking(&self.model_name) {
+            let stripped = crate::agent::history_trim::strip_all_reasoning_from_conversation(
+                &mut self.history,
+            );
+            if stripped > 0 {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "model": self.model_name,
+                            "messages": stripped,
+                        })),
+                    "dropped replayed reasoning after a turn-boundary history trim"
+                );
+            }
         }
 
         crate::agent::history_trim::insert_conversation_breadcrumb(&mut self.history);
@@ -3132,6 +3161,7 @@ impl Agent {
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "max_history_turns": max_turns,
+                        "trim_target_turns": target_turns,
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
@@ -6206,11 +6236,16 @@ mod tests {
 
         let message = crate::agent::terminal_completion_error_message(&error, None)
             .expect("an exhausted refusal projects a user-facing message");
+        let category =
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-refused-category-other");
         assert_eq!(
             message,
-            crate::i18n::get_required_cli_string("cli-agent-error-provider-refusal")
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-agent-error-provider-refused",
+                &[("category", category.as_str())],
+            )
         );
-        assert!(message.contains("safety system"), "{message}");
+        assert!(message.contains(category.as_str()), "{message}");
         assert!(!message.contains("private-category"));
         assert!(
             zeroclaw_providers::reliable::transient_error_hint(&error)
@@ -11144,6 +11179,60 @@ mod tests {
     }
 
     #[test]
+    fn history_rewrite_strips_reasoning_only_after_trim_on_prior_thinking_models() {
+        for (model, strips) in [
+            ("claude-opus-4-5", true),
+            ("claude-sonnet-4-5", false),
+            ("claude-haiku-4-6", false),
+        ] {
+            let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver {});
+            let mut agent = trim_history_test_agent(1, observer);
+            agent.model_name = model.into();
+            agent.history = vec![
+                ConversationMessage::Chat(ChatMessage::system("system")),
+                ConversationMessage::Chat(ChatMessage::user("newest request")),
+            ];
+            push_trim_history_tool_exchange(&mut agent, 1);
+            if let ConversationMessage::AssistantToolCalls {
+                reasoning_content, ..
+            } = &mut agent.history[2]
+            {
+                *reasoning_content = Some("signed prior thinking".into());
+            }
+            let before = serde_json::to_value(&agent.history).unwrap();
+            assert!(agent.trim_history(None).is_none());
+            assert_eq!(serde_json::to_value(&agent.history).unwrap(), before);
+            agent.history.splice(
+                1..1,
+                [
+                    ConversationMessage::Chat(ChatMessage::user("old request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+                ],
+            );
+            assert!(agent.trim_history(None).is_some());
+            assert_eq!(
+                agent.history.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls {
+                        reasoning_content: Some(_),
+                        ..
+                    }
+                )),
+                !strips,
+                "{model}"
+            );
+            assert!(agent.history.iter().any(|message| matches!(message,
+                ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                    if tool_calls[0].id == "trim-history-call-1"
+            )));
+            assert!(agent.history.iter().any(|message| matches!(message,
+                ConversationMessage::ToolResults(results)
+                    if results[0].tool_call_id == "trim-history-call-1"
+            )));
+        }
+    }
+
+    #[test]
     fn trim_history_drops_old_turn_with_breadcrumb_and_observer_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
@@ -13142,8 +13231,9 @@ mod tests {
         let answer_a = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 1_024,
+                    budget_tokens: Some(1_024),
                     display: None,
+                    effort: None,
                 }),
                 agent_a.turn("same request"),
             )
@@ -13152,8 +13242,9 @@ mod tests {
         let answer_b = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 2_048,
+                    budget_tokens: Some(2_048),
                     display: None,
+                    effort: None,
                 }),
                 agent_b.turn("same request"),
             )
@@ -16660,6 +16751,11 @@ model_provider = "custom.only"
         .expect("direct Agent construction");
 
         *live.write() = direct_live_generation_config(temp.path(), "new", "new-model", 8_000, 3);
+        live.write()
+            .runtime_profiles
+            .get_mut("default")
+            .unwrap()
+            .history_trim_low_water = Some(0.5);
         retained.sync_config_generation();
 
         let (_, retained_provider, retained_model) = retained.attribution_fields();
@@ -16685,10 +16781,10 @@ model_provider = "custom.only"
         );
         assert_eq!(
             retained
-                .structured_history_turn_limit_resolver
+                .structured_history_trim_policy_resolver
                 .as_ref()
                 .expect("direct Agent history resolver")(),
-            3,
+            (3, 0.5),
             "independently live history policy must adopt the reload while route state stays pinned"
         );
         assert_eq!(

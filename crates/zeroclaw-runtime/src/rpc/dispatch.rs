@@ -30484,6 +30484,7 @@ mod tests {
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
             1,
+            1,
             false,
         );
         assert!(active.trimmed);

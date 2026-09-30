@@ -105,6 +105,8 @@ kept for schema compatibility and can be renamed in a future schema version.
 Channel sender caches remain a separate exception: they count individual
 message rows and preserve their existing `0`-means-default behavior.
 
+Structured-agent count trims use `history_trim_low_water`, a runtime-profile fraction in `(0.0, 1.0]` that defaults to `0.7`. The trim triggers only above the whole-turn cap, then keeps `max(1, floor(max_history_messages * history_trim_low_water))` recent complete turns. The newest turn always remains. This leaves room for new turns instead of trimming on every turn near the cap. Setting `1.0` trims straight to the cap and disables hysteresis.
+
 ## Visible trimming
 
 Whenever token-budget trimming or the whole-turn limit drops older turns, the

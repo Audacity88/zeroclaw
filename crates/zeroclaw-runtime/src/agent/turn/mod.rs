@@ -579,6 +579,7 @@ fn record_dispatch_trim(
 fn surface_oversized_dispatch_if_needed(
     injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
+    model: &str,
     crumb_present: &mut bool,
     measured_population: u64,
     context_token_budget: usize,
@@ -596,6 +597,7 @@ fn surface_oversized_dispatch_if_needed(
         } else {
             *crumb_present =
                 crate::agent::history_trim::insert_breadcrumb_deduped(history, *crumb_present);
+            strip_reasoning_after_prefix_rewrite(history, model);
             outcome = PreDispatchOutcome::Trimmed;
         }
     }
@@ -608,10 +610,35 @@ fn surface_oversized_dispatch_if_needed(
     }
 }
 
+/// Call only after an actual history-prefix rewrite, never for an untrimmed
+/// in-flight round. Preserve the reactive recovery's accepted model gates.
+fn strip_reasoning_after_prefix_rewrite(history: &mut [ChatMessage], model: &str) {
+    if zeroclaw_providers::claude_models::claude_thinking_shape(model)
+        != zeroclaw_providers::claude_models::ClaudeThinkingShape::Adaptive
+        && !zeroclaw_providers::claude_models::claude_keeps_prior_thinking(model)
+    {
+        return;
+    }
+    let stripped = crate::agent::history_trim::strip_all_reasoning(history);
+    if stripped > 0 {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "model": model,
+                    "messages": stripped,
+                })),
+            "dropped replayed reasoning after a history prefix rewrite"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enforce_reported_budget(
     injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
+    model: &str,
     reported_input_tokens: usize,
     // Estimated token count of the exact message population that produced
     // `reported_input_tokens` (the request built from `prepared_messages`,
@@ -748,6 +775,9 @@ async fn enforce_reported_budget(
     // reserve is re-measured at every dispatch seam, so hooks whose growth
     // varies between iterations converge at the next enforcement pass.
     loop {
+        if trimmed_any {
+            strip_reasoning_after_prefix_rewrite(&mut trimmed, model);
+        }
         tokens_after = projected_provider_facing_tokens(
             &trimmed,
             multimodal_config,
@@ -1665,6 +1695,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let mut trim_result = surface_oversized_dispatch_if_needed(
             injected_memory_preamble,
             turn_state.history,
+            provider_request_model,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
             trim_budget,
@@ -1729,6 +1760,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &mut trimmed_post_hook,
                     use_native_tools,
                 );
+                // The snapshot predates the trim; do not restore reasoning
+                // signed over its old prefix into the rebuilt request.
+                strip_reasoning_after_prefix_rewrite(
+                    &mut trimmed_post_hook,
+                    provider_request_model,
+                );
                 provider_request_messages = trimmed_post_hook;
                 reported_population_estimated =
                     crate::agent::history::estimate_history_tokens(&provider_request_messages)
@@ -1750,6 +1787,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 trim_result = surface_oversized_dispatch_if_needed(
                     injected_memory_preamble,
                     turn_state.history,
+                    provider_request_model,
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
                     trim_budget,
@@ -2091,6 +2129,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let recovered = try_recover_context_overflow(
                     injected_memory_preamble,
                     turn_state.history,
+                    provider_request_model,
                     &e,
                     iteration,
                     event_tx.as_ref(),
@@ -2337,6 +2376,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 Box::pin(enforce_reported_budget(
                     injected_memory_preamble,
                     turn_state.history,
+                    served_model_key,
                     reported as usize,
                     reported_population_estimated,
                     tool_schema_tokens,
@@ -3991,6 +4031,7 @@ mod reported_budget_tests {
         super::enforce_reported_budget(
             injected_memory_preamble,
             history,
+            "claude-sonnet-4-5",
             reported_input_tokens,
             reported_population_estimated,
             tool_schema_tokens,
@@ -4051,6 +4092,7 @@ mod reported_budget_tests {
         super::enforce_reported_budget(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             estimated * 4,
             estimated,
             0,
@@ -5055,6 +5097,82 @@ mod reported_budget_tests {
 mod trim_budget_tests {
     use super::*;
 
+    #[test]
+    fn dispatch_rewrite_invalidates_reasoning_only_after_a_real_turn_drop() {
+        for (model, strips) in [
+            ("claude-fable-5", true),
+            ("claude-opus-4-5", true),
+            ("claude-sonnet-4-5", false),
+        ] {
+            let call = zeroclaw_providers::ToolCall {
+                id: "retained-call".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: Some(serde_json::json!({"opaque_signature": "keep"})),
+            };
+            let mut history = vec![
+                ChatMessage::system("system"),
+                ChatMessage::user("old ".repeat(4000)),
+                ChatMessage::assistant("old answer"),
+                ChatMessage::user("newest request"),
+                ChatMessage::assistant(crate::agent::loop_::build_native_assistant_history(
+                    "progress",
+                    &[call],
+                    Some("signed reasoning"),
+                )),
+                ChatMessage {
+                    role: "tool".into(),
+                    content:
+                        serde_json::json!({"tool_call_id": "retained-call", "content": "done"})
+                            .to_string(),
+                },
+            ];
+            let before = serde_json::to_value(&history).unwrap();
+            let mut crumb = false;
+            let tokens = crate::agent::history::estimate_history_tokens(&history);
+            let fit = surface_oversized_dispatch_if_needed(
+                &mut None,
+                &mut history,
+                model,
+                &mut crumb,
+                tokens as u64,
+                tokens,
+            );
+            assert_eq!(fit.outcome, PreDispatchOutcome::Fit);
+            assert_eq!(serde_json::to_value(&history).unwrap(), before);
+            let trim = surface_oversized_dispatch_if_needed(
+                &mut None,
+                &mut history,
+                model,
+                &mut crumb,
+                tokens as u64,
+                100,
+            );
+            assert_eq!(trim.outcome, PreDispatchOutcome::Trimmed);
+            assert_eq!(trim.kept_turns, 1);
+            let assistant = history
+                .iter()
+                .find(|message| message.role == "assistant")
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_str(&assistant.content).unwrap();
+            assert_eq!(
+                envelope.get("reasoning_content").is_none(),
+                strips,
+                "{model}"
+            );
+            assert_eq!(
+                envelope["tool_calls"][0]["extra_content"]["opaque_signature"],
+                "keep"
+            );
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.role == "tool"
+                        && message.content.contains("retained-call"))
+            );
+        }
+    }
+
     fn boundary_history() -> Vec<ChatMessage> {
         let big = "x".repeat(1000);
         vec![
@@ -5077,6 +5195,7 @@ mod trim_budget_tests {
         let result = surface_oversized_dispatch_if_needed(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &mut crumb_present,
             tokens_before as u64,
             budget,
@@ -5090,6 +5209,7 @@ mod trim_budget_tests {
         let floor = surface_oversized_dispatch_if_needed(
             &mut None,
             &mut history,
+            "claude-sonnet-4-5",
             &mut crumb_present,
             final_tokens as u64,
             budget,
@@ -5217,6 +5337,7 @@ mod active_route_context_tests {
         let trim = surface_oversized_dispatch_if_needed(
             &mut None,
             &mut history,
+            "vision-model",
             &mut false,
             tokens_before as u64,
             vision_limits.context_token_budget,
