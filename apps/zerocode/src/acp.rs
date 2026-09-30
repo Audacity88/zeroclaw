@@ -231,14 +231,6 @@ impl Acp {
     pub(crate) fn plan_visible(&self) -> bool {
         self.inner.plan_visible()
     }
-
-    pub(crate) fn set_info_notice(&mut self, message: String) {
-        self.inner.set_info_notice(message);
-    }
-
-    pub(crate) fn set_info_error(&mut self, message: String) {
-        self.inner.set_info_error(message);
-    }
 }
 
 impl crate::widgets::HelpContext for Acp {

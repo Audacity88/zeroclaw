@@ -6027,21 +6027,6 @@ impl Chat {
         }
     }
 
-    pub(crate) fn set_info_notice(&mut self, message: String) {
-        if let ChatPhase::Active(state) = &mut self.phase {
-            state.set_info_notice(message);
-        }
-    }
-
-    pub(crate) fn set_info_error(&mut self, message: String) {
-        if let ChatPhase::Active(state) = &mut self.phase {
-            state.info_message = Some(crate::widgets::InfoMessage::error(message));
-        }
-    }
-
-    /// Route a click in the shell-owned Plan rectangle without allowing it to
-    /// reach transcript or composer hit testing.
-
     pub(crate) fn plan_visible(&self) -> bool {
         matches!(
             &self.phase,
