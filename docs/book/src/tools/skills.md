@@ -271,6 +271,12 @@ For Python-specific execution patterns, interpreter policy, and native versus Do
 
 Community open-skills loading is opt-in via the `skills` config. When enabled, ZeroClaw loads skills from the configured `open_skills_dir`, or from `$HOME/open-skills` when no directory is set. If that directory does not exist, ZeroClaw may clone the community open-skills repository; if it does exist and is a git checkout, ZeroClaw may pull updates. Enable this only for community sources you trust, or point `open_skills_dir` at a reviewed local copy.
 
+Successful refreshes keep a seven-day sync marker. Git execution has a two-second deadline, followed by up to one second of caller-side cleanup. ZeroClaw disables interactive Git prompts and automatic maintenance, kills the process group or Windows job, and reaps the direct child. A cleanup worker retains child ownership if that cleanup wait expires.
+
+Loads serialize clone and pull attempts for the same checkout. Failed attempts wait 60 seconds before retrying; skipped loads do not extend that cooldown. A successful refresh whose marker cannot be written uses the same cooldown. Ordinary update failures keep the existing local copy available.
+
+First clones run in a temporary sibling directory and publish atomically without replacing an existing destination. If ZeroClaw cannot confirm process cleanup, it quarantines that checkout for the rest of the process: subsequent loads neither read it nor retry Git. It retains an uncertain clone's staging directory instead of deleting files a surviving process may still be writing. Interrupted pulls do not roll back files or remove Git locks.
+
 ## Advanced config
 
 The default prompt injection mode is `full`, which includes complete skill instructions in the system prompt. Set `prompt_injection_mode = "compact"` globally or in a runtime profile to keep ordinary skill metadata in context and load instructions on demand through `read_skill`. Skills marked `always: true` retain their full instructions in compact mode. Compact mode reduces prompt size; it is not an isolation boundary for untrusted skill sources.
