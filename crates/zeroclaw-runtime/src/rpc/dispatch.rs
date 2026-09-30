@@ -112,6 +112,7 @@ pub enum Method {
     SessionClose,
     SessionPrompt,
     SessionConfigure,
+    SessionThinkingOptions,
     SessionCancel,
     SessionGitBranch,
     SessionList,
@@ -246,6 +247,7 @@ impl Method {
         (Method::SessionClose, "session/close"),
         (Method::SessionPrompt, "session/prompt"),
         (Method::SessionConfigure, "session/configure"),
+        (Method::SessionThinkingOptions, "session/thinking-options"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
         (Method::SessionList, "session/list"),
@@ -398,6 +400,7 @@ impl Method {
 
             M::SessionNew => (Resource::Sessions, Verb::Create),
             M::SessionPrompt => (Resource::Sessions, Verb::Execute),
+            M::SessionThinkingOptions => (Resource::Sessions, Verb::Read),
             M::SessionConfigure | M::SessionApprove => (Resource::Sessions, Verb::Update),
             M::SessionList
             | M::SessionListAcp
@@ -2676,6 +2679,7 @@ impl RpcDispatcher {
             Method::SessionClose
                 | Method::SessionPrompt
                 | Method::SessionConfigure
+                | Method::SessionThinkingOptions
                 | Method::SessionCancel
                 | Method::SessionGitBranch
                 | Method::SessionMessages
@@ -3409,6 +3413,7 @@ impl RpcDispatcher {
                 return;
             }
             Method::SessionConfigure => self.handle_session_configure(params).await,
+            Method::SessionThinkingOptions => self.handle_session_thinking_options(params).await,
             Method::SessionCancel => self.handle_session_cancel(params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(params).await,
             Method::SessionList => self.handle_session_list(params).await,
@@ -5998,7 +6003,12 @@ impl RpcDispatcher {
             .authorize_session_owner(sid, Method::SessionPrompt)
             .await?;
 
-        if req.prompt.trim().is_empty() && req.attachments.is_empty() {
+        let (inline_level, prompt_body) =
+            match crate::agent::thinking::parse_thinking_directive(&req.prompt) {
+                Some((level, remaining)) => (Some(level), remaining),
+                None => (None, req.prompt.clone()),
+            };
+        if prompt_body.trim().is_empty() && req.attachments.is_empty() {
             return Err(rpc_err(
                 INVALID_PARAMS,
                 "session/prompt requires a non-empty `prompt` or at least one attachment",
@@ -6212,7 +6222,7 @@ impl RpcDispatcher {
         }
 
         // Process inline attachments: upload each, append markers to prompt.
-        let mut prompt = req.prompt.clone();
+        let mut prompt = prompt_body;
         if !req.attachments.is_empty() {
             use super::attachments::process_file_entry;
 
@@ -6423,6 +6433,25 @@ impl RpcDispatcher {
             self.apply_principal_grants_to_agent(grants, &mut guard);
         }
 
+        let overrides = self
+            .ctx
+            .sessions
+            .get_overrides(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let thinking = {
+            let config = self.ctx.config.read();
+            resolve_turn_thinking(&config, &agent_alias, &overrides, inline_level)
+        };
+        let thinking = match thinking {
+            Ok(thinking) => thinking,
+            Err(error) => {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, error)
+                    .await);
+            }
+        };
+
         // Mark the durable row running only after every preflight wait has
         // passed. The generation waits and the canonical Agent lookup above
         // can all still fail this prompt (SESSION_BUSY / SESSION_NOT_FOUND)
@@ -6565,6 +6594,7 @@ impl RpcDispatcher {
             },
             cost_context,
             self.connection_activity.clone(),
+            thinking,
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -7004,6 +7034,50 @@ impl RpcDispatcher {
             .await?;
         validate_session_configure_overrides(&req.overrides)?;
 
+        // Only the incoming patch can request a route or Agent mutation.
+        // Remembered model overrides must not block a thinking-only update.
+        if req.overrides.model.is_none()
+            && req.overrides.model_provider.is_none()
+            && req.overrides.temperature.is_none()
+        {
+            let generation = self
+                .capture_session_access(&req.session_id)
+                .await?
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            self.revalidate_admitted_session(&req.session_id, authorized.as_ref())
+                .await?;
+            let agent_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(&req.session_id)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            let merged = self
+                .ctx
+                .sessions
+                .set_thinking_overrides_gated(
+                    &req.session_id,
+                    generation,
+                    &req.overrides,
+                    &req.reset,
+                    |merged| {
+                        let config = self.ctx.config.read();
+                        validate_thinking_overrides(&config, &agent_alias, merged, &req.overrides)
+                    },
+                )
+                .await?
+                .ok_or_else(|| self.stale_session_incarnation_error())?;
+            let thinking_options = {
+                let config = self.ctx.config.read();
+                session_thinking_options(&config, &agent_alias, &merged)?
+            };
+            return to_result(SessionConfigureResult {
+                session_id: req.session_id,
+                overrides: merged,
+                thinking_options,
+            });
+        }
+
         // Wait for a provisional binding to be confirmed, for the same reason
         // `session/prompt` does: a session rehydrated during a route-affecting
         // commit is live but unconfirmed, and committing an override against
@@ -7084,7 +7158,7 @@ impl RpcDispatcher {
         let merged = self
             .ctx
             .sessions
-            .preview_overrides(&req.session_id, &req.overrides)
+            .preview_overrides_reset(&req.session_id, &req.overrides, &req.reset)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
@@ -7092,60 +7166,76 @@ impl RpcDispatcher {
         // which requires Config — held here, not in the session store. Resolve
         // the provider from the prospective merged override or configured
         // agent, build the box, and only then commit the override.
-        let built_model_provider = if merged.model_provider.is_some() || merged.model.is_some() {
+        {
             let agent_alias = self
                 .ctx
                 .sessions
                 .get_agent_alias(&req.session_id)
                 .await
                 .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-            let built = {
-                let config = self.ctx.config.read();
-                let agent_cfg = config
-                    .resolved_agent_config(&agent_alias)
-                    .or_else(|| config.agent(&agent_alias).cloned())
-                    .ok_or_else(|| {
-                        rpc_err(
-                            INVALID_PARAMS,
-                            format!("Agent `{agent_alias}` is not configured"),
+            let config = self.ctx.config.read();
+            validate_thinking_overrides(&config, &agent_alias, &merged, &req.overrides)?;
+        }
+        let built_model_provider =
+            if req.overrides.model_provider.is_some() || req.overrides.model.is_some() {
+                let agent_alias = self
+                    .ctx
+                    .sessions
+                    .get_agent_alias(&req.session_id)
+                    .await
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+                let built = {
+                    let config = self.ctx.config.read();
+                    let agent_cfg = config
+                        .resolved_agent_config(&agent_alias)
+                        .or_else(|| config.agent(&agent_alias).cloned())
+                        .ok_or_else(|| {
+                            rpc_err(
+                                INVALID_PARAMS,
+                                format!("Agent `{agent_alias}` is not configured"),
+                            )
+                        })?;
+                    let model_provider_ref = merged
+                        .model_provider
+                        .as_deref()
+                        .unwrap_or_else(|| agent_cfg.model_provider.as_str());
+                    let (model_provider, model_provider_name, model_name, model_route_resolver) =
+                        crate::agent::agent::build_session_model_provider(
+                            &config,
+                            model_provider_ref,
+                            merged.model.as_deref(),
                         )
-                    })?;
-                let model_provider_ref = merged
-                    .model_provider
-                    .as_deref()
-                    .unwrap_or_else(|| agent_cfg.model_provider.as_str());
-                let (model_provider, model_provider_name, model_name, model_route_resolver) =
-                    crate::agent::agent::build_session_model_provider(
-                        &config,
-                        model_provider_ref,
-                        merged.model.as_deref(),
+                        .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                    let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                        &agent_cfg,
+                        model_provider.as_ref(),
+                        &model_name,
+                    );
+                    (
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        // The exact generation the box and resolver above were built
+                        // from, published onto the agent with them.
+                        std::sync::Arc::new(config.clone()),
                     )
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-                let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
-                    &agent_cfg,
-                    model_provider.as_ref(),
-                    &model_name,
-                );
-                (
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    // The exact generation the box and resolver above were built
-                    // from, published onto the agent with them.
-                    std::sync::Arc::new(config.clone()),
-                )
+                };
+                Some(built)
+            } else {
+                None
             };
-            Some(built)
-        } else {
-            None
-        };
 
         let merged = self
             .ctx
             .sessions
-            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
+            .set_overrides_gated_reset(
+                &req.session_id,
+                session_generation,
+                req.overrides,
+                &req.reset,
+            )
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
@@ -7181,9 +7271,53 @@ impl RpcDispatcher {
                 .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
         }
 
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let thinking_options = {
+            let config = self.ctx.config.read();
+            session_thinking_options(&config, &agent_alias, &merged)?
+        };
         to_result(SessionConfigureResult {
             session_id: req.session_id,
             overrides: merged,
+            thinking_options,
+        })
+    }
+
+    async fn handle_session_thinking_options(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        let authorized = self
+            .authorize_session_owner(&req.session_id, Method::SessionThinkingOptions)
+            .await?;
+        let generation = self.capture_session_access(&req.session_id).await?;
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let overrides = self
+            .ctx
+            .sessions
+            .get_overrides(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        self.ensure_session_incarnation(&req.session_id, generation)
+            .await?;
+        self.revalidate_admitted_session(&req.session_id, authorized.as_ref())
+            .await?;
+        let thinking_options = {
+            let config = self.ctx.config.read();
+            session_thinking_options(&config, &agent_alias, &overrides)?
+        };
+        to_result(SessionThinkingOptionsResult {
+            session_id: req.session_id,
+            overrides,
+            thinking_options,
         })
     }
 
@@ -12075,6 +12209,186 @@ fn resolve_skill_ref(
     }
     svc.resolve_ref(name, Some(bundle))
         .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))
+}
+
+fn session_thinking_profile(
+    config: &Config,
+    agent_alias: &str,
+) -> zeroclaw_config::scattered_types::ThinkingConfig {
+    config
+        .resolved_agent_config(agent_alias)
+        .map(|agent| agent.resolved.thinking)
+        .unwrap_or_default()
+}
+
+/// Reject a thinking choice the session's model does not take, naming what
+/// it does take. `merged` carries the model the choice is checked against,
+/// which may be one the same patch switches to.
+fn validate_thinking_overrides(
+    config: &Config,
+    agent_alias: &str,
+    merged: &SessionOverrides,
+    patch: &SessionOverrides,
+) -> Result<(), JsonRpcError> {
+    use super::thinking_options::{
+        accepted_levels, capabilities_for_with_config, join_displays, join_levels,
+    };
+
+    let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
+        config,
+        agent_alias,
+        merged.model_provider.as_deref(),
+        merged.model.as_deref(),
+    )
+    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+    let capabilities = capabilities_for_with_config(config, &model_provider, &model);
+    if let Some(level) = patch.thinking_level {
+        let accepted = accepted_levels(
+            &capabilities,
+            &session_thinking_profile(config, agent_alias),
+        );
+        if !accepted.contains(&level) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                unsupported_thinking_message(
+                    "thinking_level",
+                    level.as_str(),
+                    &model,
+                    &model_provider,
+                    &join_levels(&accepted),
+                ),
+            ));
+        }
+    }
+    if let Some(display) = patch.thinking_display
+        && !capabilities.supports_display(display)
+    {
+        return Err(rpc_err(
+            INVALID_PARAMS,
+            unsupported_thinking_message(
+                "thinking_display",
+                display.as_str(),
+                &model,
+                &model_provider,
+                &join_displays(capabilities.displays),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// What a session can adjust about the reasoning, for the model its
+/// overrides resolve to.
+fn session_thinking_options(
+    config: &Config,
+    agent_alias: &str,
+    overrides: &SessionOverrides,
+) -> Result<ThinkingOptions, JsonRpcError> {
+    use super::thinking_options::{
+        ThinkingContext, capabilities_for_with_config, thinking_options,
+    };
+
+    let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
+        config,
+        agent_alias,
+        overrides.model_provider.as_deref(),
+        overrides.model.as_deref(),
+    )
+    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+    let profile = session_thinking_profile(config, agent_alias);
+    Ok(thinking_options(&ThinkingContext {
+        model_provider: &model_provider,
+        model: &model,
+        profile: &profile,
+        alias_display: alias_thinking_display(config, &model_provider),
+        capabilities: capabilities_for_with_config(config, &model_provider, &model),
+        session_level: overrides.thinking_level,
+        session_display: overrides.thinking_display,
+    }))
+}
+
+/// The display the provider alias configured. Only the Anthropic slot has
+/// the knob.
+fn alias_thinking_display(
+    config: &Config,
+    model_provider_ref: &str,
+) -> Option<zeroclaw_api::model_provider::ThinkingDisplay> {
+    let (provider_type, alias) = model_provider_ref.split_once('.')?;
+    if provider_type != "anthropic" {
+        return None;
+    }
+    config
+        .providers
+        .models
+        .anthropic
+        .get(alias)
+        .and_then(|slot| slot.thinking_display)
+        .map(Into::into)
+}
+
+/// The thinking request for one RPC turn. An inline level the model does not
+/// take is rejected, naming what it does take; the session override was
+/// checked when it was set.
+fn resolve_turn_thinking(
+    config: &Config,
+    agent_alias: &str,
+    overrides: &SessionOverrides,
+    inline_level: Option<zeroclaw_config::scattered_types::ThinkingLevel>,
+) -> Result<Option<zeroclaw_api::model_provider::NativeThinkingParams>, JsonRpcError> {
+    use super::thinking_options::{
+        accepted_levels, capabilities_for_with_config, join_levels, resolve_session_thinking,
+    };
+
+    let profile = session_thinking_profile(config, agent_alias);
+    if let Some(level) = inline_level {
+        let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
+            config,
+            agent_alias,
+            overrides.model_provider.as_deref(),
+            overrides.model.as_deref(),
+        )
+        .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        let accepted = accepted_levels(
+            &capabilities_for_with_config(config, &model_provider, &model),
+            &profile,
+        );
+        if !accepted.contains(&level) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                unsupported_thinking_message(
+                    "thinking_level",
+                    level.as_str(),
+                    &model,
+                    &model_provider,
+                    &join_levels(&accepted),
+                ),
+            ));
+        }
+    }
+    Ok(resolve_session_thinking(
+        inline_level,
+        overrides.thinking_level,
+        overrides.thinking_display,
+        &profile,
+    ))
+}
+
+fn unsupported_thinking_message(
+    field: &str,
+    value: &str,
+    model: &str,
+    model_provider: &str,
+    accepted: &str,
+) -> String {
+    if accepted.is_empty() {
+        format!(
+            "{field} `{value}` is not supported by `{model}` ({model_provider}); this model takes no {field}"
+        )
+    } else {
+        format!(
+            "{field} `{value}` is not supported by `{model}` ({model_provider}); accepted: {accepted}"
+        )
+    }
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -35042,6 +35356,197 @@ mod tests {
             .runtime_profiles
             .insert("default".into(), Default::default());
         config
+    }
+
+    fn make_thinking_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let fable = config
+            .providers
+            .models
+            .ensure("anthropic", "default")
+            .expect("anthropic provider slot exists");
+        fable.api_key = Some("test-key".into());
+        fable.model = Some("claude-fable-5-1".into());
+        let legacy = config
+            .providers
+            .models
+            .ensure("anthropic", "legacy")
+            .expect("anthropic provider slot exists");
+        legacy.api_key = Some("test-key".into());
+        legacy.model = Some("claude-haiku-4-5".into());
+        let other = config
+            .providers
+            .models
+            .ensure("openai", "other")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("gpt-4o".into());
+
+        config.agents = HashMap::from([(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "anthropic.default".into(),
+                risk_profile: "test-profile".into(),
+                runtime_profile: "default".into(),
+                ..Default::default()
+            },
+        )]);
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        let mut profile = zeroclaw_config::schema::RuntimeProfileConfig::default();
+        profile.thinking.default_level = zeroclaw_config::scattered_types::ThinkingLevel::High;
+        config.runtime_profiles.insert("default".into(), profile);
+        config
+    }
+
+    #[tokio::test]
+    async fn thinking_only_configure_completes_while_a_turn_holds_the_agent() {
+        use zeroclaw_config::scattered_types::ThinkingLevel;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(make_thinking_test_config(
+            &tmp,
+        )));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        // Leave a remembered route override, the original freeze trigger.
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id, "overrides": {"model": "claude-fable-5-1"}
+            }))
+            .await
+            .unwrap();
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .unwrap();
+        let turn_guard = agent.lock().await;
+        let ordering_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "max", "thinking_display": "summarized"}
+            })),
+        )
+        .await
+        .expect("thinking-only configure must bypass both turn locks")
+        .unwrap();
+        assert_eq!(result["thinking_options"]["current_level"], "max");
+        assert_eq!(result["thinking_options"]["level_source"], "session");
+        assert_eq!(result["thinking_options"]["current_display"], "summarized");
+        assert_eq!(result["overrides"]["model"], "claude-fable-5-1");
+        let options = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_thinking_options(&json!({"session_id": session_id})),
+        )
+        .await
+        .expect("options must not wait for a turn")
+        .unwrap();
+        assert_eq!(options["thinking_options"]["current_level"], "max");
+        let reset = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": session_id, "overrides": {},
+                "reset": ["thinking_level", "thinking_display"]
+            })),
+        )
+        .await
+        .expect("reset must bypass both turn locks")
+        .unwrap();
+        assert!(reset["overrides"].get("thinking_level").is_none());
+        assert!(reset["overrides"].get("thinking_display").is_none());
+        assert_eq!(reset["thinking_options"]["level_source"], "profile");
+
+        let (foreign, _rx) = oidc_peer(&dispatcher.ctx);
+        let denied = foreign
+            .handle_session_configure(&json!({
+                "session_id": session_id, "overrides": {"thinking_level": "low"}
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, FORBIDDEN);
+        let generation = dispatcher
+            .ctx
+            .sessions
+            .get_generation(&session_id)
+            .await
+            .unwrap();
+        assert!(
+            dispatcher
+                .ctx
+                .sessions
+                .set_thinking_overrides_gated(
+                    &session_id,
+                    generation.wrapping_add(1),
+                    &SessionOverrides {
+                        thinking_level: Some(ThinkingLevel::Low),
+                        ..Default::default()
+                    },
+                    &[],
+                    |_| Ok::<_, JsonRpcError>(()),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "stale incarnation must not mutate overrides"
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .unwrap()
+                .thinking_level
+                .is_none()
+        );
+
+        let model_dispatcher = Arc::clone(&dispatcher);
+        let model_session = session_id.clone();
+        let mut model_change = zeroclaw_spawn::spawn!(async move {
+            model_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": model_session, "overrides": {"model": "claude-opus-4-6"}
+                }))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut model_change)
+                .await
+                .is_err()
+        );
+        drop(ordering_guard);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut model_change)
+                .await
+                .is_err()
+        );
+        drop(turn_guard);
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(5), model_change)
+            .await
+            .expect("model change should finish after the turn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed["overrides"]["model"], "claude-opus-4-6");
     }
 
     async fn create_model_refresh_test_session(

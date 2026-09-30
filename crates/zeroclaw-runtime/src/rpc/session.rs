@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use zeroclaw_api::model_provider::ThinkingDisplay;
 use zeroclaw_api::plan::PlanEntry;
+use zeroclaw_config::scattered_types::ThinkingLevel;
 use zeroclaw_infra::session_queue::SessionActorQueue;
 use zeroclaw_providers::ModelProvider;
 
@@ -74,6 +76,70 @@ pub struct SessionOverrides {
     pub model_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// Reasoning depth for this session's turns. A model or provider switch
+    /// clears it, since the incoming model may not take the same depths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
+    /// How much of the reasoning comes back on this session's turns. Cleared
+    /// together with the level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<ThinkingDisplay>,
+}
+
+/// A session override that `session/configure` can clear by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOverrideField {
+    ThinkingLevel,
+    ThinkingDisplay,
+}
+
+impl SessionOverrides {
+    /// Merge `patch` over these overrides.
+    ///
+    /// `reset` clears fields first. A model or provider switch in the patch
+    /// then clears both thinking fields, because the incoming model may not
+    /// take them. A provider switch without a model clears the model, so the
+    /// new alias's configured model is resolved rather than the previous
+    /// provider's. The patch's own values apply last, so one call can switch
+    /// models and choose a depth for the new model at once.
+    #[must_use]
+    pub fn merged(
+        &self,
+        patch: &SessionOverrides,
+        reset: &[SessionOverrideField],
+    ) -> SessionOverrides {
+        let mut merged = self.clone();
+        for field in reset {
+            match field {
+                SessionOverrideField::ThinkingLevel => merged.thinking_level = None,
+                SessionOverrideField::ThinkingDisplay => merged.thinking_display = None,
+            }
+        }
+        if patch.model.is_some() || patch.model_provider.is_some() {
+            merged.thinking_level = None;
+            merged.thinking_display = None;
+        }
+        if let Some(ref m) = patch.model {
+            merged.model = Some(m.clone());
+        }
+        if let Some(ref p) = patch.model_provider {
+            merged.model_provider = Some(p.clone());
+            if patch.model.is_none() {
+                merged.model = None;
+            }
+        }
+        if let Some(t) = patch.temperature {
+            merged.temperature = Some(t);
+        }
+        if let Some(level) = patch.thinking_level {
+            merged.thinking_level = Some(level);
+        }
+        if let Some(display) = patch.thinking_display {
+            merged.thinking_display = Some(display);
+        }
+        merged
+    }
 }
 
 /// An entry in the per-session upload index (content-addressed by SHA-256).
@@ -1160,14 +1226,18 @@ impl SessionStore {
         generation: u64,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        self.set_overrides_gated_reset(id, generation, patch, &[])
+            .await
+    }
+
+    pub async fn set_overrides_gated_reset(
+        &self,
+        id: &str,
+        generation: u64,
+        patch: SessionOverrides,
+        reset: &[SessionOverrideField],
+    ) -> Option<SessionOverrides> {
         let done = self.wait_test_gate().await;
-        let merged = match self.preview_overrides(id, &patch).await {
-            Some(merged) => merged,
-            None => {
-                self.signal_test_gate_done(done);
-                return None;
-            }
-        };
         let mut sessions = self.sessions.lock().await;
         let session = match sessions.get_mut(id) {
             Some(session) => session,
@@ -1180,11 +1250,17 @@ impl SessionStore {
             self.signal_test_gate_done(done);
             return None;
         }
-        session.overrides = merged.clone();
+        session.overrides = session.overrides.merged(&patch, reset);
         // Apply to agent immediately.
         let overrides = session.overrides.clone();
         let agent = session.agent.clone();
         drop(sessions);
+        // Thinking is transient request state, not an Agent mutation. In
+        // particular, a lingering model override must not wait on a turn.
+        if patch.model.is_none() && patch.model_provider.is_none() && patch.temperature.is_none() {
+            self.signal_test_gate_done(done);
+            return Some(overrides);
+        }
         let mut guard = agent.lock().await;
         if let Some(ref m) = overrides.model {
             guard.set_model_name(m.clone());
@@ -1201,26 +1277,38 @@ impl SessionStore {
         id: &str,
         patch: &SessionOverrides,
     ) -> Option<SessionOverrides> {
+        self.preview_overrides_reset(id, patch, &[]).await
+    }
+
+    /// Validate thinking against the exact merged route while committing to
+    /// the captured incarnation. No turn-held Agent or provider lock is needed.
+    pub async fn set_thinking_overrides_gated<E>(
+        &self,
+        id: &str,
+        generation: u64,
+        patch: &SessionOverrides,
+        reset: &[SessionOverrideField],
+        validate: impl FnOnce(&SessionOverrides) -> Result<(), E>,
+    ) -> Result<Option<SessionOverrides>, E> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(id).filter(|s| s.generation == generation) else {
+            return Ok(None);
+        };
+        let merged = session.overrides.merged(patch, reset);
+        validate(&merged)?;
+        session.overrides = merged.clone();
+        Ok(Some(merged))
+    }
+
+    pub async fn preview_overrides_reset(
+        &self,
+        id: &str,
+        patch: &SessionOverrides,
+        reset: &[SessionOverrideField],
+    ) -> Option<SessionOverrides> {
         let sessions = self.sessions.lock().await;
         let session = sessions.get(id)?;
-        let mut merged = session.overrides.clone();
-        if let Some(ref m) = patch.model {
-            merged.model = Some(m.clone());
-        }
-        if let Some(ref p) = patch.model_provider {
-            merged.model_provider = Some(p.clone());
-            // A provider switch without an explicit model must not carry the
-            // previous provider's model forward (e.g. switching to an Ollama
-            // alias while a Claude model override lingers). Clear it so the
-            // dispatcher resolves the new alias's configured model.
-            if patch.model.is_none() {
-                merged.model = None;
-            }
-        }
-        if let Some(t) = patch.temperature {
-            merged.temperature = Some(t);
-        }
-        Some(merged)
+        Some(session.overrides.merged(patch, reset))
     }
 
     /// Swap a freshly built `ModelProvider` box (and its name) onto the

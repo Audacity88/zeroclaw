@@ -204,6 +204,20 @@ fn pre_executed_tools_without_final_response_message(
     }
 }
 
+fn refusal_category_key(category: zeroclaw_api::model_provider::RefusalCategory) -> &'static str {
+    use zeroclaw_api::model_provider::RefusalCategory;
+    match category {
+        RefusalCategory::Cyber => "cli-agent-error-provider-refused-category-cyber",
+        RefusalCategory::Bio => "cli-agent-error-provider-refused-category-bio",
+        RefusalCategory::ReasoningExtraction => {
+            "cli-agent-error-provider-refused-category-reasoning-extraction"
+        }
+        RefusalCategory::FrontierLlm => "cli-agent-error-provider-refused-category-frontier-llm",
+        RefusalCategory::Unspecified => "cli-agent-error-provider-refused-category-unspecified",
+        RefusalCategory::Other => "cli-agent-error-provider-refused-category-other",
+    }
+}
+
 fn reliable_provider_terminal_failure_message_with_renderer(
     failure: &zeroclaw_providers::ReliableProviderTerminalFailure,
     render: CliStringRenderer,
@@ -211,6 +225,10 @@ fn reliable_provider_terminal_failure_message_with_renderer(
     use zeroclaw_providers::ReliableProviderTerminalFailureKind;
 
     match failure.kind() {
+        ReliableProviderTerminalFailureKind::Refused(category) => {
+            let label = render(refusal_category_key(category), &[]);
+            render("cli-agent-error-provider-refused", &[("category", &label)])
+        }
         ReliableProviderTerminalFailureKind::ContextWindow => {
             render("cli-agent-error-provider-context-window", &[])
         }
@@ -280,8 +298,12 @@ fn terminal_completion_error_message_with_renderer(
     // envelopes; it needs safety-specific guidance rather than the generic
     // provider-failure projection. A later non-refusal failure replaces it as
     // the final cause and keeps the generic projection below.
-    if zeroclaw_providers::model_refusal_from_error(err).is_some() {
-        return Some(render("cli-agent-error-provider-refusal", &[]));
+    if let Some(refusal) = zeroclaw_providers::model_refusal_from_error(err) {
+        let label = render(refusal_category_key(refusal.refusal_category()), &[]);
+        return Some(render(
+            "cli-agent-error-provider-refused",
+            &[("category", &label)],
+        ));
     }
     if let Some(failure) = err.chain().find_map(|source| {
         source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()

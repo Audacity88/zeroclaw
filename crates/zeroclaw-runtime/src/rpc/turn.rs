@@ -73,6 +73,7 @@ pub async fn execute_turn<F, Fut>(
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
     connection_activity: Option<crate::rpc::ConnectionActivity>,
+    thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -102,18 +103,22 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            TOOL_LOOP_COST_TRACKING_CONTEXT
-                .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            None,
+            zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .scope(thinking, async move {
+                    TOOL_LOOP_COST_TRACKING_CONTEXT
+                        .scope(
+                            cost_context,
+                            guard
+                                .turn_streamed_with_steering_state(
+                                    &prompt,
+                                    event_tx,
+                                    Some(cancel_clone),
+                                    None,
+                                )
+                                .instrument(span),
                         )
-                        .instrument(span),
-                )
+                        .await
+                })
                 .await
         })
         .await
@@ -1032,6 +1037,7 @@ mod tests {
             },
             Some(cost_context),
             None,
+            None,
             noop,
         )
         .await
@@ -1184,6 +1190,7 @@ mod tests {
                 model: "test-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             move |event| {
@@ -1357,6 +1364,7 @@ mod tests {
                     model: "matrix-model".into(),
                     channel: "rpc",
                 },
+                None,
                 None,
                 None,
                 move |event| {
@@ -1621,6 +1629,7 @@ mod tests {
                 model: "w1-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             move |event| {
@@ -1900,6 +1909,7 @@ mod tests {
                 },
                 None,
                 Some(activity),
+                None,
                 noop,
             )
             .await;

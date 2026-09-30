@@ -150,7 +150,16 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
-                let provider_error = anyhow::Error::msg(message.clone());
+                let refused = matches!(
+                    &err,
+                    zeroclaw_api::model_provider::StreamError::ModelRefusal(_)
+                );
+                let provider_error = match &err {
+                    zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal) => {
+                        anyhow::Error::new((**refusal).clone())
+                    }
+                    _ => anyhow::Error::msg(message.clone()),
+                };
                 if visible_event_output {
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
@@ -168,21 +177,29 @@ pub(crate) async fn consume_provider_streaming_response(
                     )
                     .with_terminal_cause(anyhow::Error::new(err));
                     return Err(StreamInterruptedAfterOutput {
-                        partial_text: forwarded_text,
+                        partial_text: if refused {
+                            String::new()
+                        } else {
+                            forwarded_text
+                        },
                         message,
                         usage,
                         cause,
                     }
                     .into());
                 }
-                return Err(StreamErrorWithUsage {
+                let error = StreamErrorWithUsage {
                     message,
                     usage: outcome.usage,
                     // Keep the typed error so the provider-call step can
                     // recognize terminal stream failures (no fallback).
                     source: err,
-                }
-                .into());
+                };
+                return Err(if refused {
+                    provider_error.context(error)
+                } else {
+                    error.into()
+                });
             }
         };
         match event {
