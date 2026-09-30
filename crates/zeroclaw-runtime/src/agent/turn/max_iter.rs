@@ -247,6 +247,7 @@ pub(crate) async fn finish_after_max_iterations(
                     .messages;
                     messages.push(summary_prompt_mirror.clone());
                     messages.extend(hook_suffix.iter().cloned());
+                    super::strip_reasoning_after_prefix_rewrite(&mut messages, &selected_model);
                     continue;
                 }
                 trim.dropped_messages = dropped_messages;
