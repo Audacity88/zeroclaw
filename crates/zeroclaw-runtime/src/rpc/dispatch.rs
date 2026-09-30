@@ -35418,9 +35418,11 @@ mod tests {
     async fn thinking_only_configure_completes_while_a_turn_holds_the_agent() {
         use zeroclaw_config::scattered_types::ThinkingLevel;
         let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = Arc::new(make_config_set_test_dispatcher(make_thinking_test_config(
-            &tmp,
-        )));
+        let mut config = make_thinking_test_config(&tmp);
+        let oidc_config = oidc_session_config(&tmp);
+        config.oidc = oidc_config.oidc;
+        config.permission_profiles = oidc_config.permission_profiles;
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(config));
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
         // Leave a remembered route override, the original freeze trigger.
         dispatcher
