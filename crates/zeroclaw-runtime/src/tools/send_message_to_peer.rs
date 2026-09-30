@@ -10,6 +10,7 @@ use crate::control_plane::{
     control_plane as global_control_plane,
 };
 use crate::cron::scheduler::deliver_announcement;
+use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 use crate::peers::resolve_peer_set;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -45,17 +46,27 @@ pub struct SendMessageToPeerTool {
     sender_alias: String,
     description: String,
     task_control_plane: Option<ControlPlaneHandle>,
+    execution_capability: Option<AgentExecutionCapability>,
 }
 
 impl SendMessageToPeerTool {
     pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Self {
-        Self::new_with_live_config(config, sender_alias, None)
+        Self::new_with_live_config_and_capability(config, sender_alias, None, None)
     }
 
-    pub(crate) fn new_with_live_config(
+    pub fn new_with_capability(
+        config: Arc<Config>,
+        sender_alias: impl Into<String>,
+        execution_capability: Option<AgentExecutionCapability>,
+    ) -> Self {
+        Self::new_with_live_config_and_capability(config, sender_alias, None, execution_capability)
+    }
+
+    pub(crate) fn new_with_live_config_and_capability(
         config: Arc<Config>,
         sender_alias: impl Into<String>,
         live_config: Option<Arc<RwLock<Config>>>,
+        execution_capability: Option<AgentExecutionCapability>,
     ) -> Self {
         let sender_alias = sender_alias.into();
         let description = build_description();
@@ -65,6 +76,7 @@ impl SendMessageToPeerTool {
             sender_alias,
             description,
             task_control_plane: None,
+            execution_capability,
         }
     }
 
@@ -225,7 +237,15 @@ impl Tool for SendMessageToPeerTool {
                 .cloned()
                 .unwrap_or_else(|| target.clone());
 
-            let cfg = Arc::clone(&self.config);
+            let admission = self
+                .execution_capability
+                .as_ref()
+                .map(|capability| capability.resolve_and_admit(&canonical))
+                .transpose()?;
+            let cfg = admission
+                .as_ref()
+                .map(AgentExecutionAdmission::config)
+                .unwrap_or_else(|| Arc::clone(&self.config));
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
             let turn_recipient_alias = recipient_alias.clone();
@@ -311,36 +331,21 @@ impl Tool for SendMessageToPeerTool {
             let task_owner_pid = task.owner_pid;
             let task_owner_boot_id = task.owner_boot_id.clone();
             zeroclaw_spawn::spawn!(async move {
-                // Keep the large turn future out of the nested cost-scope wrappers.
-                // The recipient executes under its own alias; the sender's
-                // canonical alias is provenance for the detached turn.
-                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
-                    if let Some(live_config) = live_config {
-                        Box::pin(
-                            crate::agent::loop_::process_message_shared_with_live_config(
-                                cfg,
-                                live_config,
-                                &turn_recipient_alias,
-                                &body,
-                                None,
-                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                                    sender_alias: sender.clone(),
-                                }),
-                            ),
-                        )
-                    } else {
-                        Box::pin(crate::agent::loop_::process_message_shared(
-                            cfg,
-                            &turn_recipient_alias,
-                            &body,
-                            None,
-                            zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                            Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                                sender_alias: sender.clone(),
-                            }),
-                        ))
-                    };
+                // Keep the admitted recipient turn out of the cost-scope wrappers.
+                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = Box::pin(
+                    crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                        cfg,
+                        live_config,
+                        &turn_recipient_alias,
+                        &body,
+                        None,
+                        zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                        admission,
+                        Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                            sender_alias: sender.clone(),
+                        }),
+                    ),
+                );
                 let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
                 if let Err(error) = settle_peer_inbox_task(
                     task_store.as_ref(),
@@ -1537,26 +1542,39 @@ mod tests {
         // OpenAI-compatible client (`factory::build_ollama_compat_provider`),
         // not the native `/api/chat` wire format, so the fake stands in at
         // the OpenAI-compatible `/v1/chat/completions` boundary.
-        type RequestCount = Arc<Mutex<u32>>;
+        #[derive(Clone)]
+        struct RequestState {
+            count: Arc<Mutex<u32>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
         async fn capture_chat(
-            State(count): State<RequestCount>,
+            State(state): State<RequestState>,
             Json(_body): Json<serde_json::Value>,
         ) -> Json<serde_json::Value> {
-            *count.lock() += 1;
+            *state.count.lock() += 1;
+            state.entered.notify_one();
+            state.release.notified().await;
             Json(serde_json::json!({
                 "choices": [{"message": {"content": "peer turn complete"}}],
                 "usage": {"prompt_tokens": 1_000, "completion_tokens": 200}
             }))
         }
 
-        let request_count: RequestCount = Arc::new(Mutex::new(0));
+        let request_count = Arc::new(Mutex::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("mock provider listener should bind");
         let mock_addr = listener.local_addr().expect("mock provider addr");
         let app = Router::new()
             .route("/v1/chat/completions", post(capture_chat))
-            .with_state(request_count.clone());
+            .with_state(RequestState {
+                count: request_count.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            });
         let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app)
                 .await
@@ -1626,8 +1644,14 @@ mod tests {
         let control_plane = ControlPlaneHandle::open(workspace.path())
             .expect("isolated control plane should initialize");
         let task_store = Arc::clone(&control_plane.store);
-        let tool = SendMessageToPeerTool::new(Arc::new(config.clone()), "sender")
-            .with_control_plane(control_plane);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let lifecycle = authority.agent_lifecycle();
+        let tool = SendMessageToPeerTool::new_with_capability(
+            Arc::new(config.clone()),
+            "sender",
+            Some(authority.execution_capability()),
+        )
+        .with_control_plane(control_plane);
         let result = tool
             .execute(json!({
                 "channel": "telegram.prod",
@@ -1650,6 +1674,19 @@ mod tests {
             .and_then(|(_, value)| value.strip_suffix(')'))
             .map(str::to_string)
             .expect("accepted output must contain a durable task id");
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("recipient reaches paused provider");
+        drop(tool);
+        drop(authority);
+        assert!(
+            matches!(
+                lifecycle.begin_delete("recipient"),
+                Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+            ),
+            "detached peer retains admission after its caller is dropped"
+        );
+        release.notify_one();
 
         // `execute()` already resolved the recipient's cost context off the
         // process-global tracker (synchronously, before the detached spawn).
@@ -1755,6 +1792,14 @@ mod tests {
              process-wide daily budget, blocking an unrelated agent's next call"
         );
 
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while lifecycle.active_turn_count("recipient") != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recipient finishes persistence and releases admission");
+        assert!(lifecycle.begin_delete("recipient").is_ok());
         server.abort();
     }
 }
