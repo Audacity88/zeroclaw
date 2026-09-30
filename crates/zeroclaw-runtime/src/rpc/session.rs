@@ -1281,11 +1281,13 @@ impl SessionStore {
     }
 
     /// Validate thinking against the exact merged route while committing to
-    /// the captured incarnation. No turn-held Agent or provider lock is needed.
+    /// the captured incarnation and remote owner. No turn-held Agent or
+    /// provider lock is needed.
     pub async fn set_thinking_overrides_gated<E>(
         &self,
         id: &str,
         generation: u64,
+        expected_access: Option<(u64, Option<&str>)>,
         patch: &SessionOverrides,
         reset: &[SessionOverrideField],
         validate: impl FnOnce(&SessionOverrides) -> Result<(), E>,
@@ -1294,6 +1296,12 @@ impl SessionStore {
         let Some(session) = sessions.get_mut(id).filter(|s| s.generation == generation) else {
             return Ok(None);
         };
+        if let Some((expected_generation, expected_owner)) = expected_access
+            && (session.generation != expected_generation
+                || session.owner_tui_id.as_deref() != expected_owner)
+        {
+            return Ok(None);
+        }
         let merged = session.overrides.merged(patch, reset);
         validate(&merged)?;
         session.overrides = merged.clone();

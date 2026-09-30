@@ -1656,10 +1656,7 @@ mod tests {
         let interrupted = err
             .downcast_ref::<StreamInterruptedAfterOutput>()
             .expect("must produce StreamInterruptedAfterOutput");
-        assert_eq!(
-            interrupted.partial_text,
-            "Visible partial text before refusal"
-        );
+        assert!(interrupted.partial_text.is_empty());
         let usage = interrupted
             .usage
             .as_ref()

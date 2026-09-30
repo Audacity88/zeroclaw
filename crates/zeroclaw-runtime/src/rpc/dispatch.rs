@@ -7058,6 +7058,7 @@ impl RpcDispatcher {
                 .set_thinking_overrides_gated(
                     &req.session_id,
                     generation,
+                    self.resume_access_fence(Some(generation)),
                     &req.overrides,
                     &req.reset,
                     |merged| {
@@ -35497,6 +35498,7 @@ mod tests {
                 .set_thinking_overrides_gated(
                     &session_id,
                     generation.wrapping_add(1),
+                    None,
                     &SessionOverrides {
                         thinking_level: Some(ThinkingLevel::Low),
                         ..Default::default()
@@ -35508,6 +35510,44 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "stale incarnation must not mutate overrides"
+        );
+        dispatcher
+            .ctx
+            .sessions
+            .resume_existing(
+                &session_id,
+                "test-agent",
+                &crate::rpc::types::ChatMode::Chat,
+                Some("successor-owner".into()),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dispatcher.ctx.sessions.get_generation(&session_id).await,
+            Some(generation),
+            "ownership transfer need not replace the incarnation"
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .sessions
+                .set_thinking_overrides_gated(
+                    &session_id,
+                    generation,
+                    Some((generation, Some("previous-owner"))),
+                    &SessionOverrides {
+                        thinking_level: Some(ThinkingLevel::Low),
+                        ..Default::default()
+                    },
+                    &[],
+                    |_| Ok::<_, JsonRpcError>(()),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "an admitted remote caller must not mutate after ownership moves"
         );
         assert!(
             dispatcher
