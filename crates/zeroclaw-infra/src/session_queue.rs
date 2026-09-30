@@ -65,9 +65,6 @@ pub enum SessionQueueError {
     QueueFull { session_id: String, depth: usize },
     /// Timed out waiting for the session lock.
     Timeout { session_id: String },
-    /// Fail-fast admission for an operation that may run only while the
-    /// session has no holder or registered waiter.
-    Busy { session_id: String },
 }
 
 impl std::fmt::Display for SessionQueueError {
@@ -81,12 +78,6 @@ impl std::fmt::Display for SessionQueueError {
             }
             Self::Timeout { session_id } => {
                 write!(f, "Timed out waiting for session {session_id}")
-            }
-            Self::Busy { session_id } => {
-                write!(
-                    f,
-                    "Session {session_id} is busy (idle-only admission refused)"
-                )
             }
         }
     }
@@ -188,13 +179,7 @@ impl SessionActorQueue {
 
     /// Admit an idle-only operation without queueing or barging ahead of an
     /// already registered waiter.
-    pub async fn try_acquire_idle(
-        &self,
-        session_id: &str,
-    ) -> Result<SessionGuard, SessionQueueError> {
-        let busy = || SessionQueueError::Busy {
-            session_id: session_id.to_string(),
-        };
+    pub async fn try_acquire_idle(&self, session_id: &str) -> Option<SessionGuard> {
         let mut slots = self.slots.lock().await;
         let slot = slots
             .entry(session_id.to_string())
@@ -221,13 +206,13 @@ impl SessionActorQueue {
         let registration = PendingRegistration { slot: slot.clone() };
         if slot.pending.fetch_add(1, Ordering::Relaxed) > 0 {
             drop(registration);
-            return Err(busy());
+            return None;
         }
         match Arc::clone(&slot.semaphore).try_acquire_owned() {
             Ok(permit) => {
                 *slot.last_active.lock().await = Instant::now();
                 drop(slots);
-                Ok(SessionGuard {
+                Some(SessionGuard {
                     _permit: permit,
                     _registration: registration,
                     session_id: session_id.to_string(),
@@ -235,7 +220,7 @@ impl SessionActorQueue {
             }
             Err(_) => {
                 drop(registration);
-                Err(busy())
+                None
             }
         }
     }
@@ -336,13 +321,10 @@ mod tests {
         let queue = SessionActorQueue::new(8, 30, 600);
         let guard = queue.acquire("s1").await.unwrap();
 
-        assert!(matches!(
-            queue.try_acquire_idle("s1").await,
-            Err(SessionQueueError::Busy { .. })
-        ));
+        assert!(queue.try_acquire_idle("s1").await.is_none());
 
         drop(guard);
-        assert!(queue.try_acquire_idle("s1").await.is_ok());
+        assert!(queue.try_acquire_idle("s1").await.is_some());
     }
 
     #[tokio::test]
@@ -355,10 +337,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        assert!(matches!(
-            queue.try_acquire_idle("s1").await,
-            Err(SessionQueueError::Busy { .. })
-        ));
+        assert!(queue.try_acquire_idle("s1").await.is_none());
 
         drop(guard);
         drop(waiter.await.unwrap().unwrap());
