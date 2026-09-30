@@ -5468,12 +5468,11 @@ impl RpcDispatcher {
         let admission = Arc::clone(&self.ctx.sessions)
             .acquire_idle_operation(session_id, Some(generation), cancellation.clone())
             .await
-            .map_err(|error| match error {
-                zeroclaw_infra::session_queue::SessionQueueError::Busy { .. } => rpc_err(
+            .ok_or_else(|| {
+                rpc_err(
                     SESSION_BUSY,
                     "Session is busy with a running or queued turn; retry when it is idle",
-                ),
-                other => rpc_err(SESSION_BUSY, format!("Session busy: {other}")),
+                )
             })?;
 
         self.recheck_authority_after_admission(method)?;

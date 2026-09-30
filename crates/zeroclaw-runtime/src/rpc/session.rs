@@ -1784,7 +1784,7 @@ impl SessionStore {
         id: &str,
         session_generation: Option<u64>,
         token: tokio_util::sync::CancellationToken,
-    ) -> Result<IdleOperationAdmission, zeroclaw_infra::session_queue::SessionQueueError> {
+    ) -> Option<IdleOperationAdmission> {
         let guard = self.session_queue.try_acquire_idle(id).await?;
         let mut tokens = self
             .cancel_tokens
@@ -1793,7 +1793,7 @@ impl SessionStore {
         let cancel_generation =
             self.register_cancel_token_locked(&mut tokens, id, session_generation, token);
         drop(tokens);
-        Ok(IdleOperationAdmission {
+        Some(IdleOperationAdmission {
             _guard: guard,
             store: Arc::clone(self),
             session_id: id.to_string(),
