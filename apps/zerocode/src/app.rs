@@ -2273,7 +2273,6 @@ pub async fn run(
                         &reconnect_state,
                         &mut mode,
                         &mut chat_pane,
-                        &mut dock,
                     )
                     .await;
                 })
@@ -2601,7 +2600,6 @@ pub async fn run(
                     &reconnect_state,
                     &mut mode,
                     &mut chat_pane,
-                    &mut dock,
                 )
                 .await;
             }
@@ -2774,7 +2772,6 @@ pub async fn run(
                             &reconnect_state,
                             &mut mode,
                             &mut chat_pane,
-                            &mut dock,
                         )
                         .await;
                         anyhow::Ok(())
@@ -2810,7 +2807,6 @@ pub async fn run(
                             &reconnect_state,
                             &mut mode,
                             &mut chat_pane,
-                            &mut dock,
                         )
                         .await;
                     })

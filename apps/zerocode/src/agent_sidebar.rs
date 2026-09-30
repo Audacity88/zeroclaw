@@ -216,7 +216,7 @@ impl AgentSidebar {
         } else {
             0
         };
-        let title = truncate_to_cells(
+        let title = widgets::truncate_to_width(
             &t("zc-sidebar-title"),
             area.width.saturating_sub(2 + header_controls) as usize,
         );
@@ -329,7 +329,7 @@ impl AgentSidebar {
             };
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    truncate_to_cells(&t("zc-sidebar-empty"), hint.width as usize),
+                    widgets::truncate_to_width(&t("zc-sidebar-empty"), hint.width as usize),
                     theme::dim_style(),
                 ))
                 .centered(),
@@ -384,7 +384,7 @@ impl AgentSidebar {
             // Keep the name before optional date metadata.
             let show_date = available >= date_width + 5;
             let name_width = available.saturating_sub(if show_date { date_width + 1 } else { 0 });
-            let name = truncate_to_cells(
+            let name = widgets::truncate_to_width(
                 &format!("{} #{}", summary.agent_alias, summary.display_ordinal),
                 name_width,
             );

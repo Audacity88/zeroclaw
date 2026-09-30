@@ -407,7 +407,6 @@ impl ZerocodePane {
     pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
         self.capture.is_some()
             || self.conn_edit.is_some()
-            || self.tracker_edit.is_some()
             || crate::keymap::ConfigTabAction::from_chord(key).is_some()
     }
 
