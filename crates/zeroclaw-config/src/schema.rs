@@ -1294,9 +1294,45 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model model_provider config. No family-specific extras yet — typed
-/// slot reserved for future Anthropic-only knobs (cache_control, beta
-/// headers) so they land cleanly without another schema rework.
+/// How much of the model's reasoning comes back inside thinking blocks.
+/// Applies to the Claude generations that think adaptively; older ones ignore
+/// it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicThinkingDisplay {
+    /// Blocks arrive signed but with their text withheld, which is the API's
+    /// own default.
+    #[default]
+    Omitted,
+    /// Blocks carry a readable summary of the reasoning.
+    Summarized,
+    /// Blocks carry the short progress notes the model writes between tool
+    /// calls. Newer models only.
+    Updates,
+}
+
+impl From<AnthropicThinkingDisplay> for zeroclaw_api::model_provider::ThinkingDisplay {
+    fn from(display: AnthropicThinkingDisplay) -> Self {
+        match display {
+            AnthropicThinkingDisplay::Omitted => Self::Omitted,
+            AnthropicThinkingDisplay::Summarized => Self::Summarized,
+            AnthropicThinkingDisplay::Updates => Self::Updates,
+        }
+    }
+}
+
+impl AnthropicThinkingDisplay {
+    /// Wire value, or `None` to let the API apply its own default.
+    #[must_use]
+    pub fn wire_value(self) -> Option<&'static str> {
+        zeroclaw_api::model_provider::ThinkingDisplay::from(self).wire_value()
+    }
+}
+
+/// Anthropic-specific native reasoning visibility and server-side fallback controls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1316,6 +1352,10 @@ pub struct AnthropicModelProviderConfig {
     /// sends no fallback parameter and no beta value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_fallback_models: Vec<String>,
+    /// Adaptive reasoning visibility. Request-level display wins over this alias setting.
+    /// Unsupported displays are fitted to the selected model generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<AnthropicThinkingDisplay>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -3781,6 +3821,9 @@ impl Default for DelegateToolConfig {
 
 // ── Aliased Agents ───────────────────────────────────────────────
 
+/// Default fraction of the whole-turn history cap retained after a count trim.
+pub const DEFAULT_HISTORY_TRIM_LOW_WATER: f32 = 0.7;
+
 /// Runtime tunables resolved from the agent's runtime profile. Populated
 /// by `Config::resolved_agent_config`; never deserialized from the agent
 /// table. The runtime profile is the sole config surface for these.
@@ -3792,6 +3835,8 @@ pub struct ResolvedRuntime {
     /// History retention limit. Structured Agent and legacy loop sessions
     /// interpret this as complete turns; channel caches retain message rows.
     pub max_history_messages: usize,
+    /// Fraction of the complete-turn cap retained after trimming; 1.0 disables hysteresis.
+    pub history_trim_low_water: f32,
     /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
     /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
     /// With a ratio, `Some(n)` clamps the model-relative threshold down to `n`.
@@ -3996,6 +4041,7 @@ impl Default for ResolvedRuntime {
             max_tool_iterations: 10,
             max_execution_tree_iterations: None,
             max_history_messages: 50,
+            history_trim_low_water: DEFAULT_HISTORY_TRIM_LOW_WATER,
             max_context_tokens: None,
             model_context_window: 32_000,
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
@@ -4623,6 +4669,14 @@ impl Config {
             .unwrap_or(50)
     }
 
+    /// Resolve count-trim headroom from the runtime profile, measured in complete turns.
+    #[must_use]
+    pub fn effective_history_trim_low_water(&self, agent_alias: &str) -> f32 {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.history_trim_low_water)
+            .unwrap_or(DEFAULT_HISTORY_TRIM_LOW_WATER)
+    }
+
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
     ///
     /// The legacy config key is named `max_history_messages`, but structured
@@ -4890,6 +4944,7 @@ impl Config {
             max_execution_tree_iterations: self
                 .effective_max_execution_tree_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
+            history_trim_low_water: self.effective_history_trim_low_water(agent_alias),
             // Absolute operator budget. In opt-in ratio mode it also caps the
             // model-derived threshold (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
@@ -14668,6 +14723,9 @@ pub struct RuntimeProfileConfig {
     /// sessions count complete turns; channel caches count message rows. `None`
     /// inherits the default of 50.
     pub max_history_messages: Option<usize>,
+    /// Fraction of the complete-turn cap retained after a count trim.
+    /// Valid range (0.0, 1.0]; 1.0 disables hysteresis. None uses 0.7.
+    pub history_trim_low_water: Option<f32>,
     /// Maximum estimated tokens before proactive history trimming. `None`
     /// preserves the legacy 32,000-token default when `context_compact_ratio`
     /// is unset. In ratio mode this remains an optional downward cap. Every
@@ -14733,6 +14791,7 @@ impl Default for RuntimeProfileConfig {
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
             max_history_messages: None,
+            history_trim_low_water: None,
             max_context_tokens: None,
             context_compact_ratio: None,
             compact_context: None,
@@ -25071,6 +25130,22 @@ impl Config {
                 "delegate.agentic_timeout_secs",
                 "delegate.agentic_timeout_secs must be greater than 0"
             );
+        }
+
+        // Sorted profile iteration keeps validation error ordering stable.
+        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
+        profile_aliases.sort();
+        for palias in profile_aliases {
+            let Some(low_water) = self.runtime_profiles[palias].history_trim_low_water else {
+                continue;
+            };
+            if !low_water.is_finite() || low_water <= 0.0 || low_water > 1.0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{palias}.history_trim_low_water"),
+                    "runtime_profiles.{palias}.history_trim_low_water must be a finite number in (0.0, 1.0] (got {low_water})",
+                );
+            }
         }
 
         // Per-profile validation: the context-compression summarizer provider

@@ -22,11 +22,17 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `wire_api`, `native_tools`, `provider_extra`, `think`, `thinking_passthrough`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
-- `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
+- `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds system, rolling and eligible prior-turn `cache_control` breakpoints, deduplicating co-located markers, and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
 - `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default) or `"1h"`. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
+
+## Custom reasoning effort
+
+`reasoning_effort_passthrough = true` opts an OpenAI-compatible alias into effort forwarding for model names outside the OpenAI reasoning families. Only enable it on a backend verified to accept `reasoning_effort`. The thinking controls offer selected `low` and `high`, with `medium` leaving the provider default unchanged. A selected effort takes precedence over the global `runtime.reasoning_effort`; without a selection the existing global setting and model filter still apply. Forwarding covers structured calls, tool calls, prompt-guided fallback calls and tool-free streaming.
+
+This flag is independent of `thinking_passthrough`. Effort alone injects no Anthropic thinking object. When both flags are on, thinking injection and signed replay keep their existing contract while selected effort is forwarded separately. Explicit `provider_extra` keys retain precedence. Thinking passthrough still disables streaming for signed capture; enabling effort does not bypass that guard.
 
 ## Anthropic thinking passthrough
 
@@ -300,33 +306,15 @@ used for backward compatibility.
 
 ## Native thinking display (Anthropic)
 
-`agent.thinking.display` controls how Anthropic extended thinking is
-delivered when native thinking is enabled (`agent.thinking.native_thinking
-= true`). Accepted values:
+Claude thinking controls follow the selected model generation on both native Anthropic and Bedrock. Generations before 4.6 use a token budget, pin temperature to 1.0 and raise `max_tokens` above the budget. The 4.6 generation uses adaptive thinking with `low`, `high` or `max` effort. Later and unversioned Claude models also accept `xhigh`. Adaptive requests omit sampling parameters and fixed budgets; effort travels as `output_config.effort`. A budget without an effort does not enable adaptive thinking.
 
-- `off` (default): no `display` field is sent; requests are byte-identical
-  to earlier ZeroClaw versions and thinking requests use the non-streaming
-  fallback.
-- `omitted`: Anthropic omits thinking text from the response; blocks arrive
-  signature-only (empty `thinking`, required signature), keeping replay
-  intact while minimizing visible reasoning.
-- `updates`: the request carries the
-  `thinking-display-updates-2026-08-18` beta and uses the streaming
-  response path. Readable thinking progress is surfaced live while the
-  model works; the signed reasoning payload is retained separately for
-  history replay and never shown.
-- `summarized`: same streaming behavior, requesting summarized thinking.
+On the native Anthropic slot, `providers.models.anthropic.<alias>.thinking_display` selects reasoning visibility. Request-level display wins over the alias setting. `omitted` uses the API default without sending a display field; `summarized` requests readable reasoning. `updates` is fitted to `summarized` on currently supported models. The 4.6 generation and older ignore display; Bedrock sends no display control. Fixed-budget thinking uses the non-streaming capture path, while adaptive thinking can stream. Display-bearing native requests carry the thinking-display beta and require a supporting account and endpoint.
 
-```toml
-[agent.thinking]
-native_thinking = true
-display = "updates"
-```
+Set native thinking and the default level on the agent's runtime profile through the Config editor. `high` and `max` supply budgets for older generations; `xhigh` is effort-only. `medium` leaves adaptive effort at the provider default.
 
-The setting requires an Anthropic account enrolled in the
-`thinking-display-updates` beta; without enrollment the API rejects the
-request. Set `display = "off"` (or remove the field) to return to the
-previous wire behavior.
+Signed thinking is retained across prior turns for Opus 4.5+, Sonnet 4.6+ and Fable 5.1+. Other generations replay thinking only from the current exchange. Visibility does not change replay retention. A history-prefix rewrite invalidates stored reasoning before provider conversion; signed payloads are kept separately from readable progress.
+
+Runtime profiles may set `history_trim_low_water` to a finite fraction in `(0.0, 1.0]`. The default `0.7` leaves headroom after a count trim, measured in complete turns under `max_history_messages`; tool rows do not consume separate slots. `1.0` disables count hysteresis.
 
 ## Prompt cache passthrough (chat-completions gateways)
 
@@ -344,17 +332,9 @@ passthrough entirely; the native provider places its own breakpoints.
 surface.
 
 With the flag on, requests gain at most two `cache_control` breakpoints:
-one on the system prompt, and one rolling breakpoint on the last message
-once the conversation has more than one non-system message, the same gate
-the native Anthropic provider applies. On a message that ends with an
-image, the rolling breakpoint sits on the message's last text block; the
-image is covered by the following turn. With
-`merge_system_into_user` the system role never reaches the wire, so the
-merged first user message (or the synthetic user carrying the system text)
-carries the system-equivalent breakpoint instead. Only breakpoint-carrying
-messages change serialization.
+With the flag on, requests gain up to three `cache_control` breakpoints: the system prompt, a rolling breakpoint on the last eligible non-system text message once the conversation has more than one non-system message, and an eligible prior-turn anchor before the latest user message. Prior-turn selection walks back at most two steps past an ineligible candidate and skips system or merged-system carriers and tool-call carriers. Co-located rolling and prior-turn anchors serialize one marker. With `merge_system_into_user`, the first user message carrying system content takes the system-equivalent breakpoint. Only breakpoint-carrying messages change serialization.
 
-The flag also scopes to the structured request paths: agent turns, tool
+Native Anthropic requests additionally mark the last tool definition. Their prior-turn anchor is placed only when actual system, OAuth-prefix, tool and rolling markers leave room under the API's four-marker limit. Every marker uses the configured cache TTL.
 calls, and structured streaming. The text-only helpers (`chat_with_system`,
 `chat_with_history`, the legacy chunk-stream APIs) deliberately emit no
 breakpoints even with the flag on, because their responses drop token usage
@@ -411,8 +391,7 @@ Requirements and caveats:
 - **Tool definitions are not separately marked.** The native Anthropic
   provider additionally marks the last tool definition, which covers
   tool-schema tokens when no system prompt exists. This flag does not mark
-  tool definitions; requests with tools but no system prompt cache only the
-  rolling message breakpoint. The live gateway qualification showed that
+  tool definitions; requests with tools but no system prompt rely on the rolling and eligible prior-turn message breakpoints. The live gateway qualification showed that
   with a system prompt present, tool-schema tokens sit inside the cached
   prefix anyway.
 

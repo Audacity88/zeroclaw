@@ -11,38 +11,95 @@ pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 /// resolution time gives a clearer error site than the first API call.
 pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
-/// Parameters for native extended thinking support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeThinkingParams {
-    pub budget_tokens: u32,
-    /// Requests Anthropic's `thinking.display` beta
-    /// (`thinking-display-updates-2026-08-18`), which controls whether
-    /// thinking blocks come back omitted, as progress updates, or
-    /// summarized. `None` leaves the field out of the request entirely,
-    /// matching pre-beta behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display: Option<ThinkingDisplay>,
+/// How much reasoning a model should spend on a request, for model families
+/// that take a depth setting rather than a token budget. Variants are declared
+/// in ascending depth, so they compare by depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingEffort {
+    Low,
+    High,
+    /// Between `high` and `max`; the 4.7 generation and later take it.
+    XHigh,
+    Max,
 }
 
-/// Anthropic's `thinking.display` request field (beta
-/// `thinking-display-updates-2026-08-18`), controlling whether thinking
-/// blocks come back omitted, as progress updates, or summarized.
+impl ThinkingEffort {
+    /// Wire value for the provider request body.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// How much of the model's reasoning comes back inside thinking blocks, for
+/// the model families whose requests can choose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum ThinkingDisplay {
+    /// Blocks arrive signed with their text withheld, which is the API's own
+    /// default on the families that read this field.
     Omitted,
-    Updates,
+    /// Blocks carry a readable summary of the reasoning.
     Summarized,
+    /// Blocks carry the short progress notes the model writes between tool
+    /// calls. Newer families only.
+    Updates,
 }
 
 impl ThinkingDisplay {
-    pub fn as_str(&self) -> &'static str {
+    /// Stable token for config, RPC and logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Omitted => "omitted",
-            Self::Updates => "updates",
             Self::Summarized => "summarized",
+            Self::Updates => "updates",
         }
     }
+
+    /// Parse the stable token, ignoring case and surrounding whitespace.
+    #[must_use]
+    pub fn from_str_insensitive(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "omitted" => Some(Self::Omitted),
+            "summarized" => Some(Self::Summarized),
+            "updates" => Some(Self::Updates),
+            _ => None,
+        }
+    }
+
+    /// Wire value, or `None` to let the API apply its own default.
+    #[must_use]
+    pub fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Omitted => None,
+            Self::Summarized => Some("summarized"),
+            Self::Updates => Some("updates"),
+        }
+    }
+}
+
+/// Parameters for native extended thinking support. A model family reads
+/// whichever of the depth settings it accepts; both are absent when the caller
+/// asked for the provider's own default depth. The display travels alongside
+/// so one request can choose how much of the reasoning comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NativeThinkingParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ThinkingEffort>,
+    /// How much of the reasoning comes back. `None` leaves the choice to the
+    /// runtime profile, then the provider alias, and past that to the API
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<ThinkingDisplay>,
 }
 
 /// A single message in a conversation.
@@ -481,6 +538,56 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// Why a provider's safety classifier declined a request.
+///
+/// A closed presentation projection. Raw categories remain diagnostic metadata
+/// on ModelRefusalError; only this projection is safe to render to users.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusalCategory {
+    Cyber,
+    Bio,
+    ReasoningExtraction,
+    FrontierLlm,
+    /// The provider reported a refusal with no category.
+    Unspecified,
+    /// The provider reported a category this build does not recognise.
+    Other,
+}
+
+impl RefusalCategory {
+    /// Map a provider's category string onto the closed set.
+    #[must_use]
+    pub fn from_wire(category: Option<&str>) -> Self {
+        match category.map(str::trim) {
+            None | Some("") => Self::Unspecified,
+            Some("cyber") => Self::Cyber,
+            Some("bio") => Self::Bio,
+            Some("reasoning_extraction") => Self::ReasoningExtraction,
+            Some("frontier_llm") => Self::FrontierLlm,
+            Some(_) => Self::Other,
+        }
+    }
+
+    /// Stable token for structured logs and message lookups.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cyber => "cyber",
+            Self::Bio => "bio",
+            Self::ReasoningExtraction => "reasoning_extraction",
+            Self::FrontierLlm => "frontier_llm",
+            Self::Unspecified => "unspecified",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for RefusalCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A provider safety refusal that completed at the transport layer but cannot
 /// be accepted as an assistant response.
 ///
@@ -508,6 +615,14 @@ pub struct ModelRefusalError {
     /// This disambiguates same-profile fallback models, which intentionally
     /// share one configured candidate/cooldown identity.
     pub attempted_candidate_index: Option<usize>,
+}
+
+impl ModelRefusalError {
+    /// Closed category projection for user-facing diagnostics.
+    #[must_use]
+    pub fn refusal_category(&self) -> RefusalCategory {
+        RefusalCategory::from_wire(self.category.as_deref())
+    }
 }
 
 /// Errors that can occur during streaming.
@@ -1410,7 +1525,8 @@ mod thinking_display_tests {
     #[test]
     fn serialization_includes_display_when_present() {
         let params = NativeThinkingParams {
-            budget_tokens: 1_024,
+            budget_tokens: Some(1_024),
+            effort: None,
             display: Some(ThinkingDisplay::Updates),
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");
@@ -1423,7 +1539,8 @@ mod thinking_display_tests {
     #[test]
     fn serialization_omits_display_when_absent() {
         let params = NativeThinkingParams {
-            budget_tokens: 1_024,
+            budget_tokens: Some(1_024),
+            effort: None,
             display: None,
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");

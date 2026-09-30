@@ -1134,8 +1134,9 @@ impl OpenAiCompatibleModelProvider {
     /// it carries text, otherwise the nearest earlier non-system message
     /// that does, so an image-only turn rolls the breakpoint back instead
     /// of silently dropping it. System messages are never marked twice, and
-    /// when nothing qualifies there is no rolling breakpoint. At most two
-    /// breakpoints per request; only breakpoint-carrying messages convert
+    /// when nothing qualifies there is no rolling breakpoint. An eligible
+    /// prior-turn anchor adds a third marker, deduplicated on co-location.
+    /// Only breakpoint-carrying messages convert
     /// from string content to block form, every other message serializes
     /// exactly as before.
     fn apply_cache_breakpoints<T: CacheBreakpointMessage>(
@@ -1183,6 +1184,11 @@ impl OpenAiCompatibleModelProvider {
                 }
             }
         }
+        if let Some(index) = Self::prior_turn_breakpoint_index(messages, carrier)
+            && let Some(content) = messages[index].cache_content()
+        {
+            content.apply_cache_control(cache_ttl);
+        }
     }
 
     /// Index of the merged system-content carrier (the first user message)
@@ -1198,9 +1204,28 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
-    /// Build the full URL for chat completions, detecting if base_url already includes the path.
-    /// This allows custom model_providers with non-standard endpoints (e.g., VolcEngine ARK uses
-    /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
+    /// Select an eligible prior-turn anchor, bounded to two backward steps.
+    fn prior_turn_breakpoint_index<T: CacheBreakpointMessage>(
+        messages: &[T],
+        carrier: Option<usize>,
+    ) -> Option<usize> {
+        let last_user = messages.iter().rposition(|m| m.cache_role() == "user")?;
+        let mut candidate = last_user.checked_sub(1)?;
+        for _ in 0..3 {
+            let after_carrier = carrier.is_none_or(|idx| candidate > idx);
+            if candidate > 0
+                && after_carrier
+                && messages[candidate].cache_role() != "system"
+                && messages[candidate].has_cacheable_content()
+            {
+                return Some(candidate);
+            }
+            candidate = candidate.checked_sub(1)?;
+        }
+        None
+    }
+
+    /// Build the chat URL, including custom complete endpoints and API paths.
     fn chat_completions_url(&self) -> String {
         // If a custom api_path is configured, use it directly.
         if let Some(ref api_path) = self.api_path {
@@ -1260,6 +1285,20 @@ impl OpenAiCompatibleModelProvider {
     /// either because the model_provider was configured that way or the model requires it.
     fn effective_merge_system(&self, model: &str) -> bool {
         self.merge_system_into_user || Self::model_requires_system_merge(model)
+    }
+
+    fn wire_reasoning_effort(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<String> {
+        if self.reasoning_effort_passthrough
+            && let Some(params) = thinking
+            && let Some(effort) = params.effort
+        {
+            return Some(effort.as_str().to_string());
+        }
+        self.reasoning_effort_for_model(model)
     }
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
@@ -1493,7 +1532,7 @@ impl OpenAiCompatibleModelProvider {
             temperature: shape.temperature,
             stream: Some(false),
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, thinking),
             tool_stream: None,
             tools: None,
             tool_choice: None,
@@ -1563,7 +1602,7 @@ impl OpenAiCompatibleModelProvider {
             }
             crate::anthropic::AnthropicThinkingStyle::Budget => serde_json::json!({
                 "type": "enabled",
-                "budget_tokens": params.budget_tokens
+                "budget_tokens": params.budget_tokens?
             }),
         };
         if let Some(display) = params.display {
@@ -1777,6 +1816,16 @@ enum MessageContent {
 }
 
 impl MessageContent {
+    fn cacheable(&self) -> bool {
+        match self {
+            MessageContent::Text(text) => !text.is_empty(),
+            MessageContent::Parts(parts) => matches!(
+                parts.last(),
+                Some(MessagePart::Text { text, .. }) if !text.is_empty()
+            ),
+        }
+    }
+
     /// Mark this content as an Anthropic prompt-cache breakpoint and return
     /// whether a markable text part was found: plain string content
     /// converts to the single-text-block wire form (block conversion
@@ -1826,6 +1875,12 @@ impl MessageContent {
 trait CacheBreakpointMessage {
     fn cache_role(&self) -> &str;
     fn cache_content(&mut self) -> Option<&mut MessageContent>;
+    /// Whether a prior-turn breakpoint on this message would land. Tool-call
+    /// carriers are the `tool_use` analog: on the native wire those blocks
+    /// always trail the message, so the native placement match skips them,
+    /// and the field-form carrier is skipped for the same reason even when
+    /// incidental text rides along.
+    fn has_cacheable_content(&self) -> bool;
 }
 
 impl CacheBreakpointMessage for Message {
@@ -1836,6 +1891,10 @@ impl CacheBreakpointMessage for Message {
     fn cache_content(&mut self) -> Option<&mut MessageContent> {
         Some(&mut self.content)
     }
+
+    fn has_cacheable_content(&self) -> bool {
+        self.content.cacheable()
+    }
 }
 
 impl CacheBreakpointMessage for NativeMessage {
@@ -1845,6 +1904,10 @@ impl CacheBreakpointMessage for NativeMessage {
 
     fn cache_content(&mut self) -> Option<&mut MessageContent> {
         self.content.as_mut()
+    }
+
+    fn has_cacheable_content(&self) -> bool {
+        self.tool_calls.is_none() && self.content.as_ref().is_some_and(MessageContent::cacheable)
     }
 }
 
@@ -3113,7 +3176,7 @@ impl OpenAiCompatibleModelProvider {
             // Non-streaming path; `usage` is on the final response body, not
             // gated on `stream_options.include_usage`.
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, thinking),
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice,
@@ -3144,7 +3207,7 @@ impl OpenAiCompatibleModelProvider {
             temperature: shape.temperature,
             stream: Some(false),
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, thinking),
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice: has_tool_entries.then(|| "auto".to_string()),
@@ -3218,7 +3281,7 @@ impl OpenAiCompatibleModelProvider {
             model: model.to_string(),
             messages,
             temperature: shape.temperature,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, thinking),
             tool_stream: if options_enabled {
                 self.tool_stream_for_tools(true)
             } else {
@@ -4106,7 +4169,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             temperature,
             stream: Some(false),
             stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
+            reasoning_effort: self.wire_reasoning_effort(model, None),
             tool_stream: None,
             tools: None,
             tool_choice: None,
@@ -4521,7 +4584,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
             let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = tools_count > 0;
-            let reasoning_effort = provider.reasoning_effort_for_model(&model);
+            let reasoning_effort = provider.wire_reasoning_effort(&model, thinking_owned);
             let reasoning_effort_omitted =
                 provider.reasoning_effort.is_some() && reasoning_effort.is_none();
             let reasoning_effort_omission_reason =
@@ -5707,18 +5770,21 @@ mod tests {
                      "cache_control": {"type": "ephemeral"}},
                 ]},
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
                 {"role": "user", "content": [
                     {"type": "text", "text": "bye",
                      "cache_control": {"type": "ephemeral"}},
                 ]},
             ]),
-            "system and last message carry the breakpoints; middle messages untouched"
+            "system, prior-turn and last message carry the breakpoints"
         );
         assert_eq!(
             requests[0].to_string().matches("cache_control").count(),
-            2,
-            "rolling breakpoint must never exceed two per request"
+            3,
+            "system, prior-turn and rolling breakpoints must remain distinct"
         );
     }
 
@@ -5787,19 +5853,22 @@ mod tests {
                      "cache_control": {"type": "ephemeral"}},
                 ]},
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
                 {"role": "user", "content": [
                     {"type": "text", "text": "look at this",
                      "cache_control": {"type": "ephemeral"}},
                     {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
                 ]},
             ]),
-            "system and the text part ahead of the trailing image carry the breakpoints; middle messages untouched"
+            "system, prior-turn and text ahead of the trailing image carry the breakpoints"
         );
         assert_eq!(
             requests[0].to_string().matches("cache_control").count(),
-            2,
-            "an image-ending turn must still carry exactly two breakpoints"
+            3,
+            "image-ending turn retains the prior-turn anchor"
         );
     }
 
@@ -5853,7 +5922,10 @@ mod tests {
                      "cache_control": {"type": "ephemeral"}},
                 ]},
                 {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
                 {"role": "user", "content": [
                     {"type": "text", "text": "look at this",
                      "cache_control": {"type": "ephemeral"}},
@@ -5864,8 +5936,8 @@ mod tests {
         );
         assert_eq!(
             requests[0].to_string().matches("cache_control").count(),
-            2,
-            "streaming image-ending turn must carry exactly two breakpoints"
+            3,
+            "streaming image-ending turn retains the prior-turn anchor"
         );
     }
 
@@ -6469,7 +6541,8 @@ mod tests {
         // absent), and the extra_body seam returns the configured extra_body
         // value unchanged.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -6522,7 +6595,8 @@ mod tests {
     #[test]
     fn thinking_passthrough_injects_enabled_budget_shape() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6584,7 +6658,8 @@ mod tests {
             .build();
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
         };
 
@@ -6624,7 +6699,8 @@ mod tests {
         // Adaptive-only models reject the fixed-budget shape with HTTP 400;
         // the injected object must switch to the bare adaptive shape.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6654,7 +6730,8 @@ mod tests {
         // A budget model keeps the enabled shape exactly, with no display
         // key when params.display is None.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6686,7 +6763,8 @@ mod tests {
             .build();
 
         let updates = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
         };
         let budget = p.request_extra_body("test-model", Some(updates)).unwrap();
@@ -6710,7 +6788,8 @@ mod tests {
         );
 
         let omitted = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
         };
         let omitted_body = p.request_extra_body("test-model", Some(omitted)).unwrap();
@@ -6728,7 +6807,8 @@ mod tests {
         // resolve to the adaptive shape (live gateways emit IDs like
         // "claude-group/claude-fable-5").
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6757,7 +6837,8 @@ mod tests {
         // End to end through the non-streaming builder: an adaptive-only
         // gateway model gets the adaptive thinking object at the top level.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6821,7 +6902,8 @@ mod tests {
         // Explicit operator `extra_body` always wins: an extra_body `thinking`
         // key must fully shadow the injected object.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -6880,7 +6962,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -6954,7 +7037,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -6999,7 +7083,8 @@ mod tests {
         // caller's values, an `enabled` override raises the limit above
         // its own budget and still forces temperature 1.0.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7144,7 +7229,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -7247,7 +7333,8 @@ mod tests {
     #[test]
     fn thinking_passthrough_merges_alongside_unrelated_extra_body_keys() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 4_096,
+            budget_tokens: Some(4_096),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7275,7 +7362,8 @@ mod tests {
         // serde(flatten) boundary — unchanged pre-existing behavior — so
         // this pins the seam, not the wire.)
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7302,7 +7390,8 @@ mod tests {
         // provider's rule). Flag off and params-None keep the caller's
         // value, leaving those bodies byte-identical.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7377,7 +7466,8 @@ mod tests {
     #[test]
     fn thinking_passthrough_forces_temperature_in_raw_tool_builder() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7448,7 +7538,8 @@ mod tests {
         // provider: an adaptive-only gateway model with thinking params also
         // gets temperature 1.0.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7491,7 +7582,8 @@ mod tests {
         // caller's value is kept, nothing is forced. Flag off is the same
         // byte-identical legacy body.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7579,7 +7671,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -7641,7 +7734,8 @@ mod tests {
         // params-None keep the configured limit, leaving those bodies
         // byte-identical.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7723,7 +7817,8 @@ mod tests {
     #[test]
     fn thinking_passthrough_raises_max_tokens_in_raw_tool_builder() {
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7801,7 +7896,8 @@ mod tests {
         // already above the budget is sent unchanged, and an unset limit
         // resolves to the minimum the budget requires.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -7861,7 +7957,8 @@ mod tests {
         // adaptive-style thinking carries no budget, so the configured
         // limit is unconstrained.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7905,7 +8002,8 @@ mod tests {
         // value is kept, nothing is raised. Flag off is the same
         // byte-identical legacy body.
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
@@ -8000,7 +8098,8 @@ mod tests {
         let base_url = format!("http://{addr}");
         let messages = vec![ChatMessage::user("hello")];
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -8672,7 +8771,8 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
         let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -8830,7 +8930,8 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
         let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
 
@@ -8932,7 +9033,8 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
         let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 8_192,
+            budget_tokens: Some(8_192),
+            effort: None,
             display: None,
         };
         let messages = vec![ChatMessage::user("What is the weather in SF?")];
@@ -13557,6 +13659,7 @@ mod tests {
         let (provider, captured, server) = mock_streaming_cache_capture(true).await;
         let provider = OpenAiCompatibleModelProvider {
             thinking_passthrough: true,
+            reasoning_effort_passthrough: true,
             ..provider
         };
         let messages = vec![
@@ -13571,7 +13674,8 @@ mod tests {
                     messages: &messages,
                     tools: None,
                     thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                        budget_tokens: 2048,
+                        budget_tokens: Some(2048),
+                        effort: Some(zeroclaw_api::model_provider::ThinkingEffort::High),
                         display: None,
                     }),
                 },
@@ -13583,6 +13687,7 @@ mod tests {
         result.unwrap_or_else(|error| panic!("two-flag request failed: {error}"));
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["reasoning_effort"], serde_json::json!("high"));
         assert_eq!(
             requests[0]["thinking"],
             serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
@@ -13707,18 +13812,21 @@ mod tests {
                     {"type": "text", "text": "core policy\n\nhi",
                      "cache_control": {"type": "ephemeral"}},
                 ]},
-                {"role": "assistant", "content": "hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
                 {"role": "user", "content": [
                     {"type": "text", "text": "bye",
                      "cache_control": {"type": "ephemeral"}},
                 ]},
             ]),
-            "merged carrier and rolling breakpoint with middle messages untouched"
+            "merged carrier, prior-turn and rolling breakpoints compose"
         );
         assert_eq!(
             requests[0].to_string().matches("cache_control").count(),
-            2,
-            "merged multi-turn must carry exactly two breakpoints"
+            3,
+            "merged multi-turn retains the prior-turn anchor"
         );
     }
 
