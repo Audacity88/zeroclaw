@@ -10626,7 +10626,7 @@ mod tests {
             temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let thinking = request.thinking.as_ref();
-            let thinking_budget = thinking.map(|params| params.budget_tokens);
+            let thinking_budget = thinking.and_then(|params| params.budget_tokens);
             let thinking_display = thinking.and_then(|params| params.display);
             let system_prompt = request
                 .messages

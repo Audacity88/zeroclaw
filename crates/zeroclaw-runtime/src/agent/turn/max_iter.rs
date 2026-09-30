@@ -222,6 +222,7 @@ pub(crate) async fn finish_after_max_iterations(
                 let mut trim = super::surface_oversized_dispatch_if_needed(
                     injected_memory_preamble,
                     history,
+                    &selected_model,
                     crumb_present,
                     tokens,
                     trim_budget,

@@ -42,25 +42,28 @@ type SessionModelProvider = (
     Arc<zeroclaw_providers::router::ModelRouteResolver>,
 );
 
-pub fn build_session_model_provider(
-    config: &Config,
-    model_provider_ref: &str,
-    model_override: Option<&str>,
-) -> Result<SessionModelProvider> {
-    let (model_provider_name, model_provider_alias) = model_provider_ref
+fn split_model_provider_ref(model_provider_ref: &str) -> Result<(String, String)> {
+    model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
         .ok_or_else(|| {
             anyhow::Error::msg(format!(
                 "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
             ))
-        })?;
+        })
+}
 
+fn resolve_session_model(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let (model_provider_name, model_provider_alias) = split_model_provider_ref(model_provider_ref)?;
     let entry = config
         .providers
         .models
         .find(&model_provider_name, &model_provider_alias);
-    let model_name = model_override
+    model_override
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(str::to_string)
@@ -76,7 +79,44 @@ pub fn build_session_model_provider(
                 "model_provider `{model_provider_ref}` has no `model` configured and no model \
                  override was supplied"
             ))
-        })?;
+        })
+}
+
+/// Resolve the same model identity as provider construction without building
+/// a provider or waiting for the session's live Agent.
+pub fn resolve_session_model_identity(
+    config: &Config,
+    agent_alias: &str,
+    model_provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<(String, String)> {
+    let model_provider_ref = match model_provider_override
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+    {
+        Some(reference) => reference.to_string(),
+        None => config
+            .agent(agent_alias)
+            .map(|agent| agent.model_provider.as_str().to_string())
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!("Agent `{agent_alias}` is not configured"))
+            })?,
+    };
+    let model = resolve_session_model(config, &model_provider_ref, model_override)?;
+    Ok((model_provider_ref, model))
+}
+
+pub fn build_session_model_provider(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModelProvider> {
+    let (model_provider_name, model_provider_alias) = split_model_provider_ref(model_provider_ref)?;
+    let model_name = resolve_session_model(config, model_provider_ref, model_override)?;
+    let entry = config
+        .providers
+        .models
+        .find(&model_provider_name, &model_provider_alias);
 
     let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
         config,
