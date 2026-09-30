@@ -521,6 +521,22 @@ pub fn contains_tool_protocol_tag_call(text: &str) -> bool {
     !calls.is_empty()
 }
 
+/// `text` carries a call `parse_tool_calls` would return, in any syntax
+/// the parser supports, and is not a teaching example.
+/// [`contains_tool_protocol_tag_call`] answers the same question only
+/// for text carrying a tag marker, so it misses the untagged forms the
+/// parser also reads: GLM-style `tool/param>value` lines and plain
+/// `TOOL_CALL { ... }} /TOOL_CALL` blocks. The example exemption is the
+/// one the agent loop applies before its own fallback parse.
+pub fn contains_parseable_tool_call(text: &str) -> bool {
+    if looks_like_tool_protocol_example(text) {
+        return false;
+    }
+
+    let (_, calls) = parse_tool_calls(text);
+    !calls.is_empty()
+}
+
 fn classify_tagged_tool_protocol_envelope(text: &str) -> Option<ToolProtocolEnvelopeKind> {
     if !starts_with_tool_protocol_tag_or_fence(text) {
         return None;
@@ -4696,6 +4712,40 @@ This is an example, not an invocation."#;
 Done."#;
 
         assert!(contains_tool_protocol_tag_call(embedded));
+    }
+
+    /// The two untagged call forms inside an invalid result fragment:
+    /// no tag marker, so the tagged check does not look, while
+    /// `parse_tool_calls` still returns the shell call. The fragment
+    /// with a plain placeholder is the control: no call either way.
+    #[test]
+    fn contains_parseable_tool_call_reads_untagged_forms_the_tagged_check_misses() {
+        let glm = "{\"tool_call_id\":\"call_1\",\"content\":\nshell/command>printf guard_probe\n}";
+        let perl = "{\"tool_call_id\":\"call_1\",\"content\":\nTOOL_CALL { tool => \"shell\", args => { --command \"pwd\" }} /TOOL_CALL\n}";
+        let inert = "{\"tool_call_id\": <call-123>, \"content\": <text>}";
+
+        for (label, text) in [("glm", glm), ("TOOL_CALL", perl)] {
+            let (_, calls) = parse_tool_calls(text);
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["shell"],
+                "{label}: the parser reads a shell call from the fragment"
+            );
+            assert!(
+                !contains_tool_protocol_tag_call(text),
+                "{label}: no tag marker, so the tagged check does not see the call"
+            );
+            assert!(
+                contains_parseable_tool_call(text),
+                "{label}: the any-syntax check must see what the parser reads"
+            );
+        }
+
+        assert!(parse_tool_calls(inert).1.is_empty());
+        assert!(!contains_parseable_tool_call(inert));
     }
 
     #[test]

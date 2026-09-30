@@ -9,9 +9,10 @@ use super::protocol_detect::{
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
     TERMINAL_MARKERS, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope_for_known_tools,
-    looks_like_tool_protocol_envelope, looks_like_tool_protocol_example,
-    strip_trailing_terminal_markers, tool_protocol_envelope_mentions_known_tool,
+    contains_parseable_tool_call, contains_tool_protocol_tag_call,
+    looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
+    looks_like_tool_protocol_example, strip_trailing_terminal_markers,
+    tool_protocol_envelope_mentions_known_tool,
 };
 
 /// Which guard detector suppressed a candidate and where the candidate
@@ -70,13 +71,13 @@ fn opens_with_unterminated_container(text: &str) -> bool {
 }
 
 /// A result-shaped fragment whose root never parses as a complete
-/// leading JSON value, and which carries no call-shaped key, names
-/// nothing the parser can execute; after a prose preamble it is a
-/// quotation of the result shape, delivered at finish. A candidate
-/// whose leading value completed is the classifier's business, whatever
-/// text follows the value. Leading (offset 0) fragments are not
-/// covered: a result shape that leads the message is withheld, as
-/// before.
+/// leading JSON value, and which carries no call-shaped key and no call
+/// the parser reads (tagged or untagged), names nothing the parser can
+/// execute; after a prose preamble it is a quotation of the result
+/// shape, delivered at finish. A candidate whose leading value
+/// completed is the classifier's business, whatever text follows the
+/// value. Leading (offset 0) fragments are not covered: a result shape
+/// that leads the message is withheld, as before.
 fn is_inert_result_fragment(text: &str) -> bool {
     let trimmed = text.trim();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
@@ -112,12 +113,13 @@ fn is_inert_result_fragment(text: &str) -> bool {
             return false;
         }
     }
-    // Tagged tool-call markup names something the parser can execute, so
-    // a fragment carrying it is not a harmless quotation: the finish-time
-    // detector and fallback paths must not release it where the release
-    // gate (which `evaluate_pending` applies before any quoted-result
-    // release) would withhold it.
-    !contains_tool_protocol_tag_call(trimmed)
+    // A fragment carrying any call the parser reads is not a harmless
+    // quotation: tagged markup, and also the untagged GLM-style
+    // `tool/param>value` lines and `TOOL_CALL` blocks, which carry no tag
+    // marker for the tagged check to find. The finish-time detector and
+    // fallback paths must not release it where the base guard withheld
+    // the malformed candidate.
+    !contains_parseable_tool_call(trimmed)
 }
 
 /// A parsed JSON value whose own top level carries one of the keys the
@@ -426,7 +428,8 @@ impl StreamTextGuard {
     /// reads as a teaching example (the same exemption and order
     /// `evaluate_pending` applies). Otherwise the span faces the result
     /// test the release paths already apply: a releasable result, or a
-    /// result fragment that never parses and carries no call-shaped key.
+    /// result fragment that never parses and carries neither a
+    /// call-shaped key nor a call the parser reads in any syntax.
     fn releases_as_quoted_result(&self, candidate: &str, span: &str) -> bool {
         if !looks_like_tool_protocol_example(candidate) {
             if contains_tool_protocol_tag_call(span) {
@@ -2806,6 +2809,151 @@ mod stream_text_guard_tests {
                 detector: "function_call",
                 candidate_offset: expected_offset,
             })
+        );
+    }
+
+    /// The untagged call forms `parse_tool_calls` reads, each inside a
+    /// result fragment that never parses (review 5369095801): a GLM-style
+    /// `tool/param>value` line and a plain `TOOL_CALL` block. Neither
+    /// carries a tag marker, so the tagged check does not see them.
+    const UNTAGGED_CALL_FRAGMENTS: [(&str, &str); 2] = [
+        (
+            "glm",
+            "{\"tool_call_id\":\"call_1\",\"content\":\nshell/command>printf guard_probe\n}",
+        ),
+        (
+            "TOOL_CALL",
+            "{\"tool_call_id\":\"call_1\",\"content\":\nTOOL_CALL { tool => \"shell\", args => { --command \"pwd\" }} /TOOL_CALL\n}",
+        ),
+    ];
+
+    /// The base outcome for these fragments: the preamble is delivered
+    /// and the malformed candidate is withheld from its first byte.
+    fn untagged_withheld_after(
+        prose: &str,
+    ) -> (String, bool, Option<ProtocolSuppressionDiagnostic>) {
+        (
+            prose.to_string(),
+            true,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "malformed",
+                candidate_offset: prose.len(),
+            }),
+        )
+    }
+
+    /// Regression for review 5369095801: a closed json fence quoting a
+    /// result fragment that carries an untagged call. The fence release
+    /// used to call the fragment inert and deliver it; the parser reads
+    /// the call, so it is withheld, one delta and split alike.
+    #[test]
+    fn prose_prefix_json_fenced_untagged_call_fragment_is_withheld() {
+        let prose = "Result shape:\n";
+        for (label, fragment) in UNTAGGED_CALL_FRAGMENTS {
+            let expected = untagged_withheld_after(prose);
+            let (head, tail) = fragment.split_once('\n').expect("fragment spans lines");
+            assert_eq!(
+                guard_outcome(&[format!("{prose}```json\n{fragment}\n```").as_str()]),
+                expected,
+                "{label}: one delta"
+            );
+            assert_eq!(
+                guard_outcome(&[prose, "```json\n", fragment, "\n```"]),
+                expected,
+                "{label}: fence and fragment in separate deltas"
+            );
+            assert_eq!(
+                guard_outcome(&[prose, "```json\n", head, "\n", tail, "\n```"]),
+                expected,
+                "{label}: fragment split before the call line"
+            );
+        }
+    }
+
+    /// The same fragments in a json fence that never closes: judged at
+    /// finish, withheld, one delta and split alike.
+    #[test]
+    fn prose_prefix_unclosed_json_fence_untagged_call_fragment_is_withheld() {
+        let prose = "Result shape:\n";
+        for (label, fragment) in UNTAGGED_CALL_FRAGMENTS {
+            let expected = untagged_withheld_after(prose);
+            assert_eq!(
+                guard_outcome(&[format!("{prose}```json\n{fragment}").as_str()]),
+                expected,
+                "{label}: one delta"
+            );
+            assert_eq!(
+                guard_outcome(&[prose, format!("```json\n{fragment}").as_str()]),
+                expected,
+                "{label}: preamble in an earlier delta"
+            );
+        }
+    }
+
+    /// The bare fragment after a preamble, which reaches the finish-time
+    /// detector (preamble in the same delta) or the finish fallback
+    /// (preamble in an earlier delta): both withhold it. The `TOOL_CALL`
+    /// form is covered only when the fragment's first line arrives in a
+    /// delta of its own: a delta carrying the whole unfenced fragment has
+    /// its last brace inside the `args` block, so the candidate finder
+    /// seeds nothing and the text is delivered as prose. That finder is
+    /// unchanged from base, which delivers the same text.
+    #[test]
+    fn prose_prefix_bare_untagged_call_fragment_is_withheld_at_finish() {
+        let prose = "Result shape: ";
+        for (label, fragment) in UNTAGGED_CALL_FRAGMENTS {
+            let expected = untagged_withheld_after(prose);
+            let (head, tail) = fragment.split_once('\n').expect("fragment spans lines");
+            assert_eq!(
+                guard_outcome(&[prose, head, "\n", tail]),
+                expected,
+                "{label}: fragment split before the call line"
+            );
+            if label == "TOOL_CALL" {
+                continue;
+            }
+            assert_eq!(
+                guard_outcome(&[format!("{prose}{fragment}").as_str()]),
+                expected,
+                "{label}: one delta"
+            );
+            assert_eq!(
+                guard_outcome(&[prose, fragment]),
+                expected,
+                "{label}: preamble in an earlier delta"
+            );
+        }
+    }
+
+    /// Positive control: a result fragment whose content has a path with
+    /// a slash, which the GLM line parser does not read as a call (no
+    /// `>` and no JSON after the slash), stays inert and is delivered
+    /// byte for byte, fenced and bare, one delta and split.
+    #[test]
+    fn prose_prefix_result_fragment_with_path_content_is_still_delivered() {
+        let prose = "Result shape:\n";
+        let fragment = "{\"tool_call_id\":\"call_1\",\"content\":\nsrc/lib.rs line 4\n}";
+        let fenced = format!("{prose}```json\n{fragment}\n```");
+        assert_eq!(
+            guard_outcome(&[fenced.as_str()]),
+            (fenced.clone(), false, None),
+            "fenced, one delta"
+        );
+        assert_eq!(
+            guard_outcome(&[prose, "```json\n", fragment, "\n```"]),
+            (fenced.clone(), false, None),
+            "fenced, split"
+        );
+        let bare = format!("{prose}{fragment}");
+        assert_eq!(
+            guard_outcome(&[bare.as_str()]),
+            (bare.clone(), false, None),
+            "bare, one delta"
+        );
+        assert_eq!(
+            guard_outcome(&[prose, fragment]),
+            (bare.clone(), false, None),
+            "bare, split"
         );
     }
 }
