@@ -5433,8 +5433,8 @@ impl RpcDispatcher {
         &self,
         session_id: &str,
         method: Method,
+        authorized: Option<super::session::SessionRecord>,
     ) -> Result<super::compaction::AdmittedCompactionSession, JsonRpcError> {
-        let authorized = self.authorize_session_owner(session_id, method).await?;
         let Some(record) = authorized.as_ref() else {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         };
@@ -5523,8 +5523,15 @@ impl RpcDispatcher {
 
     async fn handle_session_compact_context(&self, params: &Value) -> RpcResult {
         let params: SessionCompactContextParams = parse_params(params)?;
+        let authorized = self
+            .authorize_session_owner(&params.session_id, Method::SessionCompactContext)
+            .await?;
         let admitted = self
-            .admit_context_operation(&params.session_id, Method::SessionCompactContext)
+            .admit_context_operation(
+                &params.session_id,
+                Method::SessionCompactContext,
+                authorized,
+            )
             .await?;
         to_result(
             super::compaction::compact_context(
@@ -5539,8 +5546,15 @@ impl RpcDispatcher {
 
     async fn handle_session_restore_context(&self, params: &Value) -> RpcResult {
         let params: SessionRestoreContextParams = parse_params(params)?;
+        let authorized = self
+            .authorize_session_owner(&params.session_id, Method::SessionRestoreContext)
+            .await?;
         let admitted = self
-            .admit_context_operation(&params.session_id, Method::SessionRestoreContext)
+            .admit_context_operation(
+                &params.session_id,
+                Method::SessionRestoreContext,
+                authorized,
+            )
             .await?;
         to_result(
             super::compaction::restore_context(

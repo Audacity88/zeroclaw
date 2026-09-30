@@ -2302,10 +2302,10 @@ impl AcpSessionStore {
         }))
     }
 
-    fn split_breadcrumb<'a>(
-        messages: &'a [ConversationMessage],
+    fn split_breadcrumb(
+        messages: &[ConversationMessage],
         breadcrumb: bool,
-    ) -> (Option<&'a ConversationMessage>, &'a [ConversationMessage]) {
+    ) -> (Option<&ConversationMessage>, &[ConversationMessage]) {
         if breadcrumb && !messages.is_empty() {
             (messages.first(), &messages[1..])
         } else {
