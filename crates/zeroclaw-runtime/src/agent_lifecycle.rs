@@ -540,7 +540,7 @@ mod tests {
         config.heartbeat.agent = "victim".to_string();
         AcpSessionStore::new(&config.data_dir)
             .unwrap()
-            .create_session("live", "victim", "/tmp/victim")
+            .create_session("live", "victim", "/tmp/victim", None)
             .unwrap();
 
         let preview = plan_agent_delete(&config, "victim");
@@ -623,6 +623,7 @@ mod tests {
                 depth: 0,
                 parent_id: None,
                 originator_route: None,
+                originator_chain: Vec::new(),
                 delivered: true,
                 idem_key: None,
                 principal_id: None,

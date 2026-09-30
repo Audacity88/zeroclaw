@@ -22,6 +22,11 @@ use crate::live_config_authority::{ConfigCommit, ConfigCommitError};
 
 #[derive(Default)]
 pub struct ApprovalPendingMap {
+    /// `request_id -> (originating session_id, responder)`. The session ID
+    /// binds each in-flight approval to the session it was raised for, so
+    /// `session/approve` authorizes against that session's owner instead
+    /// of trusting a client-supplied `session_id` or the bare
+    /// `request_id`.
     inner: std::sync::Mutex<HashMap<String, PendingApprovalEntry>>,
 }
 
@@ -97,6 +102,17 @@ impl ApprovalPendingMap {
         false
     }
 
+    /// The session id an in-flight approval was raised for, if still
+    /// pending. `session/approve` authorizes the caller against this
+    /// session's owner, never against client-supplied routing.
+    pub fn session_for(&self, request_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(request_id)
+            .map(|entry| entry.session_id.clone())
+    }
+
     pub fn remove(&self, request_id: &str) -> bool {
         self.inner
             .lock()
@@ -123,7 +139,7 @@ pub struct RpcContext {
     pub config: LiveConfigHandle,
 
     /// The live-config authority that owns this context's publication
-    /// transaction: the daemon-wide writer mutex, the config-work
+    /// transaction: the process-wide writer mutex, the parent config-write
     /// lifecycle lease, and the published pair. Every RPC config writer
     /// serializes through it before cloning the current config, and the
     /// irreversible save-and-publish phase of each commit runs retained
@@ -156,6 +172,14 @@ pub struct RpcContext {
     /// events as JSON-RPC notifications (`logs/subscribe`).
     pub event_tx: Option<tokio::sync::broadcast::Sender<Value>>,
 
+    /// Recent observer frames on the same bus (`events/history`). `None`
+    /// when there is no daemon event bus.
+    pub event_history: Option<Arc<crate::observability::EventBuffer>>,
+
+    /// Replayable, bounded subscription sources (`logs/subscribe`,
+    /// `events/subscribe`). The daemon feeds it from its event bus.
+    pub subscriptions: Arc<crate::rpc::subscription::SubscriptionHub>,
+
     /// Write `true` to trigger a daemon-level config reload. Mirrors
     /// the gateway's `/admin/reload` mechanism.
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -180,6 +204,10 @@ pub struct RpcContext {
     /// Shared SOP engine from the daemon (for RPC/TUI agent sessions).
     /// `None` when standalone — sessions build their own.
     pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    /// The daemon generation's driver supervisor set. Approval surfaces
+    /// register resumed headless drivers here so reload drains them instead
+    /// of letting them run detached under superseded configuration.
+    pub sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
 
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
@@ -201,6 +229,32 @@ pub struct RpcContext {
     /// Certificate paths fail closed on `None` rather than issuing
     /// credentials with no trail.
     pub cert_audit: Option<Arc<crate::security::audit::AuditLogger>>,
+    /// Inbound authentication layer: providers, shared resolver, and the
+    /// live pairing/roster authorities. Always present — a default config
+    /// yields the legacy local shared-operator behavior, never a bypass.
+    pub auth: Arc<crate::rpc::auth::RpcInboundAuth>,
+
+    /// Test-only pause between the prepare and commit halves of
+    /// `commit_config_with_live_session_refresh`. See `ConfigCommitPause`.
+    #[cfg(test)]
+    pub config_commit_pause: Option<Arc<ConfigCommitPause>>,
+}
+
+/// Test-only pause point inside `commit_config_with_live_session_refresh`:
+/// fires `arrived` once the prepare phase has completed (so every per-session
+/// skip decision has already dropped the skipped sessions' ordering guards
+/// and the `list_ids()` snapshot has passed), then parks on `release` until
+/// the test fires it. Lets a regression drive other RPCs (`session/configure`,
+/// session rehydration) deterministically inside the prepared-and-skipped
+/// window — after the refresh snapshot has passed over a session but before
+/// the candidate config is saved and swapped.
+#[cfg(test)]
+#[derive(Default)]
+pub struct ConfigCommitPause {
+    /// Notified (once) when the commit reaches the pause.
+    pub arrived: tokio::sync::Notify,
+    /// The commit parks on this after `arrived`; the test releases it.
+    pub release: tokio::sync::Notify,
 }
 
 impl RpcContext {
@@ -218,6 +272,7 @@ impl RpcContext {
         authority: &LiveConfigAuthority,
         sessions: Arc<SessionStore>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&authority.live_handle().read());
         Arc::new(Self {
             config: authority.live_handle(),
             config_authority: authority.clone(),
@@ -228,15 +283,21 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
+            #[cfg(test)]
+            config_commit_pause: None,
         })
     }
 
@@ -254,6 +315,7 @@ impl RpcContext {
             data_dir.clone(),
         )
         .ok();
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -265,20 +327,27 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit,
+            auth,
         })
     }
 
     #[cfg(test)]
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -290,15 +359,21 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -313,6 +388,7 @@ impl RpcContext {
             config.data_dir.clone(),
         )
         .ok();
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -324,15 +400,21 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit,
+            auth,
         })
     }
 
@@ -342,6 +424,53 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         event_tx: tokio::sync::broadcast::Sender<Value>,
     ) -> Arc<Self> {
+        Self::minimal_with_events(
+            config,
+            sessions,
+            event_tx,
+            None,
+            Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+        )
+    }
+
+    /// Like [`Self::minimal_with_event_tx`] with a caller-built hub, so a test
+    /// can use small ring caps.
+    #[cfg(test)]
+    pub fn minimal_with_subscription_hub(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        event_tx: tokio::sync::broadcast::Sender<Value>,
+        hub: Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) -> Arc<Self> {
+        Self::minimal_with_events(config, sessions, event_tx, None, hub)
+    }
+
+    /// Like [`Self::minimal_with_event_tx`], wired to a whole daemon-style
+    /// [`EventBus`](crate::observability::EventBus): live sender and history.
+    #[cfg(test)]
+    pub fn minimal_with_event_bus(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        bus: &crate::observability::EventBus,
+    ) -> Arc<Self> {
+        Self::minimal_with_events(
+            config,
+            sessions,
+            bus.sender().clone(),
+            Some(Arc::clone(bus.history())),
+            Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+        )
+    }
+
+    #[cfg(test)]
+    fn minimal_with_events(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        event_tx: tokio::sync::broadcast::Sender<Value>,
+        event_history: Option<Arc<crate::observability::EventBuffer>>,
+        subscriptions: Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -353,15 +482,21 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: Some(event_tx),
+            event_history,
+            subscriptions,
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -371,6 +506,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -382,15 +518,62 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: Some(sop_engine),
+            sop_driver_handles: Some(crate::sop::SopDriverHandles::default()),
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
+            auth,
+        })
+    }
+
+    /// Like [`Self::minimal_with_sop_engine`] but with the audit logger too.
+    /// `sops/run` refuses without both, so the start path needs this one. The
+    /// driver handles are explicit so a test can choose an open generation, a
+    /// drained one, or none at all.
+    #[cfg(test)]
+    pub fn minimal_with_sop_engine_and_audit(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        sop_audit: Arc<crate::sop::SopAuditLogger>,
+        sop_driver_handles: Option<crate::sop::SopDriverHandles>,
+    ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
+        let authority = LiveConfigAuthority::new(config);
+        Arc::new(Self {
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: Some(sop_engine),
+            sop_driver_handles,
+            sop_audit: Some(sop_audit),
+            hooks: None,
+            config_commit_pause: None,
+            cert_audit: None,
+            auth,
         })
     }
 
@@ -400,6 +583,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         memory: Arc<dyn zeroclaw_api::memory_traits::Memory>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -411,15 +595,21 @@ impl RpcContext {
             memory: Some(memory),
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -429,6 +619,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         cost_tracker: Arc<CostTracker>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -440,15 +631,21 @@ impl RpcContext {
             memory: None,
             cost_tracker: Some(cost_tracker),
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -459,6 +656,7 @@ impl RpcContext {
         session_backend: Option<Arc<dyn SessionBackend>>,
         acp_session_store: Option<Arc<AcpSessionStore>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -470,15 +668,21 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -489,6 +693,7 @@ impl RpcContext {
         gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
         reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
             config: authority.live_handle(),
@@ -500,15 +705,21 @@ impl RpcContext {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx,
             gateway_shutdown_tx,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
             cert_audit: None,
+            auth,
         })
     }
 }
@@ -545,6 +756,21 @@ mod tests {
         assert!(map.resolve("req-1", "sess-1", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-1"));
         assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[test]
+    fn pending_map_binds_approvals_to_their_session() {
+        let map = ApprovalPendingMap::default();
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        map.insert("req-9".to_string(), "sess-42".to_string(), tx);
+        assert_eq!(map.session_for("req-9").as_deref(), Some("sess-42"));
+        assert_eq!(map.session_for("other"), None);
+        assert!(map.resolve("req-9", "sess-42", ChannelApprovalResponse::Deny));
+        assert_eq!(
+            map.session_for("req-9"),
+            None,
+            "a resolved approval is no longer bound"
+        );
     }
 
     #[test]

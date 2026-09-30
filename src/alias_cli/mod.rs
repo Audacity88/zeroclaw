@@ -8,6 +8,8 @@ use zeroclaw_config::alias_refs::{
 };
 use zeroclaw_config::schema::Config;
 
+mod export;
+
 /// Resolve a `cli-*` Fluent key for alias-CRUD CLI output. Under `agent-runtime`
 /// (default + what CI/release build) this routes through Fluent; without it the
 /// runtime i18n crate is absent, so the English `fallback` is used.
@@ -578,6 +580,9 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             };
             create_entry(config, "agents", &alias)?;
             save(config).await
+        }
+        AgentsCommands::Export { alias, out, force } => {
+            export::run(config, &alias, &out, force).await
         }
         AgentsCommands::Rename { from, to } => {
             #[cfg(feature = "agent-runtime")]

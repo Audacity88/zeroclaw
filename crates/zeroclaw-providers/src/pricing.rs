@@ -142,6 +142,15 @@ fn any_live_pricing(config: &Config) -> bool {
         .any(|(_, _, base)| base.live_pricing)
 }
 
+/// Whether the background price refresher has been started in this process.
+///
+/// Read-only: it reports the once-per-process guard [`spawn_refresher`]
+/// claims, so an owner can confirm the refresher runs without depending on
+/// which component started it.
+pub fn refresher_running() -> bool {
+    REFRESHER_STARTED.get().is_some()
+}
+
 /// Spawn the background price refresher, once per process.
 ///
 /// No-op when no provider currently sets `live_pricing = true`: zero network,
@@ -170,7 +179,7 @@ fn any_live_pricing(config: &Config) -> bool {
 pub fn spawn_refresher(config: LiveConfigHandle) {
     // Re-bind before the enabled pre-check so even a "nothing enabled yet"
     // call leaves the freshest handle for a refresher started later.
-    *CONFIG_HANDLE.write() = Some(config.clone());
+    bind_config(config.clone());
     if !any_live_pricing(&config.read()) {
         return;
     }
@@ -180,26 +189,54 @@ pub fn spawn_refresher(config: LiveConfigHandle) {
 
     ::zeroclaw_spawn::spawn!(async {
         loop {
-            // Re-resolve the handle (re-bound across daemon reloads), then
-            // clone the published config and build/poll without holding any
-            // guard. The handle is bound above before this task can exist,
-            // and never unbound, so the `expect` cannot fire.
-            let handle = CONFIG_HANDLE
-                .read()
-                .clone()
-                .expect("config handle is bound before the refresher is spawned");
-            let cfg = handle.snapshot();
-            let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
-            if groups.is_empty() {
-                if !current_snapshot().is_empty() {
-                    store_snapshot(PriceSnapshot::new());
-                }
-            } else {
-                refresh_once(&groups, &total_aliases_per_family).await;
-            }
+            refresh_cycle().await;
             tokio::time::sleep(REFRESH_INTERVAL).await;
         }
     });
+}
+
+/// Point the refresher at the live config handle a surface writes, without
+/// starting it.
+///
+/// Starting the refresher belongs to the process that owns the runtime (the
+/// daemon, or a standalone command). A surface that owns a *live* config
+/// handle, one its config API writes in place, binds that handle here so the
+/// next cycle sees an operator's change (an opt-out, a new endpoint or model)
+/// without waiting for a reload. The gateway does this at startup.
+pub fn bind_config(config: LiveConfigHandle) {
+    *CONFIG_HANDLE.write() = Some(config);
+}
+
+/// Whether the config the refresher is bound to opts any provider into live
+/// pricing. `false` when nothing is bound yet.
+pub fn live_pricing_enabled() -> bool {
+    bound_config().is_some_and(|cfg| any_live_pricing(&cfg))
+}
+
+/// A copy of the bound config, read under its lock at the moment of the call.
+fn bound_config() -> Option<Config> {
+    let handle = CONFIG_HANDLE.read().clone()?;
+    Some(handle.snapshot())
+}
+
+/// One refresh cycle. Re-resolves the bound handle (re-bound across daemon
+/// reloads and by a surface that owns a live handle), then builds and polls
+/// without holding either lock. An opt-out on the bound handle clears the
+/// snapshot on the very next cycle.
+async fn refresh_cycle() {
+    // The handle is bound before the refresher task can exist and is never
+    // unbound, so a missing handle means there is nothing to refresh.
+    let Some(cfg) = bound_config() else {
+        return;
+    };
+    let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
+    if groups.is_empty() {
+        if !current_snapshot().is_empty() {
+            store_snapshot(PriceSnapshot::new());
+        }
+    } else {
+        refresh_once(&groups, &total_aliases_per_family).await;
+    }
 }
 
 /// One model whose price we want filled: the composite alias (`<type>.<alias>`)
@@ -519,6 +556,91 @@ async fn refresh_once(groups: &[GatewayGroup], total_aliases_per_family: &HashMa
 mod tests {
     use super::*;
 
+    /// The bound config handle and the price snapshot are process-global.
+    /// Every test here that reads or writes them holds this lock.
+    static GLOBAL_STATE: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    fn opted_in_config() -> Config {
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "priced".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("priced-model".to_string()),
+                    live_pricing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn opt_out(config: &mut Config) {
+        config
+            .providers
+            .models
+            .ollama
+            .get_mut("priced")
+            .expect("the opted-in provider exists")
+            .base
+            .live_pricing = false;
+    }
+
+    /// An operator's opt-out written through the bound live handle, the way
+    /// the gateway config API writes its handle, stops live pricing on the
+    /// next cycle without a reload: the snapshot is cleared.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_live_opt_out_on_the_bound_handle_clears_prices_on_the_next_cycle() {
+        let _guard = GLOBAL_STATE.lock();
+        let live = zeroclaw_config::live::LiveConfig::new(opted_in_config());
+        bind_config(live.handle());
+        assert!(live_pricing_enabled());
+
+        let mut stale = PriceSnapshot::new();
+        stale
+            .entry("ollama.priced".to_string())
+            .or_default()
+            .insert("priced-model".to_string(), rate(1.0));
+        store_snapshot(stale);
+        assert!(!current_snapshot().is_empty());
+
+        let mut config = live.snapshot();
+        opt_out(&mut config);
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        assert!(
+            !live_pricing_enabled(),
+            "the refresher reads the live handle, so the opt-out is visible at once"
+        );
+        refresh_cycle().await;
+        assert!(
+            current_snapshot().is_empty(),
+            "the next cycle honors the opt-out and clears the stale prices"
+        );
+    }
+
+    /// Binding a private copy is the regression this guards against: a write
+    /// to the live handle never reaches a copy taken before it, so the
+    /// refresher would keep polling a provider the operator opted out of.
+    #[test]
+    fn a_copy_of_the_config_does_not_see_later_live_writes() {
+        let _guard = GLOBAL_STATE.lock();
+        let live = zeroclaw_config::live::LiveConfig::new(opted_in_config());
+        let copy = zeroclaw_config::live::LiveConfig::new(live.snapshot());
+        bind_config(copy.handle());
+        let mut config = live.snapshot();
+        opt_out(&mut config);
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        assert!(
+            live_pricing_enabled(),
+            "a copy keeps the stale opt-in, which is why a surface binds its live handle"
+        );
+        bind_config(live.handle());
+        assert!(!live_pricing_enabled());
+    }
+
     #[test]
     fn lookup_keyed_by_family_with_bare_type_fallback() {
         let mut snap = PriceSnapshot::new();
@@ -591,6 +713,7 @@ mod tests {
 
     #[test]
     fn current_snapshot_is_synchronous_and_non_blocking() {
+        let _guard = GLOBAL_STATE.lock();
         // Reading the global must never block or require an async runtime:
         // this whole test runs without a tokio runtime.
         store_snapshot(PriceSnapshot::new());

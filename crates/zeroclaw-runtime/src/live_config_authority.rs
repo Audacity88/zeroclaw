@@ -21,7 +21,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 /// Readers receive [`LiveConfigHandle`] through [`Self::live_handle`]; the
 /// writable storage is never exposed. Writers admit through
 /// [`Self::begin_config_commit`], which serializes on the writer mutex and
-/// admits a general config-work lifecycle lease as one unit.
+/// admits a generation write lease as one unit.
 #[derive(Clone)]
 pub struct LiveConfigAuthority {
     live: LiveConfig,
@@ -35,7 +35,7 @@ impl LiveConfigAuthority {
     pub fn new(config: Config) -> Self {
         Self {
             live: LiveConfig::new(config),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
         }
     }
@@ -55,7 +55,7 @@ impl LiveConfigAuthority {
     pub fn new_with_ownership(config: Config, ownership: ConfigOwnershipGuard) -> Self {
         Self {
             live: LiveConfig::new(config),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::with_ownership(ownership),
         }
     }
@@ -83,8 +83,8 @@ impl LiveConfigAuthority {
         self.live.epoch()
     }
 
-    /// Admit one serialized config write: acquire the daemon-wide writer
-    /// mutex, then admit a general config-work lease into the lifecycle
+    /// Admit one serialized config write: acquire the process-wide writer
+    /// mutex, then admit a generation write lease into the lifecycle
     /// generation. The returned [`ConfigCommit`] owns both for its whole
     /// lifetime, so a commit dispatched to a retained task keeps
     /// serialization and stays drain-visible even when its requester
@@ -96,7 +96,10 @@ impl LiveConfigAuthority {
     /// against a waiter that will simply be refused.
     pub async fn begin_config_commit(&self) -> Result<ConfigCommit, ConfigCommitError> {
         let guard = Arc::clone(&self.config_write_lock).lock_owned().await;
-        let lease = self.agent_lifecycle.admit_config_work()?;
+        let lease = self
+            .agent_lifecycle
+            .reserve_config_write()
+            .map_err(|_| ConfigCommitError::GenerationClosing)?;
         Ok(ConfigCommit {
             guard,
             lease,
@@ -164,7 +167,7 @@ impl LiveConfigAuthority {
                 return;
             }
             let aliases = self.agent_lifecycle.pending_work_aliases();
-            let pending_config_commits = self.agent_lifecycle.config_work_count();
+            let active_config_writes = self.agent_lifecycle.active_config_write_count();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -172,10 +175,10 @@ impl LiveConfigAuthority {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "pending_aliases": aliases,
-                        "pending_config_commits": pending_config_commits,
+                        "active_config_writes": active_config_writes,
                         "waited_seconds": DIAGNOSTIC_INTERVAL.as_secs(),
                     })),
-                "daemon generation remains fail-closed while admitted agent work or config commits are still running"
+                "daemon generation remains fail-closed while admitted agent work is still running"
             );
         }
     }
@@ -199,7 +202,7 @@ impl LiveConfigAuthority {
                 return;
             }
             let aliases = self.agent_lifecycle.pending_work_aliases();
-            let pending_config_commits = self.agent_lifecycle.config_work_count();
+            let active_config_writes = self.agent_lifecycle.active_config_write_count();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -207,10 +210,10 @@ impl LiveConfigAuthority {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "pending_aliases": aliases,
-                        "pending_config_commits": pending_config_commits,
+                        "active_config_writes": active_config_writes,
                         "waited_seconds": DIAGNOSTIC_INTERVAL.as_secs(),
                     })),
-                "daemon generation remains fail-closed while admitted agent work or config commits are still running"
+                "daemon generation remains fail-closed while admitted agent work is still running"
             );
         }
     }
@@ -611,13 +614,8 @@ impl AliasLifecycleState {
 #[derive(Default)]
 struct AgentLifecycleState {
     aliases: HashMap<String, AliasLifecycleState>,
+    active_config_writes: usize,
     closing: bool,
-    // Non-agent config commits admitted for this generation. Each admitted
-    // writer holds one count from admission until its commit completes, so
-    // a closing generation drains in-flight config commits before process
-    // ownership is released or transferred — not merely alias work. This
-    // is a general counter, deliberately not a fabricated alias entry.
-    config_work: usize,
     // Retained across ordinary drops, but released once a closed generation drains.
     ownership: Option<ConfigOwnershipGuard>,
 }
@@ -704,6 +702,11 @@ pub struct AgentDeleteLease {
     committed: bool,
 }
 
+pub struct ConfigWriteLease {
+    coordinator: AgentLifecycleCoordinator,
+    active: bool,
+}
+
 impl AgentDeleteLease {
     /// Transition a reserved destructive mutation into committed destructive
     /// ownership: advance the alias generation exactly once under the
@@ -785,35 +788,20 @@ impl AgentLifecycleCoordinator {
         self.reserve_admission(alias)
     }
 
-    /// Admit one general config commit into this generation. Called by the
-    /// authority's `begin_config_commit` after the writer mutex is held;
-    /// the lease releases when the commit completes (or is abandoned
-    /// before dispatch). Refused once the generation is closing, which is
-    /// how old handles fail closed after a reload begins.
-    fn admit_config_work(&self) -> Result<ConfigWorkLease, ConfigCommitError> {
+    /// Retain one config write in this daemon generation. Unlike the
+    /// alias-scoped reservations above, this lease also covers config writes
+    /// that do not target an agent. Generation drain waits for every retained
+    /// writer before transferring process ownership to its successor.
+    pub fn reserve_config_write(&self) -> Result<ConfigWriteLease, AgentAdmissionError> {
         let mut state = self.state.lock();
         if state.closing {
-            return Err(ConfigCommitError::GenerationClosing);
+            return Err(AgentAdmissionError::GenerationClosing);
         }
-        state.config_work += 1;
-        Ok(ConfigWorkLease {
+        state.active_config_writes += 1;
+        Ok(ConfigWriteLease {
             coordinator: self.clone(),
             active: true,
         })
-    }
-
-    /// Number of config commits currently admitted for this generation.
-    /// Diagnostics and drain evidence only.
-    pub fn config_work_count(&self) -> usize {
-        self.state.lock().config_work
-    }
-
-    /// Whether a closed generation has finished all of its admitted work:
-    /// every alias is idle and every admitted config commit has completed.
-    fn closed_generation_is_drained(state: &AgentLifecycleState) -> bool {
-        state.closing
-            && state.config_work == 0
-            && state.aliases.values().all(AliasLifecycleState::is_idle)
     }
 
     /// Reserve an alias generation before slow agent construction starts.
@@ -949,6 +937,10 @@ impl AgentLifecycleCoordinator {
         aliases
     }
 
+    pub(crate) fn active_config_write_count(&self) -> usize {
+        self.state.lock().active_config_writes
+    }
+
     pub fn live_session_count(&self, alias: &str) -> usize {
         self.state
             .lock()
@@ -980,7 +972,10 @@ impl AgentLifecycleCoordinator {
             notified.as_mut().enable();
             {
                 let mut state = self.state.lock();
-                if Self::closed_generation_is_drained(&state) {
+                if state.closing
+                    && state.active_config_writes == 0
+                    && state.aliases.values().all(AliasLifecycleState::is_idle)
+                {
                     drop(state.ownership.take());
                     return;
                 }
@@ -999,7 +994,10 @@ impl AgentLifecycleCoordinator {
             notified.as_mut().enable();
             {
                 let state = self.state.lock();
-                if Self::closed_generation_is_drained(&state) {
+                if state.closing
+                    && state.active_config_writes == 0
+                    && state.aliases.values().all(AliasLifecycleState::is_idle)
+                {
                     return;
                 }
             }
@@ -1093,29 +1091,21 @@ impl Drop for AgentDeleteLease {
     }
 }
 
-/// One admitted config commit's lifecycle lease. Releasing it (drop) is
-/// what makes a closed generation's drain proceed, so a commit that owns
-/// this lease cannot disappear from drain accounting — including a
-/// commit retained in a detached task whose requester was cancelled.
-pub struct ConfigWorkLease {
-    coordinator: AgentLifecycleCoordinator,
-    active: bool,
-}
-
-impl Drop for ConfigWorkLease {
+impl Drop for ConfigWriteLease {
     fn drop(&mut self) {
         if !self.active {
             return;
         }
         let mut state = self.coordinator.state.lock();
-        state.config_work = state.config_work.saturating_sub(1);
+        state.active_config_writes = state.active_config_writes.saturating_sub(1);
+        drop(state);
         self.coordinator.idle.notify_waiters();
     }
 }
 
 /// One admitted, serialized config write.
 ///
-/// Owns the daemon-wide writer guard and the config-work lifecycle lease
+/// Owns the process-wide writer guard and the generation write lease
 /// from admission until the commit completes (or the value drops before
 /// dispatch, which abandons preparation and releases both). Created only
 /// through [`LiveConfigAuthority::begin_config_commit`].
@@ -1131,7 +1121,7 @@ impl Drop for ConfigWorkLease {
 /// write without its publication.
 pub struct ConfigCommit {
     guard: tokio::sync::OwnedMutexGuard<()>,
-    lease: ConfigWorkLease,
+    lease: ConfigWriteLease,
     live: LiveConfig,
 }
 
@@ -1187,7 +1177,7 @@ impl ConfigCommit {
     }
 
     /// Release serialization explicitly — the writer guard and the
-    /// config-work lease drop here — while the caller continues with
+    /// generation write lease drop here — while the caller continues with
     /// slow, non-config side effects. The retained destructive
     /// transactions call this after their required config work, exactly
     /// where they previously dropped the raw writer guard before
@@ -1241,8 +1231,41 @@ mod tests {
             &cloned.config_write_lock
         ));
         assert!(Arc::ptr_eq(
+            &authority.config_write_lock,
+            &zeroclaw_config::write_lock::shared_config_write_lock()
+        ));
+        assert!(Arc::ptr_eq(
             &authority.agent_lifecycle().state,
             &cloned.agent_lifecycle().state
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_writer_waiter_is_not_admitted_and_refuses_closed_generation() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let held = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
+        let mut pending = std::pin::pin!(authority.begin_config_commit());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        assert_eq!(authority.agent_lifecycle().active_config_write_count(), 0);
+        authority.close_agent_lifecycle();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            authority.drain_agent_lifecycle_retaining_ownership(),
+        )
+        .await
+        .expect("a waiting writer must not delay generation drain");
+        drop(held);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                .await
+                .unwrap(),
+            Err(ConfigCommitError::GenerationClosing)
         ));
     }
 
@@ -1314,7 +1337,7 @@ mod tests {
         // only awaits the join handle. Simulate the requester disappearing
         // exactly while the save is paused inside the post-rename window.
         let job = spawn_agent_lifecycle_job(Box::pin(async move {
-            // `commit` owns the writer guard and the config-work lease for
+            // `commit` owns the writer guard and the generation write lease for
             // the whole body; dropping this future is what releases them.
             let mut config = working;
             config.save_dirty().await?;
@@ -1343,7 +1366,7 @@ mod tests {
         }
         assert_eq!(authority.live_handle().read().gateway.host, "0.0.0.0");
         assert!(!authority.config_write_lock_is_held());
-        assert_eq!(authority.agent_lifecycle().config_work_count(), 0);
+        assert_eq!(authority.agent_lifecycle().active_config_write_count(), 0);
     }
 
     #[tokio::test]
