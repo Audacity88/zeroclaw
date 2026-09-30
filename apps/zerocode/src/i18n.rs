@@ -734,6 +734,82 @@ mod tests {
     }
 
     #[test]
+    fn picker_and_thinking_control_keys_present_in_all_builtin_catalogues() {
+        // The picker modals and the session thinking controls read these
+        // keys; every shipped catalogue must define them so a picker row or an
+        // info-bar note never falls back to a bare `{key}` placeholder.
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        const PLAIN_KEYS: &[&str] = &[
+            "zc-picker-current",
+            "zc-picker-search",
+            "zc-picker-no-results",
+            "zc-sidebar-date-placeholder",
+            "zc-config-description",
+            "zc-config-help-scroll-description",
+            "zc-chat-help-resume-session",
+            "zc-effort-picker-title",
+            "zc-display-picker-title",
+            "zc-thinking-switch-applying",
+            "zc-effort-none-for-model",
+            "zc-display-none-for-model",
+        ];
+        // Keys that embed a value: (key, argument name).
+        const ARG_KEYS: &[(&str, &str)] = &[
+            ("zc-dock-config-unavailable", "error"),
+            ("zc-effort-ok", "level"),
+            ("zc-effort-reset", "level"),
+            ("zc-display-ok", "display"),
+            ("zc-display-reset", "display"),
+            ("zc-thinking-switch-failed", "error"),
+            ("zc-thinking-options-failed", "error"),
+            ("zc-thinking-remembered-skipped", "value"),
+        ];
+
+        for (locale, source) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
+            for key in PLAIN_KEYS {
+                let value = format_ftl_message(&bundle, key, &[])
+                    .unwrap_or_else(|| panic!("{key} must be defined for {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} must not be blank for {locale}"
+                );
+            }
+            for (key, arg) in ARG_KEYS {
+                let value = format_ftl_message(&bundle, key, &[(arg, "xhigh-marker")])
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                assert!(
+                    value.contains("xhigh-marker"),
+                    "{key} must embed ${arg} for {locale}: {value}"
+                );
+            }
+            for (key, args) in [
+                (
+                    "zc-dock-config-summary",
+                    [("side", "side-marker"), ("width", "width-marker")],
+                ),
+                (
+                    "zc-config-description-scroll",
+                    [("up", "up-marker"), ("down", "down-marker")],
+                ),
+            ] {
+                let value = format_ftl_message(&bundle, key, &args)
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                for (_, marker) in args {
+                    assert!(value.contains(marker), "{key} lost {marker} for {locale}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn doctor_persistence_keys_present_in_all_builtin_catalogues() {
         // The Doctor view surfaces four persistence keys in the detail panel.
         // Every shipped catalogue must define them so the operator-facing

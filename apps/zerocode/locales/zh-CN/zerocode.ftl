@@ -15,10 +15,10 @@ zc-chrome-summary-loading = 加载中
 zc-app-help-cycle-mode = 循环模式
 zc-app-help-help = 帮助
 zc-app-help-reload = 重新加载守护进程
-zc-app-help-toggle-sidebar = 切换智能体侧栏
+zc-app-help-toggle-sidebar = 切换会话侧栏
 zc-app-help-quit = 退出
 
-zc-sidebar-title = 智能体
+zc-sidebar-title = 会话
 zc-dock-header = Dock { $side }
 zc-dock-side-left = 左
 zc-dock-side-right = 右
@@ -34,7 +34,7 @@ zc-dock-toggle-queue = 队列
 zc-dock-toggle-plan = 计划
 zc-todo-plan-title = 计划 ({ $total }) — 已完成 { $done }/{ $total }
 zc-todo-plan-empty = 暂无活动计划
-zc-sidebar-empty = 没有活动的智能体
+zc-sidebar-empty = 没有活动的会话
 zc-sidebar-picker-title = 添加智能体
 zc-sidebar-picker-loading = 正在加载智能体…
 zc-sidebar-picker-empty = 没有已配置的智能体
@@ -485,7 +485,7 @@ zc-chat-help-toggle-thoughts = 切换思考
 zc-chat-help-new-session = 新建会话
 zc-chat-help-change-directory = 选择一个目录并启动新的 Code 会话
 zc-chat-session-list-resume-title = 已保存会话（Enter=恢复，Esc=新建）
-zc-chat-session-list-switch-title = 会话（Enter=切换，Esc=关闭）
+zc-chat-session-list-switch-title = 全部会话（Enter=切换，Esc=关闭）
 zc-elicit-help-toggle = 切换选项
 zc-elicit-help-confirm = 确认选项
 zc-elicit-help-cancel = 取消
@@ -680,3 +680,27 @@ zc-config-section-peer-groups-help = 绑定频道、成员代理和外部对等�
 zc-config-section-cron-help = 将计划与提示、频道和目标绑定的计划任务。
 zc-config-section-tunnel-help = 可选择通过 Cloudflare 或 ngrok 暴露网关，或仅保持本地访问。
 zc-config-section-onboard-state-help = 快速入门生命周期状态及其按分区记录的旧版完成记录。
+
+# Session presentation, searchable pickers, and thinking controls.
+zc-dock-config-summary = Dock：{ $side } / { $width } 列
+zc-dock-config-unavailable = Dock 设置不可用：{ $error }
+zc-sidebar-date-placeholder = --/--
+zc-picker-search = 搜索
+zc-picker-no-results = 没有匹配的模型
+zc-effort-picker-title = 选择思考强度
+zc-display-picker-title = 选择思考显示方式
+zc-thinking-switch-applying = 正在应用思考设置更改…
+zc-effort-ok = 思考强度已设为 { $level }。
+zc-effort-reset = 已清除思考强度覆盖；当前为 { $level }。
+zc-display-ok = 思考显示方式已设为 { $display }。
+zc-display-reset = 已清除思考显示覆盖；当前为 { $display }。
+zc-thinking-switch-failed = 思考设置更改失败：{ $error }
+zc-effort-none-for-model = 此模型不提供思考强度选项。
+zc-display-none-for-model = 此模型不提供思考显示选项。
+zc-thinking-options-failed = 无法加载思考选项：{ $error }
+zc-thinking-remembered-skipped = 记住的思考设置 { $value } 不适用于此模型，已跳过。
+zc-picker-current = 当前
+zc-chat-help-resume-session = 恢复已有会话
+zc-config-description = 说明
+zc-config-description-scroll = 说明 · { $up }/{ $down } 滚动
+zc-config-help-scroll-description = 滚动说明（或在说明上使用鼠标滚轮）

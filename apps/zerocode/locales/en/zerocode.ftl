@@ -16,10 +16,10 @@ zc-chrome-summary-loading = loading
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
-zc-app-help-toggle-sidebar = Toggle agent sidebar
+zc-app-help-toggle-sidebar = Toggle sessions sidebar
 zc-app-help-quit = Quit
 
-zc-sidebar-title = Agents
+zc-sidebar-title = Open sessions
 zc-dock-header = Dock { $side }
 zc-dock-side-left = left
 zc-dock-side-right = right
@@ -35,7 +35,7 @@ zc-dock-toggle-queue = Queue
 zc-dock-toggle-plan = Plan
 zc-todo-plan-title = Plan ({ $total }) — { $done }/{ $total } done
 zc-todo-plan-empty = No active plan
-zc-sidebar-empty = No active agents
+zc-sidebar-empty = No active sessions
 zc-sidebar-picker-title = Add agent
 zc-sidebar-picker-loading = Loading agents…
 zc-sidebar-picker-empty = No configured agents
@@ -557,7 +557,7 @@ zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
 zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
 zc-chat-session-list-resume-note = Session history saved & resumable · Persistent memory isolated
 zc-chat-agent-picker-acp-memory-note = Session history saved & resumable · Persistent memory isolated
-zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
+zc-chat-session-list-switch-title = All sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice
 zc-elicit-help-cancel = Cancel
@@ -766,3 +766,27 @@ zc-config-section-peer-groups-help = Named groups that bind a channel, member ag
 zc-config-section-cron-help = Scheduled tasks that bind a schedule to a prompt, channel, and target.
 zc-config-section-tunnel-help = Optionally expose the gateway through Cloudflare or ngrok, or keep it local only.
 zc-config-section-onboard-state-help = Quickstart lifecycle state and its legacy per-section completion ledger.
+
+# Session presentation, searchable pickers, and thinking controls.
+zc-dock-config-summary = Dock: { $side } / { $width } cols
+zc-dock-config-unavailable = Dock settings unavailable: { $error }
+zc-sidebar-date-placeholder = --/--
+zc-picker-search = Search
+zc-picker-no-results = No matching models
+zc-effort-picker-title = Select effort
+zc-display-picker-title = Select thinking display
+zc-thinking-switch-applying = Applying thinking change…
+zc-effort-ok = Effort set to { $level }.
+zc-effort-reset = Effort override cleared; now { $level }.
+zc-display-ok = Thinking display set to { $display }.
+zc-display-reset = Thinking display override cleared; now { $display }.
+zc-thinking-switch-failed = Thinking change failed: { $error }
+zc-effort-none-for-model = This model offers no effort levels.
+zc-display-none-for-model = This model offers no thinking display choices.
+zc-thinking-options-failed = Could not load thinking options: { $error }
+zc-thinking-remembered-skipped = Remembered thinking setting { $value } is not offered by this model; skipped.
+zc-picker-current = current
+zc-chat-help-resume-session = Resume existing session
+zc-config-description = Description
+zc-config-description-scroll = Description · { $up }/{ $down } scroll
+zc-config-help-scroll-description = Scroll the description (or use the mouse wheel over it)

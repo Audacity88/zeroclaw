@@ -15,10 +15,10 @@ zc-chrome-summary-loading = chargement
 zc-app-help-cycle-mode = Changer de mode
 zc-app-help-help = Aide
 zc-app-help-reload = Recharger le démon
-zc-app-help-toggle-sidebar = Afficher/masquer la barre des agents
+zc-app-help-toggle-sidebar = Afficher/masquer la barre des sessions
 zc-app-help-quit = Quitter
 
-zc-sidebar-title = Agents
+zc-sidebar-title = Sessions
 zc-dock-header = Dock { $side }
 zc-dock-side-left = gauche
 zc-dock-side-right = droite
@@ -34,7 +34,7 @@ zc-dock-toggle-queue = File
 zc-dock-toggle-plan = Plan
 zc-todo-plan-title = Plan ({ $total }) — { $done }/{ $total } terminées
 zc-todo-plan-empty = Aucun plan actif
-zc-sidebar-empty = Aucun agent actif
+zc-sidebar-empty = Aucune session active
 zc-sidebar-picker-title = Ajouter un agent
 zc-sidebar-picker-loading = Chargement des agents…
 zc-sidebar-picker-empty = Aucun agent configuré
@@ -485,7 +485,7 @@ zc-chat-help-toggle-thoughts = Basculer les réflexions
 zc-chat-help-new-session = Nouvelle session
 zc-chat-help-change-directory = Choisissez un répertoire et démarrez une nouvelle session Code
 zc-chat-session-list-resume-title = Sessions enregistrées (Entrée=reprendre, Échap=nouveau)
-zc-chat-session-list-switch-title = Sessions (Entrée=changer, Échap=fermer)
+zc-chat-session-list-switch-title = Toutes les sessions (Entrée=changer, Échap=fermer)
 zc-elicit-help-toggle = Basculer le choix
 zc-elicit-help-confirm = Confirmer le choix
 zc-elicit-help-cancel = Annuler
@@ -680,3 +680,27 @@ zc-config-section-peer-groups-help = Groupes nommés associant un canal, des age
 zc-config-section-cron-help = Tâches planifiées associant une planification à un prompt, un canal et une cible.
 zc-config-section-tunnel-help = Exposez éventuellement la passerelle via Cloudflare ou ngrok, ou gardez-la uniquement en local.
 zc-config-section-onboard-state-help = État du cycle de vie du démarrage rapide et registre hérité de complétion par section.
+
+# Session presentation, searchable pickers, and thinking controls.
+zc-dock-config-summary = Dock : { $side } / { $width } colonnes
+zc-dock-config-unavailable = Paramètres du dock indisponibles : { $error }
+zc-sidebar-date-placeholder = --/--
+zc-picker-search = Rechercher
+zc-picker-no-results = Aucun modèle correspondant
+zc-effort-picker-title = Sélectionner l'effort
+zc-display-picker-title = Sélectionner l'affichage de la réflexion
+zc-thinking-switch-applying = Application du changement de réflexion…
+zc-effort-ok = Effort défini sur { $level }.
+zc-effort-reset = Remplacement de l'effort supprimé ; maintenant { $level }.
+zc-display-ok = Affichage de la réflexion défini sur { $display }.
+zc-display-reset = Remplacement de l'affichage supprimé ; maintenant { $display }.
+zc-thinking-switch-failed = Échec du changement de réflexion : { $error }
+zc-effort-none-for-model = Ce modèle ne propose aucun niveau d'effort.
+zc-display-none-for-model = Ce modèle ne propose aucun choix d'affichage de la réflexion.
+zc-thinking-options-failed = Impossible de charger les options de réflexion : { $error }
+zc-thinking-remembered-skipped = Le réglage de réflexion mémorisé { $value } n'est pas proposé par ce modèle ; ignoré.
+zc-picker-current = actuel
+zc-chat-help-resume-session = Reprendre une session existante
+zc-config-description = Description
+zc-config-description-scroll = Description · { $up }/{ $down } pour défiler
+zc-config-help-scroll-description = Faire défiler la description (ou utiliser la molette au-dessus)

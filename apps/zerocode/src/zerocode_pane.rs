@@ -201,6 +201,9 @@ pub(crate) struct ZerocodePane {
     /// action. While set, tracker edits are refused and the error is surfaced,
     /// leaving the file untouched for the user to repair by hand.
     tracker_load_error: Option<String>,
+    /// Effective shared-dock geometry captured when this pane is opened. The
+    /// Config screen must not re-read and parse the file on every draw.
+    dock_summary: String,
 }
 
 /// Truncate `s` to at most `width` terminal cells, marking elision with `…`.
@@ -235,6 +238,24 @@ fn truncate_to_width(s: &str, width: u16) -> String {
     }
     out.push('…');
     out
+}
+
+fn effective_dock_summary(dock_config: &config::ZerocodeConfig) -> String {
+    dock_summary(
+        dock_config.effective_sidebar_side(),
+        dock_config.effective_sidebar_width(),
+    )
+}
+
+fn dock_summary(side: config::SidebarSide, width: u16) -> String {
+    let dock_side = match side {
+        config::SidebarSide::Left => crate::i18n::t("zc-dock-side-left"),
+        config::SidebarSide::Right => crate::i18n::t("zc-dock-side-right"),
+    };
+    crate::i18n::t_args(
+        "zc-dock-config-summary",
+        &[("side", &dock_side), ("width", &width.to_string())],
+    )
 }
 
 /// The innermost cause of an error chain, as a display string.
@@ -276,7 +297,9 @@ impl ZerocodePane {
             .iter()
             .position(|n| theme::theme_by_name(n).map(|t| t.title) == Some(active.title))
             .unwrap_or(0);
-        let agent_overrides: HashMap<String, String> = config::ensure_and_load(config_dir)
+        let effective_config = config::ensure_and_load(config_dir);
+        let agent_overrides: HashMap<String, String> = effective_config
+            .as_ref()
             .ok()
             .map(|c| {
                 c.agent_override_aliases()
@@ -310,7 +333,8 @@ impl ZerocodePane {
             capture: None,
             locales: Vec::new(),
             locale_cursor: 0,
-            active_locale: config::ensure_and_load(config_dir)
+            active_locale: effective_config
+                .as_ref()
                 .ok()
                 .and_then(|c| c.resolve_locale()),
             pending_fetch: None,
@@ -320,9 +344,10 @@ impl ZerocodePane {
             focus_area: Rect::default(),
             content_area: Rect::default(),
             double_click: crate::mouse::DoubleClickTracker::new(),
-            conn: config::ensure_and_load(config_dir)
+            conn: effective_config
+                .as_ref()
                 .ok()
-                .map(|c| c.connection.wss)
+                .map(|c| c.connection.wss.clone())
                 .unwrap_or_default(),
             conn_cursor: 0,
             conn_edit: None,
@@ -348,6 +373,15 @@ impl ZerocodePane {
             tracker_load_error: tracker_loaded
                 .err()
                 .map(|e| collapse_whitespace(&root_cause_of(&e))),
+            dock_summary: effective_config
+                .as_ref()
+                .map(effective_dock_summary)
+                .unwrap_or_else(|error| {
+                    crate::i18n::t_args(
+                        "zc-dock-config-unavailable",
+                        &[("error", &collapse_whitespace(&root_cause_of(error)))],
+                    )
+                }),
         };
         pane.rebuild_rows();
         pane
@@ -364,6 +398,17 @@ impl ZerocodePane {
 
     pub(crate) fn wants_text_input(&self) -> bool {
         self.conn_edit.is_some()
+    }
+
+    pub(crate) fn set_dock_summary(&mut self, side: config::SidebarSide, width: u16) {
+        self.dock_summary = dock_summary(side, width);
+    }
+
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        self.capture.is_some()
+            || self.conn_edit.is_some()
+            || self.tracker_edit.is_some()
+            || crate::keymap::ConfigTabAction::from_chord(key).is_some()
     }
 
     // ── Draw ─────────────────────────────────────────────────────
@@ -829,6 +874,21 @@ impl ZerocodePane {
     }
 
     fn draw_todo_tracker(&self, frame: &mut Frame, area: Rect) {
+        let summary_height = u16::from(area.height >= 4);
+        if summary_height > 0 {
+            let summary_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    truncate_to_width(&self.dock_summary, area.width),
+                    theme::dim_style(),
+                )),
+                summary_area,
+            );
+        }
+        let area = Rect {
+            height: area.height.saturating_sub(summary_height),
+            ..area
+        };
         let items: Vec<ListItem> = TRACKER_FIELDS
             .iter()
             .map(|f| {
@@ -1999,6 +2059,19 @@ mod tests {
     fn given_explicit_row(action_key: &str, chords: Vec<Chord>) {
         let (tag, variant) = action_key.split_once('.').expect("dotted action key");
         overrides::set_row(tag, variant, chords);
+    }
+
+    #[test]
+    fn session_shortcut_is_captured_by_the_binding_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let row = focus_binding(&mut pane, "input_bar.clear_input");
+        pane.capture = Some(Capture { row, error: None });
+
+        assert!(pane.claims_session_shortcut(&KeyEvent::new(
+            KeyCode::Char('1'),
+            Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL).effective_modifiers(),
+        )));
     }
 
     /// The bot's round-2 finding, at both call sites. An operator already owning

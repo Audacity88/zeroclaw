@@ -1597,6 +1597,10 @@ pub async fn run(
     initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
+    let timing = crate::ui_timing::TimingTrace::from_env()?;
+    use crate::ui_timing::Phase;
+    let max_tracked_sessions_per_pane =
+        crate::config::resolve_max_tracked_sessions_per_pane_checked(config_dir)?;
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut help_overlay: Option<HelpOverlayState> = None;
     let mut reload_confirm = false;
@@ -1635,14 +1639,21 @@ pub async fn run(
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
-                let mut acp_pane = acp::Acp::new(rpc.clone());
+                let mut acp_pane = acp::Acp::new_with_max_tracked_sessions(
+                    rpc.clone(),
+                    max_tracked_sessions_per_pane,
+                );
                 // Carry the pre-disconnect sessions across a reconnect rebuild
                 // so the rebuilt pane reattaches every daemon-retained session
                 // (focused + sidebar backgrounds) instead of minting a fresh
                 // one. Empty on first build.
                 acp_pane.set_resume_sessions($resume_acp);
                 acp_pane.init().await?;
-                let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+                let mut chat_pane = chat::Chat::new_with_max_tracked_sessions(
+                    rpc.clone(),
+                    chat::PaneKind::Chat,
+                    max_tracked_sessions_per_pane,
+                );
                 chat_pane.set_resume_sessions($resume_chat);
                 chat_pane.init().await?;
                 let pending_start_chat = take_pending_quickstart_chat(
@@ -1688,6 +1699,7 @@ pub async fn run(
         mut quickstart,
         mut sop_pane,
     ) = build_panes!(Vec::new(), Vec::new())?;
+    config_app.set_dock_summary(dock.side, dock.width);
 
     // Route one sidebar event: switch to the owning pane's mode and call
     // into it. A macro (like `build_panes!`) because the routing needs the
@@ -1701,6 +1713,7 @@ pub async fn run(
                 crate::agent_sidebar::SidebarEvent::FocusSession { pane, session_id }
                     if connected =>
                 {
+                    dock.clear_capture();
                     let next = match pane {
                         chat::PaneKind::Chat => Mode::Chat,
                         chat::PaneKind::Acp => Mode::Acp,
@@ -1756,6 +1769,7 @@ pub async fn run(
                     sidebar.open_picker(target, open_aliases, &rpc);
                 }
                 crate::agent_sidebar::SidebarEvent::PickAgent { pane, alias } if connected => {
+                    dock.clear_capture();
                     let next = match pane {
                         chat::PaneKind::Chat => Mode::Chat,
                         chat::PaneKind::Acp => Mode::Acp,
@@ -1876,8 +1890,10 @@ pub async fn run(
 
     loop {
         // Draw
+        timing.mark(Phase::Tick);
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+            dock.clear_capture();
             chrome_status.clear();
             // The picker's agent list would be stale by reconnect time.
             sidebar.close_picker();
@@ -1935,9 +1951,12 @@ pub async fn run(
                 .iter()
                 .map(|(status, agent)| (Some(status), Some(agent.as_str()))),
         );
+        timing.mark(Phase::StatusWrite);
         crate::osc_status::sync(terminal_status, terminal_agent);
 
+        timing.mark(Phase::TerminalOutput);
         term.draw(|frame| {
+            timing.mark(Phase::Render);
             // Theme backdrop: paint the whole screen with the active
             // theme's background first so every pane inherits it. The
             // `terminal` theme returns None and the user's own shell
@@ -1948,35 +1967,11 @@ pub async fn run(
                     frame.area(),
                 );
             }
-            // The info bar appears as a dedicated row between the content and
-            // the status bar, only while the active pane has a message to show.
-            let info_message = match mode {
-                Mode::Chat => chat_pane.info_message().cloned(),
-                _ => None,
-            };
-            let has_info = info_message.is_some();
-            let constraints: Vec<Constraint> = if has_info {
-                vec![
-                    Constraint::Length(1), // mode bar
-                    Constraint::Min(0),    // content
-                    Constraint::Length(1), // info bar
-                    Constraint::Length(1), // status bar
-                ]
-            } else {
-                vec![
-                    Constraint::Length(1), // mode bar
-                    Constraint::Min(0),    // content
-                    Constraint::Length(1), // status bar
-                ]
-            };
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(constraints)
-                .split(frame.area());
+            let chunks = app_frame_layout(frame.area());
 
             mode_bar_layout = draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
-            // The dock shares the content row; the mode,
-            // info, and status bars stay full-width. Panes render into (and
+            // The dock shares the content row; the mode and status bars
+            // stay full-width. Panes render into (and
             // hit-test against) the remaining `content_area` untouched.
             let dock_layout = dock.layout(chunks[1], mode, plan_visible);
             content_area = dock_layout.conversation;
@@ -2020,18 +2015,6 @@ pub async fn run(
                 Mode::Chat => chat_pane.draw_dock_overlay(frame),
                 _ => {}
             }
-            let status_idx = if has_info {
-                // Render the info bar in its own row above the status bar.
-                let info_area = chunks[2];
-                let bar = crate::widgets::InfoBar::new(info_message.as_ref());
-                if let Some(widget) = bar.widget(info_area.width as usize) {
-                    frame.render_widget(widget, info_area);
-                }
-                3
-            } else {
-                2
-            };
-
             let (ctx_input, ctx_max, ctx_model_window) = match mode {
                 Mode::Chat => chat_pane.ctx_tokens(),
                 Mode::Acp => acp_pane.ctx_tokens(),
@@ -2044,7 +2027,7 @@ pub async fn run(
             };
             draw_status_bar(
                 frame,
-                chunks[status_idx],
+                chunks[2],
                 &conn_state,
                 rpc.tui_id(),
                 CtxBar::new(ctx_input, ctx_max, ctx_model_window),
@@ -2082,7 +2065,10 @@ pub async fn run(
             if let Some(msg) = &reload_status {
                 draw_reload_status_toast(frame, frame.area(), msg);
             }
+            timing.mark(Phase::TerminalOutput);
         })?;
+        timing.frame_completed();
+        timing.mark(Phase::Reconnect);
 
         // Restore the base palette so the override never leaks into the next
         // frame, a different pane, or live theme changes from the Config pane.
@@ -2173,6 +2159,7 @@ pub async fn run(
                         let adopted = adopt_client!(new_client);
                         active_leg = leg_after_adoption(adopted, active_leg, leg);
                         if adopted {
+                            dock.clear_capture();
                             chrome_status.clear();
                             chrome_status.tick(&rpc);
                             reconnect_last_attempt = None;
@@ -2252,12 +2239,21 @@ pub async fn run(
         // assembly and drag coalescing finish, or after a genuine timeout.
         let (input_event, dispatch_state) = poll_input_event_and_snapshot(
             &mut input_decoder,
-            |timeout| Ok(event::poll(timeout)?),
-            || Ok(event::read()?),
+            |timeout| {
+                timing.mark(Phase::Poll);
+                Ok(event::poll(timeout)?)
+            },
+            || {
+                timing.mark(Phase::Read);
+                let event = event::read()?;
+                timing.input_received();
+                Ok(event)
+            },
             || rpc.connection_state(),
         )?;
 
         let Some(input_event) = input_event else {
+            timing.mark(Phase::IdleTick);
             dispatch_state
                 .run_rpc_dispatch(|| async {
                     if mode == Mode::Dashboard {
@@ -2277,6 +2273,7 @@ pub async fn run(
                         &reconnect_state,
                         &mut mode,
                         &mut chat_pane,
+                        &mut dock,
                     )
                     .await;
                 })
@@ -2284,6 +2281,7 @@ pub async fn run(
             continue;
         };
 
+        timing.mark(Phase::Dispatch);
         if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
             // The visible confirmation modal is the authoritative input
             // owner; discard paste instead of forwarding it underneath.
@@ -2294,6 +2292,13 @@ pub async fn run(
             Event::Key(key) => {
                 dock.clear_capture();
                 if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+
+                if dock.capture.is_some()
+                    && ModalAction::from_chord(&key) == Some(ModalAction::Cancel)
+                {
+                    dock.clear_capture();
                     continue;
                 }
 
@@ -2308,6 +2313,12 @@ pub async fn run(
                     Mode::Sop => sop_pane.wants_text_input(),
                 };
                 let global = GlobalAction::from_chord(&key);
+                if matches!(mode, Mode::Acp | Mode::Chat)
+                    && crate::keymap::ChatTabAction::from_chord(&key)
+                        == Some(crate::keymap::ChatTabAction::TodoToggle)
+                {
+                    dock.clear_capture();
+                }
 
                 // Quit-confirm modal. The first exit chord closes any open
                 // transient widgets and arms the modal; a second exit chord —
@@ -2435,6 +2446,42 @@ pub async fn run(
                     continue;
                 }
 
+                if let Some(ordinal) = session_shortcut_ordinal(global) {
+                    let pane_claims_shortcut = match mode {
+                        Mode::Dashboard => {
+                            crate::keymap::DashboardTabAction::from_chord(&key).is_some()
+                                || SearchBoxAction::from_chord(&key).is_some()
+                                || crate::keymap::ConfigEditorAction::from_chord(&key).is_some()
+                        }
+                        Mode::Config => config_app.claims_session_shortcut(&key),
+                        Mode::Doctor => crate::keymap::DoctorTabAction::from_chord(&key).is_some(),
+                        Mode::Acp => acp_pane.claims_session_shortcut(&key),
+                        Mode::Chat => chat_pane.claims_session_shortcut(&key),
+                        Mode::Logs => {
+                            crate::keymap::LogsTabAction::from_chord(&key).is_some()
+                                || SearchBoxAction::from_chord(&key).is_some()
+                        }
+                        Mode::Quickstart => {
+                            crate::keymap::QuickstartTabAction::from_chord(&key).is_some()
+                                || crate::keymap::QuickstartModalAction::from_chord(&key).is_some()
+                        }
+                        Mode::Sop => {
+                            crate::keymap::SopTabAction::from_chord(&key).is_some()
+                                || crate::keymap::SopEditorAction::from_chord(&key).is_some()
+                        }
+                    };
+                    if session_shortcut_is_available(mode, in_text_input, pane_claims_shortcut) {
+                        let sessions = session_summaries_in_sidebar_order(
+                            acp_pane.session_summaries(),
+                            chat_pane.session_summaries(),
+                        );
+                        if let Some(event) = session_shortcut_event(ordinal, &sessions) {
+                            apply_sidebar_event!(event, dispatch_state);
+                        }
+                        continue;
+                    }
+                }
+
                 let editor_claims_pane_navigation = matches!(
                     global,
                     Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
@@ -2456,6 +2503,7 @@ pub async fn run(
                 .map(|delta| mode.cycle(delta));
                 if let Some(next) = switch_to {
                     remember_quickstart_return(mode, next, &mut quickstart_return);
+                    dock.clear_capture();
                     switch_mode(
                         &mut mode,
                         next,
@@ -2535,6 +2583,7 @@ pub async fn run(
                     } else {
                         quickstart_return
                     };
+                    dock.clear_capture();
                     switch_mode(
                         &mut mode,
                         back,
@@ -2552,6 +2601,7 @@ pub async fn run(
                     &reconnect_state,
                     &mut mode,
                     &mut chat_pane,
+                    &mut dock,
                 )
                 .await;
             }
@@ -2601,6 +2651,23 @@ pub async fn run(
                     dock.clear_capture();
                     continue;
                 }
+                let composer_capture_active = match mode {
+                    Mode::Acp => acp_pane.input_mouse_capture_active(),
+                    Mode::Chat => chat_pane.input_mouse_capture_active(),
+                    _ => false,
+                };
+                if composer_capture_active {
+                    dispatch_state
+                        .run_rpc_dispatch(|| async {
+                            match mode {
+                                Mode::Acp => acp_pane.handle_mouse(mouse, content_area).await,
+                                Mode::Chat => chat_pane.handle_mouse(mouse, content_area).await,
+                                _ => {}
+                            }
+                        })
+                        .await;
+                    continue;
+                }
                 let (dock_consumed, dock_action) =
                     handle_dock_mouse(&mut dock, mode, &mut chat_pane, &mut acp_pane, &mouse);
                 if dock_consumed {
@@ -2610,6 +2677,7 @@ pub async fn run(
                         _ => {}
                     }
                     if let Some(action) = dock_action {
+                        config_app.set_dock_summary(dock.side, dock.width);
                         if !dock.sessions_visible {
                             sidebar.close_picker();
                         }
@@ -2622,6 +2690,7 @@ pub async fn run(
                     && let Some(next) = mode_bar_layout.mode_at(mouse.column, mouse.row)
                 {
                     remember_quickstart_return(mode, next, &mut quickstart_return);
+                    dock.clear_capture();
                     switch_mode(
                         &mut mode,
                         next,
@@ -2705,6 +2774,7 @@ pub async fn run(
                             &reconnect_state,
                             &mut mode,
                             &mut chat_pane,
+                            &mut dock,
                         )
                         .await;
                         anyhow::Ok(())
@@ -2740,6 +2810,7 @@ pub async fn run(
                             &reconnect_state,
                             &mut mode,
                             &mut chat_pane,
+                            &mut dock,
                         )
                         .await;
                     })
@@ -2789,8 +2860,21 @@ fn global_help_entries() -> Vec<HelpEntry> {
     let cycle_keys = action_key_labels(GlobalAction::PaneNavLeft)
         .into_iter()
         .chain(action_key_labels(GlobalAction::PaneNavRight));
+    let session_keys = [
+        GlobalAction::FocusSession1,
+        GlobalAction::FocusSession2,
+        GlobalAction::FocusSession3,
+        GlobalAction::FocusSession4,
+        GlobalAction::FocusSession5,
+        GlobalAction::FocusSession6,
+        GlobalAction::FocusSession7,
+        GlobalAction::FocusSession8,
+    ]
+    .into_iter()
+    .flat_map(action_key_labels);
     vec![
         HelpEntry::new(cycle_keys, crate::i18n::t("zc-app-help-cycle-mode")),
+        HelpEntry::new(session_keys, crate::i18n::t("zc-chat-help-switch-session")),
         HelpEntry::new(
             action_key_labels(GlobalAction::Help),
             crate::i18n::t("zc-app-help-help"),
@@ -2824,6 +2908,48 @@ fn pane_switch_delta(
         Some(GlobalAction::PaneNavRight) => Some(1),
         _ => None,
     }
+}
+
+fn session_shortcut_ordinal(action: Option<GlobalAction>) -> Option<usize> {
+    match action? {
+        GlobalAction::FocusSession1 => Some(0),
+        GlobalAction::FocusSession2 => Some(1),
+        GlobalAction::FocusSession3 => Some(2),
+        GlobalAction::FocusSession4 => Some(3),
+        GlobalAction::FocusSession5 => Some(4),
+        GlobalAction::FocusSession6 => Some(5),
+        GlobalAction::FocusSession7 => Some(6),
+        GlobalAction::FocusSession8 => Some(7),
+        _ => None,
+    }
+}
+
+fn session_shortcut_event(
+    ordinal: usize,
+    sessions: &[chat::SidebarSessionSummary],
+) -> Option<crate::agent_sidebar::SidebarEvent> {
+    sessions
+        .get(ordinal)
+        .map(|session| crate::agent_sidebar::SidebarEvent::FocusSession {
+            pane: session.pane_kind,
+            session_id: session.session_id.clone(),
+        })
+}
+
+fn session_shortcut_is_available(
+    mode: Mode,
+    in_text_input: bool,
+    pane_claims_shortcut: bool,
+) -> bool {
+    !pane_claims_shortcut && (!in_text_input || matches!(mode, Mode::Acp | Mode::Chat))
+}
+
+fn session_summaries_in_sidebar_order(
+    mut acp_sessions: Vec<chat::SidebarSessionSummary>,
+    chat_sessions: Vec<chat::SidebarSessionSummary>,
+) -> Vec<chat::SidebarSessionSummary> {
+    acp_sessions.extend(chat_sessions);
+    acp_sessions
 }
 
 fn copy_disconnected_composer(
@@ -3037,6 +3163,18 @@ fn mode_window_width(titles: &[String], start: usize, end: usize) -> usize {
 const HEALTHY_GREEN: Color = Color::Rgb(80, 220, 120);
 const DEAD_RED: Color = Color::Rgb(255, 80, 80);
 
+fn app_frame_layout(area: Rect) -> [Rect; 3] {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // mode bar
+            Constraint::Min(0),    // content
+            Constraint::Length(1), // status bar
+        ])
+        .split(area);
+    [chunks[0], chunks[1], chunks[2]]
+}
+
 fn draw_status_bar(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -3074,7 +3212,10 @@ fn draw_status_bar(
     };
 
     let id_len = id_span.as_ref().map(|s| s.width()).unwrap_or(0);
-    let conn_text_len = (id_len + 1 + label.len()) as u16; // id + dot + label
+    let conn_text_len = u16::try_from(
+        id_len + 1 + crate::display_width::display_width(&label), // id + dot + label
+    )
+    .unwrap_or(u16::MAX);
 
     // Split the row: ctx bar on the left, connection status on the right.
     // Right column is sized to exactly fit the conn text; left gets the rest.
@@ -3087,15 +3228,17 @@ fn draw_status_bar(
     let right_area = chunks[1];
 
     // Right: connection status, no leading padding (column is exact width).
-    let mut spans = Vec::with_capacity(3);
-    if let Some(id) = id_span {
-        spans.push(id);
+    if right_area.width > 0 {
+        let mut spans = Vec::with_capacity(3);
+        if let Some(id) = id_span {
+            spans.push(id);
+        }
+        spans.push(Span::styled(dot, style));
+        spans.push(Span::styled(label, style));
+        frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
     }
-    spans.push(Span::styled(dot, style));
-    spans.push(Span::styled(label, style));
-    frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
-    // Left: ctx bar, possibly preceded by a browse-mode badge.
+    // Left: browse badge and token monitor.
     // The ctx bar is held back until the context-accounting feature is
     // ready to show; there is no user-facing switch — the gate flips
     // when the work lands.
@@ -3120,8 +3263,8 @@ fn draw_status_bar(
     } else {
         left_area
     };
-    if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
-        frame.render_widget(w, left_area);
+    if SHOW_CTX_BAR && let Some(widget) = ctx.widget() {
+        frame.render_widget(widget, left_area);
     }
 }
 
@@ -3204,21 +3347,31 @@ fn flatten_help_node(node: &HelpNode, out: &mut Vec<(String, String)>, inner_wid
     }
 }
 
-/// Naive soft-wrap: split `text` into lines no longer than `width`.
-/// Breaks on word boundaries where possible.
+/// Wrap by terminal cells, including long chords and wide graphemes.
 fn soft_wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(2);
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
         let mut current = String::new();
         for word in paragraph.split_whitespace() {
-            if current.is_empty() {
-                current.push_str(word);
-            } else if current.len() + 1 + word.len() <= width {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                lines.push(current.clone());
-                current = word.to_string();
+            if !current.is_empty() {
+                if crate::display_width::display_width(&current)
+                    + 1
+                    + crate::display_width::display_width(word)
+                    <= width
+                {
+                    current.push(' ');
+                } else {
+                    lines.push(std::mem::take(&mut current));
+                }
+            }
+            for (_, grapheme, cells) in crate::display_width::grapheme_widths(word) {
+                if !current.is_empty()
+                    && crate::display_width::display_width(&current) + cells > width
+                {
+                    lines.push(std::mem::take(&mut current));
+                }
+                current.push_str(grapheme);
             }
         }
         if !current.is_empty() {
@@ -3251,6 +3404,10 @@ fn filter_help_node(node: &HelpNode, query: &str) -> Option<HelpNode> {
         .iter()
         .filter(|entry| {
             entry.key_str().to_lowercase().contains(&needle)
+                || entry
+                    .keys
+                    .iter()
+                    .any(|key| key.to_lowercase().contains(&needle))
                 || entry.action.to_lowercase().contains(&needle)
         })
         .cloned()
@@ -3293,7 +3450,7 @@ fn draw_help_modal(
 ) {
     // We need inner_width to soft-wrap descriptions. Use a generous default
     // first pass, then clamp to terminal width.
-    let max_inner_w = (area.width as usize).saturating_sub(6).max(30);
+    let max_inner_w = (area.width as usize).saturating_sub(6).clamp(2, 96);
 
     let mut all_flat: Vec<(String, String)> = Vec::new();
     flatten_help_node(node, &mut all_flat, max_inner_w);
@@ -3308,7 +3465,9 @@ fn draw_help_modal(
         .filter(|(k, _)| k != "\x01")
         .map(|(k, _)| crate::display_width::display_width(k))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(28)
+        .min(max_inner_w / 3);
     let val_width = all_flat
         .iter()
         .filter(|(k, _)| k != "\x01")
@@ -3335,8 +3494,38 @@ fn draw_help_modal(
     .into_iter()
     .max()
     .unwrap_or(0);
-    let inner_w = (key_width + 2 + val_width).max(chrome_width);
+    let inner_w = (key_width + 2 + val_width)
+        .max(chrome_width)
+        .min(max_inner_w);
     let box_w = (inner_w + 4).min(area.width as usize) as u16;
+    let value_width = (box_w as usize).saturating_sub(key_width + 4).max(2);
+    let wrap_rows = |rows: Vec<(String, String)>| {
+        let mut wrapped = Vec::new();
+        for (key, value) in rows {
+            if key == "\x01" || (key.is_empty() && value.is_empty()) {
+                wrapped.push((key, value));
+            } else if key.is_empty() {
+                wrapped.extend(
+                    soft_wrap(&value, box_w.saturating_sub(2) as usize)
+                        .into_iter()
+                        .map(|line| (String::new(), line)),
+                );
+            } else {
+                let keys = soft_wrap(&key, key_width);
+                let values = soft_wrap(&value, value_width);
+                for row in 0..keys.len().max(values.len()) {
+                    // A blank key continuation still belongs in the value column.
+                    wrapped.push((
+                        keys.get(row).cloned().unwrap_or_else(|| " ".to_string()),
+                        values.get(row).cloned().unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+        wrapped
+    };
+    let all_flat = wrap_rows(all_flat);
+    let flat = wrap_rows(flat);
     // +4: 2 border + 1 filter row + 1 footer row.
     let box_h = (all_flat.len() + 4).min(area.height as usize) as u16;
 
@@ -4821,6 +5010,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn app_frame_layout_keeps_one_fixed_status_row() {
+        let area = Rect::new(0, 0, 100, 30);
+        let chunks = app_frame_layout(area);
+
+        assert_eq!(chunks[0], Rect::new(0, 0, 100, 1));
+        assert_eq!(chunks[1], Rect::new(0, 1, 100, 28));
+        assert_eq!(chunks[2], Rect::new(0, 29, 100, 1));
+    }
+
     #[tokio::test]
     async fn chrome_status_tick_starts_refresh_without_waiting_for_rpc_response() {
         let (tx, mut rx) = mpsc::channel::<String>(1);
@@ -5219,6 +5418,116 @@ mod tests {
     }
 
     #[test]
+    fn session_shortcut_help_groups_all_live_ordinals() {
+        use crate::keymap::{GlobalAction, action_key_labels};
+
+        let entries = global_help_entries();
+        let switch = entries
+            .iter()
+            .find(|entry| entry.action == crate::i18n::t("zc-chat-help-switch-session"))
+            .expect("global Help should advertise direct session switching");
+        let expected = [
+            GlobalAction::FocusSession1,
+            GlobalAction::FocusSession2,
+            GlobalAction::FocusSession3,
+            GlobalAction::FocusSession4,
+            GlobalAction::FocusSession5,
+            GlobalAction::FocusSession6,
+            GlobalAction::FocusSession7,
+            GlobalAction::FocusSession8,
+        ]
+        .into_iter()
+        .flat_map(action_key_labels)
+        .collect::<Vec<_>>();
+
+        assert_eq!(switch.keys, expected);
+    }
+
+    #[test]
+    fn session_shortcut_targets_follow_visible_code_then_chat_order() {
+        let summary = |pane_kind, session_id: &str| chat::SidebarSessionSummary {
+            session_id: session_id.to_string(),
+            agent_alias: "test".to_string(),
+            message_count: 0,
+            status: chat::SidebarStatus::Ready,
+            pane_kind,
+            focused: false,
+            display_ordinal: 1,
+            last_activity: None,
+        };
+        let acp = vec![
+            summary(chat::PaneKind::Acp, "code-1"),
+            summary(chat::PaneKind::Acp, "code-2"),
+        ];
+        let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
+        let sessions = session_summaries_in_sidebar_order(acp, chat);
+
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession2)).unwrap(),
+                &sessions,
+            ),
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Acp,
+                session_id: "code-2".to_string(),
+            })
+        );
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession3)).unwrap(),
+                &sessions,
+            ),
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Chat,
+                session_id: "chat-1".to_string(),
+            })
+        );
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession4)).unwrap(),
+                &sessions,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn session_shortcut_dispatch_respects_composer_and_other_input_owners() {
+        assert!(
+            session_shortcut_is_available(Mode::Chat, true, false),
+            "typed composer text must not disable the modified session shortcut"
+        );
+        assert!(
+            !session_shortcut_is_available(Mode::Chat, true, true),
+            "an explicit Chat or input-bar binding must retain the chord"
+        );
+        assert!(
+            !session_shortcut_is_available(Mode::Config, true, false),
+            "non-chat text editors retain their existing input ownership"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_shortcut_decoder_preserves_ctrl_command_modifiers() {
+        let original = Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        ));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(original.clone());
+
+        assert_eq!(decoder.next(), Some(original));
+        assert_eq!(
+            GlobalAction::from_chord(&KeyEvent::new(
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SUPER,
+            )),
+            Some(GlobalAction::FocusSession1)
+        );
+    }
+
+    #[test]
     fn active_text_editor_can_claim_global_pane_navigation() {
         assert_eq!(
             pane_switch_delta(Some(GlobalAction::PaneNavLeft), false, true),
@@ -5595,6 +5904,48 @@ mod tests {
     }
 
     #[test]
+    fn help_modal_wraps_long_chords_without_losing_action_text() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let node = HelpNode::entries(vec![HelpEntry::new(
+            ["Ctrl+Shift+Super+Left", "Ctrl+Shift+Super+Right"],
+            "Resume existing session",
+        )]);
+        for width in [40, 80, 140] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_help_modal(frame, frame.area(), &node, &mut HelpOverlayState::default())
+                })
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Resume"));
+            assert!(rendered.contains("session"));
+            assert!(rendered.contains("Left"));
+            assert!(rendered.contains("Right"));
+        }
+        for line in soft_wrap("界界界 Ctrl+Super+Shift+Left", 8) {
+            assert!(crate::display_width::display_width(&line) <= 8);
+        }
+    }
+
+    #[test]
+    fn help_compacts_numbered_chords_without_losing_filter_matches() {
+        let keys: Vec<_> = (1..=8).map(|n| format!("Ctrl+Super+{n}")).collect();
+        let entry = HelpEntry::new(keys, "Focus open session");
+        assert_eq!(entry.key_str(), "Ctrl+Super+1-8");
+        let node = HelpNode::entries(vec![entry]);
+        assert!(filter_help_node(&node, "Ctrl+Super+5").is_some());
+        let irregular = HelpEntry::new(["Ctrl+1", "Alt+2", "Ctrl+3"], "Sessions");
+        assert_eq!(irregular.key_str(), "Ctrl+1 / Alt+2 / Ctrl+3");
+    }
+
+    #[test]
     fn help_modal_scrolls_results_without_scrolling_filter_row() {
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -5661,7 +6012,7 @@ mod tests {
             ),
         )
         .await
-        .expect("switching to Chat must not wait for agent status");
+        .expect("switching to Chat must not wait for the agent list");
 
         assert_eq!(mode, Mode::Chat);
         let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -5669,7 +6020,7 @@ mod tests {
             .expect("Chat entry should start the background request")
             .expect("RPC request channel should stay open");
         let request: serde_json::Value = serde_json::from_str(&request).unwrap();
-        assert_eq!(request["method"], crate::client::method::AGENTS_STATUS);
+        assert_eq!(request["method"], crate::client::method::AGENTS_LIST);
         assert_eq!(rpc_out.pending_count(), 1);
     }
 
@@ -5691,7 +6042,7 @@ mod tests {
         chat.start_entry_retry();
         let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
-            .expect("Chat entry should request agents/status")
+            .expect("Chat entry should request agents/list")
             .expect("RPC request channel should stay open");
         let request: serde_json::Value = serde_json::from_str(&request).unwrap();
 

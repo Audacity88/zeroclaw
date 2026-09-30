@@ -7,7 +7,8 @@
 //! `session_summaries()` — the panes stay the single source of truth.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -26,8 +27,6 @@ use crate::{mouse, theme, widgets};
 /// Minimum columns the main content keeps; below this the sidebar auto-skips
 /// for the frame instead of squeezing the pane.
 pub(crate) const CONTENT_MIN_COLS: u16 = 40;
-/// Row width at which the right-aligned pane tag is shown.
-const PANE_TAG_MIN_COLS: u16 = 16;
 
 /// Per-frame shell context the sidebar renders against.
 pub(crate) struct SidebarCtx {
@@ -57,6 +56,7 @@ struct SidebarPicker {
     /// Informational only: selecting an open alias still creates a new session.
     open_aliases: HashSet<String>,
     loading: bool,
+    opened_at: Instant,
     error: Option<String>,
     rx: mpsc::UnboundedReceiver<Result<Vec<String>, String>>,
     double_click: mouse::DoubleClickTracker,
@@ -71,15 +71,63 @@ impl SidebarPicker {
 
     /// The rows the modal shows: real aliases, or a single status row.
     fn display_items(&self) -> Vec<String> {
-        if self.loading {
-            vec![t("zc-sidebar-picker-loading")]
+        let mut items = if self.loading && !self.aliases.is_empty() {
+            self.state.items.clone()
+        } else if self.loading {
+            vec![if self.opened_at.elapsed() >= Duration::from_millis(150) {
+                t("zc-sidebar-picker-loading")
+            } else {
+                String::new()
+            }]
         } else if let Some(ref e) = self.error {
             vec![t_args("zc-sidebar-picker-error", &[("error", e)])]
         } else if self.aliases.is_empty() {
             vec![t("zc-sidebar-picker-empty")]
         } else {
             self.state.items.clone()
+        };
+        // Reserve the same modest footprint for loading, empty and populated lists.
+        let width = self
+            .state
+            .items
+            .iter()
+            .map(|label| crate::display_width::display_width(label))
+            .max()
+            .unwrap_or(0)
+            .max(48);
+        items.resize(
+            items.len().max(self.state.items.len()).max(8),
+            String::new(),
+        );
+        for item in &mut items {
+            item.push_str(
+                &" ".repeat(width.saturating_sub(crate::display_width::display_width(item))),
+            );
         }
+        items
+    }
+
+    fn set_aliases(&mut self, aliases: Vec<String>) {
+        let selected = self.aliases.get(self.state.cursor).cloned();
+        let open_suffix = t("zc-sidebar-picker-open-suffix");
+        let labels = aliases
+            .iter()
+            .map(|alias| {
+                if self.open_aliases.contains(alias) {
+                    format!("{alias} {open_suffix}")
+                } else {
+                    alias.clone()
+                }
+            })
+            .collect();
+        let cursor = selected
+            .as_ref()
+            .and_then(|alias| aliases.iter().position(|item| item == alias))
+            .unwrap_or(0);
+        self.aliases = aliases;
+        self.state = widgets::PickerState::new(labels, None);
+        self.state.cursor = cursor;
+        self.double_click = mouse::DoubleClickTracker::new();
     }
 }
 
@@ -97,6 +145,9 @@ pub(crate) struct AgentSidebar {
     row_rects: Vec<(PaneKind, String, Rect)>,
     row_close_rects: Vec<(PaneKind, String, Rect)>,
     picker: Option<SidebarPicker>,
+    /// Last successful display list, valid only for this RPC connection.
+    cached_aliases: Vec<String>,
+    cache_rpc: Weak<RpcClient>,
 }
 
 impl AgentSidebar {
@@ -111,6 +162,8 @@ impl AgentSidebar {
             row_rects: Vec::new(),
             row_close_rects: Vec::new(),
             picker: None,
+            cached_aliases: Vec::new(),
+            cache_rpc: Weak::new(),
         }
     }
 
@@ -154,7 +207,20 @@ impl AgentSidebar {
         }
         self.area = area;
         frame.render_widget(Clear, area);
-        let block = theme::panel_block(&t("zc-sidebar-title")).style(theme::fill_style());
+        let header_controls = if area.width >= 14 {
+            12
+        } else if area.width >= 10 {
+            8
+        } else if area.width >= 6 {
+            4
+        } else {
+            0
+        };
+        let title = truncate_to_cells(
+            &t("zc-sidebar-title"),
+            area.width.saturating_sub(2 + header_controls) as usize,
+        );
+        let block = theme::panel_block(&title).style(theme::fill_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -263,7 +329,7 @@ impl AgentSidebar {
             };
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    widgets::truncate_to_width(&t("zc-sidebar-empty"), hint.width as usize),
+                    truncate_to_cells(&t("zc-sidebar-empty"), hint.width as usize),
                     theme::dim_style(),
                 ))
                 .centered(),
@@ -296,56 +362,32 @@ impl AgentSidebar {
                 Style::default()
             };
 
-            // Every row shows the dim pane tag when the sidebar is wide enough.
-            // The row body changes focus; the right-edge `✕` closes that row's
-            // session without changing focus first.
-            let tag = if row_rect.width >= PANE_TAG_MIN_COLS {
-                let label = match summary.pane_kind {
-                    PaneKind::Chat => t("zc-pane-chat"),
-                    PaneKind::Acp => t("zc-pane-code"),
-                };
-                Some(label)
+            let date = session_activity_date(summary.last_activity.as_deref());
+            let date_width = crate::display_width::display_width(&date);
+            let count = if summary.message_count > 999 {
+                "999+".to_string()
             } else {
-                None
+                summary.message_count.to_string()
             };
-            let tag_width = tag
-                .as_ref()
-                .map(|s| crate::display_width::display_width(s) + 1)
-                .unwrap_or(0);
-
-            // Right-edge per-row close affordance (`✕`), restored alongside the
-            // Sessions-header `[-]` so a specific session can be closed without
-            // focusing it first. Skipped only when the row is too narrow.
-            let close_w: u16 = if row_rect.width >= 6 { 2 } else { 0 };
+            // The sidebar count is the turn-terminal projected conversation length
+            // (the daemon's turn-end count) plus an optimistic in-flight user
+            // message; the switch picker's counts come from the daemon's
+            // durable store. The two measure different things and can differ.
+            let close_width = u16::from(row_rect.width >= 6) * 2;
             let content_rect = Rect {
-                width: row_rect.width.saturating_sub(close_w),
+                width: row_rect.width.saturating_sub(close_width),
                 ..row_rect
             };
-
-            let name_width = (content_rect.width as usize).saturating_sub(2 + tag_width);
-            let duplicate = rows
-                .iter()
-                .filter(|row| row.agent_alias == summary.agent_alias)
-                .count()
-                > 1;
-            let name = if duplicate {
-                let ordinal = rows
-                    .iter()
-                    .take(self.scroll as usize + i + 1)
-                    .filter(|row| row.agent_alias == summary.agent_alias)
-                    .count();
-                let suffix = format!(" #{ordinal}");
-                format!(
-                    "{}{}",
-                    widgets::truncate_to_width(
-                        &summary.agent_alias,
-                        name_width.saturating_sub(suffix.len())
-                    ),
-                    suffix
-                )
-            } else {
-                widgets::truncate_to_width(&summary.agent_alias, name_width)
-            };
+            let count_label = format!(" ({count})");
+            let count_width = crate::display_width::display_width(&count_label);
+            let available = (content_rect.width as usize).saturating_sub(2 + count_width);
+            // Keep the name before optional date metadata.
+            let show_date = available >= date_width + 5;
+            let name_width = available.saturating_sub(if show_date { date_width + 1 } else { 0 });
+            let name = truncate_to_cells(
+                &format!("{} #{}", summary.agent_alias, summary.display_ordinal),
+                name_width,
+            );
             let pad = name_width.saturating_sub(crate::display_width::display_width(&name));
 
             let status_glyph = match summary.status {
@@ -355,10 +397,12 @@ impl AgentSidebar {
             let mut spans = vec![
                 Span::styled(status_glyph, status_style(summary.status)),
                 Span::styled(name, theme::body_style()),
+                Span::styled(count_label, theme::dim_style()),
             ];
-            if let Some(label) = tag {
-                spans.push(Span::raw(" ".repeat(pad + 1)));
-                spans.push(Span::styled(label, theme::dim_style()));
+            spans.push(Span::raw(" ".repeat(pad)));
+            if show_date {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(date, theme::dim_style()));
             }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(row_style),
@@ -366,11 +410,11 @@ impl AgentSidebar {
             );
             self.row_rects
                 .push((summary.pane_kind, summary.session_id.clone(), row_rect));
-            if close_w > 0 {
+            if close_width > 0 {
                 let close_rect = Rect {
-                    x: content_rect.x + content_rect.width,
+                    x: content_rect.right(),
                     y: row_rect.y,
-                    width: close_w,
+                    width: close_width,
                     height: 1,
                 };
                 let close_style = if focused_here {
@@ -399,7 +443,7 @@ impl AgentSidebar {
         };
         let title = t("zc-sidebar-picker-title");
         let items = picker.display_items();
-        let cursor = if picker.selectable() {
+        let cursor = if !picker.aliases.is_empty() && picker.error.is_none() {
             picker.state.cursor
         } else {
             usize::MAX // no highlighted row for status-only content
@@ -417,10 +461,18 @@ impl AgentSidebar {
         open_aliases: HashSet<String>,
         rpc: &Arc<RpcClient>,
     ) {
+        if !self
+            .cache_rpc
+            .upgrade()
+            .is_some_and(|cached| Arc::ptr_eq(&cached, rpc))
+        {
+            self.cached_aliases.clear();
+        }
+        self.cache_rpc = Arc::downgrade(rpc);
         let (tx, rx) = mpsc::unbounded_channel();
         let rpc = Arc::clone(rpc);
         tokio::spawn(async move {
-            let result = match rpc.agents_status().await {
+            let result = match rpc.agents_list().await {
                 Ok(result) => Ok(result
                     .agents
                     .into_iter()
@@ -437,11 +489,15 @@ impl AgentSidebar {
             aliases: Vec::new(),
             open_aliases,
             loading: true,
+            opened_at: Instant::now(),
             error: None,
             rx,
             double_click: mouse::DoubleClickTracker::new(),
             modal_rect: Rect::default(),
         });
+        if let Some(picker) = self.picker.as_mut() {
+            picker.set_aliases(self.cached_aliases.clone());
+        }
     }
 
     /// Drain the background agent fetch, if one is pending. Called once per
@@ -456,26 +512,17 @@ impl AgentSidebar {
         match picker.rx.try_recv() {
             Ok(Ok(aliases)) => {
                 picker.loading = false;
-                let open_suffix = t("zc-sidebar-picker-open-suffix");
-                let labels = aliases
-                    .iter()
-                    .map(|alias| {
-                        if picker.open_aliases.contains(alias) {
-                            format!("{alias} {open_suffix}")
-                        } else {
-                            alias.clone()
-                        }
-                    })
-                    .collect();
-                picker.aliases = aliases;
-                picker.state = widgets::PickerState::new(labels, None);
+                self.cached_aliases.clone_from(&aliases);
+                picker.set_aliases(aliases);
             }
             Ok(Err(e)) => {
+                self.cached_aliases.clear();
                 picker.loading = false;
                 picker.error = Some(e);
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.cached_aliases.clear();
                 picker.loading = false;
                 picker.error = Some(t("zc-sidebar-picker-disconnected"));
             }
@@ -496,6 +543,9 @@ impl AgentSidebar {
                 None
             }
             Some(ModalAction::Confirm) => {
+                if picker.loading {
+                    return None;
+                }
                 let event = Self::picker_confirm(picker);
                 self.picker = None;
                 event
@@ -584,9 +634,16 @@ impl AgentSidebar {
                 if !picker.selectable() {
                     return None;
                 }
-                if let Some(idx) =
-                    mouse::list_click_index(row, picker.modal_rect, 0, picker.aliases.len())
-                {
+                if let Some(idx) = mouse::list_click_index(
+                    row,
+                    picker.modal_rect,
+                    picker
+                        .state
+                        .cursor
+                        .saturating_add(1)
+                        .saturating_sub(picker.modal_rect.height.saturating_sub(2) as usize),
+                    picker.aliases.len(),
+                ) {
                     picker.state.cursor = idx;
                     if picker.double_click.click(col, row) {
                         let event = Self::picker_confirm(picker);
@@ -618,10 +675,28 @@ fn status_style(status: SidebarStatus) -> Style {
     }
 }
 
+fn session_activity_date(last_activity: Option<&str>) -> String {
+    last_activity
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Local)
+                .format("%m/%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| t("zc-sidebar-date-placeholder"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseEventKind};
+
+    fn rendered_row(buffer: &ratatui::buffer::Buffer, rect: Rect) -> String {
+        (rect.x..rect.x + rect.width)
+            .map(|x| buffer[(x, rect.y)].symbol())
+            .collect()
+    }
 
     fn sidebar() -> AgentSidebar {
         AgentSidebar {
@@ -634,17 +709,30 @@ mod tests {
             row_rects: Vec::new(),
             row_close_rects: Vec::new(),
             picker: None,
+            cached_aliases: Vec::new(),
+            cache_rpc: Weak::new(),
         }
     }
 
     fn summary(alias: &str, sid: &str, focused: bool) -> SidebarSessionSummary {
+        summary_in_pane(alias, sid, PaneKind::Chat, focused)
+    }
+
+    fn summary_in_pane(
+        alias: &str,
+        sid: &str,
+        pane_kind: PaneKind,
+        focused: bool,
+    ) -> SidebarSessionSummary {
         SidebarSessionSummary {
             session_id: sid.into(),
             agent_alias: alias.into(),
             message_count: 0,
             status: SidebarStatus::Ready,
-            pane_kind: PaneKind::Chat,
+            pane_kind,
             focused,
+            display_ordinal: 1,
+            last_activity: Some("2026-01-02T12:00:00Z".into()),
         }
     }
 
@@ -753,7 +841,8 @@ mod tests {
     fn duplicate_alias_rows_have_distinct_labels_and_session_targets() {
         let mut sidebar = sidebar();
         let area = Rect::new(0, 0, 24, 10);
-        let rows = vec![summary("alpha", "s1", true), summary("alpha", "s2", false)];
+        let mut rows = vec![summary("alpha", "s1", true), summary("alpha", "s2", false)];
+        rows[1].display_ordinal = 2;
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
             quickstart_active: false,
@@ -824,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn running_row_is_explicit_without_showing_count_or_losing_close_target() {
+    fn running_row_is_explicit_with_count_and_close_target() {
         let mut sidebar = sidebar();
         let area = Rect::new(0, 0, crate::config::SIDEBAR_WIDTH_MIN, 8);
         let mut row = summary("long-agent-name", "s1", true);
@@ -853,7 +942,7 @@ mod tests {
             "running state must not rely on color: {text}"
         );
         assert!(
-            !text.contains("(42)"),
+            text.contains("(42)"),
             "message counts are not session identity: {text}"
         );
         // The trailing close affordance closes the running session; the row

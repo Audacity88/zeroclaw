@@ -15,10 +15,10 @@ zc-chrome-summary-loading = 読み込み中
 zc-app-help-cycle-mode = モード切り替え
 zc-app-help-help = ヘルプ
 zc-app-help-reload = デーモンを再読み込み
-zc-app-help-toggle-sidebar = エージェントサイドバーを切り替え
+zc-app-help-toggle-sidebar = セッションサイドバーを切り替え
 zc-app-help-quit = 終了
 
-zc-sidebar-title = エージェント
+zc-sidebar-title = セッション
 zc-dock-header = ドック { $side }
 zc-dock-side-left = 左
 zc-dock-side-right = 右
@@ -34,7 +34,7 @@ zc-dock-toggle-queue = キュー
 zc-dock-toggle-plan = プラン
 zc-todo-plan-title = プラン ({ $total }) — { $done }/{ $total } 完了
 zc-todo-plan-empty = アクティブなプランはありません
-zc-sidebar-empty = アクティブなエージェントはありません
+zc-sidebar-empty = アクティブなセッションはありません
 zc-sidebar-picker-title = エージェントを追加
 zc-sidebar-picker-loading = エージェントを読み込み中…
 zc-sidebar-picker-empty = 設定済みのエージェントがありません
@@ -485,7 +485,7 @@ zc-chat-help-toggle-thoughts = 思考を切り替え
 zc-chat-help-new-session = 新しいセッション
 zc-chat-help-change-directory = ディレクトリを選んで新しい Code セッションを開始
 zc-chat-session-list-resume-title = 保存済みセッション (Enter=再開, Esc=新規)
-zc-chat-session-list-switch-title = セッション (Enter=切替, Esc=閉じる)
+zc-chat-session-list-switch-title = すべてのセッション (Enter=切替, Esc=閉じる)
 zc-elicit-help-toggle = 選択を切り替え
 zc-elicit-help-confirm = 選択を確定
 zc-elicit-help-cancel = キャンセル
@@ -679,3 +679,27 @@ zc-config-section-peer-groups-help = チャンネル、参加エージェント�
 zc-config-section-cron-help = スケジュール、プロンプト、チャンネル、対象を結び付ける定期タスクを設定します。
 zc-config-section-tunnel-help = Cloudflare または ngrok でゲートウェイを公開するか、ローカル専用のままにします。
 zc-config-section-onboard-state-help = クイックスタートのライフサイクル状態と、互換性のために残されたセクション別完了記録です。
+
+# Session presentation, searchable pickers, and thinking controls.
+zc-dock-config-summary = ドック: { $side } / { $width } 列
+zc-dock-config-unavailable = ドック設定を利用できません: { $error }
+zc-sidebar-date-placeholder = --/--
+zc-picker-search = 検索
+zc-picker-no-results = 一致するモデルはありません
+zc-effort-picker-title = 思考レベルを選択
+zc-display-picker-title = 思考表示を選択
+zc-thinking-switch-applying = 思考設定の変更を適用中…
+zc-effort-ok = 思考レベルを { $level } に設定しました。
+zc-effort-reset = 思考レベルの上書きを解除しました（現在: { $level }）。
+zc-display-ok = 思考表示を { $display } に設定しました。
+zc-display-reset = 思考表示の上書きを解除しました（現在: { $display }）。
+zc-thinking-switch-failed = 思考設定の変更に失敗しました: { $error }
+zc-effort-none-for-model = このモデルには思考レベルの選択肢がありません。
+zc-display-none-for-model = このモデルには思考表示の選択肢がありません。
+zc-thinking-options-failed = 思考オプションを読み込めませんでした: { $error }
+zc-thinking-remembered-skipped = 記憶された思考設定 { $value } はこのモデルでは利用できないため、スキップしました。
+zc-picker-current = 現在
+zc-chat-help-resume-session = 既存のセッションを再開
+zc-config-description = 説明
+zc-config-description-scroll = 説明 · { $up }/{ $down } でスクロール
+zc-config-help-scroll-description = 説明をスクロール（説明上でマウスホイールも使用可能）

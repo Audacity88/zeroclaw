@@ -12,9 +12,24 @@ pub(crate) struct Acp {
 }
 
 impl Acp {
+    #[cfg(test)]
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+        Self::new_with_max_tracked_sessions(
+            rpc,
+            crate::config::DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE,
+        )
+    }
+
+    pub(crate) fn new_with_max_tracked_sessions(
+        rpc: Arc<RpcClient>,
+        max_tracked_sessions_per_pane: usize,
+    ) -> Self {
         Self {
-            inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
+            inner: chat::Chat::new_with_max_tracked_sessions(
+                rpc,
+                chat::PaneKind::Acp,
+                max_tracked_sessions_per_pane,
+            ),
         }
     }
 
@@ -129,10 +144,6 @@ impl Acp {
         self.inner.handle_context_menu_mouse(mouse).await
     }
 
-    pub(crate) fn plan_visible(&self) -> bool {
-        self.inner.plan_visible()
-    }
-
     pub(crate) fn current_session_id(&self) -> Option<&str> {
         self.inner.current_session_id()
     }
@@ -161,6 +172,10 @@ impl Acp {
         self.inner.claims_pane_navigation(key)
     }
 
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        self.inner.claims_session_shortcut(key)
+    }
+
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }
@@ -175,6 +190,10 @@ impl Acp {
 
     pub(crate) fn copy_composer_selection(&self, key: &KeyEvent) -> bool {
         self.inner.copy_composer_selection(key)
+    }
+
+    pub(crate) fn input_mouse_capture_active(&self) -> bool {
+        self.inner.input_mouse_capture_active()
     }
 
     pub(crate) fn take_help_request(&mut self) -> bool {
@@ -207,6 +226,18 @@ impl Acp {
 
     pub(crate) fn current_cwd(&self) -> Option<&str> {
         self.inner.current_cwd()
+    }
+
+    pub(crate) fn plan_visible(&self) -> bool {
+        self.inner.plan_visible()
+    }
+
+    pub(crate) fn set_info_notice(&mut self, message: String) {
+        self.inner.set_info_notice(message);
+    }
+
+    pub(crate) fn set_info_error(&mut self, message: String) {
+        self.inner.set_info_error(message);
     }
 }
 

@@ -57,6 +57,8 @@ Clicking a session row's body focuses it; clicking its right-edge `✕` closes t
 Use the Sessions header `[+]` to add a sibling session and `[-]` to close the focused session in the active pane.
 Closing a live session safely stops its current work while preserving durable history.
 
+Rows show a process-local per-agent ordinal, a bounded message count, and the last activity date when space permits. A missing or invalid date displays `--/--`. Direct session shortcuts select the first eight rows in Code-then-Chat order: Control+Command+1 through 8 on macOS, Control+1 through 8 elsewhere. Dialogs and explicit pane or composer bindings retain ownership of their chords. The Help overlay shows the resolved bindings.
+
 Switching to an existing **Code** session resumes it at its own saved root,
 while **New session** starts fresh: at the selected agent's workspace over a
 local connection, or in the directory you pick in the daemon-side picker over
@@ -66,6 +68,38 @@ WSS. Neither action changes the root of a session that is already running; use
 The in-app help overlay shows your live key bindings for these actions.
 
 Chat/Code sessions and ACP-backed sessions use different stores. If you use the ACP protocol directly, use `session/load` when you need transcript replay and `session/resume` when you only need the server-side session state restored. See the [ACP documentation](../channels/acp.md) for protocol-level details.
+
+## Session thinking controls
+
+The conversation title shows `effort:<level>` and `display:<value>` when the daemon advertises adjustable thinking controls for the current model. Click either segment or use its command:
+
+| Command | Effect |
+| --- | --- |
+| `/effort` | Open the effort picker. `/thinking` and `/think` are aliases. |
+| `/effort <level>` | Set the session's effort level. |
+| `/effort reset` | Clear the session override and use the daemon's configured default. |
+| `/display` | Open the thinking-display picker. |
+| `/display <value>` | Set an offered display value, such as `omitted` or `summarized`. |
+| `/display reset` | Clear the session's display override. |
+| `/effort:<level> <prompt>` | Set effort for one message. `/think:<level>` is also accepted. |
+
+The daemon determines available values and their sources. Unsupported controls stay hidden. A message-level effort overrides the session value, which overrides the configured default. Changing the model or provider clears the session's thinking overrides; it does not carry unsupported values into the new model.
+
+ZeroCode remembers successful explicit choices per agent in its local config:
+
+```toml
+[thinking.agent_override.coder]
+level = "high"
+display = "summarized"
+```
+
+At a session boundary, ZeroCode reads this memory again and applies only values the daemon offers for that session. It reports skipped values. Resetting a control removes its remembered value. A thinking change can alter the provider's request and reduce prompt-cache reuse on the next turn.
+
+## Choosing a model
+
+Run `/model` in Chat or Code to open the active provider's model catalogue. Type or paste a model-name fragment to filter case-insensitively. Backspace removes the last search character; the current model remains marked when it matches.
+
+Up/Down moves one result, Page Up/Page Down moves a page, and Home/End selects the first or last result. The mouse wheel moves three results. Enter or a click applies a model; Escape closes the picker unchanged. An empty result list cannot be submitted.
 
 ## Terminal text input
 
@@ -93,6 +127,14 @@ Undo history belongs to the current draft and retains at most 100 edit groups. C
 Selection shortcuts act on the focused composer, not the queue sidebar. Copying selected input does not cancel a running turn or quit; with no input selection, Control+C retains its cancel/quit behavior. Dialogs and transcript browsing keep their own shortcuts. Use `/attach` to browse files; the configurable **browse files** action has no default shortcut because Primary+A now selects text. The Help overlay shows the current configured bindings.
 
 Terminal or operating-system shortcuts may intercept Command, Control, or clipboard events before zerocode sees them. Clipboard copy uses the terminal's OSC 52 support; bracketed paste remains available.
+
+Drag the composer's top border to change its height. The conversation retains minimum space, and attachments keep their own row. Add to Chat appends transcript text as a separate undoable edit and clears stale redo history.
+
+Wide Markdown tables keep their columns. Tables that do not fit use header-labelled records and wrap complete values instead of truncating them. Expanded generic tool cards show semantic input fields as well as output; specialized tool previews keep their existing presentation.
+
+### Interaction timing
+
+Set `ZEROCODE_TIMING=1` for an opt-in interaction trace. ZeroCode writes a new private `zerocode-timing-<pid>-<timestamp>.csv` in the system temporary directory, bounded to 16 MiB. It records numeric phase durations and counters, never prompts, transcript text, keystrokes, tool inputs, or credentials. The writer runs independently and shutdown does not wait for filesystem writes. The trace is local diagnostic data, not a file to publish.
 
 ## CLI flags
 

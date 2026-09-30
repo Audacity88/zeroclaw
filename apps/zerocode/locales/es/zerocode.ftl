@@ -15,10 +15,10 @@ zc-chrome-summary-loading = cargando
 zc-app-help-cycle-mode = Modo cíclico
 zc-app-help-help = Ayuda
 zc-app-help-reload = Recargar daemon
-zc-app-help-toggle-sidebar = Mostrar/ocultar barra de agentes
+zc-app-help-toggle-sidebar = Mostrar/ocultar barra de sesiones
 zc-app-help-quit = Salir
 
-zc-sidebar-title = Agentes
+zc-sidebar-title = Sesiones
 zc-dock-header = Panel { $side }
 zc-dock-side-left = izquierda
 zc-dock-side-right = derecha
@@ -34,7 +34,7 @@ zc-dock-toggle-queue = Cola
 zc-dock-toggle-plan = Plan
 zc-todo-plan-title = Plan ({ $total }) — { $done }/{ $total } completadas
 zc-todo-plan-empty = No hay un plan activo
-zc-sidebar-empty = Sin agentes activos
+zc-sidebar-empty = Sin sesiones activas
 zc-sidebar-picker-title = Añadir agente
 zc-sidebar-picker-loading = Cargando agentes…
 zc-sidebar-picker-empty = No hay agentes configurados
@@ -485,7 +485,7 @@ zc-chat-help-toggle-thoughts = Alternar pensamientos
 zc-chat-help-new-session = Nueva sesión
 zc-chat-help-change-directory = Elija un directorio e inicie una nueva sesión de Code
 zc-chat-session-list-resume-title = Sesiones guardadas (Intro=reanudar, Esc=nueva)
-zc-chat-session-list-switch-title = Sesiones (Intro=cambiar, Esc=cerrar)
+zc-chat-session-list-switch-title = Todas las sesiones (Intro=cambiar, Esc=cerrar)
 zc-elicit-help-toggle = Alternar opción
 zc-elicit-help-confirm = Confirmar opción
 zc-elicit-help-cancel = Cancelar
@@ -680,3 +680,27 @@ zc-config-section-peer-groups-help = Grupos con nombre que vinculan un canal, ag
 zc-config-section-cron-help = Tareas programadas que vinculan un horario con un prompt, un canal y un destino.
 zc-config-section-tunnel-help = Expón opcionalmente la puerta de enlace mediante Cloudflare o ngrok, o mantenla solo local.
 zc-config-section-onboard-state-help = Estado del ciclo de vida del inicio rápido y su registro heredado de finalización por sección.
+
+# Session presentation, searchable pickers, and thinking controls.
+zc-dock-config-summary = Panel: { $side } / { $width } columnas
+zc-dock-config-unavailable = Configuración del panel no disponible: { $error }
+zc-sidebar-date-placeholder = --/--
+zc-picker-search = Buscar
+zc-picker-no-results = No hay modelos coincidentes
+zc-effort-picker-title = Seleccionar esfuerzo
+zc-display-picker-title = Seleccionar visualización del razonamiento
+zc-thinking-switch-applying = Aplicando cambio de razonamiento…
+zc-effort-ok = Esfuerzo establecido en { $level }.
+zc-effort-reset = Anulación de esfuerzo eliminada; ahora { $level }.
+zc-display-ok = Visualización del razonamiento establecida en { $display }.
+zc-display-reset = Anulación de visualización eliminada; ahora { $display }.
+zc-thinking-switch-failed = Error al cambiar el razonamiento: { $error }
+zc-effort-none-for-model = Este modelo no ofrece niveles de esfuerzo.
+zc-display-none-for-model = Este modelo no ofrece opciones de visualización del razonamiento.
+zc-thinking-options-failed = No se pudieron cargar las opciones de razonamiento: { $error }
+zc-thinking-remembered-skipped = El ajuste de razonamiento recordado { $value } no está disponible para este modelo; omitido.
+zc-picker-current = actual
+zc-chat-help-resume-session = Reanudar sesión existente
+zc-config-description = Descripción
+zc-config-description-scroll = Descripción · { $up }/{ $down } para desplazar
+zc-config-help-scroll-description = Desplazar la descripción (o usar la rueda del ratón sobre ella)

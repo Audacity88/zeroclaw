@@ -395,6 +395,43 @@ impl Default for SidebarSection {
     }
 }
 
+// ── Tracked sessions ────────────────────────────────────────────────────────
+
+pub(crate) const DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
+pub(crate) const MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE: usize = 32;
+
+/// The `[sessions]` section: client-side tracked-session capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionsSection {
+    /// Maximum focused, background, and retained resume sessions tracked by
+    /// each chat-like pane.
+    #[serde(default = "default_max_tracked_sessions_per_pane")]
+    pub max_tracked_per_pane: usize,
+}
+
+impl Default for SessionsSection {
+    fn default() -> Self {
+        Self {
+            max_tracked_per_pane: default_max_tracked_sessions_per_pane(),
+        }
+    }
+}
+
+const fn default_max_tracked_sessions_per_pane() -> usize {
+    DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE
+}
+
+impl SessionsSection {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !(1..=MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE).contains(&self.max_tracked_per_pane) {
+            anyhow::bail!(
+                "max_tracked_per_pane must be between 1 and {MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE}"
+            );
+        }
+        Ok(())
+    }
+}
+
 // ── Todo tracker ──────────────────────────────────────────────────────────────
 
 /// Where the todo tracker renders inside the Code pane.
@@ -528,6 +565,8 @@ pub(crate) struct ZerocodeConfig {
     pub connection: ConnectionSection,
     #[serde(default)]
     pub sidebar: SidebarSection,
+    #[serde(default)]
+    pub sessions: SessionsSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -543,6 +582,7 @@ impl Default for ZerocodeConfig {
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
             sidebar: SidebarSection::default(),
+            sessions: SessionsSection::default(),
             keybindings: HashMap::new(),
             todotracker: TodoTrackerSection::default(),
         }
@@ -558,6 +598,11 @@ fn default_theme() -> String {
 }
 
 impl ZerocodeConfig {
+    pub(crate) fn resolve_max_tracked_sessions_per_pane(&self) -> Result<usize> {
+        self.sessions.validate()?;
+        Ok(self.sessions.max_tracked_per_pane)
+    }
+
     pub fn resolve_theme(&self) -> Result<Theme> {
         let name = self.theme.name.trim();
         if name.is_empty() {
@@ -672,6 +717,26 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
     Ok(config)
 }
 
+/// Resolve the effective client-side tracked-session limit, rejecting a
+/// malformed section or an out-of-range file/environment value rather than
+/// silently falling back to the default.
+pub(crate) fn resolve_max_tracked_sessions_per_pane_checked(config_dir: &Path) -> Result<usize> {
+    let path = config_path(config_dir);
+    if path.exists() {
+        let doc = load_document(&path)?;
+        if let Some(value) = doc.get("sessions") {
+            value
+                .clone()
+                .try_into::<SessionsSection>()
+                .with_context(|| format!("[sessions] in {} is malformed", path.display()))?;
+        }
+    }
+    let config = ensure_and_load(config_dir)?;
+    config
+        .resolve_max_tracked_sessions_per_pane()
+        .map_err(|error| anyhow::Error::msg(format!("[sessions] is invalid: {error}")))
+}
+
 /// Resolve the effective `[todotracker]` settings for a session boundary,
 /// treating a **present-but-malformed** `[todotracker]` section as an error
 /// rather than silently falling back to defaults.
@@ -784,6 +849,15 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
             Ok(section) => config.sidebar = section,
             Err(e) => eprintln!(
                 "zerocode: ignoring [sidebar] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
+    if let Some(v) = doc.get("sessions") {
+        match v.clone().try_into::<SessionsSection>() {
+            Ok(section) => config.sessions = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [sessions] in {} ({e}); using default",
                 path.display()
             ),
         }
@@ -1150,6 +1224,116 @@ fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a m
         cur = section_mut(cur, key)?;
     }
     Ok(cur)
+}
+
+// ── Per-agent thinking memory ─────────────────────────────────────────────────
+
+/// The last effort level and thinking display the user chose for an agent:
+/// `[thinking.agent_override.<alias>]` in `zerocode-config.toml`. A UI memory
+/// re-applied at session start only when the session's model offers the
+/// value; the daemon stays the authority on what is valid, and the file is
+/// re-read at every session boundary rather than cached.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AgentThinkingMemory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+/// One remembered thinking control, named by the key it is stored under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentThinkingKey {
+    Level,
+    Display,
+}
+
+impl AgentThinkingKey {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Level => "level",
+            Self::Display => "display",
+        }
+    }
+}
+
+/// Remember (`Some`) or forget (`None`) one thinking control for `alias`,
+/// editing only `[thinking.agent_override.<alias>].<key>`. Forgetting drops
+/// tables that become empty so the last forgotten value leaves no scaffold;
+/// other agents and every other section are preserved.
+pub(crate) fn persist_agent_thinking(
+    config_dir: &Path,
+    alias: &str,
+    key: AgentThinkingKey,
+    value: Option<&str>,
+) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    match value {
+        Some(value) => {
+            section_mut_path(&mut doc, &["thinking", "agent_override", alias])?.insert(
+                key.as_str().to_string(),
+                toml::Value::String(value.to_string()),
+            );
+        }
+        None => forget_agent_thinking(&mut doc, alias, key),
+    }
+    write_document(&path, &doc)
+}
+
+fn forget_agent_thinking(doc: &mut toml::Table, alias: &str, key: AgentThinkingKey) {
+    let Some(thinking) = doc.get_mut("thinking").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+    if let Some(overrides) = thinking
+        .get_mut("agent_override")
+        .and_then(toml::Value::as_table_mut)
+    {
+        if let Some(agent) = overrides.get_mut(alias).and_then(toml::Value::as_table_mut) {
+            agent.remove(key.as_str());
+            if agent.is_empty() {
+                overrides.remove(alias);
+            }
+        }
+        if overrides.is_empty() {
+            thinking.remove("agent_override");
+        }
+    }
+    if thinking.is_empty() {
+        doc.remove("thinking");
+    }
+}
+
+/// The remembered thinking controls for `alias`, read fresh from the file.
+/// No file is created and no `ZEROCODE_*` override applies: this is a UI
+/// memory, not runtime config. A missing file or entry is an empty memory; a
+/// malformed entry is an error so a hand-edit typo is reported rather than
+/// silently forgotten.
+pub(crate) fn remembered_agent_thinking(
+    config_dir: &Path,
+    alias: &str,
+) -> Result<AgentThinkingMemory> {
+    let path = config_path(config_dir);
+    if !path.exists() {
+        return Ok(AgentThinkingMemory::default());
+    }
+    let doc = load_document(&path)?;
+    let Some(entry) = doc
+        .get("thinking")
+        .and_then(|thinking| thinking.get("agent_override"))
+        .and_then(|overrides| overrides.get(alias))
+    else {
+        return Ok(AgentThinkingMemory::default());
+    };
+    entry
+        .clone()
+        .try_into::<AgentThinkingMemory>()
+        .with_context(|| {
+            format!(
+                "[thinking.agent_override.{alias}] in {} is malformed",
+                path.display()
+            )
+        })
 }
 
 pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> {
@@ -1568,6 +1752,183 @@ mod tests {
         assert!(
             !on_disk.contains("agent_override"),
             "clearing the last override must drop the table; got:\n{on_disk}"
+        );
+    }
+
+    #[test]
+    fn tracked_session_limit_defaults_and_round_trips() {
+        let default = ZerocodeConfig::default();
+        assert_eq!(default.resolve_max_tracked_sessions_per_pane().unwrap(), 8);
+        let default_body = toml::to_string_pretty(&default).unwrap();
+        assert!(
+            default_body.contains("[sessions]")
+                && default_body.contains("max_tracked_per_pane = 8"),
+            "default config must materialize [sessions] for schema-mirror overrides; got:\n{default_body}"
+        );
+
+        let config: ZerocodeConfig =
+            toml::from_str("[sessions]\nmax_tracked_per_pane = 12\n").unwrap();
+        assert_eq!(config.resolve_max_tracked_sessions_per_pane().unwrap(), 12);
+    }
+
+    #[test]
+    fn checked_tracked_session_limit_rejects_invalid_values() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+
+        for value in [0, MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE + 1] {
+            seed(
+                dir.path(),
+                &format!("[sessions]\nmax_tracked_per_pane = {value}\n"),
+            );
+            let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("max_tracked_per_pane must be between 1 and 32"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+
+        seed(dir.path(), "[sessions]\nmax_tracked_per_pane = \"many\"\n");
+        let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("[sessions]"));
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_tracked_session_limit() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sessions]\nmax_tracked_per_pane = 10\n");
+        let _value = EnvVarGuard::set("ZEROCODE_sessions__max_tracked_per_pane", "14");
+
+        assert_eq!(
+            resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap(),
+            14
+        );
+    }
+
+    #[test]
+    fn persist_agent_thinking_round_trips_per_agent_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord_dark\"\n\n[future]\nkeep = true\n",
+        );
+
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Level, Some("high")).unwrap();
+        persist_agent_thinking(
+            dir.path(),
+            "coder",
+            AgentThinkingKey::Display,
+            Some("summarized"),
+        )
+        .unwrap();
+        persist_agent_thinking(dir.path(), "writer", AgentThinkingKey::Level, Some("low")).unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["thinking"]["agent_override"]["coder"]["level"].as_str(),
+            Some("high")
+        );
+        assert_eq!(
+            doc["thinking"]["agent_override"]["coder"]["display"].as_str(),
+            Some("summarized")
+        );
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord_dark"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "coder").unwrap(),
+            AgentThinkingMemory {
+                level: Some("high".into()),
+                display: Some("summarized".into()),
+            }
+        );
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "writer").unwrap(),
+            AgentThinkingMemory {
+                level: Some("low".into()),
+                display: None,
+            }
+        );
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "ghost").unwrap(),
+            AgentThinkingMemory::default()
+        );
+    }
+
+    #[test]
+    fn persist_agent_thinking_forget_drops_empty_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Level, Some("high")).unwrap();
+        persist_agent_thinking(
+            dir.path(),
+            "coder",
+            AgentThinkingKey::Display,
+            Some("updates"),
+        )
+        .unwrap();
+
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Level, None).unwrap();
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "coder").unwrap(),
+            AgentThinkingMemory {
+                level: None,
+                display: Some("updates".into()),
+            }
+        );
+
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Display, None).unwrap();
+        let on_disk = read(dir.path());
+        assert!(
+            !on_disk.contains("thinking"),
+            "forgetting the last value must drop the tables; got:\n{on_disk}"
+        );
+
+        // Forgetting for an agent with no memory is a no-op.
+        persist_agent_thinking(dir.path(), "ghost", AgentThinkingKey::Level, None).unwrap();
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "ghost").unwrap(),
+            AgentThinkingMemory::default()
+        );
+    }
+
+    #[test]
+    fn remembered_agent_thinking_is_empty_without_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "coder").unwrap(),
+            AgentThinkingMemory::default()
+        );
+        assert!(
+            !config_path(dir.path()).exists(),
+            "reading the memory must not scaffold a config file"
+        );
+    }
+
+    #[test]
+    fn remembered_agent_thinking_rejects_a_malformed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[thinking.agent_override.coder]\nlevel = 3\n");
+        let err = remembered_agent_thinking(dir.path(), "coder")
+            .expect_err("a non-string level must be reported");
+        assert!(
+            format!("{err:#}").contains("[thinking.agent_override.coder]"),
+            "error should name the entry: {err:#}"
+        );
+    }
+
+    #[test]
+    fn persist_agent_thinking_survives_other_section_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_agent_thinking(dir.path(), "coder", AgentThinkingKey::Level, Some("max")).unwrap();
+        persist_agent_theme(dir.path(), "coder", "dracula").unwrap();
+        persist_theme(dir.path(), "nord_dark").unwrap();
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "coder")
+                .unwrap()
+                .level
+                .as_deref(),
+            Some("max")
         );
     }
 
