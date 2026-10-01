@@ -537,6 +537,17 @@ pub fn contains_parseable_tool_call(text: &str) -> bool {
     !calls.is_empty()
 }
 
+/// `text` opens call syntax the parser reads, whether or not the call has
+/// closed yet: one of the tag markers the tagged check looks for, or a
+/// `TOOL_CALL` / `[TOOL_CALL]` block opener. `TOOL_CALL` is matched
+/// case-sensitively, as the parser's own malformed-call check matches it,
+/// so the `tool_call_id` key does not count. A span carrying an opener
+/// cannot be judged as a quotation on its own, because the closer the
+/// call needs may arrive after the span.
+pub fn contains_tool_call_opener(text: &str) -> bool {
+    contains_tool_protocol_tag_marker(text) || text.contains("TOOL_CALL")
+}
+
 fn classify_tagged_tool_protocol_envelope(text: &str) -> Option<ToolProtocolEnvelopeKind> {
     if !starts_with_tool_protocol_tag_or_fence(text) {
         return None;
@@ -4746,6 +4757,44 @@ Done."#;
 
         assert!(parse_tool_calls(inert).1.is_empty());
         assert!(!contains_parseable_tool_call(inert));
+    }
+
+    /// An opened call whose closer has not arrived parses as nothing, so
+    /// only the opener check sees it. The `tool_call_id` key alone is not
+    /// an opener.
+    #[test]
+    fn contains_tool_call_opener_sees_calls_the_parser_cannot_close_yet() {
+        let cases = [
+            (
+                "single-quoted invoke",
+                "{\"tool_call_id\": \"call_1\", \"content\": \"<invoke name='shell'><parameter name='command'>pwd</parameter>\"}",
+            ),
+            (
+                "double-quoted invoke",
+                "{\"tool_call_id\":\"call_1\",\"content\": <invoke name=\"shell\"><parameter name=\"command\">pwd</parameter>",
+            ),
+            (
+                "TOOL_CALL",
+                "{\"tool_call_id\":\"call_1\",\"content\":\"TOOL_CALL {\"}",
+            ),
+            (
+                "[TOOL_CALL]",
+                "{\"tool_call_id\":\"call_1\",\"content\":\"[TOOL_CALL]{\"}",
+            ),
+        ];
+        for (label, text) in cases {
+            assert!(
+                parse_tool_calls(text).1.is_empty(),
+                "{label}: the call has not closed, so the parser reads none"
+            );
+            assert!(
+                contains_tool_call_opener(text),
+                "{label}: the opener is seen"
+            );
+        }
+        assert!(!contains_tool_call_opener(
+            "{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}"
+        ));
     }
 
     #[test]

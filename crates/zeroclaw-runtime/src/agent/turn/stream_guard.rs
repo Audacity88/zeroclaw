@@ -9,7 +9,7 @@ use super::protocol_detect::{
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
     TERMINAL_MARKERS, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_parseable_tool_call, contains_tool_protocol_tag_call,
+    contains_parseable_tool_call, contains_tool_call_opener, contains_tool_protocol_tag_call,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, strip_trailing_terminal_markers,
     tool_protocol_envelope_mentions_known_tool,
@@ -182,9 +182,10 @@ fn is_releasable_result(text: &str) -> bool {
 /// is the first three-backtick run after the opening line, so a run
 /// inside the quoted body ends the span early: choosing the wrong close
 /// can only move where a release splits the text, because the body test
-/// runs on exactly the span the release would deliver. A fence with no
-/// close yet waits while the stream runs; at finish the rest of the
-/// candidate is the body and the end is the candidate's end.
+/// runs on exactly the span the release would deliver, and that test
+/// rejects a span opening a call whose closer could follow the close. A
+/// fence with no close yet waits while the stream runs; at finish the
+/// rest of the candidate is the body and the end is the candidate's end.
 fn quoted_result_fence_end(candidate: &str, finalizing: bool) -> Option<(usize, &str)> {
     let rest = candidate.strip_prefix("```")?;
     let first_newline = rest.find("\n")?;
@@ -324,7 +325,11 @@ impl StreamTextGuard {
     /// 6. Detectors: the parser-side suppression sequence, in which an
     ///    invalid-JSON result fragment after a preamble is inert and
     ///    released at finish.
-    /// 7. Complete-fence state and complete non-protocol JSON, on the
+    /// 7. Open call: while streaming, a prose-prefixed candidate that
+    ///    opens call syntax waits for more text instead of reaching the
+    ///    release in step 8, so a closer in a later delta is judged with
+    ///    its opener.
+    /// 8. Complete-fence state and complete non-protocol JSON, on the
     ///    candidate itself.
     fn evaluate_pending(&mut self, finalizing: bool) -> Option<String> {
         let candidate_start = self.pending_candidate_start.unwrap_or(0);
@@ -382,6 +387,19 @@ impl StreamTextGuard {
             if let Some(detector) = self.protocol_suppression_detector(candidate, finalizing) {
                 return self.suppress_protocol(detector);
             }
+
+            // A prose-prefixed candidate the release predicate refused for
+            // an open call (the closer has not arrived) must not leave
+            // through the complete-JSON release below either: the closer
+            // seeds no candidate of its own, so the call would reach the
+            // client in two pieces. It waits for more text; at finish the
+            // whole candidate is judged with whatever closer arrived.
+            if self.candidate_has_prose_prefix()
+                && !finalizing
+                && contains_tool_call_opener(candidate)
+            {
+                return None;
+            }
         }
 
         if let Some(is_protocol) =
@@ -423,16 +441,22 @@ impl StreamTextGuard {
     /// result shape after a preamble gates on this one predicate, so the
     /// tagged rejection `evaluate_pending` applies before its own
     /// quoted-result releases cannot be bypassed by another release path:
-    /// the span is rejected when it carries tagged tool-call markup or
+    /// the span is rejected when it carries a call the parser reads in
+    /// any syntax, opens call syntax whose closer has not arrived, or
     /// classifies as a tagged call envelope, unless the whole candidate
     /// reads as a teaching example (the same exemption and order
-    /// `evaluate_pending` applies). Otherwise the span faces the result
-    /// test the release paths already apply: a releasable result, or a
-    /// result fragment that never parses and carries neither a
-    /// call-shaped key nor a call the parser reads in any syntax.
+    /// `evaluate_pending` applies). The opener rule matters because the
+    /// span is judged alone: a call opened inside a quoted result can
+    /// close in text after the span, and that closer seeds no candidate
+    /// of its own, so releasing the span would deliver the call in two
+    /// pieces. A rejected span stays buffered and is judged with what
+    /// follows. Otherwise the span faces the result test the release
+    /// paths already apply: a releasable result, or a result fragment
+    /// that never parses and carries neither a call-shaped key nor a call
+    /// the parser reads in any syntax.
     fn releases_as_quoted_result(&self, candidate: &str, span: &str) -> bool {
         if !looks_like_tool_protocol_example(candidate) {
-            if contains_tool_protocol_tag_call(span) {
+            if contains_tool_call_opener(span) || contains_parseable_tool_call(span) {
                 return false;
             }
             if let Some(kind) = classify_tool_protocol_envelope(span)
@@ -2954,6 +2978,103 @@ mod stream_text_guard_tests {
             guard_outcome(&[prose, fragment]),
             (bare.clone(), false, None),
             "bare, split"
+        );
+    }
+
+    /// Review 5372714287, case 1: a complete quoted result whose content
+    /// string opens a single-quoted invoke, with the closing tag in the
+    /// next delta. Judged alone, the value parses no call and was
+    /// released, and the bare closer that followed seeded no candidate,
+    /// so the call reached the client in two pieces. The opener now keeps
+    /// the value buffered; once the closer arrives the candidate parses
+    /// as a tagged call and is withheld from its first byte, as when the
+    /// value and closer share a delta.
+    #[test]
+    fn prose_prefix_result_opening_invoke_closed_in_next_delta_is_withheld() {
+        let prose = "The history messages are ";
+        let value = "{\"tool_call_id\": \"call_1\", \"content\": \"<invoke name='shell'><parameter name='command'>pwd</parameter>\"}";
+        let closer = "</invoke>";
+        let expected = (
+            prose.to_string(),
+            true,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "tagged",
+                candidate_offset: prose.len(),
+            }),
+        );
+        assert_eq!(
+            guard_outcome(&[prose, value, closer]),
+            expected,
+            "split after the value"
+        );
+        assert_eq!(
+            guard_outcome(&[prose, format!("{value}{closer}").as_str()]),
+            expected,
+            "value and closer in one delta"
+        );
+        // With the preamble in the same delta, the finder seeds the
+        // candidate at the invoke rather than at the value's brace, so
+        // the call is withheld from there and the result text ahead of it
+        // is delivered: no call reaches the client either way.
+        let invoke_at = prose.len() + value.find("<invoke").expect("value carries the invoke");
+        assert_eq!(
+            guard_outcome(&[format!("{prose}{value}{closer}").as_str()]),
+            (
+                format!("{prose}{}", &value[..invoke_at - prose.len()]),
+                true,
+                Some(ProtocolSuppressionDiagnostic {
+                    detector: "tagged",
+                    candidate_offset: invoke_at,
+                }),
+            ),
+            "preamble, value and closer in one delta"
+        );
+    }
+
+    /// Review 5372714287, case 2: a closed json fence whose invalid body
+    /// opens an invoke, with the closing tag after the fence. The body
+    /// alone parses no call and was released at the fence close; the
+    /// opener now keeps the fence buffered, and the candidate with the
+    /// closer is withheld as a tagged call, one delta and split alike.
+    #[test]
+    fn prose_prefix_json_fence_opening_invoke_closed_after_fence_is_withheld() {
+        let prose = "Result shape:\n";
+        let body = "{\"tool_call_id\":\"call_1\",\"content\": <invoke name=\"shell\"><parameter name=\"command\">pwd</parameter>";
+        let expected = (
+            prose.to_string(),
+            true,
+            Some(ProtocolSuppressionDiagnostic {
+                detector: "tagged",
+                candidate_offset: prose.len(),
+            }),
+        );
+        assert_eq!(
+            guard_outcome(&[format!("{prose}```json\n{body}\n```\n</invoke>").as_str()]),
+            expected,
+            "one delta"
+        );
+        assert_eq!(
+            guard_outcome(&[prose, "```json\n", body, "\n```\n", "</invoke>"]),
+            expected,
+            "split at the fence close and before the closer"
+        );
+    }
+
+    /// Review 5372714287, `TOOL_CALL` variant: a complete quoted result
+    /// whose content ends in `TOOL_CALL {`, followed in the same delta by
+    /// the rest of the block. The value is not released on its own, so
+    /// the block never reaches the client; the preamble still does.
+    #[test]
+    fn prose_prefix_result_opening_tool_call_block_completed_after_value_is_withheld() {
+        let prose = "The history messages are ";
+        let rest = "{\"tool_call_id\": \"call_1\", \"content\": \"TOOL_CALL {\"} tool => \"shell\", args => { --command \"pwd\" }} /TOOL_CALL";
+        let (forwarded, suppressed, suppression) = guard_outcome(&[prose, rest]);
+        assert_eq!(forwarded, prose, "only the preamble is delivered");
+        assert!(suppressed, "the completed block is withheld");
+        assert_eq!(
+            suppression.map(|diagnostic| diagnostic.candidate_offset),
+            Some(prose.len()),
+            "withheld from the quoted result's first byte"
         );
     }
 }
