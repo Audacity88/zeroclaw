@@ -2751,10 +2751,13 @@ mod stream_text_guard_tests {
     /// thousand quoted-result fences in one delta. The fence release
     /// used to re-enter `evaluate_pending` per fence, whose fence
     /// branch called `release_through` again — one nested pair per
-    /// fence, deep enough to overflow a 128 KiB stack. The re-scan now
-    /// loops: every fence drains through the release loop, the
-    /// delivered output equals the input byte for byte, and nothing is
-    /// flagged.
+    /// fence, deep enough to overflow the test's 512 KiB stack. The
+    /// re-scan now loops: every fence drains through the release loop,
+    /// the delivered output equals the input byte for byte, and nothing
+    /// is flagged. The stack leaves room for one release predicate call
+    /// per fence (it runs the full tool-call parser, whose debug frames
+    /// exceeded 128 KiB on Linux CI) while a nesting of two thousand
+    /// still overflows it.
     #[test]
     fn two_thousand_quoted_result_fences_in_one_delta_release_without_recursion() {
         let prose = "The history messages are ";
@@ -2767,7 +2770,7 @@ mod stream_text_guard_tests {
         let assert_input = input.clone();
         let moved = input;
         let handle = std::thread::Builder::new()
-            .stack_size(128 * 1024)
+            .stack_size(512 * 1024)
             .spawn(move || {
                 let mut guard = guard_with_tool();
                 let forwarded = push_all(&mut guard, &[moved.as_str()]);
@@ -2810,7 +2813,7 @@ mod stream_text_guard_tests {
         let assert_delivered = input[..expected_offset].to_string();
         let moved = input;
         let handle = std::thread::Builder::new()
-            .stack_size(128 * 1024)
+            .stack_size(512 * 1024)
             .spawn(move || {
                 let mut guard = guard_with_tool();
                 let forwarded = push_all(&mut guard, &[moved.as_str()]);
