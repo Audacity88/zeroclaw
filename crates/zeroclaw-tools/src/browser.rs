@@ -874,10 +874,11 @@ impl BrowserTool {
         let filename = format!("browser_screenshot_{timestamp}.png");
         let full = self.security.resolve_tool_path(&filename);
         if full.exists() {
-            anyhow::bail!(
-                "allocated screenshot target {filename} already exists; \
-                 pass an explicit `path` instead of overwriting it"
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-allocated-target-exists",
+                &[("filename", &filename)],
             );
+            anyhow::bail!("{msg}");
         }
         Ok(filename)
     }
