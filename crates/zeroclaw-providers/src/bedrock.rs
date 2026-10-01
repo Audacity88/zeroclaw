@@ -1245,8 +1245,8 @@ impl BedrockModelProvider {
 
     /// Build user-role blocks for a prompt-mode tool-result carrier: the
     /// declared image attachments become image blocks, and the carrier text
-    /// `parse_user_message_image_refs` returns — the rebuilt carrier without
-    /// its image attachment lines — becomes one verbatim text block that is
+    /// `parse_user_message_image_refs` returns (the rebuilt carrier without
+    /// its image attachment lines) becomes one verbatim text block that is
     /// never scanned for markers. The Bedrock counterpart of the seam every
     /// other adapter routes user-role carriers through, so a carrier body
     /// quoting marker syntax stays text instead of smuggling an image into
@@ -2192,7 +2192,7 @@ mod tests {
     }
 
     /// A count-zero carrier whose body quotes a data-URI marker and a path
-    /// marker — the ordinary shape of a tool reading source text that
+    /// marker, the ordinary shape of a tool reading source text that
     /// contains them. The carrier reads through its declaration, so the
     /// quotes stay body text: zero image blocks, and the delivered text is
     /// the carrier byte-for-byte, no marker rewrite.
@@ -2228,7 +2228,7 @@ mod tests {
 
     /// A declared carrier with one data-URI image attachment whose body
     /// quotes a second data-URI marker: exactly one image block, built from
-    /// the declared attachment — never the quoted one — with the body text
+    /// the declared attachment and never the quoted one, with the body text
     /// verbatim around it.
     #[test]
     fn convert_messages_prompt_carrier_declared_image_builds_exactly_one_block() {
