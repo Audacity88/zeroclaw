@@ -1483,7 +1483,7 @@ impl OpenAiCompatibleModelProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
+                content: self.message_content_for_role(&m.role, &m.content, !merge),
                 thinking_blocks: self.fallback_thinking_replay(m),
             })
             .collect();
@@ -3408,7 +3408,6 @@ impl OpenAiCompatibleModelProvider {
         role: &str,
         content: &str,
         allow_user_image_parts: bool,
-        _allow_tool_image_parts: bool,
     ) -> MessageContent {
         if role == "tool"
             && let Some(parts) = classify(role, content)
@@ -3579,7 +3578,6 @@ impl OpenAiCompatibleModelProvider {
                                 "tool",
                                 &message.content,
                                 allow_user_image_parts,
-                                false,
                             ))
                         });
 
@@ -3616,7 +3614,6 @@ impl OpenAiCompatibleModelProvider {
                         &message.role,
                         &message.content,
                         allow_user_image_parts,
-                        false,
                     )),
                     tool_call_id: None,
                     tool_calls: None,
@@ -4602,7 +4599,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             &message.role,
                             &message.content,
                             !merge,
-                            false,
                             // Streamed requests are thinking-off under
                             // passthrough (see streaming_thinking_params):
                             // history replay blocks require the request
@@ -5002,7 +4998,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .iter()
                 .map(|m| Message {
                     role: m.role.clone(),
-                    content: provider.message_content_for_role(&m.role, &m.content, !merge, false),
+                    content: provider.message_content_for_role(&m.role, &m.content, !merge),
                     thinking_blocks: None,
                 })
                 .collect();
@@ -11458,7 +11454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_history_no_tools_omits_attachment_and_keeps_envelope_fields() {
+    async fn chat_with_history_no_tools_omits_attachment_and_delivers_body_text() {
         let (mut provider, captured, server) = mock_non_streaming_response(serde_json::json!({
             "choices": [{"message": {"content": "ok"}}]
         }))

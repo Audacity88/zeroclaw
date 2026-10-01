@@ -1536,9 +1536,10 @@ pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
                 }
                 return m.clone();
             }
-            // Legacy carriers and raw non-JSON tool text keep the historical
-            // body sweep so pre-upgrade history is cleaned exactly as it was
-            // before declarations existed.
+            // Only messages `classify` does not treat as carriers at all
+            // reach the historical body sweep: every carrier shape, legacy
+            // included, returns above with its body untouched, so the sweep
+            // sees ordinary message text only.
             let (content, n) = rewrite_model_visible_text(m, strip_undeliverable_image_markers);
             stripped += n;
             ChatMessage {
