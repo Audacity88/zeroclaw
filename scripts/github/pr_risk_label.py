@@ -859,7 +859,10 @@ def classify(
 
 
 def build_report(pr: dict[str, Any], classification: dict[str, Any]) -> dict[str, Any]:
-    head_sha, base_sha, live_labels, changed_files = parse_pr_metadata(pr)
+    head_sha, base_sha, pr_labels, changed_files = parse_pr_metadata(pr)
+    # Read labels only through `report_labels`, so the stale-metadata check
+    # in `evaluate` compares exactly the labels the report can see.
+    live_labels = report_labels(pr_labels)
     current_risk = [label for label in RISK_LABELS if label in live_labels]
     manual = MANUAL_LABEL in live_labels
     security = SECURITY_LABEL in live_labels
