@@ -83,6 +83,7 @@ where
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
+    let prompt_runner = crate::tools::sessions_prompt::current_session_prompt_runner();
 
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         // Held inside the task body so the connection stays counted until this
@@ -92,7 +93,7 @@ where
         let _connection_activity = connection_activity;
         let mut guard = agent.lock().await;
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+        let turn = crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
             let span = ::zeroclaw_log::info_span!(
                 target: "zeroclaw_log_internal_scope",
@@ -120,8 +121,8 @@ where
                         .await
                 })
                 .await
-        })
-        .await
+        });
+        crate::tools::sessions_prompt::scope_session_prompt_runner(prompt_runner, turn).await
     });
 
     let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));
@@ -477,6 +478,78 @@ mod tests {
     }
 
     zeroclaw_api::tool_attribution!(CountingTool, ::zeroclaw_api::attribution::ToolKind::Plugin);
+
+    #[tokio::test]
+    async fn execute_turn_carries_session_prompt_scope_into_its_spawned_worker() {
+        use crate::tools::sessions_prompt::{
+            SessionPromptFn, SessionPromptOutcome, SessionsPromptTool, scope_session_prompt_runner,
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let runner: SessionPromptFn = Box::new(move |_sid, message, alias| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(alias, "caller");
+            assert!(message.starts_with("[from agent caller, session source]"));
+            Box::pin(async {
+                Ok(SessionPromptOutcome {
+                    content: "delivered".into(),
+                    stop_reason: "end_turn".into(),
+                })
+            })
+        });
+        let provider = TwoCallToolProvider {
+            first: ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "prompt-call".into(),
+                    name: "sessions_prompt".into(),
+                    arguments: r#"{"session_id":"target","message":"hello"}"#.into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            },
+            second: ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            done: std::sync::atomic::AtomicBool::new(false),
+            alias: "scope-test",
+        };
+        let agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SessionsPromptTool::new("caller"))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(NoopObserver))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .unwrap();
+        scope_session_prompt_runner(
+            Some(Arc::new(runner)),
+            execute_turn(
+                Arc::new(Mutex::new(agent)),
+                "prompt".into(),
+                CancellationToken::new(),
+                TurnAttribution {
+                    session_key: Some("source".into()),
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+                noop,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(crate::tools::sessions_prompt::current_session_prompt_runner().is_none());
+    }
 
     fn token_usage(input: u64, output: u64) -> TokenUsage {
         TokenUsage {

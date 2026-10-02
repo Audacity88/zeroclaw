@@ -1730,6 +1730,18 @@ impl SessionStore {
             .map(|session| (session.generation, session.owner_tui_id.clone()))
     }
 
+    /// Run a synchronous callback against the canonical live session map.
+    /// The callback may borrow the session, but must not await while the map
+    /// lock is held.
+    pub async fn with_live_session<R>(
+        &self,
+        session_id: &str,
+        f: impl FnOnce(&RpcSession) -> R,
+    ) -> Option<R> {
+        let sessions = self.sessions.lock().await;
+        Some(f(sessions.get(session_id)?))
+    }
+
     pub async fn list_ids(&self) -> Vec<String> {
         self.sessions.lock().await.keys().cloned().collect()
     }

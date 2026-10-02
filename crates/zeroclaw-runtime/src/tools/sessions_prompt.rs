@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Final state of an injected prompt, mirrored from the target turn's
@@ -17,9 +17,8 @@ pub struct SessionPromptOutcome {
 }
 
 /// Runs a turn in a live RPC session on the calling agent's behalf.
-/// Registered by the daemon once its RPC context exists; in processes
-/// without one the tool reports itself unavailable instead of failing
-/// silently.
+/// Bound to the verified initiating RPC connection for one turn. Processes
+/// and tasks without that binding cannot prompt a live session.
 pub type SessionPromptFn = Box<
     dyn Fn(
             String, // target session id
@@ -30,13 +29,19 @@ pub type SessionPromptFn = Box<
         + Sync,
 >;
 
-static SESSION_PROMPT_FN: OnceLock<SessionPromptFn> = OnceLock::new();
+tokio::task_local! {
+    static SESSION_PROMPT_RUNNER: Option<Arc<SessionPromptFn>>;
+}
 
-/// Register the session-prompt runner. Called once at daemon startup; a
-/// later call is a no-op, so a restart cannot displace the live
-/// registration mid-run.
-pub fn register_session_prompt_fn(f: SessionPromptFn) {
-    let _ = SESSION_PROMPT_FN.set(f);
+pub(crate) fn current_session_prompt_runner() -> Option<Arc<SessionPromptFn>> {
+    SESSION_PROMPT_RUNNER.try_with(Clone::clone).ok().flatten()
+}
+
+pub(crate) async fn scope_session_prompt_runner<F: Future>(
+    runner: Option<Arc<SessionPromptFn>>,
+    future: F,
+) -> F::Output {
+    SESSION_PROMPT_RUNNER.scope(runner, future).await
 }
 
 /// Prompt another agent's live session. Bound to a single calling agent's
@@ -94,7 +99,8 @@ impl Tool for SessionsPromptTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        run_sessions_prompt(SESSION_PROMPT_FN.get(), args, &self.caller_alias).await
+        let runner = current_session_prompt_runner();
+        run_sessions_prompt(runner.as_deref(), args, &self.caller_alias).await
     }
 }
 
@@ -144,12 +150,9 @@ pub(crate) async fn run_sessions_prompt(
         return Ok(ToolResult {
             success: false,
             output: ToolOutput::default(),
-            error: Some(
-                "sessions_prompt is not available in this process: the RPC session \
-                 runner was not registered (the daemon exposes it once its RPC \
-                 context exists)"
-                    .to_string(),
-            ),
+            error: Some(crate::i18n::get_required_cli_string(
+                "tool-sessions-prompt-authenticated-turn-required",
+            )),
         });
     };
 
@@ -280,7 +283,7 @@ mod tests {
         assert!(!result.success);
         let error = result.error.expect("refusal must carry a message");
         assert!(
-            error.contains("not available"),
+            error.contains("authenticated RPC connection"),
             "refusal must name the gate, got: {error:?}"
         );
     }
@@ -333,6 +336,31 @@ mod tests {
             result.error.as_deref(),
             Some("session s is busy (turn in flight); retry later")
         );
+    }
+
+    #[tokio::test]
+    async fn unbound_tool_cannot_prompt_and_nested_scopes_restore_the_caller() {
+        let tool = SessionsPromptTool::new("caller-a");
+        let args = json!({"session_id": "s", "message": "hi"});
+        assert!(!tool.execute(args.clone()).await.unwrap().success);
+        let captured = Arc::new(Mutex::new(None));
+        let runner = Arc::new(capture_hook(
+            captured,
+            Ok(SessionPromptOutcome {
+                content: "authorized".into(),
+                stop_reason: "end_turn".into(),
+            }),
+        ));
+        scope_session_prompt_runner(Some(runner), async {
+            assert!(tool.execute(args.clone()).await.unwrap().success);
+            scope_session_prompt_runner(None, async {
+                assert!(!tool.execute(args.clone()).await.unwrap().success);
+            })
+            .await;
+            assert!(tool.execute(args.clone()).await.unwrap().success);
+        })
+        .await;
+        assert!(!tool.execute(args).await.unwrap().success);
     }
 
     #[tokio::test]

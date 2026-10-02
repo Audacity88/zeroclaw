@@ -2978,30 +2978,16 @@ impl RpcDispatcher {
         }
     }
 
-    /// Construct a pre-authenticated dispatcher around an existing outbound,
-    /// with no transport of its own and no TUI identity. Used for
-    /// daemon-initiated turns whose notifications must stream through the
-    /// session owner's writer.
-    pub(crate) fn new_with_outbound(
-        ctx: Arc<RpcContext>,
-        rpc: Arc<RpcOutbound>,
-        peer_label: String,
-    ) -> Self {
-        Self {
-            ctx,
-            rpc,
-            authenticated: true,
-            tui_id: None,
-            tui_epoch: None,
-            peer_label,
-            client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
-            connection_cancel: CancellationToken::new(),
-            owns_connection: true,
-            connection_activity: None,
-            prompt_tasks: Vec::new(),
-            peer_cert_fingerprint: None,
-            trusted_injector: true,
-        }
+    fn session_prompt_runner(&self) -> Arc<crate::tools::sessions_prompt::SessionPromptFn> {
+        let caller = Arc::new(self.spawn_handle());
+        Arc::new(Box::new(move |session_id, message, caller_alias| {
+            let caller = Arc::clone(&caller);
+            Box::pin(async move {
+                caller
+                    .run_agent_injected_session_prompt(&session_id, &message, &caller_alias)
+                    .await
+            })
+        }))
     }
 
     /// Cancel and join every prompt accepted by this connection generation.
@@ -3683,6 +3669,7 @@ impl RpcDispatcher {
                 // session. Removed with the entry on disconnect, under the
                 // same epoch check.
                 outbound: Some(Arc::clone(&self.rpc)),
+                auth: Some(connection_auth.clone()),
             });
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
@@ -6050,13 +6037,12 @@ impl RpcDispatcher {
     /// connected), this is just the issuer's own outbound — exactly one copy
     /// of each notification, as before.
     async fn turn_notification_outbound(&self, session_id: &str) -> Arc<RpcOutbound> {
-        let owner_outbound = self
-            .ctx
-            .sessions
-            .session_owner_tui_id(session_id)
-            .await
-            .flatten()
-            .and_then(|owner_tui_id| self.ctx.tui_registry.outbound_for(&owner_tui_id));
+        let owner_outbound = super::turn_notifications::owner_turn_outbound(
+            Arc::clone(&self.ctx),
+            session_id,
+            &self.rpc,
+        )
+        .await;
         match owner_outbound {
             Some(owner) if !Arc::ptr_eq(&owner, &self.rpc) => {
                 fanout_outbound(vec![Arc::clone(&self.rpc), owner])
@@ -6117,11 +6103,23 @@ impl RpcDispatcher {
             _ = self.connection_cancel.cancelled() => {
                 return Err(rpc_err(SESSION_BUSY, "RPC connection closed before prompt admission"));
             }
-            result = self.ctx.sessions.acquire_prompt(
-                sid,
-                live_generation_at_entry,
-                cancel.clone(),
-            ) => {
+            result = async {
+                let admission = self.ctx.sessions.acquire_prompt(
+                    sid,
+                    live_generation_at_entry,
+                    cancel.clone(),
+                );
+                if self.trusted_injector {
+                    use futures_util::FutureExt as _;
+                    admission.now_or_never().unwrap_or_else(|| Err(
+                        zeroclaw_infra::session_queue::SessionQueueError::Timeout {
+                            session_id: sid.to_string(),
+                        },
+                    ))
+                } else {
+                    admission.await
+                }
+            } => {
                 result.map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
             }
         };
@@ -6485,6 +6483,49 @@ impl RpcDispatcher {
                     .await);
             }
         };
+        if self.trusted_injector {
+            // A queued injection must not retain an administrator's old owner
+            // bypass after demotion, or a delegate edge removed while waiting.
+            let mut current = self.spawn_handle();
+            if let (Some(auth), Some(grants)) = (current.auth.as_mut(), environment_grants.as_ref())
+            {
+                auth.grants = grants.clone();
+            }
+            current
+                .revalidate_admitted_session(sid, authorized.as_ref())
+                .await?;
+            let target_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(sid)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            let workspace = self
+                .ctx
+                .sessions
+                .get_workspace_dir(sid)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            {
+                let config = self.ctx.config.read();
+                current.authorize_live_session_binding(
+                    Method::SessionPrompt,
+                    environment_grants.as_ref(),
+                    &config,
+                    &target_alias,
+                    &workspace,
+                )?;
+            }
+            let caller_alias = req.injected_by.as_deref().ok_or_else(|| {
+                rpc_err(INVALID_PARAMS, "Injected prompt has no runtime provenance")
+            })?;
+            if !self.agent_prompt_reaches(caller_alias, &target_alias) {
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    "Target is no longer reachable by the calling agent",
+                ));
+            }
+        }
         if let Err(denied) = self.authorize_session_environment(
             Method::SessionPrompt,
             environment_grants.as_ref(),
@@ -6503,6 +6544,12 @@ impl RpcDispatcher {
             .get_agent(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        let grants = if self.trusted_injector {
+            environment_grants
+        } else {
+            grants
+        };
 
         // The grants were re-resolved after admission, so apply that posture
         // to this session's static and already-activated deferred tools. It is
@@ -6754,6 +6801,10 @@ impl RpcDispatcher {
                     }
                 }
             },
+        );
+        let turn = crate::tools::sessions_prompt::scope_session_prompt_runner(
+            Some(self.session_prompt_runner()),
+            turn,
         );
         tokio::pin!(turn);
         let mut outcome = tokio::select! {
@@ -7146,6 +7197,17 @@ impl RpcDispatcher {
         }
     }
 
+    fn agent_prompt_reaches(&self, caller_alias: &str, target_alias: &str) -> bool {
+        target_alias == caller_alias
+            || self
+                .ctx
+                .config
+                .read()
+                .reachable_delegate_target_configs(caller_alias)
+                .iter()
+                .any(|target| target.agent == target_alias)
+    }
+
     /// Run a full `session/prompt` turn in a live session on behalf of a
     /// calling agent (the `sessions_prompt` tool path). Authorization: the
     /// target session's agent must be the caller itself or one of the
@@ -7154,23 +7216,37 @@ impl RpcDispatcher {
     /// one is live (see [`Self::turn_notification_outbound`]); the caller
     /// receives the final content and stop reason.
     pub(crate) async fn run_agent_injected_session_prompt(
-        ctx: &Arc<RpcContext>,
+        &self,
         session_id: &str,
         message: &str,
         caller_alias: &str,
     ) -> Result<crate::tools::sessions_prompt::SessionPromptOutcome, String> {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        let mut dispatcher = self.spawn_handle();
+        dispatcher
+            .authorize(Method::SessionPrompt, Resource::Sessions, Verb::Execute)
+            .map_err(|denied| denied.message)?;
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "prompt": message,
+            "injected_by": caller_alias,
+        });
+        dispatcher
+            .ensure_method_session_access(Method::SessionPrompt, &params)
+            .await
+            .map_err(|denied| denied.message)?;
+        dispatcher
+            .authorize_session_owner(session_id, Method::SessionPrompt)
+            .await
+            .map_err(|denied| denied.message)?;
+        let ctx = &dispatcher.ctx;
         let Some(target_alias) = ctx.sessions.get_agent_alias(session_id).await else {
             return Err(format!(
                 "session {session_id:?} not found: no live session with that id"
             ));
         };
-        let authorized = target_alias == caller_alias || {
-            let config = ctx.config.read();
-            config
-                .reachable_delegate_target_configs(caller_alias)
-                .iter()
-                .any(|target| target.agent == target_alias)
-        };
+        let authorized = dispatcher.agent_prompt_reaches(caller_alias, &target_alias);
         if !authorized {
             return Err(format!(
                 "session {session_id:?} belongs to agent {target_alias:?}, which is \
@@ -7199,30 +7275,11 @@ impl RpcDispatcher {
             "agent-injected session prompt accepted"
         );
 
-        // Stream through the session owner's writer when it is live, so the
-        // owner pane sees the turn; otherwise into a closed sink — the turn
-        // still runs and persists, and the pane resyncs later. This
-        // dispatcher has no TUI identity of its own.
-        let rpc = ctx
-            .sessions
-            .session_owner_tui_id(session_id)
-            .await
-            .flatten()
-            .and_then(|owner_tui_id| ctx.tui_registry.outbound_for(&owner_tui_id))
-            .unwrap_or_else(|| {
-                let (sink_tx, _) = mpsc::channel::<String>(1);
-                Arc::new(RpcOutbound::new(sink_tx))
-            });
-        let dispatcher = RpcDispatcher::new_with_outbound(
-            Arc::clone(ctx),
-            rpc,
-            "agent-session-prompt".to_string(),
-        );
-        let params = serde_json::json!({
-            "session_id": session_id,
-            "prompt": message,
-            "injected_by": caller_alias,
-        });
+        // The caller gets the final tool result, not a second session's stream.
+        // Owner fanout resolves and checks its recipient separately.
+        let (sink_tx, _) = mpsc::channel::<String>(1);
+        dispatcher.rpc = Arc::new(RpcOutbound::new(sink_tx));
+        dispatcher.trusted_injector = true;
         match dispatcher.handle_session_prompt(&params).await {
             Ok(value) => {
                 let parsed: SessionPromptResult = serde_json::from_value(value)
@@ -18576,6 +18633,8 @@ mod tests {
                 peer_label: tui_id.to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
+                outbound: None,
+                auth: None,
             });
         dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
     }
@@ -18783,6 +18842,8 @@ mod tests {
                 peer_label: "tui_reuse0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                outbound: None,
+                auth: None,
             });
         client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
         let response = rpc(
@@ -18856,6 +18917,8 @@ mod tests {
                 peer_label: "tui_empty0001".to_string(),
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
+                outbound: None,
+                auth: None,
             });
         client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
         for id in [1, 2] {
@@ -38095,6 +38158,65 @@ mod tests {
     // stream to the connection that owns the session
     // -----------------------------------------------------------------------
 
+    #[derive(Default)]
+    struct TurnRecordingProvider {
+        calls: std::sync::Mutex<
+            Vec<(
+                Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+                Option<String>,
+            )>,
+        >,
+    }
+
+    struct SharedRecordingProvider(Arc<TurnRecordingProvider>);
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for SharedRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let user = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone());
+            self.0.calls.lock().unwrap().push((request.thinking, user));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SharedRecordingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "recording"
+        }
+    }
+
     /// Two dispatchers on one shared context: the session owner (registered
     /// in the TUI registry with its writer, exactly as `initialize` does)
     /// and a second, distinct issuer. The session's `owner_tui_id` points at
@@ -38149,8 +38271,9 @@ mod tests {
             .expect("owner fanout test session should insert");
 
         let (owner_tx, owner_rx) = tokio::sync::mpsc::channel::<String>(64);
-        let owner_dispatcher =
+        let mut owner_dispatcher =
             RpcDispatcher::new(Arc::clone(&ctx), owner_tx, "test-owner:pid=1".into());
+        owner_dispatcher.set_authenticated_for_test();
         let epoch = ctx
             .tui_registry
             .register(crate::rpc::tui_identity::TuiEntry {
@@ -38160,6 +38283,7 @@ mod tests {
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
                 outbound: Some(owner_dispatcher.rpc_for_test()),
+                auth: owner_dispatcher.auth.clone(),
             });
 
         let (issuer_tx, issuer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -38402,6 +38526,7 @@ mod tests {
             .await
             .expect("gateway test session should insert");
         let (owner_tx, owner_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let owner_auth = gateway_caller(&ctx).auth.clone();
         ctx.tui_registry
             .register(crate::rpc::tui_identity::TuiEntry {
                 tui_id: "tui-gateway-owner".to_string(),
@@ -38410,25 +38535,210 @@ mod tests {
                 transport: "unix".to_string(),
                 env: std::collections::HashMap::new(),
                 outbound: Some(Arc::new(RpcOutbound::new(owner_tx))),
+                auth: owner_auth,
             });
         (ctx, owner_rx, provider, session_id)
     }
 
     const GATEWAY_MESSAGE: &str = "[from agent tool-caller, session caller-1]\n\ndo the thing";
 
+    fn gateway_caller(ctx: &Arc<RpcContext>) -> RpcDispatcher {
+        let (tx, _) = tokio::sync::mpsc::channel(64);
+        let mut caller = RpcDispatcher::new(Arc::clone(ctx), tx, "test-caller".into());
+        caller.set_authenticated_for_test();
+        caller
+    }
+
+    async fn gateway_principal_caller(ctx: &Arc<RpcContext>) -> RpcDispatcher {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        bind_test_principal(RpcDispatcher::new(
+            Arc::clone(ctx),
+            tx,
+            "test-caller".into(),
+        ))
+        .await
+    }
+
+    async fn replace_gateway_target_owner(
+        ctx: &Arc<RpcContext>,
+        provider: &Arc<TurnRecordingProvider>,
+        sid: &str,
+        owner: String,
+    ) {
+        let workspace = ctx.config.read().agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(SharedRecordingProvider(Arc::clone(provider))))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(workspace.clone())
+            .build()
+            .unwrap();
+        ctx.sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    workspace.to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                )
+                .with_owner_principal(Some(owner)),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_requires_verified_caller_and_refuses_cross_principal_access() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+        let (tx, _) = tokio::sync::mpsc::channel(64);
+        let unbound = RpcDispatcher::new(Arc::clone(&ctx), tx, "test-unbound".into());
+        assert!(
+            unbound
+                .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "test-agent")
+                .await
+                .is_err()
+        );
+        let config = oidc_session_config(&tmp);
+        ctx.auth.refresh_from_config(&config).unwrap();
+        let (caller, _) = oidc_peer(&ctx);
+        let error = caller
+            .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "test-agent")
+            .await
+            .unwrap_err();
+        assert!(error.contains("not owned by this principal"), "{error}");
+        assert!(provider.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_scoped_runner_observes_revocation_after_it_was_created() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+        let mut config = principal_test_config(&tmp, &["*"], &["test-agent"]);
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = true;
+        ctx.auth.refresh_from_config(&config).unwrap();
+        let caller = gateway_principal_caller(&ctx).await;
+        let runner = caller.session_prompt_runner();
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = false;
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .grants
+            .insert(Resource::Sessions, vec![Verb::Read]);
+        ctx.auth.refresh_from_config(&config).unwrap();
+        let error = runner(sid, GATEWAY_MESSAGE.into(), "test-agent".into())
+            .await
+            .unwrap_err();
+        assert!(error.contains("not granted"), "{error}");
+        assert!(provider.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_admin_demotion_after_admission_removes_cross_owner_bypass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+        let mut config = principal_test_config(&tmp, &["*"], &["test-agent"]);
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = true;
+        *ctx.config.write() = config.clone();
+        ctx.auth.refresh_from_config(&config).unwrap();
+        let caller = gateway_principal_caller(&ctx).await;
+        replace_gateway_target_owner(&ctx, &provider, &sid, "user:foreign-owner".into()).await;
+        let update = ctx.sessions.lock_model_provider_update(&sid).await.unwrap();
+        let waiting = ctx.sessions.model_provider_update_waiting();
+        let task = zeroclaw_spawn::spawn!(async move {
+            caller
+                .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "test-agent")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .unwrap();
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = false;
+        ctx.auth.refresh_from_config(&config).unwrap();
+        drop(update);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.contains("not owned by this principal"), "{error}");
+        assert!(provider.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_agent_revocation_during_provider_wait_refuses_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
+        let mut config = principal_test_config(&tmp, &["*"], &["test-agent"]);
+        *ctx.config.write() = config.clone();
+        ctx.auth.refresh_from_config(&config).unwrap();
+        let caller = gateway_principal_caller(&ctx).await;
+        let owner = caller
+            .auth
+            .as_ref()
+            .unwrap()
+            .principal
+            .id
+            .as_str()
+            .to_string();
+        replace_gateway_target_owner(&ctx, &provider, &sid, owner).await;
+        let update = ctx.sessions.lock_model_provider_update(&sid).await.unwrap();
+        let waiting = ctx.sessions.model_provider_update_waiting();
+        let task = zeroclaw_spawn::spawn!(async move {
+            caller
+                .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "test-agent")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .unwrap();
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .allowed_agents
+            .clear();
+        ctx.auth.refresh_from_config(&config).unwrap();
+        drop(update);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("not entitled to agent"), "{error}");
+        assert!(provider.calls.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn gateway_authorizes_own_alias_and_runs_the_turn() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, mut owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
 
-        let outcome = RpcDispatcher::run_agent_injected_session_prompt(
-            &ctx,
-            &sid,
-            GATEWAY_MESSAGE,
-            "test-agent",
-        )
-        .await
-        .expect("the session's own agent must be authorized to prompt it");
+        let outcome = gateway_caller(&ctx)
+            .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "test-agent")
+            .await
+            .expect("the session's own agent must be authorized to prompt it");
 
         assert_eq!(outcome.stop_reason, "end_turn");
         assert_eq!(outcome.content, "done");
@@ -38457,14 +38767,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
 
-        let outcome = RpcDispatcher::run_agent_injected_session_prompt(
-            &ctx,
-            &sid,
-            GATEWAY_MESSAGE,
-            "tool-caller",
-        )
-        .await
-        .expect("a delegate target listed on the caller's roster must pass");
+        let outcome = gateway_caller(&ctx)
+            .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "tool-caller")
+            .await
+            .expect("a delegate target listed on the caller's roster must pass");
 
         assert_eq!(outcome.content, "done");
         assert_eq!(provider.calls.lock().unwrap().len(), 1);
@@ -38475,14 +38781,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
 
-        let error = RpcDispatcher::run_agent_injected_session_prompt(
-            &ctx,
-            &sid,
-            GATEWAY_MESSAGE,
-            "outsider",
-        )
-        .await
-        .expect_err("an agent with no delegate reach into the target must be refused");
+        let error = gateway_caller(&ctx)
+            .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "outsider")
+            .await
+            .expect_err("an agent with no delegate reach into the target must be refused");
 
         assert!(
             error.contains("reachable delegate targets"),
@@ -38504,14 +38806,10 @@ mod tests {
         ctx.sessions
             .register_cancel_token(&sid, tokio_util::sync::CancellationToken::new());
 
-        let error = RpcDispatcher::run_agent_injected_session_prompt(
-            &ctx,
-            &sid,
-            GATEWAY_MESSAGE,
-            "test-agent",
-        )
-        .await
-        .expect_err("a busy session must be refused immediately");
+        let error = gateway_caller(&ctx)
+            .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "test-agent")
+            .await
+            .expect_err("a busy session must be refused immediately");
 
         assert_eq!(
             error,
@@ -38529,14 +38827,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, _owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
 
-        let error = RpcDispatcher::run_agent_injected_session_prompt(
-            &ctx,
-            "no-such-session",
-            GATEWAY_MESSAGE,
-            "test-agent",
-        )
-        .await
-        .expect_err("an unknown session must be refused");
+        let error = gateway_caller(&ctx)
+            .run_agent_injected_session_prompt("no-such-session", GATEWAY_MESSAGE, "test-agent")
+            .await
+            .expect_err("an unknown session must be refused");
 
         assert!(
             error.contains("not found"),
@@ -38549,42 +38843,29 @@ mod tests {
         assert!(provider.calls.lock().unwrap().is_empty());
     }
 
-    // The full path the daemon wires: the tool reads the registered runner,
-    // prefixes provenance, and the runner drives `session/prompt` with
-    // notifications reaching the owner pane. Registered once — the lock is
-    // process-global, exactly like the cron delivery hook.
+    // The tool uses only the initiating turn's verified runner.
     #[tokio::test]
-    async fn sessions_prompt_tool_runs_end_to_end_through_the_registered_runner() {
+    async fn sessions_prompt_tool_runs_end_to_end_through_the_scoped_runner() {
         use zeroclaw_api::tool::Tool as _;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, mut owner_rx, provider, sid) = session_prompt_gateway_harness(&tmp).await;
-        crate::tools::sessions_prompt::register_session_prompt_fn(Box::new(
-            move |session_id, message, caller_alias| {
-                let ctx = Arc::clone(&ctx);
-                Box::pin(async move {
-                    RpcDispatcher::run_agent_injected_session_prompt(
-                        &ctx,
-                        &session_id,
-                        &message,
-                        &caller_alias,
-                    )
-                    .await
-                })
-            },
-        ));
+        let caller = gateway_caller(&ctx);
+        let runner = caller.session_prompt_runner();
 
         let tool = crate::tools::sessions_prompt::SessionsPromptTool::new("tool-caller");
-        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
-            .scope(Some("caller-1".to_string()), async {
+        let execute =
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(Some("caller-1".to_string()), async {
                 tool.execute(json!({
                     "session_id": sid,
                     "message": "do the thing",
                 }))
                 .await
-            })
-            .await
-            .expect("tool execution must not hard-fail");
+            });
+        let result =
+            crate::tools::sessions_prompt::scope_session_prompt_runner(Some(runner), execute)
+                .await
+                .expect("tool execution must not hard-fail");
 
         assert!(
             result.success,
@@ -38620,14 +38901,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, mut owner_rx, _provider, sid) = session_prompt_gateway_harness(&tmp).await;
 
-        let outcome = RpcDispatcher::run_agent_injected_session_prompt(
-            &ctx,
-            &sid,
-            GATEWAY_MESSAGE,
-            "test-agent",
-        )
-        .await
-        .expect("own-alias prompt must run");
+        let outcome = gateway_caller(&ctx)
+            .run_agent_injected_session_prompt(&sid, GATEWAY_MESSAGE, "test-agent")
+            .await
+            .expect("own-alias prompt must run");
         assert_eq!(outcome.stop_reason, "end_turn");
 
         // The first frame the owner pane sees is the injected user message
@@ -38660,16 +38937,16 @@ mod tests {
         // The fixture registers a cancel token of its own (the ownership
         // tests need one); a real turn would replace it under a new
         // generation, so "no turn started" is "generation unchanged".
-        let fixture_token =
-            create_session_with_owner(&mut dispatcher, &sessions, "sess-forge", "tui-A").await;
-        let generation_before = sessions.inflight_turn_generation("sess-forge");
+        let (sid, fixture_token) =
+            create_session_with_owner(&mut dispatcher, &sessions, "tui-A").await;
+        let generation_before = sessions.inflight_turn_generation(&sid);
 
         // A connection-backed dispatcher presenting `injected_by` is forging
         // another agent's authorship of the prompt; refused before any turn
         // state is touched.
         let err = dispatcher
             .handle_session_prompt(&json!({
-                "session_id": "sess-forge",
+                "session_id": sid,
                 "prompt": "hello",
                 "injected_by": "some-other-agent",
             }))
@@ -38682,7 +38959,7 @@ mod tests {
             err.message
         );
         assert_eq!(
-            sessions.inflight_turn_generation("sess-forge"),
+            sessions.inflight_turn_generation(&sid),
             generation_before,
             "a refused forge must not register a turn"
         );

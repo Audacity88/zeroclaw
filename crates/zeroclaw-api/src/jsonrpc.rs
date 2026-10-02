@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 // ── Protocol constants ───────────────────────────────────────────
 
@@ -299,6 +300,25 @@ pub struct RpcOutbound {
     writer_tx: mpsc::Sender<String>,
     pending: std::sync::Mutex<HashMap<String, PendingResponder>>,
     next_id: AtomicU64,
+    raw_shutdown: CancellationToken,
+}
+
+/// A reserved slot in an outbound writer's raw-frame queue.
+pub struct RpcRawPermit {
+    permit: mpsc::OwnedPermit<String>,
+}
+
+impl RpcRawPermit {
+    /// Deliver one pre-serialized frame into the reserved writer slot.
+    pub fn send(self, json: String) {
+        self.permit.send(json);
+    }
+}
+
+impl Drop for RpcOutbound {
+    fn drop(&mut self) {
+        self.raw_shutdown.cancel();
+    }
 }
 
 struct PendingRequestGuard<'a> {
@@ -317,16 +337,38 @@ impl Drop for PendingRequestGuard<'_> {
 
 impl RpcOutbound {
     pub fn new(writer_tx: mpsc::Sender<String>) -> Self {
-        Self {
+        Self::new_with_drop_signal(writer_tx).0
+    }
+
+    /// Construct an outbound together with a token that fires when its last
+    /// handle is dropped. This is for short-lived forwarding wrappers that
+    /// must interrupt a blocked raw reservation when their upstream fanout
+    /// disappears.
+    pub fn new_with_drop_signal(writer_tx: mpsc::Sender<String>) -> (Self, CancellationToken) {
+        let raw_shutdown = CancellationToken::new();
+        let outbound = Self {
             writer_tx,
             pending: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
-        }
+            raw_shutdown: raw_shutdown.clone(),
+        };
+        (outbound, raw_shutdown)
     }
 
     /// Send a raw pre-serialized JSON line. Returns `true` on success.
     pub async fn send_raw(&self, json: String) -> bool {
         self.writer_tx.send(json).await.is_ok()
+    }
+
+    /// Reserve one raw-frame slot before doing work that guards delivery.
+    /// `None` means the writer has been closed or refused the reservation.
+    pub async fn reserve_raw(&self) -> Option<RpcRawPermit> {
+        self.writer_tx
+            .clone()
+            .reserve_owned()
+            .await
+            .ok()
+            .map(|permit| RpcRawPermit { permit })
     }
 
     /// Resolve when the writer end is closed (peer dropped). Useful for
