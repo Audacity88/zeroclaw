@@ -619,10 +619,12 @@ impl DelegateTool {
     /// token otherwise. Background tasks keep this tool's token on purpose:
     /// they outlive the turn by design and are cancelled through `cancel_task`.
     fn turn_bound_child_token(&self) -> CancellationToken {
-        crate::agent::tool_execution::current_turn_cancellation().map_or_else(
-            || self.cancellation_token.child_token(),
-            |turn| turn.child_token(),
-        )
+        zeroclaw_api::tool::ToolExecutionContext::current()
+            .and_then(|context| context.cancellation_token().cloned())
+            .map_or_else(
+                || self.cancellation_token.child_token(),
+                |turn| turn.child_token(),
+            )
     }
 
     /// Attach memory for namespace isolation on delegate agents.
@@ -5129,6 +5131,14 @@ impl Tool for ToolArcRef {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_context(args, context).await
     }
 }
 
@@ -12178,10 +12188,10 @@ mod tests {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
 
         let turn = CancellationToken::new();
-        let bound = crate::agent::tool_execution::scope_turn_cancellation(turn.clone(), async {
-            tool.turn_bound_child_token()
-        })
-        .await;
+        let bound = zeroclaw_api::tool::ToolExecutionContext::new(Some(turn.clone()))
+            .run(async { Ok(tool.turn_bound_child_token()) })
+            .await
+            .unwrap();
         assert!(!bound.is_cancelled());
         turn.cancel();
         assert!(
