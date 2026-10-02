@@ -380,6 +380,11 @@ enum DelegateAdmission {
     Prevalidated,
 }
 
+struct DelegateApprovalContext<'a> {
+    target_config: Option<&'a Config>,
+    registry: &'a (dyn Fn(&Config) -> Option<crate::tools::PerToolChannelHandle> + Send + Sync),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DelegateAction {
     Delegate,
@@ -4538,8 +4543,10 @@ impl DelegateTool {
             full_prompt,
             temperature,
             admission,
-            target_config,
-            &crate::agent::loop_::live_approval_channel_registry,
+            DelegateApprovalContext {
+                target_config,
+                registry: &crate::agent::loop_::live_approval_channel_registry,
+            },
         )
         .await
     }
@@ -4554,11 +4561,12 @@ impl DelegateTool {
         full_prompt: &str,
         temperature: Option<f64>,
         admission: DelegateAdmission,
-        target_config: Option<&Config>,
-        approval_registry: &(
-             dyn Fn(&Config) -> Option<crate::tools::PerToolChannelHandle> + Send + Sync
-         ),
+        approval_context: DelegateApprovalContext<'_>,
     ) -> anyhow::Result<ToolResult> {
+        let DelegateApprovalContext {
+            target_config,
+            registry: approval_registry,
+        } = approval_context;
         let Some(tool_policy) =
             self.resolve_tool_policy_from_config(target_config, &agent_config.risk_profile)
         else {
@@ -5067,7 +5075,8 @@ impl DelegateTool {
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
-                parent_agent_alias: Some(&self.caller_alias),
+                parent_agent_alias: (target_mode == DelegateExecutionMode::Independent)
+                    .then_some(self.caller_alias.as_str()),
                 turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(
@@ -15711,8 +15720,10 @@ command = "rm independent-delegate-marker"
                     "remove the marker",
                     None,
                     DelegateAdmission::Required,
-                    Some(&config),
-                    &|_| Some(Arc::clone(&handles)),
+                    DelegateApprovalContext {
+                        target_config: Some(&config),
+                        registry: &|_| Some(Arc::clone(&handles)),
+                    },
                 )
                 .await
                 .unwrap();
@@ -15800,8 +15811,10 @@ command = "rm independent-delegate-marker"
                         "remove the marker",
                         None,
                         admission,
-                        Some(&config),
-                        &|_| Some(Arc::clone(&handles)),
+                        DelegateApprovalContext {
+                            target_config: Some(&config),
+                            registry: &|_| Some(Arc::clone(&handles)),
+                        },
                     )
                     .await
                     .unwrap();
@@ -15849,8 +15862,10 @@ command = "rm independent-delegate-marker"
                     "remove the marker",
                     None,
                     DelegateAdmission::Required,
-                    Some(&config),
-                    &|_| Some(Arc::clone(&handles)),
+                    DelegateApprovalContext {
+                        target_config: Some(&config),
+                        registry: &|_| Some(Arc::clone(&handles)),
+                    },
                 )
                 .await
                 .unwrap();
