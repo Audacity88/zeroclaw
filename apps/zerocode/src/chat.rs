@@ -12719,11 +12719,10 @@ impl ChatState {
             }
             if let (Some(selection), Some((a, a_row, h, h_row))) =
                 (&mut self.transcript_selection, selection_anchors)
+                && let (Some(anchor), Some(head)) = (new_row(a, a_row), new_row(h, h_row))
             {
-                if let (Some(anchor), Some(head)) = (new_row(a, a_row), new_row(h, h_row)) {
-                    selection.anchor.row = anchor;
-                    selection.head.row = head;
-                }
+                selection.anchor.row = anchor;
+                selection.head.row = head;
             }
             if let Some(snapshot) = self.transcript_snapshot.as_mut() {
                 let remap_row = |row: u16| {
