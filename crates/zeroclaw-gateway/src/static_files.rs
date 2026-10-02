@@ -582,7 +582,7 @@ mod tests {
         let root_path = root.path().to_path_buf();
 
         let response = serve_fs_file(Some(&root_path), "assets/app.js").await;
-        let index = load_index_html_bytes(Some(&root_path)).await;
+        let index = read_fs_file(&root_path, Path::new("index.html")).await;
 
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(&assets, std::fs::Permissions::from_mode(0o755)).unwrap();
