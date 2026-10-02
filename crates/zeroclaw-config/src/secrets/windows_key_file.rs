@@ -229,17 +229,16 @@ impl PendingKeyFile {
 
     fn publish(&mut self, destination: &Path) -> io::Result<()> {
         let absolute = std::path::absolute(destination)?;
-        let mut wide = wide_path(&absolute)?;
-        wide.pop(); // FileNameLength excludes a trailing NUL.
-        let name_bytes =
-            u32::try_from(wide.len().checked_mul(size_of::<u16>()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Key file path is too long")
-            })?)
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Key file path is too long")
-            })?;
-        let bytes = (offset_of!(FILE_RENAME_INFO, FileName) + name_bytes as usize)
-            .max(size_of::<FILE_RENAME_INFO>());
+        let wide = wide_path(&absolute)?;
+        // FileName is NUL-terminated; FileNameLength excludes that terminator.
+        // Keep it in the buffer rather than relying on allocation padding.
+        let name_bytes = u32::try_from((wide.len() - 1).checked_mul(size_of::<u16>()).ok_or_else(
+            || io::Error::new(io::ErrorKind::InvalidInput, "Key file path is too long"),
+        )?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Key file path is too long"))?;
+        let bytes =
+            (offset_of!(FILE_RENAME_INFO, FileName) + name_bytes as usize + size_of::<u16>())
+                .max(size_of::<FILE_RENAME_INFO>());
         let bytes_u32 = u32::try_from(bytes).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "Key file path is too long")
         })?;
@@ -523,33 +522,36 @@ mod tests {
     fn protected_at_birth_under_permissive_parent_and_same_identity_after_publish() {
         let dir = tempfile::tempdir().unwrap();
         make_inheritable_permissive_parent(dir.path());
-        let path = dir.path().join(".secret_key");
         let key = [17; 32];
-        let mut identity = None;
-        super::super::write_key_file_atomic_publish_with(&path, &key, |file, bytes| {
-            assert_eq!(
-                file.metadata()?.len(),
-                0,
-                "inspect before any key bytes are written"
-            );
-            assert_restrictive_descriptor(file);
-            let mut handle_flags = 0;
-            // SAFETY: this handle is live and the output is writable.
-            win32(unsafe {
-                GetHandleInformation(HANDLE(file.as_raw_handle()), &mut handle_flags)
-            })?;
-            assert_eq!(handle_flags & HANDLE_FLAG_INHERIT.0, 0);
-            identity = Some(file_identity(file));
-            file.write_all(bytes)?;
-            file.flush()?;
-            file.sync_all()
-        })
-        .unwrap();
-        let published = super::super::open_no_follow(&path).unwrap();
-        assert_eq!(Some(file_identity(&published)), identity);
-        assert_restrictive_descriptor(&published);
-        drop(published);
-        assert_eq!(super::super::load_or_create_key(&path).unwrap(), key);
+        // Consecutive UTF-16 lengths exercise every usize-alignment phase.
+        for suffix in ["", "a", "ab", "abc"] {
+            let path = dir.path().join(format!(".secret_key{suffix}"));
+            let mut identity = None;
+            super::super::write_key_file_atomic_publish_with(&path, &key, |file, bytes| {
+                assert_eq!(
+                    file.metadata()?.len(),
+                    0,
+                    "inspect before any key bytes are written"
+                );
+                assert_restrictive_descriptor(file);
+                let mut handle_flags = 0;
+                // SAFETY: this handle is live and the output is writable.
+                win32(unsafe {
+                    GetHandleInformation(HANDLE(file.as_raw_handle()), &mut handle_flags)
+                })?;
+                assert_eq!(handle_flags & HANDLE_FLAG_INHERIT.0, 0);
+                identity = Some(file_identity(file));
+                file.write_all(bytes)?;
+                file.flush()?;
+                file.sync_all()
+            })
+            .unwrap();
+            let published = super::super::open_no_follow(&path).unwrap();
+            assert_eq!(Some(file_identity(&published)), identity);
+            assert_restrictive_descriptor(&published);
+            drop(published);
+            assert_eq!(super::super::load_or_create_key(&path).unwrap(), key);
+        }
         assert!(super::super::tests::no_temp_residue(dir.path()));
     }
 
