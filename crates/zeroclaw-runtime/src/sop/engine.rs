@@ -200,9 +200,16 @@ pub enum OrphanedRunSettlement {
 #[derive(Clone, Default)]
 pub struct OrphanedRunSettlementQueue {
     pending: Arc<parking_lot::Mutex<std::collections::HashMap<String, OrphanedRunSettlement>>>,
+    settlement: Arc<parking_lot::Mutex<()>>,
 }
 
 impl OrphanedRunSettlementQueue {
+    /// Observe the shared gate while a test pauses an engine's durable read.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn settlement_in_progress_for_test(&self) -> bool {
+        self.settlement.is_locked()
+    }
+
     fn snapshot(&self) -> Vec<(String, OrphanedRunSettlement)> {
         self.pending
             .lock()
@@ -3482,6 +3489,10 @@ impl SopEngine {
         run_id: &str,
         kind: OrphanedRunSettlement,
     ) -> Result<Option<SopRunStatus>> {
+        // Old drivers can outlive reload. Serialize the durable read and write
+        // across engines, without holding the pending map through persistence.
+        let queue = self.pending_orphan_settlements.clone();
+        let _settlement = queue.settlement.lock();
         let kind = self
             .pending_orphan_settlements
             .pending
@@ -3491,12 +3502,15 @@ impl SopEngine {
             .unwrap_or(kind);
         let result = self
             .load_orphaned_run_for_settlement(run_id, kind)
-            .and_then(|()| match kind {
-                OrphanedRunSettlement::DrainedBeforeAdmission => {
+            .and_then(|needs_settlement| match (needs_settlement, kind) {
+                (false, _) => Ok(None),
+                (true, OrphanedRunSettlement::DrainedBeforeAdmission) => {
                     self.settle_run_for_drained_generation(run_id)
                 }
-                OrphanedRunSettlement::DriverAborted => self.settle_run_for_aborted_driver(run_id),
-                OrphanedRunSettlement::ExecutionRejected => {
+                (true, OrphanedRunSettlement::DriverAborted) => {
+                    self.settle_run_for_aborted_driver(run_id)
+                }
+                (true, OrphanedRunSettlement::ExecutionRejected) => {
                     self.settle_run_for_rejected_execution(run_id)
                 }
             });
@@ -3521,28 +3535,48 @@ impl SopEngine {
         &mut self,
         run_id: &str,
         kind: OrphanedRunSettlement,
-    ) -> Result<()> {
-        if !self.active_runs.contains_key(run_id) {
-            // Restore may have failed. A cache miss alone does not prove the
-            // durable run no longer needs the terminal write we own.
-            if let Some(stored) = self.store.load_run(run_id)? {
+    ) -> Result<bool> {
+        // A restored cache can be stale even when populated: another generation
+        // may already have settled this run through the shared queue.
+        if let Some(stored) = self.store.load_run(run_id)? {
+            if matches!(
+                stored.run.status,
+                SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
+            ) {
+                self.claims_pending_persist.remove(run_id);
+                self.claims_retained_after_terminal_rollback.remove(run_id);
+                self.cancellation_finalization_ready.remove(run_id);
+                self.step_budget_finalization_ready.remove(run_id);
+                self.active_runs.remove(run_id);
+                // This is view reconciliation, not another completion.
+                self.finished_runs.retain(|run| run.run_id != run_id);
+                self.finished_runs.push(stored.run);
+                let max = self.config.max_finished_runs;
+                if max > 0 && self.finished_runs.len() > max {
+                    let excess = self.finished_runs.len() - max;
+                    self.finished_runs.drain(..excess);
+                }
+                return Ok(false);
+            } else {
                 let needs_settlement = matches!(
                     stored.run.status,
                     SopRunStatus::Running | SopRunStatus::CancelRequested
                 ) || (kind == OrphanedRunSettlement::DrainedBeforeAdmission
                     && stored.run.status == SopRunStatus::Pending);
-                if needs_settlement {
+                if needs_settlement || self.active_runs.contains_key(run_id) {
                     self.active_runs.insert(run_id.to_string(), stored.run);
                 }
+                return Ok(needs_settlement);
             }
         }
-        Ok(())
+        Ok(self.active_runs.contains_key(run_id))
     }
 
     /// Hand this engine the retry for runs a previous engine could not settle.
     ///
-    /// A reload tears down the old generation before this engine exists. If
-    /// settling an aborted driver's run failed there, the durable row is still
+    /// A reload retires the old generation, but its stragglers may still be
+    /// settling through the shared queue. If their terminal write failed, the
+    /// durable row is still
     /// `Running`, and restoring it here would renew its claim with no driver
     /// to advance it. Recording the runs here makes this engine's maintenance
     /// the owner of that terminal write.
