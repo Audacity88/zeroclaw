@@ -12259,11 +12259,7 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    fn load_history(
-        &mut self,
-        messages: Vec<crate::client::MessageEntry>,
-        strip_runtime_enrichment: bool,
-    ) {
+    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>, acp_history: bool) {
         for m in messages {
             match m.kind {
                 crate::client::MessageEntryKind::ToolCall => {
@@ -12315,7 +12311,7 @@ impl ChatState {
             }
             match m.role() {
                 crate::client::MessageRole::User => {
-                    let display = if strip_runtime_enrichment {
+                    let display = if acp_history {
                         strip_enrichment_prefix(&m.content)
                     } else {
                         &m.content
@@ -12331,6 +12327,13 @@ impl ChatState {
                 crate::client::MessageRole::Assistant => {
                     self.entries
                         .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
+                }
+                crate::client::MessageRole::System if acp_history => {
+                    // ACP history excludes real system prompts in the store.
+                    // Its system rows are persisted recovery notices, not
+                    // provider instructions. Ordinary Chat has no such contract.
+                    self.entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
             }
@@ -28120,6 +28123,63 @@ mod tests {
             ChatEntry::UserMessage { text: Some(t), .. }
                 if t.starts_with("[CURRENT DATE & TIME:") && t.ends_with("first ask")
         ));
+    }
+
+    #[tokio::test]
+    async fn load_history_preserves_acp_recovery_notice_between_turns() {
+        use crate::client::MessageEntry;
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut s = state();
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "question".to_string(),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "partial answer".to_string(),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "system".to_string(),
+                    content: "localized recovery notice".to_string(),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "continue".to_string(),
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+        assert!(matches!(
+            s.entries.as_slice(),
+            [ChatEntry::UserMessage { .. }, ChatEntry::AgentMessage(partial),
+             ChatEntry::SystemMessage(notice), ChatEntry::UserMessage { .. }]
+                if partial.as_ref() == "partial answer"
+                    && notice.as_ref() == "localized recovery notice"
+        ));
+        assert_eq!(s.first_message.as_deref(), Some("question"));
+
+        let mut chat = chat_with_active_input(PaneKind::Acp);
+        chat.phase = ChatPhase::Active(Box::new(s));
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+            .unwrap();
+        let text = overlay_text(&terminal, area);
+        let partial = text
+            .find("partial answer")
+            .expect("partial output is visible");
+        let notice = text
+            .find("localized recovery notice")
+            .expect("recovery notice is visible in the final terminal cells");
+        let next = text.find("continue").expect("next prompt is visible");
+        assert!(partial < notice && notice < next, "{text}");
     }
 
     #[test]
