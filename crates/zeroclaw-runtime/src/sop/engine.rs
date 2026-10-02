@@ -122,7 +122,7 @@ pub struct SopEngine {
     /// leaves the run `Running` and claimed with nobody to write the terminal
     /// state again; maintenance consumes this map until the write lands. The
     /// durable run row stays the source of truth for status.
-    pending_orphan_settlements: std::collections::HashMap<String, OrphanedRunSettlement>,
+    pending_orphan_settlements: OrphanedRunSettlementQueue,
     /// Decision models by alias, consulted by dispatch for SOPs with a
     /// `[decision]` table. An SOP whose alias is absent resolves fail-closed.
     decision_models: HashMap<String, Arc<dyn super::decision::DecisionModel>>,
@@ -178,7 +178,7 @@ impl MaintenanceSummary {
 
 /// Why a run is waiting on a terminal write that no driver will ever make.
 ///
-/// Both cases are runs the engine still holds as active, with an execution
+/// These are runs the engine still holds as active, with an execution
 /// claim, but that nothing is left to advance. Each settles through the normal
 /// claim-releasing terminal path; the kind only decides the terminal status and
 /// the durable event that explains it.
@@ -190,6 +190,26 @@ pub enum OrphanedRunSettlement {
     /// A reload aborted the run's driver mid-drive. Settled `Failed`: the step
     /// was underway and did not finish.
     DriverAborted,
+    /// Execution authority rejected the next step before its target ran.
+    /// Settled `Cancelled`: the driver stopped without executing that step.
+    ExecutionRejected,
+}
+
+/// Canonical pending terminal writes, retained across daemon generations.
+/// Handles may be handed off, but only an engine mutates or retries entries.
+#[derive(Clone, Default)]
+pub struct OrphanedRunSettlementQueue {
+    pending: Arc<parking_lot::Mutex<std::collections::HashMap<String, OrphanedRunSettlement>>>,
+}
+
+impl OrphanedRunSettlementQueue {
+    fn snapshot(&self) -> Vec<(String, OrphanedRunSettlement)> {
+        self.pending
+            .lock()
+            .iter()
+            .map(|(run_id, kind)| (run_id.clone(), *kind))
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -401,7 +421,7 @@ impl SopEngine {
             step_budget_finalization_ready: std::collections::HashSet::new(),
             execution_capability: None,
             headless_drivers: std::collections::HashSet::new(),
-            pending_orphan_settlements: std::collections::HashMap::new(),
+            pending_orphan_settlements: OrphanedRunSettlementQueue::default(),
             decision_models: HashMap::new(),
         }
     }
@@ -3420,6 +3440,36 @@ impl SopEngine {
         Ok(Some(prior))
     }
 
+    fn settle_run_for_rejected_execution(&mut self, run_id: &str) -> Result<Option<SopRunStatus>> {
+        let Some((prior, current_step)) = self
+            .active_runs
+            .get(run_id)
+            .map(|run| (run.status, run.current_step))
+        else {
+            return Ok(None);
+        };
+        if !matches!(prior, SopRunStatus::Running | SopRunStatus::CancelRequested) {
+            return Ok(None);
+        }
+        let reason = "execution authority rejected this step before target execution, so the \
+                      driver stopped and nothing will advance the run"
+            .to_string();
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_execution_rejected".to_string(),
+            actor: None,
+            reason: Some(reason.clone()),
+            payload: ::serde_json::json!({
+                "step": current_step,
+                "prior_status": prior.to_string(),
+            }),
+        };
+        self.finish_run_with_gate_event(run_id, SopRunStatus::Cancelled, Some(reason), &event)?;
+        Ok(Some(prior))
+    }
+
     /// Settle a run no driver will advance, keeping ownership of the retry.
     ///
     /// On success any pending retry for the run is cleared. On failure the run
@@ -3432,22 +3482,61 @@ impl SopEngine {
         run_id: &str,
         kind: OrphanedRunSettlement,
     ) -> Result<Option<SopRunStatus>> {
-        let result = match kind {
-            OrphanedRunSettlement::DrainedBeforeAdmission => {
-                self.settle_run_for_drained_generation(run_id)
-            }
-            OrphanedRunSettlement::DriverAborted => self.settle_run_for_aborted_driver(run_id),
-        };
+        let kind = self
+            .pending_orphan_settlements
+            .pending
+            .lock()
+            .get(run_id)
+            .copied()
+            .unwrap_or(kind);
+        let result = self
+            .load_orphaned_run_for_settlement(run_id, kind)
+            .and_then(|()| match kind {
+                OrphanedRunSettlement::DrainedBeforeAdmission => {
+                    self.settle_run_for_drained_generation(run_id)
+                }
+                OrphanedRunSettlement::DriverAborted => self.settle_run_for_aborted_driver(run_id),
+                OrphanedRunSettlement::ExecutionRejected => {
+                    self.settle_run_for_rejected_execution(run_id)
+                }
+            });
         match &result {
             Ok(_) => {
-                self.pending_orphan_settlements.remove(run_id);
+                self.pending_orphan_settlements
+                    .pending
+                    .lock()
+                    .remove(run_id);
             }
             Err(_) => {
                 self.pending_orphan_settlements
+                    .pending
+                    .lock()
                     .insert(run_id.to_string(), kind);
             }
         }
         result
+    }
+
+    fn load_orphaned_run_for_settlement(
+        &mut self,
+        run_id: &str,
+        kind: OrphanedRunSettlement,
+    ) -> Result<()> {
+        if !self.active_runs.contains_key(run_id) {
+            // Restore may have failed. A cache miss alone does not prove the
+            // durable run no longer needs the terminal write we own.
+            if let Some(stored) = self.store.load_run(run_id)? {
+                let needs_settlement = matches!(
+                    stored.run.status,
+                    SopRunStatus::Running | SopRunStatus::CancelRequested
+                ) || (kind == OrphanedRunSettlement::DrainedBeforeAdmission
+                    && stored.run.status == SopRunStatus::Pending);
+                if needs_settlement {
+                    self.active_runs.insert(run_id.to_string(), stored.run);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Hand this engine the retry for runs a previous engine could not settle.
@@ -3461,22 +3550,37 @@ impl SopEngine {
         &mut self,
         runs: impl IntoIterator<Item = (String, OrphanedRunSettlement)>,
     ) {
-        self.pending_orphan_settlements.extend(runs);
+        let mut pending = self.pending_orphan_settlements.pending.lock();
+        for (run_id, kind) in runs {
+            pending.entry(run_id).or_insert(kind);
+        }
+    }
+
+    /// Retain the canonical retry queue even after its drivers were pruned.
+    #[must_use]
+    pub fn orphaned_run_settlement_queue(&self) -> OrphanedRunSettlementQueue {
+        self.pending_orphan_settlements.clone()
+    }
+
+    /// Transfer retry ownership without losing writes from late old producers.
+    pub fn adopt_orphaned_run_settlement_queue(&mut self, queue: OrphanedRunSettlementQueue) {
+        let pending = self.pending_orphan_settlements.snapshot();
+        self.pending_orphan_settlements = queue;
+        self.adopt_orphaned_run_settlements(pending);
     }
 
     /// Runs awaiting a retried terminal write, for callers and tests that need
     /// to see whether maintenance still owns one.
     #[must_use]
     pub fn has_pending_orphan_settlement(&self, run_id: &str) -> bool {
-        self.pending_orphan_settlements.contains_key(run_id)
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .contains_key(run_id)
     }
 
     fn retry_pending_orphan_settlements(&mut self) -> usize {
-        let pending: Vec<(String, OrphanedRunSettlement)> = self
-            .pending_orphan_settlements
-            .iter()
-            .map(|(run_id, kind)| (run_id.clone(), *kind))
-            .collect();
+        let pending = self.pending_orphan_settlements.snapshot();
         let mut settled = 0;
         for (run_id, kind) in pending {
             match self.settle_orphaned_run(&run_id, kind) {
@@ -5863,7 +5967,10 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
         self.step_budget_finalization_ready.remove(run_id);
-        self.pending_orphan_settlements.remove(run_id);
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         // The park snapshot is purely a rehydration artifact: a terminal run must
@@ -5919,7 +6026,10 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
         self.step_budget_finalization_ready.remove(run_id);
-        self.pending_orphan_settlements.remove(run_id);
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         self.remove_deterministic_state_file(&run);
