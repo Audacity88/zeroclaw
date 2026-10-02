@@ -108,6 +108,8 @@ file artifact, a receipt, or a log event.
 
 ## Files and media
 
+Successful `file_write` results preserve the target's existence and byte size observed before the write, together with the byte count written. They do not read or retain previous file contents or fingerprints. The observation is bound to the authorized parent directory but is not an atomic snapshot of the inode replaced by a concurrent external writer. ZeroCode shows supplied content as a neutral preview, and ACP does not emit an input-only creation diff. Restored transcripts use the retained result, never the current filesystem. Older results cannot establish whether a target existed before the write. Real removed-line diffs remain unavailable until a separate, explicit previous-content retention policy exists.
+
 File contents and media bytes are payloads, not memories. The filesystem owner
 is the per-agent workspace policy described in
 [Filesystem components](../agents/filesystem.md) and

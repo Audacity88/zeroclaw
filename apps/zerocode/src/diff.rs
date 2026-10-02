@@ -383,7 +383,8 @@ pub fn diff_lines_limited(
     }
 }
 
-pub fn write_lines_limited(
+/// Preview supplied content without implying a filesystem creation or diff.
+pub fn content_lines_limited(
     content: &str,
     lang: Option<&str>,
     limit: Option<usize>,
@@ -393,10 +394,10 @@ pub fn write_lines_limited(
     let width = gutter_width(show);
     let preview = content.lines().take(show).collect::<Vec<_>>().join("\n");
 
-    let add_fg = add_fg();
+    let plain_fg = theme::fg_primary();
     let hl = lang
         .and_then(ext_to_language)
-        .map(|language| highlight_all(&preview, language, ADD_BG, add_fg));
+        .map(|language| highlight_all_no_bg(&preview, language, plain_fg));
     let mut out: Vec<Line<'static>> = Vec::with_capacity(show);
 
     for (i, item) in content.lines().take(show).enumerate() {
@@ -407,18 +408,15 @@ pub fn write_lines_limited(
             .unwrap_or_else(|| {
                 vec![Span::styled(
                     item.to_string(),
-                    Style::default().bg(ADD_BG).fg(add_fg),
+                    Style::default().fg(plain_fg),
                 )]
             });
         let mut spans = vec![Span::styled(
-            gutter(i + 1, width) + "+ ",
-            Style::default()
-                .bg(ADD_BG)
-                .fg(add_fg)
-                .add_modifier(Modifier::BOLD),
+            gutter(i + 1, width),
+            Style::default().fg(plain_fg).add_modifier(Modifier::BOLD),
         )];
         spans.extend(content_spans);
-        out.push(Line::from(spans).style(Style::default().bg(ADD_BG)));
+        out.push(Line::from(spans));
     }
 
     RenderedLines {
@@ -441,8 +439,8 @@ mod tests {
         diff_lines_limited(old, new, lang, Some(start_line), None).lines
     }
 
-    fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
-        write_lines_limited(content, lang, None).lines
+    fn content_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+        content_lines_limited(content, lang, None).lines
     }
 
     #[test]
@@ -475,12 +473,17 @@ mod tests {
     }
 
     #[test]
-    fn write_lines_limit_reports_omitted_rows() {
+    fn content_lines_limit_reports_omitted_rows() {
         let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
-        let rendered = write_lines_limited(&content, None, Some(6));
+        let rendered = content_lines_limited(&content, None, Some(6));
         assert_eq!(rendered.lines.len(), 6);
         assert_eq!(rendered.omitted, 94);
-        assert_eq!(write_lines(&content, None).len(), 100);
+        assert_eq!(content_lines(&content, None).len(), 100);
+        assert!(rendered.lines.iter().all(|line| {
+            line.style.bg != Some(ADD_BG)
+                && line.spans.iter().all(|span| span.style.bg != Some(ADD_BG))
+                && !line.to_string().contains("| + ")
+        }));
     }
 
     #[test]
@@ -586,8 +589,8 @@ mod tests {
             "expected left-aligned line number"
         );
 
-        let write_lines = write_lines("first\nsecond\nthird", None);
-        assert!(write_lines[0].spans[0].content.starts_with("1 | + "));
+        let write_lines = content_lines("first\nsecond\nthird", None);
+        assert!(write_lines[0].spans[0].content.starts_with("1 | "));
     }
 
     #[test]
@@ -627,9 +630,9 @@ mod tests {
     }
 
     #[test]
-    fn write_lines_with_syntax_highlighting() {
+    fn content_lines_with_syntax_highlighting() {
         let content = "fn main() {\n    println!(\"hello\");\n}\n";
-        let lines = write_lines(content, Some("rs"));
+        let lines = content_lines(content, Some("rs"));
         // With highlighting, the first content line should have multiple spans
         // (line-number prefix + highlighted tokens).
         assert!(

@@ -6864,7 +6864,14 @@ fn render_tool_entry(
                             TOOL_EXPANDED_MAX_LINES,
                         );
                         display_limited |= limited;
-                        let rendered = diff::write_lines_limited(
+                        // Input alone cannot establish creation or removed lines,
+                        // including for pending, failed and historical calls.
+                        push_text(
+                            lines,
+                            "content",
+                            &crate::i18n::t("zc-chat-tool-write-preview"),
+                        );
+                        let rendered = diff::content_lines_limited(
                             &content,
                             file_ext(input),
                             matches!(disclosure, ToolDisclosure::Preview)
@@ -7989,8 +7996,8 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}")
     };
 
-    // For file_edit/file_write, strip the bulk content fields — the diff
-    // preview in the conversation already shows old/new content.
+    // For file_edit/file_write, strip bulk content fields already shown by
+    // the conversation's edit diff or supplied-content preview.
     let summary = if is_edit_tool {
         strip_content_fields(&pa.arguments_summary)
     } else {
@@ -24588,6 +24595,8 @@ mod tests {
         assert!(preview_text.contains(r#"input: {"path":"/tmp/example.txt"}"#));
         assert!(preview_text.contains("line 0"));
         assert!(preview_text.contains("line 5"));
+        assert!(preview_text.contains("Supplied content preview"));
+        assert!(!preview_text.contains("| + "));
         assert!(!preview_text.contains("line 6"));
         assert!(preview_text.contains("4 more lines"));
         assert!(!preview_text.contains(&write_input));
@@ -24614,6 +24623,7 @@ mod tests {
         );
         let full_text = rendered_text(&full_lines);
         assert!(full_text.contains("line 9"));
+        assert!(!full_text.contains("| + "));
         assert!(full_text.contains("first"));
         assert!(full_text.contains(&"result".repeat(60)));
         assert!(full_text.contains("[Show less]"));

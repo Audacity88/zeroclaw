@@ -297,7 +297,9 @@ impl Tool for FileWriteTool {
 
             // The returned parent handle is the bound authority. Re-resolving
             // the ambient pathname here would reintroduce a post-mutation race.
-            match parent_dir.symlink_metadata(&file_name) {
+            // Retain only this pre-write observation, never the old contents.
+            // It is not an atomic snapshot of what a concurrent writer replaces.
+            let previous_bytes = match parent_dir.symlink_metadata(&file_name) {
                 Ok(meta) if meta.is_symlink() => {
                     return Ok(ToolResult {
                         success: false,
@@ -309,10 +311,10 @@ impl Tool for FileWriteTool {
                         )),
                     });
                 }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(meta) => Some(meta.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error.into()),
-            }
+            };
 
             if let Err(error) = write_file_atomic(&parent_dir, Path::new(&file_name), &bytes) {
                 if error.is_denied() {
@@ -324,9 +326,24 @@ impl Tool for FileWriteTool {
                 }
                 return Err(error.into());
             }
+            let new_bytes = bytes.len().to_string();
+            let output = match previous_bytes {
+                Some(previous_bytes) => crate::i18n::get_required_tool_string_with_args(
+                    "tool-file-write-result-existing",
+                    &[
+                        ("bytes", &new_bytes),
+                        ("path", &display_path),
+                        ("previous_bytes", &previous_bytes.to_string()),
+                    ],
+                ),
+                None => crate::i18n::get_required_tool_string_with_args(
+                    "tool-file-write-result-absent",
+                    &[("bytes", &new_bytes), ("path", &display_path)],
+                ),
+            };
             Ok(ToolResult {
                 success: true,
-                output: format!("Written {} bytes to {display_path}", bytes.len()).into(),
+                output: output.into(),
                 error: None,
             })
         })
@@ -485,6 +502,8 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("8 bytes"));
+        assert!(result.output.contains("Before write: file absent."));
+        assert!(result.output.contains("Content diff unavailable"));
 
         let content = tokio::fs::read_to_string(dir.join("out.txt"))
             .await
@@ -572,10 +591,11 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_overwrites_existing() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_overwrite");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("exist.txt"), "old")
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        // This unlabelled value would evade credential-pattern redaction.
+        let previous = "private-deleted-value";
+        tokio::fs::write(dir.join("exist.txt"), previous)
             .await
             .unwrap();
 
@@ -585,13 +605,51 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
+        assert!(result.output.contains("Written 3 bytes"));
+        assert!(
+            result
+                .output
+                .contains(&format!("existing file, {} bytes", previous.len()))
+        );
+        assert!(
+            result
+                .output
+                .contains("previous contents were not retained")
+        );
+        assert!(!serde_json::to_string(&result).unwrap().contains(previous));
 
         let content = tokio::fs::read_to_string(dir.join("exist.txt"))
             .await
             .unwrap();
         assert_eq!(content, "new");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        // Later mutation cannot rewrite the already returned history evidence.
+        tokio::fs::write(dir.join("exist.txt"), "later content")
+            .await
+            .unwrap();
+        assert!(
+            result
+                .output
+                .contains(&format!("existing file, {} bytes", previous.len()))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_empty_existing_file_is_not_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("empty.bin"), []).unwrap();
+        let result = test_tool(temp.path().to_path_buf())
+            .execute(json!({"path": "empty.bin", "content": "AAEC", "encoding": "base64"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Written 3 bytes"));
+        assert!(result.output.contains("existing file, 0 bytes"));
+        assert!(!result.output.contains("file absent"));
+        assert_eq!(
+            std::fs::read(temp.path().join("empty.bin")).unwrap(),
+            [0, 1, 2]
+        );
     }
 
     #[tokio::test]

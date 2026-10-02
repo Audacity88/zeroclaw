@@ -205,12 +205,7 @@ fn build_approval_raw_input(
                 return json!({ "path": path, "oldText": old_text, "newText": new_text });
             }
             "file_write" => {
-                let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
-                let new_text = args
-                    .get("content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                return json!({ "path": path, "newText": new_text });
+                return args.clone();
             }
             _ => {}
         }
@@ -239,18 +234,6 @@ fn build_approval_content(
                     "type": "diff",
                     "path": path,
                     "oldText": old_text,
-                    "newText": new_text,
-                }]);
-            }
-            "file_write" => {
-                let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
-                let new_text = args
-                    .get("content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                return json!([{
-                    "type": "diff",
-                    "path": path,
                     "newText": new_text,
                 }]);
             }
@@ -1324,7 +1307,11 @@ mod tests {
         let request = ChannelApprovalRequest {
             tool_name: "file_write".to_string(),
             arguments_summary: "write bar.rs".to_string(),
-            raw_arguments: None,
+            raw_arguments: Some(json!({
+                "path": "bar.rs",
+                "content": "aGVsbG8=",
+                "encoding": "base64"
+            })),
             position: None,
         };
 
@@ -1339,6 +1326,12 @@ mod tests {
             has_reject_edit,
             "file_write approval must offer reject-with-edit"
         );
+        let tool_call = &req["params"]["toolCall"];
+        assert_eq!(tool_call["rawInput"]["content"], "aGVsbG8=");
+        assert_eq!(tool_call["rawInput"]["encoding"], "base64");
+        assert!(tool_call["rawInput"].get("newText").is_none());
+        assert_eq!(tool_call["content"][0]["type"], "content");
+        assert_eq!(tool_call["content"][0]["content"]["text"], "write bar.rs");
 
         let id = req["id"].as_str().unwrap().to_string();
         rpc_for_resp.dispatch_response(
