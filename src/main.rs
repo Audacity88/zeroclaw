@@ -3002,8 +3002,9 @@ async fn run_quickstart_cli(
                     "cli-quickstart-partial-personality-failure",
                     &[("alias", &applied.alias)],
                     "The agent config for {$alias} was saved, but installing its \
-                     personality files failed. Fix the following and re-run \
-                     quickstart to converge:",
+                     personality files failed. Repair the reported paths or permissions, \
+                     then create or edit the intended personality files in this existing \
+                     agent's workspace. Do not rerun Quickstart for this saved alias.",
                 )
             );
             eprintln!();
