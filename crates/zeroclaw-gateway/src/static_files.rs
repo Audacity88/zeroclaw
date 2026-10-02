@@ -8,7 +8,9 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use cap_std::{ambient_authority, fs::Dir as CapabilityDir};
+#[cfg(not(target_os = "macos"))]
+use cap_std::ambient_authority;
+use cap_std::fs::Dir as CapabilityDir;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -202,8 +204,19 @@ fn open_fs_file(root: &Path, relative: &Path) -> Result<cap_std::fs::File, FsPat
     // Bind authority before resolving names. Canonicalization preserves support
     // for contained absolute symlinks; only the handle-relative open enforces
     // confinement when entries change between resolution and opening.
+    #[cfg(not(target_os = "macos"))]
     let directory = CapabilityDir::open_ambient_dir(root, ambient_authority())
         .map_err(|_| FsPathError::Unavailable)?;
+    #[cfg(target_os = "macos")]
+    let directory = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_SEARCH)
+            .open(root)
+            .map_err(|_| FsPathError::Unavailable)?;
+        CapabilityDir::from_std_file(handle)
+    };
     let canonical_root = std::fs::canonicalize(root).map_err(|_| FsPathError::Unavailable)?;
     let canonical_file = std::fs::canonicalize(canonical_root.join(relative))
         .map_err(|_| FsPathError::Unavailable)?;
@@ -223,6 +236,8 @@ fn open_fs_file(root: &Path, relative: &Path) -> Result<cap_std::fs::File, FsPat
         use cap_std::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
+    #[cfg(target_os = "macos")]
+    let (directory, contained) = open_searchable_parent(directory, contained)?;
     let file = directory
         .open_with(contained, &options)
         .map_err(|_| FsPathError::Unavailable)?;
@@ -234,6 +249,31 @@ fn open_fs_file(root: &Path, relative: &Path) -> Result<cap_std::fs::File, FsPat
         return Err(FsPathError::Unavailable);
     }
     Ok(file)
+}
+
+// macOS lacks O_PATH, so cap-std's normal directory traversal requires read
+// permission. O_SEARCH retains the former search-only directory contract.
+#[cfg(target_os = "macos")]
+fn open_searchable_parent(
+    mut directory: CapabilityDir,
+    path: &Path,
+) -> Result<(CapabilityDir, &Path), FsPathError> {
+    use cap_std::fs::OpenOptionsExt;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_SEARCH);
+    let parent = path.parent().ok_or(FsPathError::Unavailable)?;
+    for component in parent.components() {
+        let Component::Normal(name) = component else {
+            return Err(FsPathError::Invalid);
+        };
+        let handle = directory
+            .open_with(name, &options)
+            .map_err(|_| FsPathError::Unavailable)?;
+        directory = CapabilityDir::from_std_file(handle.into_std());
+    }
+    let filename = path.file_name().ok_or(FsPathError::Unavailable)?;
+    Ok((directory, Path::new(filename)))
 }
 
 #[cfg(test)]
@@ -525,5 +565,29 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"opened-root-asset");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn fs_asset_allows_search_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let assets = root.path().join("assets");
+        std::fs::create_dir(&assets).unwrap();
+        std::fs::write(assets.join("app.js"), b"search-only-asset").unwrap();
+        std::fs::write(root.path().join("index.html"), b"search-only-index").unwrap();
+        std::fs::set_permissions(&assets, std::fs::Permissions::from_mode(0o111)).unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o111)).unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let response = serve_fs_file(Some(&root_path), "assets/app.js").await;
+        let index = load_index_html_bytes(Some(&root_path)).await;
+
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&assets, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body(response).await, b"search-only-asset");
+        assert_eq!(index.unwrap(), b"search-only-index");
     }
 }
