@@ -5610,6 +5610,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn provider_alias_rename_requires_confirmation_and_refreshes_each_family() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
@@ -5694,6 +5695,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn provider_alias_rename_blank_unchanged_and_cancel_send_no_rpc() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
@@ -5729,6 +5731,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn provider_alias_rename_failure_keeps_editable_name_and_requires_reconfirmation() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
@@ -5795,6 +5798,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn provider_alias_rename_refresh_failure_does_not_retry_committed_mutation() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
@@ -5836,6 +5840,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn provider_alias_rename_is_rebindable_and_excludes_other_rows() {
         use crate::keymap::{Chord, ConfigTabAction};
         let _guard = crate::keymap::overrides::TEST_GUARD
@@ -5893,6 +5898,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn provider_alias_rename_is_cleared_when_switching_sections() {
         let _guard = crate::keymap::overrides::TEST_GUARD
             .lock()
