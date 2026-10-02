@@ -438,7 +438,8 @@ mod tests {
         let mut lines = BufReader::new(child.stdout().take().unwrap()).lines();
         let pid = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(line) = lines.next_line().await.unwrap() {
-                if let Some(pid) = line.strip_prefix("MEMORY_FIXTURE_CHILD=") {
+                // libtest prefixes its first uncaptured line with the fixture's test name.
+                if let Some((_, pid)) = line.split_once("MEMORY_FIXTURE_CHILD=") {
                     return pid.parse::<u32>().unwrap();
                 }
             }
