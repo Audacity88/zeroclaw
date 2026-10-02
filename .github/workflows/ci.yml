@@ -461,9 +461,11 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Build controlled Windows service fixture
+        # This unshipped fixture proves service lifecycle behavior, so avoid
+        # release optimization and thin LTO before the short smoke.
         shell: bash
         run: >-
-          cargo build --profile ci --locked -p zeroclaw-runtime
+          cargo build --profile dev --locked -p zeroclaw-runtime
           --example windows_service_smoke_fixture
           --target x86_64-pc-windows-msvc
       - name: Exercise installed Windows service lifecycle
@@ -471,7 +473,7 @@ jobs:
         timeout-minutes: 15
         run: |
           ./scripts/ci/windows_service_smoke.ps1 `
-            -FixturePath "target/x86_64-pc-windows-msvc/ci/examples/windows_service_smoke_fixture.exe" `
+            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
             -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
             -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence"
       - name: Clean up Windows service smoke
@@ -480,7 +482,7 @@ jobs:
         timeout-minutes: 3
         run: |
           ./scripts/ci/windows_service_smoke.ps1 `
-            -FixturePath "target/x86_64-pc-windows-msvc/ci/examples/windows_service_smoke_fixture.exe" `
+            -FixturePath "target/x86_64-pc-windows-msvc/debug/examples/windows_service_smoke_fixture.exe" `
             -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
             -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence" `
             -CleanupOnly
