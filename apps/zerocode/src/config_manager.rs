@@ -7,8 +7,8 @@ use anyhow::Result;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -127,6 +127,14 @@ enum Screen {
         section_idx: usize,
         map_path: String,
         breadcrumb: Vec<String>,
+    },
+    AliasRename {
+        section_idx: usize,
+        map_path: String,
+        breadcrumb: Vec<String>,
+        /// Capture the selected alias before entering the name editor.
+        from: String,
+        confirming: bool,
     },
     FieldList {
         section_idx: usize,
@@ -616,6 +624,19 @@ impl App {
                 let bc = breadcrumb.clone();
                 self.draw_alias_create(frame, right, &bc);
             }
+            Screen::AliasRename {
+                map_path,
+                breadcrumb,
+                from,
+                confirming,
+                ..
+            } => {
+                let path = map_path.clone();
+                let bc = breadcrumb.clone();
+                let from = from.clone();
+                let confirming = *confirming;
+                self.draw_alias_rename(frame, right, &path, &bc, &from, confirming);
+            }
             Screen::FieldList {
                 section_idx,
                 breadcrumb,
@@ -643,6 +664,18 @@ impl App {
         let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
 
         match &self.screen {
+            Screen::AliasList { .. }
+                if self.zeroclaw_pane == ZeroclawPane::Detail
+                    && self.provider_alias_rename_available()
+                    && self.filter.is_none() =>
+            {
+                format!(
+                    " {}={}  ?={}",
+                    tab_key(T::RenameAlias),
+                    crate::i18n::t("zc-config-footer-action-rename"),
+                    crate::i18n::t("zc-config-footer-action-help"),
+                )
+            }
             Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
                 if self.filter.is_some() {
                     let help = crate::i18n::t("zc-config-footer-action-help");
@@ -694,6 +727,19 @@ impl App {
                     " {}={}  {}={}",
                     editor_key(E::Confirm),
                     crate::i18n::t("zc-config-footer-action-create"),
+                    editor_key(E::Cancel),
+                    crate::i18n::t("zc-config-footer-action-cancel"),
+                )
+            }
+            Screen::AliasRename { confirming, .. } => {
+                format!(
+                    " {}={}  {}={}",
+                    editor_key(E::Confirm),
+                    crate::i18n::t(if *confirming {
+                        "zc-config-footer-action-rename"
+                    } else {
+                        "zc-config-footer-action-review-rename"
+                    }),
                     editor_key(E::Cancel),
                     crate::i18n::t("zc-config-footer-action-cancel"),
                 )
@@ -850,6 +896,7 @@ impl App {
             Screen::TypeList { .. } => self.handle_type_list(key).await?,
             Screen::AliasList { .. } => self.handle_alias_list(key).await?,
             Screen::AliasCreate { .. } => self.handle_alias_create(key).await?,
+            Screen::AliasRename { .. } => self.handle_alias_rename(key).await?,
             Screen::FieldList { .. } => self.handle_field_list(key, term).await?,
             Screen::FieldEdit { .. } => self.handle_field_edit(key).await?,
         }
@@ -864,6 +911,7 @@ impl App {
     }
 
     fn cycle_section(&mut self, delta: isize) {
+        self.cancel_alias_rename();
         let i = CONFIG_SECTIONS
             .iter()
             .position(|s| *s == self.section)
@@ -888,6 +936,9 @@ impl App {
         {
             let labels: Vec<&str> = CONFIG_SECTIONS.iter().map(|s| s.label()).collect();
             if let Some(idx) = mouse::tab_click_index(mouse.column, mouse.row, bar, &labels, 3) {
+                if self.section != CONFIG_SECTIONS[idx] {
+                    self.cancel_alias_rename();
+                }
                 self.section = CONFIG_SECTIONS[idx];
                 return Ok(());
             }
@@ -1071,7 +1122,7 @@ impl App {
                     }
                 }
             }
-            Screen::AliasCreate { .. } => 0,
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => 0,
             Screen::FieldList { .. } => {
                 if self.is_composite_tab() {
                     match self.tab_names[self.active_tab] {
@@ -1176,7 +1227,7 @@ impl App {
                     self.alias_cursor
                 }
             }
-            Screen::AliasCreate { .. } => 0,
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => 0,
             Screen::FieldList { .. } => {
                 if self.is_composite_tab() {
                     match self.tab_names[self.active_tab] {
@@ -1250,7 +1301,7 @@ impl App {
                     self.alias_cursor = pos.min(total.saturating_sub(1));
                 }
             }
-            Screen::AliasCreate { .. } => {}
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => {}
             Screen::FieldList { .. } => {
                 if self.is_composite_tab() {
                     match self.tab_names[self.active_tab] {
@@ -1331,7 +1382,7 @@ impl App {
                 }
                 // If on [+ Add], double-click does nothing — use keyboard.
             }
-            Screen::AliasCreate { .. } => {}
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => {}
             Screen::FieldList { .. } => {
                 if self.is_composite_tab() {
                     // Double-click on personality file or skill opens editor —
@@ -1515,6 +1566,25 @@ impl App {
     /// Whether the active AliasList carries the Aliases/Costs tab pair.
     fn alias_list_has_tabs(&self) -> bool {
         self.alias_list_cost_target().is_some()
+    }
+
+    fn provider_alias_rename_available(&self) -> bool {
+        if let Screen::AliasList {
+            section_idx,
+            map_path,
+            ..
+        } = &self.screen
+        {
+            return self.alias_tab == 0
+                && self.alias_cursor < self.aliases.len()
+                && self.sections.get(*section_idx).is_some_and(|section| {
+                    matches!(
+                        section.key.as_str(),
+                        "providers.models" | "providers.tts" | "providers.transcription"
+                    ) && is_direct_child_path(map_path, &section.key)
+                });
+        }
+        false
     }
 
     async fn load_cost_resources(&mut self) -> Result<()> {
@@ -1814,6 +1884,7 @@ impl App {
     }
 
     async fn preview_section(&mut self, idx: usize) -> Result<()> {
+        self.cancel_alias_rename();
         if self.loaded_section == Some(idx) {
             return Ok(());
         }
@@ -1857,6 +1928,7 @@ impl App {
     }
 
     async fn load_section_content(&mut self, idx: usize) -> Result<()> {
+        self.cancel_alias_rename();
         if let Some(section) = self.sections.get(idx) {
             let section_key = section.key.clone();
             match section.shape {
@@ -2066,6 +2138,27 @@ impl App {
             }
             Some(ConfigTabAction::Down) if self.alias_cursor + 1 < visible_total => {
                 self.alias_cursor += 1;
+            }
+            Some(ConfigTabAction::RenameAlias)
+                if self.provider_alias_rename_available()
+                    && self.alias_cursor < self.aliases.len() =>
+            {
+                if let Screen::AliasList {
+                    section_idx,
+                    map_path,
+                    breadcrumb,
+                } = &self.screen
+                {
+                    let from = self.aliases[self.alias_cursor].clone();
+                    self.edit_buf = from.clone();
+                    self.screen = Screen::AliasRename {
+                        section_idx: *section_idx,
+                        map_path: map_path.clone(),
+                        breadcrumb: breadcrumb.clone(),
+                        from,
+                        confirming: false,
+                    };
+                }
             }
             _ if into => {
                 if has_add && self.alias_cursor == add_pos {
@@ -2388,6 +2481,130 @@ impl App {
                 self.edit_buf.pop();
             }
             None => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.edit_buf.push(c);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn cancel_alias_rename(&mut self) {
+        if !matches!(self.screen, Screen::AliasRename { .. }) {
+            return;
+        }
+        if let Screen::AliasRename {
+            section_idx,
+            map_path,
+            breadcrumb,
+            ..
+        } = std::mem::replace(&mut self.screen, Screen::SectionList)
+        {
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            };
+        }
+        self.edit_buf.clear();
+        self.status_msg = None;
+    }
+
+    async fn handle_alias_rename(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::ConfigEditorAction;
+        let Screen::AliasRename {
+            from, confirming, ..
+        } = &self.screen
+        else {
+            return Ok(());
+        };
+        let from = from.clone();
+        let confirming = *confirming;
+        match ConfigEditorAction::from_chord(&key) {
+            Some(ConfigEditorAction::Cancel) => self.cancel_alias_rename(),
+            Some(ConfigEditorAction::Confirm) if key.kind != KeyEventKind::Press => {}
+            Some(ConfigEditorAction::Confirm) if !confirming => {
+                let to = self.edit_buf.trim().to_string();
+                if to.is_empty() {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-empty"));
+                } else if to == from {
+                    self.status_msg =
+                        Some(crate::i18n::t("zc-config-status-alias-rename-unchanged"));
+                } else {
+                    self.edit_buf = to;
+                    if let Screen::AliasRename { confirming, .. } = &mut self.screen {
+                        *confirming = true;
+                    }
+                }
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                let Screen::AliasRename { map_path, .. } = &self.screen else {
+                    return Ok(());
+                };
+                let map_path = map_path.clone();
+                let to = self.edit_buf.clone();
+                match self.rpc.config_map_key_rename(&map_path, &from, &to).await {
+                    Ok(result) => {
+                        let mut status = if result.renamed {
+                            // The rename has committed. Leave the editor before refreshing
+                            // so a failed read cannot cause the mutation to be retried.
+                            self.cancel_alias_rename();
+                            match self.load_aliases(&map_path).await {
+                                Ok(()) => {
+                                    self.alias_cursor = self
+                                        .aliases
+                                        .iter()
+                                        .position(|alias| alias == &to)
+                                        .unwrap_or(0);
+                                    crate::i18n::t_args(
+                                        "zc-config-status-alias-renamed",
+                                        &[("from", &from), ("to", &to)],
+                                    )
+                                }
+                                Err(e) => {
+                                    self.aliases.clear();
+                                    self.alias_enabled.clear();
+                                    self.alias_cursor = 0;
+                                    self.loaded_section = None;
+                                    crate::i18n::t_args(
+                                        "zc-config-status-alias-renamed-refresh-failed",
+                                        &[("from", &from), ("to", &to), ("err", &e.to_string())],
+                                    )
+                                }
+                            }
+                        } else {
+                            if let Screen::AliasRename { confirming, .. } = &mut self.screen {
+                                *confirming = false;
+                            }
+                            crate::i18n::t("zc-config-status-alias-rename-not-applied")
+                        };
+                        if !result.warnings.is_empty() {
+                            status.push(' ');
+                            status.push_str(&crate::i18n::t_args(
+                                "zc-config-status-alias-rename-warnings",
+                                &[("warnings", &result.warnings.join("; "))],
+                            ));
+                        }
+                        self.status_msg = Some(status);
+                    }
+                    Err(e) => {
+                        if let Screen::AliasRename { confirming, .. } = &mut self.screen {
+                            *confirming = false;
+                        }
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-alias-rename-failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
+                }
+            }
+            Some(ConfigEditorAction::Backspace) if !confirming => {
+                self.edit_buf.pop();
+            }
+            None if !confirming => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
@@ -3945,6 +4162,58 @@ impl App {
         self.draw_status(frame, r);
     }
 
+    fn draw_alias_rename(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        map_path: &str,
+        breadcrumb: &[String],
+        from: &str,
+        confirming: bool,
+    ) {
+        let r = regions(area);
+        let mut bc = breadcrumb.to_vec();
+        bc.push(from.to_string());
+        bc.push(crate::i18n::t("zc-config-breadcrumb-rename"));
+        render_breadcrumb(frame, r.breadcrumb, &bc);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                crate::i18n::t(if confirming {
+                    "zc-config-alias-rename-confirm-hint"
+                } else {
+                    "zc-config-alias-rename-input-hint"
+                }),
+                theme::dim_style(),
+            ))
+            .wrap(Wrap { trim: false }),
+            r.help,
+        );
+        let content = if confirming {
+            crate::i18n::t_args(
+                "zc-config-alias-rename-confirm-target",
+                &[("path", map_path), ("from", from), ("to", &self.edit_buf)],
+            )
+        } else {
+            format!("{}█", self.edit_buf)
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(content, theme::input_style()))
+                .wrap(Wrap { trim: false })
+                .block(theme::panel_block(&format!(
+                    " {} ",
+                    crate::i18n::t(if confirming {
+                        "zc-config-alias-rename-confirm-title"
+                    } else {
+                        "zc-config-alias-rename-input-title"
+                    })
+                ))),
+            r.main,
+        );
+        self.last_main_area = r.main;
+        self.last_tab_area = None;
+        self.draw_status(frame, r);
+    }
+
     fn draw_field_list(
         &mut self,
         frame: &mut Frame,
@@ -4425,7 +4694,7 @@ impl App {
 
     /// Handle a bracketed-paste payload. Routes pasted text into whichever
     /// text-input surface is currently active (filter, edit buffer, alias
-    /// create, personality/skills editor). Filters out the bracket-paste
+    /// create/rename, personality/skills editor). Filters out the bracket-paste
     /// terminator bytes and normalises CRLF.
     pub(crate) fn handle_paste(&mut self, text: &str) {
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
@@ -4444,7 +4713,10 @@ impl App {
         }
 
         match &self.screen {
-            Screen::AliasCreate { .. } => {
+            Screen::AliasCreate { .. }
+            | Screen::AliasRename {
+                confirming: false, ..
+            } => {
                 // Aliases are single-line identifiers.
                 for c in cleaned.chars() {
                     if c == '\n' {
@@ -4482,7 +4754,7 @@ impl App {
         }
     }
 
-    /// Whether the pane is in a text-input mode (filter, edit buf, alias create, editors).
+    /// Whether the pane owns text-input keys (filter, edit buf, alias create/rename, editors).
     pub(crate) fn wants_text_input(&self) -> bool {
         if self.section == ConfigSection::Zerocode {
             return self.zerocode.wants_text_input();
@@ -4491,7 +4763,7 @@ impl App {
             return true;
         }
         match &self.screen {
-            Screen::AliasCreate { .. } => true,
+            Screen::AliasCreate { .. } | Screen::AliasRename { .. } => true,
             Screen::FieldEdit { .. } if !self.is_select_edit() => true,
             Screen::FieldList { .. } => {
                 self.personality_active_file.is_some() || self.skills_active.is_some()
@@ -4629,7 +4901,7 @@ impl App {
                         help(),
                     ])
                 } else if self.alias_list_has_tabs() {
-                    HelpNode::entries(vec![
+                    let mut entries = vec![
                         nav(),
                         E::new(
                             switch_tabs_keys(),
@@ -4641,10 +4913,14 @@ impl App {
                         help(),
                         E::spacer(),
                         mouse_open(),
-                    ])
+                    ];
+                    if self.provider_alias_rename_available() {
+                        entries.insert(3, k(A::RenameAlias, "zc-config-help-rename-alias"));
+                    }
+                    HelpNode::entries(entries)
                 } else {
                     let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
-                    HelpNode::entries(vec![
+                    let mut entries = vec![
                         nav(),
                         E::new(open, crate::i18n::t("zc-config-help-open-alias")),
                         k(A::ToggleSecret, "zc-config-help-delete-alias"),
@@ -4653,13 +4929,32 @@ impl App {
                         help(),
                         E::spacer(),
                         mouse_open(),
-                    ])
+                    ];
+                    if self.provider_alias_rename_available() {
+                        entries.insert(2, k(A::RenameAlias, "zc-config-help-rename-alias"));
+                    }
+                    HelpNode::entries(entries)
                 }
             }
             Screen::AliasCreate { .. } => HelpNode::entries(vec![
                 E::new(
                     vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
                     crate::i18n::t("zc-config-help-create-alias"),
+                ),
+                E::new(
+                    vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
+                    crate::i18n::t("zc-config-help-cancel"),
+                ),
+                help(),
+            ]),
+            Screen::AliasRename { confirming, .. } => HelpNode::entries(vec![
+                E::new(
+                    vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
+                    crate::i18n::t(if *confirming {
+                        "zc-config-help-confirm-rename"
+                    } else {
+                        "zc-config-help-review-rename"
+                    }),
                 ),
                 E::new(
                     vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
@@ -5232,6 +5527,421 @@ mod tests {
             shape: Some(SectionShape::TypedFamilyMap),
             cost_category: String::new(),
         }
+    }
+
+    fn alias_rename_manager(
+        section_key: &str,
+        family: &str,
+    ) -> (
+        App,
+        Arc<crate::jsonrpc::RpcOutbound>,
+        tokio::sync::mpsc::Receiver<String>,
+        Term,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut manager = App::new(client, Path::new("/tmp"));
+        manager.sections = vec![typed_section(section_key)];
+        manager.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: format!("{section_key}.{family}"),
+            breadcrumb: vec![section_key.into(), family.into()],
+        };
+        manager.aliases = vec!["old".into(), "other".into()];
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.loaded_section = Some(0);
+        let term = Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap();
+        (manager, outbound, rx, term)
+    }
+
+    async fn config_key(manager: &mut App, term: &mut Term, code: KeyCode) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.handle_key(KeyEvent::new(code, KeyModifiers::NONE), term),
+        )
+        .await
+        .expect("config key handler must complete")
+        .unwrap();
+    }
+
+    async fn enter_alias_rename(manager: &mut App, term: &mut Term, to: &str) {
+        config_key(manager, term, KeyCode::Char('e')).await;
+        assert!(manager.wants_text_input());
+        for _ in 0..manager.edit_buf.chars().count() {
+            config_key(manager, term, KeyCode::Backspace).await;
+        }
+        manager.handle_paste(to);
+    }
+
+    async fn answer_config_request(
+        outbound: &crate::jsonrpc::RpcOutbound,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        method: &str,
+        params: serde_json::Value,
+        response: std::result::Result<serde_json::Value, &str>,
+    ) {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("expected config RPC request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(req["method"], method);
+        assert_eq!(req["params"], params);
+        let id = req["id"].as_str().unwrap();
+        match response {
+            Ok(result) => outbound.dispatch_response(id, Some(result), None),
+            Err(message) => outbound.dispatch_response(
+                id,
+                None,
+                Some(crate::jsonrpc::JsonRpcError {
+                    code: -32602,
+                    message: message.into(),
+                    data: None,
+                }),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_requires_confirmation_and_refreshes_each_family() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for (section, family) in [
+            ("providers.models", "anthropic"),
+            ("providers.tts", "openai"),
+            ("providers.transcription", "groq"),
+        ] {
+            let (mut manager, outbound, mut rx, mut term) = alias_rename_manager(section, family);
+            enter_alias_rename(&mut manager, &mut term, "new\r\n").await;
+            // The alias-list cursor is no longer authoritative once editing starts.
+            manager.alias_cursor = 1;
+            assert!(rx.try_recv().is_err());
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            assert!(matches!(
+                manager.screen,
+                Screen::AliasRename {
+                    confirming: true,
+                    ..
+                }
+            ));
+            manager
+                .handle_key(
+                    KeyEvent::new_with_kind(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            assert!(rx.try_recv().is_err());
+            manager.handle_paste("ignored");
+            config_key(&mut manager, &mut term, KeyCode::Char('x')).await;
+            assert_eq!(manager.edit_buf, "new");
+
+            let path = format!("{section}.{family}");
+            let (_, ()) =
+                tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), async {
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/map-key-rename",
+                        serde_json::json!({"path": path, "from": "old", "to": "new"}),
+                        Ok(serde_json::json!({"renamed": true, "warnings": ["synthetic warning"]})),
+                    )
+                    .await;
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/map-keys",
+                        serde_json::json!({"path": path}),
+                        Ok(serde_json::json!({"keys": ["other", "new"]})),
+                    )
+                    .await;
+                    for alias in ["other", "new"] {
+                        answer_config_request(
+                            &outbound,
+                            &mut rx,
+                            "config/list",
+                            serde_json::json!({"prefix": format!("{path}.{alias}.enabled")}),
+                            Ok(serde_json::json!({"entries": []})),
+                        )
+                        .await;
+                    }
+                });
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert_eq!(manager.aliases[manager.alias_cursor], "new");
+            assert!(manager.edit_buf.is_empty());
+            assert!(
+                manager
+                    .status_msg
+                    .as_deref()
+                    .unwrap()
+                    .contains("synthetic warning")
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_blank_unchanged_and_cancel_send_no_rpc() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, _outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        for to in ["   ", "old"] {
+            enter_alias_rename(&mut manager, &mut term, to).await;
+            config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            assert!(matches!(
+                manager.screen,
+                Screen::AliasRename {
+                    confirming: false,
+                    ..
+                }
+            ));
+            assert!(manager.status_msg.is_some());
+            config_key(&mut manager, &mut term, KeyCode::Esc).await;
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert!(rx.try_recv().is_err());
+        }
+        for confirm in [false, true] {
+            enter_alias_rename(&mut manager, &mut term, "new").await;
+            if confirm {
+                config_key(&mut manager, &mut term, KeyCode::Enter).await;
+            }
+            config_key(&mut manager, &mut term, KeyCode::Esc).await;
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert!(manager.edit_buf.is_empty());
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_failure_keeps_editable_name_and_requires_reconfirmation() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) =
+            alias_rename_manager("providers.tts", "openai");
+        enter_alias_rename(&mut manager, &mut term, "taken").await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        tokio::join!(
+            config_key(&mut manager, &mut term, KeyCode::Enter),
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-key-rename",
+                serde_json::json!({"path": "providers.tts.openai", "from": "old", "to": "taken"}),
+                Err("alias already exists")
+            )
+        );
+        assert!(matches!(
+            manager.screen,
+            Screen::AliasRename {
+                confirming: false,
+                ..
+            }
+        ));
+        assert_eq!(manager.edit_buf, "taken");
+        assert!(
+            manager
+                .status_msg
+                .as_deref()
+                .unwrap()
+                .contains("alias already exists")
+        );
+        config_key(&mut manager, &mut term, KeyCode::Char('2')).await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        assert!(rx.try_recv().is_err());
+        tokio::join!(
+            config_key(&mut manager, &mut term, KeyCode::Enter),
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-key-rename",
+                serde_json::json!({"path": "providers.tts.openai", "from": "old", "to": "taken2"}),
+                Ok(serde_json::json!({"renamed": false, "warnings": ["not applied warning"]}))
+            )
+        );
+        assert!(matches!(
+            manager.screen,
+            Screen::AliasRename {
+                confirming: false,
+                ..
+            }
+        ));
+        assert_eq!(manager.edit_buf, "taken2");
+        assert!(
+            manager
+                .status_msg
+                .as_deref()
+                .unwrap()
+                .contains("not applied warning")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_refresh_failure_does_not_retry_committed_mutation() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        tokio::join!(config_key(&mut manager, &mut term, KeyCode::Enter), async {
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-key-rename",
+                serde_json::json!({"path": "providers.models.openai", "from": "old", "to": "new"}),
+                Ok(serde_json::json!({"renamed": true, "warnings": ["saved warning"]})),
+            )
+            .await;
+            answer_config_request(
+                &outbound,
+                &mut rx,
+                "config/map-keys",
+                serde_json::json!({"path": "providers.models.openai"}),
+                Err("refresh unavailable"),
+            )
+            .await;
+        });
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(manager.aliases.is_empty());
+        assert!(manager.edit_buf.is_empty());
+        assert_eq!(manager.loaded_section, None);
+        let status = manager.status_msg.as_deref().unwrap();
+        assert!(status.contains("Renamed"));
+        assert!(status.contains("refresh unavailable"));
+        assert!(status.contains("saved warning"));
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_is_rebindable_and_excludes_other_rows() {
+        use crate::keymap::{Chord, ConfigTabAction};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for section in ["channels", "agents", "skill-bundles", "knowledge_bundles"] {
+            let (mut manager, _outbound, mut rx, mut term) =
+                alias_rename_manager(section, "example");
+            if section != "channels" {
+                manager.sections[0].shape = Some(SectionShape::OneTierAliasMap);
+                manager.screen = Screen::AliasList {
+                    section_idx: 0,
+                    map_path: section.into(),
+                    breadcrumb: vec![section.into()],
+                };
+            }
+            config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+            assert!(matches!(manager.screen, Screen::AliasList { .. }));
+            assert!(rx.try_recv().is_err());
+        }
+        let (mut manager, _outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        manager.alias_cursor = manager.aliases.len();
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        manager.alias_cursor = 0;
+        manager.sections[0].cost_category = "models".into();
+        manager.alias_tab = 1;
+        manager.cost_resources = vec!["example-model".into()];
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        manager.alias_tab = 0;
+        config_key(&mut manager, &mut term, KeyCode::Char('/')).await;
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert_eq!(manager.filter.as_deref(), Some("e"));
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        config_key(&mut manager, &mut term, KeyCode::Esc).await;
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            "rename_alias",
+            vec![Chord::key(KeyCode::F(6))],
+        );
+        assert_eq!(
+            ConfigTabAction::from_chord(&KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)),
+            Some(ConfigTabAction::RenameAlias)
+        );
+        assert!(manager.bottom_hint().contains("F6"));
+        config_key(&mut manager, &mut term, KeyCode::Char('e')).await;
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        config_key(&mut manager, &mut term, KeyCode::F(6)).await;
+        assert!(matches!(manager.screen, Screen::AliasRename { .. }));
+        assert!(rx.try_recv().is_err());
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_is_cleared_when_switching_sections() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, _outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        config_key(&mut manager, &mut term, KeyCode::Enter).await;
+        config_key(&mut manager, &mut term, KeyCode::Tab).await;
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(manager.edit_buf.is_empty());
+        config_key(&mut manager, &mut term, KeyCode::BackTab).await;
+        assert!(manager.section == ConfigSection::Zeroclaw);
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        // A section-pane click may re-preview the already loaded section.
+        manager.preview_section(0).await.unwrap();
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(manager.edit_buf.is_empty());
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        manager.section_tab_area = Some(Rect::new(0, 0, 40, 1));
+        manager
+            .handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 12,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::default(),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        assert!(manager.edit_buf.is_empty());
+        config_key(&mut manager, &mut term, KeyCode::BackTab).await;
+        enter_alias_rename(&mut manager, &mut term, "new").await;
+        manager.sections.push(typed_section("providers.tts"));
+        manager.preview_section(1).await.unwrap();
+        assert!(matches!(
+            manager.screen,
+            Screen::TypeList { section_idx: 1 }
+        ));
+        assert!(manager.edit_buf.is_empty());
+        assert!(rx.try_recv().is_err());
     }
 
     fn field(path: &str) -> ConfigFieldEntry {
