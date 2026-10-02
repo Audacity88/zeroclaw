@@ -668,7 +668,12 @@ fn load_or_create_key(key_path: &Path) -> Result<Vec<u8>> {
                     // winner used atomic publication, the file content is
                     // guaranteed complete at this point.
                     let hex = read_key_file_no_follow(key_path)
-                        .context("Failed to read key file (created by concurrent process)")?;
+                        .with_context(|| {
+                            format!(
+                                "Failed to read key file at {} (created by concurrent process); initial publication error: {write_err:#}",
+                                key_path.display()
+                            )
+                        })?;
                     let bytes = hex_decode(hex.trim())
                         .context("Secret key file created by concurrent process is corrupt")?;
                     validate_key(bytes)

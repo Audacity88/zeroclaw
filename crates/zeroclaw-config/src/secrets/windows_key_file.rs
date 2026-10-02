@@ -361,11 +361,13 @@ pub(super) fn write_and_publish_with(
     {
         return Err(pending.abort(error));
     }
-    if let Err(error) = pending
-        .publish(key_path)
-        .context("Failed to atomically publish key file")
-    {
-        return Err(pending.abort(error));
+    if let Err(error) = pending.publish(key_path) {
+        let context = if error.kind() == io::ErrorKind::AlreadyExists {
+            "Key file already exists — another process created it concurrently"
+        } else {
+            "Failed to atomically publish key file"
+        };
+        return Err(pending.abort(anyhow::Error::new(error).context(context)));
     }
     // Return closes the exclusive handle immediately after successful rename.
     Ok(())
