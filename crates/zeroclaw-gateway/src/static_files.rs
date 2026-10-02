@@ -8,6 +8,8 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
+use cap_std::{ambient_authority, fs::Dir};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use super::AppState;
@@ -107,10 +109,7 @@ async fn load_index_html_bytes(dist_dir: Option<&PathBuf>) -> Option<Vec<u8>> {
         return Some(file.contents().to_vec());
     }
 
-    let index_path = resolve_fs_file(dist_dir?, Path::new("index.html"))
-        .await
-        .ok()?;
-    tokio::fs::read(&index_path).await.ok()
+    read_fs_file(dist_dir?, Path::new("index.html")).await.ok()
 }
 
 async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
@@ -122,17 +121,7 @@ async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
 
-    let file_path = match resolve_fs_file(dir, Path::new(path)).await {
-        Ok(path) => path,
-        Err(FsPathError::Invalid) => {
-            return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
-        }
-        Err(FsPathError::Unavailable) => {
-            return (StatusCode::NOT_FOUND, "Not found").into_response();
-        }
-    };
-
-    match tokio::fs::read(&file_path).await {
+    match read_fs_file(dir, Path::new(path)).await {
         Ok(content) => {
             let mime = mime_guess::from_path(path)
                 .first_or_octet_stream()
@@ -157,7 +146,8 @@ async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
             )
                 .into_response()
         }
-        Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+        Err(FsPathError::Invalid) => (StatusCode::BAD_REQUEST, "Invalid path").into_response(),
+        Err(FsPathError::Unavailable) => (StatusCode::NOT_FOUND, "Not found").into_response(),
     }
 }
 
@@ -186,7 +176,21 @@ fn is_valid_relative_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-async fn resolve_fs_file(root: &Path, relative: &Path) -> Result<PathBuf, FsPathError> {
+async fn read_fs_file(root: &Path, relative: &Path) -> Result<Vec<u8>, FsPathError> {
+    let root = root.to_path_buf();
+    let relative = relative.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = open_fs_file(&root, &relative)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| FsPathError::Unavailable)?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| FsPathError::Unavailable)?
+}
+
+fn open_fs_file(root: &Path, relative: &Path) -> Result<cap_std::fs::File, FsPathError> {
     if relative.as_os_str().is_empty()
         || !relative
             .components()
@@ -195,25 +199,55 @@ async fn resolve_fs_file(root: &Path, relative: &Path) -> Result<PathBuf, FsPath
         return Err(FsPathError::Invalid);
     }
 
-    let canonical_root = tokio::fs::canonicalize(root)
-        .await
+    // Bind authority before resolving names. Canonicalization preserves support
+    // for contained absolute symlinks; only the handle-relative open enforces
+    // confinement when entries change between resolution and opening.
+    let directory =
+        Dir::open_ambient_dir(root, ambient_authority()).map_err(|_| FsPathError::Unavailable)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(|_| FsPathError::Unavailable)?;
+    let canonical_file = std::fs::canonicalize(canonical_root.join(relative))
         .map_err(|_| FsPathError::Unavailable)?;
-    let canonical_file = tokio::fs::canonicalize(canonical_root.join(relative))
-        .await
+    let contained = canonical_file
+        .strip_prefix(&canonical_root)
         .map_err(|_| FsPathError::Unavailable)?;
 
-    if !canonical_file.starts_with(&canonical_root) {
+    #[cfg(test)]
+    run_before_open_hook();
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    // A regular file may become a FIFO before opening. Avoid blocking a worker
+    // waiting for a pipe writer before the opened-handle type check rejects it.
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = directory
+        .open_with(contained, &options)
+        .map_err(|_| FsPathError::Unavailable)?;
+    if !file
+        .metadata()
+        .map_err(|_| FsPathError::Unavailable)?
+        .is_file()
+    {
         return Err(FsPathError::Unavailable);
     }
+    Ok(file)
+}
 
-    let metadata = tokio::fs::metadata(&canonical_file)
-        .await
-        .map_err(|_| FsPathError::Unavailable)?;
-    if !metadata.is_file() {
-        return Err(FsPathError::Unavailable);
+#[cfg(test)]
+thread_local! {
+    static BEFORE_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_open_hook() {
+    let hook = BEFORE_OPEN_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
     }
-
-    Ok(canonical_file)
 }
 
 #[cfg(feature = "embedded-web")]
@@ -371,12 +405,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("app.js"), b"inside-asset").unwrap();
         symlink("app.js", root.path().join("alias.js")).unwrap();
+        symlink(root.path().join("app.js"), root.path().join("absolute.js")).unwrap();
         let root_path = root.path().to_path_buf();
 
-        let response = serve_fs_file(Some(&root_path), "alias.js").await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_body(response).await, b"inside-asset".to_vec());
+        for path in ["alias.js", "absolute.js"] {
+            let response = serve_fs_file(Some(&root_path), path).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body(response).await, b"inside-asset".to_vec());
+        }
     }
 
     #[cfg(unix)]
@@ -395,5 +431,99 @@ mod tests {
         let root_path = root.path().to_path_buf();
 
         assert!(load_index_html_bytes(Some(&root_path)).await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_open_rejects_entry_replacement_after_resolution() {
+        use std::os::unix::fs::symlink;
+
+        for replace_parent in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("assets")).unwrap();
+            std::fs::write(root.path().join("assets/app.js"), b"inside-asset").unwrap();
+            std::fs::write(outside.path().join("app.js"), b"outside-secret").unwrap();
+            let root_path = root.path().to_path_buf();
+            let outside_path = outside.path().to_path_buf();
+            BEFORE_OPEN_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if replace_parent {
+                        std::fs::rename(root_path.join("assets"), root_path.join("retired"))
+                            .unwrap();
+                        symlink(outside_path, root_path.join("assets")).unwrap();
+                    } else {
+                        std::fs::remove_file(root_path.join("assets/app.js")).unwrap();
+                        symlink(outside_path.join("app.js"), root_path.join("assets/app.js"))
+                            .unwrap();
+                    }
+                }));
+            });
+
+            assert_eq!(
+                open_fs_file(root.path(), Path::new("assets/app.js")).unwrap_err(),
+                FsPathError::Unavailable,
+                "replacement must not escape the opened root; parent={replace_parent}"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_open_rejects_non_file_replacement_after_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("app.js"), b"inside-asset").unwrap();
+        let path = root.path().join("app.js");
+        BEFORE_OPEN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(path).unwrap();
+            }));
+        });
+
+        assert_eq!(
+            open_fs_file(root.path(), Path::new("app.js")).unwrap_err(),
+            FsPathError::Unavailable
+        );
+    }
+
+    #[test]
+    fn fs_open_keeps_file_identity_after_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("app.js");
+        std::fs::write(&path, b"opened-asset").unwrap();
+        let mut file = open_fs_file(root.path(), Path::new("app.js")).unwrap();
+        std::fs::rename(&path, root.path().join("retired.js")).unwrap();
+        std::fs::write(&path, b"replacement-asset").unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+
+        assert_eq!(bytes, b"opened-asset");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_open_keeps_root_identity_after_directory_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("dist");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("app.js"), b"opened-root-asset").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("app.js"), b"outside-secret").unwrap();
+        let original_root = root.clone();
+        let retired = parent.path().join("retired");
+        let outside_path = outside.path().to_path_buf();
+        BEFORE_OPEN_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&original_root, retired).unwrap();
+                symlink(outside_path, original_root).unwrap();
+            }));
+        });
+
+        let mut file = open_fs_file(&root, Path::new("app.js")).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"opened-root-asset");
     }
 }
