@@ -545,12 +545,9 @@ mod tests {
                                 .cancellation_token()
                                 .is_none()
                         );
-                        assert!(
-                            tokio::spawn(async { ToolExecutionContext::current() })
-                                .await
-                                .unwrap()
-                                .is_none()
-                        );
+                        let mut children = tokio::task::JoinSet::new();
+                        children.spawn(async { ToolExecutionContext::current() });
+                        assert!(children.join_next().await.unwrap().unwrap().is_none());
                         anyhow::bail!("inner failure")
                     })
                     .await

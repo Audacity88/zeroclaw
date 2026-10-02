@@ -2718,7 +2718,7 @@ mod tests {
                 .cancellation_token()
                 .expect("turn token")
                 .child_token();
-            *self.child.lock().unwrap() = Some(tokio::spawn(async move {
+            *self.child.lock().unwrap() = Some(zeroclaw_spawn::spawn!(async move {
                 token.cancelled().await;
             }));
             self.started.notify_one();
