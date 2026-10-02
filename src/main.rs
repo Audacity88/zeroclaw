@@ -16987,9 +16987,11 @@ mod tests {
 
         // Pause one authoritative read after it took its snapshot. The other
         // engine must not enter its read until this settlement has finished.
+        type ReadProbe = (mpsc::Sender<()>, Option<mpsc::Receiver<()>>);
+
         struct ReadProbeStore {
             inner: SqliteRunStore,
-            probe: Mutex<Option<(mpsc::Sender<()>, Option<mpsc::Receiver<()>>)>>,
+            probe: Mutex<Option<ReadProbe>>,
         }
 
         impl SopRunStore for ReadProbeStore {
