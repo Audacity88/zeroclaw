@@ -65,6 +65,8 @@ struct DockLayout {
     divider: Rect,
     plan_divider: Rect,
     side_switch: Rect,
+    menu_button: Rect,
+    menu: Rect,
     toggles: [Rect; 3],
     close: [Rect; 3],
 }
@@ -79,6 +81,7 @@ struct ConversationDock {
     sessions_percent: u16,
     queue_percent: u16,
     capture: Option<DockCapture>,
+    menu_cursor: Option<usize>,
     layout: DockLayout,
 }
 
@@ -95,6 +98,7 @@ impl ConversationDock {
             sessions_percent: config.effective_sidebar_sessions_percent(),
             queue_percent: config.effective_sidebar_queue_percent(),
             capture: None,
+            menu_cursor: None,
             layout: DockLayout::default(),
         }
     }
@@ -113,19 +117,10 @@ impl ConversationDock {
             conversation: content,
             ..DockLayout::default()
         };
-        let mut content = content;
-        if active_conversation && content.height > 1 {
-            let mut x = content.x;
-            for (index, label) in Self::section_labels().iter().enumerate() {
-                let width = (unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 4)
-                    .min(content.right().saturating_sub(x) / (3 - index as u16));
-                layout.toggles[index] = Rect::new(x, content.y, width, 1);
-                x = x.saturating_add(width);
-            }
-            content.y += 1;
-            content.height -= 1;
-            layout.content = content;
-            layout.conversation = content;
+        if active_conversation && content.width >= 3 && content.height > 1 {
+            layout.menu_button = Rect::new(content.right() - 3, content.y, 3, 1);
+        } else {
+            self.menu_cursor = None;
         }
         let width = self
             .width
@@ -135,8 +130,7 @@ impl ConversationDock {
             || content.height <= DOCK_HEADER_ROWS
         {
             self.clear_capture();
-            self.layout = layout;
-            return layout;
+            return self.finish_layout(layout);
         }
 
         let dock = match self.side {
@@ -172,8 +166,8 @@ impl ConversationDock {
         layout.conversation = conversation;
         layout.dock = Some(dock);
         layout.header = header;
-        layout.side_switch =
-            Rect::new(dock.right().saturating_sub(7), dock.y, 6.min(dock.width), 1);
+        layout.side_switch = Rect::new(dock.right().saturating_sub(4), dock.y, 3, 1);
+        layout.menu_button = Rect::new(dock.right().saturating_sub(7), dock.y, 3, 1);
         layout.width_edge = match self.side {
             config::SidebarSide::Left => {
                 Rect::new(dock.right().saturating_sub(1), dock.y, 1, dock.height)
@@ -190,8 +184,8 @@ impl ConversationDock {
             layout.side_switch = Rect::default();
             layout.width_edge = Rect::default();
             self.clear_capture();
-            self.layout = layout;
-            return layout;
+            layout.menu_button = Rect::new(content.right().saturating_sub(3), content.y, 3, 1);
+            return self.finish_layout(layout);
         }
 
         let mut next_y = body.y;
@@ -237,8 +231,8 @@ impl ConversationDock {
             .enumerate()
         {
             if let Some(area) = area {
-                // Sessions keeps its existing plus control at the right edge.
-                let inset = if index == 0 { 8 } else { 4 };
+                // Leave separate slots for Sessions hide, close, and add.
+                let inset = if index == 0 { 12 } else { 4 };
                 layout.close[index] = Rect::new(area.right().saturating_sub(inset), area.y, 3, 1);
             }
         }
@@ -248,6 +242,40 @@ impl ConversationDock {
             DockCapture::QueuePlanHeight => layout.plan_divider.is_empty(),
         }) {
             self.clear_capture();
+        }
+        self.finish_layout(layout)
+    }
+
+    fn finish_layout(&mut self, mut layout: DockLayout) -> DockLayout {
+        if layout.dock.is_none() && !layout.menu_button.is_empty() {
+            layout.conversation.y += 1;
+            layout.conversation.height -= 1;
+        }
+        if let Some(cursor) = self.menu_cursor {
+            let width = Self::section_labels()
+                .iter()
+                .map(|label| unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 6)
+                .max()
+                .unwrap_or(6)
+                .min(layout.content.width);
+            let height = 5.min(layout.content.height);
+            let x = layout
+                .menu_button
+                .right()
+                .saturating_sub(width)
+                .max(layout.content.x);
+            let y = layout
+                .menu_button
+                .bottom()
+                .min(layout.content.bottom().saturating_sub(height));
+            layout.menu = Rect::new(x, y, width, height);
+            let inner = Self::menu_block(layout.menu).inner(layout.menu);
+            let first = cursor.saturating_sub(inner.height.saturating_sub(1) as usize);
+            for (index, toggle) in layout.toggles.iter_mut().enumerate() {
+                if index >= first && index < first + usize::from(inner.height) {
+                    *toggle = Rect::new(inner.x, inner.y + (index - first) as u16, inner.width, 1);
+                }
+            }
         }
         self.layout = layout;
         layout
@@ -260,6 +288,16 @@ impl ConversationDock {
             "zc-dock-toggle-plan",
         ]
         .map(crate::i18n::t)
+    }
+
+    fn menu_block(area: Rect) -> Block<'static> {
+        Block::default()
+            .borders(if area.height >= 5 {
+                Borders::ALL
+            } else {
+                Borders::LEFT | Borders::RIGHT
+            })
+            .style(theme::fill_style())
     }
 
     fn toggle_section(&mut self, index: usize) -> DockAction {
@@ -277,24 +315,17 @@ impl ConversationDock {
                 DockAction::TogglePlan
             }
         };
+        self.menu_cursor = None;
         self.clear_capture();
         action
     }
 
     fn draw_shell(&self, frame: &mut ratatui::Frame) {
-        for (index, label) in Self::section_labels().into_iter().enumerate() {
-            let visible = [self.sessions_visible, self.queue_visible, self.plan_visible][index];
-            let marker = if visible { "−" } else { "+" };
-            frame.render_widget(
-                Paragraph::new(format!("[{marker} {label}]")).style(if visible {
-                    theme::accent_style()
-                } else {
-                    theme::dim_style()
-                }),
-                self.layout.toggles[index],
-            );
-        }
         let Some(dock) = self.layout.dock else {
+            frame.render_widget(
+                Paragraph::new("[…]").style(theme::accent_style()),
+                self.layout.menu_button,
+            );
             return;
         };
         frame.render_widget(
@@ -311,13 +342,16 @@ impl ConversationDock {
             self.layout.header.x.saturating_add(label_inset),
             self.layout.header.y,
             self.layout
-                .side_switch
+                .menu_button
                 .x
                 .saturating_sub(self.layout.header.x.saturating_add(label_inset)),
             self.layout.header.height,
         );
         frame.render_widget(
-            Paragraph::new(Span::styled(label, theme::title_style())),
+            Paragraph::new(Span::styled(
+                crate::widgets::truncate_to_width(&label, label_area.width as usize),
+                theme::title_style(),
+            )),
             label_area,
         );
         frame.render_widget(
@@ -327,6 +361,47 @@ impl ConversationDock {
             )),
             self.layout.side_switch,
         );
+        frame.render_widget(
+            Paragraph::new("[…]").style(theme::accent_style()),
+            self.layout.menu_button,
+        );
+    }
+
+    fn draw_menu(&self, frame: &mut ratatui::Frame, plan_visible: bool) {
+        let Some(cursor) = self.menu_cursor else {
+            return;
+        };
+        frame.render_widget(Clear, self.layout.menu);
+        frame.render_widget(Self::menu_block(self.layout.menu), self.layout.menu);
+        for (index, label) in Self::section_labels().into_iter().enumerate() {
+            let visible = [self.sessions_visible, self.queue_visible, plan_visible][index];
+            let marker = if visible { "[x]" } else { "[ ]" };
+            frame.render_widget(
+                Paragraph::new(format!("{marker} {label}")).style(if index == cursor {
+                    theme::selected_style()
+                } else {
+                    theme::body_style()
+                }),
+                self.layout.toggles[index],
+            );
+        }
+    }
+
+    fn handle_menu_key(&mut self, key: &KeyEvent) -> (bool, Option<DockAction>) {
+        let Some(cursor) = self.menu_cursor.as_mut() else {
+            return (false, None);
+        };
+        match ModalAction::from_chord(key) {
+            Some(ModalAction::Up) => *cursor = cursor.saturating_sub(1),
+            Some(ModalAction::Down) => *cursor = (*cursor + 1).min(2),
+            Some(ModalAction::Confirm | ModalAction::Toggle) => {
+                let index = *cursor;
+                return (true, Some(self.toggle_section(index)));
+            }
+            Some(ModalAction::Cancel) => self.menu_cursor = None,
+            _ => {}
+        }
+        (true, None)
     }
 
     fn draw_resize_handles(&self, frame: &mut ratatui::Frame) {
@@ -460,6 +535,23 @@ impl ConversationDock {
     }
 
     fn handle_mouse(&mut self, mouse: &crossterm::event::MouseEvent) -> (bool, Option<DockAction>) {
+        if let Some(cursor) = self.menu_cursor.as_mut() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    for index in 0..3 {
+                        if mouse::in_rect(mouse.column, mouse.row, self.layout.toggles[index]) {
+                            return (true, Some(self.toggle_section(index)));
+                        }
+                    }
+                    self.menu_cursor = None;
+                }
+                MouseEventKind::Down(_) => self.menu_cursor = None,
+                MouseEventKind::ScrollUp => *cursor = cursor.saturating_sub(1),
+                MouseEventKind::ScrollDown => *cursor = (*cursor + 1).min(2),
+                _ => {}
+            }
+            return (true, None);
+        }
         if let Some(capture) = self.capture {
             match mouse.kind {
                 MouseEventKind::Drag(MouseButton::Left) => {
@@ -497,10 +589,13 @@ impl ConversationDock {
         }
 
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            if mouse::in_rect(mouse.column, mouse.row, self.layout.menu_button) {
+                self.clear_capture();
+                self.menu_cursor = Some(0);
+                return (true, None);
+            }
             for index in 0..3 {
-                if mouse::in_rect(mouse.column, mouse.row, self.layout.toggles[index])
-                    || mouse::in_rect(mouse.column, mouse.row, self.layout.close[index])
-                {
+                if mouse::in_rect(mouse.column, mouse.row, self.layout.close[index]) {
                     return (true, Some(self.toggle_section(index)));
                 }
             }
@@ -564,6 +659,20 @@ fn set_dock_plan_visible(
     DockAction::TogglePlan
 }
 
+fn effective_dock_plan_visible(
+    dock: &ConversationDock,
+    mode: Mode,
+    chat: &chat::Chat,
+    acp: &acp::Acp,
+) -> bool {
+    dock.plan_visible
+        && match mode {
+            Mode::Chat => chat.current_session_id().is_none() || chat.plan_visible(),
+            Mode::Acp => acp.current_session_id().is_none() || acp.plan_visible(),
+            _ => false,
+        }
+}
+
 fn handle_dock_mouse(
     dock: &mut ConversationDock,
     mode: Mode,
@@ -571,14 +680,24 @@ fn handle_dock_mouse(
     acp: &mut acp::Acp,
     mouse: &crossterm::event::MouseEvent,
 ) -> (bool, Option<DockAction>) {
-    let pane_visible = match mode {
-        Mode::Chat => chat.current_session_id().is_none() || chat.plan_visible(),
-        Mode::Acp => acp.current_session_id().is_none() || acp.plan_visible(),
-        _ => false,
-    };
     // Without an active pane, toggle the saved preference on its own.
-    let plan_was_visible = dock.plan_visible && pane_visible;
+    let plan_was_visible = effective_dock_plan_visible(dock, mode, chat, acp);
     let result = dock.handle_mouse(mouse);
+    if result.1 == Some(DockAction::TogglePlan) {
+        set_dock_plan_visible(dock, mode, chat, acp, !plan_was_visible);
+    }
+    result
+}
+
+fn handle_dock_menu_key(
+    dock: &mut ConversationDock,
+    mode: Mode,
+    chat: &mut chat::Chat,
+    acp: &mut acp::Acp,
+    key: &KeyEvent,
+) -> (bool, Option<DockAction>) {
+    let plan_was_visible = effective_dock_plan_visible(dock, mode, chat, acp);
+    let result = dock.handle_menu_key(key);
     if result.1 == Some(DockAction::TogglePlan) {
         set_dock_plan_visible(dock, mode, chat, acp, !plan_was_visible);
     }
@@ -1929,6 +2048,7 @@ pub async fn run(
             Mode::Chat => chat_pane.plan_visible(),
             _ => false,
         };
+        let menu_plan_visible = effective_dock_plan_visible(&dock, mode, &chat_pane, &acp_pane);
         let sidebar_ctx = crate::agent_sidebar::SidebarCtx {
             active_pane: match mode {
                 Mode::Acp => Some(chat::PaneKind::Acp),
@@ -2037,6 +2157,7 @@ pub async fn run(
 
             // Sidebar "+" picker modal: above the panes, below the help and
             // confirm overlays.
+            dock.draw_menu(frame, menu_plan_visible);
             sidebar.draw_picker(frame, frame.area());
 
             // Help modal overlay (drawn last so it sits on top).
@@ -2294,11 +2415,20 @@ pub async fn run(
                     continue;
                 }
 
-                if dock.capture.is_some()
-                    && ModalAction::from_chord(&key) == Some(ModalAction::Cancel)
+                if !quit_confirm
+                    && !reload_confirm
+                    && help_overlay.is_none()
+                    && !sidebar.picker_open()
                 {
-                    dock.clear_capture();
-                    continue;
+                    let (consumed, action) =
+                        handle_dock_menu_key(&mut dock, mode, &mut chat_pane, &mut acp_pane, &key);
+                    if consumed {
+                        if let Some(action) = action {
+                            reload_status =
+                                dock_save_message(action, persist_dock_action(&dock, action));
+                        }
+                        continue;
+                    }
                 }
 
                 let in_text_input = match mode {
@@ -2789,6 +2919,7 @@ pub async fn run(
                     state.scroll = 0;
                 }
             }
+            Event::Paste(_) if dock.menu_cursor.is_some() => {}
             Event::Paste(text) => {
                 dispatch_state
                     .run_rpc_dispatch(|| async {
@@ -3821,6 +3952,7 @@ mod tests {
             sessions_percent: 60,
             queue_percent: 50,
             capture: None,
+            menu_cursor: None,
             layout: DockLayout::default(),
         }
     }
@@ -3832,6 +3964,25 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    fn dock_menu_target(
+        dock: &mut ConversationDock,
+        area: Rect,
+        mode: Mode,
+        active_plan: bool,
+        index: usize,
+    ) -> Rect {
+        let layout = dock.layout(area, mode, active_plan);
+        assert_eq!(
+            dock.handle_mouse(&dock_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.menu_button.x,
+                layout.menu_button.y
+            )),
+            (true, None)
+        );
+        dock.layout(area, mode, active_plan).toggles[index]
     }
 
     #[test]
@@ -3848,7 +3999,11 @@ mod tests {
                     assert_eq!(layout.sessions.is_some(), dock.sessions_visible);
                     assert_eq!(layout.queue.is_some(), dock.queue_visible);
                     assert_eq!(layout.plan.is_some(), dock.plan_visible && active_plan);
-                    assert!(layout.toggles.iter().all(|rect| rect.width > 0));
+                    assert!(!layout.menu_button.is_empty());
+                    assert!(layout.toggles.iter().all(|rect| rect.is_empty()));
+                    if layout.dock.is_some() {
+                        assert_eq!(layout.conversation.y, area.y);
+                    }
                     let sections: Vec<_> = [layout.sessions, layout.queue, layout.plan]
                         .into_iter()
                         .flatten()
@@ -3907,32 +4062,62 @@ mod tests {
                     crate::keymap::Chord::primary('p').effective_modifiers(),
                 );
                 for mode in [Mode::Chat, Mode::Acp] {
-                    for expected in [false, true] {
-                        let target = dock.layout(Rect::new(0, 0, 120, 40), mode, false).toggles[2];
-                        let (handled, action) = handle_dock_mouse(
-                            &mut dock,
-                            mode,
-                            &mut chat,
-                            &mut acp,
-                            &dock_mouse(
-                                MouseEventKind::Down(MouseButton::Left),
-                                target.x,
-                                target.y,
-                            ),
-                        );
-                        assert!(handled);
-                        assert_eq!(action, Some(DockAction::TogglePlan));
-                        assert_eq!(dock.plan_visible, expected);
-                        persist_dock_action(&dock, action.unwrap()).unwrap();
-                        assert_eq!(
-                            config::load_persisted(dir.path())
-                                .unwrap()
-                                .sidebar
-                                .plan_visible,
-                            expected
-                        );
-                        assert!(chat.current_session_id().is_none());
-                        assert!(acp.current_session_id().is_none());
+                    for keyboard in [false, true] {
+                        for expected in [false, true] {
+                            let target = dock_menu_target(
+                                &mut dock,
+                                Rect::new(0, 0, 120, 40),
+                                mode,
+                                false,
+                                2,
+                            );
+                            let (handled, action) = if keyboard {
+                                for _ in 0..2 {
+                                    assert_eq!(
+                                        handle_dock_menu_key(
+                                            &mut dock,
+                                            mode,
+                                            &mut chat,
+                                            &mut acp,
+                                            &KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)
+                                        ),
+                                        (true, None)
+                                    );
+                                }
+                                handle_dock_menu_key(
+                                    &mut dock,
+                                    mode,
+                                    &mut chat,
+                                    &mut acp,
+                                    &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                                )
+                            } else {
+                                handle_dock_mouse(
+                                    &mut dock,
+                                    mode,
+                                    &mut chat,
+                                    &mut acp,
+                                    &dock_mouse(
+                                        MouseEventKind::Down(MouseButton::Left),
+                                        target.x,
+                                        target.y,
+                                    ),
+                                )
+                            };
+                            assert!(handled);
+                            assert_eq!(action, Some(DockAction::TogglePlan));
+                            assert_eq!(dock.plan_visible, expected);
+                            persist_dock_action(&dock, action.unwrap()).unwrap();
+                            assert_eq!(
+                                config::load_persisted(dir.path())
+                                    .unwrap()
+                                    .sidebar
+                                    .plan_visible,
+                                expected
+                            );
+                            assert!(chat.current_session_id().is_none());
+                            assert!(acp.current_session_id().is_none());
+                        }
                     }
                     for expected in [false, true] {
                         match mode {
@@ -3993,7 +4178,7 @@ mod tests {
             for expected in [false, true] {
                 let layout = dock.layout(area, mode, true);
                 let target = if expected {
-                    layout.toggles[2]
+                    dock_menu_target(&mut dock, area, mode, true, 2)
                 } else {
                     layout.close[2]
                 };
@@ -4059,7 +4244,21 @@ mod tests {
                     Mode::Acp => acp.plan_visible(),
                     _ => unreachable!(),
                 };
-                let target = dock.layout(area, active_mode, pane_visible).toggles[2];
+                let target = dock_menu_target(&mut dock, area, active_mode, pane_visible, 2);
+                let mut menu_terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+                menu_terminal
+                    .draw(|frame| {
+                        dock.draw_menu(
+                            frame,
+                            effective_dock_plan_visible(&dock, active_mode, &chat, &acp),
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(
+                    menu_terminal.backend().buffer()[(target.x + 1, target.y)].symbol(),
+                    if expected { " " } else { "x" }
+                );
                 assert_eq!(
                     handle_dock_mouse(
                         &mut dock,
@@ -4111,7 +4310,7 @@ mod tests {
             }
             let layout = dock.layout(area, Mode::Chat, true);
             assert!(layout.close[index].is_empty());
-            let reopen = layout.toggles[index];
+            let reopen = dock_menu_target(&mut dock, area, Mode::Chat, true, index);
             assert_eq!(
                 dock.handle_mouse(&dock_mouse(
                     MouseEventKind::Down(MouseButton::Left),
@@ -4129,7 +4328,18 @@ mod tests {
         }
         let layout = dock.layout(area, Mode::Chat, true);
         assert!(layout.dock.is_none());
-        assert!(layout.toggles.iter().all(|rect| !rect.is_empty()));
+        assert!(!layout.menu_button.is_empty());
+        assert!(layout.toggles.iter().all(|rect| rect.is_empty()));
+        let reopen = dock_menu_target(&mut dock, area, Mode::Chat, true, 0);
+        assert_eq!(
+            dock.handle_mouse(&dock_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                reopen.x,
+                reopen.y
+            )),
+            (true, Some(DockAction::ToggleSessions))
+        );
+        assert!(dock.layout(area, Mode::Chat, true).sessions.is_some());
     }
 
     #[test]
@@ -4149,7 +4359,8 @@ mod tests {
                     && layout.divider.is_empty()
                     && layout.plan_divider.is_empty()
             );
-            assert!(layout.toggles.iter().all(|rect| !rect.is_empty()));
+            assert!(!layout.menu_button.is_empty());
+            assert!(layout.toggles.iter().all(|rect| rect.is_empty()));
             assert!(dock.capture.is_none());
         }
         let mut dock = test_dock();
@@ -4173,7 +4384,14 @@ mod tests {
                 sidebar.draw(
                     frame,
                     sessions,
-                    &[],
+                    &[chat::SidebarSessionSummary {
+                        session_id: "focused-session".into(),
+                        agent_alias: "test-agent".into(),
+                        message_count: 0,
+                        status: chat::SidebarStatus::Ready,
+                        pane_kind: chat::PaneKind::Chat,
+                        focused: true,
+                    }],
                     &crate::agent_sidebar::SidebarCtx {
                         active_pane: Some(chat::PaneKind::Chat),
                         quickstart_active: false,
@@ -4184,11 +4402,17 @@ mod tests {
             })
             .unwrap();
         let close = layout.close[0];
+        let minus = Rect::new(sessions.right() - 8, sessions.y, 3, 1);
         let plus = Rect::new(sessions.right() - 4, sessions.y, 3, 1);
+        assert!(close.intersection(minus).is_empty());
         assert!(close.intersection(plus).is_empty());
         assert_eq!(
             terminal.backend().buffer()[(close.x + 1, close.y)].symbol(),
             "×"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(minus.x + 1, minus.y)].symbol(),
+            "-"
         );
         assert_eq!(
             terminal.backend().buffer()[(plus.x + 1, plus.y)].symbol(),
@@ -4200,6 +4424,19 @@ mod tests {
             sidebar.handle_mouse(&add),
             Some(crate::agent_sidebar::SidebarEvent::OpenPicker)
         );
+        let remove = dock_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            minus.x + 1,
+            minus.y,
+        );
+        assert_eq!(dock.handle_mouse(&remove), (false, None));
+        assert_eq!(
+            sidebar.handle_mouse(&remove),
+            Some(crate::agent_sidebar::SidebarEvent::CloseSession {
+                pane: chat::PaneKind::Chat,
+                session_id: "focused-session".into(),
+            })
+        );
         let hide = dock_mouse(
             MouseEventKind::Down(MouseButton::Left),
             close.x + 1,
@@ -4209,6 +4446,93 @@ mod tests {
             dock.handle_mouse(&hide),
             (true, Some(DockAction::ToggleSessions))
         );
+    }
+
+    #[test]
+    fn dock_minimum_width_header_keeps_title_and_both_controls() {
+        let mut dock = test_dock();
+        dock.width = config::SIDEBAR_WIDTH_MIN;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        for side in [config::SidebarSide::Left, config::SidebarSide::Right] {
+            dock.side = side;
+            let layout = dock.layout(Rect::new(0, 0, 120, 40), Mode::Chat, true);
+            terminal
+                .draw(|frame| {
+                    dock.draw_shell(frame);
+                    dock.draw_resize_handles(frame);
+                })
+                .unwrap();
+            let header: String = (layout.header.x..layout.header.right())
+                .map(|x| terminal.backend().buffer()[(x, layout.header.y)].symbol())
+                .collect();
+            assert!(
+                header.contains(if side == config::SidebarSide::Left {
+                    "Dock left"
+                } else {
+                    "Dock right"
+                }),
+                "{header:?}"
+            );
+            assert!(header.contains("[…]"), "{header:?}");
+            assert!(header.contains("[↔]"), "{header:?}");
+            assert!(
+                layout
+                    .menu_button
+                    .intersection(layout.side_switch)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn dock_menu_owns_keys_and_outside_clicks_until_dismissed() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut dock = test_dock();
+        dock_menu_target(&mut dock, area, Mode::Chat, true, 0);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(dock.handle_menu_key(&key(KeyCode::Char('a'))), (true, None));
+        assert_eq!(dock.handle_menu_key(&key(KeyCode::Down)), (true, None));
+        assert_eq!(
+            dock.handle_menu_key(&key(KeyCode::Enter)),
+            (true, Some(DockAction::ToggleQueue))
+        );
+        assert!(!dock.queue_visible);
+        assert!(dock.sessions_visible && dock.plan_visible);
+        assert!(dock.menu_cursor.is_none());
+
+        dock_menu_target(&mut dock, area, Mode::Chat, true, 0);
+        assert_eq!(dock.handle_menu_key(&key(KeyCode::Esc)), (true, None));
+        assert_eq!(
+            dock.handle_menu_key(&key(KeyCode::Char('a'))),
+            (false, None)
+        );
+        dock_menu_target(&mut dock, area, Mode::Chat, true, 0);
+        assert_eq!(
+            dock.handle_mouse(&dock_mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)),
+            (true, None)
+        );
+        assert!(dock.menu_cursor.is_none());
+        assert!(dock.layout(area, Mode::Config, true).menu_button.is_empty());
+
+        for height in [2, 3, 5] {
+            let area = Rect::new(0, 0, 120, height);
+            let mut dock = test_dock();
+            dock_menu_target(&mut dock, area, Mode::Chat, true, 0);
+            for cursor in 0..3 {
+                let layout = dock.layout(area, Mode::Chat, true);
+                assert!(!layout.toggles[cursor].is_empty());
+                assert_eq!(
+                    layout.toggles[cursor].intersection(area),
+                    layout.toggles[cursor]
+                );
+                dock.handle_menu_key(&key(KeyCode::Down));
+            }
+            assert_eq!(
+                dock.handle_menu_key(&key(KeyCode::Enter)),
+                (true, Some(DockAction::TogglePlan))
+            );
+        }
     }
 
     #[test]
