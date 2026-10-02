@@ -2900,7 +2900,12 @@ impl Chat {
             // The response proves the handler returned, but only the missing
             // terminal notification distinguishes completed from cancelled or
             // failed. Settle conservatively so queued work cannot auto-run.
-            state.settle_turn_from_prompt_response();
+            let pause_reason = if completion.error.is_some() {
+                QueuePauseReason::Generic
+            } else {
+                QueuePauseReason::MissingCompletion
+            };
+            state.settle_turn_from_prompt_response(pause_reason);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
                 state.set_info_notice(crate::i18n::t_args(
@@ -13847,7 +13852,7 @@ impl ChatState {
         self.settle_turn_lifecycle(clean, QueuePauseReason::Generic);
     }
 
-    fn settle_turn_from_prompt_response(&mut self) {
+    fn settle_turn_from_prompt_response(&mut self, pause_reason: QueuePauseReason) {
         self.freeze_prompt_settled_stream();
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
@@ -13867,7 +13872,7 @@ impl ChatState {
         // Preserve per-turn provenance for a delayed terminal notification;
         // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
-        self.settle_turn_lifecycle(false, QueuePauseReason::MissingCompletion);
+        self.settle_turn_lifecycle(false, pause_reason);
     }
 
     fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
@@ -33978,6 +33983,9 @@ mod tests {
         chat.phase = ChatPhase::Active(Box::new(active));
         chat.pump_all_queues();
         let request = next_rpc_request(&mut writer_rx, "busy prompt should be sent").await;
+        active_state(&mut chat)
+            .enqueue_message("queued follow-up".to_string(), Vec::new())
+            .unwrap();
         respond_err(
             &chat.rpc_out,
             &request,
@@ -33988,6 +33996,8 @@ mod tests {
         chat.drain_prompt_completions();
 
         let active = active_state(&mut chat);
+        assert_eq!(active.queue_paused, Some(QueuePauseReason::Generic));
+        assert!(active.take_next_dispatchable().is_none());
         assert!(!active.turn_in_flight);
         assert!(
             active.first_message.is_none(),
