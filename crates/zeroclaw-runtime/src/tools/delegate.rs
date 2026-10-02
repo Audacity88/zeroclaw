@@ -15759,8 +15759,8 @@ command = "rm independent-delegate-marker"
     #[tokio::test]
     async fn independent_delegate_always_ask_route_dispatches_only_with_operator_approval() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
-        // Cover both normal admission and the prevalidated worker shared by
-        // detached background and parallel execution.
+        // Foreground and parallel workers use normal admission; detached
+        // background workers use the prevalidated path.
         for admission in [DelegateAdmission::Required, DelegateAdmission::Prevalidated] {
             for response in [Some(ChannelApprovalResponse::Approve), None] {
                 let approved = response.is_some();
