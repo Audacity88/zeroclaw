@@ -2811,10 +2811,10 @@ mod tests {
         let pid_path = workspace.path().join("child.pid");
         let pid: i32 = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Ok(text) = tokio::fs::read_to_string(&pid_path).await {
-                    if let Ok(pid) = text.trim().parse() {
-                        break pid;
-                    }
+                if let Ok(text) = tokio::fs::read_to_string(&pid_path).await
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
