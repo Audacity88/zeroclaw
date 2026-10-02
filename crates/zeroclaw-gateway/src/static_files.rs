@@ -8,7 +8,7 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use cap_std::{ambient_authority, fs::Dir};
+use cap_std::{ambient_authority, fs::Dir as CapabilityDir};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -202,8 +202,8 @@ fn open_fs_file(root: &Path, relative: &Path) -> Result<cap_std::fs::File, FsPat
     // Bind authority before resolving names. Canonicalization preserves support
     // for contained absolute symlinks; only the handle-relative open enforces
     // confinement when entries change between resolution and opening.
-    let directory =
-        Dir::open_ambient_dir(root, ambient_authority()).map_err(|_| FsPathError::Unavailable)?;
+    let directory = CapabilityDir::open_ambient_dir(root, ambient_authority())
+        .map_err(|_| FsPathError::Unavailable)?;
     let canonical_root = std::fs::canonicalize(root).map_err(|_| FsPathError::Unavailable)?;
     let canonical_file = std::fs::canonicalize(canonical_root.join(relative))
         .map_err(|_| FsPathError::Unavailable)?;
