@@ -27,6 +27,17 @@ enum WindowsChild {
     Job(Box<dyn process_wrap::tokio::ChildWrapper>),
 }
 
+#[cfg(windows)]
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if let WindowsChild::Job(child) = &mut self.child {
+            // process-wrap 9.0 cannot see KillOnDrop during JobObject setup.
+            // Terminate the owned job explicitly, even after the root is reaped.
+            let _ = child.start_kill();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum MemoryWaitError {
     Io(io::Error),
@@ -119,7 +130,7 @@ impl ManagedChild {
             WindowsChild::Ordinary(child) => child.wait().await,
             // The watchdog covers the root lifetime on every platform. Keep
             // the Job Object for containment, but do not use its wait-for-all
-            // completion-port wrapper. Closing the owned job stops leftovers.
+            // completion-port wrapper. Dropping ManagedChild stops leftovers.
             WindowsChild::Job(child) => child.inner_mut().wait().await,
         }
     }
