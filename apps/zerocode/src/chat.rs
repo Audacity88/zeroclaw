@@ -10281,27 +10281,38 @@ fn wrap_table_cell(text: &str, budget: usize) -> Vec<TableCellLine<'_>> {
             fragments
         };
 
-    let split_urls = recognized_url_ranges(text)
-        .into_iter()
-        .filter(|(url_start, url_end, _)| {
-            !fragments
-                .iter()
-                .any(|(start, end)| start <= url_start && url_end <= end)
-        })
-        .collect::<Vec<_>>();
+    let mut disabled_url_ranges = vec![Vec::new(); fragments.len()];
+    let mut fragment_index = 0usize;
+    for (url_start, url_end, _) in recognized_url_ranges(text) {
+        while fragment_index < fragments.len() && fragments[fragment_index].1 <= url_start {
+            fragment_index += 1;
+        }
+        if fragment_index == fragments.len() {
+            break;
+        }
+        let (fragment_start, fragment_end) = fragments[fragment_index];
+        if fragment_start <= url_start && url_end <= fragment_end {
+            continue;
+        }
+
+        let mut overlap_index = fragment_index;
+        while overlap_index < fragments.len() && fragments[overlap_index].0 < url_end {
+            let (start, end) = fragments[overlap_index];
+            let overlap_start = start.max(url_start);
+            let overlap_end = end.min(url_end);
+            if overlap_start < overlap_end {
+                disabled_url_ranges[overlap_index]
+                    .push((overlap_start - start, overlap_end - start));
+            }
+            overlap_index += 1;
+        }
+    }
     fragments
         .into_iter()
-        .map(|(start, end)| TableCellLine {
+        .zip(disabled_url_ranges)
+        .map(|((start, end), disabled_url_ranges)| TableCellLine {
             text: &text[start..end],
-            disabled_url_ranges: split_urls
-                .iter()
-                .filter_map(|(url_start, url_end, _)| {
-                    let overlap_start = start.max(*url_start);
-                    let overlap_end = end.min(*url_end);
-                    (overlap_start < overlap_end)
-                        .then_some((overlap_start - start, overlap_end - start))
-                })
-                .collect(),
+            disabled_url_ranges,
         })
         .collect()
 }
@@ -10345,9 +10356,22 @@ fn render_table(
         }
     }
 
-    // Frame budget: `│` borders (cols+1) + one-cell padding either side
-    // of each cell (cols * 2).
-    let frame = (cols + 1) + cols * 2;
+    // Keep the normal one-cell padding on both sides when possible. Under
+    // pressure, shed that optional padding before reducing a column below its
+    // widest grapheme. Only a grid whose borders plus graphemes cannot fit may
+    // still exceed the viewport.
+    let border_width = cols + 1;
+    let minimum_total: usize = minimum.iter().sum();
+    let padding_per_cell: usize = if border_width + cols * 2 + minimum_total <= width as usize {
+        2
+    } else if border_width + cols + minimum_total <= width as usize {
+        1
+    } else {
+        0
+    };
+    let outer_left_padding = usize::from(padding_per_cell > 0);
+    let outer_right_padding = padding_per_cell.saturating_sub(outer_left_padding);
+    let frame = border_width + cols * padding_per_cell;
     let avail = (width as usize).saturating_sub(frame);
     let total_natural: usize = natural.iter().sum();
 
@@ -10358,7 +10382,6 @@ fn render_table(
         // proportionally. The minimum grid is wider than `width` only when the
         // viewport cannot hold each column's widest grapheme plus its frame.
         let mut widths = minimum.clone();
-        let minimum_total: usize = minimum.iter().sum();
         let remaining = avail.saturating_sub(minimum_total);
         let extra = natural
             .iter()
@@ -10408,7 +10431,7 @@ fn render_table(
     let border = |left: &str, mid: &str, right: &str| -> Line<'static> {
         let mut s = String::from(left);
         for (i, w) in widths.iter().enumerate() {
-            s.push_str(&"\u{2500}".repeat(w + 2));
+            s.push_str(&"\u{2500}".repeat(w + padding_per_cell));
             if i + 1 < widths.len() {
                 s.push_str(mid);
             }
@@ -10434,7 +10457,7 @@ fn render_table(
                     if let Some(fragment) = cell_lines.get(line_index) {
                         let (left_padding, right_padding) =
                             cell_padding(fragment.text, widths[index], align);
-                        spans.push(Span::raw(format!(" {}", " ".repeat(left_padding))));
+                        spans.push(Span::raw(" ".repeat(outer_left_padding + left_padding)));
                         let mut cursor = 0usize;
                         for (start, end) in &fragment.disabled_url_ranges {
                             if *start > cursor {
@@ -10447,12 +10470,15 @@ fn render_table(
                             cursor = *end;
                         }
                         spans.push(Span::raw(format!(
-                            "{}{} ",
+                            "{}{}{}",
                             &fragment.text[cursor..],
-                            " ".repeat(right_padding)
+                            " ".repeat(right_padding),
+                            " ".repeat(outer_right_padding),
                         )));
                     } else {
-                        spans.push(Span::raw(format!(" {} ", " ".repeat(widths[index]))));
+                        spans.push(Span::raw(
+                            " ".repeat(outer_left_padding + widths[index] + outer_right_padding),
+                        ));
                     }
                     spans.push(Span::styled("\u{2502}".to_string(), theme::dim_style()));
                 }
@@ -31373,6 +31399,49 @@ mod tests {
                 .collect::<String>();
             crate::display_width::display_width(&text) <= width as usize
         }));
+    }
+
+    #[test]
+    fn md_table_sheds_optional_padding_before_clipping_wide_graphemes() {
+        for width in [7, 10] {
+            let lines = markdown_to_lines("| A | B |\n|---|---|\n| \u{754c} | \u{754c} |\n", width);
+            let rendered = lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                rendered
+                    .iter()
+                    .all(|line| { crate::display_width::display_width(line) <= width as usize }),
+                "representable table must fit width {width}: {rendered:?}"
+            );
+            assert_eq!(
+                rendered
+                    .iter()
+                    .map(|line| line.matches('\u{754c}').count())
+                    .sum::<usize>(),
+                2,
+                "wide graphemes must remain visible at width {width}: {rendered:?}"
+            );
+            assert!(
+                rendered.iter().all(|line| {
+                    matches!(
+                        line.chars().next(),
+                        Some('\u{250C}' | '\u{251C}' | '\u{2514}' | '\u{2502}')
+                    ) && matches!(
+                        line.chars().last(),
+                        Some('\u{2510}' | '\u{2524}' | '\u{2518}' | '\u{2502}')
+                    )
+                }),
+                "compacted table must retain its border at width {width}: {rendered:?}"
+            );
+        }
     }
 
     #[test]
