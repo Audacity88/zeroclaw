@@ -218,27 +218,24 @@ fn build_approval_content(
     raw_arguments: &Option<serde_json::Value>,
     fallback_summary: &str,
 ) -> serde_json::Value {
-    if let Some(args) = raw_arguments {
-        match tool_name {
-            "file_edit" => {
-                let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
-                let old_text = args
-                    .get("old_string")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let new_text = args
-                    .get("new_string")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                return json!([{
-                    "type": "diff",
-                    "path": path,
-                    "oldText": old_text,
-                    "newText": new_text,
-                }]);
-            }
-            _ => {}
-        }
+    if let Some(args) = raw_arguments
+        && tool_name == "file_edit"
+    {
+        let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
+        let old_text = args
+            .get("old_string")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let new_text = args
+            .get("new_string")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        return json!([{
+            "type": "diff",
+            "path": path,
+            "oldText": old_text,
+            "newText": new_text,
+        }]);
     }
     json!([{
         "type": "content",
