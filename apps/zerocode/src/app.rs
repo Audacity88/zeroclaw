@@ -3660,7 +3660,9 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    // Keep process-wide keymap overrides serialized through current-thread UI calls.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn binding_query_global_dispatch_keeps_quit_and_modified_shortcuts() {
         use crate::keymap::{Chord, RebindableActions};
         let _g = crate::keymap::overrides::TEST_GUARD

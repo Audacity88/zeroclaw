@@ -4996,7 +4996,9 @@ fn edit_in_external_editor(
 mod tests {
     use super::*;
 
+    // Keep process-wide keymap overrides serialized through current-thread UI calls.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn client_binding_query_owns_printable_outer_keys_and_paste() {
         use crate::keymap::{Chord, ConfigTabAction as A, RebindableActions};
         let _g = crate::keymap::overrides::TEST_GUARD
