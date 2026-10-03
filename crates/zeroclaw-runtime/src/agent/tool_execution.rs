@@ -739,7 +739,7 @@ mod tests {
             always_ask: vec!["file_read".into()],
             ..RiskProfileConfig::default()
         });
-        let excluded = vec!["file_read".to_string()];
+        let excluded = ["file_read".to_string()];
         // The read can be supplied by the current static or activated registry.
         // Every denied case still completes the authorized write normally.
         for (label, local, read_mode, exclusions, approval, sink, expected) in [
