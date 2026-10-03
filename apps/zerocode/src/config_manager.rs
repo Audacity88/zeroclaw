@@ -479,6 +479,8 @@ pub(crate) struct App {
     /// right-pane draws overwrite) so a click on a scrolled section list
     /// maps to the right row in any screen.
     last_section_list_offset: usize,
+    /// Segment hit areas from the actual breadcrumb renderer; separators are inert.
+    last_breadcrumb_areas: Vec<Rect>,
     last_tab_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
 }
@@ -539,6 +541,7 @@ impl App {
             last_list_offset: 0,
             last_section_rows: Vec::new(),
             last_section_list_offset: 0,
+            last_breadcrumb_areas: Vec::new(),
             last_tab_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
         }
@@ -564,6 +567,7 @@ impl App {
     /// section sub-tab bar (`zeroclaw` / `zerocode`).
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
         use ratatui::layout::{Constraint, Direction, Layout};
+        self.last_breadcrumb_areas.clear();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -952,6 +956,14 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if let Some(idx) = self
+                    .last_breadcrumb_areas
+                    .iter()
+                    .position(|&area| mouse::in_rect(mouse.column, mouse.row, area))
+                {
+                    self.open_breadcrumb(idx).await?;
+                    return Ok(());
+                }
                 // Aliases/Costs tab bar click on a cost-bearing provider list.
                 if self.alias_list_has_tabs()
                     && let Some(tab_rect) = self.last_tab_area
@@ -972,20 +984,23 @@ impl App {
                     let display_refs: Vec<&str> = display.iter().map(|s| s.as_str()).collect();
                     if let Some(idx) =
                         mouse::tab_click_index(mouse.column, mouse.row, tab_rect, &display_refs, 3)
-                        && idx != self.alias_tab
                         && idx < labels.len()
                     {
-                        self.alias_tab = idx;
-                        self.deactivate_filter();
-                        if idx == 1 {
-                            self.load_cost_resources().await?;
+                        self.zeroclaw_pane = ZeroclawPane::Detail;
+                        if idx != self.alias_tab {
+                            self.alias_tab = idx;
+                            self.deactivate_filter();
+                            if idx == 1 {
+                                self.load_cost_resources().await?;
+                            }
                         }
                     }
                     return Ok(());
                 }
 
                 // Tab bar click (FieldList only).
-                if let Some(tab_rect) = self.last_tab_area
+                if matches!(self.screen, Screen::FieldList { .. })
+                    && let Some(tab_rect) = self.last_tab_area
                     && mouse::in_rect(mouse.column, mouse.row, tab_rect)
                 {
                     let labels: Vec<&str> = self.tab_names.iter().map(|t| t.label()).collect();
@@ -1007,13 +1022,16 @@ impl App {
                         tab_rect,
                         &display_refs,
                         3, // " │ " separator
-                    ) && idx != self.active_tab
-                        && idx < self.tab_names.len()
+                    ) && idx < self.tab_names.len()
                     {
-                        self.active_tab = idx;
-                        self.field_cursor = self.tab_field_indices().first().copied().unwrap_or(0);
-                        self.deactivate_filter();
-                        self.on_tab_switched(term).await?;
+                        self.zeroclaw_pane = ZeroclawPane::Detail;
+                        if idx != self.active_tab {
+                            self.active_tab = idx;
+                            self.field_cursor =
+                                self.tab_field_indices().first().copied().unwrap_or(0);
+                            self.deactivate_filter();
+                            self.on_tab_switched(term).await?;
+                        }
                     }
                     return Ok(());
                 }
@@ -1051,6 +1069,7 @@ impl App {
                         self.active_tab = 0;
                         self.alias_tab = 0;
                         self.last_tab_area = None;
+                        self.last_breadcrumb_areas.clear();
                         self.status_msg = None;
                     }
                     return Ok(());
@@ -1899,6 +1918,100 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    async fn open_breadcrumb(&mut self, idx: usize) -> Result<()> {
+        let (section_idx, current_idx) = match &self.screen {
+            Screen::SectionList => return Ok(()),
+            Screen::TypeList { section_idx } => (*section_idx, 0),
+            Screen::AliasList {
+                section_idx,
+                breadcrumb,
+                ..
+            }
+            | Screen::FieldList {
+                section_idx,
+                breadcrumb,
+                ..
+            } => (*section_idx, breadcrumb.len().saturating_sub(1)),
+            Screen::AliasCreate {
+                section_idx,
+                breadcrumb,
+                ..
+            }
+            | Screen::FieldEdit {
+                section_idx,
+                breadcrumb,
+                ..
+            } => (*section_idx, breadcrumb.len()),
+            Screen::AliasRename {
+                section_idx,
+                breadcrumb,
+                ..
+            } => (*section_idx, breadcrumb.len() + 1),
+        };
+        self.zeroclaw_pane = ZeroclawPane::Detail;
+        if idx >= current_idx {
+            return Ok(());
+        }
+        if idx == 0 {
+            self.load_section_content(section_idx).await?;
+        } else {
+            match &self.screen {
+                Screen::AliasCreate {
+                    map_path,
+                    breadcrumb,
+                    ..
+                } => {
+                    self.restore_alias_list_from_create_back(
+                        section_idx,
+                        map_path.clone(),
+                        breadcrumb.clone(),
+                    )
+                    .await?;
+                }
+                Screen::AliasRename {
+                    map_path,
+                    breadcrumb,
+                    from,
+                    ..
+                } if idx == breadcrumb.len() => {
+                    let prefix = format!("{map_path}.{from}");
+                    let mut bc = breadcrumb.clone();
+                    bc.push(from.clone());
+                    self.load_fields(&prefix).await?;
+                    self.screen = Screen::FieldList {
+                        section_idx,
+                        prefix,
+                        breadcrumb: bc,
+                    };
+                }
+                Screen::AliasRename { .. } => self.cancel_alias_rename(),
+                Screen::FieldEdit { .. } => self.pop_to_field_list().await?,
+                _ => {}
+            }
+            if let Screen::FieldList { breadcrumb, .. } = &self.screen
+                && breadcrumb.len() > idx + 1
+            {
+                self.restore_alias_list_from_field_back(section_idx, breadcrumb.clone())
+                    .await?;
+            }
+            // Costs is a breadcrumb only inside a resource form. Its parent
+            // family still opens Aliases; the Costs crumb keeps the Costs tab.
+            if matches!(self.screen, Screen::AliasList { .. }) {
+                self.active_tab = 0;
+                if idx == 1 {
+                    self.alias_tab = 0;
+                }
+            }
+        }
+        self.deactivate_filter();
+        self.edit_buf.clear();
+        self.edit_cursor = 0;
+        self.last_tab_area = None;
+        self.last_breadcrumb_areas.clear();
+        self.status_msg = None;
+        Ok(())
     }
 
     async fn preview_section(&mut self, idx: usize) -> Result<()> {
@@ -3934,7 +4047,8 @@ impl App {
         let r = regions(area);
         let section = &self.sections[section_idx];
 
-        render_breadcrumb(frame, r.breadcrumb, std::slice::from_ref(&section.label));
+        self.last_breadcrumb_areas =
+            render_breadcrumb(frame, r.breadcrumb, std::slice::from_ref(&section.label));
 
         if let Some(buf) = &self.filter {
             render_filter_bar(frame, r.help, buf);
@@ -4007,7 +4121,7 @@ impl App {
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         // Aliases/Costs tab bar on cost-bearing provider types. Reuses the
         // same two-row help split the FieldList tab bar uses.
@@ -4159,7 +4273,7 @@ impl App {
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         bc.push(crate::i18n::t("zc-config-breadcrumb-new"));
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -4193,7 +4307,7 @@ impl App {
         let mut bc = breadcrumb.to_vec();
         bc.push(from.to_string());
         bc.push(crate::i18n::t("zc-config-breadcrumb-rename"));
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
         frame.render_widget(
             Paragraph::new(Span::styled(
                 crate::i18n::t(if confirming {
@@ -4246,7 +4360,7 @@ impl App {
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         // When tabs are present, split the help row into tab bar + help.
         // The help area is 2 rows: use the first for tabs, second for help.
@@ -4582,7 +4696,7 @@ impl App {
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
         bc.push(short_name.to_string());
-        render_breadcrumb(frame, r.breadcrumb, &bc);
+        self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         if self.is_select_edit() {
             // Enum, Bool, or model select — with optional `/` filter.
@@ -5196,20 +5310,28 @@ fn render_filter_bar(frame: &mut Frame, area: Rect, buf: &str) {
     );
 }
 
-fn render_breadcrumb(frame: &mut Frame, area: Rect, segments: &[String]) {
+fn render_breadcrumb(frame: &mut Frame, area: Rect, segments: &[String]) -> Vec<Rect> {
+    use unicode_width::UnicodeWidthStr;
+    let mut hit_areas = Vec::with_capacity(segments.len());
+    let mut x = area.x;
     let mut spans: Vec<Span<'_>> = Vec::new();
     for (i, seg) in segments.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ›  ", theme::dim_style()));
+            x = x.saturating_add(5);
         }
         let style = if i == segments.len() - 1 {
             theme::accent_style().add_modifier(Modifier::BOLD)
         } else {
             theme::heading_style()
         };
+        let width = UnicodeWidthStr::width(seg.as_str()).min(u16::MAX as usize) as u16;
+        hit_areas.push(Rect::new(x, area.y, width, area.height.min(1)).intersection(area));
+        x = x.saturating_add(width);
         spans.push(Span::styled(seg.clone(), style));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    hit_areas
 }
 
 // ── $EDITOR helper ───────────────────────────────────────────────
@@ -6055,6 +6177,165 @@ mod tests {
                 .unwrap();
             assert!(manager.at_section_top_level());
             assert_eq!(manager.type_cursor, 1);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    fn render_config_for_mouse(manager: &mut App) {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        Terminal::new(backend)
+            .unwrap()
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_breadcrumbs_navigate_without_saving() {
+        for target in 0..3 {
+            let (mut manager, outbound, mut rx, mut term) =
+                alias_rename_manager("providers.models", "openai");
+            let prefix = "providers.models.openai.old";
+            manager.fields = vec![field(&format!("{prefix}.model"))];
+            manager.screen = Screen::FieldEdit {
+                section_idx: 0,
+                prefix: prefix.into(),
+                breadcrumb: vec!["providers.models".into(), "openai".into(), "old".into()],
+                field_idx: 0,
+            };
+            manager.edit_buf = "unsaved".into();
+            manager.edit_cursor = manager.edit_buf.len();
+            render_config_for_mouse(&mut manager);
+            let areas = manager.last_breadcrumb_areas.clone();
+            let click = |column| MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row: areas[0].y,
+                modifiers: KeyModifiers::NONE,
+            };
+            // A separator and the current field only focus; neither cancels input.
+            for column in [areas[0].right(), areas[3].x] {
+                manager
+                    .handle_mouse(click(column), Rect::default(), &mut term)
+                    .await
+                    .unwrap();
+                assert_eq!(manager.edit_buf, "unsaved");
+                assert!(rx.try_recv().is_err());
+            }
+            manager.filter = Some("old".into());
+            let fields = manager.fields.clone();
+            let replies = async {
+                if target > 0 {
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/list",
+                        serde_json::json!({"prefix": prefix}),
+                        Ok(serde_json::json!({"entries": fields})),
+                    )
+                    .await;
+                }
+                if target == 1 {
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/map-keys",
+                        serde_json::json!({"path": "providers.models.openai"}),
+                        Ok(serde_json::json!({"keys": []})),
+                    )
+                    .await;
+                }
+            };
+            let (result, ()) = tokio::join!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    manager.handle_mouse(click(areas[target].x), Rect::default(), &mut term),
+                ),
+                replies
+            );
+            result.unwrap().unwrap();
+            match target {
+                0 => assert!(matches!(
+                    manager.screen,
+                    Screen::TypeList { section_idx: 0 }
+                )),
+                1 => assert!(matches!(&manager.screen, Screen::AliasList { map_path, .. }
+                    if map_path == "providers.models.openai")),
+                _ => assert!(
+                    matches!(&manager.screen, Screen::FieldList { prefix: path, .. }
+                    if path == prefix)
+                ),
+            }
+            assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
+            assert!(manager.filter.is_none());
+            assert!(manager.edit_buf.is_empty());
+            assert!(manager.last_breadcrumb_areas.is_empty());
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_alias_rename_field_tab_clicks_focus_the_detail_pane() {
+        let (mut manager, outbound, mut rx, mut term) =
+            alias_rename_manager("providers.models", "openai");
+        let prefix = "providers.models.openai.old";
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Model, ConfigTab::Advanced];
+        manager.fields = manager
+            .tab_names
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                let mut entry = field(&format!("{prefix}.field_{i}"));
+                entry.tab = *tab;
+                entry
+            })
+            .collect();
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: prefix.into(),
+            breadcrumb: vec!["providers.models".into(), "openai".into(), "old".into()],
+        };
+        for target in [0, 1, 2, 0] {
+            manager.zeroclaw_pane = ZeroclawPane::Sections;
+            render_config_for_mouse(&mut manager);
+            let rect = manager.last_tab_area.unwrap();
+            let column = rect.x
+                + manager
+                    .tab_names
+                    .iter()
+                    .enumerate()
+                    .take(target)
+                    .map(|(i, tab)| {
+                        tab.label().len() as u16 + 3 + u16::from(i == manager.active_tab) * 2
+                    })
+                    .sum::<u16>();
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            let changing = target != manager.active_tab;
+            let fields = manager.fields.clone();
+            let reply = async {
+                if changing {
+                    answer_config_request(
+                        &outbound,
+                        &mut rx,
+                        "config/list",
+                        serde_json::json!({"prefix": prefix}),
+                        Ok(serde_json::json!({"entries": fields})),
+                    )
+                    .await;
+                }
+            };
+            let (result, ()) = tokio::join!(
+                manager.handle_mouse(click, Rect::default(), &mut term),
+                reply
+            );
+            result.unwrap();
+            assert_eq!(manager.active_tab, target);
+            assert_eq!(manager.field_cursor, target);
+            assert!(manager.zeroclaw_pane == ZeroclawPane::Detail);
             assert!(rx.try_recv().is_err());
         }
     }
